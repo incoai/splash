@@ -150,6 +150,7 @@ class SmokeRealTests(unittest.TestCase):
                         ple_memory=None,
                         expert_memory=None,
                         verify_rows=None,
+                        max_concurrent_requests=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
                         cached_states="exact" if absolute else None,
@@ -200,6 +201,7 @@ class SmokeRealTests(unittest.TestCase):
             ple_memory=None,
             expert_memory=None,
             verify_rows=None,
+            max_concurrent_requests=None,
             max_image_pixels=None,
             kv_format="int8",
             cached_states=None,
@@ -309,6 +311,30 @@ class SmokeRealTests(unittest.TestCase):
             try:
                 command = popen.call_args.args[0]
                 self.assertEqual(command[command.index("--verify-rows") + 1], "all")
+            finally:
+                server.close()
+
+    def test_lanes_reach_the_server(self):
+        model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
+        self.assertIsNone(smoke_real.parse_args(model).max_concurrent_requests)
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--max-concurrent-requests", command)
+        arguments = self.server_arguments()
+        arguments.max_concurrent_requests = smoke_real.parse_args(
+            [*model, "--max-concurrent-requests", "3"]
+        ).max_concurrent_requests
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(
+                    command[command.index("--max-concurrent-requests") + 1], "3"
+                )
             finally:
                 server.close()
 

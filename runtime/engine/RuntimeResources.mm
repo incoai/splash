@@ -322,10 +322,14 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
 // cache.
 RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t configuredLimitBytes,
                                   uint64_t hardBudgetBytes, const model::StreamableWeights &streamable,
-                                  const model::ModelDescriptor &model) {
+                                  const model::ModelDescriptor &model, uint32_t lanes) {
   if (!result.requiredBytes)
     return RuntimeResourcesError(RuntimeResourceStage::Configuration, result.error);
-  std::string floors = "model weights and their arenas with the runtime reserves, one lane's state, the KV runway";
+  std::string floors = "model weights and their arenas" +
+                       (lanes > model::ExecutionLimits::defaultLanes
+                            ? " of " + std::to_string(lanes) + " lanes (--max-concurrent-requests; fewer take less)"
+                            : std::string()) +
+                       " with the runtime reserves, one lane's state, the KV runway";
   if (streamable.expertBytes || streamable.tableBytes)
     floors += ", the streamed stores at their smallest or at the size --expert-memory or --ple-memory sets";
   if (model.capabilities.sparseKv)
@@ -752,8 +756,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // layout may have.
   const bool kvMaySpill = config.model.capabilities.sparseKv && kvLayout.spillable();
   std::array<std::array<uint64_t, 2>, 2> arenaBytes{}, spillArenaBytes{};
-  // The arenas' lanes, the default's, and the target's geometry that plans them.
-  const uint32_t lanes = model::ExecutionLimits::defaultLanes;
+  // The arenas' lanes, the start's (the default's where a start compares what
+  // its lanes cost, below), and the target's geometry that plans them.
+  uint32_t lanes = config.lanes;
   model::QwenTargetGeometry plannedTarget;
   // The room for active KV, which only a target whose KV may spill plans
   // with: until the tier's files open, what the volume they will take
@@ -902,7 +907,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // cache and any SSD cache state staging.
     const StreamedMemoryResult planned = storesPlan();
     if (!planned.plan)
-      throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model);
+      throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model, lanes);
     loadOptions = storesOf(*planned.plan);
     // Fail before loading the model when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
@@ -1194,6 +1199,43 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     AneFfnStart aneFfn = startAneFfn(splitModel, config.aneFfn, splitContext, planMemory, config.cancelled);
     if (aneFfn.plan)
       memoryPlan = std::move(*aneFfn.plan);
+    // What lanes past the default's cost against a start of the default's
+    // lanes with the same staging and split: the stores the parts stream
+    // through where those differ, else the context this start serves and the
+    // one a first start of four would, capped by --max-context.
+    if (lanes > model::ExecutionLimits::defaultLanes) {
+      const uint64_t staging = memoryPlan.breakdown().stateStagingBytes;
+      // The split the context served rests on: the one that runs where a
+      // context is asked for, else the automatic context's.
+      const uint64_t split =
+          requestedContextTokens ? memoryPlan.breakdown().aneFfnBytes : aneFfn.outcome.contextSplitBytes;
+      const auto planLanes = [&](uint32_t count) {
+        lanes = count;
+        planArenas(plannedTarget);
+        planRuntime();
+        return std::pair(sizingPlan(staging).plan, planWith(staging, split).plan);
+      };
+      const auto [fewerStores, fewer] = planLanes(model::ExecutionLimits::defaultLanes);
+      const std::optional<StreamedMemoryPlan> stores = planLanes(config.lanes).first;
+      const auto storeCosts = [&](const char *part, uint64_t StreamedMemoryPlan::*bytes) {
+        const uint64_t these = (*stores).*bytes, fewerBytes = (*fewerStores).*bytes;
+        if (these != fewerBytes)
+          logLine("A concurrency limit of ", config.lanes, " (--max-concurrent-requests) streams the ", part, " through ",
+                  gibibytes(these), "; ", model::ExecutionLimits::defaultLanes, " would ",
+                  fewerBytes ? "stream it through " + gibibytes(fewerBytes) : std::string("load it whole"), ".");
+        return these != fewerBytes;
+      };
+      const bool expertsCost = stores && fewerStores && storeCosts("routed experts", &StreamedMemoryPlan::expertBytes);
+      const bool tableCosts = stores && fewerStores && storeCosts("PLE table", &StreamedMemoryPlan::tableBytes);
+      // What this start serves (Bootstrap): a relaunch's or the asked
+      // context where the plan holds it, else the automatic context.
+      const uint32_t asked = config.relaunchContext ? config.relaunchContext : requestedContextTokens;
+      const uint32_t served = asked ? std::min(asked, memoryPlan.maximumContextTokens()) : aneFfn.outcome.context;
+      if (!expertsCost && !tableCosts && fewer)
+        if (const uint32_t more = memoryPlan.compareDefaultLanes(*fewer, served, requestedContextTokens))
+          logLine("A concurrency limit of ", config.lanes, " (--max-concurrent-requests) leaves ", served,
+                  " tokens of context; ", model::ExecutionLimits::defaultLanes, " would leave ", more, ".");
+    }
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     const KvSpillPlan &spill = budget.kvSpill;
     const std::string spillOff = spillOffReason(config.model, kvLayout, spill, stateStagingBytes && kvFileOpen);

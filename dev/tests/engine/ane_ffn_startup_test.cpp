@@ -342,7 +342,8 @@ void testAutomaticContext() {
 
 // Every start of the model on a Mac serves the automatic context of its calibration, whatever it makes of the split:
 // the remembered split's units, none for a calibration that found no gain, and until one is made the most units the
-// model could take. The plan of each holds it, and the memory a smaller split leaves stays in the cache.
+// model could take. The plan of each holds it, the outcome carries the split bytes it rests on, and the memory a
+// smaller split leaves stays in the cache.
 void testDeterministicContext() {
   const auto noGain = [] {
     Timings timings = measured();
@@ -392,6 +393,7 @@ void testDeterministicContext() {
     const bool named = has(started.log, "; context " + grouped(context) + " tokens (" + grouped(contextWith(0)) +
                                             " with --disable-ane)");
     require(outcome.kind == kind && outcome.context == context && outcome.contextWithout == contextWith(0) &&
+                contextWith(outcome.contextSplitBytes) == context &&
                 (!started.start.plan || started.start.plan->maximumContextTokens() >= context) &&
                 (kind == Kind::Split) == started.start.plan.has_value() && named == (context != contextWith(0)),
             "start " + std::to_string(index) + " did not serve its calibration's automatic context: " + started.log);

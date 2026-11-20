@@ -122,6 +122,7 @@ void writeBudget(json::Writer &w, const EngineMemoryBreakdown &budget) {
         .field("draft_weights_bytes", budget.draftWeightsBytes)
         .field("vision_weights_bytes", budget.visionWeightsBytes)
         .field("maximum_batch_width", budget.maximumBatchWidth)
+        .field("default_lanes_context_tokens", budget.defaultLanesContextTokens)
         .field("lane_state_bytes", budget.laneStateBytes)
         .field("shared_prefill_bytes", budget.sharedPrefillBytes)
         .field("shared_decode_bytes", budget.sharedDecodeBytes)
@@ -172,7 +173,7 @@ std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
   uint64_t dynamicBytes = 0;
   uint64_t result = 0;
   if (!checkedMultiply(layout.bytesPerModelPage() + kv::kPageTokens * model::kLookupIndexTokenBytes,
-                       kvRunwayPages(layout.minimumExtentPages(), lanes), runwayBytes) ||
+                       model::ExecutionLimits::runwayPages(layout.minimumExtentPages(), lanes), runwayBytes) ||
       !checkedAdd(laneStateBytes, runwayBytes, dynamicBytes) ||
       !checkedAdd(fixedBytes, dynamicBytes, result))
     return std::nullopt;
@@ -343,6 +344,13 @@ SpillGeometry EngineMemoryPlan::spillGeometry() const noexcept {
           .densePages = spill.densePages,
           .windowPages = spill.windowPages,
           .groupPages = spill.groupPages};
+}
+
+uint32_t EngineMemoryPlan::compareDefaultLanes(const EngineMemoryPlan &defaultLanes, uint32_t servedTokens,
+                                               uint32_t askedTokens) noexcept {
+  const uint32_t most = defaultLanes.maximumContextTokens();
+  const uint32_t tokens = askedTokens ? std::min(askedTokens, most) : most;
+  return breakdown_.defaultLanesContextTokens = tokens > servedTokens ? tokens : 0;
 }
 
 void writeJson(json::Writer &w, const EngineMemoryPlan &plan) {

@@ -343,6 +343,11 @@ extension LaunchOption {
                                         parse: { Int($0.trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? "\($0)G" : nil } },
                                         text: { String($0.dropLast()) }, title: { "\($0.dropLast()) GB" }))),
         LaunchOption(
+            flag: "--max-concurrent-requests", title: "Concurrency limit",
+            help: "How many requests the model answers at the same time. More give many chats or agents more words a second together, each a little slower, and take memory, which can stream more of the model from the disk or leave less context.",
+            section: .main,
+            kind: .choice(standard: "4", choices: [1, 2, 3, 5, 6, 7, 8].map { (String($0), String($0)) }, custom: nil)),
+        LaunchOption(
             flag: "--idle-release", title: "Free memory when idle",
             help: "An idle model frees its memory and loads again with the next message.",
             section: .main,

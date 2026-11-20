@@ -250,6 +250,9 @@ OPTIONS = {
     "--queue-size": values(
         "--queue-size", {"64": 64, "1": 1}, ("0", "-1", "1.5", "many")
     ),
+    "--max-concurrent-requests": values(
+        "--max-concurrent-requests", {"8": 8, "1": 1}, ("0", "9", "1.5", "all")
+    ),
     "--api-key": values(
         "--api-key",
         {"secret-key": "secret-key"},

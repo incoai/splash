@@ -176,8 +176,9 @@ class Frontend:
         sampling_defaults=None,
     ):
         # What the engine serves, from its Ready (backend.runtime.capabilities):
-        # the context follows the latest engine (max_context); its lanes and
-        # vision are the model's. Without vision, message normalization
+        # the context follows the latest engine (max_context); its lanes are
+        # the ones the start runs (--max-concurrent-requests) and its vision
+        # the model's. Without vision, message normalization
         # rejects image and PDF input before any decoding.
         served = backend.runtime.capabilities
         preparation_capacity = served.max_concurrent_requests

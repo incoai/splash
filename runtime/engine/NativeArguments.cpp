@@ -193,6 +193,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+    } else if (option == "--max-concurrent-requests") {
+      if (!parsePositive(value, result.lanes) || result.lanes > model::ExecutionLimits::maximumBatchWidth)
+        throw UsageError("--max-concurrent-requests requires an integer in [1, " +
+                         std::to_string(model::ExecutionLimits::maximumBatchWidth) + "]");
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {

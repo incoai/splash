@@ -29,6 +29,11 @@ MAX_YARN_CONTEXT_TOKENS = 1010000
 _CONTEXT_UNITS = {"K": 1024, "M": 1000000}
 DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 DEFAULT_QUEUE_SIZE = 32
+# The requests the engine decodes at once unless --max-concurrent-requests
+# says otherwise (ExecutionLimits::defaultLanes), and the most it can
+# (SPLASH_MAXIMUM_BATCH_WIDTH).
+DEFAULT_CONCURRENT_REQUESTS = 4
+MAX_CONCURRENT_REQUESTS = 8
 # The port both commands serve on unless --port names another, or for the
 # launcher SPLASH_PORT does.
 DEFAULT_PORT = 8000
@@ -263,6 +268,18 @@ def parse_queue_size(value):
             "must be a positive number of requests such as 32"
         )
     return size
+
+
+def parse_concurrent_requests(value):
+    try:
+        requests = int(value)
+    except ValueError:
+        requests = 0
+    if not 1 <= requests <= MAX_CONCURRENT_REQUESTS:
+        raise argparse.ArgumentTypeError(
+            f"must be a number of requests from 1 to {MAX_CONCURRENT_REQUESTS}"
+        )
+    return requests
 
 
 def parse_decode_share(value):
@@ -837,6 +854,23 @@ SERVE_OPTIONS = (
             help="requests admitted at once, running or waiting; more get 503 "
             f"(default: {DEFAULT_QUEUE_SIZE})",
         ),
+    ),
+    ServeOption(
+        "--max-concurrent-requests",
+        "requests",
+        dict(
+            type=parse_concurrent_requests,
+            default=DEFAULT_CONCURRENT_REQUESTS,
+            metavar="REQUESTS",
+            help="requests the engine runs at once, 1 to "
+            f"{MAX_CONCURRENT_REQUESTS}; more let more clients be answered "
+            "together, each a little slower, and take memory for their "
+            "states and arenas: where that streams more of the weights or "
+            "leaves less context than four would, the start logs both, and "
+            "/status reports four's context (default: "
+            f"{DEFAULT_CONCURRENT_REQUESTS})",
+        ),
+        engine=EngineArgument("--max-concurrent-requests"),
     ),
     ServeOption(
         "--decode-share",

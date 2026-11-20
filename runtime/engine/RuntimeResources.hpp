@@ -166,6 +166,8 @@ struct RuntimeResourcesConfig {
   // benchmark round verifies every row of a draft's block a lane (all) so
   // that rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --max-concurrent-requests: the lanes the runtime runs and plans for.
+  uint32_t lanes = model::ExecutionLimits::defaultLanes;
   // --activations: whether the plans may round activations to int8
   // where an int8-activation path takes them, or keep every activation bf16
   // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).

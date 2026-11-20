@@ -685,6 +685,43 @@ void testDense35BKeepsMainsPlan() {
   }
 }
 
+// A runtime of eight lanes is planned as eight: its arenas, which hold
+// 191.6 MB more decode and 1.0 MB more prefill than four lanes' on the 35B
+// (model::plannedDecodeBytes, Apple10), and their KV runway are in the plan
+// and its minimum. Where memory bounds the context, the 35B's on a 24 GB M6, the
+// plan offers less than four lanes' and carries what four would leave
+// (EngineMemoryPlan::compareDefaultLanes); where it holds the window beside
+// them, a 36 GB M5 Max's, it carries nothing.
+void testEightLanesArePlannedAsEight() {
+  constexpr uint64_t kDecode = 191'643'648, kPrefill = 1'015'808;
+  for (const auto &[mac, target, costs] : {std::tuple{kM6, k35BQ2, true}, {kStudio, k35BQ4, false}}) {
+    const EngineMemoryPlan four = test::requireMemoryPlan(deviceOf(mac), target.profile());
+    Target wide = target;
+    wide.chunk.sharedDecodePlannedAllocatedBytes += kDecode;
+    wide.chunk.sharedPrefillPlannedAllocatedBytes += kPrefill;
+    wide.chunk.lanes = 8;
+    EngineMemoryPlan eight = test::requireMemoryPlan(deviceOf(mac), wide.profile());
+    const EngineMemoryBreakdown &a = four.breakdown(), &b = eight.breakdown();
+    const uint32_t extent = target.layout.minimumExtentPages();
+    const uint64_t runway =
+        (model::ExecutionLimits::runwayPages(extent, 8) - model::ExecutionLimits::runwayPages(extent, 4)) *
+        (target.layout.bytesPerModelPage() + kv::kPageTokens * model::kLookupIndexTokenBytes);
+    require(a.maximumBatchWidth == 4 && b.maximumBatchWidth == 8 &&
+                b.fixedRuntimeBytes == a.fixedRuntimeBytes + kDecode + kPrefill &&
+                b.minimumRequiredBytes == a.minimumRequiredBytes + kDecode + kPrefill + runway,
+            std::string("eight lanes of the 35B on the ") + mac.name + " were not planned as eight");
+    require((eight.maximumContextTokens() < four.maximumContextTokens()) == costs,
+            std::string("eight lanes of the 35B on the ") + mac.name + (costs ? " cost no" : " cost") + " context");
+    eight.compareDefaultLanes(four, eight.maximumContextTokens(), 0);
+    require(b.defaultLanesContextTokens == (costs ? four.maximumContextTokens() : 0),
+            std::string("eight lanes of the 35B on the ") + mac.name + " did not carry four lanes' context");
+    // A --max-context both hold is served alike: nothing to say.
+    eight.compareDefaultLanes(four, 65'536, 65'536);
+    require(b.defaultLanesContextTokens == 0,
+            std::string("eight lanes of the 35B on the ") + mac.name + " said a cost a 64K context does not pay");
+  }
+}
+
 // An explicit context loads every expert of the 35B where main holds it so
 // on the M6, beside the SSD cache's state staging up to main's 229,361
 // tokens, and without it up to main's context then (the automatic SSD cache
@@ -1257,6 +1294,7 @@ int main() {
     testAutoStreamsTheTableWhereMemoryHoldsIt();
     testSpillAllowanceFollowsASmallerRequestedContext();
     testDense35BKeepsMainsPlan();
+    testEightLanesArePlannedAsEight();
     testDenseExplicitContextKeepsMainsExperts();
     testDenseExplicitContextStreamsExperts();
     testDense35BContextGrowsWithTheBudget();

@@ -21,14 +21,6 @@ namespace splash::engine {
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
 inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 
-// The pages of the KV runway of a runtime of `lanes` lanes in extents of
-// extentPages pages: the whole extents that hold the pages startup warmup and
-// its step measurement run on, which the KV pool allocates when it is built
-// (ExecutionLimits::runwayPages).
-[[nodiscard]] constexpr uint64_t kvRunwayPages(uint32_t extentPages, uint32_t lanes) noexcept {
-  return model::ExecutionLimits::runwayPages(extentPages, lanes);
-}
-
 // What one request needs at the least: the fixed bytes, one lane's state and
 // the KV runway of `lanes` lanes (smallest extents, lookup index too);
 // nullopt on overflow.
@@ -277,8 +269,9 @@ struct EngineMemoryBreakdown {
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
   uint64_t visionWeightsBytes = 0;
-  // The lanes the plan holds, the most requests the runtime runs at once.
+  // The lanes and the default's context (EngineMemoryPlan::compareDefaultLanes).
   uint32_t maximumBatchWidth = model::ExecutionLimits::defaultLanes;
+  uint32_t defaultLanesContextTokens = 0;
   uint64_t laneStateBytes = 0;
   uint64_t sharedPrefillBytes = 0;
   uint64_t sharedDecodeBytes = 0;
@@ -402,6 +395,13 @@ public:
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
   // What admission decides which requests spill by (EngineSpillConfig).
   [[nodiscard]] SpillGeometry spillGeometry() const noexcept;
+  // Takes the context a first start of `defaultLanes`, the plan of the
+  // default's lanes, would serve, its most capped by `askedTokens`
+  // (--max-context, none uncapped), where it is more than `servedTokens`,
+  // this start's (EngineMemoryBreakdown::defaultLanesContextTokens), and
+  // returns it.
+  uint32_t compareDefaultLanes(const EngineMemoryPlan &defaultLanes, uint32_t servedTokens,
+                               uint32_t askedTokens) noexcept;
 
   // The plan as /status reports it (memory_plan): the device, the model and
   // the budget.

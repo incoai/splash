@@ -96,8 +96,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
                    const std::function<EngineMemoryPlanResult(uint64_t)> &planMemory,
                    const std::function<bool()> &cancelled) {
   const uint32_t without = contextOf(planMemory(0));
-  const auto gpuAlone = [&](Kind kind, std::string reason, uint32_t context) {
-    return AneFfnStart{{}, {}, {kind, std::move(reason), context, without}};
+  const auto gpuAlone = [&](Kind kind, std::string reason, uint32_t context, uint64_t contextSplitBytes = 0) {
+    return AneFfnStart{{}, {}, {kind, std::move(reason), context, without, contextSplitBytes}};
   };
   if (std::optional<std::pair<Kind, std::string>> off = notRunning(model, setting))
     return gpuAlone(off->first, std::move(off->second), without);
@@ -148,7 +148,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
   // whatever it makes of the split, and until then the most.
   uint32_t assumed = maxAneUnits;
   const auto gpuAloneServing = [&](Kind kind, std::string reason) {
-    return gpuAlone(kind, std::move(reason), automaticWith(assumed));
+    return gpuAlone(kind, std::move(reason), automaticWith(assumed), assumed ? model.plannedBytes(assumed) : 0);
   };
 
   logLine("Setting up the Neural Engine FFN split (splash serve --disable-ane keeps the FFN on the GPU).");
@@ -178,7 +178,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
            << timed << ", " << fixed(100.0 * prepared.error) << "% from the GPU alone on the Neural Engine's part ("
            << how << " in " << seconds() << ")";
     return AneFfnStart{std::move(prepared.split), std::move(plan.plan),
-                       {Kind::Split, reason.str(), automaticWith(aneUnits), without}};
+                       {Kind::Split, reason.str(), automaticWith(aneUnits), without, model.plannedBytes(aneUnits)}};
   };
   // This Mac's calibration as recalled; what the next start does once this one tried to remember `record`.
   std::optional<Calibration> calibration;

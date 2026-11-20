@@ -322,7 +322,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     const uint32_t affordableWidth = static_cast<uint32_t>(std::min<uint64_t>(
         budget.maximumBatchWidth,
         (budget.dynamicBudgetBytes -
-         kvRunwayPages(budget.kvExtentPages, budget.maximumBatchWidth) * budget.kvPageBytes) /
+         model::ExecutionLimits::runwayPages(budget.kvExtentPages, budget.maximumBatchWidth) * budget.kvPageBytes) /
             budget.laneStateBytes));
     for (uint32_t width = 1; width <= budget.maximumBatchWidth; ++width) {
       if (width > affordableWidth ||

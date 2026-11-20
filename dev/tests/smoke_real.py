@@ -128,6 +128,10 @@ class RealServer:
             command.extend(("--expert-memory", arguments.expert_memory))
         if arguments.verify_rows is not None:
             command.extend(("--verify-rows", arguments.verify_rows))
+        if arguments.max_concurrent_requests is not None:
+            command.extend(
+                ("--max-concurrent-requests", str(arguments.max_concurrent_requests))
+            )
         if cache_dir is not None:
             command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
@@ -1799,6 +1803,12 @@ def add_server_arguments(parser):
         choices=("auto", "all"),
         help="the rows of each draft block decode verifies (splash serve "
         "--verify-rows); a MoE model's greedy output repeats only with all",
+    )
+    parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        help="the requests the engine runs at once (splash serve "
+        "--max-concurrent-requests)",
     )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")

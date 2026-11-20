@@ -144,8 +144,9 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   uint64_t budget = pages;
   while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
   const uint64_t index = kv::kPageTokens * model::kLookupIndexTokenBytes;
+  const uint64_t runway = model::ExecutionLimits::runwayPages(layout.minimumExtentPages(), config.lanes);
   return kvPagesBytes(layout, budget, kvWindowFloorPages(layout, 0), layout.extentPagesFor(budget)) + budget * index -
-         kvRunwayPages(layout.minimumExtentPages(), model::ExecutionLimits::defaultLanes) * (layout.bytesPerModelPage() + index);
+         runway * (layout.bytesPerModelPage() + index);
 }
 
 // The runtime memory a start plans of a model of `config` before its weights
@@ -469,13 +470,13 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config) {
   const ops::ExecutionPlans operators(backend.capabilities(), config.int8Activations);
   const model::ModelMemoryPlan arenas = model::plannedRuntimeMemory(
       config.model, model::plannedTargetGeometry(backend, config.modelRoot, config.model, 0, nullptr), operators,
-      config.kvFormat, config.stateFormat, {}, model::ExecutionLimits::defaultLanes);
+      config.kvFormat, config.stateFormat, {}, config.lanes);
   return minimumRequiredBytes(model::streamableWeights(config.modelRoot, config.model, {}).loadedBytes +
                                   arenas.sharedPrefillPlannedAllocatedBytes +
                                   arenas.sharedDecodePlannedAllocatedBytes + model::kPipelineReserveBytes +
                                   model::kRuntimeOverheadReserveBytes,
                               config.model.stateLayout.laneBytes(),
-                              config.model.targetKvLayout, model::ExecutionLimits::defaultLanes)
+                              config.model.targetKvLayout, config.lanes)
       .value();
 }
 
@@ -1089,6 +1090,58 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
   const std::string log = test::capturedStderr([&] { static_cast<void>(runtime->warmupCompositeStateRestore()); });
   require(backend.pipelinesCreatedWhileServing() == 0,
           "a restore after the start's other warmups created pipelines: " + log);
+}
+
+// A start of any lanes the option offers is a runtime that warms as a start
+// does: its arenas, its sampling policies' pipelines, its prefill and every
+// decode width up to its lanes (a draft step of one lane may store two
+// lanes' rows, decodeArenaLanes) and the state restore, which moves a state
+// to another state lane where it has one. One, two, three and five lanes.
+void testRuntimesOfOtherLanesWarm(const char *metallibPath) {
+  for (const uint32_t lanes : {1U, 2U, 3U, 5U}) {
+    const test::TemporaryDirectory root("splash-lanes-" + std::to_string(lanes));
+    RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "lanes-test");
+    config.lanes = lanes;
+    std::unique_ptr<RuntimeResources> resources;
+    static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+    const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+    require(budget.maximumBatchWidth == lanes, "a start of " + std::to_string(lanes) + " lanes planned others");
+    std::unique_ptr<model::RuntimeModel> runtime;
+    require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+                budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+                [&] { runtime = model::createRuntime(resources->modelContext()); })),
+            "the runtime's arenas were refused");
+    require(runtime->commandLimits().lanes == lanes, "a runtime of " + std::to_string(lanes) + " lanes runs others");
+    const KvPool::RunwayHold runway(resources->kvPool());
+    static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+    for (uint32_t width = 1; width <= lanes; ++width) static_cast<void>(runtime->warmupDecodeBatch(width));
+    static_cast<void>(test::capturedStderr([&] { static_cast<void>(runtime->warmupCompositeStateRestore()); }));
+    rejects([&] { static_cast<void>(runtime->warmupDecodeBatch(lanes + 1)); }, "invalid decode warmup width",
+            "a runtime of " + std::to_string(lanes) + " lanes warmed a wider batch");
+  }
+}
+
+// Where eight lanes leave less context than four would, the start says so
+// (EngineMemoryBreakdown::defaultLanesContextTokens), and a relaunch, which
+// serves its first engine's context, says it again: four's context is capped
+// by --max-context alone, never by the relaunch's.
+void testARelaunchKeepsTheLanesNote(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-lanes-note");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "lanes-note");
+  config.lanes = 8;
+  const auto start = [&] {
+    std::unique_ptr<RuntimeResources> resources;
+    static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+    return std::pair(resources->aneFfnOutcome().context, resources->memoryPlan().breakdown());
+  };
+  // A budget whose memory, not the window, bounds the context.
+  config.maximumMemoryBytes = start().second.minimumRequiredBytes + 64 * kMiB;
+  const auto [served, first] = start();
+  require(first.defaultLanesContextTokens > served,
+          "eight lanes that leave less context than four did not carry four's");
+  config.relaunchContext = served;
+  require(start().second.defaultLanesContextTokens == first.defaultLanesContextTokens,
+          "a relaunch of eight lanes did not carry four lanes' context");
 }
 
 // A verify's kernels follow its lanes' history, which the decode warmups'
@@ -2300,6 +2353,8 @@ int main(int argc, char **argv) {
       testThePlanCountsEveryBuffer(argv[1]);
       testDecodeArenaHoldsAStepsPackedRows(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
+      testRuntimesOfOtherLanesWarm(argv[1]);
+      testARelaunchKeepsTheLanesNote(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
       testThePlanCountsTheSpilledKvReadersTables(argv[1]);
       {

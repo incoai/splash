@@ -98,7 +98,10 @@ struct AneFfnOutcome final {
   // serves the same; with no calibration made, with the largest split the
   // model could take. Otherwise both are the same. For a split refused a
   // context asked for, the first is the most context a split leaves instead.
+  // The split's bytes the plan of the first holds, none where it is the GPU
+  // alone's.
   uint32_t context = 0, contextWithout = 0;
+  uint64_t contextSplitBytes = 0;
 };
 // The kind's name in lowercase, as "no_gain".
 [[nodiscard]] std::string_view aneFfnOutcomeName(AneFfnOutcome::Kind kind) noexcept;

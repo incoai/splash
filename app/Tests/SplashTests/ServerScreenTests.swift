@@ -841,6 +841,11 @@ extension ServerScreenTests {
                                            size: ServerPictures.size, appearance: .aqua)
         defer { window.orderOut(nil) }
         pump(0.3)
+        // The page at its end, where the Advanced row shows however many options are above it.
+        let scroll = try #require(window.contentView?.pageScroll)
+        let end = try #require(scroll.documentView).frame.height - scroll.contentView.bounds.height + scroll.contentInsets.bottom
+        scroll.scroll(by: end - scroll.contentView.bounds.minY)
+        pump(0.3)
         let anchor = try #require(row.view)
         let frame = anchor.convert(anchor.bounds, to: nil)
         let point = NSPoint(x: frame.minX + 40, y: frame.midY)

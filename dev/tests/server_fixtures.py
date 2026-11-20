@@ -920,6 +920,7 @@ def main_args(**overrides):
             "persistent_cache": False,
             "cache_dir": None,
             "decode_share": None,
+            "max_concurrent_requests": serve_options.DEFAULT_CONCURRENT_REQUESTS,
             "disable_ane": False,
             "activations": "auto",
             "verify_rows": "auto",
