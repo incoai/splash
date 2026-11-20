@@ -811,6 +811,16 @@ SERVE_OPTIONS = (
         engine=EngineArgument("--decode-share"),
     ),
     ServeOption(
+        "--short-prefill-cohorts",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="give warm short background requests a bounded turn alongside long prefills",
+        ),
+        engine=EngineArgument("--short-prefill-cohorts", text=_spelled("on")),
+    ),
+    ServeOption(
         "--disable-ane",
         "requests",
         dict(

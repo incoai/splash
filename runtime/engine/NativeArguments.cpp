@@ -145,6 +145,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       result.exactCachedStates = value == "exact";
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
+    } else if (option == "--short-prefill-cohorts") {
+      if (value != "on" && value != "off")
+        throw UsageError("--short-prefill-cohorts requires on or off");
+      result.shortPrefillCohorts = value == "on";
     } else if (option == "--max-image-patches") {
       result.maxImagePatches = parseMaxImagePatches(value);
     } else if (option == "--persistent-cache") {

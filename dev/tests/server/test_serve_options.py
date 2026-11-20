@@ -112,6 +112,7 @@ OPTIONS = {
     "--cached-states": values(
         "--cached-states", {"int8": "int8", "exact": "exact"}, ("", "fp32", "Exact")
     ),
+    "--short-prefill-cohorts": ([(["--short-prefill-cohorts"], True)], []),
     "--disable-ane": ([(["--disable-ane"], True)], []),
     "--activations": values(
         "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")

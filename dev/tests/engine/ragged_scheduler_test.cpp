@@ -88,9 +88,10 @@ std::string at(const test::TimingProfile &profile) {
 class Sim {
 public:
   explicit Sim(const test::TimingProfile &profile, model::CommandLimits commandLimits = limits(),
-               double decodeShare = 0.5, std::function<double()> residentShare = {})
+               double decodeShare = 0.5, std::function<double()> residentShare = {}, bool cohorts = false)
       : work(profile, std::move(residentShare)), commandLimits(reported(profile, commandLimits)),
-        scheduler({.decodeShare = decodeShare, .decodeGapMilliseconds = kGap, .limits = this->commandLimits}, work) {}
+        scheduler({.decodeShare = decodeShare, .decodeGapMilliseconds = kGap, .limits = this->commandLimits,
+                   .shortPrefillCohorts = cohorts}, work) {}
 
   test::TimedWork work;
   model::CommandLimits commandLimits;
@@ -1897,7 +1898,75 @@ void testPassesYieldToAHigherPriority() {
           "an abandoned command's lanes did not run its rows again from a first pass");
 }
 
+void testShortCohortsReconsiderQueuedRequestsAfterLongProgress() {
+  Sim sim(test::kDense27B, limits(), 1.0, {}, true);
+  sim.lane(1, 0, 64000);
+  for (uint64_t id = 2; id <= 7; ++id)
+    sim.scheduler.submit(request(id, 20000, RequestPriority::Background));
+  require(!sim.scheduler.sponsorShortPrefill(2, 19673), "short used time before long progress");
+  sim.sampled = [](model::CommandSample &sample, const BatchPlan &) {
+    sample.wallMilliseconds = 1200;
+  };
+  sim.step();
+  require(!sim.scheduler.sponsorShortPrefill(2, 19673), "a cohort started with only one grant available");
+  sim.step();
+  sim.sampled = nullptr;
+  require(!sim.scheduler.sponsorShortPrefill(2, 19000), "long suffix used a short grant");
+  require(sim.scheduler.sponsorShortPrefill(2, 19673) &&
+              sim.scheduler.sponsorShortPrefill(3, 19673) &&
+              sim.scheduler.sponsorShortPrefill(4, 19673),
+          "waiting warm requests could not use a cohort");
+  require(!sim.scheduler.sponsorShortPrefill(5, 19673), "more than three requests formed a cohort");
+  const PrefillAdmission waiting[]{{2, 19673}, {3, 19673}, {4, 19673}, {5, 19673}};
+  const auto admitted = sim.scheduler.prefillAdmissionOrder(waiting, sim.in());
+  require(admitted == std::vector<uint64_t>({2, 3, 4}), "cohort was not planned together");
+  for (uint64_t id : admitted)
+    sim.scheduler.resourcesReady(id, 19673);
+  sim.run(sim.plan(), 32.0);
+  const BatchPlan decode = sim.plan();
+  require(decode.kind == WorkKind::Decode && decode.width() == 3,
+          "the third warm turn did not join the decode batch");
+  sim.scheduler.finish(2);
+  sim.scheduler.finish(4);
+  sim.scheduler.cancel(3);
+  require(!sim.scheduler.sponsorShortPrefill(5, 19673), "sponsored work did not spend its own time");
+  sim.run(sim.plan(), 192.0);
+  sim.decoder(8, RequestPriority::Foreground);
+  require(!sim.scheduler.sponsorShortPrefill(5, 19673), "sponsorship ran next to foreground work");
+  sim.scheduler.finish(8);
+  require(sim.scheduler.sponsorShortPrefill(5, 19673), "long work did not renew the budget");
+}
+
+void testSponsoredDecodeCanFinishBeforeCuttingLongPrefill() {
+  Sim sim(test::kDense27B, limits(), 0.0, {}, true);
+  sim.lane(1, 0, 64000);
+  sim.scheduler.submit(request(2, 20000, RequestPriority::Background));
+  sim.sampled = [](model::CommandSample &sample, const BatchPlan &) { sample.wallMilliseconds = 1200; };
+  sim.step();
+  sim.step();
+  require(sim.scheduler.sponsorShortPrefill(2, 19673), "the long request did not fund warm admission");
+  sim.scheduler.resourcesReady(2, 19673);
+  sim.sampled = [](model::CommandSample &sample, const BatchPlan &) { sample.wallMilliseconds = 400; };
+  const BatchPlan shortPrefill = sim.plan();
+  require(shortPrefill.kind == WorkKind::Prefill && shortPrefill.items.front().requestId == 2,
+          "the sponsored prompt did not start");
+  sim.run(shortPrefill);
+  sim.sampled = [](model::CommandSample &sample, const BatchPlan &) { sample.wallMilliseconds = 100; };
+  const BatchPlan decode = sim.plan();
+  require(decode.kind == WorkKind::Decode, "the sponsored decoder did not become runnable");
+  sim.run(decode);
+  require(sim.plan().kind == WorkKind::Decode, "a cut interrupted the sponsored decode within its budget");
+  sim.sampled = [](model::CommandSample &sample, const BatchPlan &) { sample.wallMilliseconds = 1500; };
+  sim.step();
+  const BatchPlan longPrefill = sim.plan();
+  require(longPrefill.kind == WorkKind::Prefill && longPrefill.items.front().requestId == 1 &&
+              longPrefill.items.front().tokenCount < kChunk,
+          "long prefill did not resume under the ordinary cut rule after the budget");
+}
+
 constexpr test::TestCase kTests[] = {
+    {"testSponsoredDecodeCanFinishBeforeCuttingLongPrefill", testSponsoredDecodeCanFinishBeforeCuttingLongPrefill},
+    {"testShortCohortsReconsiderQueuedRequestsAfterLongProgress", testShortCohortsReconsiderQueuedRequestsAfterLongProgress},
     {"testRealDecodeWidths", testRealDecodeWidths},
     {"testRejectedCommitCountsNothing", testRejectedCommitCountsNothing},
     {"testDecodeLanesRotate", testDecodeLanesRotate},

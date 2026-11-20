@@ -78,6 +78,7 @@ struct EngineConfig final {
   // the next request (WeightResidency): the native loop's; empty where
   // nothing is released.
   std::optional<WeightResidencyConfig> weights;
+  bool shortPrefillCohorts = false;
 };
 
 // What a request fails with once it has waited the resource wait limit for
