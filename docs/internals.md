@@ -1405,7 +1405,14 @@ writing one set of surfaces sized for 2048 rows. The program holds the
 functions of the split's shares alone (`AneFfn::programRows`): of one share,
 one step's to 2048 rows (13); of a share of each kind of command, one step's to
 1,024 rows and the halves' to 1,024 (10), which Apple9's ANE compiler takes
-where it refuses 22 (`ANECCompile() FAILED` on an M4, each time). The ANE
+where it refuses 22 (`ANECCompile() FAILED` on an M4, each time). On
+Apple11's Neural Engine and later's a function runs gate and up in blocks of
+1,024 of its channels, each block through its scales, SiLU and product
+before the next; every other family runs each projection whole (`AneFfn.cpp`,
+`gateUpInBlocks`): with Qwen3.8-27B the blocks took an M6's requests' first
+tokens 10-12% sooner from 1,024 rows, while on M5 Pros and an M5 Max they
+took the ANE alone 1-7% longer at every function the program holds, and they
+add 20-45% to the program's compile everywhere. The ANE
 service holds memory for a loaded program's intermediate values, which its
 functions share: 13 programs of one function each held it 13 times (3.25 GB at
 the M6's share, against 0.67 GB for the one program). A command queues all its

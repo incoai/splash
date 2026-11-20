@@ -35,6 +35,26 @@ constexpr uint32_t kSegment = 2560;
 static_assert(kSegment % ANE_FFN_INPUT_BLOCK == 0 && kSegment % ANE_FFN_INTERMEDIATE_BLOCK == 0 &&
                   kSegment % ANE_FFN_TILE == 0,
               "segments hold whole rotation blocks and packing tiles");
+// Where the split runs gate and up in blocks (gateUpInBlocks), their matmuls
+// each compute at most kOutputBlock of the ANE's channels, and each block
+// runs through its scales, SiLU and product before the next. On an M6, with
+// Qwen3.8-27B's FFN shapes on synthetic weights, the split layer of 2048 rows
+// took 7.6% less than with one matmul of all the ANE's channels a segment at
+// 26 of 34 units (26.4 against 28.6 ms) and 2.5% less at 10. Down in blocks
+// of 1024 hidden channels took no less; each matmul cut into blocks joined at
+// once, 5% more.
+constexpr uint32_t kOutputBlock = 1024;
+// Whether gate and up run in blocks on the GPU of `appleGpuFamily`'s Neural
+// Engine: Apple11's and later's. On an M6, Qwen3.8-27B UD-IQ3_XXS, the
+// blocks took requests' first tokens 10-12% sooner from 1,024 rows and 2-4%
+// below; on two M5 Pros they took the ANE alone 1-7% longer at every
+// function of the program (512-1,024 rows), which moved one step's least rows
+// from 535 to 648 on the 20-core and its 640-row prompts 10% past 1.7.0's;
+// on an M4 (Apple9) they took 2.5% less, for 46% more compile on a Mac whose
+// first start takes two minutes. Every family compiles 30-45% longer with
+// them.
+constexpr bool gateUpInBlocks(uint32_t appleGpuFamily) noexcept { return appleGpuFamily >= 11; }
+
 // The hidden channels ane_ffn_rotate's simdgroups rotate a block each of.
 constexpr uint32_t kRotateGroup = ANE_FFN_INPUT_BLOCK * (ANE_FFN_ROTATE_THREADS / 32);
 static_assert(kRotateGroup % ANE_FFN_TILE == 0 && kRotateGroup % ANE_FFN_WEIGHT_ROWS == 0,
@@ -58,10 +78,10 @@ static_assert(kChannelUnit % ANE_FFN_WEIGHT_ROWS == 0,
 constexpr auto kHandoffBound = std::chrono::seconds(2);
 static_assert(kHandoffBound < supervision::kGpuWaitLimit);
 // How long the service may take to compile and load the program: four times
-// the cold compile of the largest the split compiles, calibration's at share
-// 0.8 (27 s on an M5 Max, about 30 s on an M6), so that a busy Mac still
-// finishes and only a service that stopped answering runs out of it.
-constexpr auto kProgramLimit = std::chrono::seconds(120);
+// the longest cold compile measured, the M6's of the program of 13 functions
+// at 26 units (52 s), so that a busy Mac still finishes and only a service
+// that stopped answering runs out of it.
+constexpr auto kProgramLimit = std::chrono::seconds(210);
 // How long the service may take to unload the program for the idle release
 // (release()) and to load it again (restore()), while the engine's loop and
 // then the request that ends the idle wait: the service unloads a program in
@@ -314,7 +334,7 @@ std::vector<AneFfn::Input> AneFfn::programInputs(const Shape &shape, const Memor
 // overflow fp16. The function reads and writes the leading `rows` of each row
 // of the chunk's surfaces.
 std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, const ane::Surface &output,
-                             uint32_t rows) {
+                             uint32_t rows, bool blocks) {
   const auto segmentCount = static_cast<uint32_t>(shape.inputSegments.size());
   const uint32_t channels = shape.ane;
   const std::string unit = fp16(1.0 / ANE_FFN_INT8_UNIT);
@@ -345,29 +365,93 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
     }
     return total;
   };
-
-  for (uint32_t k = 0; k < segmentCount; ++k) {
-    const std::string x = "x" + std::to_string(k);
-    f16(x + "_d", shape.inputSegments[k], rows, "dequantize(input = " + x + "_t, scale = " + unit + ")");
-  }
-  for (const char *projection : {"g", "u"}) {
-    const std::string p = projection;
-    for (uint32_t k = 0; k < segmentCount; ++k)
-      matmul(p + "m" + std::to_string(k), "w" + p + std::to_string(k), "x" + std::to_string(k) + "_d", channels,
-             shape.inputSegments[k]);
-    f16(p + "s", channels, rows, "mul(x = " + sum(p + "m", segmentCount, channels) + ", y = s" + p + "_t)");
+  // The `count` rows from `begin` of `source`, `width` values each.
+  const auto slice = [&](const char *type, const std::string &name, const std::string &source, uint64_t begin,
+                         uint64_t count, uint64_t width) {
+    line(tensor(type, count, width) + " " + name + " = slice_by_size(x = " + source +
+         ", begin = tensor<int32, [4]>([0, 0, " + std::to_string(begin) + ", 0]), size = tensor<int32, [4]>(" +
+         dimensions(count, width) + "))");
+  };
+  // `name`: the `count` output channels from `begin` of a projection of
+  // `height`, the sum over its input segments (`matmuls`) of each segment's
+  // int8 weight rows times its values, times those rows' `scales`.
+  struct Matmul final {
+    std::string weights, values;
+    uint32_t width;
+  };
+  const auto project = [&](const std::string &name, std::span<const Matmul> matmuls, const std::string &scales,
+                           uint64_t begin, uint64_t count, uint64_t height) {
+    const bool whole = count == height;
+    std::string total;
+    for (size_t term = 0; term < matmuls.size(); ++term) {
+      const auto &[weights, values, width] = matmuls[term];
+      const std::string product = name + "_m" + std::to_string(term);
+      if (!whole) slice("int8", product + "_w", weights + "_t", begin, count, width);
+      f16(product + "_wd", count, width,
+          "dequantize(input = " + (whole ? weights + "_t" : product + "_w") + ", scale = " + unit + ")");
+      f16(product, count, rows,
+          "matmul(transpose_x = bool(false), transpose_y = bool(false), x = " + product + "_wd, y = " + values +
+              ")");
+      if (term) f16(product + "_sum", count, rows, "add(x = " + total + ", y = " + product + ")");
+      total = term ? product + "_sum" : product;
+    }
+    if (!whole) slice("fp16", name + "_scale", scales + "_t", begin, count, 1);
+    f16(name, count, rows, "mul(x = " + total + ", y = " + (whole ? scales + "_t" : name + "_scale") + ")");
+  };
+  // The ANE's channels through gate and up, their scales, SiLU and product:
+  // where the chip runs them in blocks (gateUpInBlocks), a block at a time;
+  // else each projection whole, as 1.7.0's program does.
+  if (blocks) {
+    std::vector<Matmul> gate, up;
+    for (uint32_t k = 0; k < segmentCount; ++k) {
+      const std::string index = std::to_string(k), x = "x" + index;
+      f16(x + "_d", shape.inputSegments[k], rows, "dequantize(input = " + x + "_t, scale = " + unit + ")");
+      gate.push_back({"wg" + index, x + "_d", shape.inputSegments[k]});
+      up.push_back({"wu" + index, x + "_d", shape.inputSegments[k]});
+    }
+    // Each block of the ANE's channels through gate and up, their scales, SiLU
+    // and their product, before the next block's; one block is h itself.
+    std::string intermediate;
+    for (uint64_t begin = 0; begin < channels; begin += kOutputBlock) {
+      const uint64_t count = std::min<uint64_t>(kOutputBlock, channels - begin);
+      const std::string b = "b" + std::to_string(begin / kOutputBlock) + "_",
+                        h = channels > kOutputBlock ? b + "h" : "h";
+      project(b + "gs", gate, "sg", begin, count, channels);
+      project(b + "us", up, "su", begin, count, channels);
+      // silu(g) = g/2 (1 + tanh(g/2)): through the ANE's sigmoid, layers whose
+      // gate pre-activations are about 0.1 differed from the GPU alone by 6.5%
+      // RMS, through its tanh by 1.6%.
+      f16(b + "gt", count, rows, "mul(x = " + b + "gs, y = tx_t)");
+      f16(b + "gh", count, rows, "mul(x = " + b + "gt, y = " + fp16(0.5) + ")");
+      f16(b + "th", count, rows, "tanh(x = " + b + "gh)");
+      f16(b + "tp", count, rows, "add(x = " + b + "th, y = " + fp16(1.0) + ")");
+      f16(b + "silu", count, rows, "mul(x = " + b + "gh, y = " + b + "tp)");
+      f16(h, count, rows, "mul(x = " + b + "silu, y = " + b + "us)");
+      intermediate += (intermediate.empty() ? "" : ", ") + h;
+    }
+    if (channels > kOutputBlock)
+      f16("h", channels, rows, "concat(axis = int32(2), interleave = bool(false), values = (" + intermediate + "))");
+  } else {
+    for (uint32_t k = 0; k < segmentCount; ++k) {
+      const std::string x = "x" + std::to_string(k);
+      f16(x + "_d", shape.inputSegments[k], rows, "dequantize(input = " + x + "_t, scale = " + unit + ")");
+    }
+    for (const char *projection : {"g", "u"}) {
+      const std::string p = projection;
+      for (uint32_t k = 0; k < segmentCount; ++k)
+        matmul(p + "m" + std::to_string(k), "w" + p + std::to_string(k), "x" + std::to_string(k) + "_d", channels,
+               shape.inputSegments[k]);
+      f16(p + "s", channels, rows, "mul(x = " + sum(p + "m", segmentCount, channels) + ", y = s" + p + "_t)");
+    }
+    f16("gt", channels, rows, "mul(x = gs, y = tx_t)");
+    f16("gh", channels, rows, "mul(x = gt, y = " + fp16(0.5) + ")");
+    f16("th", channels, rows, "tanh(x = gh)");
+    f16("tp", channels, rows, "add(x = th, y = " + fp16(1.0) + ")");
+    f16("silu", channels, rows, "mul(x = gh, y = tp)");
+    f16("h", channels, rows, "mul(x = silu, y = us)");
   }
   const std::string c = std::to_string(channels), r = std::to_string(rows),
                     block = std::to_string(ANE_FFN_INTERMEDIATE_BLOCK);
-  // silu(g) = g/2 (1 + tanh(g/2)): through the ANE's sigmoid, layers whose
-  // gate pre-activations are about 0.1 differed from the GPU alone by 6.5%
-  // RMS, through its tanh by 1.6%.
-  f16("gt", channels, rows, "mul(x = gs, y = tx_t)");
-  f16("gh", channels, rows, "mul(x = gt, y = " + fp16(0.5) + ")");
-  f16("th", channels, rows, "tanh(x = gh)");
-  f16("tp", channels, rows, "add(x = th, y = " + fp16(1.0) + ")");
-  f16("silu", channels, rows, "mul(x = gh, y = tp)");
-  f16("h", channels, rows, "mul(x = silu, y = us)");
   line("tensor<fp16, [1, " + c + ", 1, " + r + "]> h4 = reshape(x = h, shape = tensor<int32, [4]>([1, " + c + ", 1, " +
        r + "]))");
   line("tensor<fp16, [" + c + ", " + block +
@@ -387,17 +471,30 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
   line(tensor("int8", channels, rows) + " hq = quantize(input = hs, scale = fp16(1), output_dtype = string(\"int8\"))");
   f16("hd", channels, rows, "dequantize(input = hq, scale = " + unit + ")");
   f16("hscale", 1, rows, "mul(x = floor, y = " + fp16(double(ANE_FFN_INT8_UNIT) / ANE_FFN_INT8_PEAK) + ")");
-  uint32_t begin = 0;
-  for (size_t i = 0; i < shape.downSegments.size(); ++i) {
-    const uint32_t width = shape.downSegments[i];
-    const std::string index = std::to_string(i), slice = "hd" + index;
-    f16(slice, width, rows,
-        "slice_by_size(x = hd, begin = tensor<int32, [4]>([0, 0, " + std::to_string(begin) +
-            ", 0]), size = tensor<int32, [4]>(" + dimensions(width, rows) + "))");
-    matmul("dm" + index, "wd" + index, slice, shape.hidden, width);
-    begin += width;
+  if (blocks) {
+    std::vector<Matmul> down;
+    uint32_t input = 0;
+    for (size_t i = 0; i < shape.downSegments.size(); ++i) {
+      const uint32_t width = shape.downSegments[i];
+      const std::string index = std::to_string(i);
+      slice("fp16", "hd" + index, "hd", input, width, rows);
+      down.push_back({"wd" + index, "hd" + index, width});
+      input += width;
+    }
+    project("ds", down, "sd", 0, shape.hidden, shape.hidden);
+  } else {
+    uint32_t begin = 0;
+    for (size_t i = 0; i < shape.downSegments.size(); ++i) {
+      const uint32_t width = shape.downSegments[i];
+      const std::string index = std::to_string(i), part = "hd" + index;
+      f16(part, width, rows,
+          "slice_by_size(x = hd, begin = tensor<int32, [4]>([0, 0, " + std::to_string(begin) +
+              ", 0]), size = tensor<int32, [4]>(" + dimensions(width, rows) + "))");
+      matmul("dm" + index, "wd" + index, part, shape.hidden, width);
+      begin += width;
+    }
+    f16("ds", shape.hidden, rows, "mul(x = " + sum("dm", shape.downSegments.size(), shape.hidden) + ", y = sd_t)");
   }
-  f16("ds", shape.hidden, rows, "mul(x = " + sum("dm", shape.downSegments.size(), shape.hidden) + ", y = sd_t)");
   f16("yt", shape.hidden + 1, rows, "concat(axis = int32(2), interleave = bool(false), values = (ds, hscale))");
   line(output.bufferType(shape.hidden + 1, rows) +
        " y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), "
@@ -406,8 +503,8 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
 }
 
 AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
-               Shares shares, Rows rows, std::function<bool()> interrupted)
-    : AneFfn(backend, linear, layers, shares, std::move(interrupted), programRows(shares)) {
+               Shares shares, Rows rows, std::function<bool()> interrupted, std::optional<bool> blocks)
+    : AneFfn(backend, linear, layers, shares, std::move(interrupted), programRows(shares), blocks) {
   setRows(rows);
 }
 
@@ -436,7 +533,7 @@ void AneFfn::setRows(Rows rows) {
 
 AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
                Shares shares, std::function<bool()> interrupted,
-               const std::array<std::vector<uint32_t>, 2> &functionRows)
+               const std::array<std::vector<uint32_t>, 2> &functionRows, std::optional<bool> blocks)
     : backend_(backend), linear_(linear), shape_(shapeOf(layers, shares.most())),
       rows_{shares.oneStep ? kMinimumRows : 0, shares.twoSteps ? 2 * kMinimumRows : 0},
       steps_(shares.oneStep ? Steps::One : Steps::Two), handoff_(backend, kHandoffBound) {
@@ -480,7 +577,8 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
     // Shares of the same channels share the functions of the same rows.
     for (const uint32_t rows : functionRows[kind])
       if (text.find(" " + functionName(share.shape.ane, rows) + "<") == std::string::npos)
-        text += function(share.shape, inputs[kind], memory_.partial, rows);
+        text += function(share.shape, inputs[kind], memory_.partial, rows,
+                         blocks.value_or(gateUpInBlocks(backend.capabilities().appleGpuFamily)));
   }
   program_ = std::make_unique<ane::Program>(text + "}\n", rotationBlob(shape_.ane, signs),
                                             ane::Program::Limits{kProgramLimit, std::move(interrupted)});

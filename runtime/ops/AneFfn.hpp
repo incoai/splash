@@ -102,11 +102,12 @@ public:
   // GPU the rest through `linear`'s prefill plans, in commands of `rows`:
   // its program holds the functions programRows(shares) gives. The program
   // is compiled and loaded here, and the wait for the ANE's service ends with
-  // ane::Interrupted once `interrupted` returns true. Throws
-  // std::invalid_argument for a kind of command without its share or rows,
-  // or rows no function holds.
+  // ane::Interrupted once `interrupted` returns true. Its gate and up run in
+  // blocks where `blocks` says so, else as the backend's chip runs them best
+  // (AneFfn.cpp). Throws std::invalid_argument for a kind of command without
+  // its share or rows, or rows no function holds.
   AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
-         Shares shares, Rows rows, std::function<bool()> interrupted);
+         Shares shares, Rows rows, std::function<bool()> interrupted, std::optional<bool> blocks = std::nullopt);
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
@@ -325,7 +326,8 @@ private:
   // The split with a function of each of `functionRows` rows, ascending, by
   // kind of command, and no rows set: every command of a function's rows.
   AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
-         Shares shares, std::function<bool()> interrupted, const std::array<std::vector<uint32_t>, 2> &functionRows);
+         Shares shares, std::function<bool()> interrupted, const std::array<std::vector<uint32_t>, 2> &functionRows,
+         std::optional<bool> blocks = std::nullopt);
   [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
   // Every allocation of the split, which `buffer` and `surface` make:
   // plannedBytes() counts them and the constructor allocates them: the
@@ -337,7 +339,7 @@ private:
   // its channels take, and its function of `rows` rows over them.
   [[nodiscard]] static std::vector<Input> programInputs(const Shape &shape, const Memory &memory);
   [[nodiscard]] static std::string function(const Shape &shape, std::span<const Input> inputs,
-                                            const ane::Surface &output, uint32_t rows);
+                                            const ane::Surface &output, uint32_t rows, bool blocks);
   // The share of the command being encoded.
   [[nodiscard]] const Share &share() const;
   // Fills the CPU-visible bf16 rows `normalized` with the same values of a

@@ -592,13 +592,13 @@ constexpr AneFfn::Rows kBothRows{AneFfn::kMinimumRows, 2 * AneFfn::kMinimumRows}
 // One step alone, from the least rows: a function of every rows.
 constexpr AneFfn::Rows kOneStep{AneFfn::kMinimumRows, 0};
 std::unique_ptr<AneFfn> splitOf(MetalBackend &backend, const Model &model, AneFfn::Shares shares = kShares,
-                                AneFfn::Rows rows = kBothRows) {
+                                AneFfn::Rows rows = kBothRows, std::optional<bool> blocks = std::nullopt) {
   const std::vector<Projection> copies = model.projections;
   std::vector<SwiGluProjections> layers;
   for (uint32_t layer = 0; layer < kLayers; ++layer)
     layers.push_back({&copies[3 * layer], &copies[3 * layer + 1], &copies[3 * layer + 2]});
   return std::make_unique<AneFfn>(backend, Linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill),
-                                  layers, shares, rows, nullptr);
+                                  layers, shares, rows, nullptr, blocks);
 }
 
 void split(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
@@ -683,8 +683,16 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
   std::cout << "  " << model.name << ": verified in " << millisecondsSince(started) << " ms, " << 100.0 * error
             << "% from the GPU alone on the Neural Engine's part\n";
   if (split->retired()) fail(model.name + ": verify stopped the split: " + split->reason());
+  // Gate and up whole and in blocks, the form this chip does not run too (AneFfn.cpp): every function of each
+  // within verify()'s bound of the GPU alone.
+  for (const bool blocks : {false, true}) {
+    const std::unique_ptr<AneFfn> form = splitOf(backend, model, kShares, kBothRows, blocks);
+    const double formError = form->verify(model.layers, chunk.ffn, chunk.hidden);
+    std::cout << "  " << model.name << ", gate and up " << (blocks ? "in blocks" : "whole") << ": " << 100.0 * formError
+              << "% from the GPU alone on the Neural Engine's part\n";
+  }
   section("split: " + model.name + " least chunk rows, a chunk's rows on the GPU alone as a full chunk's, and "
-          "verify() of every function");
+          "verify() of every function, gate and up whole and in blocks");
 }
 
 // A command the split takes from 1,024 rows runs as two steps, its halves, each on the function of its rows, whose layers
