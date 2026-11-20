@@ -57,6 +57,7 @@
 // under macOS 27.0 beside the load (alone, far fewer or none), none of 20 on
 // an Apple9 under macOS 26.6. With the fragment skipped instead, none failed.
 #include "MoeStep.hpp"
+#include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/Linear.hpp"
@@ -864,7 +865,8 @@ double int8ActivationError(const float *x, const float *w, uint32_t K) {
 // passes (each pass then inside the int8 rule's interval too); returns its output rows and the tile kinds of its
 // routes.
 MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan,
-               std::map<std::pair<uint32_t, uint32_t>, GateUp> &products, Stats &stats, const std::string &label) {
+               std::map<std::pair<uint32_t, uint32_t>, GateUp> &products, Stats &stats, const std::string &label,
+               bool twoPasses = true) {
   const uint32_t rows = plan.rows();
   allocate(backend, b, plan);
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
@@ -1046,6 +1048,7 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
     require(!std::memcmp(result.output.data(), output, result.output.size() * 2),
             label + ": the output differs from a repeat of the run");
   }
+  if (!twoPasses) return result;
   std::deque<MoeGgufExpertParams> passes;
   const MetalBuffer gate = zeros(backend, b.moe.scratch.expertIntermediate.sizeBytes(), "moe-two-pass-gate");
   const std::vector<ComputeDispatch> reference = fullGridsTwoPasses(graph, gate, passes);
@@ -1753,6 +1756,77 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
   return failures;
 }
 
+// A backend that stages every expert tile (BackendInstrumentation::
+// stageExpertTiles, function constant kMoeStagedOnly) runs no column tile:
+// eight rows, whose routes leave most of their experts' only tiles at one or
+// two rows, which the default passes run on the column tile, give each row
+// the bits that the same rows three times over give it, where each of a
+// row's experts holds at least its three copies and runs the staged tile. The
+// rows that ran a column route on the default passes, and how many of them
+// that changed, are counted. The staged backend's run is held to its repeats
+// alone: the two-pass reference (gguf_moe_test.metal) takes the column tile.
+int stagedTiles(MetalBackend &backend, const char *metallib) {
+  constexpr uint32_t rows = 8, copies = 3;
+  const MoeShape shape = kShape;
+  MetalBackend staged(metallib);
+  splash::metal::BackendInstrumentation::stageExpertTiles(staged);
+  const std::mt19937 weights = rng;
+  const Model m = makeModel(backend, shape, Q4K, true);
+  rng = weights;
+  const Model ms = makeModel(staged, shape, Q4K, true);
+  Buffers b, bs;
+  b.input = activations(uint64_t{rows} * kHidden);
+  b.residual = activations(uint64_t{rows} * kHidden);
+  for (float &v : b.residual) v = bf16(0.1f * v);
+  for (std::vector<float> *values : {&b.input, &b.residual})
+    for (uint32_t copy = 1; copy < copies; ++copy)
+      values->insert(values->end(), values->begin(), values->begin() + uint64_t{rows} * kHidden);
+  bs.input = b.input;
+  bs.residual = b.residual;
+  const auto upload = [&](MetalBackend &on, Buffers &buffers) {
+    buffers.moe.input = bfloatBuffer(on, buffers.input, "moe-input");
+    buffers.moe.residual = bfloatBuffer(on, buffers.residual, "moe-residual");
+    buffers.moe.output = zeros(on, uint64_t{copies} * rows * kHidden * 2, "moe-output");
+  };
+  upload(backend, b);
+  upload(staged, bs);
+  std::map<std::pair<uint32_t, uint32_t>, GateUp> products, stagedProducts;
+  Stats stats;
+  const std::string formats = formatNames(m);
+  const MoeRun copied = runPlan(backend, m, b, MoE::plan(shape, copies * rows, MoeConfig{MoeExpertTile::M8}),
+                                products, stats, formats + " staged-only copies");
+  const MoeRun plain = runPlan(backend, m, b, MoE::plan(shape, rows, MoeConfig{MoeExpertTile::M8}), products, stats,
+                               formats + " staged-only default");
+  const MoeRun only = runPlan(staged, ms, bs, MoE::plan(shape, rows, MoeConfig{MoeExpertTile::M8}), stagedProducts,
+                              stats, formats + " staged-only", false);
+  int failures = 0;
+  uint32_t column = 0, changed = 0;
+  for (uint32_t r = 0; r < rows; ++r) {
+    const auto routes = [&](const MoeRun &run) { return run.column.begin() + uint64_t{r} * kRoutes; };
+    const auto row = [&](const MoeRun &run) { return run.output.begin() + uint64_t{r} * kHidden; };
+    if (std::find(routes(copied), routes(copied) + kRoutes, true) != routes(copied) + kRoutes) {
+      printf("  staged-only: row %u's copies ran a column tile FAIL\n", r);
+      ++failures;
+    }
+    if (!std::equal(row(only), row(only) + kHidden, row(copied))) {
+      printf("  staged-only: row %u is not its copies' row FAIL\n", r);
+      ++failures;
+    }
+    if (std::find(routes(plain), routes(plain) + kRoutes, true) != routes(plain) + kRoutes) {
+      ++column;
+      changed += !std::equal(row(only), row(only) + kHidden, row(plain));
+    }
+  }
+  if (!column) {
+    printf("  staged-only: no row ran a column route on the default passes FAIL\n");
+    ++failures;
+  }
+  printf("%-20s staged-only decode %u rows: each its %u copies' row bitwise, %u ran a column route by default, %u of "
+         "them changed: %s\n",
+         formats.c_str(), rows, copies, column, changed, failures ? "FAIL" : "ok");
+  return failures;
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     const bool stress = argc == 4 && std::string(argv[2]) == "float-stress";
@@ -1778,7 +1852,7 @@ int main(int argc, const char *argv[]) {
                                          {{0, 8}, {8, 5}, {13, 2}, {15, 1}}) +
                            laneRowsRoute(backend, "rows of no lane around lanes of 6/2/3/1", 26,
                                          {{2, 6}, {10, 2}, {18, 3}, {21, 1}}) +
-                           chunkedSlots(backend) + int8Experts(backend);
+                           chunkedSlots(backend) + int8Experts(backend) + stagedTiles(backend, argv[1]);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;

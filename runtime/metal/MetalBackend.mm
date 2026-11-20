@@ -331,11 +331,14 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
     return library;
 }
 
-// The pipeline of function `name` of `source` at these function constants.
-// It touches no backend state, and Metal's device and library are
-// thread-safe, so any thread may create one.
+// The pipeline of function `name` of `source` at these function constants,
+// and with `stagedExpertTiles` (an instrumented backend's,
+// BackendInstrumentation::stageExpertTiles) kMoeStagedOnly true where the
+// function declares it. It touches no backend state, and Metal's device and
+// library are thread-safe, so any thread may create one.
 id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> source,
-                                           std::string_view name, std::span<const uint32_t> constants) {
+                                           std::string_view name, std::span<const uint32_t> constants,
+                                           [[maybe_unused]] bool stagedExpertTiles) {
     NSString *key = checkedNSString(name, "pipeline name");
     NSError *error = nil;
     id<MTLFunction> function = nil;
@@ -345,6 +348,12 @@ id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> 
         MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
         [values setConstantValues:constants.data() type:MTLDataTypeUInt
                         withRange:NSMakeRange(0, constants.size())];
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+        if (stagedExpertTiles && [source newFunctionWithName:key].functionConstantsDictionary[@"kMoeStagedOnly"]) {
+            const bool staged = true;
+            [values setConstantValue:&staged type:MTLDataTypeBool withName:@"kMoeStagedOnly"];
+        }
+#endif
         function = [source newFunctionWithName:key constantValues:values error:&error];
     }
     if (!function) {
@@ -1249,6 +1258,8 @@ struct MetalBackend::Impl {
     uint64_t lastCommandBuffers = 0;
     // BackendInstrumentation::submitPartsWhole.
     bool wholeParts = false;
+    // BackendInstrumentation::stageExpertTiles.
+    bool stagedExpertTiles = false;
 #endif
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
@@ -1362,6 +1373,11 @@ struct MetalBackend::Impl {
         std::vector<Creation> creations(keys.size());
         Creation *created = creations.data();
         const PipelineKeyView *requested = keys.data();
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+        const bool staged = stagedExpertTiles;
+#else
+        constexpr bool staged = false;
+#endif
         std::atomic<size_t> claimed{0};
         std::atomic<size_t> *next = &claimed;
         // Each worker creates the next pipeline no other has taken.
@@ -1370,8 +1386,8 @@ struct MetalBackend::Impl {
                 @autoreleasepool {
                     const auto started = AwakeClock::now();
                     try {
-                        created[index].pipeline =
-                            createPipeline(device, library, requested[index].name, requested[index].constants);
+                        created[index].pipeline = createPipeline(device, library, requested[index].name,
+                                                                 requested[index].constants, staged);
                     } catch (...) {
                         created[index].failure = std::current_exception();
                     }
@@ -1419,7 +1435,7 @@ struct MetalBackend::Impl {
     // outside the cache.
     id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name) {
         const auto started = AwakeClock::now();
-        id<MTLComputePipelineState> result = createPipeline(device, source, name, {});
+        id<MTLComputePipelineState> result = createPipeline(device, source, name, {}, false);
         noteCreated(name, {}, millisecondsSince(started));
         return result;
     }
@@ -2666,6 +2682,12 @@ uint64_t BackendInstrumentation::submittedCommands(
 
 size_t BackendInstrumentation::cachedPipelines(const MetalBackend &backend) {
     return backend.impl_->pipelines.size();
+}
+
+void BackendInstrumentation::stageExpertTiles(MetalBackend &backend) {
+    if (!backend.impl_->pipelines.empty())
+        throw MetalBackendError("expert tiles are staged before the backend creates its first pipeline");
+    backend.impl_->stagedExpertTiles = true;
 }
 
 bool BackendInstrumentation::hasFunction(const MetalBackend &backend, std::string_view name) {

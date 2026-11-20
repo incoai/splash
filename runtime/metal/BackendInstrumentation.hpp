@@ -57,6 +57,14 @@ public:
   // was seen, false once awake steps were found not to spin, nothing while
   // no check decided (awake steps then run as plain ones).
   [[nodiscard]] static std::optional<bool> hostStepSpinDecision(const MetalBackend &backend);
+  // Every pipeline the backend creates from now on whose function declares
+  // function constant kMoeStagedOnly defines it true: the GGUF expert passes
+  // run every tile on the staged tile and none on the column tile
+  // (kernels/shared/moe_gguf.metal), so that a route's output depends on its
+  // own row alone, not on how many rows its step routes to its expert.
+  // Production defines it nowhere. Throws once the backend has created a
+  // pipeline of its cache, which would keep its own.
+  static void stageExpertTiles(MetalBackend &backend);
 };
 
 } // namespace splash::metal

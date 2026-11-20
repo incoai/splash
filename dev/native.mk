@@ -466,17 +466,17 @@ $(TEST_Q8_ATTENTION_TEST): dev/tests/engine/q8_flash_attention_metal_test.mm \
 $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
 		$(ENGINE_LIBRARY) $(TEST_Q8_ATTENTION_LIB)
 $(TEST_GGUF_MOE): dev/tests/engine/gguf_moe_test.mm \
-		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 # The same test at Qwen3.8-Flash-Next's 512 experts, 10 per token and expert
 # width 640.
 $(TEST_GGUF_MOE_E512): dev/tests/engine/gguf_moe_test.mm \
-		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_GGUF_MOE_E512): ENGINE_TEST_CXXFLAGS += -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_INTERMEDIATE=640 \
 		-DGGUF_MOE_EXPERTS=512 -DGGUF_MOE_TOP_K=10
 # The same test at Flint's routing: 256 experts, 6 per token by a sigmoid
 # router, expert width 512, and a shared expert of two ungated slices.
 $(TEST_GGUF_MOE_SIGMOID): dev/tests/engine/gguf_moe_test.mm \
-		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_GGUF_MOE_SIGMOID): ENGINE_TEST_CXXFLAGS += -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_INTERMEDIATE=512 \
 		-DGGUF_MOE_EXPERTS=256 -DGGUF_MOE_TOP_K=6 -DGGUF_MOE_ROUTER=SigmoidNormalized \
 		-DGGUF_MOE_SHARED_SLICES=2 -DGGUF_MOE_SHARED_GATE=false
