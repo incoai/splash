@@ -6851,8 +6851,11 @@ int main(int argc, char **argv) {
     // serve's option serves it: with YaRN past the native window
     // (model::servedFor).
     uint32_t maxContext = 0;
-    // The runtime's lanes: its lane checks run every width up to them.
-    const uint32_t lanes = model::ExecutionLimits::defaultLanes;
+    // --lanes N: the runtime's lanes, as splash serve's
+    // --max-concurrent-requests sets them, four to eight: its lane checks run
+    // every width up to them, and its other checks place requests in four
+    // state lanes.
+    uint32_t lanes = model::ExecutionLimits::defaultLanes;
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
@@ -6878,7 +6881,7 @@ int main(int argc, char **argv) {
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
            "[--cached-states int8|exact] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
-           "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
+           "[--expert-memory SIZE] [--max-context TOKENS] [--lanes N] [--spill-tokens N] [--spill-window PAGES] "
            "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only | "
            "--siblings-only]");
     for (int i = 3; i < argc; ++i) {
@@ -6932,6 +6935,15 @@ int main(int argc, char **argv) {
         if (end == value || *end || !parsed || parsed > kv::kMaximumLogicalTokens)
           fail("--max-context takes a token count");
         maxContext = static_cast<uint32_t>(parsed);
+      } else if (option == "--lanes" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (end == value || *end || parsed < model::ExecutionLimits::defaultLanes ||
+            parsed > model::ExecutionLimits::maximumBatchWidth)
+          fail("--lanes takes " + std::to_string(model::ExecutionLimits::defaultLanes) + " to " +
+               std::to_string(model::ExecutionLimits::maximumBatchWidth));
+        lanes = static_cast<uint32_t>(parsed);
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);

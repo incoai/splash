@@ -807,7 +807,8 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 \
 		--spill-buffers 2 $(ORACLE_ARGS)
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --siblings-only $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --lanes 8 $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --lanes 8 --siblings-only $(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep \
