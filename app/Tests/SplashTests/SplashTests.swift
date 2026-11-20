@@ -62,6 +62,16 @@ struct ServeSettingsTests {
             == ["serve", "--model", "a/b:Q4", "--port", "8000", "--offline"])
     }
 
+    @Test func shortPrefillSchedulingRequiresOptIn() {
+        var settings = ServeSettings()
+        let flag = "--short-prefill-cohorts"
+        #expect(!settings.serveArguments(model: "a/b").contains(flag))
+        settings[flag] = "true"
+        #expect(settings.serveArguments(model: "a/b").contains(flag))
+        settings[flag] = nil
+        #expect(!settings.serveArguments(model: "a/b").contains(flag))
+    }
+
     @Test func servesFilesOnThisMacUnderANameTheServerTakes() {
         #expect(ServeSettings().serveArguments(model: "/models/My Model-UD-Q4_K_M.gguf")
             == ["serve", "--model", "local/My-Model-UD-Q4_K_M", "--model-dir", "/models/My Model-UD-Q4_K_M.gguf",
