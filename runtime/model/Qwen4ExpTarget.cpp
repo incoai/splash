@@ -234,7 +234,7 @@ void Qwen4ExpTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const 
 metal::MetalBuffer Qwen4ExpTarget::addPrefillEnd(PrefillStep &step) const {
   if (const QwenTargetDecodeBuffers *d = step.decode) {
     const ops::Projection *head = step.rows <= ops::kMaximumDecodeTileRows ? &vocabularyProjection() : nullptr;
-    addHead(step.graph, d->finalHidden, d->logits, step.rows, step.buffers.linearScratch,
+    addHead(step.graph, linear(step), d->finalHidden, d->logits, step.rows, step.buffers.linearScratch,
             addMix(step, weights_.finalHyper, d->finalHidden, head));
     return d->finalHidden;
   }
@@ -397,9 +397,7 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addDecodeQsa(PrefillStep &step
 
 void Qwen4ExpTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer,
                                   metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const {
-  const ops::Linear &linear = operators_.linear();
-  linear.add(graph, {.input = std::move(hidden), .output = std::move(logits), .scratch = scratch},
-             vocabularyProjection(), linear.plan(vocabularyProjection(), rows));
+  addHead(graph, operators_.linear(), std::move(hidden), std::move(logits), rows, scratch, {});
 }
 
 void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,

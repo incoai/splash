@@ -88,15 +88,16 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 };
 
 // The rows every tensor a decode step's plans store rows in holds, for steps
-// of up to `lanes` lanes: the rows the decode tiles store a step of the most
-// rows in (ops::stagedStorageRows), on the staged tile and past one tile's
-// rows on its two row groups: the decode arena's row and target step tensors,
-// and a target's own step scratch (Qwen4Steps).
+// of up to `lanes` lanes: the most the decode tiles store a step of the most
+// rows in (ops::stagedStorageRows), its rows on the staged tile and its row
+// groups, and past 32 rows the int8 tiles' groups of 32 (96 rows at five
+// lanes, 128 at seven): the decode arena's row and target step tensors, and a
+// target's own step scratch (Qwen4Steps).
 [[nodiscard]] constexpr uint32_t decodeStorageRows(uint32_t lanes) noexcept {
   static_assert(ExecutionLimits::stepRows(SPLASH_MAXIMUM_BATCH_WIDTH) <= ops::kMaximumStagedRows,
                 "the decode tiles hold a decode step of the most lanes");
   const uint32_t rows = ExecutionLimits::stepRows(lanes);
-  return ops::stagedStorageRows(rows, false);
+  return std::max(ops::stagedStorageRows(rows, false), ops::stagedStorageRows(rows, false, true));
 }
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
@@ -703,20 +704,25 @@ protected:
   void addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
                             metal::MetalBuffer residual, metal::MetalBuffer output) const;
   // The head of a target whose last layer's rows read a final RMS norm,
-  // `finalNorm`, into `finalHidden`, as addHeadBatch takes them.
-  void addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm, metal::MetalBuffer hidden,
-                         metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t rows,
-                         ops::LinearScratch scratch) const;
-  // The vocabulary head of `rows` rows of `input` into fp32 logits, and the
-  // layout its producer writes (`prepared` describes it). A step of more rows
-  // than one decode tile holds (more than four lanes) runs it in passes of at
-  // most ops::kMaximumDecodeTileRows rows, each reading the weights again: on
-  // a 12-core M6 the 27B's Q6_K head took 19.1 ms at 128 rows in two passes
-  // against 27.0 on the staged tile's two row groups, which took 13.9 against
-  // 17.5 at 96 rows (level or faster on a 20-core M5 Pro and an M4).
-  [[nodiscard]] ops::LinearInput headInput(uint32_t rows) const;
-  void addHead(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer logits, uint32_t rows,
-               ops::LinearScratch scratch, ops::PreparedInput prepared) const;
+  // `finalNorm`, into `finalHidden`, as addHeadBatch takes them, on
+  // `linear`'s plans (addHead).
+  void addNormalizedHead(metal::CommandGraph &graph, const ops::Linear &linear, const ops::NormWeights &finalNorm,
+                         metal::MetalBuffer hidden, metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
+                         uint32_t rows, ops::LinearScratch scratch) const;
+  // The vocabulary head of `rows` rows of `input` into fp32 logits on
+  // `linear`, its command's plans as every other projection's (a decode
+  // step's linear(step), a batch of first tokens' operators_.linear()), and
+  // the layout its producer writes (`prepared` describes it). A step of more
+  // rows than one decode tile holds (more than four lanes) runs it in passes
+  // of at most ops::kMaximumDecodeTileRows rows, each reading the weights
+  // again: on a 12-core M6 the 27B's Q6_K head took 19.1 ms at 128 rows in
+  // two passes against 27.0 on the staged tile's two row groups, which took
+  // 13.9 against 17.5 at 96 rows (level or faster on a 20-core M5 Pro and an
+  // M4).
+  [[nodiscard]] ops::LinearInput headInput(const ops::Linear &linear, uint32_t rows) const;
+  void addHead(metal::CommandGraph &graph, const ops::Linear &linear, metal::MetalBuffer input,
+               metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch,
+               ops::PreparedInput prepared) const;
   // The plans of a step's projections: a decode step's or a prompt chunk's
   // (ops::StepKind).
   [[nodiscard]] const ops::Linear &linear(const PrefillStep &step) const noexcept {

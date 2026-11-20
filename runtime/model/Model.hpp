@@ -679,9 +679,12 @@ struct ExecutionLimits final {
   // Pro: 53-100% of the steps of Qwen3.6-35B-A3B and Qwen3.8-27B took all 64,
   // chat at most 48). Past 64 rows a step's projections run two row groups of
   // the staged decode tile (ops::stagedRowGroups) and its head passes of at
-  // most 64 rows, in the activations a decode step takes at any rows
-  // (ops::StepKind): a lane's logits keep their precision whatever the other
-  // lanes' load.
+  // most 64 rows, every one on a decode step's plans (ops::StepKind), which
+  // take no int8 prefill path at any rows: a lane's logits keep their
+  // precision whatever the other lanes' load, but where a rotated PQ2_0
+  // unit's plan stores fewer than 16 rows (one or two rows on the column
+  // tile, three to eight split: a lone lane's short step, a head's short last
+  // pass), which keeps bf16 activations.
   [[nodiscard]] static constexpr uint32_t stepRows(uint32_t lanes) noexcept { return lanes * targetVerifyRows; }
   static constexpr uint32_t draftQueryRows = SPLASH_DRAFT_QUERY_ROWS;
   static constexpr uint32_t draftProposalTokens = SPLASH_DRAFT_PROPOSAL_TOKENS;

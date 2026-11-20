@@ -202,13 +202,14 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
       : LinearScratchSize{};
 }
 
-LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {
+LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, const UnitFormats &unit) const {
   // Every format the register tile takes K inputs in has one register plan,
   // whose partitions keep whole coefficient units of each (kRegisterTiers);
   // a projection of segments the tile does not take has none. One lane on the
-  // 16-row tile runs unsplit, without partials.
+  // 16-row tile runs unsplit, without partials. An int8 form counts its row
+  // groups' counters (int8RowGroups).
   LinearScratchSize size;
-  for (const LinearConfig &config : decodeConfigurations(calibration_, step_, w, registerFormats))
+  for (const LinearConfig &config : decodeConfigurations(calibration_, int8Activations_, step_, w, unit))
     size.include(LinearPlan(w, config).scratchSize());
   return size;
 }

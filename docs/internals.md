@@ -601,8 +601,8 @@ The rules:
    4's int8 passes, whatever its rows (`ops::StepKind`,
    `ExecutionPlans::decodeLinear`): a request's decode does not round its
    activations because other requests share its step. A decode step rounds
-   only where its weights do in a chunk of its rows, a rotated PQ2_0 unit on
-   the int8 decode tiles (rule 2). A gate/up pair of more than 64 rows runs as
+   only on the int8 decode tiles, a rotated PQ2_0 unit's plans of 16 rows or
+   more (rule 2). A gate/up pair of more than 64 rows runs as
    a gate plan and an up plan that applies silu(gate) (`Linear::addSwiGlu`).
    A projection of several segments and no epilogue runs those of each format
    in one dispatch on the 128-row prefill tile; the int8 tile runs a GEMM
@@ -654,9 +654,14 @@ The rules:
    runs a staged plan that stores at least `decodeInt8FromRows` rows (16 on
    Apple10 and Apple11, a 16-row plan among them; never on Apple9) whose K
    splits keep whole PQ2_0 blocks on those tiles, at the plan's splits and
-   passes; their shortest height is 16 rows and their tallest 32. The int8
-   tiles also run row groups of them in one dispatch (`ops::int8RowGroups`,
-   as the staged tile's), which no plan takes yet.
+   passes: their shortest height is 16 rows and their tallest 32, and a
+   decode step's plan of more runs row groups of them in one dispatch
+   (`ops::int8RowGroups`: 32 rows each, 16 at 48 rows, whole 32-row groups
+   stored past 64 rows), so such a unit, its vocabulary heads among them
+   (a decode step's head and the draft's take the step's plans), decodes a
+   plan of 16 rows or more in int8 activations whatever its lanes; a plan
+   that stores fewer (one or two rows on the column tile, three to eight
+   split) keeps bf16. A prefill chunk's plan takes them at 16 or 32 rows.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.

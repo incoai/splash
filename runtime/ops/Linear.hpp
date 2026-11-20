@@ -153,9 +153,15 @@ struct StagedRowGroups final {
   return groups.rows * groups.groups;
 }
 // The rows a staged plan of `rows` rows stores: its tile's, or 16 for a plan
-// on the 16-row tile (LinearConfig::sixteenRows) or on the int8 tiles, whose
-// shortest height is 16 (LinearConfig::decodeInt8).
+// on the 16-row tile (LinearConfig::sixteenRows); on the int8 tiles
+// (LinearConfig::decodeInt8), whose shortest height is 16 and tallest 32, at
+// least 16 and past one staged tile's rows whole row groups of 32: on a 20-core
+// M5 Pro Bonsai's [16640 x 5120] input took 0.42 ms at 80 rows as five groups
+// of 16 and 0.38 at 96 as three of 32 (at 48 rows, three of 16 0.26 and two of
+// 32 0.27).
 [[nodiscard]] constexpr uint32_t stagedStorageRows(uint32_t rows, bool sixteenRows, bool decodeInt8 = false) noexcept {
+  if (decodeInt8 && rows > kMaximumDecodeTileRows)
+    return (rows + kMaximumInt8Rows - 1) / kMaximumInt8Rows * kMaximumInt8Rows;
   return sixteenRows || decodeInt8 ? std::max(16u, stagedTileRows(rows)) : stagedTileRows(rows);
 }
 // The row groups of an int8 plan of `storageRows` (stagedStorageRows): one
@@ -331,6 +337,9 @@ enum class Int8Activations : uint8_t { Off, On };
 // rows (int8PrefillPaths, KernelSelection.cpp).
 enum class StepKind : uint8_t { Prefill, Decode };
 
+// What selection reads of a unit's formats (KernelSelection.hpp).
+struct UnitFormats;
+
 // Owns projection pipeline selection and dispatch. Plans follow the device's
 // KernelCalibration, the runtime's Int8Activations (KernelSelection.cpp),
 // which ExecutionPlans also gives its attention plans, and the work they
@@ -358,8 +367,9 @@ public:
   // The scratch of every plan of up to `rows` rows of a projection of
   // `shape`, every epilogue and every tile the device may run them on: the
   // register tile's table and the split partials and counters of the decode
-  // and staged tiles, the rotated rows of `rows` rows, and where the device
-  // runs the int8 prefill tile on the shape's formats, its codes and scales of
+  // and staged tiles, the int8 decode tiles' row groups among them where they
+  // take the shape, the rotated rows of `rows` rows, and where the device runs
+  // the int8 prefill tile on the shape's formats, its codes and scales of
   // `rows` rows.
   [[nodiscard]] LinearScratchSize scratchSize(ProjectionShape shape, uint32_t rows) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
@@ -403,8 +413,9 @@ private:
   [[nodiscard]] static std::array<metal::MetalBuffer, 2> splitScratch(const LinearBuffers &buffers,
                                                                       uint32_t splits);
   // The scratch of every tile a decode plan of the workload may take, the
-  // register tile's where it takes the projection's formats.
-  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, bool registerFormats) const;
+  // register tile's and the int8 decode tiles' where they take the unit
+  // (decodeConfigurations).
+  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, const UnitFormats &unit) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
                const Projection *gate) const;

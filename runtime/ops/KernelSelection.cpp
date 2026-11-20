@@ -215,12 +215,26 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, StepKind step,
 // whatever its rows: a request's decode keeps bf16 activations however many
 // requests share its step, and its rows past one decode tile's 64 (five to
 // eight lanes) run the staged tile's two row groups (decodeTileRows) and the
-// staged expert passes. A decode step rounds where its weights round in a
-// chunk of its rows alone: a rotated PQ2_0 (Ternary-Bonsai) unit on the int8
-// decode tiles, a plan of 16 or 32 rows at any lane count.
+// staged expert passes. A decode step rounds where its units take the int8
+// decode tiles at any of its rows: a rotated PQ2_0 (Ternary-Bonsai) unit at
+// every plan of 16 rows or more (decodeInt8).
 bool int8PrefillPaths(const KernelCalibration &calibration, Int8Activations int8Activations,
                       StepKind step) noexcept {
   return int8Activations == Int8Activations::On && calibration.projection.prefillInt8 && step == StepKind::Prefill;
+}
+
+// Whether a staged `config` of `w` runs the int8 decode tiles, for a unit they
+// take: it stores at least decodeInt8FromRows rows (a 16-row plan counts 16),
+// its K splits keep whole PQ2_0 blocks, and `step`'s work takes them at its
+// rows: a decode step's at every row count from there (past 32 rows in row
+// groups of them, int8RowGroups), so that a rotated PQ2_0 unit,
+// Ternary-Bonsai's, decodes a plan of that many rows in one precision
+// whatever its lanes; a prefill chunk's at the tiles' 16 or 32 rows, as in
+// 1.7.0.
+bool decodeInt8(const ProjectionCalibration &p, StepKind step, LinearWorkload w, const LinearConfig &config) noexcept {
+  const uint32_t storage = stagedStorageRows(w.rows, config.sixteenRows);
+  return config.tile == LinearTile::GgufStaged && decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
+         storage >= p.decodeInt8FromRows && (step == StepKind::Decode || storage <= kMaximumInt8Rows);
 }
 
 } // namespace
@@ -263,6 +277,7 @@ UnitFormats unitFormats(const ProjectionShape &shape) noexcept {
   return {.formatClass = shape.formatClass,
           .registerTakes = shape.registerFormats,
           .weightBits16 = shape.weightBits16,
+          .decodeInt8Takes = shape.rotated && shape.decodeInt8Formats,
           .prefillInt8Takes = shape.prefillInt8Formats};
 }
 
@@ -277,22 +292,16 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // holds runs the int8 prefill tile, unsplit, where its work takes the int8
 // prefill paths and the tile takes the unit (1.13-2.4x less time than the bf16
 // tiles over the 27B's shapes at 65-2048 rows on a 32-core M5 Max, a 16-core
-// M5 Pro and a 12-core M6), and a staged plan that stores at least
-// decodeInt8FromRows rows (a 16-row plan counts 16) and whose K splits keep
-// whole PQ2_0 blocks and that stores at most the int8 tiles' kMaximumInt8Rows
-// runs the int8 decode tiles where they take the unit, at the plan's rows,
-// splits and passes.
+// M5 Pro and a 12-core M6), and a staged plan runs the int8 decode tiles
+// where they take the unit and its plan (decodeInt8), at the plan's storage
+// rows, splits and passes.
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations, StepKind step,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   LinearConfig config = bf16Projection(calibration, step, w, unit, pairTensors);
   if (int8Activations == Int8Activations::Off) return config;
-  const ProjectionCalibration &p = calibration.projection;
   if (w.rows > kMaximumDecodeTileRows && int8PrefillPaths(calibration, int8Activations, step) && unit.prefillInt8Takes)
     return {.tile = LinearTile::GgufPrefillInt8};
-  const uint32_t storage = stagedStorageRows(w.rows, config.sixteenRows);
-  config.decodeInt8 = config.tile == LinearTile::GgufStaged && unit.decodeInt8Takes &&
-                      decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
-                      storage >= p.decodeInt8FromRows && storage <= kMaximumInt8Rows;
+  config.decodeInt8 = unit.decodeInt8Takes && decodeInt8(calibration.projection, step, w, config);
   return config;
 }
 
@@ -303,16 +312,26 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
 // never falls with the bits per weight and never rises with the rows (a
 // split's partials grow with its rows alone, the same in either pass mode);
 // and a gate/up pair of one format in one pass where it may and the one-pass
-// tile holds its rows.
-std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration, StepKind step,
-                                               LinearWorkload w, bool registerTakes) {
+// tile holds its rows. With int8 activations on, a unit the int8 decode tiles
+// take also has each staged configuration's int8 form where decodeInt8 takes
+// it at its splits, or at the most fewer that keep whole PQ2_0 blocks, as a
+// plan of the unit's own bits per weight may split.
+std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration, Int8Activations int8Activations,
+                                               StepKind step, LinearWorkload w, const UnitFormats &unit) {
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores, n = w.matrix.outputSize, k = w.matrix.inputSize;
-  std::vector<LinearConfig> configurations{bf16Projection(calibration, step, w, {.registerTakes = registerTakes}, {})};
+  std::vector<LinearConfig> configurations{
+      bf16Projection(calibration, step, w, {.registerTakes = unit.registerTakes}, {})};
   if (registers(p.decodeRegister, FormatClass::FourBitsOrMore, tableTiles(w.rows), n / GGUF_TILE_COLUMNS, cores))
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::Two));
   if (w.epilogue == LinearEpilogue::GateUp && cores >= p.onePassFromCores && w.rows <= kMaximumPairRows)
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::One));
+  if (int8Activations == Int8Activations::On && unit.decodeInt8Takes)
+    for (LinearConfig config : std::vector(configurations)) {
+      while (config.splits > 1 && !decodeInt8TakesSplits(k, config.splits)) config.splits /= 2;
+      config.decodeInt8 = decodeInt8(p, step, w, config);
+      if (config.decodeInt8) configurations.push_back(config);
+    }
   return configurations;
 }
 

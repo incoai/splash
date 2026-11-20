@@ -376,22 +376,23 @@ void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights 
   ops::MoE::addRouting(step.graph, step.ffn, ffn, *step.moe);
 }
 
-void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm,
-                                   metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
-                                   metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const {
+void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::Linear &linear,
+                                   const ops::NormWeights &finalNorm, metal::MetalBuffer hidden,
+                                   metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t rows,
+                                   ops::LinearScratch scratch) const {
   const ops::PreparedInput normalized = ops::Normalization::addRms(
-      graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize, rows, scratch, headInput(rows));
-  addHead(graph, std::move(finalHidden), std::move(logits), rows, scratch, normalized);
+      graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize, rows, scratch, headInput(linear, rows));
+  addHead(graph, linear, std::move(finalHidden), std::move(logits), rows, scratch, normalized);
 }
 
-ops::LinearInput QwenTarget::headInput(uint32_t rows) const {
-  return rows <= ops::kMaximumDecodeTileRows ? operators_.linear().plan(vocabularyProjection(), rows).input()
+ops::LinearInput QwenTarget::headInput(const ops::Linear &linear, uint32_t rows) const {
+  return rows <= ops::kMaximumDecodeTileRows ? linear.plan(vocabularyProjection(), rows).input()
                                              : ops::LinearInput::Plain;
 }
 
-void QwenTarget::addHead(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer logits,
-                         uint32_t rows, ops::LinearScratch scratch, ops::PreparedInput prepared) const {
-  const ops::Linear &linear = operators_.linear();
+void QwenTarget::addHead(metal::CommandGraph &graph, const ops::Linear &linear, metal::MetalBuffer input,
+                         metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch,
+                         ops::PreparedInput prepared) const {
   const ops::Projection &head = vocabularyProjection();
   if (rows <= ops::kMaximumDecodeTileRows) {
     linear.add(graph, {.input = std::move(input), .output = std::move(logits), .scratch = scratch, .prepared = prepared},
@@ -456,8 +457,8 @@ public:
 
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const override {
-    addNormalizedHead(graph, weights_.finalNorm, std::move(hidden), std::move(finalHidden), std::move(logits), rows,
-                      scratch);
+    addNormalizedHead(graph, operators_.linear(), weights_.finalNorm, std::move(hidden), std::move(finalHidden),
+                      std::move(logits), rows, scratch);
   }
 
 private:
@@ -507,7 +508,7 @@ private:
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const {
     const metal::MetalBuffer hidden = step.buffers.hidden[geometry_.layers & 1];
     if (const QwenTargetDecodeBuffers *d = step.decode)
-      addNormalizedHead(step.graph, weights_.finalNorm, hidden, d->finalHidden, d->logits, step.rows,
+      addNormalizedHead(step.graph, linear(step), weights_.finalNorm, hidden, d->finalHidden, d->logits, step.rows,
                         step.buffers.linearScratch);
     return hidden;
   }

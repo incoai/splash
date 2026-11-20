@@ -323,10 +323,12 @@ struct Scratch {
            std::all_of(count, count + counters.bytes / 4, [](uint32_t c) { return c == 0; });
   }
 };
-// The scratch of `plan` over `p`: the plan's, and a rotated projection's rotated rows (Linear::scratchSize).
+// The scratch of `plan` over `p`: the plan's, and a rotated projection's rotated rows of at least the decode
+// tiles' rows and the plan's (Linear::scratchSize).
 LinearScratchSize scratchSize(const Linear &linear, const LinearPlan &plan, const Projection &p) {
   LinearScratchSize size = plan.scratchSize();
-  if (p.rotation) size.rotated = linear.scratchSize(p.shape(), kMaximumDecodeTileRows).rotated;
+  if (p.rotation)
+    size.rotated = linear.scratchSize(p.shape(), std::max(kMaximumDecodeTileRows, plan.storageRows())).rotated;
   return size;
 }
 // One projection's buffers for a plan: its input and auxiliary rows (the residual, or the gate an up-with-gate
@@ -1130,16 +1132,20 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     const MetalBuffer signBuffer = signsOf(K, signs);
     const Tensor t = tensor(backend, PQ20, N, K);
     const Projection p = rotatedProjection({&t}, N, signBuffer), plain = projection({&t}, N);
-    const std::vector<float> x = int8Inputs(kMaximumDecodeTileRows, K, signs);
-    const std::vector<float> residual = residuals(kMaximumDecodeTileRows, N);
-    const Int8Products d = int8Tiles ? int8Products({&t}, N, x, kMaximumDecodeTileRows, signs) : Int8Products{};
-    // The production plans of 8 to 64 rows: in int8 activations up to the int8 tiles' 32, bf16 past them.
-    for (uint32_t lanes = 1; lanes <= kMaximumStagedLanes; ++lanes) {
+    const std::vector<float> x = int8Inputs(kMaximumStagedRows, K, signs);
+    const std::vector<float> residual = residuals(kMaximumStagedRows, N);
+    const Int8Products d = int8Tiles ? int8Products({&t}, N, x, kMaximumStagedRows, signs) : Int8Products{};
+    // A decode step's production plans of 8 to 128 rows: in int8 activations from the device's decodeInt8FromRows
+    // (16), past the int8 tiles' 32 rows in row groups of them (int8RowGroups).
+    const Linear steps(backend.capabilities(), Int8Activations::On, StepKind::Decode);
+    for (uint32_t lanes = 1; lanes <= kMaximumStagedRows / kLaneRows; ++lanes) {
       const LinearWorkload w = decode({N, K}, lanes, epilogue);
-      if (linear.plan(w, plain).configuration().decodeInt8)
+      if (steps.plan(w, plain).configuration().decodeInt8)
         fail("an unrotated PQ2_0 projection takes int8 activations");
-      const LinearPlan plan = linear.plan(w, p);
+      const LinearPlan plan = steps.plan(w, p);
       const LinearConfig c = plan.configuration();
+      if (int8Tiles && w.rows >= steps.calibration().projection.decodeInt8FromRows && !c.decodeInt8)
+        fail("a rotated PQ2_0 production plan of " + std::to_string(w.rows) + " rows keeps bf16 activations");
       if (!c.decodeInt8) continue;
       const std::string label = "int8 production " + std::to_string(N) + "x" + std::to_string(K) + " lanes " +
                                 std::to_string(lanes) + " S" + std::to_string(c.splits);
@@ -1151,6 +1157,17 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
       const std::vector<uint16_t> aux = storageRows(residual, N, w.rows, storage);
       const Outcome out = runInt8(plan, p, nullptr, storageRows(x, K, w.rows, storage), aux, kPoisonNaN, N, label);
       checkValues(out, int8Bound(d, K, c.splits), {}, aux, w, w.rows, N, label);
+      // A row group's rows are the bits of the same rows on one tile at the plan's splits: the last 16 rows alone.
+      if (w.rows > kMaximumInt8Rows) {
+        const LinearWorkload lastWorkload{w.matrix, 16, epilogue};
+        const LinearPlan last = Linear::plan(lastWorkload, c, FloatOutput::BFloat16);
+        const auto tail = [&](const std::vector<float> &values, uint32_t width) {
+          const auto end = values.begin() + uint64_t{w.rows} * width;
+          return storageRows(std::vector<float>(end - 16u * width, end), width, 16, last.storageRows());
+        };
+        const Outcome alone = runInt8(last, p, nullptr, tail(x, K), tail(residual, N), kPoisonNaN, N, label + " last 16");
+        if (!sameRows(alone.output, 0, out.output, w.rows - 16, 16, N)) fail(label + ": its last 16 rows differ alone");
+      }
       ++production;
     }
   }

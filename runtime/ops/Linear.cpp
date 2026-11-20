@@ -215,7 +215,7 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
   for (uint32_t count = 1; count <= std::min(rows, kMaximumStagedRows); ++count)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
       if (epilogue != LinearEpilogue::GateUp || count <= kMaximumDecodeTileRows)
-        bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, shape.registerFormats));
+        bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, unitFormats(shape)));
   // A plan stores at most its rows' tiles: the decode tiles' up to their rows
   // (a decode step's kMaximumStagedRows, a chunk's kMaximumDecodeTileRows),
   // the prefill tiles' whole 128-row tiles.

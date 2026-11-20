@@ -7,8 +7,10 @@
 // every plan line to diff them. With int8 activations off every plan must be
 // its golden plan in bf16 activations (int8ActivationsOff). It also checks
 // that startup warmup's prefill chunks select every plan a prefill chunk
-// selects, with int8 activations on and off (warmupCovers), and that a
-// decode step of any rows selects its class's plans (decodeClassesHold).
+// selects, with int8 activations on and off (warmupCovers), that a decode
+// step of any rows selects its class's plans (decodeClassesHold), and that a
+// rotated PQ2_0 unit's decode plans run int8 activations from 16 rows within
+// the decode arena's bound (rotatedDecodePlansHold).
 // With --library, every pipeline those plans name on each device, with int8
 // activations on and off, must be a function of the metallib (Pipelines).
 //
@@ -1051,6 +1053,61 @@ void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std
   });
 }
 
+// ---- Rotated PQ2_0 decode ---------------------------------------------------
+
+// A rotated PQ2_0 unit's decode plans, Ternary-Bonsai's (the 27B's shapes, its
+// head among them): with int8 activations on, every plan of 16 to 128 rows a
+// decode step runs, each epilogue, takes the int8 decode tiles on Apple10 and
+// Apple11 (`int8Tiles`) and none on Apple9; and the decode arena's bound of
+// the unit's shape over a step of each lane count's rows
+// (Linear::scratchSize on the decode plans) holds the scratch of every plan
+// of up to those rows, the counters of its int8 row groups among them. Adds
+// each that does not to `misses`.
+void rotatedDecodePlansHold(const std::string &name, const ExecutionPlans &plans, bool int8Tiles,
+                            std::vector<std::string> &misses) {
+  const FormatSet pq20{formatName(GGUF_FMT_PQ20), {GGUF_FMT_PQ20}};
+  for (const ProjectionCase &c : projectionCases()) {
+    if (!c.name.starts_with("27b-") || !rotatedUnit(c, pq20)) continue;
+    const Projection p = projection(c, pq20), gate = projection(c, pq20, 1);
+    ProjectionShape shape = p.shape();
+    shape.rotated = true;
+    // The scratch of each rows' plans, every epilogue a decode step runs.
+    std::vector<LinearScratchSize> needs(kMaximumStagedRows + 1);
+    for (uint32_t rows = 1; rows <= kMaximumStagedRows; ++rows) {
+      const LinearEpilogue pairs = rows <= kMaximumDecodeTileRows ? LinearEpilogue::GateUp : LinearEpilogue::UpWithGate;
+      for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, pairs}) {
+        const LinearWorkload w{{c.n, c.k}, rows, epilogue};
+        const bool pair = epilogue == LinearEpilogue::GateUp;
+        const std::array<const Projection *, 2> units{&p, pair ? &gate : nullptr};
+        const std::array<UnitFormats, 2> tensors{int8Formats(std::span(&units[0], 1)),
+                                                 int8Formats(std::span(&units[1], 1))};
+        const LinearConfig config =
+            selectProjection(plans.calibration(), Int8Activations::On, StepKind::Decode, w, int8Formats(units),
+                             pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{});
+        if (rows >= 16 && config.decodeInt8 != int8Tiles)
+          misses.push_back(name + " " + c.name + " rows " + std::to_string(rows) + " e" +
+                           std::to_string(unsigned(epilogue)) + ": a decode plan " +
+                           (int8Tiles ? "keeps bf16 activations" : "runs int8 activations"));
+        needs[rows].include(Linear::plan(w, config, FloatOutput::BFloat16).scratchSize());
+      }
+    }
+    for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
+      const uint32_t stepRows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+      const LinearScratchSize bound = plans.decodeLinear().scratchSize(shape, stepRows);
+      for (uint32_t rows = 1; rows <= stepRows; ++rows) {
+        const LinearScratchSize &need = needs[rows];
+        if (need.input > bound.input || need.sums > bound.sums || need.partials > bound.partials ||
+            need.counters > bound.counters) {
+          misses.push_back(name + " " + c.name + ": a decode plan of " + std::to_string(rows) +
+                           " rows takes scratch " + describe(need) + " past the bound of " + std::to_string(lanes) +
+                           " lanes, " + describe(bound));
+          break;
+        }
+      }
+    }
+  }
+}
+
 // ---- Golden file ----------------------------------------------------------
 
 Golden selections(bool dump, Pipelines *library) {
@@ -1184,6 +1241,17 @@ int main(int argc, char **argv) {
     }
     std::cout << "PASS kernel selection: every decode step selects its class's last step's plans on "
               << std::size(kDevices) << " devices, int8 activations on and off\n";
+    for (const auto [family, cores] : kDevices)
+      rotatedDecodePlansHold(std::to_string(family) + "," + std::to_string(cores),
+                             ExecutionPlans(device(family, cores), Int8Activations::On), family >= 10, misses);
+    if (!misses.empty()) {
+      for (size_t i = 0; i < misses.size() && i < 40; ++i) std::cerr << misses[i] << '\n';
+      throw std::runtime_error(std::to_string(misses.size()) + " rotated PQ2_0 decode plans break the int8 rule or "
+                                                                 "the decode arena's bound");
+    }
+    std::cout << "PASS kernel selection: a rotated PQ2_0 unit's decode plans of 16 to 128 rows run int8 activations "
+                 "on Apple10 and Apple11 alone, within the decode arena's bound, on "
+              << std::size(kDevices) << " devices\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL kernel selection: " << error.what() << '\n';

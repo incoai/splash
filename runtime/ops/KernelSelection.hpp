@@ -29,8 +29,8 @@ struct UnitFormats final {
   // The int8 decode tiles take every quantized segment: a rotated
   // projection's in a format they take (quant_decode_int8_format), over whose
   // rotated input one int8 scale per rotation block holds each row's values
-  // evenly. Never from a shape: the int8 tiles keep the plan's rows, splits
-  // and scratch, which the shape bounds.
+  // evenly; of a shape, a rotated one's of such formats
+  // (ProjectionShape::decodeInt8Formats).
   bool decodeInt8Takes = false;
   // The int8 prefill tile takes every quantized segment, of which there is
   // one at least (quant_prefill_int8_format).
@@ -67,11 +67,14 @@ struct SplitChoice final {
                                             StepKind step, LinearWorkload workload, const UnitFormats &unit,
                                             std::span<const UnitFormats> pairTensors = {});
 // Every configuration a decode plan of the workload may take on the device
-// when only whether the register tile takes its formats is known (arena
-// bounds). Int8 activations keep a plan's tile, rows and splits, and with them
-// its scratch.
-[[nodiscard]] std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration, StepKind step,
-                                                             LinearWorkload workload, bool registerTakes);
+// when only a shape's formats are known (arena bounds): whether the register
+// tile takes them, and whether the int8 decode tiles do, which run a staged
+// configuration where `step`'s plans take them, at its storage rows and its
+// splits or the most fewer that keep whole PQ2_0 blocks, on row groups of
+// their own (int8RowGroups), each with its own counters.
+[[nodiscard]] std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration,
+                                                             Int8Activations int8Activations, StepKind step,
+                                                             LinearWorkload workload, const UnitFormats &unit);
 
 // The tile of a float projection of `rows` rows into `outputSize` columns of
 // rows in `formatId` (QuantizedSegment::rows).
