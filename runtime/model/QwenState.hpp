@@ -31,6 +31,12 @@ struct GdnParityBuffers final {
 // convolution state, then every layer's recurrent state, then the auxiliary.
 [[nodiscard]] GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
                                               const GdnStateLayout &layout);
+// A prefill group's scratch cell of `layout` in `base`
+// (groupCellBytes(layout)): every layer's views are one layer's convolution
+// and recurrent state, then the auxiliary (PrefillArena::groupCell).
+[[nodiscard]] uint64_t groupCellBytes(const GdnStateLayout &layout) noexcept;
+[[nodiscard]] GdnParityBuffers groupCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
+                                                const GdnStateLayout &layout);
 // A cached state's cell of `layout` in `base` (layout.cachedCellBytes()):
 // every layer's convolution state, then every layer's recurrent codes
 // (ops::StateCodec), then the auxiliary, each recurrentLayers view a layer's

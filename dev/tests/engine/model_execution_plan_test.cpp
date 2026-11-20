@@ -412,7 +412,9 @@ void checkDecodeArenaPages(const model::LoadedModel &loaded) {
 // A default runtime's arenas are pinned to the byte: `decode` and `prefill`,
 // Apple9's and Apple10's (Apple11 plans as Apple10), are what
 // model::plannedDecodeBytes and plannedPrefillBytes give a runtime of four
-// lanes, which the planning of more lanes leaves as they are.
+// lanes, which the planning of more lanes leaves as they are. A dense
+// target's prefill arena holds its two half chunks' group cell, one GDN
+// layer's state (3.26 MB on Qwen3.8-27B).
 void checkArenasHoldTheirLanes(const char *name, const model::LoadedModel &loaded, std::array<uint64_t, 2> decode,
                                std::array<uint64_t, 2> prefill) {
   const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
@@ -573,6 +575,38 @@ void checkArenasWithoutGdnLayers() {
           "the decode arena without GDN layers is not a hybrid's without its GDN scratch");
 }
 
+// A dense target's prefill commands run in two chunks of half the rows, the steps its Neural Engine split pipelines
+// (ops::AneFfn::firstStepRows): a command still holds kPrefillRows rows, its group tensors hold no more than one chunk
+// of them would, and its group cell holds one GDN layer's state and the auxiliary, which the second chunk reads within
+// the layer the first wrote it (PrefillArena::groupCell). A MoE target's commands stay one chunk.
+void checkDenseHalves() {
+  const auto dense = model::RuntimeGeometry::from(loadedModel<model::Qwen3_8Weights>(), kv::Format::Int8,
+                                                  ops::GdnStateFormat::Float32);
+  const auto moe = model::RuntimeGeometry::from(loadedModel<model::Qwen3_6MoeWeights>(), kv::Format::Int8,
+                                                ops::GdnStateFormat::Float32);
+  require(dense.prefillChunks == 2 && dense.prefillChunkRows == model::kPrefillRows / 2 &&
+              model::commandLimits(dense, 0).commandRows == model::kPrefillRows && moe.prefillChunks == 1 &&
+              model::commandLimits(moe, 0).commandRows == model::kPrefillRows,
+          "a dense target's commands are not two chunks of half the rows, or a MoE target's not one");
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+  auto single = dense;
+  single.prefillChunks = 1;
+  single.prefillChunkRows = model::kPrefillRows;
+  const auto halves = model::targetTensorBytes(dense.target, model::prefillTargetRows(dense, plans)),
+             whole = model::targetTensorBytes(single.target, model::prefillTargetRows(single, plans));
+  for (uint32_t index = 0; index < halves.size(); ++index)
+    require(halves[index] >= whole[index] && halves[index] - whole[index] < 2 * kHostPageBytes,
+            "a dense target's tensor " + std::to_string(index) + " holds more than a chunk of its command's rows");
+  const auto prefill = model::prefillTensorBytes(dense, plans);
+  const model::GdnStateLayout &state = dense.target.stateLayout;
+  require(prefill[static_cast<uint32_t>(model::PrefillTensor::GroupCell)] ==
+              state.convolutionLayerBytes() + state.recurrentLayerBytes() + alignUp(state.auxiliaryBytes),
+          "a dense target's group cell does not hold one GDN layer's state");
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -696,12 +730,13 @@ int main() {
     checkIndexTables();
     checkSpilledKvGeometry();
     checkArenasWithoutGdnLayers();
+    checkDenseHalves();
     checkPrefillInt8Scratch();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {450'576'384, 434'864'128},
-                              {746'455'040, 730'349'568});
+                              {749'715'456, 733'609'984});
     checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {279'281'664, 273'874'944},
                               {539'017'216, 533'446'656});
     checkArenasHoldTheirLanes("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>(),

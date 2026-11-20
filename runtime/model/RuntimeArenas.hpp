@@ -61,8 +61,12 @@ struct RuntimeGeometry final {
   // stream (RuntimeContext); none for K/V that stays in memory.
   std::optional<SparseKvShape> spilledKv;
   // The chunks of a prefill command: a group's for a target whose experts
-  // stream or whose K/V spills, otherwise one.
-  uint32_t prefillChunks = 1;
+  // stream or whose K/V spills; two halves of kPrefillRows for a dense
+  // target; otherwise one. And the rows each chunk's views of the group's
+  // tensors begin after the one before's: a group's tensors hold
+  // prefillChunks * prefillChunkRows rows, the first chunk's view all of them,
+  // so that a dense target's command of one chunk takes them all.
+  uint32_t prefillChunks = 1, prefillChunkRows = kPrefillRows;
   // Whether the target's experts stream from the SSD.
   bool streamedExperts = false;
   // The step scratch the target keeps itself beside the arenas.
@@ -121,7 +125,12 @@ struct RuntimeGeometry final {
     // (MoE::addRouted), so a start that streams them takes no int8 passes:
     // the plan from the files and the model as it loaded decide it alike.
     if (parts.experts) result.target.moeInt8Experts = false;
-    if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
+    if (parts.experts || parts.kv) {
+      result.prefillChunks = kPrefillGroupChunks;
+    } else if (result.target.ffnKind != QwenFfnKind::SparseMoe) {
+      result.prefillChunks = 2;
+      result.prefillChunkRows = kPrefillRows / 2;
+    }
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         (parts.kv && !result.target.kvLayout.spillable()) ||
         result.target.contextTokens() != descriptor.capabilities.maximumContextTokens ||
@@ -159,7 +168,7 @@ struct RuntimeGeometry final {
 // stays in memory; whether its experts stream; and in one attention layer
 // the pairs of a full chunk at the end of the native window.
 [[nodiscard]] inline CommandLimits commandLimits(const RuntimeGeometry &geometry, uint32_t aneFfnRows) noexcept {
-  return {.commandRows = geometry.prefillChunks * kPrefillRows,
+  return {.commandRows = geometry.prefillChunks * geometry.prefillChunkRows,
           .layers = geometry.target.layers,
           .maximumPasses = aneFfnRows ? 1u : geometry.target.layers,
           .minimumUnitRows = aneFfnRows ? aneFfnRows : 1u,
@@ -264,9 +273,11 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
 // chunks (a prefill group's), whose attention's workspace is `attention` and
 // whose MoE blocks' `moe` (the operators' bounds of the plans its commands
 // run), each chunk of at most `lanes` sequences, the runtime's lanes.
+// The rows of a step's tensors, and of a group's: `chunks` chunks whose
+// group tensors (targetGroupTensor) hold `chunkRows` rows each in turn.
 struct TargetRows final {
   uint32_t rows = 0;
-  uint32_t chunks = 1;
+  uint32_t chunks = 1, chunkRows = 0;
   uint32_t lanes = ExecutionLimits::defaultLanes;
   ops::AttentionWorkspace attention{};
   ops::MoeWorkspace moe{};
@@ -330,11 +341,8 @@ public:
     for (uint32_t index = 0; index < sizes.size(); ++index) {
       if (sizes[index]) {
         tensors_[index] = backend.view(base, cursor, sizes[index]);
-        if (shape.chunks > 1 && targetGroupTensor(static_cast<TargetTensor>(index))) {
-          const uint64_t chunkBytes = sizes[index] / shape.chunks;
-          for (uint32_t chunk = 0; chunk < shape.chunks; ++chunk)
-            chunkViews_[index].push_back(backend.view(base, cursor + chunk * chunkBytes, chunkBytes));
-        }
+        if (shape.chunks > 1 && targetGroupTensor(static_cast<TargetTensor>(index)))
+          chunkViews_[index] = groupViews(backend, base, cursor, sizes[index], shape.chunks);
       }
       cursor += alignUp(sizes[index]);
     }
@@ -360,6 +368,18 @@ public:
     return scratch;
   }
   [[nodiscard]] const TargetRows &shape() const noexcept { return shape_; }
+
+  // The views of a group tensor of `bytes` from `offset` of `base`, of
+  // `chunks` equal parts: chunk c's from part c to the tensor's end.
+  [[nodiscard]] static std::vector<metal::MetalBuffer> groupViews(metal::MetalBackend &backend,
+                                                                  const metal::MetalBuffer &base, uint64_t offset,
+                                                                  uint64_t bytes, uint32_t chunks) {
+    std::vector<metal::MetalBuffer> views;
+    const uint64_t part = bytes / chunks;
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk)
+      views.push_back(backend.view(base, offset + chunk * part, bytes - chunk * part));
+    return views;
+  }
 
 private:
   TargetRows shape_;
@@ -388,7 +408,9 @@ enum class PrefillTensor : uint32_t {
   // The rotated input of a rotated projection (ops::LinearScratch::rotated).
   LinearRotated,
   // A prefill group's scratch GDN cell, which carries the state from a chunk
-  // to the next when the lane's cells cannot (Runtime's prefill groups).
+  // to the next when the lane's cells cannot (Runtime's prefill groups): one
+  // layer's convolution and recurrent state, and the auxiliary
+  // (PrefillArena::groupCell).
   GroupCell,
   // Each sequence's rows of the chunk (SplashLaneRows), which the host
   // writes and the attention layers read (ops::AttentionRows).
@@ -449,16 +471,12 @@ public:
     for (uint32_t index = 0; index < sizes.size(); ++index) {
       if (sizes[index]) {
         tensors_[index] = backend.view(base_, cursor, sizes[index]);
-        if (chunks_ > 1 && prefillGroupTensor(static_cast<PrefillTensor>(index))) {
-          const uint64_t chunkBytes = sizes[index] / chunks_;
-          for (uint32_t chunk = 0; chunk < chunks_; ++chunk)
-            chunkViews_[index].push_back(backend.view(base_, cursor + chunk * chunkBytes, chunkBytes));
-        }
+        if (chunks_ > 1 && prefillGroupTensor(static_cast<PrefillTensor>(index)))
+          chunkViews_[index] = TargetArena::groupViews(backend, base_, cursor, sizes[index], chunks_);
       }
       cursor += alignUp(sizes[index]);
     }
-    if (chunks_ > 1)
-      groupCell_ = gdnCellBuffers(backend, get(PrefillTensor::GroupCell), geometry.target.stateLayout);
+    if (chunks_ > 1) groupCell_ = groupCellBuffers(backend, get(PrefillTensor::GroupCell), geometry.target.stateLayout);
     if (cursor != bytes_)
       throw std::logic_error("prefill arena mismatch");
     auto *target = static_cast<float *>(
@@ -494,7 +512,11 @@ public:
   }
   [[nodiscard]] uint32_t chunks() const noexcept { return chunks_; }
   // A group's scratch cell (PrefillTensor::GroupCell), whose views are empty
-  // when cells have no bytes; null without groups.
+  // when cells have no bytes; null without groups. Its layers share one
+  // layer's state, as a state passes from a chunk to the next within the
+  // layer (QwenTarget::addPrefillLayers): a part writes it at a GDN layer and
+  // the next chunk's part reads it there, before any part's next GDN layer
+  // writes it again; the auxiliary state is its own.
   [[nodiscard]] const GdnParityBuffers *groupCell() const noexcept {
     return groupCell_ ? &*groupCell_ : nullptr;
   }

@@ -46,10 +46,15 @@ std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeomet
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       put(moeScratchTensor<TargetTensor>(field), shape.moe.*ops::kMoeScratchFields[field].bytes);
   // A prefill group's tensors hold every chunk's rows, each chunk's aligned.
-  if (shape.chunks > 1)
+  if (shape.chunks > 1) {
+    TargetRows chunk = shape;
+    chunk.rows = shape.chunkRows;
+    chunk.chunks = 1;
+    const std::array<uint64_t, targetTensorCount> each = targetTensorBytes(target, chunk);
     for (uint32_t index = 0; index < result.size(); ++index)
       if (result[index] && targetGroupTensor(static_cast<TargetTensor>(index)))
-        result[index] = alignUp(result[index]) * shape.chunks;
+        result[index] = alignUp(each[index]) * shape.chunks;
+  }
   return result;
 }
 
@@ -57,6 +62,7 @@ TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::Executi
   const QwenTargetGeometry &target = geometry.target;
   TargetRows shape{.rows = kPrefillRows,
                    .chunks = geometry.prefillChunks,
+                   .chunkRows = geometry.prefillChunkRows,
                    .lanes = geometry.target.lanes,
                    // Any one sequence's splits: a chunk's sequences share the
                    // workspace in turn where they do not fit together.
@@ -75,6 +81,7 @@ TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::Executio
   const ops::AttentionWorkspace lane = operators.laneAttentionWorkspace(target.attentionQueryHeads, target.kvLayout);
   TargetRows shape{.rows = decodeStorageRows(geometry.target.lanes),
                    .chunks = 1,
+                   .chunkRows = decodeStorageRows(geometry.target.lanes),
                    .lanes = geometry.target.lanes,
                    .attention = {lane.partialsBytes * geometry.target.lanes, lane.statisticsBytes * geometry.target.lanes},
                    .moe = {}};
@@ -84,42 +91,45 @@ TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::Executio
   return shape;
 }
 
-std::array<uint64_t, prefillTensorCount>
-prefillTensorBytes(const RuntimeGeometry &geometry,
-                   const ops::ExecutionPlans &operators) {
+namespace {
+
+// The prefill tensors of a command of `rows` rows (prefillTensorBytes).
+std::array<uint64_t, prefillTensorCount> prefillTensorBytes(const RuntimeGeometry &geometry,
+                                                            const ops::ExecutionPlans &operators,
+                                                            uint32_t rows) {
   std::array<uint64_t, prefillTensorCount> result{};
   auto put = [&](PrefillTensor tensor, uint64_t bytes) {
     auto &size = result[static_cast<uint32_t>(tensor)];
     size = std::max(size, bytes);
   };
-  put(PrefillTensor::InputTokens, bytesFor<uint32_t>(kPrefillRows));
+  put(PrefillTensor::InputTokens, bytesFor<uint32_t>(rows));
   put(PrefillTensor::Captured,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(uint64_t{rows} *
                          geometry.target.capturedHiddenSize()));
   put(PrefillTensor::GateIntermediate,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(uint64_t{rows} *
                          geometry.target.intermediateSize));
   // Three rotary axes per row (Qwen3.5 M-RoPE); text rows repeat one value.
   put(PrefillTensor::TargetPositions,
-      bytesFor<uint32_t>(uint64_t{kPrefillRows} * 3));
-  put(PrefillTensor::DraftPositions, bytesFor<uint32_t>(kPrefillRows));
+      bytesFor<uint32_t>(uint64_t{rows} * 3));
+  put(PrefillTensor::DraftPositions, bytesFor<uint32_t>(rows));
   put(PrefillTensor::LaneLayout, bytesFor<SplashLaneRows>(geometry.target.lanes));
   put(PrefillTensor::TargetInverseFrequencies,
       bytesFor<float>(geometry.target.rotaryPairs));
   put(PrefillTensor::DraftInverseFrequencies,
       bytesFor<float>(geometry.draftRotaryPairs()));
   put(PrefillTensor::ContextProjected,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{rows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextHidden,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{rows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextKv,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(uint64_t{rows} *
                          geometry.draft.contextKvSize()));
   put(PrefillTensor::DraftRopeCos,
-      bytesFor<float>(uint64_t{kPrefillRows} *
+      bytesFor<float>(uint64_t{rows} *
                       geometry.draftRotaryPairs()));
   put(PrefillTensor::DraftRopeSin,
-      bytesFor<float>(uint64_t{kPrefillRows} *
+      bytesFor<float>(uint64_t{rows} *
                       geometry.draftRotaryPairs()));
   // The split partials and counters, the rotated rows, the register tile's
   // tables of the plans of up to 32 rows and the int8 tile's codes and scales
@@ -127,23 +137,33 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   // the draft's plans.
   ops::LinearScratchSize linear;
   for (const auto &projection : geometry.target.prefillProjections)
-    linear.include(operators.linear().scratchSize(projection, kPrefillRows));
+    linear.include(operators.linear().scratchSize(projection, rows));
   const auto &draft = geometry.draft;
   for (const ops::ProjectionShape projection :
        {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
-    linear.include(operators.draftLinear().scratchSize(projection, kPrefillRows));
+    linear.include(operators.draftLinear().scratchSize(projection, rows));
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
   put(PrefillTensor::LinearTable, linear.input);
   put(PrefillTensor::LinearSums, linear.sums);
   put(PrefillTensor::LinearRotated, linear.rotated);
+  return result;
+}
+
+} // namespace
+
+std::array<uint64_t, prefillTensorCount> prefillTensorBytes(const RuntimeGeometry &geometry,
+                                                            const ops::ExecutionPlans &operators) {
+  std::array<uint64_t, prefillTensorCount> result = prefillTensorBytes(geometry, operators, kPrefillRows);
   // A prefill group's tensors hold every chunk's rows, each chunk's aligned,
   // and its chain's scratch cell.
   if (geometry.prefillChunks > 1) {
+    const std::array<uint64_t, prefillTensorCount> each =
+        prefillTensorBytes(geometry, operators, geometry.prefillChunkRows);
     for (uint32_t index = 0; index < result.size(); ++index)
       if (result[index] && prefillGroupTensor(static_cast<PrefillTensor>(index)))
-        result[index] = alignUp(result[index]) * geometry.prefillChunks;
-    put(PrefillTensor::GroupCell, geometry.target.stateLayout.cellBytes());
+        result[index] = alignUp(each[index]) * geometry.prefillChunks;
+    result[static_cast<uint32_t>(PrefillTensor::GroupCell)] = groupCellBytes(geometry.target.stateLayout);
   }
   return result;
 }

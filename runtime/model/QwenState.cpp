@@ -141,6 +141,26 @@ GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer
   return cellViews(backend, std::move(base), layout, layout.recurrentLayerBytes());
 }
 
+uint64_t groupCellBytes(const GdnStateLayout &layout) noexcept {
+  return layout.layers ? layout.convolutionLayerBytes() + layout.recurrentLayerBytes() + alignUp(layout.auxiliaryBytes)
+                       : alignUp(layout.auxiliaryBytes);
+}
+
+GdnParityBuffers groupCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base, const GdnStateLayout &layout) {
+  if (base.sizeBytes() < groupCellBytes(layout)) throw std::invalid_argument("a group cell is larger than its buffer");
+  GdnParityBuffers cell;
+  cell.stateBase = std::move(base);
+  const uint64_t convolution = layout.layers ? layout.convolutionLayerBytes() : 0,
+                 recurrent = layout.layers ? layout.recurrentLayerBytes() : 0;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    cell.convolutionLayers.push_back(backend.view(cell.stateBase, 0, convolution));
+    cell.recurrentLayers.push_back(backend.view(cell.stateBase, convolution, recurrent));
+  }
+  if (layout.auxiliaryBytes)
+    cell.auxiliary = backend.view(cell.stateBase, convolution + recurrent, layout.auxiliaryBytes);
+  return cell;
+}
+
 GdnParityBuffers cachedCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
                                    const GdnStateLayout &layout) {
   return cellViews(backend, std::move(base), layout, layout.cachedRecurrentLayerBytes());
