@@ -59,6 +59,18 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 A model ID with `--revision`, `--language-only` or `--draft-model` is a
 separate installation from the same ID without them.
 
+`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF:IQ1_M` is
+the coding-tuned Flash-Next GGUF with 256 routed experts. It uses the
+Flash-Next tokenizer and DFlash2 draft selected by the installer. To serve
+the IQ1_M variant:
+
+```bash
+splash serve --model ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF:IQ1_M
+```
+
+The target, projector and draft download is approximately 61 GB. The app
+suggests this variant on Macs with at least 128 GB of unified memory.
+
 ## MLX targets
 
 An MLX target's `quantization` gives a mode, bits and group size, and may give
