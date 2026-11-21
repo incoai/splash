@@ -105,7 +105,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
       setting.given ? std::optional(ane_ffn::nearestUnits(setting.given->share, model.units)) : std::nullopt;
   if (setting.given && (setting.given->minimumRows < ops::AneFfn::kMinimumRows ||
                         setting.given->minimumRows > ops::AneFfn::kMaximumRows))
-    throw std::invalid_argument("ANE FFN split has no function of " + std::to_string(setting.given->minimumRows) +
+    throw std::invalid_argument("ANE FFN split takes no chunk of " + std::to_string(setting.given->minimumRows) +
                                 " rows");
 
   // Feasibility. The split's memory comes out of the KV cache, more of it
@@ -139,7 +139,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
   // The most units whose plan holds the context asked for, or with none
   // asked the most whose plan holds any.
   const uint32_t maxAneUnits =
-      given ? least : most(least, model.units - 1, std::max<uint32_t>(requested.tokens, 1));
+      given ? least : most(least, model.units - (model.pipelines ? 0 : 1), std::max<uint32_t>(requested.tokens, 1));
   // The automatic context of a start whose split takes `aneUnits`, the
   // GPU alone's for none: what the plan holds with them.
   const auto automaticWith = [&](uint32_t aneUnits) { return aneUnits ? contextWith(aneUnits) : without; };
@@ -174,7 +174,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     if (!plan.plan) throw std::logic_error("the memory plan does not hold the split it chose");
     std::ostringstream reason;
     reason << std::fixed << std::setprecision(2) << "at " << (given ? "the given share " : "share ")
-           << static_cast<double>(aneUnits) / model.units << " for chunks of " << minimumRows << " rows or more"
+           << static_cast<double>(aneUnits) / model.units
+           << ane_ffn::chunksTaken(minimumRows, ops::AneFfn::kMaximumRows, model.pipelines, ops::AneFfn::kMinimumRows)
            << timed << ", " << fixed(100.0 * prepared.error) << "% from the GPU alone on the Neural Engine's part ("
            << how << " in " << seconds() << ")";
     return AneFfnStart{std::move(prepared.split), std::move(plan.plan),
@@ -197,7 +198,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     const auto take = [&](AneFfnPrepared &prepared, const ane_ffn::Calibration &calibration) {
       if (!prepared.split) return;
       prepared.split->setMinimumRows(calibration.minimumRows);
-      prepared.split->setBreaker(ane_ffn::Breaker(calibration.gpu),
+      prepared.split->setBreaker(ane_ffn::Breaker(calibration.gpu, calibration.mixer),
                                  [forget = model.forget, maxAneUnits] { forget(maxAneUnits); });
     };
     // No split gains enough: the start remembers so, and the GPU alone serves
@@ -226,7 +227,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     calibration = model.recall(maxAneUnits);
     if (calibration && calibration->aneUnits &&
         (calibration->aneUnits > maxAneUnits || calibration->minimumRows < ops::AneFfn::kMinimumRows ||
-         calibration->minimumRows > ops::AneFfn::kMaximumRows))
+         calibration->minimumRows > (model.pipelines ? ops::AneFfn::kPipelinedOnly : ops::AneFfn::kMaximumRows)))
       calibration.reset();
     if (calibration && (calibration->aneUnits || calibration->refusals != 1)) {
       assumed = calibration->aneUnits;
@@ -246,8 +247,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     const auto choice = [&](const ane_ffn::Model &fitted) {
       return ane_ffn::choose(fitted, timings.gpuAlone, model.units, maxAneUnits);
     };
-    const ane_ffn::Model fitted = ane_ffn::fit(timings.low, timings.high);
-    const std::optional<uint32_t> first = choice(fitted);
+    const ane_ffn::Model fitted = ane_ffn::fit(timings);
+    std::optional<uint32_t> first = choice(fitted);
     if (!first)
       return noGain("no Neural Engine split beats its " + fixed(timings.gpuAlone) + layer +
                     " by enough (calibrated in " + seconds() + ")");
@@ -273,10 +274,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
                 "); its first share serves.");
     };
     std::optional<uint32_t> refitted;
-    refitting("found", [&] {
-      refitted = choice(ane_ffn::refit(fitted, static_cast<double>(*first) / model.units,
-                                       model.timeAt(*first, timings.gpuAlone).split));
-    });
+    refitting("found", [&] { refitted = choice(ane_ffn::refit(fitted, model.timeAt(*first, timings.gpuAlone))); });
+    if (model.pipelines && refitted) first = refitted; // its chunks alone say nothing of the pipeline
     AneFfnPrepared prepared = timedSplit(*first);
     uint32_t chosen = *first;
     std::optional<std::string> unprepared;
@@ -296,12 +295,14 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     }
     const ane_ffn::ChunkTimings &chunks = prepared.chunks;
     const std::string timed =
-        fixed(chunks.functions.front().split) + layer + " against " + fixed(chunks.gpu[1].milliseconds);
-    const std::optional<uint32_t> minimumRows = ane_ffn::minimumRows(chunks);
+        fixed(chunks.functions.front().split) + layer + " against " + fixed(chunks.gpu[1].milliseconds) +
+        (fitted.mixer ? " beside " + fixed(fitted.mixer) + " ms of mixer" : "");
+    std::optional<uint32_t> minimumRows = ane_ffn::minimumRows(chunks);
+    if (!minimumRows && model.pipelines) minimumRows = ops::AneFfn::kPipelinedOnly; // its pipelined chunks split
     if (!minimumRows)
       return noGain("no chunk of the Neural Engine split beats it by enough, " + timed + " (calibrated in " +
                     seconds() + ")");
-    const Calibration made{chosen, *minimumRows, chunks.gpu, calibration ? calibration->refusals : 0};
+    const Calibration made{chosen, *minimumRows, chunks.gpu, calibration ? calibration->refusals : 0, fitted.mixer};
     if (unprepared) {
       assumed = chosen;
       return gpuAloneServing(Kind::Unavailable, "its calibrated share's split was not prepared again: " + *unprepared +

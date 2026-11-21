@@ -779,7 +779,8 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
       const std::string what = "projection " + set.name + " e" + std::to_string(unsigned(epilogue));
       check(what, noHistory, [&](uint32_t rows, uint32_t) { return whole[rows]; });
       check(what + " read row", noHistory, [&](uint32_t rows, uint32_t) { return read[rows]; });
-      for (uint32_t least = AneFfn::kMinimumRows; least <= AneFfn::kMaximumRows; least += AneFfn::kProgramStep)
+      // Calibration's least rows fall on any row; every 128th samples them.
+      for (uint32_t least = AneFfn::kMinimumRows; least <= AneFfn::kMaximumRows; least += 128)
         check(what + " split from " + std::to_string(least), noHistory,
               [&](uint32_t rows, uint32_t) { return whole[rows] << 1 | (rows >= least); });
     }

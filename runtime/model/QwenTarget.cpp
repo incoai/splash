@@ -138,17 +138,18 @@ void QwenTarget::requireLayerPartition(uint32_t gdnLayers, uint32_t attentionLay
 
 void QwenTarget::requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
                                 QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const {
-  // The Neural Engine splits a dense target's commands, which are one chunk
-  // and run whole.
+  // The Neural Engine splits a dense target's commands, which run whole, a
+  // chunk in each of its slots.
   const bool whole = !layers.first && layers.end == geometry_.layers;
   if (chunks.empty() || kv.layers().size() != geometry_.kvLayout.attentionLayers ||
-      (aneFfn && (chunks.size() > 1 || !whole)) || layers.first >= layers.end || layers.end > geometry_.layers)
+      (aneFfn && (chunks.size() > aneFfn->slots() || !whole)) || layers.first >= layers.end ||
+      layers.end > geometry_.layers)
     throw std::invalid_argument("invalid Qwen prefill");
 }
 
 QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                                 const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                                ops::AneFfn *aneFfn) const {
+                                                ops::AneFfn *aneFfn, bool pipelined) const {
   if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumBatchWidth || !chunk.rows ||
       chunk.rows > ExecutionLimits::prefillTokenBudget)
     throw std::invalid_argument("invalid Qwen prefill chunk");
@@ -174,7 +175,8 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
                                                         geometry_.kvLayout, workspace, {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, chunk.rows);
-  if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
+  // A pipelined command's chunks split from fewer rows than a chunk alone.
+  if (aneFfn && aneFfn->splits(chunk.rows, pipelined)) step.aneFfn = aneFfn;
   return step;
 }
 
@@ -355,16 +357,35 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
   const ops::Linear &linear = operators_.linear();
   const uint32_t rows = step.outputRows();
   const ops::PrefillFfnBuffers buffers = b.ffn();
-  // The split takes whole chunks; read rows alone run on the GPU.
+  // The split takes whole chunks, whose FFN it leaves in flight for the
+  // prefill's layer loop to join (addPrefillLayers); read rows alone run on
+  // the GPU.
   if (step.aneFfn && step.readRows.empty()) {
-    ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows);
-    step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), rows);
+    // A split whose ANE takes every channel normalizes the rows as it packs
+    // them (ops::AneFfn::fusesNorm).
+    if (step.aneFfn->fusesNorm()) {
+      step.aneFfn->start(step.graph, index, step.aneSlot, buffers, std::move(residual), std::move(output), rows,
+                         &norm);
+    } else {
+      ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows);
+      step.aneFfn->start(step.graph, index, step.aneSlot, buffers, std::move(residual), std::move(output), rows);
+    }
+    step.aneJoin = true;
     return;
   }
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows,
                                  b.linearScratch, linear.swiGluInput(ffn, rows, step.rows));
   linear.addSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows, step.rows, normalized);
+}
+
+void QwenTarget::addAneFfnJoin(PrefillStep &step) const {
+  step.aneFfn->join(step.graph, step.aneSlot);
+  step.aneJoin = false;
+}
+
+void QwenTarget::addAneFfnStage(PrefillStep &step, uint32_t index) const {
+  step.aneFfn->stageNext(step.graph, index);
 }
 
 // A decode step's lanes route their rows alone (ops::MoeBuffers::lanes).

@@ -196,6 +196,9 @@ loadModel(metal::MetalBackend &backend,
 // which the prefill FFN's Neural Engine split (ops::AneFfn) may take; none
 // for another target.
 [[nodiscard]] std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model);
+// The mixer projections of every layer of a target aneFfnLayers takes, in
+// layer order; none for another target.
+[[nodiscard]] std::vector<ops::MixerProjections> aneFfnMixers(const LoadedModel &model);
 // Runs `use` on a prefill arena allocated for the call: on the dense FFN's
 // buffers of a full chunk and the hidden rows layers alternate between.
 void withPrefillArena(
@@ -213,6 +216,17 @@ struct StreamedParts final {
   bool experts = false;
   uint64_t tableRowBytes = 0;
   bool kv = false;
+  // Not a streamed part, but one more that shapes the arenas: whether the
+  // Neural Engine FFN split pipelines a dense target's commands, whose prefill
+  // arena then holds kAneFfnPipelineChunks chunks (RuntimeGeometry).
+  bool pipelinedAneFfn = false;
+
+  // These parts with the split pipelining.
+  [[nodiscard]] StreamedParts pipelined() const noexcept {
+    StreamedParts parts = *this;
+    parts.pipelinedAneFfn = true;
+    return parts;
+  }
 
   [[nodiscard]] static StreamedParts loaded(const LoadedModel &model, bool kv = false) noexcept;
 };

@@ -23,7 +23,7 @@ constexpr double kMinimumGain = 0.05;
 constexpr double kChunkNoise = 0.02;
 // The first word of a Calibration's text, which a change to its fields
 // renumbers.
-constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-2";
+constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-3";
 
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
@@ -42,14 +42,15 @@ double usable(double milliseconds) {
 }
 
 uint32_t nearestUnits(double share, uint32_t units) {
+  if (share == 1.0 && units >= 2) return units;
   if (!(share > 0.0 && share < 1.0) || units < 2)
-    throw std::invalid_argument("ANE FFN share must lie in (0, 1) of two units or more");
+    throw std::invalid_argument("ANE FFN share must lie in (0, 1] of two units or more");
   return static_cast<uint32_t>(std::clamp<long>(std::lround(share * units), 1, units - 1));
 }
 
 // Not a number where either part is not.
 double Model::operator()(double share) const noexcept {
-  const double a = ane(share), g = gpu(share) + u * a;
+  const double a = ane(share), g = mixer + gpu(share) + u * a;
   return a > g ? a : g;
 }
 
@@ -65,6 +66,21 @@ Model fit(const Timing &low, const Timing &high) {
   if (!(low.share < high.share)) throw std::invalid_argument("ANE FFN calibration needs a low and a high share");
   const double slope = (high.gpu - low.gpu) / (high.share - low.share);
   return refit({{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}}, low.share, low.split);
+}
+
+// A split that pipelines runs its ANE part as a pipelined command keeps the
+// ANE busy, beside the GPU's mixers: A is that time, not the split layer's,
+// which waits for each layer's GPU work besides.
+Model fit(const Timings &timings) {
+  Model model = fit(timings.low, timings.high);
+  if (timings.high.ane > 0.0) model.ane = {0.0, timings.high.ane / timings.high.share};
+  model.mixer = timings.mixer;
+  return model;
+}
+
+Model refit(Model model, const Timing &at) {
+  if (at.ane > 0.0) model.ane = {0.0, at.ane / at.share};
+  return refit(model, at.share, at.split);
 }
 
 // Where the GPU's part takes the longer at `share`, the split layer there
@@ -92,20 +108,30 @@ Model refit(Model model, double share, double split) {
 // keeps the split from the chunks it loses. The choice runs only if T there
 // gains kMinimumGain on the GPU alone.
 std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t units, uint32_t maxAneUnits) {
-  if (!maxAneUnits || maxAneUnits >= units) throw std::invalid_argument("ANE FFN choice of no feasible units");
-  std::vector<double> at(units);
-  for (uint32_t aneUnits = 1; aneUnits < units; ++aneUnits) {
+  // A split without a mixer beside the ANE's part leaves the GPU idle at
+  // every unit; one with it gives the GPU the mixers.
+  const uint32_t most = model.mixer > 0.0 ? units : units - 1;
+  if (!maxAneUnits || units < 2) throw std::invalid_argument("ANE FFN choice of no feasible units");
+  maxAneUnits = std::min(maxAneUnits, most);
+  std::vector<double> at(most + 1);
+  for (uint32_t aneUnits = 1; aneUnits <= most; ++aneUnits) {
     at[aneUnits] = model(static_cast<double>(aneUnits) / units);
     if (!(at[aneUnits] > 0.0 && std::isfinite(at[aneUnits]))) return std::nullopt;
   }
   const auto longest = [&](uint32_t aneUnits) {
-    return std::max({at[aneUnits], at[std::max(aneUnits - 1, 1u)], at[std::min(aneUnits + 1, units - 1)]});
+    return std::max({at[aneUnits], at[std::max(aneUnits - 1, 1u)], at[std::min(aneUnits + 1, most)]});
   };
   uint32_t chosen = 1;
   for (uint32_t aneUnits = 2; aneUnits <= maxAneUnits; ++aneUnits)
     if (longest(aneUnits) < longest(chosen)) chosen = aneUnits;
-  if (!(at[chosen] <= (1.0 - kMinimumGain) * gpuAlone)) return std::nullopt;
+  if (!(at[chosen] <= (1.0 - kMinimumGain) * (model.mixer + gpuAlone))) return std::nullopt;
   return chosen;
+}
+
+std::string chunksTaken(uint32_t minimumRows, uint32_t mostRows, bool pipelines, uint32_t pipelinedRows) {
+  const std::string pipelined = "pipelined chunks of " + std::to_string(pipelinedRows) + " rows or more";
+  if (minimumRows > mostRows) return " for " + pipelined;
+  return " for chunks of " + std::to_string(minimumRows) + " rows or more" + (pipelines ? " alone, " + pipelined : "");
 }
 
 // A chunk splits while its function's split layer takes at most kChunkNoise
@@ -176,7 +202,7 @@ std::string Calibration::text() const {
   std::ostringstream text;
   text << std::setprecision(9) << kCalibrationTag << ' ' << aneUnits << ' ' << minimumRows;
   for (const ChunkTimings::Gpu &point : gpu) text << ' ' << point.rows << ' ' << point.milliseconds;
-  text << ' ' << refusals;
+  text << ' ' << refusals << ' ' << mixer;
   return text.str();
 }
 
@@ -189,9 +215,11 @@ std::optional<Calibration> Calibration::parse(std::string_view text) {
   Calibration calibration;
   in >> tag >> calibration.aneUnits >> calibration.minimumRows;
   for (ChunkTimings::Gpu &point : calibration.gpu) in >> point.rows >> point.milliseconds;
-  in >> calibration.refusals;
+  in >> calibration.refusals >> calibration.mixer;
   std::string rest;
-  if (!in || tag != kCalibrationTag || (in >> rest) || calibration.refusals > kRefusals) return std::nullopt;
+  if (!in || tag != kCalibrationTag || (in >> rest) || calibration.refusals > kRefusals ||
+      !(calibration.mixer >= 0.0 && std::isfinite(calibration.mixer)))
+    return std::nullopt;
   const auto &[low, high] = calibration.gpu;
   const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
   if (!calibration.aneUnits)
@@ -217,23 +245,30 @@ std::optional<Calibration> Calibration::parse(std::string_view text) {
 // the trip point. Judging kWindow commands at once, it weighs one slow
 // evaluation, as a function's first after its program loads again, among all
 // of theirs.
-Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu) {
+Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu, double mixer) {
   const auto &[low, high] = gpu;
   if (!(low.rows < high.rows)) throw std::invalid_argument("ANE FFN breaker needs the GPU alone at two row counts");
   static_cast<void>(usable(low.milliseconds));
   static_cast<void>(usable(high.milliseconds));
+  if (!(mixer >= 0.0 && std::isfinite(mixer))) throw std::invalid_argument("ANE FFN breaker needs a usable mixer");
   gpu_ = gpuAlone(gpu);
   mostRows_ = high.rows;
+  mixer_ = mixer;
 }
 
-std::string Breaker::add(uint32_t rows, uint32_t evaluations, double milliseconds) {
+// A pipelined command's GPU runs other chunks' mixers while the ANE runs a
+// chunk's FFN: it loses to the GPU alone once the ANE's time over its chunks
+// reaches the GPU alone's FFN and mixers of them.
+std::string Breaker::add(uint32_t rows, uint32_t evaluations, double milliseconds, bool pipelined) {
   if (!gpu_) return {};
   ane_ += milliseconds;
-  alone_ += evaluations * (*gpu_)(rows);
+  alone_ += evaluations * ((*gpu_)(rows) + (pipelined ? mixer_ * rows / mostRows_ : 0.0));
+  pipelined_ |= pipelined;
   if (++commands_ < kWindow) return {};
-  const double ratio = ane_ / alone_, most = (*gpu_)(mostRows_);
+  const double ratio = ane_ / alone_, most = (*gpu_)(mostRows_) + (pipelined_ ? mixer_ : 0.0);
   commands_ = 0;
   ane_ = alone_ = 0.0;
+  pipelined_ = false;
   if (!(ratio >= 1.0)) return {};
   std::ostringstream reason;
   reason << std::fixed << std::setprecision(1) << "losing to the GPU alone (" << ratio * most

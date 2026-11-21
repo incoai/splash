@@ -449,7 +449,7 @@ bool Scheduler::groups(const Lane &lane) const {
 }
 
 uint32_t Scheduler::groupRows(const Lane &lane) const {
-  return groups(lane) ? config_.limits.commandRows : kChunk;
+  return groups(lane) || config_.limits.pipelinesChunks ? config_.limits.commandRows : kChunk;
 }
 
 uint32_t Scheduler::ownRows(const Lane &lane) const {

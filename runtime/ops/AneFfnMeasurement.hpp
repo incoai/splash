@@ -21,24 +21,27 @@ namespace splash::ops::ane_ffn {
 // measured.
 class Measurement final {
 public:
+  // A split of `slots` slots, which pipelines as many chunks of a command,
+  // is also timed so (Timing::ane), and `mixers`, the layers' mixer
+  // projections (one a layer), stand in for their mixers in time().
   Measurement(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
               const PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden,
-              std::function<bool()> interrupted);
+              std::function<bool()> interrupted, uint32_t slots = 1, std::span<const MixerProjections> mixers = {});
 
   // The split's GPU part alone and its split layer of full chunks with the
-  // ANE taking the channel units nearest two shares, and the GPU's FFN
-  // alone, on the same four layers spread over the model, whose formats can
-  // differ with depth: a program of one function of a full chunk's rows
-  // each, which the ANE's service keeps once compiled.
+  // ANE taking the channel units nearest two shares, the GPU's FFN alone and
+  // the mixers' projections, on the same four layers spread over the model,
+  // whose formats can differ with depth: a program each, which the ANE's
+  // service keeps once compiled.
   [[nodiscard]] Timings time();
   // The same at `aneUnits`, the split layer less `gpuAlone`, the GPU's FFN
   // alone that time() timed: what calibration fits again at the units it
   // first chooses (ane_ffn::refit), on the layers it fitted.
   [[nodiscard]] Timing time(uint32_t aneUnits, double gpuAlone);
-  // The GPU alone over the least and the most rows of the split's
-  // functions, and the split with the ANE taking `aneUnits` over a chunk of
-  // the rows of each of its functions, on the layers time() times: a
-  // program of every function, as the split that serves compiles.
+  // The GPU alone over the least and the most rows the split takes, and the
+  // split with the ANE taking `aneUnits` over a chunk of each count of its
+  // pieces, each chunk alone, on the layers time() times: the program the
+  // split that serves compiles.
   [[nodiscard]] ChunkTimings chunks(uint32_t aneUnits);
 
 private:
@@ -49,15 +52,25 @@ private:
   [[nodiscard]] double layer(std::span<const SwiGluProjections> layers, uint32_t count, uint32_t rows,
                              AneFfn *split = nullptr, double standIn = 0.0);
   [[nodiscard]] double gpuPart(std::span<const SwiGluProjections> layers, AneFfn &split);
+  // The ANE's milliseconds a full chunk's layer of `split`, every slot's
+  // chunk of each of all but the last of `layers` started before any joins
+  // (AneFfnMeasurement.cpp).
+  [[nodiscard]] double pipelinedAne(std::span<const SwiGluProjections> layers, AneFfn &split);
   // The kSampledLayers layers time() spreads over the model, first and last
   // among them (AneFfnMeasurement.cpp).
   [[nodiscard]] std::vector<SwiGluProjections> sampled() const;
+  // The per-layer milliseconds of the sampled layers' mixers on full chunks,
+  // alone on the GPU, as their projections give them (AneFfnMeasurement.cpp);
+  // 0 without mixers.
+  [[nodiscard]] double mixer();
 
   metal::MetalBackend &backend_;
   std::span<const SwiGluProjections> layers_;
   PrefillFfnBuffers ffn_;
   std::array<metal::MetalBuffer, 2> hidden_;
   std::function<bool()> interrupted_;
+  std::span<const MixerProjections> mixers_;
+  uint32_t slots_ = 1;
   const Linear linear_;
 };
 

@@ -913,8 +913,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   model::LoadedModel loaded;
   // The runtime's lane state and arenas as the model loaded, with its K/V in
-  // memory and where it spills.
-  model::ModelMemoryPlan modelMemoryPlan, spillModelMemoryPlan;
+  // memory, with a split that pipelines its chunks, and where it spills.
+  model::ModelMemoryPlan modelMemoryPlan, pipelinedModelMemoryPlan, spillModelMemoryPlan;
   // Loads the model as loadOptions says, `again` where a store the plan sized
   // is laid out again (below), and plans its runtime memory as it loaded.
   const auto load = [&](bool again) {
@@ -944,6 +944,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     try {
       modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
                                                     model::StreamedParts::loaded(loaded));
+      pipelinedModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                             model::StreamedParts::loaded(loaded).pipelined());
       if (kvMaySpill)
         spillModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
                                                            model::StreamedParts::loaded(loaded, true));
@@ -973,12 +975,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
   load(false);
 
+  // The model's side of the split (startAneFfn).
+  AneFfnModel splitModel;
   // The engine's memory plan, with `stagingBytes` set aside for the disk
   // tier's state staging and `aneFfnBytes` for the prefill FFN's Neural Engine
   // split, each part as it loaded, whole or through its store, and the spill
   // plan beside them, with the arenas of a runtime whose K/V spills where it
-  // spills. Floors that the spill plan refuses refuse it with the engine
-  // plan's breakdown.
+  // spills, or whose split pipelines. Floors that the spill plan refuses
+  // refuse it with the engine plan's breakdown.
   const auto planWith = [&](uint64_t stagingBytes, uint64_t aneFfnBytes) -> EngineMemoryPlanResult {
     // The routed experts' store counts at its cap, as it loaded, and the PLE
     // row cache at the share the limit gives it: the context and the KV the
@@ -995,7 +999,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         loaded.targetActualAllocatedBytes(),
         loaded.draft.actualAllocatedBytes,
         loaded.vision.actualAllocatedBytes,
-        streamed.plan && streamed.plan->spill.enabled ? spillModelMemoryPlan : modelMemoryPlan,
+        streamed.plan && streamed.plan->spill.enabled ? spillModelMemoryPlan
+        : aneFfnBytes && splitModel.pipelines ? pipelinedModelMemoryPlan : modelMemoryPlan,
         stagingBytes,
         aneFfnBytes,
         loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
@@ -1023,8 +1028,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // The plan with the staging the tier keeps.
   const auto planMemory = [&](uint64_t aneFfnBytes) { return planWith(stateStagingBytes, aneFfnBytes); };
 
-  // The model's side of the split (startAneFfn).
-  AneFfnModel splitModel;
   // Readies the model as it loaded: the expert store's bytes above the floor
   // it starts at are held back, as the engine's plan charges the store at its
   // cap and the weights' allocations count its floor alone; the PLE row cache
@@ -1038,7 +1041,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     }
     if (model::SparseRowStore *table = loaded.streamedTable())
       table->commit();
-    splitModel = aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
+    splitModel = aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled,
+                             !loaded.expertStore() && !kvMaySpill ? model::kAneFfnPipelineChunks : 1);
   };
 
   ready();
@@ -1502,7 +1506,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
 
 AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                         const ops::ExecutionPlans &operators, kv::Format format, std::string_view buildId,
-                        std::function<bool()> cancelled) {
+                        std::function<bool()> cancelled, uint32_t slots) {
   auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(loaded));
   AneFfnModel model;
   model.dense = !layers->empty();
@@ -1513,33 +1517,36 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   }
   model.unavailable = [] { return ane::unavailable(); };
   model.units = ops::AneFfn::units(*layers);
-  model.plannedBytes = [layers](uint32_t aneUnits) { return ops::AneFfn::plannedBytes(*layers, aneUnits); };
+  model.pipelines = slots > 1;
+  model.plannedBytes = [layers, slots](uint32_t units) { return ops::AneFfn::plannedBytes(*layers, units, slots); };
   const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
     model::withPrefillArena(backend, loaded, operators, format, use);
   };
   const ops::Linear &linear = operators.linear();
-  model.time = [&backend, &linear, layers, cancelled, onArena] {
+  model.time = [&backend, &linear, &loaded, layers, cancelled, onArena, slots] {
     ops::ane_ffn::Timings timings;
+    const std::vector<ops::MixerProjections> mixers = model::aneFfnMixers(loaded);
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timings = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time();
+      timings = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled, slots, mixers).time();
     });
     return timings;
   };
-  model.timeAt = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, double gpuAlone) {
+  model.timeAt = [&backend, &linear, layers, cancelled, onArena, slots](uint32_t aneUnits, double gpuAlone) {
     ops::ane_ffn::Timing timing;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timing = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time(aneUnits, gpuAlone);
+      timing =
+          ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled, slots).time(aneUnits, gpuAlone);
     });
     return timing;
   };
-  model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.prepare = [&backend, &linear, layers, cancelled, onArena, slots](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
       // The chunks are timed on a split of their own, before this one is
       // made, so that no two splits are held at once.
       if (timeChunks)
         prepared.chunks = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(aneUnits);
-      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled);
+      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled, slots);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
     });
     return prepared;

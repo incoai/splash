@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace splash::ane {
 
@@ -61,12 +62,21 @@ public:
   // cannot start, or one queued once retired, has failed: this never throws
   // for the agent's faults.
   void queue(uint64_t ready, uint64_t done, const Start &start);
+  // A job's time on the agent: from the notice that the event reached its
+  // `ready` to its report.
+  struct Span final {
+    AwakeClock::time_point begin, end;
+  };
   // After the command has completed: if every job it queued succeeded, the
-  // agent's time over them, each job's from the notice that the event reached
-  // its `ready` to its report (none for a report that came first); none
-  // otherwise. Waits at most one bound for their reports: a job that has not
-  // reported by then has failed. Forgets the command's jobs either way.
+  // spans of those whose reports came after the notice of their `ready`;
+  // none otherwise. Waits at most one bound for their reports: a job that has
+  // not reported by then has failed. Forgets the command's jobs either way.
+  [[nodiscard]] std::optional<std::vector<Span>> finishSpans();
+  // finishSpans()'s spans as the agent's time over them: the time any of
+  // them covers.
   [[nodiscard]] std::optional<AwakeClock::duration> finish();
+  // The time any of `spans` covers, once each.
+  [[nodiscard]] static AwakeClock::duration covered(std::vector<Span> spans);
   // The command will not be committed: retires with `reason`, forgets its
   // jobs, and waits at most one bound for the agent to report those it
   // started.

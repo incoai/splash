@@ -43,6 +43,10 @@ public:
     // writes an fp16 infinity as its output's first value, raises the event
     // and reports success, as one whose output overflowed would.
     uint64_t poisonedEvaluation = 0;
+    // The evaluation that does not run but, once its event reaches its wait,
+    // raises the event and reports success, its output as it was, as one
+    // bound to surfaces other than its own would.
+    uint64_t skippedEvaluation = 0;
     // bind() of the function named first binds the procedure of the function
     // named second in its place, as a client that confused the two would.
     std::pair<std::string, std::string> swappedBinding;

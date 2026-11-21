@@ -2,6 +2,7 @@
 
 #include <dispatch/dispatch.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -20,12 +21,11 @@ namespace {
 // its `ready`, started from then until it reports, then succeeded or failed.
 enum class Phase : uint8_t { Queued, Started, Succeeded, Failed };
 // A job of the current command: its phase, when the handoff learned that the
-// event reached its `ready`, and once it succeeded, how long after that it
+// event reached its `ready`, and once it succeeded after that, when it
 // reported.
 struct Job final {
   Phase phase = Phase::Queued;
-  AwakeClock::time_point started{};
-  AwakeClock::duration ran{};
+  AwakeClock::time_point started{}, ended{};
 };
 
 std::string seconds(AwakeClock::duration duration) {
@@ -96,7 +96,7 @@ struct Handoff::State final {
         state->fail(job.phase, "an evaluation failed");
         return;
       }
-      if (job.phase == Phase::Started) job.ran = AwakeClock::now() - job.started;
+      if (job.phase == Phase::Started) job.ended = AwakeClock::now();
       job.phase = Phase::Succeeded;
     } catch (...) {
     }
@@ -165,6 +165,28 @@ void Handoff::queue(uint64_t ready, uint64_t done, const Start &start) {
 }
 
 std::optional<AwakeClock::duration> Handoff::finish() {
+  std::optional<std::vector<Span>> spans = finishSpans();
+  if (!spans) return std::nullopt;
+  return covered(std::move(*spans));
+}
+
+AwakeClock::duration Handoff::covered(std::vector<Span> spans) {
+  std::ranges::sort(spans, {}, &Span::begin);
+  AwakeClock::duration total{};
+  std::optional<Span> open;
+  for (const Span &span : spans) {
+    if (open && span.begin <= open->end) {
+      open->end = std::max(open->end, span.end);
+      continue;
+    }
+    if (open) total += open->end - open->begin;
+    open = span;
+  }
+  if (open) total += open->end - open->begin;
+  return total;
+}
+
+std::optional<std::vector<Handoff::Span>> Handoff::finishSpans() {
   State &state = *state_;
   std::unique_lock lock(state.mutex);
   const auto settled = [&] {
@@ -179,16 +201,16 @@ std::optional<AwakeClock::duration> Handoff::finish() {
     for (auto &[id, job] : state.jobs)
       if (job.phase != Phase::Succeeded)
         state.fail(job.phase, "an evaluation did not report within " + seconds(state.bound) + " s of its command");
-  std::optional<AwakeClock::duration> ran = AwakeClock::duration{};
+  std::optional<std::vector<Span>> spans = std::vector<Span>{};
   for (const auto &[id, job] : state.jobs) {
     if (job.phase != Phase::Succeeded) {
-      ran.reset();
+      spans.reset();
       break;
     }
-    *ran += job.ran;
+    if (job.ended != AwakeClock::time_point{}) spans->push_back({job.started, job.ended});
   }
   state.jobs.clear();
-  return ran;
+  return spans;
 }
 
 void Handoff::cancel(std::string reason) {

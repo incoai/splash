@@ -305,6 +305,15 @@ QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chun
   return buffers;
 }
 
+// The least rows of a command the Neural Engine FFN split takes, 0 without
+// it: those of a chunk alone, or a split of slots pipelines a command of two
+// pieces or more in chunks of whole pieces (prefillChunkRows).
+uint32_t aneFfnRows(const ops::AneFfn *aneFfn) noexcept {
+  if (!aneFfn) return 0;
+  if (aneFfn->slots() < 2) return aneFfn->minimumRows();
+  return std::min(aneFfn->minimumRows(), 2 * ops::AneFfn::kEvaluationRows);
+}
+
 } // namespace
 
 struct Runtime::Impl {
@@ -712,7 +721,12 @@ struct Runtime::Impl {
       : backend(value.backend),
         model(value.model),
         geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format, value.stateStorage.layout().target,
-                                       StreamedParts::loaded(value.model, value.blockCache != nullptr))),
+                                       [&] {
+                                         StreamedParts parts =
+                                             StreamedParts::loaded(value.model, value.blockCache != nullptr);
+                                         parts.pipelinedAneFfn = value.aneFfn && value.aneFfn->slots() > 1;
+                                         return parts;
+                                       }())),
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
@@ -726,7 +740,7 @@ struct Runtime::Impl {
         draftModel(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
                    geometry.target.draftVocabulary),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
-        limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
+        limits(splash::model::commandLimits(geometry, aneFfnRows(aneFfn))) {
     if (states.layout() != model.stateLayout(states.layout().target.format, states.layout().target.cachedCodes) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
       throw std::invalid_argument(
@@ -1875,6 +1889,23 @@ struct Runtime::Impl {
     return inside;
   }
 
+  // The rows of each chunk but the last of a command of `rows` rows that the pipelined Neural Engine FFN split
+  // runs: the most whole pieces of the split's (ops::AneFfn::kEvaluationRows) that cut the command into two full
+  // chunks or more, no more chunks than the split has slots and the arena holds, and that the split takes
+  // (AneFfn::splits). Only the last chunk's last piece pads; a last chunk of fewer rows than the split takes runs
+  // its FFN on the GPU alone. kPrefillRows, one chunk the split runs alone, where none does.
+  uint32_t prefillChunkRows(uint32_t rows) const {
+    if (!aneFfn || aneFfn->slots() < 2 || prefillArena->chunks() < 2) return kPrefillRows;
+    const uint32_t most = std::min(aneFfn->slots(), prefillArena->chunks());
+    constexpr uint32_t step = ops::AneFfn::kEvaluationRows;
+    for (uint32_t chunk = kPrefillRows / step * step; chunk >= step; chunk -= step) {
+      if (rows < 2 * chunk) continue;
+      // A chunk of fewer rows takes more chunks, and the split takes no fewer rows.
+      return (rows + chunk - 1) / chunk <= most && aneFfn->splits(chunk, true) ? chunk : kPrefillRows;
+    }
+    return kPrefillRows;
+  }
+
   // The chunks of a prefill command, in order: its items' rows fill them
   // from the first with room on, so that a lane's rows past a chunk's
   // continue in the next, up to the arena's chunks (a prefill group's). A
@@ -1887,6 +1918,9 @@ struct Runtime::Impl {
   std::vector<PrefillChunk> preparePrefill(std::span<const ModelBatchItem> items,
                                            std::array<Request *, kLaneCount> &entries) {
     std::vector<PrefillChunk> chunks(1);
+    uint32_t commandRows = 0;
+    for (const ModelBatchItem &item : items) commandRows += item.tokenCount;
+    const uint32_t chunkRows = prefillChunkRows(commandRows);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
       Request &entry = prefillLane(item);
@@ -1896,13 +1930,13 @@ struct Runtime::Impl {
       QwenLogicalLengths lengths = states.metadata(entry.stateLane).lengths;
       size_t nextCapture = 0;
       for (uint32_t offset = 0; offset < item.tokenCount;) {
-        if (chunks.back().rows == kPrefillRows) chunks.emplace_back();
+        if (chunks.back().rows == chunkRows) chunks.emplace_back();
         PrefillChunk &chunk = chunks.back();
         PrefillSequence &sequence = chunk.sequences.emplace_back();
         ModelBatchItem &part = sequence.part;
         part = item;
         part.logicalPosition = item.logicalPosition + offset;
-        part.tokenCount = std::min(kPrefillRows - chunk.rows, item.tokenCount - offset);
+        part.tokenCount = std::min(chunkRows - chunk.rows, item.tokenCount - offset);
         part.inputTokens = item.inputTokens.subspan(offset, part.tokenCount);
         part.stateCaptures.clear();
         const uint64_t partEnd = part.logicalPosition + part.tokenCount;
@@ -4576,6 +4610,21 @@ std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
           layers.push_back(*dense);
         }
         return layers;
+      },
+      model.target);
+}
+
+std::vector<ops::MixerProjections> aneFfnMixers(const LoadedModel &model) {
+  if (aneFfnLayers(model).empty()) return {};
+  return std::visit(
+      [](const auto &weights) {
+        std::vector<ops::MixerProjections> mixers;
+        for (const auto &layer : weights.layers) {
+          if constexpr (requires { layer.mixer; })
+            std::visit([&](const auto &mixer) { mixers.push_back({&mixer.inputProjection, &mixer.outputProjection}); },
+                       layer.mixer);
+        }
+        return mixers;
       },
       model.target);
 }

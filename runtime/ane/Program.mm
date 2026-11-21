@@ -338,14 +338,16 @@ std::vector<Signature> changed(std::string_view method) {
 
 // Runs `evaluate`, the sequence-th evaluation, or the fault `faults` puts in
 // its place: a failure reported from another thread without running, neither
-// a run nor a report, the run faults.delay later, reporting its failure, or
-// `poison`.
+// a run nor a report, the run faults.delay later, reporting its failure,
+// `poison`, or `skip`.
 void evaluateWithFaults(const ProgramInstrumentation::Faults &faults, uint64_t sequence,
                         void (^report)(BOOL, NSError *), const std::function<void()> &evaluate,
-                        const std::function<void()> &poison) {
+                        const std::function<void()> &poison, const std::function<void()> &skip) {
   dispatch_queue_t elsewhere = dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
   if (sequence == faults.poisonedEvaluation) {
     poison();
+  } else if (sequence == faults.skippedEvaluation) {
+    skip();
   } else if (sequence == faults.failingEvaluation) {
     dispatch_async(elsewhere, ^{
       report(NO, nil);
@@ -768,6 +770,12 @@ void Program::enqueue(const Binding &binding, const metal::SharedEvent &event, u
           report(YES, nil);
         });
       };
+      const auto skip = [event, wait, signal, report] {
+        event.notify(wait, [event, signal, report] {
+          event.signal(signal);
+          report(YES, nil);
+        });
+      };
       const std::function<void()> lagged = [event, wait, evaluate, report, lag = impl_->faults.lag] {
         event.notify(wait, [evaluate, report, lag] {
           dispatch_after(dispatch_time(DISPATCH_TIME_NOW, std::chrono::nanoseconds(lag).count()),
@@ -780,7 +788,8 @@ void Program::enqueue(const Binding &binding, const metal::SharedEvent &event, u
                          });
         });
       };
-      evaluateWithFaults(impl_->faults, sequence, report, impl_->faults.lag.count() ? lagged : evaluate, poison);
+      evaluateWithFaults(impl_->faults, sequence, report, impl_->faults.lag.count() ? lagged : evaluate, poison,
+                         skip);
 #else
       evaluate();
 #endif

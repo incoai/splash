@@ -34,11 +34,15 @@ double median(const std::function<double()> &run) {
 
 Measurement::Measurement(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
                          const PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden,
-                         std::function<bool()> interrupted)
+                         std::function<bool()> interrupted, uint32_t slots,
+                         std::span<const MixerProjections> mixers)
     : backend_(backend), layers_(layers), ffn_(ffn), hidden_(hidden), interrupted_(std::move(interrupted)),
-      linear_(linear) {
+      mixers_(mixers), slots_(slots), linear_(linear) {
+  if (!slots) throw std::invalid_argument("ANE FFN split timed without a slot");
   if (const char *reason = AneFfn::unsupported(layers)) throw std::invalid_argument(reason);
   if (layers.size() < 2) throw std::invalid_argument("ANE FFN split timed on fewer than two layers");
+  if (!mixers.empty() && mixers.size() != layers.size())
+    throw std::invalid_argument("ANE FFN split timed with mixers of other layers");
   // Timing does not depend on the values, but on their being finite.
   AneFfn::fillNormalized(ffn_.normalized);
   for (const metal::MetalBuffer &buffer : hidden_)
@@ -117,10 +121,77 @@ std::vector<SwiGluProjections> Measurement::sampled() const {
   return layers;
 }
 
+// A mixer's GPU work over its projections': the scan or attention, the norms
+// and the rest a prefill's layer runs beside them. Qwen3.8-27B's mixers took
+// 34.7 ms a full chunk's layer at 8K of context on a 12-core M6, of which
+// their projections 26 (dev/benchmarks' decode-profile), and 13.4 ms on a
+// 32-core M5 Max (the GPU alone's 36.4 ms layer less its FFN's 23.0), of
+// which their projections 9.3.
+constexpr double kMixerOverProjections = 4.0 / 3.0;
+
+// Each sampled layer's input projection from the normalized rows into the
+// intermediate rows, and its output projection from gate's output rows into
+// the hidden rows, as a prefill's mixer runs them on a full chunk, in
+// commands of all but the last layer, the median of kRuns, times
+// kMixerOverProjections.
+double Measurement::mixer() {
+  if (mixers_.empty()) return 0.0;
+  std::vector<MixerProjections> mixers;
+  for (uint32_t index = 0; index < kSampledLayers; ++index)
+    mixers.push_back(mixers_[index * (mixers_.size() - 1) / (kSampledLayers - 1)]);
+  constexpr uint32_t kRows = AneFfn::kMaximumRows, kCount = kSampledLayers - 1;
+  const auto fits = [&](const metal::MetalBuffer &buffer, uint32_t width) {
+    return uint64_t{kRows} * width * sizeof(uint16_t) <= buffer.sizeBytes();
+  };
+  for (const MixerProjections &projections : mixers)
+    if (!fits(ffn_.intermediate, projections.input->outputSize) ||
+        !fits(ffn_.gateScratch, projections.output->inputSize))
+      throw std::invalid_argument("ANE FFN split timed with mixer projections wider than its FFN's");
+  return usable(median([&] {
+    metal::CommandGraph graph;
+    for (uint32_t index = 0; index < kCount; ++index) {
+      linear_.addProjection(graph, ffn_.normalized, *mixers[index].input, ffn_.intermediate, kRows, ffn_.scratch);
+      linear_.addProjection(graph, ffn_.gateScratch, *mixers[index].output, hidden_[1], kRows, ffn_.scratch);
+    }
+    const auto start = AwakeClock::now();
+    static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
+    return millisecondsSince(start) / kCount;
+  })) * kMixerOverProjections;
+}
+
+// Each layer starts every slot's chunk, the slot's previous layer joined
+// first, and stages the next layer once all have started, as a pipelined
+// prefill runs them without the mixers between: the ANE runs one evaluation
+// after another, and its time over them (AneFfn::completed), the median of
+// kRuns, is what a pipelined command takes of it, without the handoff's wait
+// for each layer's GPU work that a split layer timed alone adds (7% of the
+// ANE's whole FFN of Qwen3.8-27B on an M5 Max).
+double Measurement::pipelinedAne(std::span<const SwiGluProjections> layers, AneFfn &split) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  const auto count = static_cast<uint32_t>(layers.size() - 1), slots = split.slots();
+  return usable(median([&] {
+    metal::CommandGraph graph;
+    if (!split.begin()) throw std::runtime_error("ANE FFN split stopped (" + split.reason() + ")");
+    for (uint32_t index = 0; index < count; ++index) {
+      for (uint32_t slot = 0; slot < slots; ++slot) {
+        if (index) split.join(graph, slot);
+        split.start(graph, index, slot, ffn_, hidden_[index & 1], hidden_[(index & 1) ^ 1], kRows);
+      }
+      split.stageNext(graph, index);
+    }
+    for (uint32_t slot = 0; slot < slots; ++slot) split.join(graph, slot);
+    static_cast<void>(split.commit(graph, {}).wait());
+    const std::optional<AwakeClock::duration> ran = split.completed();
+    if (!ran) throw std::runtime_error("ANE FFN split failed while timed (" + split.reason() + ")");
+    return std::chrono::duration<double, std::milli>(*ran).count() / (count * slots);
+  }));
+}
+
 Timings Measurement::time() {
   const uint32_t units = AneFfn::units(layers_);
   Timings timings;
   timings.gpuAlone = layer(sampled(), kSampledLayers - 1, AneFfn::kMaximumRows);
+  if (slots_ > 1) timings.mixer = mixer();
   timings.low = time(nearestUnits(kTimedShares[0], units), timings.gpuAlone);
   timings.high = time(nearestUnits(kTimedShares[1], units), timings.gpuAlone);
   return timings;
@@ -129,9 +200,10 @@ Timings Measurement::time() {
 Timing Measurement::time(uint32_t aneUnits, double gpuAlone) {
   const std::vector<SwiGluProjections> layers = sampled();
   constexpr uint32_t kRows = AneFfn::kMaximumRows;
-  AneFfn split(backend_, linear_, layers, aneUnits, interrupted_, std::array{kRows});
+  AneFfn split(backend_, linear_, layers, aneUnits, interrupted_, slots_);
   return Timing{static_cast<double>(aneUnits) / AneFfn::units(layers_), gpuPart(layers, split),
-                layer(layers, kSampledLayers - 1, kRows, &split, gpuAlone)};
+                layer(layers, kSampledLayers - 1, kRows, &split, gpuAlone),
+                slots_ > 1 ? pipelinedAne(layers, split) : 0.0};
 }
 
 // On the layers time() timed, as many to a command, so that the splits
@@ -144,8 +216,10 @@ Timing Measurement::time(uint32_t aneUnits, double gpuAlone) {
 ChunkTimings Measurement::chunks(uint32_t aneUnits) {
   const std::vector<SwiGluProjections> layers = sampled();
   AneFfn split(backend_, linear_, layers, aneUnits, interrupted_);
+  // Chunks of each count of pieces, which a chunk of fewer rows costs as (AneFfn::kEvaluationRows).
   std::vector<uint32_t> rows;
-  for (const AneFfn::Evaluation &evaluation : split.evaluations_) rows.push_back(evaluation.rows);
+  for (uint32_t chunk = AneFfn::kEvaluationRows; chunk <= AneFfn::kMaximumRows; chunk += AneFfn::kEvaluationRows)
+    rows.push_back(chunk);
   constexpr uint32_t kCount = kSampledLayers - 1;
   const auto gpu = [&](uint32_t chunk) { return ChunkTimings::Gpu{chunk, layer(layers, kCount, chunk)}; };
   ChunkTimings timings{{gpu(rows.front()), gpu(rows.back())}, {}};

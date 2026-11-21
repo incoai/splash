@@ -48,6 +48,13 @@ inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
 // arrive while it runs wait for the whole command: four chunks read a layer
 // once per 8192 rows and keep both bounded.
 inline constexpr uint32_t kPrefillGroupChunks = 4;
+// The chunks of a dense target's prefill command that the Neural Engine FFN
+// split pipelines (ops::AneFfn::start), a slot of the split's each: while the
+// ANE runs one chunk's FFN the GPU runs the others' mixers. On a 12-core M6,
+// Qwen3.8-27B prefilled 8K tokens at 646 tok/s with four against 489 for
+// chunks run one after the other; eight and chunks of fewer rows did no
+// better.
+inline constexpr uint32_t kAneFfnPipelineChunks = kPrefillGroupChunks;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kDraftCacheStride = ExecutionLimits::draftContextTokens;
 inline constexpr uint32_t kMaximumPageTableEntries =
@@ -111,6 +118,8 @@ struct RuntimeGeometry final {
     if (parts.kv) result.spilledKv = descriptor.capabilities.sparseKv;
     result.streamedExperts = parts.experts;
     if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
+    else if (result.target.ffnKind == QwenFfnKind::Dense && parts.pipelinedAneFfn)
+      result.prefillChunks = kAneFfnPipelineChunks;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         (parts.kv && !result.target.kvLayout.spillable()) ||
         result.target.contextTokens() != descriptor.capabilities.maximumContextTokens ||
@@ -145,13 +154,16 @@ struct RuntimeGeometry final {
 // past a chunk, as a prefill group passes each lane's state between its
 // parts through its one scratch cell (PrefillArena::groupCell); the history
 // of one lane streamed (KvHistoryStream) where K/V spills, none where it
-// stays in memory; whether its experts stream; and in one attention layer
-// the pairs of a full chunk at the end of the native window.
+// stays in memory; whether its experts stream; whether the split pipelines
+// its chunks, where its arena holds them in memory; and in one attention
+// layer the pairs of a full chunk at the end of the native window.
 [[nodiscard]] inline CommandLimits commandLimits(const RuntimeGeometry &geometry, uint32_t aneFfnRows) noexcept {
+  const bool pipelines = aneFfnRows && geometry.prefillChunks > 1 && !geometry.streamedExperts && !geometry.spilledKv;
   return {.commandRows = geometry.prefillChunks * kPrefillRows,
           .layers = geometry.target.layers,
           .maximumPasses = aneFfnRows ? 1u : geometry.target.layers,
           .minimumUnitRows = aneFfnRows ? aneFfnRows : 1u,
+          .pipelinesChunks = pipelines,
           .lanesPastChunk = 1,
           .indexPageLanes = geometry.spilledKv ? 1u : 0u,
           .streamsWeights = geometry.streamedExperts,

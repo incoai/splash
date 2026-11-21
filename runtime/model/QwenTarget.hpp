@@ -563,6 +563,11 @@ protected:
     // layer's load and its routed work (addPrefillExperts) share.
     ops::MoeBuffers ffn{};
     ops::AneFfn *aneFfn = nullptr;
+    // The split's slot of the step's chunk, and whether the FFN of the layer
+    // added last is in flight on the Neural Engine, its join and what reads
+    // the layer's output still to add (addPrefillLayers).
+    uint32_t aneSlot = 0;
+    bool aneJoin = false;
     uint32_t gdnLayer = 0;
     uint32_t attentionLayer = 0;
     // The rows of the layer being added that something reads, ascending, when
@@ -596,8 +601,10 @@ protected:
     requirePrefill(chunks, kv, layers, aneFfn);
     std::vector<Step> steps;
     steps.reserve(chunks.size());
-    for (const QwenTargetPrefillChunk &chunk : chunks)
-      steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, aneFfn)});
+    for (const QwenTargetPrefillChunk &chunk : chunks) {
+      steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, aneFfn, chunks.size() > 1)});
+      steps.back().aneSlot = static_cast<uint32_t>(steps.size() - 1);
+    }
     return steps;
   }
   // A prefill's layers `range` over its steps (addPrefill), through a
@@ -615,6 +622,13 @@ protected:
   // step's begins: the first step's passes over the experts resident before
   // the load run beside its reads (ops::MoE::addResident), each later step's
   // after the step before it.
+  //
+  // A step whose dense FFN the Neural Engine splits leaves it in flight
+  // (ops::AneFfn::start): the step joins it, and adds what reads the layer's
+  // output (addPrefillExperts), just before its next layer, so that the GPU
+  // runs the other steps' mixers and their parts of the FFN while the ANE
+  // runs this one's. Once every step has started a layer, the split stages
+  // the next one's weights.
   template <class Step, class Layers>
   [[nodiscard]] std::vector<metal::MetalBuffer> addPrefillLayers(std::span<Step> steps, const Layers &layers,
                                                                  QwenPrefillLayers range) const {
@@ -625,9 +639,20 @@ protected:
     std::vector<ops::MoeLoadPart> parts;
     if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
       for (const Step &step : steps) parts.push_back({&step.ffn, &*step.moe});
+    const auto join = [&](Step &step, uint32_t layer) {
+      if (!step.aneJoin) return;
+      addAneFfnJoin(step);
+      layers.addPrefillExperts(step, layer);
+    };
     for (uint32_t index = range.first; index < range.end; ++index) {
       const uint32_t attentionLayer = steps.front().attentionLayer;
-      for (Step &step : steps) layers.addPrefillLayer(step, index);
+      Step *split = nullptr;
+      for (Step &step : steps) {
+        if (index > range.first) join(step, index - 1);
+        layers.addPrefillLayer(step, index);
+        if (step.aneJoin) split = &step;
+      }
+      if (split) addAneFfnStage(*split, index);
       if (steps.front().attentionLayer != attentionLayer)
         steps.front().spilled.layerEnd(steps.front().graph, attentionLayer);
       const ops::BlockMoeWeights *ffn = layers.moe(index);
@@ -638,9 +663,10 @@ protected:
         });
       for (size_t at = 0; at < steps.size(); ++at) {
         if (streams && at) ops::MoE::addResident(steps[at].graph, steps[at].ffn, *ffn, *steps[at].moe);
-        layers.addPrefillExperts(steps[at], index);
+        if (!steps[at].aneJoin) layers.addPrefillExperts(steps[at], index);
       }
     }
+    for (Step &step : steps) join(step, range.end - 1);
     std::vector<metal::MetalBuffer> outputs;
     if (range.end != geometry_.layers) return outputs;
     outputs.reserve(steps.size());
@@ -682,6 +708,11 @@ protected:
                           ops::SwiGluProjections ffn, metal::MetalBuffer residual, metal::MetalBuffer output) const;
   void addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
                             metal::MetalBuffer residual, metal::MetalBuffer output) const;
+  // A step's join of its FFN in flight on the Neural Engine (step.aneJoin),
+  // and, once every step has started layer `index`, the split's staging of
+  // the next layer's weights (ops::AneFfn::join and stageNext).
+  void addAneFfnJoin(PrefillStep &step) const;
+  void addAneFfnStage(PrefillStep &step, uint32_t index) const;
   // The head of a target whose last layer's rows read a final RMS norm,
   // `finalNorm`, into `finalHidden`, as addHeadBatch takes them.
   void addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm, metal::MetalBuffer hidden,
@@ -728,7 +759,7 @@ private:
                       QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const;
   [[nodiscard]] PrefillStep prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                         const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                        ops::AneFfn *aneFfn) const;
+                                        ops::AneFfn *aneFfn, bool pipelined = false) const;
 };
 
 // The target of a Qwen3.5-architecture family's weights (Qwen3.8-27B,

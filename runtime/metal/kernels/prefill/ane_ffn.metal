@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/quant_formats.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 // The GPU side of a dense FFN split with the ANE (ops/AneFfn.cpp). The ANE
 // multiplies int8 weights and activations after a block-diagonal Hadamard
@@ -78,6 +79,57 @@ kernel void ane_ffn_rotate(device const bfloat *input [[buffer(0)]],
   }
   if (simd_group == 0 && lane == 0) token_scale[row] = half(scale * ANE_FFN_INT8_UNIT);
 }
+
+// ane_ffn_rotate of the RMS norm of `input` by `weight` (norm_rms's, bit for
+// bit: the norm rounds to bf16 before the rotation, as its output rows do),
+// for a split whose ANE takes every channel and so whose GPU reads no
+// normalized rows: one pass over the residual rows instead of the norm's
+// write and the rotation's read. ANE_FFN_ROTATE_THREADS (256) threads a row,
+// which rms_inverse reduces as norm_rms does.
+static_assert(ANE_FFN_ROTATE_THREADS == 256, "rms_inverse reduces a row over 256 threads");
+template <class W>
+inline void ane_ffn_norm_rotate_row(device const bfloat *input, device const W *weight, device const float *sign,
+                                    device half *rotated, device half *token_scale, uint hidden, uint row,
+                                    uint thread_index, uint simd_group, uint lane, uint simd_groups,
+                                    threadgroup float *peaks, threadgroup float *reductions) {
+  const float inverse_rms = rms_inverse(input + row * hidden, hidden, reductions, thread_index, lane, simd_group);
+  const uint blocks = hidden / ANE_FFN_INPUT_BLOCK / simd_groups;
+  float value[ANE_FFN_ROTATE_BLOCKS][1][4];
+  float peak = 0.0f;
+  for (uint block = 0; block < blocks; ++block) {
+    const uint column = (simd_group * blocks + block) * ANE_FFN_INPUT_BLOCK + lane * 4;
+    for (uint e = 0; e < 4; ++e)
+      value[block][0][e] =
+          float(bfloat((float(input[row * hidden + column + e]) * inverse_rms) * float(weight[column + e])));
+    ane_ffn_rotate_block<1>(value[block], lane, sign);
+    for (uint e = 0; e < 4; ++e) peak = max(peak, fabs(value[block][0][e]));
+  }
+  peak = simd_max(peak);
+  if (lane == 0) peaks[simd_group] = peak;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  peak = 0.0f;
+  for (uint group = 0; group < simd_groups; ++group) peak = max(peak, peaks[group]);
+  const float scale = max(peak, ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK, inverse = 1.0f / scale;
+  for (uint block = 0; block < blocks; ++block) {
+    const uint origin = row * hidden + (simd_group * blocks + block) * ANE_FFN_INPUT_BLOCK + lane * 4;
+    for (uint e = 0; e < 4; ++e) rotated[origin + e] = half(value[block][0][e] * inverse);
+  }
+  if (simd_group == 0 && lane == 0) token_scale[row] = half(scale * ANE_FFN_INT8_UNIT);
+}
+#define ANE_FFN_NORM_ROTATE(Name, W)                                                                             \
+  kernel void Name(device const bfloat *input [[buffer(0)]], device const W *weight [[buffer(1)]],               \
+                   device const float *sign [[buffer(2)]], device half *rotated [[buffer(3)]],                    \
+                   device half *token_scale [[buffer(4)]], constant AneFfnRotateParams &params [[buffer(5)]],    \
+                   uint row [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]], \
+                   uint simd_group [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],   \
+                   uint simd_groups [[simdgroups_per_threadgroup]]) {                                             \
+    threadgroup float peaks[32];                                                                                  \
+    threadgroup float reductions[8];                                                                              \
+    ane_ffn_norm_rotate_row(input, weight, sign, rotated, token_scale, params.hidden, row, thread_index,         \
+                            simd_group, lane, simd_groups, peaks, reductions);                                    \
+  }
+ANE_FFN_NORM_ROTATE(ane_ffn_norm_rotate, bfloat)
+ANE_FFN_NORM_ROTATE(ane_ffn_norm_rotate_f32, float)
 
 // ANE_FFN_TILE x ANE_FFN_TILE tiles of rows x channels, ANE_FFN_TILE x
 // ANE_FFN_TILE_ROWS threads.
@@ -238,6 +290,13 @@ inline bool ane_ffn_not_finite(half value) { return (as_type<ushort>(value) & 0x
 // rounds to bf16 once more than on the GPU alone, after the GPU part's
 // residual epilogue: half a bf16 unit, which the split accepts rather than
 // fusing the join into that epilogue.
+// output = residual + the ANE's part, `residual` the output itself where the
+// GPU's part wrote residual + its own part there (ane_ffn_join), or the rows
+// before the FFN where the ANE takes every channel (ane_ffn_join_residual).
+inline void ane_ffn_join_rows(device bfloat *output, device const bfloat *residual, device const half *partial,
+                              device const half *token_scale, device atomic_uint *status,
+                              constant AneFfnJoinParams &params, uint2 tile, uint2 position,
+                              threadgroup float (*staged)[ANE_FFN_TILE + 1], threadgroup float *scale);
 kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
                          device const half *partial [[buffer(1)]],
                          device const half *token_scale [[buffer(2)]],
@@ -247,6 +306,24 @@ kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
                          uint2 position [[thread_position_in_threadgroup]]) {
   threadgroup float staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
   threadgroup float scale[ANE_FFN_TILE];
+  ane_ffn_join_rows(output, output, partial, token_scale, status, params, tile, position, staged, scale);
+}
+kernel void ane_ffn_join_residual(device bfloat *output [[buffer(0)]],
+                                  device const half *partial [[buffer(1)]],
+                                  device const half *token_scale [[buffer(2)]],
+                                  device atomic_uint *status [[buffer(3)]],
+                                  device const bfloat *residual [[buffer(4)]],
+                                  constant AneFfnJoinParams &params [[buffer(5)]],
+                                  uint2 tile [[threadgroup_position_in_grid]],
+                                  uint2 position [[thread_position_in_threadgroup]]) {
+  threadgroup float staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
+  threadgroup float scale[ANE_FFN_TILE];
+  ane_ffn_join_rows(output, residual, partial, token_scale, status, params, tile, position, staged, scale);
+}
+inline void ane_ffn_join_rows(device bfloat *output, device const bfloat *residual, device const half *partial,
+                              device const half *token_scale, device atomic_uint *status,
+                              constant AneFfnJoinParams &params, uint2 tile, uint2 position,
+                              threadgroup float (*staged)[ANE_FFN_TILE + 1], threadgroup float *scale) {
   const uint row = tile.x * ANE_FFN_TILE, channel = tile.y * ANE_FFN_TILE, token = row + position.x;
   const bool chunk = token < params.rows;
   bool finite = true;
@@ -265,6 +342,6 @@ kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
   for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS) {
     if (row + j >= params.rows) continue;
     const uint index = (row + j) * params.hidden + channel + position.x;
-    output[index] = bfloat(float(output[index]) + staged[position.x][j] * scale[j]);
+    output[index] = bfloat(float(residual[index]) + staged[position.x][j] * scale[j]);
   }
 }
