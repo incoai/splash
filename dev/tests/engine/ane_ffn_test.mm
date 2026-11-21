@@ -7,10 +7,10 @@
 // - join: ane_ffn_join adds the ANE's channel-major partial rows, scaled in fp32, to the chunk's output rows and to no
 //   others, and flags a value of the chunk's rows that is not finite;
 // - the split: which layers, units and chunks it takes; for three layers of MLX af4g64 and of mixed GGUF formats,
-//   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two functions and of the
+//   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two pieces' and of the
 //   most rows compute what the GPU computes alone within int8's error, as do quiet rows, whose intermediate values
-//   fp16 barely holds, and rows of a hidden channel of about 1e5; verify() passes every function of either model and
-//   fails a function bound to another's procedure; layers it is given out of order are refused, and it keeps what it
+//   fp16 barely holds, and rows of a hidden channel of about 1e5; verify() passes either model's chunks and fails a
+//   piece the ANE leaves unwritten; layers it is given out of order are refused, and it keeps what it
 //   needs of the layers it was built from; an infinity in the ANE's output stops it; its program unloaded for the idle
 //   release and loaded again computes what it computed before, and a command encoded or in flight refuses the
 //   release;
@@ -447,11 +447,13 @@ void takes(const Model &mlx, const Model &gguf) {
   if (!AneFfn::unsupported(uneven)) fail("the split takes a hidden size of 4608, which ane_ffn_rotate does not");
   if (!AneFfn::unsupported(mixed)) fail("the split takes layers of two shapes");
   if (AneFfn::units(mlx.layers) != kIntermediate / 512) fail("the split moves other units than 512 channels");
-  // Units that leave the GPU or the ANE no channels.
-  for (const uint32_t aneUnits : {0u, AneFfn::units(mlx.layers)})
+  // Units that leave the ANE no channels, or more than there are, are refused; every unit leaves the GPU none, which
+  // the split takes (AneFfn::fusesNorm).
+  for (const uint32_t aneUnits : {0u, AneFfn::units(mlx.layers) + 1})
     test::rejects([&] { static_cast<void>(AneFfn::plannedBytes(mlx.layers, aneUnits)); }, "no channels",
                   std::to_string(aneUnits) + " units leave the GPU or the ANE no channels, yet plan");
-  section("takes: models of one splittable shape, and units that leave each part channels");
+  if (!AneFfn::plannedBytes(mlx.layers, AneFfn::units(mlx.layers))) fail("every unit for the ANE planned nothing");
+  section("takes: models of one splittable shape, and units that leave the ANE channels, or the GPU none");
 }
 
 // A calibration is remembered under the layers' shapes and formats and the int8 activations the GPU's part plans with
@@ -592,10 +594,10 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
   if (split->minimumRows() != 640 || split->splits(639) || !split->splits(640))
     fail(model.name + ": a least chunk of 640 rows took other chunks than those of 640 rows or more");
   for (const uint32_t rows : {AneFfn::kMinimumRows - 1, AneFfn::kMaximumRows + 1})
-    test::rejects([&] { split->setMinimumRows(rows); }, "no function of",
+    test::rejects([&] { split->setMinimumRows(rows); }, "takes no chunk of",
                   model.name + ": a least chunk of " + std::to_string(rows) + " rows was taken");
-  // verify() checks every function, and both weight sets, against the leading rows of a full chunk on the GPU
-  // alone, which computes every row alike whatever the chunk's rows.
+  // verify() checks chunks of one piece, of a padded last piece and of the most rows, and both weight sets, against
+  // the leading rows of a full chunk on the GPU alone, which computes every row alike whatever the chunk's rows.
   const Forward full = forward(backend, linear, model, nullptr, chunk, AneFfn::kMaximumRows);
   for (const uint32_t rows : {AneFfn::kMinimumRows, 700u})
     if (const Forward fewer = forward(backend, linear, model, nullptr, chunk, rows);
@@ -608,18 +610,19 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
             << "% from the GPU alone on the Neural Engine's part\n";
   if (split->retired()) fail(model.name + ": verify stopped the split: " + split->reason());
   section("split: " + model.name + " least chunk rows, a chunk's rows on the GPU alone as a full chunk's, and "
-          "verify() of every function");
+          "verify() of its chunks");
 }
 
-// A program whose function of 640 rows is bound to the procedure of 512 rows leaves rows of the ANE's output
-// unwritten, which verify() fails, and the split stops.
+// An evaluation that leaves its piece of the ANE's output unwritten, as one bound to another piece's surfaces would:
+// verify()'s chunks of one piece run evaluations 1 and 2, a layer each, and of 1792 rows 3 to 10, four pieces a
+// layer, so that the 4th leaves the second piece of the first layer, which verify() fails, and the split stops.
 void misbound(MetalBackend &backend, const Model &model, const Chunk &chunk) {
-  ane::ProgramInstrumentation::arm({.swappedBinding = {"ffn640", "ffn512"}});
+  ane::ProgramInstrumentation::arm({.skippedEvaluation = 4});
   AneFfn split(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits, nullptr);
   test::rejects([&] { static_cast<void>(split.verify(model.layers, chunk.ffn, chunk.hidden)); },
-                "split of 640 rows failed", "verify() passed a function bound to another's procedure");
+                "split of 1792 rows failed", "verify() passed a piece the ANE left unwritten");
   if (!split.retired() || split.splits(AneFfn::kMaximumRows)) fail("a split that failed verify() did not stop");
-  section("verify: a function bound to the procedure of fewer rows fails it");
+  section("verify: a piece the ANE leaves unwritten fails it");
 }
 
 // Layers added out of order and buffers short of a chunk's rows are refused before anything is encoded.

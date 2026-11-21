@@ -186,6 +186,13 @@ struct SwiGluProjections final {
   const Projection *up = nullptr;
   const Projection *down = nullptr;
 };
+// A layer's mixer projections, its input projection from the normalized rows
+// and its output projection to the hidden rows, as the prefill FFN's Neural
+// Engine split times them in place of the mixer (ane_ffn::Measurement).
+struct MixerProjections final {
+  const Projection *input = nullptr;
+  const Projection *output = nullptr;
+};
 // A prefill chunk's buffers of its dense FFN: the normalized rows, gate's
 // output, the intermediate rows and the linear scratch.
 struct PrefillFfnBuffers final {

@@ -774,8 +774,9 @@ uint32_t parseAneFfnMinimumRows(std::string_view value) {
 double parseAneFfnShare(std::string_view value) {
   double share = 0.0;
   const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), share);
-  if (error != std::errc{} || end != value.data() + value.size() || !(share >= 0.0 && share < 1.0))
-    throw std::invalid_argument("--ane-ffn-share takes a share in [0, 1)");
+  // 1 gives the ANE every channel unit (ane_ffn::nearestUnits).
+  if (error != std::errc{} || end != value.data() + value.size() || !(share >= 0.0 && share <= 1.0))
+    throw std::invalid_argument("--ane-ffn-share takes a share in [0, 1]");
   return share;
 }
 

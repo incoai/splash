@@ -97,9 +97,8 @@ void testChoice() {
   const Model model = fit({0.25, 15, 15}, {0.75, 5, 30});
   require(choose(model, 20, 10, 9) == 3u, "the crossing's units were not chosen");
   require(choose(model, 20, 100, 99) == 33u, "the units nearest the crossing were not chosen");
-  for (const uint32_t most : {0u, 10u})
-    rejects([&] { static_cast<void>(choose(model, 20, 10, most)); }, "no feasible units",
-            "a choice of " + std::to_string(most) + " units of 10");
+  rejects([&] { static_cast<void>(choose(model, 20, 10, 0)); }, "no feasible units", "a choice of no units");
+  require(choose(model, 20, 10, 10) == 3u, "a split without a mixer beside it chose among every unit");
   for (const Measured &measured : kMeasured)
     require(choose(fit(measured.low, measured.high), measured.gpuAlone, 34, 33) == measured.chosen,
             std::string("the ") + measured.mac + "'s timings did not choose " + std::to_string(measured.chosen) +
@@ -115,6 +114,23 @@ void testChoice() {
   m6.u = 0.0;
   require(choose(m6, kMeasured[2].gpuAlone, 34, 33) == 23u,
           "the M6 without its bandwidth term did not choose 23 units");
+}
+
+// A pipelined split adds the mixers' time M to the GPU's side and may give the ANE every unit. With an M5 Max's
+// per-layer parts, M = 12.1 ms, G(s) = 23 - 23 s and A(s) = 57.4 s meet at s = 0.437, 14.8 of 34 units, and 14
+// (25.6 ms; 26.3 a unit below) is chosen, as a sweep of given shares found fastest; an M6's, M = 34.5 ms, G(s) =
+// 63.5 - 63.5 s and A(s) = 29.6 s, never meet, and every unit is chosen (34.5 ms), where without M 24 would be.
+void testPipelined() {
+  Model m5Max = fit({0.25, 17.25, 17.25}, {0.75, 5.75, 43.05});
+  m5Max.mixer = 12.1;
+  require(choose(m5Max, 23.0, 34, 34) == 14u, "the M5 Max's pipelined parts did not choose 14 units");
+  Model m6 = fit({0.25, 47.625, 47.625}, {0.75, 15.875, 22.2});
+  require(choose(m6, 63.5, 34, 33) == 24u, "the M6's serial parts did not choose 24 units");
+  m6.mixer = 34.5;
+  require(choose(m6, 63.5, 34, 34) == 34u, "the M6's pipelined parts did not choose every unit");
+  require(choose(m6, 63.5, 34, 30) == 30u, "units the plan does not hold were chosen");
+  // The gain counts against the mixer and the FFN alone: 34.5 ms against 98 is one.
+  require(choose(m6, 63.5, 34, 34).has_value(), "the pipelined gain was refused");
 }
 
 // Timings that put T at zero or below, or that are not numbers, choose nothing.
@@ -153,11 +169,11 @@ void testUsable() {
 // The units nearest a share, from one to all but one, and no share outside (0, 1) or of fewer than two units.
 void testNearestUnits() {
   require(nearestUnits(0.4, 34) == 14 && nearestUnits(0.8, 34) == 27 && nearestUnits(0.01, 34) == 1 &&
-              nearestUnits(0.99, 34) == 33,
+              nearestUnits(0.99, 34) == 33 && nearestUnits(1.0, 34) == 34,
           "the units nearest a share");
   for (const auto &[share, units] : std::vector<std::pair<double, uint32_t>>{
-           {0.0, 34}, {1.0, 34}, {std::numeric_limits<double>::quiet_NaN(), 34}, {0.5, 1}})
-    rejects([&] { static_cast<void>(nearestUnits(share, units)); }, "must lie in (0, 1)",
+           {0.0, 34}, {1.5, 34}, {std::numeric_limits<double>::quiet_NaN(), 34}, {0.5, 1}, {1.0, 1}})
+    rejects([&] { static_cast<void>(nearestUnits(share, units)); }, "must lie in (0, 1]",
             "a share of " + std::to_string(share) + " of " + std::to_string(units) + " units");
 }
 
@@ -228,11 +244,11 @@ void testSlowerNowhere() {
 // refusals; a line of another tag or version, with more or fewer fields, units without least rows, the GPU alone out
 // of order or unusable, more refusals than kRefusals or a split beside kRefusals is not one.
 void testCalibrationText() {
-  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 1};
+  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 1, 12.5};
   const std::optional<Calibration> back = Calibration::parse(made.text());
   require(back && back->aneUnits == 8 && back->minimumRows == 655 && back->gpu[0].rows == 512 &&
               back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 &&
-              back->gpu[1].milliseconds == 19.375 && back->refusals == 1,
+              back->gpu[1].milliseconds == 19.375 && back->refusals == 1 && back->mixer == 12.5,
           "a calibration did not come back as it was: " + made.text());
   const std::optional<Calibration> none = Calibration::parse(Calibration{}.text()),
                                    refused = Calibration::parse(Calibration{.refusals = 2}.text());
@@ -240,15 +256,18 @@ void testCalibrationText() {
               refused->refusals == 2,
           "a calibration of no split did not come back");
   for (const std::string_view line : {"", "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 0 1",
-                                      "ane-ffn-calibration-2 8 0 512 5.25 2048 19.375 0",
-                                      "ane-ffn-calibration-2 0 655 0 0 0 0 0",
-                                      "ane-ffn-calibration-2 8 655 2048 19.375 512 5.25 0",
-                                      "ane-ffn-calibration-2 8 655 512 0 2048 19.375 0",
-                                      "ane-ffn-calibration-2 8 655 512 nan 2048 19.375 0",
-                                      "ane-ffn-calibration-2 0 0 0 0 0 0 3",
-                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 2"})
+                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 0",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 0 1",
+                                      "ane-ffn-calibration-3 8 0 512 5.25 2048 19.375 0 0",
+                                      "ane-ffn-calibration-3 0 655 0 0 0 0 0 0",
+                                      "ane-ffn-calibration-3 8 655 2048 19.375 512 5.25 0 0",
+                                      "ane-ffn-calibration-3 8 655 512 0 2048 19.375 0 0",
+                                      "ane-ffn-calibration-3 8 655 512 nan 2048 19.375 0 0",
+                                      "ane-ffn-calibration-3 0 0 0 0 0 0 3 0",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 2 0",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 -1",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 nan"})
     require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
 }
 
@@ -296,6 +315,23 @@ void testBreaker() {
           "a breaker took the GPU alone at one row count");
   rejects([&] { static_cast<void>(Breaker(reversed.gpu)); }, "two row counts", "a breaker took descending rows");
   rejects([&] { static_cast<void>(Breaker(unusable.gpu)); }, "not usable", "a breaker took a GPU alone of 0 ms");
+  // A pipelined command loses once the ANE's time reaches the GPU alone's FFN and mixers: with 10 ms of mixer
+  // projections a 2048-row layer, evaluations of 25 ms each (1.25 of the FFN's 20) trip a split that ran them after
+  // each mixer, and not one that pipelined them; 30 ms each trip both.
+  const auto pipelined = [](Breaker &breaker, uint32_t count, double milliseconds) {
+    for (uint32_t command = 1; command <= count; ++command)
+      if (std::string reason = breaker.add(2048, 64, 64 * milliseconds, true); !reason.empty())
+        return std::pair{command, reason};
+    return std::pair{0u, std::string()};
+  };
+  Breaker beside(timings.gpu, 10.0), after(timings.gpu, 10.0);
+  require(pipelined(beside, 80, 25.0).first == 0, "a pipelined split faster than the GPU alone's layers tripped");
+  require(run(after, 8, 2048, 1.25).first == 8, "a split after each mixer as slow did not trip");
+  require(pipelined(beside, 8, 30.0) ==
+              std::pair{8u, std::string("losing to the GPU alone (30.0 ms on the Neural Engine per 2048-row layer "
+                                        "against 30.0 ms on the GPU alone)")},
+          "a pipelined split as slow as the GPU alone's FFN and mixers did not trip on the 8th command");
+  rejects([&] { static_cast<void>(Breaker(timings.gpu, -1.0)); }, "usable mixer", "a breaker took a negative mixer");
 }
 
 } // namespace
@@ -306,6 +342,7 @@ int main() {
     testBandwidth();
     testRefit();
     testChoice();
+    testPipelined();
     testUnusable();
     testMostUnits();
     testNoGain();

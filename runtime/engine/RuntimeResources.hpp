@@ -424,9 +424,9 @@ private:
 // remembered beside the programs (ane::recall) under its layers' shapes and
 // formats and the Int8Activations its GPU part plans with
 // (ops::AneFfn::calibrationKey), the device, the macOS version, the engine's
-// `buildId` and the most units the plan holds.
+// `buildId` and the most units the plan holds; it pipelines `slots` chunks.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
-                                      std::string_view buildId, std::function<bool()> cancelled);
+                                      std::string_view buildId, std::function<bool()> cancelled, uint32_t slots = 1);
 
 } // namespace splash::engine

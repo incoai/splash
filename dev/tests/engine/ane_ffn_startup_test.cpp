@@ -91,6 +91,10 @@ ChunkTimings timedChunks(double most) {
 // prepared split return, and what the start asked of it.
 struct Fake {
   bool dense = true;
+  // Whether the split pipelines its chunks, and then the ANE's time a full chunk's layer as a pipelined command keeps
+  // it busy at the units timeAt() times.
+  bool pipelines = false;
+  std::function<double(uint32_t)> aneAt = [](uint32_t aneUnits) { return 29.6 * aneUnits / 34; };
   std::string unsupported;
   std::optional<std::string> unavailable;
   uint64_t unitBytes = 256 * kMiB;
@@ -136,6 +140,7 @@ struct Fake {
       return unavailable;
     };
     result.units = 34;
+    result.pipelines = pipelines;
     result.plannedBytes = [this](uint32_t aneUnits) { return bytes(aneUnits); };
     result.time = [this] {
       ++timings;
@@ -144,7 +149,7 @@ struct Fake {
     result.timeAt = [this](uint32_t aneUnits, double gpuAlone) {
       if (gpuAlone != time().gpuAlone) throw std::logic_error("a split was timed against another GPU alone");
       timedUnits.push_back(aneUnits);
-      return Timing{aneUnits / 34.0, 0.0, timeAt(aneUnits)};
+      return Timing{aneUnits / 34.0, 0.0, timeAt(aneUnits), pipelines ? aneAt(aneUnits) : 0.0};
     };
     result.prepare = [this](uint32_t aneUnits, bool timeChunks) {
       prepared = {aneUnits, timeChunks};
@@ -929,8 +934,56 @@ void testRemembered() {
   }
 }
 
+// A split that pipelines its chunks adds its mixers to the GPU's side and may give the ANE every unit: an M6's
+// timings, whose mixers take 34.5 ms and whose ANE runs the whole FFN in 29.6 ms as a pipelined command keeps it busy,
+// choose all 34 units, where a split that does not pipeline takes fewer. Its chunks alone, after each mixer, lose to
+// the GPU alone
+// at every rows, so that it takes only the chunks it pipelines; the record keeps its mixers for the breaker, and a
+// later start sets it up as calibrated.
+void testPipelined() {
+  Fake fake;
+  fake.pipelines = true;
+  fake.unitBytes = 64 * kMiB;
+  fake.time = [] {
+    Timings timings{{14.0 / 34, 40.527, 45.481, 12.19}, {27.0 / 34, 17.917, 31.079, 23.5}, 64.007, 34.5};
+    return timings;
+  };
+  fake.prepare = [](uint32_t, bool timed) {
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(25.0);
+    prepared.error = 0.012;
+    return prepared;
+  };
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.prepared == std::pair(34u, true) && fake.remembered &&
+              fake.remembered->aneUnits == 34 && fake.remembered->minimumRows == ops::AneFfn::kPipelinedOnly &&
+              fake.remembered->mixer == 34.5 && fake.rememberedMost == 34u &&
+              has(started.log, "Neural Engine FFN split at share 1.00 for pipelined chunks of 512 rows or more: ") &&
+              has(started.log, "beside 34.5 ms of mixer"),
+          "the pipelined split did not take every unit for its pipelined chunks: " + started.log);
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.prepared == std::pair(34u, false) &&
+              has(started.log, "set up as calibrated before"),
+          "the pipelined split's calibration was not taken again: " + started.log);
+  // A split that does not pipeline times neither its mixers nor its pipelined ANE time.
+  Fake serial = fake;
+  serial.pipelines = false;
+  serial.stored.reset();
+  serial.time = [] { return Timings{{14.0 / 34, 40.527, 45.481}, {27.0 / 34, 17.917, 31.079}, 64.007}; };
+  serial.prepare = [](uint32_t, bool timed) {
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(15.5);
+    prepared.error = 0.012;
+    return prepared;
+  };
+  started = start(serial);
+  require(started.start.outcome.kind == Kind::Split && serial.remembered && serial.remembered->aneUnits < 34 &&
+              serial.remembered->mixer == 0.0,
+          "a split that does not pipeline took every unit or kept a mixer: " + started.log);
+}
+
 // A given share runs the units nearest it, untimed, over the chunks given, and is not remembered; a given split
-// of no units or of rows no function holds is refused.
+// of no units, of more than every unit or of rows the split does not take alone is refused.
 void testGivenShare() {
   Fake fake;
   Started started = start(fake, {.given = AneFfnSetting::Given{0.2}});
@@ -943,7 +996,13 @@ void testGivenShare() {
   started = start(fake, {.given = AneFfnSetting::Given{0.2, 832}});
   require(started.start.outcome.kind == Kind::Split && has(started.log, "for chunks of 832 rows or more"),
           "the given least chunk did not run as given: " + started.log);
-  for (const AneFfnSetting::Given given : {AneFfnSetting::Given{0.0}, AneFfnSetting::Given{1.0},
+  // A share of 1 gives the ANE every unit.
+  Fake small;
+  small.unitBytes = 64 * kMiB;
+  started = start(small, {.given = AneFfnSetting::Given{1.0}});
+  require(started.start.outcome.kind == Kind::Split && small.prepared == std::pair(34u, false),
+          "a given share of 1 did not take every unit: " + started.log);
+  for (const AneFfnSetting::Given given : {AneFfnSetting::Given{0.0}, AneFfnSetting::Given{1.5},
                                            AneFfnSetting::Given{0.2, 511}, AneFfnSetting::Given{0.2, 2049}})
     rejects([&] { static_cast<void>(start(fake, {.given = given})); }, "ANE FFN",
             "a given split of share " + std::to_string(given.share) + " from " + std::to_string(given.minimumRows) +
@@ -982,6 +1041,7 @@ int main() {
     testAFailureThatIsNotARefusalKeepsTheCalibration();
     testRemembered();
     testGivenShare();
+    testPipelined();
     std::cout << "ane ffn startup tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

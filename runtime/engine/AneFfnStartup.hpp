@@ -54,6 +54,7 @@ struct AneFfnModel final {
   std::function<std::optional<std::string>()> unavailable;
   // The channel units of the split (ops::AneFfn::units).
   uint32_t units = 0;
+  bool pipelines = false; // whether the split pipelines a command's chunks beside their mixers (AneFfn::start)
   // The split's Metal memory with the ANE taking `aneUnits` of them.
   std::function<uint64_t(uint32_t aneUnits)> plannedBytes;
   // Calibration's timings (ops::ane_ffn::Measurement::time), and the same of

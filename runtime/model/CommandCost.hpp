@@ -32,6 +32,9 @@ struct CommandLimits final {
                                  // split the least rows of a chunk it takes (ops::AneFfn::minimumRows), as fewer
                                  // run the FFN on the GPU alone at a higher cost a row; else 1. A planning bound
                                  // (Scheduler), which the runtime does not refuse
+  bool pipelinesChunks = false;  // the Neural Engine FFN split pipelines a command's chunks (ops::AneFfn::start):
+                                 // an uncontended command takes commandRows, and the runtime cuts a command into
+                                 // chunks of the split's whole pieces (Runtime's prefillChunkRows)
   uint32_t lanesPastChunk = 1;   // lanes whose rows may run past a chunk as the lanes fill the chunks in order: 1
                                  // with GDN state, whose prefill group has one scratch cell for the state between a
                                  // lane's parts (ExecutionLimits::prefillTokenBudget), else maximumBatchWidth

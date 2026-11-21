@@ -6,6 +6,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/AneFfnCalibration.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Normalization.hpp"
 
 #include <array>
 #include <cstdint>
@@ -37,12 +38,22 @@ class Measurement;
 // command whose results are usable (setBreaker).
 class AneFfn final {
 public:
-  // A chunk runs on the smallest of the program's functions that holds it,
-  // one every kProgramStep rows from kMinimumRows to the prefill budget,
-  // since an evaluation costs the ANE its function's rows.
-  static constexpr uint32_t kMinimumRows = 512, kProgramStep = 128, kMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
-  static_assert(kMaximumRows >= kMinimumRows && (kMaximumRows - kMinimumRows) % kProgramStep == 0,
-                "the functions cover the chunks the split takes");
+  // The program has one function, of kEvaluationRows rows, and a chunk runs
+  // as its pieces of that many rows, each an evaluation of the function into
+  // surfaces of its own, the last padded: an evaluation costs the ANE its
+  // function's rows. The service compiles a function in time about
+  // proportional to its rows and channels, so one function of 512 rows
+  // compiles in a tenth of the time of the thirteen, one every 128 rows from
+  // 512 to 2,048, that each chunk ran on whole before. A pipelined command
+  // cuts its chunks at whole pieces (Runtime's prefillChunkRows), so that only
+  // its last chunk pads.
+  static constexpr uint32_t kMinimumRows = 512, kEvaluationRows = 512, kMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
+  static constexpr uint32_t kPieces = kMaximumRows / kEvaluationRows;
+  // The least rows of a split of slots that takes no chunk alone, only those
+  // a command pipelines (splits()).
+  static constexpr uint32_t kPipelinedOnly = kMaximumRows + 1;
+  static_assert(kMaximumRows >= kMinimumRows && kMaximumRows % kEvaluationRows == 0,
+                "a chunk the split takes is whole pieces, but for its last one's padding");
   // The GPU part's down projection is a view of leading inputs, which only
   // the prefill residual tiles (GgufPrefill, GgufPrefillInt8) run: no chunk
   // the split takes stages.
@@ -52,9 +63,12 @@ public:
   // the GPU the rest through `linear`'s prefill plans. The program is
   // compiled and loaded here, and the wait for the ANE's service ends with
   // ane::Interrupted once `interrupted` returns true. The split takes every
-  // chunk its functions hold until setMinimumRows().
+  // chunk from kMinimumRows rows until setMinimumRows(). A command may hold up to
+  // `slots` chunks whose FFNs are in flight at once (start() and join()),
+  // each slot with its own inputs, output and shared event.
   AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
-         uint32_t aneUnits, std::function<bool()> interrupted);
+         uint32_t aneUnits, std::function<bool()> interrupted, uint32_t slots = 1);
+  ~AneFfn();
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
@@ -64,8 +78,10 @@ public:
   // The units the split moves intermediate channels in, of `layers`, which
   // it takes: the ANE takes from one to all but one of them.
   [[nodiscard]] static uint32_t units(std::span<const SwiGluProjections> layers);
-  // The Metal memory of the split of `layers` with the ANE taking `aneUnits`.
-  [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
+  // The Metal memory of the split of `layers` with the ANE taking `aneUnits`,
+  // over `slots` slots.
+  [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+                                             uint32_t slots = 1);
   // What tells this Mac's calibrations of a split of `layers` apart for one
   // macOS version, engine build and most units its plan holds: the layers'
   // shapes and formats, and the Int8Activations of `linear`, whose plans run
@@ -77,8 +93,9 @@ public:
   [[nodiscard]] double share() const noexcept;
   // What Metal allocated for the split, which plannedBytes() bounds.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return allocatedBytes_; }
-  // The least rows of a chunk the split takes (ane_ffn::minimumRows), from
-  // kMinimumRows to kMaximumRows.
+  // The least rows of a chunk the split takes alone, as the only chunk of its
+  // command (ane_ffn::minimumRows): from kMinimumRows to kMaximumRows, or
+  // kPipelinedOnly for a split of slots.
   [[nodiscard]] uint32_t minimumRows() const noexcept { return minimumRows_; }
   void setMinimumRows(uint32_t rows);
   // Stops the split once it loses to the GPU alone: `breaker` judges each
@@ -100,33 +117,59 @@ public:
 
   // Checks the split against the GPU alone on `layers`, those it was built
   // from, with chunks in `ffn` and the residual and output of alternate
-  // layers in `hidden`, all of which it overwrites: each function at its own
-  // rows over the first two layers, which stage the ANE's weights through
-  // both sets, with the ANE's output filled with NaN before so that rows it
-  // leaves unwritten show; each through begin(), the layers encoded as add()
-  // encodes them, commit() and its completion check; each against the
-  // leading rows of a full chunk on the GPU, which computes every row alike
-  // whatever the chunk's rows. Returns the largest error of what the ANE
+  // layers in `hidden`, all of which it overwrites: chunks of one piece, of
+  // pieces whose last pads and of the most rows (verifiedRows() in
+  // AneFfn.cpp) over the first two layers, which stage the ANE's weights
+  // through both sets, with the ANE's output filled with NaN before so that
+  // rows it leaves unwritten show; each through begin(), the layers encoded
+  // as add() encodes them, commit() and its completion check; each against
+  // the leading rows of a full chunk on the GPU, which computes every row
+  // alike whatever the chunk's rows. Returns the largest error of what the ANE
   // adds to the GPU's part (AneFfn.cpp). Throws ane::Refused if an output is
   // not finite, that error exceeds its bound or the ANE's work fails, which
   // stops the split.
   [[nodiscard]] double verify(std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
                               const std::array<metal::MetalBuffer, 2> &hidden);
 
-  // Whether the split takes a chunk of `rows` rows: from minimumRows() to
-  // kMaximumRows, until it stops.
-  [[nodiscard]] bool splits(uint32_t rows) const;
+  // Whether the split takes a chunk of `rows` rows, until it stops: alone,
+  // from minimumRows() to kMaximumRows; one of a command's `pipelined`
+  // chunks, from kMinimumRows, as the ANE runs its FFN beside the GPU's work
+  // on the others.
+  [[nodiscard]] bool splits(uint32_t rows, bool pipelined = false) const;
   // Whether the split stopped, and why.
-  [[nodiscard]] bool retired() const { return handoff_.retired(); }
-  [[nodiscard]] std::string reason() const { return handoff_.reason(); }
+  [[nodiscard]] bool retired() const;
+  [[nodiscard]] std::string reason() const;
+  // The chunks a command may have in flight at once.
+  [[nodiscard]] uint32_t slots() const noexcept { return static_cast<uint32_t>(handoffs_.size()); }
 
   // Starts encoding a command; false once the split stopped.
   bool begin();
   // Layer `layer`'s FFN of a chunk of `rows` rows, from kMinimumRows to
   // kMaximumRows, encoded in layer order from layer 0 after begin(): output =
-  // residual + FFN of ffn.normalized.
+  // residual + FFN of ffn.normalized. start(), stageNext() and join() of
+  // slot 0.
   void add(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
            metal::MetalBuffer output, uint32_t rows);
+  // A pipelined command's parts of add(), for chunks in slots: start() packs
+  // the chunk's normalized rows for the ANE, raises its slot's event and adds
+  // the GPU's part into `output`; join() waits for the ANE's evaluation and
+  // adds its part, before anything reads `output`. Each slot's layers start
+  // in order from layer 0, one start() and join() each. The GPU runs other
+  // chunks' work between them while the ANE runs this one's. Every chunk of a
+  // layer starts on weights staged before its first: begin() stages none, the
+  // first start() of a layer stages it unless stageNext() did, and
+  // stageNext(layer) stages layer + 1 once every chunk of `layer` has
+  // started, and every chunk has joined layer - 1, whose staging set it
+  // overwrites.
+  // With `norm`, which only a split whose ANE takes every channel takes
+  // (fusesNorm()), start() reads `residual` and normalizes it by `norm` as it
+  // packs it, and ffn.normalized stays unwritten: no GPU part reads it.
+  void start(metal::CommandGraph &graph, uint32_t layer, uint32_t slot, const PrefillFfnBuffers &ffn,
+             metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
+             const NormWeights *norm = nullptr);
+  [[nodiscard]] bool fusesNorm() const noexcept { return shape_.gpu == 0; }
+  void join(metal::CommandGraph &graph, uint32_t slot);
+  void stageNext(metal::CommandGraph &graph, uint32_t layer);
   // Starts the ANE's evaluations of the command encoded since begin(), then
   // submits it (MetalBackend::submitCommandAsync). A submission that throws
   // stops the split before the exception goes on.
@@ -171,16 +214,25 @@ private:
     std::vector<ane::Surface> gate, up, down;
     ane::Surface gateScale, upScale, downScale;
   };
-  // Everything the split allocates (allocate() in AneFfn.cpp). The chunk's
-  // rotated input rows in int8 segments, their per-token scales and the ANE's
-  // partial down projection, which every function reads or writes, hold
-  // kMaximumRows rows, whose row stride each function declares. A join that
+  // A piece's surfaces: its rows' rotated inputs in int8 segments, their
+  // per-token scales and the ANE's partial down projection, which the
+  // function reads or writes, of kEvaluationRows rows, whose row stride the
+  // function declares.
+  struct Piece final {
+    std::vector<ane::Surface> inputs;
+    ane::Surface tokenScale, partial;
+  };
+  // A slot's pieces, kPieces of them, the first rows of its chunk first.
+  struct Slot final {
+    std::vector<Piece> pieces;
+  };
+  // Everything the split allocates (allocate() in AneFfn.cpp): each slot's
+  // surfaces, and the scratch and weight sets the slots share. A join that
   // reads a partial value or token scale that is not finite sets the status
   // word (ane_ffn_join).
   struct Memory final {
     metal::MetalBuffer signs, rowScales, rotated, status;
-    std::vector<ane::Surface> inputs;
-    ane::Surface tokenScale, partial;
+    std::vector<Slot> slots;
     std::array<Weights, 2> sets;
   };
   // A projection's weight planes as the ane_ffn kernels bind them: an image
@@ -198,14 +250,14 @@ private:
   // A layer, held by value: the planes of its gate, up and down, from which
   // the GPU stages the ANE's int8 weights, and the GPU's share of it: gate
   // and up over views of their leading rows, down over the leading inputs of
-  // its rows.
+  // its rows; none when the ANE takes every channel.
   struct Layer final {
     std::array<Planes, 3> planes;
-    Projection gate, up, down;
+    std::optional<Projection> gate, up, down;
   };
-  // An input of the ANE program's functions: its name, the surface each
-  // weight set binds to it, and the rows and width the functions read of it,
-  // a width of 0 reading the chunk's rows.
+  // An input of the ANE program's function: its name, the surface each
+  // weight set binds to it, and the rows and width the function reads of it,
+  // a width of 0 reading a piece's rows.
   struct Input final {
     std::string name;
     std::array<const ane::Surface *, 2> surfaces;
@@ -216,32 +268,41 @@ private:
   // of the ANE's channels), or with the ANE's evaluation, which the shared
   // event orders between the packing and the join.
   enum class Parts : uint8_t { Gpu, Both };
-  // The program's function of `rows` rows over the surfaces of each weight
-  // set, by set.
-  struct Evaluation final {
-    uint32_t rows = 0;
-    std::vector<ane::Program::Binding> bindings;
-  };
-  // An evaluation of weight set `set`: it starts once the event reaches
-  // `ready`, and raises it to `done`.
+  // An evaluation of piece `piece` of slot `slot` on weight set `set`: it
+  // starts once the slot's event reaches `ready`, the GPU's or the piece
+  // before's, and raises it to `done`. A chunk's first piece holds its rows,
+  // whole pieces; the others none.
   struct Job final {
-    uint32_t evaluation, set;
+    uint32_t set, slot, piece, rows;
     uint64_t ready, done;
   };
+  // A slot's chunk between start() and join(): the value of its event the
+  // join waits for (none for the GPU's part alone), and the output and rows
+  // it joins into.
+  struct Pending final {
+    bool active = false, ane = false;
+    uint64_t done = 0;
+    metal::MetalBuffer output, residual;
+    uint32_t rows = 0;
+  };
+  // What feeds a committed command's jobs to the ANE, at most kQueueDepth
+  // outstanding (the service refuses its 128th outstanding request): a
+  // thread that queues the next job whenever one reports (AneFfn.cpp).
+  struct Feeder;
 
-  // The split with a function of each of `functionRows` rows, ascending.
-  AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
-         uint32_t aneUnits, std::function<bool()> interrupted, std::span<const uint32_t> functionRows);
   [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
-  // Every allocation of the split, which `buffer` and `surface` make:
-  // plannedBytes() counts them and the constructor allocates them.
+  // Every allocation of the split over `slots` slots, which `buffer` and
+  // `surface` make: plannedBytes() counts them and the constructor allocates
+  // them.
   template <class MakeBuffer, class MakeSurface>
-  [[nodiscard]] static Memory allocate(const Shape &shape, MakeBuffer &&buffer, MakeSurface &&surface);
-  // The program's inputs; the program over them, with a function of each of
-  // `rows` rows; and its function of `rows` rows.
-  [[nodiscard]] static std::vector<Input> programInputs(const Shape &shape, const Memory &memory);
+  [[nodiscard]] static Memory allocate(const Shape &shape, uint32_t slots, MakeBuffer &&buffer,
+                                       MakeSurface &&surface);
+  // The program's inputs for piece `piece` of slot `slot`, and the program
+  // over them: its one function, of kEvaluationRows rows.
+  [[nodiscard]] static std::vector<Input> programInputs(const Shape &shape, const Memory &memory, uint32_t slot,
+                                                        uint32_t piece);
   [[nodiscard]] static std::string program(const Shape &shape, std::span<const Input> inputs,
-                                           const ane::Surface &output, std::span<const uint32_t> rows);
+                                           const ane::Surface &output);
   [[nodiscard]] static std::string function(const Shape &shape, std::span<const Input> inputs,
                                             const ane::Surface &output, uint32_t rows);
   // Fills the CPU-visible bf16 rows `normalized` with the same values of a
@@ -249,10 +310,22 @@ private:
   static void fillNormalized(const metal::MetalBuffer &normalized);
   void encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
               metal::MetalBuffer output, uint32_t rows, Parts parts);
+  void startIn(metal::CommandGraph &graph, uint32_t layer, uint32_t slot, const PrefillFfnBuffers &ffn,
+               metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, Parts parts,
+               const NormWeights *norm = nullptr);
+  // A view of `count` hidden rows of `buffer` from row `first`, in bf16.
+  [[nodiscard]] metal::MetalBuffer hiddenRows(const metal::MetalBuffer &buffer, uint32_t first, uint32_t count) const;
+  // Stages layer `layer`'s weights unless this command did.
+  void stage(metal::CommandGraph &graph, uint32_t layer);
   void addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set) const;
   [[nodiscard]] metal::MetalBuffer rowScales(uint32_t layer, Matrix matrix) const;
-  // Starts `job` on the ANE through the handoff.
-  void queue(const Job &job);
+  // Starts `job` on the ANE through its slot's handoff; `reported` runs once
+  // the ANE has reported it, or at once if it never starts.
+  void queue(const Job &job, std::function<void()> reported);
+  // Each slot's handoff, in turn; retires every slot's with `reason`.
+  void retireAll(const std::string &reason);
+  // Cancels the command committed last on every slot.
+  void cancelAll(const std::string &reason);
   // finish() but for its log line and judgment: if every evaluation of the
   // command committed last succeeded and its joins read finite values, the
   // Neural Engine's time over them (ane::Handoff::finish); none otherwise,
@@ -268,14 +341,21 @@ private:
   std::vector<Layer> layers_;
   Memory memory_;
   std::unique_ptr<ane::Program> program_;
-  // By rows, ascending.
-  std::vector<Evaluation> evaluations_;
-  // The jobs of the command being encoded, which commit() starts, and the
-  // layer it adds next.
+  // The function over each piece's surfaces with each weight set, by
+  // (set * slots + slot) * kPieces + piece.
+  std::vector<ane::Program::Binding> bindings_;
+  // The jobs of the command being encoded, which commit() starts; the layer
+  // each slot adds next and its chunk between start() and join(); and the
+  // layers whose weights the command staged, the last one's.
   std::vector<Job> jobs_;
-  uint32_t nextLayer_ = 0;
-  // The evaluations of the command committed last, and its function's rows.
+  std::vector<uint32_t> nextLayer_;
+  std::vector<Pending> pending_;
+  std::optional<uint32_t> staged_;
+  // The chunks' evaluations of the command committed last, a layer's each,
+  // and their rows (the most, whole pieces), and whether more than one slot
+  // ran them.
   uint32_t committedEvaluations_ = 0, committedRows_ = 0;
+  bool committedSlots_ = false;
   ane_ffn::Breaker breaker_;
   std::function<void()> lost_;
   Served served_;
@@ -285,8 +365,10 @@ private:
   bool released_ = false;
   bool warned_ = false;
   uint64_t allocatedBytes_ = 0;
-  // Destroyed first: it waits for the evaluations the ANE has not reported.
-  ane::Handoff handoff_;
+  // Destroyed first: each waits for the evaluations the ANE has not reported
+  // of its slot, once the destructor has stopped the feeder.
+  std::shared_ptr<Feeder> feeder_;
+  std::vector<std::unique_ptr<ane::Handoff>> handoffs_;
 };
 
 } // namespace splash::ops
