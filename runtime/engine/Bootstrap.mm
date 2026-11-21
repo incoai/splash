@@ -378,12 +378,12 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     WarmupStepStatus status = WarmupStepStatus::Pending;
     run(RuntimeBootstrapStage::AneFfnSetUp, status, [&] {
       const auto started = AwakeClock::now();
-      const uint32_t rows = setUp(mostRowsMilliseconds);
-      if (!rows)
-        return model::WarmupStepResult{"the GPU alone",
-                                       std::chrono::duration<double>(AwakeClock::now() - started).count(), {}};
-      const KvPool::RunwayHold runway(kvPool);
-      return modelRuntime.warmupPrefill(rows);
+      if (const uint32_t rows = setUp(mostRowsMilliseconds)) {
+        const KvPool::RunwayHold runway(kvPool);
+        return modelRuntime.warmupPrefill(rows);
+      }
+      // A set-up that left the GPU alone took at least the clock's tick (1 ns), even where the clock read none.
+      return model::WarmupStepResult{"the GPU alone", std::max(millisecondsSince(started) / 1000.0, 1e-9), {}};
     }, true);
     audit();
   }
