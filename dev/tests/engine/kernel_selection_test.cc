@@ -686,7 +686,9 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
 
 // Every device's plans with int8 activations off (int8ActivationsOff): with
 // them on every Apple10 and Apple11 device runs all three int8-activation
-// paths and no Apple9 device any.
+// paths. Apple9 runs the INT8 prefill tile and decode tiles never, and INT8
+// attention queries on its larger GPUs only (kApple9Attention); a small one
+// keeps the BF16 queries the M4 measured.
 void int8ActivationsOff() {
   for (const auto [family, cores] : kDevices) {
     const std::string name = std::to_string(family) + "," + std::to_string(cores);
@@ -694,7 +696,11 @@ void int8ActivationsOff() {
         off(device(family, cores), Int8Activations::Off);
     const Int8Paths paths = int8ActivationsOff(name, on, off);
     const bool int8 = family >= 10;
-    if ((paths.prefillTile > 0) != int8 || (paths.decode > 0) != int8 || (paths.queries > 0) != int8)
+    // Apple9's large GPUs score INT8 queries from 32 pages a split; its small
+    // ones (and a device reporting no cores, planned at 32) do not.
+    const bool int8Queries = int8 || (family == 9 && (cores == 0 || cores > ops::kApple9SmallGpuCores));
+    if ((paths.prefillTile > 0) != int8 || (paths.decode > 0) != int8 ||
+        (paths.queries > 0) != int8Queries)
       throw std::runtime_error(name + ": with int8 activations on, " + std::to_string(paths.prefillTile) +
                                " prefill, " + std::to_string(paths.decode) + " decode and " +
                                std::to_string(paths.queries) + " attention plans run int8 activations");

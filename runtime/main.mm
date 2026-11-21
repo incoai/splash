@@ -241,6 +241,13 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.int8Activations = arguments.int8Activations;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
+  // A lone prefill command keeps to eight seconds: macOS aborts a command
+  // buffer that holds the GPU while the display needs it
+  // (kIOGPUCommandBufferCallbackErrorImpactingInteractivity), which a
+  // 2,048-row command did on an M2 Max at about 16 s. Eight seconds holds a
+  // 512-row chunk, the Neural Engine FFN split's least chunk, in one command
+  // instead of cutting it below that split, so long prefills keep the split.
+  config.nativeLoop.engine.isolatedPrefillMilliseconds = 8000.0;
   return config;
 }
 

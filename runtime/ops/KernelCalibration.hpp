@@ -298,14 +298,29 @@ inline constexpr FloatTileCalibration kApple10FloatTile{true, 16, 3, 4, 6};
 // 20-core M5 Pro).
 inline constexpr AttentionCalibration kApple10Attention{.pagesPerSplit = 32, .int8QueriesFromPages = 8};
 
-// No Apple9 GPU scores INT8 queries: on a 10-core M4 they took 8-12% longer,
-// its matrix operations sharing the FP32 pipe. Larger Apple9 GPUs, unmeasured,
-// share that pipe too.
+// Apple9 keeps BF16 queries where a split reads fewer than 32 pages: on a
+// 10-core M4 they took 8-12% longer measured at that size, its matrix
+// operations sharing the FP32 pipe. Past it the INT8 product's smaller
+// operand traffic repays the query codes: on a 38-core M2 Max, whose pipe is
+// the same kind, one 27B attention layer with 8 verify rows ran 1.42x faster
+// at 32,768 tokens, 1.46x at 131,072 and 1.49x at 249,935 (attention-sweep,
+// medians of 5), and its gain saturates there. Larger Apple9 GPUs are
+// unmeasured; this threshold leaves their short histories as the M4 measured
+// them and takes INT8 only where the gain is steep.
 inline constexpr AttentionCalibration kApple9Attention = [] {
   AttentionCalibration row = kApple10Attention;
-  row.int8QueriesFromPages = kNever;
+  row.int8QueriesFromPages = 32;
   return row;
 }();
+
+// Apple8 (M2) scores INT8 queries faster than BF16 ones: measured on a
+// 38-core M2 Max, one 27B attention layer, 8 verify rows: 9.30 -> 6.58 ms at
+// 131,072 tokens and 18.41 -> 11.98 at 249,935 (repeat 5, fused graphs), and
+// a 2,048-row prefill chunk 310.7 -> 198.2 ms at 16,384 tokens. The INT8
+// kernels read half the K bytes; the M4 result above is an Apple9 one, whose
+// pipeline layout differs. Short histories keep BF16 queries: a split under
+// int8QueriesFromPages pages never takes them.
+inline constexpr AttentionCalibration kApple8Attention{.pagesPerSplit = 32, .int8QueriesFromPages = 8};
 
 // On a 10-core M4 one split per 64 pages leaves every case within the A/A
 // spread (0.7%), where one per 32 takes 1.8% more on the 35B's 512-row chunk
@@ -313,6 +328,9 @@ inline constexpr AttentionCalibration kApple9Attention = [] {
 inline constexpr AttentionCalibration kApple9SmallAttention = [] {
   AttentionCalibration row = kApple9Attention;
   row.pagesPerSplit = 64;
+  // The one measured Apple9 row: a 10-core M4's BF16 queries were the
+  // faster ones, so its splits keep them at every history.
+  row.int8QueriesFromPages = kNever;
   return row;
 }();
 
@@ -321,11 +339,19 @@ inline constexpr AttentionCalibration kApple9SmallAttention = [] {
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
   const GpuClass gpu = device.gpuClass();
-  if (gpu != GpuClass::Apple9)
+  // Apple8 multiplies on the FP32 pipe as Apple9 does, so it takes Apple9's
+  // rows: a 38-core M2 Max decodes Qwen3.8-27B IQ4_XS at 79 tok/s, 95 ms a
+  // cycle at 256K context, its DFlash2 draft accepting all 437 proposals of a
+  // 500-token request. Those weights decode at 91 tok/s on paperniuk's 1.6.1
+  // M1/M2 build, which runs the register tile this tree no longer carries:
+  // Apple8's rows have that much headroom left.
+  if (gpu == GpuClass::Apple10 || gpu == GpuClass::Apple11)
     return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
             kApple10Attention};
   return {cores, kApple9Projection, kApple9FloatTile,
-          cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention};
+          device.gpuClass() == GpuClass::Apple8
+              ? kApple8Attention
+              : cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention};
 }
 
 } // namespace splash::ops
