@@ -10,6 +10,9 @@ namespace {
 constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
 // The fewest rows the pair bound halves a lane's command to.
 constexpr uint32_t kMinimumPrefillRows = 64;
+// The rows a lone lane's first command takes under the isolated bound, before
+// any command has been timed.
+constexpr uint32_t kIsolatedPrefillFirstRows = 512;
 // The fewest rows a contended cut leaves a unit, or the model's least rows
 // where more (the Neural Engine FFN split's least chunk): smaller cuts lose
 // prefill throughput (17% fewer rows a second on an M6 below 512 rows).
@@ -66,6 +69,8 @@ Scheduler::Scheduler(SchedulerConfig config, const model::PrefillWorkSource &wor
     : config_(config), work_(work), decodeShare_(config.decodeShare) {
   if (!std::isfinite(config_.decodeGapMilliseconds) || config_.decodeGapMilliseconds <= 0.0)
     throw std::invalid_argument("the decode gap target must be positive and finite");
+  if (!(config_.isolatedPrefillMilliseconds > 0.0))
+    throw std::invalid_argument("the isolated prefill bound must be positive");
   if (!config_.limits.commandRows || !config_.limits.maximumPasses)
     throw std::invalid_argument("a prefill command must hold a row in at least one pass");
   counters_.decodeGapTargetMilliseconds = config_.decodeGapMilliseconds;
@@ -503,8 +508,8 @@ bool Scheduler::withinPairs(std::span<const model::PrefillLane> lanes) const {
   return layerPairs(lanes) <= config_.limits.attentionPairs;
 }
 
-uint32_t Scheduler::cutRows(const Lane &leader) const {
-  const uint32_t floor = std::max(kFloorRows, config_.limits.minimumUnitRows);
+uint32_t Scheduler::cutRows(const Lane &leader, double milliseconds, uint32_t floorRows) const {
+  const uint32_t floor = floorRows;
   uint32_t rows = floor;
   if (measured_) {
     // The rows the last command ran in G at its time a row, fewer where this
@@ -513,9 +518,8 @@ uint32_t Scheduler::cutRows(const Lane &leader) const {
     const double pairs = double(layerPairs({&probe, 1}));
     const double deeper =
         measured_->pairs && pairs > double(measured_->pairs) ? double(measured_->pairs) / pairs : 1.0;
-    rows = static_cast<uint32_t>(std::clamp(
-        measured_->rows * config_.decodeGapMilliseconds / measured_->milliseconds * deeper, double(floor),
-        double(std::max(floor, kChunk))));
+    rows = static_cast<uint32_t>(std::clamp(measured_->rows * milliseconds / measured_->milliseconds * deeper,
+                                            double(floor), double(std::max(floor, kChunk))));
   }
   // A rest below the floor runs with the unit, up to a chunk.
   const uint32_t remaining = leader.remaining();
@@ -545,8 +549,17 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   // A layer's attention pairs bound the rows, which passes never lower.
   while (lanes.front().rows > kMinimumPrefillRows && !withinPairs(lanes))
     lanes.front().rows /= 2;
-  // Joiners never take a unit past its rows: a cut's, a group's or a chunk.
-  const uint32_t unitRows = cut ? cutRows(leader) : groupRows(leader);
+  // Joiners never take a unit past its rows: a cut's, a group's, a chunk's, or
+  // the time one command may hold the GPU for a lane alone.
+  const uint32_t unitRows =
+      group ? groupRows(leader)
+      : cut ? cutRows(leader, config_.decodeGapMilliseconds, std::max(kFloorRows, config_.limits.minimumUnitRows))
+            : !std::isfinite(config_.isolatedPrefillMilliseconds)
+                  ? groupRows(leader)
+              : measured_
+                  ? std::min(groupRows(leader),
+                             cutRows(leader, config_.isolatedPrefillMilliseconds, kMinimumPrefillRows))
+                  : std::min(groupRows(leader), kIsolatedPrefillFirstRows);
   if (unitRows < lanes.front().rows) {
     lanes.front().rows = unitRows;
     ++result.boundCuts;

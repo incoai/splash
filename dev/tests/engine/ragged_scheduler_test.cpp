@@ -88,9 +88,14 @@ std::string at(const test::TimingProfile &profile) {
 class Sim {
 public:
   explicit Sim(const test::TimingProfile &profile, model::CommandLimits commandLimits = limits(),
-               double decodeShare = 0.5, std::function<double()> residentShare = {})
+               double decodeShare = 0.5, std::function<double()> residentShare = {},
+               double isolatedPrefillMilliseconds = std::numeric_limits<double>::infinity())
       : work(profile, std::move(residentShare)), commandLimits(reported(profile, commandLimits)),
-        scheduler({.decodeShare = decodeShare, .decodeGapMilliseconds = kGap, .limits = this->commandLimits}, work) {}
+        scheduler({.decodeShare = decodeShare,
+                   .decodeGapMilliseconds = kGap,
+                   .isolatedPrefillMilliseconds = isolatedPrefillMilliseconds,
+                   .limits = this->commandLimits},
+                  work) {}
 
   test::TimedWork work;
   model::CommandLimits commandLimits;
@@ -1641,6 +1646,20 @@ void testEqualPromptsFinishInArrivalOrder() {
   require(sim.plan().items[0].requestId == 2, "the next oldest equal prompt did not lead once the oldest's ended");
 }
 
+// A lane alone keeps its prefill commands inside the time the configuration
+// allows: with a one-millisecond bound, the command after the first measured
+// one runs the floor's rows, not a whole chunk.
+void testALoneLaneKeepsItsCommandsInsideTheIsolatedBound() {
+  Sim sim(test::kDense27B, limits(), 0.0, {}, 1.0);
+  sim.lane(1, 0, 5000);
+  const BatchPlan first = sim.plan();
+  require(first.items[0].tokenCount <= 512, "the first command was not the bound's seed rows");
+  sim.run(first);
+  const BatchPlan second = sim.plan();
+  require(second.items[0].tokenCount < first.items[0].tokenCount,
+          "the isolated prefill bound did not shorten the next command");
+}
+
 // A later short prompt leads an earlier long one.
 void testShortArrivalPrecedesLongColdPrompt() {
   DenseSim sim;
@@ -1954,6 +1973,7 @@ constexpr test::TestCase kTests[] = {
     {"testARestoringStartHoldsBackWhatItWouldLead", testARestoringStartHoldsBackWhatItWouldLead},
     {"testAgingBoundsALongLaneUnderArrivals", testAgingBoundsALongLaneUnderArrivals},
     {"testAWaitingPromptIsOverdueAfterKOvertakes", testAWaitingPromptIsOverdueAfterKOvertakes},
+    {"testALoneLaneKeepsItsCommandsInsideTheIsolatedBound", testALoneLaneKeepsItsCommandsInsideTheIsolatedBound},
     {"testEqualPromptsFinishInArrivalOrder", testEqualPromptsFinishInArrivalOrder},
     {"testShortArrivalPrecedesLongColdPrompt", testShortArrivalPrecedesLongColdPrompt},
     {"testHigherTierCommandsDoNotAgeALowerTier", testHigherTierCommandsDoNotAgeALowerTier},

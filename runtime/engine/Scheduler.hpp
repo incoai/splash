@@ -33,6 +33,12 @@ enum class Phase : uint8_t {
 struct SchedulerConfig final {
   double decodeShare = 0.5;
   double decodeGapMilliseconds = 500.0;
+  // The longest a prefill command of a lane alone may take, in milliseconds:
+  // macOS aborts a command buffer that holds the GPU while the display needs
+  // it (kIOGPUCommandBufferCallbackErrorImpactingInteractivity), which a
+  // 2,048-row command did on an M2 Max at about 16 s. Infinite leaves a lone
+  // lane whole chunks. Finite and positive.
+  double isolatedPrefillMilliseconds = std::numeric_limits<double>::infinity();
   model::CommandLimits limits;
 };
 
@@ -327,7 +333,7 @@ private:
   // max(kFloorRows, CommandLimits::minimumUnitRows), to a chunk; the floor
   // before any command ran; to the leader's prompt's end where the rest
   // would fall below the floor. The pair bound may leave the leader fewer.
-  [[nodiscard]] uint32_t cutRows(const Lane &leader) const;
+  [[nodiscard]] uint32_t cutRows(const Lane &leader, double milliseconds, uint32_t floorRows) const;
   // The resident prefill lanes a plan may serve: those it is not made
   // without and that did not end.
   [[nodiscard]] std::vector<Lane> readyLanes(const PlanInputs &in) const;

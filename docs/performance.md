@@ -69,6 +69,64 @@ Prefilling a 2,048-token chunk, it runs at 559 tok/s against 374 on the 27B
 and 3,662 against 1,968 on the 35B on the M5 Pro, and at 245 against 193 and
 1,814 against 1,575 on the M3 Max.
 
+## Apple8 (M2)
+
+Apple8 takes the Apple9 kernel plans, whose matrix operations run on the FP32
+pipe it shares, with one attention row of its own: it scores INT8 queries from
+eight pages a split, where Apple9 never does (below).
+
+Measured on an M2 Max (38-core GPU, 64 GB, macOS 27.0.1) serving Qwen3.8-27B
+Heretic IQ4_XS with its DFlash2 draft at the model's 256K window, greedy, one
+warm session climbing 65K, 131K and 250K tokens so each rung reuses the
+previous prefix:
+
+| Context | Decode | Prefill |
+| --- | ---: | ---: |
+| Empty | 53.1 tok/s | — |
+| 65,571 | 39.1 tok/s | 112 tok/s |
+| 131,047 | 29.0 tok/s | 61 tok/s |
+| 249,935 | 20.0 tok/s | 38 tok/s |
+
+The empty-context figure is the median of three programming questions (53.1,
+40.8 and 67.7 tok/s; the spread is draft acceptance). Prefill is the rate of
+the tokens each rung computes: a first cold send at 65K, the newly sent tail
+above it.
+
+Attention scores INT8 queries where a split reads enough pages for the
+smaller operand traffic to repay the query codes: from eight pages on Apple8,
+Apple10 and Apple11, and from 32 on larger Apple9 GPUs, whose 10-core M4
+measurement at short histories kept BF16. For Apple8 that is 1.41x at 131,072
+tokens and 1.54x at 249,935 in `attention-sweep`'s one-layer verify case (9.30
+-> 6.58 and 18.41 -> 11.98 ms), and 1.57x on a 2,048-row prefill chunk at
+16,384 tokens (310.7 -> 198.2 ms). The gain rises with a split's pages: on the
+same Mac a verify reads 16 pages a split at 16,384 tokens for 1.19x and 62 at
+249,935 for 1.49x. Shorter histories keep BF16 queries.
+
+Qwen3.8-27B UD-Q4_K_M on the 1.6.1 tree, `--max-memory 46G --language-only`,
+greedy, 400 output tokens, medians of three runs:
+
+| Metric | M2 Max |
+| --- | ---: |
+| Decode · code prompt | 30.6 tok/s |
+| Decode · prose prompt | 26.0 tok/s |
+| Decode · 4 concurrent short prompts | 46.9 tok/s |
+| Prefill · 6,430-token prompt | 146 tok/s |
+| Prefill · 25,540-token prompt | 123 tok/s |
+| Cached time to first token · 25.5K replay | 1.0 s |
+| Context at `--max-memory 46G` | 256K tokens |
+
+The prompts are the author's; each prefill is a first, cold send of its
+prompt, and the decode figures are the engine's own
+`predicted_per_second`. A 2,048-row prefill command holds the GPU for about 16
+seconds at the 25.5K rate above, past the few seconds macOS gives a command
+while the display needs the GPU, so a long cold prompt can be aborted with
+`Impacting Interactivity` under desktop load, which fails that request and
+restarts the engine. A lone lane's prefill commands now keep to eight seconds
+(`EngineConfig::isolatedPrefillMilliseconds`, set by the native loop): that
+holds a 512-row chunk, the Neural Engine FFN split's least, in one command,
+where a three-second bound cuts to about 200 rows and never runs the split. A
+cold 131K prefill runs 45 -> 61 tok/s and no 250K run aborted.
+
 ## Smaller GGUFs on 24 GB Macs
 
 Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:

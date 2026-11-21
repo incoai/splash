@@ -65,6 +65,9 @@ struct EngineConfig final {
   // only where one layer of a group, or a cut at its floor rows, does
   // (Scheduler). Finite and positive.
   double decodeGapMilliseconds = 500.0;
+  // The longest a prefill command of a lane alone may take, in milliseconds;
+  // infinite leaves it whole chunks (SchedulerConfig).
+  double isolatedPrefillMilliseconds = std::numeric_limits<double>::infinity();
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
