@@ -452,7 +452,7 @@ extension ServerScreenTests {
         let flint = ServeSettingsTests.flint.unusable.sorted().map { "\"\($0)\"" }.joined(separator: ", ")
         let moe = ServeSettingsTests.moe.unusable.sorted().map { "\"\($0)\"" }.joined(separator: ", ")
         let qwen = #""context_tokens": 262144, "max_context_tokens": 1010000"#
-        return #"{"Qwen3.8-27B": {"unusable": ["--disable-ane", "--expert-memory", "--ple-memory", "--sparse-kv-memory"], \#(qwen)}, "#
+        return #"{"Qwen3.8-27B": {"unusable": ["--disable-ane", "--expert-memory", "--ple-memory", "--recalibrate-ane", "--sparse-kv-memory"], \#(qwen)}, "#
             + #""Qwen3.6-35B-A3B": {"unusable": [\#(moe)], \#(qwen)}, "#
             + #""Flint": {"unusable": [\#(flint)], "context_tokens": 262144, "max_context_tokens": 262144}}"#
     }()

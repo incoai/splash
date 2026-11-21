@@ -528,6 +528,11 @@ extension LaunchOption {
             help: "Reads long prompts faster on models that can use it.",
             section: .requests, kind: .toggle(on: false)),
         LaunchOption(
+            flag: "--recalibrate-ane", title: "Recalibrate Neural Engine",
+            help: "Measures again at each start how much of a long prompt the Neural Engine reads, which makes the start longer. Turn it on if long prompts read slower than they should, start the model once, then turn it off.",
+            section: .requests, kind: .toggle(on: true),
+            requires: [Requirement("Needs Neural Engine for long prompts on.") { $0["--disable-ane"] != "true" }]),
+        LaunchOption(
             flag: "--activations", title: "Activations",
             help: "Auto does some of the GPU’s math in 8 bits where M5 and later Macs run it faster, at a small cost in precision. 16-bit does none.",
             section: .requests, kind: .choice(standard: "Auto", choices: [("bf16", "16-bit")], custom: nil)),

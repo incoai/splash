@@ -142,17 +142,23 @@ struct ServeSettingsTests {
                                           "--max-cache-disk": "0", "--sparse-kv-memory": "2G"])
         #expect(text.serveArguments(model: "a/b") == ["serve", "--model", "a/b", "--port", "8000", "--offline",
                                                       "--language-only", "--max-cache-disk", "0"])
+        // A start recalibrates the Neural Engine where asked while it is on, never while it is off.
+        var ane = ServeSettings(values: ["--recalibrate-ane": "true"])
+        #expect(ane.serveArguments(model: "a/b").last == "--recalibrate-ane")
+        ane["--disable-ane"] = "true"
+        #expect(ane.serveArguments(model: "a/b") == ServeSettings(values: ["--disable-ane": "true"]).serveArguments(model: "a/b"))
     }
 
     /// An option the others leave no effect says what it lacks.
     @Test func aDimmedOptionSaysWhatItNeeds() {
-        let off = ServeSettings(values: ["--max-cache-disk": "0", "--language-only": "true"])
+        let off = ServeSettings(values: ["--max-cache-disk": "0", "--language-only": "true", "--disable-ane": "true"])
         let ssd = "Needs the SSD cache (SSD Cache Size not Off)."
         #expect(LaunchOption.all.filter { !$0.applies(off) }.map { [$0.flag, $0.lacks(off)] } == [
             ["--sparse-kv-memory", ssd], ["--max-cache-disk-writes", ssd], ["--persistent-cache", ssd],
             ["--cache-dir", "Needs Keep after stopping on. \(ssd)"],
             ["--announce-served-name", "Needs a served model name."],
             ["--max-image-pixels", "Needs the model’s vision (Text only off)."],
+            ["--recalibrate-ane", "Needs Neural Engine for long prompts on."],
         ])
         // Only what it lacks.
         let cacheDir = LaunchOption.all.first { $0.flag == "--cache-dir" }
@@ -164,10 +170,10 @@ struct ServeSettingsTests {
     /// Flint's options, as the runtime reports its family: no vision, recurrent state, PLE table,
     /// sparse KV, Neural Engine or thinking switch.
     static let flint = ModelFamily(unusable: ["--language-only", "--state-format", "--cached-states", "--ple-memory", "--sparse-kv-memory",
-                                              "--disable-ane", "--max-image-pixels", "--default-reasoning-effort",
+                                              "--disable-ane", "--recalibrate-ane", "--max-image-pixels", "--default-reasoning-effort",
                                               "--thinking-token-budget", "--thinking-end-text"],
                                    contextTokens: 262_144, maxContextTokens: 262_144)
-    static let moe = ModelFamily(unusable: ["--ple-memory", "--sparse-kv-memory", "--disable-ane"],
+    static let moe = ModelFamily(unusable: ["--ple-memory", "--sparse-kv-memory", "--disable-ane", "--recalibrate-ane"],
                                  contextTokens: 262_144, maxContextTokens: 1_010_000)
 
     @Test func aModelStartsWithoutTheOptionsItsFamilyCannotUse() {
@@ -190,6 +196,10 @@ struct ServeSettingsTests {
         #expect(LaunchOptions.options(.memory, for: Self.flint).map(\.flag)
             == ["--kv-format", "--expert-memory"])
         #expect(LaunchOptions.options(.memory, for: .unknown).count == 6)
+        // Recalibrating the Neural Engine goes with the Neural Engine.
+        #expect(LaunchOptions.options(.requests, for: Self.moe).map(\.flag).filter { $0.hasSuffix("-ane") } == [])
+        #expect(LaunchOptions.options(.requests, for: .unknown).map(\.flag).filter { $0.hasSuffix("-ane") }
+            == ["--disable-ane", "--recalibrate-ane"])
     }
 
     /// A context length longer than the model picked serves stays kept for a model that serves it,
