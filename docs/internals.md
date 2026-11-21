@@ -1655,7 +1655,12 @@ so later starts load them, in about 0.1 s, until macOS clears that directory.
 Startup gives the service 120 s to compile and load a program, after which the
 GPU runs alone: the private client's work for every program runs in turn on one
 queue (`runtime/ane/Program.mm`), so work queued behind a service that stopped
-answering runs out of its time too. The ANE computes in fp16, whose range
+answering runs out of its time too. Its requests run at user-initiated QoS,
+which orders the ANE's queue ahead of default, utility and background clients'
+work (media analysis, indexing) but does not cut short an inference already
+running: at default QoS, behind a client at user-initiated, each evaluation of
+a 20-core M5 Pro's split waited 234 ms instead of 12.
+The ANE computes in fp16, whose range
 (±65504) bounds a split layer's gate pre-activations and its intermediate
 values over each token's input peak; it leaves its output's token scales to the
 GPU's join, in fp32. While serving, any failure of the ANE's work stops the
