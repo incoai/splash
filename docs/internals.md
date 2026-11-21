@@ -2724,9 +2724,12 @@ the host mask exchange: the draft, the target forward while the server computes
 each constrained lane's masks, and the selection, in which only the constrained
 lanes read masks. A lane's mask request carries its rows as their tree,
 each row's token and its parent row, and the server's grammar walks it depth
-first in one matcher, consuming a row's token over its parent's state and
-rolling it back after the row's subtree, so each row's mask follows its own
-path; a row whose token the grammar rejects there, and every row below it,
+first and only forward, on a copy of the request's committed matcher, each row
+with several children giving each but its last a copy of its own matcher, so
+each row's mask follows its own path. No matcher takes a token back: LLGuidance
+1.8.0 keeps its last mask keyed by its lexer state and parser row index, which
+another branch can reach again after a rollback with other parser rows under it
+(#790). A row whose token the grammar rejects there, and every row below it,
 takes its parent's mask, as the target never accepts it. With the masks come
 the tokens the grammar forces after each row's path, as pairs of a row and a
 token, which the next cycle proposes as its host chain where the path the
