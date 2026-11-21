@@ -214,7 +214,6 @@ struct Fake {
       stored = remembered = calibration;
       return true;
     };
-    result.forget = [this](uint32_t) { stored.reset(); };
     result.healthy = [this] { return healthy; };
     return result;
   }
@@ -629,7 +628,7 @@ void testExplicitContext() {
 }
 
 // A relaunch holds the context the server's first engine served: the largest split's, whatever that engine's
-// calibration made of the split, so that one made anew, as once the breaker forgot the first, serves it too. Its
+// calibration made of the split, so that one made anew, as by another build of the engine, serves it too. Its
 // split takes at most the units whose plan holds that context, calibrated within them and remembered under them,
 // and the log names no automatic context. Where no split leaves it, as after a first engine that took a record of no
 // gain, the GPU runs alone, untimed, with a plain line instead of the way out a refused --max-context is warned of;

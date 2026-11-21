@@ -149,12 +149,9 @@ public:
   void setRows(Rows rows);
   // Pauses the split for `pause` once it loses to the GPU alone, and stops
   // it once a probe loses too (ane_ffn::Pause): `breaker` judges each command
-  // finish() finds split, and `lost` runs once when it stops. Until this is
-  // called, none does.
-  void setBreaker(ane_ffn::Breaker breaker, std::function<void()> lost,
-                  AwakeClock::duration pause = ane_ffn::Pause::kLength) noexcept {
+  // finish() finds split. Until this is called, none does.
+  void setBreaker(ane_ffn::Breaker breaker, AwakeClock::duration pause = ane_ffn::Pause::kLength) noexcept {
     breaker_ = std::move(breaker);
-    lost_ = std::move(lost);
     pause_ = ane_ffn::Pause(pause);
   }
 
@@ -387,7 +384,6 @@ private:
   // evaluations' function rows over a layer.
   uint32_t committedLayers_ = 0, committedEvaluations_ = 0, committedRows_ = 0;
   ane_ffn::Breaker breaker_;
-  std::function<void()> lost_;
   ane_ffn::Pause pause_;
   Served served_;
   // Whether a command committed jobs that finish() has not yet judged.

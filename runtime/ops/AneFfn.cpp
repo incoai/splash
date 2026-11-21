@@ -839,7 +839,6 @@ bool AneFfn::finish(const metal::CommandTiming &timing) {
   if (verdict == ane_ffn::Pause::Verdict::Stopped) {
     handoff_.retire(std::move(losing));
     warnStopped();
-    if (lost_) std::exchange(lost_, {})();
   }
   return true;
 }

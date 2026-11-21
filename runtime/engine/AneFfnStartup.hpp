@@ -69,10 +69,9 @@ struct AneFfnModel final {
   // model a test plays prepares no split.
   std::function<AneFfnPrepared(ops::AneFfn::Shares shares, ops::AneFfn::Rows rows, bool timeChunks)> prepare;
   // This Mac's calibration of the split within `maxAneUnits` units, if one
-  // is remembered; remembering one, true once kept; and forgetting it.
+  // is remembered; and remembering one, true once kept.
   std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;
   std::function<bool(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
-  std::function<void(uint32_t maxAneUnits)> forget;
   // Whether the Metal backend still serves.
   std::function<bool()> healthy;
 };
@@ -170,8 +169,8 @@ startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, RequestedCon
 // start's prefill gives: one taken on a busier Mac. Else it is calibrated
 // (AneFfnStartup.cpp), the mixer the rest of that prefill's layer, and the
 // outcome remembered, a split or none. The split judges itself against the
-// GPU alone as calibrated (ops::ane_ffn::Breaker), which forgets the
-// calibration when it trips; the Neural Engine's refusals count
+// GPU alone as calibrated (ops::ane_ffn::Breaker), and a split that stops for
+// losing keeps the calibration; the Neural Engine's refusals count
 // (ops::ane_ffn::Calibration). Fails as startAneFfn does.
 struct AneFfnFinished final {
   std::unique_ptr<ops::AneFfn> split;

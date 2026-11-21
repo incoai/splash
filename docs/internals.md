@@ -1688,8 +1688,11 @@ command was slower than the GPU alone. The GPU then runs every chunk alone for
 (...)`; the next command split after that probes: one that wins resumes the
 split, and a later loss pauses it for 5 minutes again, so that a server that
 meets a busy ANE now and then never pauses for longer; one that loses too
-stops the split the same way as a failure, and the start's calibration is then
-forgotten, so that the next start calibrates again. Another client of the ANE
+stops the split the same way as a failure. The start's calibration is kept: a
+loss says the ANE was busy, not that the calibration is wrong, and a start
+that calibrated again beside the same client would read the ANE slow and keep
+a small share or none (a record taken on a busier Mac is the busy check's).
+Another client of the ANE
 made a 20-core M5 Pro's split commands take 1.77 times the GPU alone's layers
 at the split's priority and 12.7 times behind a higher one, and the split
 paused after the first; a healthy split's commands come nearest the line at
@@ -1754,8 +1757,7 @@ function the client's instrumented build
 (`runtime/ane/ProgramInstrumentation.hpp`) binds to another's procedure, each
 fault of an evaluation it injects at each layer, a program that does not load
 again and evaluations slower than the GPU alone, which the breaker pauses at
-the first command and stops at the probe after it, telling the start to forget
-its calibration, and the private
+the first command and stops at the probe after it, and the private
 client's failures, limits, unload and load, and cache files on a small program.
 `handoff` runs the event handoff against an agent the CPU plays in each way it
 can fail, and `ane-program-faults` checks that an Objective-C exception and a

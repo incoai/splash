@@ -955,8 +955,8 @@ void stops(MetalBackend &backend, const Linear &linear, const Model &model, cons
 // trips the breaker, the GPU alone's layers. The breaker given those timings, its pause none long, pauses the split
 // at its first command, whose results are usable; the GPU alone runs the next command, computing, bit for bit, what
 // it computes on its own, and ends the pause; the probe after it loses too and stops the split for losing to the GPU
-// alone, with the Neural Engine's time over both split commands counted, lag and all, telling its owner once; idle,
-// the stopped split unloads its program for good.
+// alone, with the Neural Engine's time over both split commands counted, lag and all; idle, the stopped split unloads
+// its program for good.
 void loses(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
   constexpr uint32_t kRows = AneFfn::kMaximumRows;
   ane_ffn::ChunkTimings timings;
@@ -977,8 +977,7 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
       2.0 * std::chrono::duration<double, std::milli>(std::max(timings.gpu[1].milliseconds, evaluation)));
   ane::ProgramInstrumentation::arm({.lag = lag});
   const auto split = std::make_unique<AneFfn>(backend, linear, model.layers, kShares, kBothRows, nullptr);
-  uint32_t lost = 0;
-  split->setBreaker(ane_ffn::Breaker(timings.gpu, 0.0), [&] { ++lost; }, AwakeClock::duration::zero());
+  split->setBreaker(ane_ffn::Breaker(timings.gpu, 0.0), AwakeClock::duration::zero());
   const Forward alone = forward(backend, linear, model, nullptr, chunk, kRows);
   // The paused split, the GPU alone, the probe.
   for (uint32_t command = 1; command <= 3; ++command) {
@@ -988,9 +987,8 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
     if (!got.usable) fail(label + ": unusable: " + split->reason());
     if (splits != (command != 2) || (command == 2 && got.bits != alone.bits))
       fail(label + (splits ? ": split" : ": not split") + (got.bits == alone.bits ? "" : ", not the GPU alone's"));
-    if (split->retired() != (command == 3) || lost != (command == 3))
-      fail(label + (split->retired() ? ": the split stopped for " + split->reason() : ": the split did not stop") +
-           ", its owner told " + std::to_string(lost) + " times");
+    if (split->retired() != (command == 3))
+      fail(label + (split->retired() ? ": the split stopped for " + split->reason() : ": the split did not stop"));
   }
   std::cout << "  a lag of " << lag.count() << " ms, the Neural Engine's own evaluation " << evaluation
             << " ms: stopped for " << split->reason() << '\n';
@@ -1005,8 +1003,7 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
   const Forward after = forward(backend, linear, model, split.get(), chunk, kRows);
   if (!after.usable || after.bits != alone.bits)
     fail("a slow Neural Engine: the GPU's forward after the split stopped differs from the GPU's alone");
-  if (split->served().commands != 2 || lost != 1)
-    fail("a slow Neural Engine: the stopped split counted a command, or told its owner again");
+  if (split->served().commands != 2) fail("a slow Neural Engine: the stopped split counted a command");
   // Its evaluations all reported, the stopped split unloads its program while idle, once, and keeps it unloaded.
   if (!split->release()) fail("a slow Neural Engine: the stopped split did not unload its program while idle");
   split->restore();

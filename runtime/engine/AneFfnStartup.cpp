@@ -329,12 +329,11 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
     return ops::AneFfn::Shares{record.aneUnits, record.twoStepUnits};
   };
   // The split takes the calibration's least chunk, and judges itself against
-  // the GPU alone as calibrated, forgetting the calibration once it loses.
+  // the GPU alone as calibrated.
   const auto take = [&](AneFfnPrepared &prepared, const Calibration &record) {
     if (!prepared.split) return;
     prepared.split->setRows(rowsOf(record));
-    prepared.split->setBreaker(ane_ffn::Breaker(record.gpu, record.mixer),
-                               [forget = model.forget, maxAneUnits] { forget(maxAneUnits); });
+    prepared.split->setBreaker(ane_ffn::Breaker(record.gpu, record.mixer));
   };
   const auto serve = [&](AneFfnPrepared prepared, const Calibration &record, const std::string &timed,
                          const std::string &how) {
