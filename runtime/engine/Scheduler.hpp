@@ -151,6 +151,10 @@ struct SchedulerSnapshot final {
 class Scheduler final {
 public:
   Scheduler(SchedulerConfig config, const model::PrefillWorkSource &work);
+  // What one prefill command may hold from the next plan on, before any
+  // request: a Neural Engine split joined the model's commands
+  // (model::RuntimeModel::setAneFfn).
+  void setLimits(const model::CommandLimits &limits) noexcept { config_.limits = limits; }
 
   void submit(RequestSpec request);
   void deferAdmission(uint64_t requestId);

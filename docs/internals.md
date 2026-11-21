@@ -1389,7 +1389,7 @@ them.
 
 ## Neural Engine prefill
 
-Prefill chunks of a dense target split each layer's FFN by intermediate
+Prefill commands of a dense target split each layer's FFN by intermediate
 channel (`runtime/ops/AneFfn.cpp`), from the least rows startup finds the split
 faster at (below). The GPU runs the leading
 channels on its prefill kernels, its down projection reading a view of the
@@ -1399,12 +1399,22 @@ the residual kernel's tile on the weight planes advanced past the inputs the
 view leaves unread, or, on the int8-activation tile, through that tile's
 stride over the planes' rows. The Neural Engine runs the rest as one W8A8
 program, Hadamard-rotated int8 activations and per-row int8 weights
-(`runtime/ane/Program.mm`): a chunk takes the smallest of
-its functions that holds it, one every 128 rows from 512 to 2048, all reading
-and writing one set of surfaces sized for 2048 rows. The ANE service holds
-memory for a loaded program's intermediate values, which its functions share:
-13 programs of one function each held it 13 times (3.25 GB at the M6's share,
-against 0.67 GB for the one program). The GPU requantizes the
+(`runtime/ane/Program.mm`): a step takes the smallest of
+its functions that holds it, one every 128 rows from 512, all reading and
+writing one set of surfaces sized for 2048 rows. The program holds the
+functions of the split's shares alone (`AneFfn::programRows`): of one share,
+one step's to 2048 rows (13); of a share of each kind of command, one step's to
+1,024 rows and the halves' to 1,024 (10), which Apple9's ANE compiler takes
+where it refuses 22 (`ANECCompile() FAILED` on an M4, each time). The ANE
+service holds memory for a loaded program's intermediate values, which its
+functions share: 13 programs of one function each held it 13 times (3.25 GB at
+the M6's share, against 0.67 GB for the one program). A command queues all its
+evaluations before the GPU starts, one a layer of each step but the last
+layer's, whose rows are read and which runs on the GPU alone; the ANE's client
+holds at most 127 in flight for a program (its queue depth, macOS 26.5 and
+27.0) and would make the 128th wait 10 s and fail, so two steps take a model of
+at most 64 layers (Qwen3.8-27B's 64 queue 126) and one step one of at most 128
+(`AneFfn::fits`). The GPU requantizes the
 ANE's weights from the block planes one layer ahead into double-buffered
 IOSurfaces and adds the ANE's partial down projection to its own. Shared
 events order each evaluation between the GPU's packing and that join inside
@@ -1412,10 +1422,38 @@ the one prefill command (`metal::EventStep`); each signal ends a Metal command
 buffer, so the queue holds 512. MoE targets, the mixers and decode stay on the
 GPU.
 
+A command of 1,024 rows or more runs as two steps, its rows' halves
+(`AneFfn::firstStepRows`, each at least one step's least 512 rows), so that the Neural
+Engine runs one step's FFN while the GPU runs the other step's mixer: a step's
+mixer needs only the K/V and the state of the rows before it, which the step
+before wrote at the same layer. Each kind of command, one step or two, takes a
+share of its own (`AneFfn::Shares`), the larger for two steps, whose ANE runs
+beside the mixer too: both in the one program over the one set of surfaces,
+which hold the ANE's channels in descending 512-channel units, the last
+first, so that each share's channels are their leading rows (and down's
+leading inputs), which its functions read; down's per-row scales are each
+share's own, so that a command of one step stages the weights a split of that
+share alone stages, and computes what it computes.
+A dense target's prefill commands are two chunks of a prefill group
+(`RuntimeGeometry::prefillChunks`) whose group tensors hold one command's rows,
+the first chunk's views all of them, so that a command of one step takes them
+whole; a group's scratch cell, which carries a lane's state from a chunk to the
+next within a layer, holds one GDN layer's state (`PrefillArena::groupCell`).
+The layer loop (`QwenTarget::addPrefillLayers`) adds the first step's mixer
+and FFN, then the second's mixer, the first's join, the second's FFN, and the
+second's join once the first step's next mixer is encoded, or at once where a
+layer's output rows are read in it (the draft's captures, the last layer).
+On Qwen3.8-27B MLX 4-bit a full chunk's layer takes the GPU alone 37.0 ms, of
+which 23.6 are the FFN, and the Neural Engine's whole FFN 56 ms at 2,048 rows
+(19.5 int8 TFLOPS, 20-core M5 Pro): one step's split, the ANE idle through the
+mixer, took 31.9 ms. Every row computes what one step of the command's rows
+computes, and each share of a split of two what a split of that share alone
+computes (`ane-ffn split`).
+
 Startup decides the split on the loaded model before it allocates the KV cache
 (`runtime/engine/AneFfnStartup.cpp`), once it has built the memory governor,
-which is the same with the split or without, every step arithmetic until the
-memory plan holds a split. `--disable-ane`, a target the split does not take
+which is the same with the split or without, every step arithmetic.
+`--disable-ane`, a target the split does not take
 and a Mac whose private ANE interface does not resolve (`ane::unavailable`,
 which compiles nothing) leave the GPU alone; a dense target whose layers it
 does not take, or a Mac without the interface, says why, a MoE target says
@@ -1425,20 +1463,18 @@ ANE takes: with `--max-context` the split takes at most the channels whose plan
 still holds that context, and if even the fewest do not, the GPU runs alone and
 the start warns how much context any split leaves. The
 [SSD cache](server.md#ssd-cache)'s automatic state staging gives way to the split: where
-the fewest channels fit only without it, the cache turns off. Without
-`--max-context` the engine serves the automatic context, which while the split
-may run is what the plan holds with the split this Mac's calibration of the
-model takes (below), the GPU alone's if it found no gain, whatever the start
-then makes of it: a split that failed leaves the GPU alone at the same context,
-and the memory the split would hold stays with the KV cache. Every start of a
-model on a Mac that takes one calibration so serves the same context; one
-calibrated anew may serve another, after the split lost to the GPU alone, which
-forgets the calibration (below), after the Neural Engine refused a remembered
-split, which leaves the next start to calibrate again (below), after a start
-whose calibration failed and left none, or once macOS cleared the directory
-that keeps it. The server's
-relaunch of the engine after a failure keeps the first engine's context
-whatever it calibrates: the server passes that context
+the fewest channels fit only without it, the cache turns off. While the
+split may run, the plan holds the largest split the model could take (all its
+channel units but one, or the most whose plan holds the context asked, or with
+none asked any), whatever the split then takes, so that without
+`--max-context` every start of a model on a Mac serves the same automatic
+context, which the log line names beside the context without the split
+(`context 61,433 tokens (73,721 with --disable-ane)`); once this Mac's
+calibration of the model found no split gains enough the plan holds none, and
+the start serves the GPU alone's. A split that fails leaves the GPU alone at
+the same context, and the memory the split would hold stays with the KV cache.
+The server's relaunch of the engine after a failure keeps the first engine's
+context: the server passes that context
 (`serve-native --relaunch-context`) beside the first engine's `MAX_CONTEXT`,
 and the relaunch is planned as the first engine was. One of the automatic
 context decides the rest as that engine did, the SSD cache's staging among it,
@@ -1448,15 +1484,23 @@ line, not the warning a refused `--max-context` gets. A relaunch whose plan
 holds less, as once the Mac's memory budget shrank, serves that, with
 `--max-context` too, and the server serves it from then on
 ([engine restarts](server.md#engine-restarts-and-sleep)).
-Until a calibration is remembered, a start that fails assumes the largest split
-the model could take (all its channel units but one, or the most whose plan
-holds any context). The log line names it beside the context without the split
-(`context 61,433 tokens (73,721 with --disable-ane)`); `--disable-ane`, a
-target the split does not take and a Mac without the interface serve the
-latter. The start then logs `Setting up the Neural Engine FFN split (splash
-serve --disable-ane keeps the FFN on the GPU)`, so that a fault in the private
-client that ended the process would leave the way around it above, and, when it
-calibrates (below), times the split as a prefill runs it
+`--disable-ane`, a target the split does not take and a Mac without the
+interface serve the context without the split. The start sets the split up
+as its warmup's last step (`engine::finishAneFfn`), with the GPU time of the
+runtime's first warmup, a prefill of a full chunk on the GPU alone: after the
+other steps, once the memory audit has given back what the engine does not
+keep idle, so the split is calibrated and loaded at the least memory the
+engine holds, as 1.7.0's was before the KV pool and the warmup took theirs
+(on a 16 GB M4 the split's set-up after the prefill of the most rows found
+1.5 GiB reclaimable against macOS's 1.6, where 1.7.0's split started), and on
+the runtime's own prefill buffers, so that it holds no memory past the plan's;
+the audit runs again with it. The runtime and the scheduler take the split
+from their next command (`RuntimeModel::setAneFfn`), and a prefill of the
+least rows it takes creates its kernels, one per GGUF format, before a
+request waits on them (skipped where memory is refused it). It logs `Setting up the Neural Engine FFN split
+(splash serve --disable-ane keeps the FFN on the GPU)` first, so that a fault
+in the private client that ended the process would leave the way around it
+above, and, when it calibrates (below), times the split as a prefill runs it
 (`runtime/ops/AneFfnMeasurement.cpp`): commands of layers through `begin()`,
 `add()`, `commit()` and the handoff, each split layer after the GPU alone's FFN
 of the same layer, a stand-in for the mixer, which the GPU's layer alone timed
@@ -1465,8 +1509,10 @@ model's depth, with the ANE taking the 512-channel units nearest 0.4 and 0.8 of
 them in programs of one 2048-row function, which the ANE service keeps once
 compiled, it times the split layer and its GPU part alone, and the GPU's layer
 alone, each over commands of the first four full-chunk layers, the fifth
-staged. It fits `T(s) = max(A(s), G(s) + u·A(s))`
-(`runtime/ops/AneFfnCalibration.cpp`): G the line through the GPU part's
+staged; at 0.8 also the split layer of a step of 1,024 rows, the program
+holding both functions. It fits `T(s) = max(A(s), G(s) + u·A(s))`
+(`runtime/ops/AneFfnCalibration.cpp`), a full chunk's split FFN layer of one
+step: G the line through the GPU part's
 timings; A, the ANE's part, proportional to its channels through the split
 layer at 0.8, where the ANE's part takes the longer on every Mac measured; and
 u the bandwidth the ANE's part takes from the GPU's beside it, the split
@@ -1477,7 +1523,23 @@ put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
-`--activations bf16`. It fits u at 0.4, then again at the units it chose,
+`--activations bf16`. For two steps it takes the rest of the GPU alone's
+layer of a full chunk, the mixer M, from the warmup's prefill, its GPU time
+over the layers less the FFN layer it timed, and fits
+`T(s) = max(H(s), M + G(s) + u·H(s))` from the same timings, H the ANE's two
+half steps, proportional to its channels through the step of 1,024 rows at
+0.8; it takes the units whose T is least where T gains 5% on the GPU alone's
+whole layer and a command of two steps fits the evaluations in flight (above).
+Two steps then take every command of 1,024 rows or more: on an M6, two M5 Pros
+and an M5 Max, with Qwen3.8-27B in MLX 4-bit, UD-Q4_K_M and UD-IQ3_XXS, two
+steps beat one from 1,024 rows on each, and on the M6 from 672 (the 2-4% this
+gives up there); half steps timed at each start had put the boundary at 1,541
+to 1,665 rows on the M5 Pros and the M5 Max, where two steps already won 1-10%,
+since those timings leave out what the ANE's and the GPU's work cost each other
+while they overlap, and below 896 rows the M5 Max's half steps stalled the GPU
+at random. Where two steps gain too little, as where the ANE is too slow beside
+the mixer, nothing pipelines, and the start's line says which it chose.
+It fits u at 0.4, then again at the units it chose,
 nearest T's least, from their split's full-chunk layer timed as the fit's were,
 on the same four layers (a mixed quantization can give the model's first
 layers other formats than the rest's, which would bias u); where that fit
@@ -1499,13 +1561,18 @@ while the split layer of 6 units (13.8 ms against G's 13.2: u = 0.06) chooses
 on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best each Mac's
 sweeps measured. By default the int8-activation tile makes the GPU's part
 faster, so the split takes fewer: 10 on a 20-core M5 Pro and 7 on a 32-core M5
-Max (the M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
-start calibrates the split once for a Mac, a model, a macOS version, an engine
-build, `--activations` and the most units its memory plan holds, and remembers
-what it found (`remembered-*` in the cache directory below): the units, the
-least chunk and the GPU alone's layer at 512 and 2048 rows, or that no split
+Max. On an M6, Qwen3.8-27B UD-IQ3_XXS takes 25 units in one step from 512 rows
+and 33 in two steps; a start beside a build of four compile jobs took 22 units
+in one step. The split runs if T there gains 5% on the GPU alone. One program
+holds both kinds' functions (above): the start times its one-step functions
+(below) on a split of its own before it builds the split that serves, which
+loads the same program. A start calibrates the split once for a Mac, a model, a
+macOS version, an engine build, `--activations` and the most units its memory
+plan holds, and remembers what it found (`remembered-*` in the cache directory
+below): the units of each kind, one step's least chunk, the GPU alone's FFN
+layer at 512 and 2048 rows and the mixer beside the latter, or that no split
 gains enough. Later starts take it untimed: they build the split, check it as
-below and serve, in 0.6 s on an M5 Max, 0.9 s on an M5 Pro and 1.4 s on an M6.
+below and serve.
 Beside it the start keeps how often the Neural Engine refused a split
 (`ane::Refused`: its service did not compile, load or run the program, or the
 check below failed): the first refusal of a remembered split leaves the next
@@ -1527,11 +1594,18 @@ against the leading rows of a full chunk on the GPU alone, which computes every
 row alike whatever the chunk's rows. The outputs must be finite and differ from
 the GPU's by at most 10% of what the ANE adds over the GPU's part; int8 leaves
 2.5-2.8% on Qwen3.8-27B. A start that calibrates first times the GPU's FFN
-layer alone at 512 and 2048 rows and the split layer of every function, on a
-split of its own over the four layers the fit timed, as many to a command, so
-that the splits it compares are timed where it fitted them; and it splits the
-chunks from the least rows from which every larger chunk's split layer takes at
-most 2% longer than the GPU's at the chunk's rows. Six calibrations of
+layer alone at 512 and 2048 rows and the split layer of every one-step function
+of the program that serves (to 1,024 rows beside two steps, to 2048 without),
+on a split of its own over the four layers the fit timed, as many to a command,
+so that the splits it compares are timed where it fitted them; and it splits
+the chunks from the least rows from which every larger chunk's split layer of
+one step takes at most 2% longer than the GPU's at the chunk's rows. Each kind
+stands on its own: two steps are asked whatever one step's fit chose, and
+where one step splits no chunk below two steps' 1,024 rows they serve alone
+from 1,024 where they gain (the record keeps the units that name the program,
+one step's, or two steps' where one step's fit chose none, and no least rows).
+Where neither kind gains the GPU alone serves, and that record is not looked
+at again until macOS or the build changes. Six calibrations of
 Qwen3.8-27B MLX 4-bit on the Studio (M5 Max) timed each function's split layer
 within a range of 3.2% of its mean for the median function, 6.1% at most,
 where over the model's first layers, about 4,096 rows of layers to a command,
@@ -1575,7 +1649,8 @@ Engine FFN split stopped (...)`. A split that loses to the GPU alone stops the
 same way, after a chunk whose results it keeps (`ops::ane_ffn::Breaker`): over
 each 8 commands it ran, the ANE's evaluations, each from the GPU's signal to
 start it to its report, took as long as the GPU alone's FFN layers of their
-functions' rows, on the line through the timings calibration took; the start's
+functions' rows, on the line through the timings calibration took, or for
+pipelined steps its whole layers, the mixer calibration took added; the start's
 calibration is then forgotten, so that the next start calibrates again. The GPU
 then waits on the ANE at every layer, so the split is slower than the GPU
 alone; another process keeping the ANE busy costs the split 2-8% and a minute
@@ -1589,11 +1664,27 @@ program again after the weights (`AneFfn::restore`), in about 0.1 s, and logs
 load again within 10 s stops the split like a failure while serving, and the
 request runs on the GPU alone. A split that stopped unloads its program at the
 next idle release once the ANE has reported every evaluation, and keeps it
-unloaded. The split's logits differ from the GPU's alone (KL about 1e-4 to 7e-4
-on Qwen3.8-27B); `splash serve --disable-ane` keeps the FFN on the GPU, and
+unloaded. The split's int8 rounding moves its next-token distributions: on
+Qwen3.8-27B over prose and code prefixes of 0.8K to 8K tokens (the release
+kit's `logits/natural27.sh`), its KL from the GPU alone in bf16 activations is
+about 3e-4 for the split's own rounding at an M5 Max's 0.21 of the channels,
+9e-4 as served there (0.21, and 0.29 in two steps; MLX 4-bit, whose GPU part
+keeps its int8 activations), 9e-4 on a 16-core M5 Pro at 0.47 and 0.68 in two
+steps (UD-Q4_K_M) and 4e-3 on an M6 at 0.74 and 0.97 in two steps
+(UD-IQ3_XXS), the most likely token unchanged at every prefix whose likeliest
+token the GPU alone puts 0.1 or more ahead of the next. At default flags an
+MLX model's GPU alone rounds its own activations to int8
+([int8-activation prefill](#int8-activation-prefill)), 1e-3 from bf16 on the
+same prefixes and up to 7.5e-2 at single ones, so the split's KL from it
+measures both, and where the two differ most the split, which rotates its
+values before it rounds them, is the nearer to bf16; `splash serve
+--disable-ane` keeps the FFN on the GPU, and
 `backend-benchmark --ane-ffn-share` runs a given share over chunks of
-`--ane-ffn-minimum-rows` rows or more (512 by default), which
-`backend_regression` pins to its first round's. `make test-engine-cpu` runs
+`--ane-ffn-minimum-rows` rows or more (512 by default, below 1,024), in two
+steps from 1,024, as a calibrated split does;
+`backend_regression` pins every round to its first round's, the baseline's,
+so that the candidate runs the baseline's share in one step where the
+baseline does and in two from 1,024 rows. `make test-engine-cpu` runs
 `ane-ffn-calibration`, the fit, the choice, the least chunk, a calibration's
 line of text and the breaker on timings it is given, also under the sanitizers,
 and `ane-ffn-startup`, each outcome of a start on a model it plays, a
@@ -1604,7 +1695,8 @@ context where a calibration made anew would serve another.
 `make test-engine-metal` runs `ane-ffn`: its kernels
 against CPU references for every image format under shader
 validation, then, without it, the split's memory and its output against the GPU
-alone, the same output once its program is unloaded and loaded again, a chunk's
+alone, the functions a split's shares give its program, a command of 127
+evaluations and one of 128, which commit() refuses, the same output once its program is unloaded and loaded again, a chunk's
 rows on the GPU alone as a full chunk's, `verify()` of every function and of a
 function the client's instrumented build
 (`runtime/ane/ProgramInstrumentation.hpp`) binds to another's procedure, each
@@ -1616,9 +1708,10 @@ client's failures, limits, unload and load, and cache files on a small program.
 can fail, and `ane-program-faults` checks that an Objective-C exception and a
 changed method signature fail as `std::runtime_error`. `make test-real` runs
 the model runtime oracle with the GPU alone, with the GPU alone over a BF16
-state (`--state-format bf16`), and with the split as a start makes it, which
-must not be unavailable, and whose automatic context must be what the plan
-holds with the split it runs.
+state (`--state-format bf16`), and with the split as a start makes it, once its
+runtime has prefilled a full chunk on the GPU alone, which must not be
+unavailable, and whose automatic context must be what the plan holds with the
+split it runs.
 
 ## Host steps
 

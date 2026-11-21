@@ -288,6 +288,9 @@ public:
   [[nodiscard]] bool idle() const noexcept {
     return requests_.empty() && !pending_;
   }
+  // Before any request: the model's command limits changed, as the Neural
+  // Engine split joined its commands; the scheduler plans with them.
+  void refreshCommandLimits() noexcept { scheduler_.setLimits(model_.commandLimits()); }
   [[nodiscard]] std::optional<double> nextWakeupMilliseconds() const;
   [[nodiscard]] EngineSnapshot snapshot() const;
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;

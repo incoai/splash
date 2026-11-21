@@ -131,13 +131,22 @@ void QwenTarget::requireLayerPartition(uint32_t gdnLayers, uint32_t attentionLay
 }
 
 void QwenTarget::requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
-                                QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const {
-  // The Neural Engine splits a dense target's commands, which are one chunk
-  // and run whole.
-  const bool whole = !layers.first && layers.end == geometry_.layers;
-  if (chunks.empty() || kv.layers().size() != geometry_.kvLayout.attentionLayers ||
-      (aneFfn && (chunks.size() > 1 || !whole)) || layers.first >= layers.end || layers.end > geometry_.layers)
+                                QwenPrefillLayers layers) const {
+  if (chunks.empty() || kv.layers().size() != geometry_.kvLayout.attentionLayers || layers.first >= layers.end ||
+      layers.end > geometry_.layers)
     throw std::invalid_argument("invalid Qwen prefill");
+}
+
+ops::AneFfn *QwenTarget::splitOf(std::span<const QwenTargetPrefillChunk> chunks, QwenPrefillLayers layers,
+                                 ops::AneFfn *aneFfn) const {
+  uint32_t rows = 0;
+  for (const QwenTargetPrefillChunk &chunk : chunks) rows += chunk.rows;
+  if (!aneFfn || !aneFfn->splits(rows)) return nullptr;
+  const uint32_t first = aneFfn->firstStepRows(rows);
+  if (layers.first || layers.end != geometry_.layers || chunks.front().rows != first ||
+      chunks.size() != (first < rows ? 2u : 1u))
+    throw std::invalid_argument("a Qwen prefill the Neural Engine splits runs whole, in its steps' chunks");
+  return aneFfn;
 }
 
 QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
@@ -169,7 +178,7 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moe(geometry_.moeShape(), geometry_.moeRouterFormat, chunk.rows,
                               chunk.decode ? ops::StepKind::Decode : ops::StepKind::Prefill);
-  if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
+  step.aneFfn = aneFfn;
   return step;
 }
 
@@ -350,7 +359,9 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
   const ops::Linear &linear = this->linear(step);
   const uint32_t rows = step.outputRows();
   const ops::PrefillFfnBuffers buffers = b.ffn();
-  // The split takes whole chunks; read rows alone run on the GPU.
+  // The other step's split FFN joins once this step's mixer is encoded
+  // (addPrefillLayers); read rows alone run on the GPU.
+  if (step.aneFfn) step.aneFfn->join(step.graph);
   if (step.aneFfn && step.readRows.empty()) {
     ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows);
     step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), rows);

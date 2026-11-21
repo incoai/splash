@@ -23,7 +23,7 @@ constexpr double kMinimumGain = 0.05;
 constexpr double kChunkNoise = 0.02;
 // The first word of a Calibration's text, which a change to its fields
 // renumbers.
-constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-2";
+constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-4";
 
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
@@ -31,6 +31,15 @@ Line gpuAlone(const std::array<ChunkTimings::Gpu, 2> &gpu) {
   const auto &[low, high] = gpu;
   const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
   return {low.milliseconds - slope * low.rows, slope};
+}
+
+// The split layer of the function that holds a step of `rows` rows; infinite
+// where none does.
+double functionLayer(const ChunkTimings &timings, uint32_t rows) {
+  const auto function = std::ranges::find_if(timings.functions, [&](const ChunkTimings::Function &timed) {
+    return timed.least <= rows && rows <= timed.rows;
+  });
+  return function == timings.functions.end() ? std::numeric_limits<double>::infinity() : function->split;
 }
 
 } // namespace
@@ -47,9 +56,10 @@ uint32_t nearestUnits(double share, uint32_t units) {
   return static_cast<uint32_t>(std::clamp<long>(std::lround(share * units), 1, units - 1));
 }
 
-// Not a number where either part is not.
+// Not a number where either part is not. A model of two steps has its
+// halves' line, whatever its mixer.
 double Model::operator()(double share) const noexcept {
-  const double a = ane(share), g = gpu(share) + u * a;
+  const double a = halves.slope ? halves(share) : ane(share), g = mixer + gpu(share) + u * a;
   return a > g ? a : g;
 }
 
@@ -64,7 +74,19 @@ double Model::operator()(double share) const noexcept {
 Model fit(const Timing &low, const Timing &high) {
   if (!(low.share < high.share)) throw std::invalid_argument("ANE FFN calibration needs a low and a high share");
   const double slope = (high.gpu - low.gpu) / (high.share - low.share);
-  return refit({{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}}, low.share, low.split);
+  return refit({{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}, {}}, low.share, low.split);
+}
+
+// The high share's step of half the rows gives H as its full chunk gives A:
+// a half costs the ANE more than half a full chunk (its 0.97 share of
+// Qwen3.8-27B's FFN 29.7 ms at 1,024 rows against 54.5 at 2,048 on a 20-core
+// M5 Pro).
+Model twoSteps(Model oneStep, const Timings &timings) {
+  if (!(timings.mixer >= 0.0 && std::isfinite(timings.mixer)))
+    throw std::invalid_argument("ANE FFN calibration's mixer is not usable");
+  oneStep.halves = {0.0, 2.0 * usable(timings.highHalf) / timings.high.share};
+  oneStep.mixer = timings.mixer;
+  return oneStep;
 }
 
 // Where the GPU's part takes the longer at `share`, the split layer there
@@ -144,14 +166,8 @@ bool slowerNowhere(const ChunkTimings &candidate, const ChunkTimings &incumbent)
   const std::optional<uint32_t> candidateLeast = minimumRows(candidate), incumbentLeast = minimumRows(incumbent);
   if (!incumbentLeast) return true;
   if (!candidateLeast || *candidateLeast > *incumbentLeast) return false;
-  const auto split = [](const ChunkTimings &timings, uint32_t rows) {
-    const auto function = std::ranges::find_if(timings.functions, [&](const ChunkTimings::Function &timed) {
-      return timed.least <= rows && rows <= timed.rows;
-    });
-    return function == timings.functions.end() ? std::numeric_limits<double>::infinity() : function->split;
-  };
   for (uint32_t rows = *incumbentLeast; rows <= incumbent.functions.front().rows; ++rows)
-    if (!(split(candidate, rows) <= (1.0 + kChunkNoise) * split(incumbent, rows))) return false;
+    if (!(functionLayer(candidate, rows) <= (1.0 + kChunkNoise) * functionLayer(incumbent, rows))) return false;
   return true;
 }
 
@@ -176,37 +192,41 @@ std::string Calibration::text() const {
   std::ostringstream text;
   text << std::setprecision(9) << kCalibrationTag << ' ' << aneUnits << ' ' << minimumRows;
   for (const ChunkTimings::Gpu &point : gpu) text << ' ' << point.rows << ' ' << point.milliseconds;
-  text << ' ' << refusals;
+  text << ' ' << refusals << ' ' << twoStepUnits << ' ' << mixer;
   return text.str();
 }
 
-// A record of units holds least rows and the GPU alone at ascending rows of
-// usable milliseconds, and fewer than kRefusals refusals; one of none holds
-// neither, and at most kRefusals.
+// A record of units holds least rows of one step or units of two steps, or
+// both, the GPU alone at ascending rows of usable milliseconds, and fewer
+// than kRefusals refusals; one of none holds neither, and at most kRefusals.
 std::optional<Calibration> Calibration::parse(std::string_view text) {
   std::istringstream in{std::string(text)};
   std::string tag;
   Calibration calibration;
   in >> tag >> calibration.aneUnits >> calibration.minimumRows;
   for (ChunkTimings::Gpu &point : calibration.gpu) in >> point.rows >> point.milliseconds;
-  in >> calibration.refusals;
+  in >> calibration.refusals >> calibration.twoStepUnits >> calibration.mixer;
   std::string rest;
   if (!in || tag != kCalibrationTag || (in >> rest) || calibration.refusals > kRefusals) return std::nullopt;
   const auto &[low, high] = calibration.gpu;
   const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
   if (!calibration.aneUnits)
-    return calibration.minimumRows ? std::nullopt : std::optional(Calibration{.refusals = calibration.refusals});
+    return calibration.minimumRows || calibration.twoStepUnits
+               ? std::nullopt
+               : std::optional(Calibration{.refusals = calibration.refusals});
   if (calibration.refusals == kRefusals) return std::nullopt;
-  if (!calibration.minimumRows || !(low.rows < high.rows) || !usableMilliseconds(low.milliseconds) ||
-      !usableMilliseconds(high.milliseconds))
+  if ((!calibration.minimumRows && !calibration.twoStepUnits) || !(low.rows < high.rows) ||
+      !usableMilliseconds(low.milliseconds) || !usableMilliseconds(high.milliseconds) ||
+      !(calibration.mixer >= 0.0 && std::isfinite(calibration.mixer)))
     return std::nullopt;
   return calibration;
 }
 
-// Each layer the GPU waits for the Neural Engine's evaluation before it joins
-// the ANE's part to its own, so evaluations that take as long as the GPU's
-// whole layers alone make the split slower than the GPU alone, whatever the
-// rest of the layer takes: the breaker trips there, and never short of it. An
+// Each layer the GPU waits for the Neural Engine's evaluations before it joins
+// the ANE's part to its own: one step's evaluations that take as long as the
+// GPU alone's FFN layers, or two pipelined steps' as long as its whole layers,
+// beside which they run, make the split slower than the GPU alone, whatever
+// the rest of the layer takes: the breaker trips there, and never short of it. An
 // evaluation counts against the GPU alone's layer of its function's rows,
 // which the chunk pads up to, so the GPU alone would take no longer over the
 // chunk; the reason scales the window's ratio to a layer of the most rows.
@@ -217,19 +237,21 @@ std::optional<Calibration> Calibration::parse(std::string_view text) {
 // the trip point. Judging kWindow commands at once, it weighs one slow
 // evaluation, as a function's first after its program loads again, among all
 // of theirs.
-Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu) {
+Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu, double mixer) {
   const auto &[low, high] = gpu;
   if (!(low.rows < high.rows)) throw std::invalid_argument("ANE FFN breaker needs the GPU alone at two row counts");
+  if (!(mixer >= 0.0 && std::isfinite(mixer))) throw std::invalid_argument("ANE FFN breaker's mixer is not usable");
   static_cast<void>(usable(low.milliseconds));
   static_cast<void>(usable(high.milliseconds));
   gpu_ = gpuAlone(gpu);
+  mixer_ = mixer;
   mostRows_ = high.rows;
 }
 
-std::string Breaker::add(uint32_t rows, uint32_t evaluations, double milliseconds) {
+std::string Breaker::add(uint32_t rows, uint32_t layers, bool pipelined, double milliseconds) {
   if (!gpu_) return {};
   ane_ += milliseconds;
-  alone_ += evaluations * (*gpu_)(rows);
+  alone_ += layers * ((*gpu_)(rows) + (pipelined ? mixer_ * rows / mostRows_ : 0.0));
   if (++commands_ < kWindow) return {};
   const double ratio = ane_ / alone_, most = (*gpu_)(mostRows_);
   commands_ = 0;

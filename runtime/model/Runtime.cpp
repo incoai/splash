@@ -592,8 +592,9 @@ struct Runtime::Impl {
   // its first pass, so a reservation for another prompt between its passes
   // leaves it the command's too.
   std::vector<uint64_t> stagingRequests;
-  // What one prefill command may hold (Runtime::commandLimits).
-  const CommandLimits limits;
+  // What one prefill command may hold (Runtime::commandLimits), which the
+  // split sets (Runtime::setAneFfn).
+  CommandLimits limits;
 
   // The history's staging (KvHistoryStream) as an elastic pool: a streaming
   // prompt's reservation allocates it, and it goes whole once no prompt
@@ -1917,6 +1918,15 @@ struct Runtime::Impl {
   std::vector<PrefillChunk> preparePrefill(std::span<const ModelBatchItem> items,
                                            std::array<Request *, kLaneCount> &entries) {
     std::vector<PrefillChunk> chunks(1);
+    // A chunk holds kPrefillRows rows, but a command the Neural Engine's
+    // split takes ends its first at its first step's rows, which its
+    // pipelined steps run (ops::AneFfn::firstStepRows).
+    uint32_t rows = 0;
+    for (const ModelBatchItem &item : items) rows += item.tokenCount;
+    const uint32_t firstRows = aneFfn ? aneFfn->firstStepRows(rows) : kPrefillRows;
+    const auto full = [&](const PrefillChunk &chunk) {
+      return chunk.rows == (chunks.size() == 1 ? firstRows : kPrefillRows);
+    };
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
       Request &entry = prefillLane(item);
@@ -1926,13 +1936,14 @@ struct Runtime::Impl {
       QwenLogicalLengths lengths = states.metadata(entry.stateLane).lengths;
       size_t nextCapture = 0;
       for (uint32_t offset = 0; offset < item.tokenCount;) {
-        if (chunks.back().rows == kPrefillRows) chunks.emplace_back();
+        if (full(chunks.back())) chunks.emplace_back();
         PrefillChunk &chunk = chunks.back();
         PrefillSequence &sequence = chunk.sequences.emplace_back();
         ModelBatchItem &part = sequence.part;
         part = item;
         part.logicalPosition = item.logicalPosition + offset;
-        part.tokenCount = std::min(kPrefillRows - chunk.rows, item.tokenCount - offset);
+        part.tokenCount = std::min((chunks.size() == 1 ? firstRows : kPrefillRows) - chunk.rows,
+                                   item.tokenCount - offset);
         part.inputTokens = item.inputTokens.subspan(offset, part.tokenCount);
         part.stateCaptures.clear();
         const uint64_t partEnd = part.logicalPosition + part.tokenCount;
@@ -3620,7 +3631,9 @@ Runtime::prefillAsync(const BatchPlan &plan,
   if (impl_->aneFfn) {
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       draws[lane] = impl_->request(items[lane].requestId).rngCounter;
-    impl_->aneFfn->begin();
+    uint32_t rows = 0;
+    for (const ModelBatchItem &item : items) rows += item.tokenCount;
+    impl_->aneFfn->begin(impl_->aneFfn->steps(rows));
   }
   const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items, layers);
   CommandGraph encodes;
@@ -4651,6 +4664,16 @@ ModelMemoryActual Runtime::actualRuntimeMemory() const {
   const QwenTargetScratchBytes target = impl_->targetModel->allocatedScratchBytes();
   return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->bytes() + target.prefill,
           impl_->decodeArena->bytes() + target.decode, impl_->states.stagingBytes()};
+}
+
+void Runtime::setAneFfn(ops::AneFfn *split) {
+  impl_->aneFfn = split;
+  impl_->limits = splash::model::commandLimits(impl_->geometry, split ? split->minimumRows() : 0);
+}
+
+void Runtime::withPrefillFfn(const PrefillFfnUse &use) {
+  const QwenTargetPrefillBuffers buffers = prefillBuffers(*impl_->prefillArena, 0);
+  use(buffers.ffn(), buffers.hidden);
 }
 
 ModelTelemetry Runtime::telemetry() const noexcept {

@@ -4,6 +4,7 @@
 #include "model/Qwen4Exp.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/SparseRowStore.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/BlockIndexer.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/HyperConnection.hpp"

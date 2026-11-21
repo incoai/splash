@@ -131,6 +131,29 @@ void testMostUnits() {
   require(choose(model, 20, 100, 30) == 30u, "units the plan does not hold were chosen");
 }
 
+// Of two steps, the ANE's halves H(s) = 44 s run beside the mixer, 10 ms, and T(s) = max(H(s), 10 + G(s)): they meet
+// at s = 0.47, and of 10 units 4 (22; 24 a unit below) beat 5 (22; 26.4 above) and 3 (24), where one step chose 3. A
+// mixer below none or not a number is refused.
+void testTwoSteps() {
+  Timings timings{{0.25, 15, 15}, {0.75, 5, 30}, 20, 16.5, 10};
+  const Model one = fit(timings.low, timings.high), two = twoSteps(one, timings);
+  require(near(two.halves.slope, 44) && two.mixer == 10 && near(two(0.4), 22) && near(two(0.5), 22) &&
+              near(two(0.3), 24),
+          "two steps' T is not the longer of the ANE's halves and the mixer with the GPU's part");
+  require(choose(two, 30, 10, 9) == 4u && choose(one, 20, 10, 9) == 3u,
+          "the mixer the ANE runs beside did not move the choice from 3 units to 4");
+  // A mixer of none, as a prefill no longer than the GPU alone's FFN layers gives, still prices two steps by their
+  // halves: 22 at 0.5, where one step takes 20.
+  timings.mixer = 0;
+  const Model none = twoSteps(one, timings);
+  require(near(none(0.5), 22) && near(one(0.5), 20), "two steps beside a mixer of none were priced as one step");
+  for (const double mixer : {-1.0, std::numeric_limits<double>::quiet_NaN()}) {
+    timings.mixer = mixer;
+    rejects([&] { static_cast<void>(twoSteps(one, timings)); }, "mixer is not usable",
+            "a mixer of " + std::to_string(mixer) + " ms was taken");
+  }
+}
+
 // The split runs only where T is predicted at least 5% below the GPU alone: 14 against 14.5 is not, and the GPU's
 // timing not a number proves nothing.
 void testNoGain() {
@@ -162,7 +185,7 @@ void testNearestUnits() {
 }
 
 // The GPU alone's layer on the line through 5 ms at 512 rows and 20 at 2048.
-double gpuAt(uint32_t rows) { return 5.0 + (rows - 512) * 15.0 / 1536; }
+double gpuAt(uint32_t rows) { return 5.0 + (static_cast<double>(rows) - 512) * 15.0 / 1536; }
 
 // The timings of functions every 128 rows from 512 to 2048, from the most rows down, each running the chunks above
 // the one below it (the least, those of 512 rows): each function's split layer at `ratio` of the GPU's at its own
@@ -225,30 +248,42 @@ void testSlowerNowhere() {
 }
 
 // A calibration as a line of text comes back as it was, its refusals too, and one of no split as none with its
-// refusals; a line of another tag or version, with more or fewer fields, units without least rows, the GPU alone out
-// of order or unusable, more refusals than kRefusals or a split beside kRefusals is not one.
+// refusals; one of one step alone too, and of two steps alone; a line of another tag or version, with more or fewer
+// fields, units without least rows or two steps, least rows or two steps without units of one step, the GPU alone out of order or unusable, a mixer below none,
+// more refusals than kRefusals or a split beside kRefusals is not one.
 void testCalibrationText() {
-  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 1};
+  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 1, 15, 13.5};
   const std::optional<Calibration> back = Calibration::parse(made.text());
   require(back && back->aneUnits == 8 && back->minimumRows == 655 && back->gpu[0].rows == 512 &&
               back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 &&
-              back->gpu[1].milliseconds == 19.375 && back->refusals == 1,
+              back->gpu[1].milliseconds == 19.375 && back->refusals == 1 && back->twoStepUnits == 15 &&
+              back->mixer == 13.5,
           "a calibration did not come back as it was: " + made.text());
+  const std::optional<Calibration> oneOnly =
+      Calibration::parse(Calibration{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 0, 0, 13.5}.text());
+  require(oneOnly && oneOnly->aneUnits == 8 && !oneOnly->twoStepUnits, "a calibration of one step alone did not come back");
+  const std::optional<Calibration> twoOnly =
+      Calibration::parse(Calibration{8, 0, {{{512, 5.25}, {2048, 19.375}}}, 0, 15, 13.5}.text());
+  require(twoOnly && twoOnly->aneUnits == 8 && !twoOnly->minimumRows && twoOnly->twoStepUnits == 15 &&
+              twoOnly->mixer == 13.5,
+          "a calibration of two steps alone did not come back");
   const std::optional<Calibration> none = Calibration::parse(Calibration{}.text()),
                                    refused = Calibration::parse(Calibration{.refusals = 2}.text());
   require(none && !none->aneUnits && !none->minimumRows && !none->refusals && refused && !refused->aneUnits &&
               refused->refusals == 2,
           "a calibration of no split did not come back");
-  for (const std::string_view line : {"", "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 0 1",
-                                      "ane-ffn-calibration-2 8 0 512 5.25 2048 19.375 0",
-                                      "ane-ffn-calibration-2 0 655 0 0 0 0 0",
-                                      "ane-ffn-calibration-2 8 655 2048 19.375 512 5.25 0",
-                                      "ane-ffn-calibration-2 8 655 512 0 2048 19.375 0",
-                                      "ane-ffn-calibration-2 8 655 512 nan 2048 19.375 0",
-                                      "ane-ffn-calibration-2 0 0 0 0 0 0 3",
-                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 2"})
+  for (const std::string_view line : {"", "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 15 806 13.5",
+                                      "ane-ffn-calibration-4 8 655 512 5.25 2048 19.375 0 0",
+                                      "ane-ffn-calibration-4 8 655 512 5.25 2048 19.375 0 0 0 1",
+                                      "ane-ffn-calibration-4 8 0 512 5.25 2048 19.375 0 0 0",
+                                      "ane-ffn-calibration-4 0 0 512 5.25 2048 19.375 0 15 0",
+                                      "ane-ffn-calibration-4 0 655 0 0 0 0 0 0 0",
+                                      "ane-ffn-calibration-4 8 655 2048 19.375 512 5.25 0 0 0",
+                                      "ane-ffn-calibration-4 8 655 512 0 2048 19.375 0 0 0",
+                                      "ane-ffn-calibration-4 8 655 512 nan 2048 19.375 0 0 0",
+                                      "ane-ffn-calibration-4 8 655 512 5.25 2048 19.375 0 0 -1",
+                                      "ane-ffn-calibration-4 0 0 0 0 0 0 3 0 0",
+                                      "ane-ffn-calibration-4 8 655 512 5.25 2048 19.375 2 0 0"})
     require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
 }
 
@@ -261,41 +296,48 @@ void testBreaker() {
   timings.gpu = {{{512, 8.0}, {2048, 20.0}}};
   // `count` commands of 64 evaluations of the function of `rows` rows, each `ratio` of the GPU alone's layer of
   // those rows: the first reason the breaker gives, and after how many commands.
-  const auto run = [](Breaker &breaker, uint32_t count, uint32_t rows, double ratio) {
+  const auto run = [](Breaker &breaker, uint32_t count, uint32_t rows, double ratio, bool pipelined = false) {
     for (uint32_t command = 1; command <= count; ++command) {
-      std::string reason = breaker.add(rows, 64, 64 * ratio * (4.0 + rows / 128.0));
+      std::string reason = breaker.add(rows, 64, pipelined, 64 * ratio * (4.0 + rows / 128.0));
       if (!reason.empty()) return std::pair{command, reason};
     }
     return std::pair{0u, std::string()};
   };
-  Breaker breaker(timings.gpu);
+  Breaker breaker(timings.gpu, 10.0);
   require(run(breaker, 8, 2048, 1.0) ==
               std::pair{8u, std::string("losing to the GPU alone (20.0 ms on the Neural Engine per 2048-row layer "
                                         "against 20.0 ms on the GPU alone)")},
           "evaluations as long as the GPU alone's layers did not trip the breaker on the 8th command");
-  Breaker faster(timings.gpu);
+  Breaker faster(timings.gpu, 10.0);
   require(run(faster, 80, 2048, 0.99).first == 0, "evaluations faster than the GPU alone's layers tripped it");
   Breaker off;
   require(run(off, 80, 2048, 100.0).first == 0, "a breaker given no GPU alone tripped");
   // 1024 rows: the GPU alone takes 12 ms, more than half its 20 ms at 2048 rows.
-  Breaker fewer(timings.gpu);
+  Breaker fewer(timings.gpu, 10.0);
   require(run(fewer, 80, 1024, 0.99).first == 0,
           "evaluations of 1024 rows faster than the GPU alone's layer of 1024 rows tripped it");
   require(run(fewer, 8, 1024, 1.25) ==
               std::pair{8u, std::string("losing to the GPU alone (25.0 ms on the Neural Engine per 2048-row layer "
                                         "against 20.0 ms on the GPU alone)")},
           "evaluations of 1024 rows slower than the GPU alone's layer of 1024 rows did not trip it");
-  Breaker windows(timings.gpu);
+  Breaker windows(timings.gpu, 10.0);
   require(run(windows, 8, 2048, 0.5).first == 0 && run(windows, 8, 2048, 1.5).first == 8,
           "a window was not judged on its own commands");
+  // Two steps run beside the mixer, 10 ms of a 2048-row layer: their evaluations count against the GPU alone's whole
+  // layer, 30 ms; 1.2 times its FFN does not trip it, 1.6 times does.
+  Breaker pipelined(timings.gpu, 10.0);
+  require(run(pipelined, 80, 2048, 1.2, true).first == 0 && run(pipelined, 8, 2048, 1.6, true).first == 8,
+          "two steps' evaluations were not judged against the GPU alone's whole layers");
+  rejects([&] { static_cast<void>(Breaker(timings.gpu, -1.0)); }, "mixer is not usable",
+          "a breaker took a mixer below none");
   ChunkTimings equal = timings, reversed = timings, unusable = timings;
   equal.gpu[0].rows = 2048;
   std::ranges::reverse(reversed.gpu);
   unusable.gpu[1].milliseconds = 0.0;
-  rejects([&] { static_cast<void>(Breaker(equal.gpu)); }, "two row counts",
+  rejects([&] { static_cast<void>(Breaker(equal.gpu, 0.0)); }, "two row counts",
           "a breaker took the GPU alone at one row count");
-  rejects([&] { static_cast<void>(Breaker(reversed.gpu)); }, "two row counts", "a breaker took descending rows");
-  rejects([&] { static_cast<void>(Breaker(unusable.gpu)); }, "not usable", "a breaker took a GPU alone of 0 ms");
+  rejects([&] { static_cast<void>(Breaker(reversed.gpu, 0.0)); }, "two row counts", "a breaker took descending rows");
+  rejects([&] { static_cast<void>(Breaker(unusable.gpu, 0.0)); }, "not usable", "a breaker took a GPU alone of 0 ms");
 }
 
 } // namespace
@@ -308,6 +350,7 @@ int main() {
     testChoice();
     testUnusable();
     testMostUnits();
+    testTwoSteps();
     testNoGain();
     testUsable();
     testNearestUnits();

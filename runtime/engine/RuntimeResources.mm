@@ -179,14 +179,6 @@ void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, uin
   logLine(line.str());
 }
 
-// The split's part of what the engine gives back while idle, if it runs one.
-std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split) {
-  if (!split)
-    return std::nullopt;
-  return ReleasableMemory::Split{[split] { return split->release(); },
-                                 [split] { split->restore(); }};
-}
-
 // The SSD cache tier as a start opens its files (openDiskTier): its budget,
 // its state and KV files, a persistent tier's directory, and its volume's
 // measure; none of them when it is off, and no KV file when that alone
@@ -620,7 +612,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier, std::unique_ptr<DiskSpace> diskSpace,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+    AneFfnStart aneFfn, kv::Format kvFormat, std::string buildId, std::function<bool()> cancelled,
     std::unique_ptr<model::KvBlockCache> blockCache,
     std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
     model::VerifyRows verifyRows)
@@ -633,10 +625,33 @@ RuntimeResources::RuntimeResources(
       kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
+      cache_(std::move(cache)), aneFfn_(std::move(aneFfn.split)),
       blockCache_(std::move(blockCache)), historyStream_(std::move(historyStream)),
-      releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get())),
-      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), verifyRows_(verifyRows) {}
+      // The split serves from the start or once set up (finishAneFfn), until
+      // the engine ends.
+      releasableMemory_({model_.images.get(), model_.expertStore()},
+                        ReleasableMemory::Split{[this] { return aneFfn_ && aneFfn_->release(); },
+                                                [this] {
+                                                  if (aneFfn_) aneFfn_->restore();
+                                                }}),
+      aneFfnOutcome_(aneFfn.outcome), kvFormat_(kvFormat), buildId_(std::move(buildId)),
+      cancelled_(std::move(cancelled)), spillAlways_(spillAlways), verifyRows_(verifyRows) {
+  if (aneFfn.outcome.kind == AneFfnOutcome::Kind::Pending) aneFfnPending_ = std::move(aneFfn);
+}
+
+void RuntimeResources::finishAneFfn(double prefillMilliseconds, model::RuntimeModel &runtime) {
+  if (!aneFfnPending_) throw std::logic_error("the Neural Engine split was not left to set up");
+  AneFfnTiming timing;
+  timing.cancelled = cancelled_;
+  timing.buffers = [&runtime](const AneFfnTiming::Use &use) { runtime.withPrefillFfn(use); };
+  AneFfnFinished finished =
+      engine::finishAneFfn(aneFfnModel(*backend_, model_, operators_, kvFormat_, buildId_, std::move(timing)),
+                           *aneFfnPending_, prefillMilliseconds, cancelled_);
+  aneFfnPending_.reset();
+  aneFfn_ = std::move(finished.split);
+  aneFfnOutcome_ = std::move(finished.outcome);
+  runtime.setAneFfn(aneFfn_.get());
+}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
@@ -1053,7 +1068,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     }
     if (model::SparseRowStore *table = loaded.streamedTable())
       table->commit();
-    splitModel = aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
+    splitModel = aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, {config.cancelled, {}});
   };
 
   ready();
@@ -1335,7 +1350,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), startClaim, std::move(startScope), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
-        std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
+        std::move(aneFfn), config.kvFormat, config.buildId, config.cancelled, std::move(blockCache),
         std::move(historyStream), config.kvSpillAlways, config.verifyRows));
     result->adoptPersistentCache();
     return result;
@@ -1512,7 +1527,7 @@ AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
   const ops::AneFfn::Served &served = aneFfn_->served();
   return {stopped ? AneFfnSnapshot::State::Stopped : AneFfnSnapshot::State::Split,
           stopped ? aneFfn_->reason() : aneFfnOutcome_.reason,
-          aneFfn_->share(),
+          aneFfnShare(),
           aneFfn_->minimumRows(),
           served.commands,
           served.evaluations,
@@ -1559,7 +1574,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
 
 AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                         const ops::ExecutionPlans &operators, kv::Format format, std::string_view buildId,
-                        std::function<bool()> cancelled) {
+                        AneFfnTiming timing) {
   auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(loaded));
   AneFfnModel model;
   model.dense = !layers->empty();
@@ -1570,33 +1585,45 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   }
   model.unavailable = [] { return ane::unavailable(); };
   model.units = ops::AneFfn::units(*layers);
-  model.plannedBytes = [layers](uint32_t aneUnits) { return ops::AneFfn::plannedBytes(*layers, aneUnits); };
-  const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
-    model::withPrefillArena(backend, loaded, operators, format, use);
+  model.layers = static_cast<uint32_t>(layers->size());
+  model.plannedBytes = [layers](uint32_t aneUnits) {
+    return ops::AneFfn::plannedBytes(*layers, {aneUnits, aneUnits});
+  };
+  const auto on = [&backend, &loaded, &operators, format, buffers = timing.buffers](const AneFfnTiming::Use &use) {
+    if (buffers)
+      buffers(use);
+    else
+      model::withPrefillArena(backend, loaded, operators, format, use);
   };
   const ops::Linear &linear = operators.linear();
-  model.time = [&backend, &linear, layers, cancelled, onArena] {
-    ops::ane_ffn::Timings timings;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timings = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time();
+  const std::function<bool()> cancelled = timing.cancelled;
+  // A measurement of the split on the buffers `on` hands it.
+  const auto measured = [&backend, &linear, layers, cancelled, on](const auto &measure) {
+    on([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      ops::ane_ffn::Measurement measurement(backend, linear, *layers, ffn, hidden, cancelled);
+      measure(measurement);
     });
+  };
+  model.time = [measured] {
+    ops::ane_ffn::Timings timings;
+    measured([&](ops::ane_ffn::Measurement &measurement) { timings = measurement.time(); });
     return timings;
   };
-  model.timeAt = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, double gpuAlone) {
+  model.timeAt = [measured](uint32_t aneUnits, double gpuAlone) {
     ops::ane_ffn::Timing timing;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timing = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time(aneUnits, gpuAlone);
-    });
+    measured([&](ops::ane_ffn::Measurement &measurement) { timing = measurement.time(aneUnits, gpuAlone); });
     return timing;
   };
-  model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.prepare = [&backend, &linear, layers, cancelled, on](ops::AneFfn::Shares shares, ops::AneFfn::Rows rows,
+                                                             bool timeChunks) {
     AneFfnPrepared prepared;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      // The chunks are timed on a split of their own, before this one is
-      // made, so that no two splits are held at once.
+    on([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      // The chunks are timed on a split of their own, of the same program,
+      // before this one is made, so that no two splits are held at once.
       if (timeChunks)
-        prepared.chunks = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(aneUnits);
-      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled);
+        prepared.chunks =
+            ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(shares);
+      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, shares, rows, cancelled);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
     });
     return prepared;

@@ -486,9 +486,11 @@ public:
   // A chunk's sequences read the states and KV that the chunks before it
   // wrote, in `kv`, and a sequence whose history holds Index pages reads its
   // K/V through `spilled` (the command's SpilledKvReads, the null one for
-  // none). The dense FFN of a command of one chunk the split takes
-  // (AneFfn::splits) runs split with the Neural Engine on `aneFfn`, when
-  // given. Of the command, this runs `layers`, all of them or a pass's:
+  // none). The dense FFN of a command the split takes (AneFfn::splits) runs
+  // split with the Neural Engine on `aneFfn`, when given: a command of one
+  // chunk, or of the two its first step's rows cut it into
+  // (AneFfn::firstStepRows), whose layers pipeline (addPrefillLayers). Of
+  // the command, this runs `layers`, all of them or a pass's:
   // what the layers before left in the chunks' buffers and the target's
   // prefill scratch the layers after read on, from another command, with no
   // other prefill between. With the last layer, returns each chunk's buffer
@@ -614,11 +616,12 @@ protected:
                                                std::span<const QwenTargetPrefillChunk> chunks,
                                                const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                QwenPrefillLayers layers, ops::AneFfn *aneFfn) const {
-    requirePrefill(chunks, kv, layers, aneFfn);
+    ops::AneFfn *split = splitOf(chunks, layers, aneFfn);
+    requirePrefill(chunks, kv, layers);
     std::vector<Step> steps;
     steps.reserve(chunks.size());
     for (const QwenTargetPrefillChunk &chunk : chunks)
-      steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, aneFfn)});
+      steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, split)});
     return steps;
   }
   // A prefill's layers `range` over its steps (addPrefill), through a
@@ -649,6 +652,13 @@ protected:
     for (uint32_t index = range.first; index < range.end; ++index) {
       const uint32_t attentionLayer = steps.front().attentionLayer;
       for (Step &step : steps) layers.addPrefillLayer(step, index);
+      // The last step's split FFN joins once the first step's next mixer is
+      // encoded, so that the Neural Engine runs it beside that mixer
+      // (AneFfn); here where no other step's mixer comes next, or where the
+      // layer's output rows are read before it.
+      if (auto *split = steps.front().aneFfn;
+          split && (steps.size() == 1 || index + 1 == range.end || geometry_.captureSlot(index)))
+        split->join(steps.front().graph);
       if (steps.front().attentionLayer != attentionLayer)
         steps.front().spilled.layerEnd(steps.front().graph, attentionLayer);
       const ops::BlockMoeWeights *ffn = layers.moe(index);
@@ -766,7 +776,11 @@ protected:
 
 private:
   void requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
-                      QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const;
+                      QwenPrefillLayers layers) const;
+  // `aneFfn` where it splits the command of `chunks`, which it then takes
+  // whole and cut as its first step's rows say; null where it does not.
+  [[nodiscard]] ops::AneFfn *splitOf(std::span<const QwenTargetPrefillChunk> chunks, QwenPrefillLayers layers,
+                                     ops::AneFfn *aneFfn) const;
   [[nodiscard]] PrefillStep prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                         const kv::PageStorage &kv, SpilledKvReads &spilled,
                                         ops::AneFfn *aneFfn) const;

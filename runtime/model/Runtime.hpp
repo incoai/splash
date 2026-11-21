@@ -77,6 +77,8 @@ public:
 
   [[nodiscard]] ModelTelemetry
   telemetry() const noexcept override;
+  void setAneFfn(ops::AneFfn *split) override;
+  void withPrefillFfn(const PrefillFfnUse &use) override;
 
 private:
   // The state lane of a resident request; the storage checks that its

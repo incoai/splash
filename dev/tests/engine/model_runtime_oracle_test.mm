@@ -7066,8 +7066,10 @@ int main(int argc, char **argv) {
     const auto checksContext = static_cast<uint32_t>(
         (checksBytes - stateLayout.laneBytes() + pageBytes - 1) / pageBytes * kv::kPageTokens);
     // A dense target's prefill FFN splits with the Neural Engine as a start
-    // splits it (engine::startAneFfn), calibrated by the build's first run and
-    // remembered for the runs after it unless a share is given, within a plan
+    // splits it (engine::startAneFfn, engine::finishAneFfn, once the runtime
+    // has prefilled a full chunk on the GPU alone), calibrated by the build's
+    // first run and remembered for the runs after it unless a share is given,
+    // within a plan
     // that holds what the checks hold: the oracle asks the split to leave
     // their context, as a start asks it to leave --max-context, so that no
     // split takes memory a check needs. The split is allocated beside the
@@ -7095,17 +7097,23 @@ int main(int argc, char **argv) {
             "the plan cannot hold the checks' context of " + std::to_string(checksContext) +
                 " tokens beside the given share");
     // The automatic context is what the plan holds with the split the start
-    // runs, as this Mac's calibration of the model remembers it, and without
-    // the split otherwise; a refused split names the most a split leaves
-    // instead (ane_ffn_startup_test).
+    // runs: a given share's, the largest split's where the start sets it up
+    // after the runtime's prefill, and without the split otherwise; a refused
+    // split names the most a split leaves instead (ane_ffn_startup_test).
     const auto contextOf = [&](uint64_t aneFfnBytes) {
       const EngineMemoryPlanResult result = planMemory(aneFfnBytes);
       return result.plan ? result.plan->maximumContextTokens() : 0u;
     };
+    const auto mostShare = [](const ops::AneFfn &split) {
+      return std::max(split.share(ops::AneFfn::Steps::One), split.share(ops::AneFfn::Steps::Two));
+    };
+    const bool pending = aneFfnStart.outcome.kind == engine::AneFfnOutcome::Kind::Pending;
     const uint32_t automaticContext =
-        aneFfnStart.split ? contextOf(aneFfnModel.plannedBytes(static_cast<uint32_t>(
-                                std::lround(aneFfnStart.split->share() * aneFfnModel.units))))
-                          : contextOf(0);
+        pending ? contextOf(aneFfnModel.plannedBytes(aneFfnStart.maxAneUnits))
+        : aneFfnStart.split
+            ? contextOf(aneFfnModel.plannedBytes(
+                  static_cast<uint32_t>(std::lround(mostShare(*aneFfnStart.split) * aneFfnModel.units))))
+            : contextOf(0);
     std::cout << "ane_ffn_context=" << aneFfnStart.outcome.context
               << " no_ane_context=" << aneFfnStart.outcome.contextWithout << " checks_context=" << checksContext
               << '\n';
@@ -7116,8 +7124,6 @@ int main(int argc, char **argv) {
     std::unique_ptr<ops::AneFfn> aneFfn = std::move(aneFfnStart.split);
     require(!aneFfn || aneFfn->allocatedBytes() <= aneFfnStart.plan->breakdown().aneFfnBytes,
             "the Neural Engine split allocated more than its plan");
-    std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
-              << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     AllocationFault allocationFault;
     const metal::AllocationAdmission admission =
         [admit = governed, &allocationFault, &backend](
@@ -7182,6 +7188,31 @@ int main(int argc, char **argv) {
       warmupEos(context, model);
       return 0;
     }
+    // A pending split is set up as a start sets it up: once the runtime has
+    // prefilled a full chunk on the GPU alone, whose GPU time gives the
+    // mixer, on the runtime's own prefill buffers, which then takes it.
+    if (pending) {
+      const double before = runtime->telemetry().totalPrefillGpuSeconds;
+      static_cast<void>(runtime->warmupPrefill(ops::AneFfn::kMaximumRows));
+      const double prefillMilliseconds = 1000.0 * (runtime->telemetry().totalPrefillGpuSeconds - before);
+      engine::AneFfnTiming timing;
+      timing.buffers = [&](const engine::AneFfnTiming::Use &use) { runtime->withPrefillFfn(use); };
+      engine::AneFfnFinished finished = engine::finishAneFfn(
+          engine::aneFfnModel(backend, model, operators, format, "model-runtime-oracle " SPLASH_BUILD_ID, timing),
+          aneFfnStart, prefillMilliseconds, {});
+      std::cout << "ane_ffn_finished=" << engine::aneFfnOutcomeName(finished.outcome.kind) << ' '
+                << finished.outcome.reason << '\n';
+      require(finished.outcome.kind != engine::AneFfnOutcome::Kind::Unavailable,
+              "the Neural Engine split is unavailable: " + finished.outcome.reason);
+      require(finished.outcome.context == aneFfnStart.outcome.context,
+              "setting the split up changed the context the start's plan holds");
+      aneFfn = std::move(finished.split);
+      require(!aneFfn || aneFfn->allocatedBytes() <= aneFfnStart.plan->breakdown().aneFfnBytes,
+              "the Neural Engine split allocated more than its plan");
+      runtime->setAneFfn(aneFfn.get());
+    }
+    std::cout << "ane_ffn_share=" << (aneFfn ? mostShare(*aneFfn) : 0.0)
+              << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     model::Runtime &executor = *runtime;
     // The scheduler plans no unit below the split's least chunk, where the GPU
     // alone runs the FFN (model::CommandLimits::minimumUnitRows).

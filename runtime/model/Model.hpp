@@ -26,6 +26,13 @@
 #include <vector>
 
 namespace splash {
+namespace metal {
+class MetalBuffer;
+} // namespace metal
+namespace ops {
+class AneFfn;
+struct PrefillFfnBuffers;
+} // namespace ops
 
 namespace model {
 class KvPageSources;
@@ -1010,6 +1017,20 @@ public:
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;
   [[nodiscard]] virtual ModelTelemetry telemetry() const noexcept = 0;
+  // The prefill FFN's Neural Engine split the runtime's next commands take,
+  // set between commands, and the command limits that follow from it
+  // (commandLimits()); none for the GPU alone. A runtime without a dense
+  // target's prefill ignores it.
+  virtual void setAneFfn(ops::AneFfn *split) { static_cast<void>(split); }
+  // Runs `use` between commands on the runtime's own prefill buffers of a
+  // dense FFN and the hidden rows its layers alternate between, which `use`
+  // may overwrite: the split's set-up. Throws for a runtime without them.
+  using PrefillFfnUse =
+      std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)>;
+  virtual void withPrefillFfn(const PrefillFfnUse &use) {
+    static_cast<void>(use);
+    throw std::logic_error("the runtime has no prefill buffers of a dense FFN");
+  }
 };
 
 } // namespace model

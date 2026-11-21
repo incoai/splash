@@ -62,10 +62,11 @@ struct RuntimeGeometry final {
   std::optional<SparseKvShape> spilledKv;
   // The chunks of a prefill command: a group's for a target whose experts
   // stream or whose K/V spills; two halves of kPrefillRows for a dense
-  // target; otherwise one. And the rows each chunk's views of the group's
-  // tensors begin after the one before's: a group's tensors hold
-  // prefillChunks * prefillChunkRows rows, the first chunk's view all of them,
-  // so that a dense target's command of one chunk takes them all.
+  // target, whose Neural Engine split pipelines a command's two steps
+  // (ops::AneFfn::firstStepRows); otherwise one. And the rows each chunk's
+  // views of the group's tensors begin after the one before's: a group's
+  // tensors hold prefillChunks * prefillChunkRows rows, the first chunk's view
+  // all of them, so that a dense target's command of one step takes them all.
   uint32_t prefillChunks = 1, prefillChunkRows = kPrefillRows;
   // Whether the target's experts stream from the SSD.
   bool streamedExperts = false;

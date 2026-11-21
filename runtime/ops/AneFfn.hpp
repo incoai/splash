@@ -22,39 +22,91 @@ namespace ane_ffn {
 class Measurement;
 } // namespace ane_ffn
 
-// The dense FFN of a prefill chunk split by intermediate channel between the
+// The dense FFN of a prefill command split by intermediate channel between the
 // GPU and the Neural Engine. The GPU runs the leading channels with its
 // prefill kernels over views of the projections' planes;
-// the ANE runs the rest as one W8A8 program over the chunk's rows, with int8
+// the ANE runs the rest as one W8A8 program over a step's rows, with int8
 // weights the GPU requantizes from those planes one layer ahead into
 // double-buffered surfaces, and the GPU adds the ANE's partial down projection
-// to its own. A shared event orders each layer's ANE evaluation between the
-// GPU's packing of its inputs and that join, within the one prefill command
-// (ane::Handoff). Any failure of the ANE's work stops the split for the life
-// of the process: finish() then reports the command's results unusable, and
-// the caller runs the chunk again on the GPU alone, which every later chunk
-// runs too. A split that loses to the GPU alone stops the same way, after a
-// command whose results are usable (setBreaker).
+// to its own. A command of enough rows runs as two steps, its rows' halves
+// (firstStepRows), whose layers interleave: the ANE runs a step's FFN while
+// the GPU runs the other step's mixer, which needs only the earlier rows'
+// K/V and state (QwenTarget::addPrefillLayers places each join). Each kind of
+// command, one step or two, takes its own share of the channels (Shares),
+// both in the one program over the one set of surfaces: the surfaces hold the
+// ANE's channels in descending units, the last first, so that every share's
+// channels are their leading rows (and down's leading inputs). A shared
+// event orders each step's ANE evaluation between the GPU's packing of its
+// inputs and that join, within the one prefill command (ane::Handoff). Any
+// failure of the ANE's work stops the split for the life of the process:
+// finish() then reports the command's results unusable, and the caller runs
+// the command again on the GPU alone, which every later command runs too. A
+// split that loses to the GPU alone stops the same way, after a command whose
+// results are usable (setBreaker).
 class AneFfn final {
 public:
-  // A chunk runs on the smallest of the program's functions that holds it,
+  // A step runs on the smallest of the program's functions that holds it,
   // one every kProgramStep rows from kMinimumRows to the prefill budget,
-  // since an evaluation costs the ANE its function's rows.
-  static constexpr uint32_t kMinimumRows = 512, kProgramStep = 128, kMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
+  // since an evaluation costs the ANE its function's rows. The least is
+  // 1.7.0's.
+  static constexpr uint32_t kProgramStep = 128, kMinimumRows = 512, kMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
   static_assert(kMaximumRows >= kMinimumRows && (kMaximumRows - kMinimumRows) % kProgramStep == 0,
                 "the functions cover the chunks the split takes");
+  // The least rows of a command a split runs in two steps: twice one step's
+  // least, so each half takes a function of at least as many. Two steps beat
+  // one from 1,024 rows on every Mac and model measured (an M6, two M5 Pros
+  // and an M5 Max, Qwen3.8-27B in MLX 4-bit, UD-Q4_K_M and UD-IQ3_XXS), and
+  // from 672 on the M6, so this gives up 2-4% there; below 896 rows on the
+  // M5 Max the halves' evaluations stalled the GPU at random. A program of
+  // both kinds holds one step's functions to this (5) and the halves' (5):
+  // Apple9's ANE compiler takes 15, where it refuses 22 (ANECCompile() FAILED
+  // on an M4, each time).
+  static constexpr uint32_t kTwoStepRows = 2 * kMinimumRows;
+  static_assert(kTwoStepRows <= kMaximumRows && (kTwoStepRows - kMinimumRows) / kProgramStep +
+                                                        (kMaximumRows / 2 - kMinimumRows) / kProgramStep + 2 <=
+                                                    15,
+                "a program of both kinds holds at most the 15 functions Apple9 compiles");
   // The GPU part's down projection is a view of leading inputs, which only
   // the prefill residual tiles (GgufPrefill, GgufPrefillInt8) run: no chunk
   // the split takes stages.
   static_assert(kMinimumRows > kMaximumStagedRows, "the split's chunks run the prefill residual tiles");
 
-  // The ANE takes `aneUnits` of the units() of intermediate channels, and
-  // the GPU the rest through `linear`'s prefill plans. The program is
-  // compiled and loaded here, and the wait for the ANE's service ends with
-  // ane::Interrupted once `interrupted` returns true. The split takes every
-  // chunk its functions hold until setMinimumRows().
+  // The kinds of command: one step, or two pipelined steps.
+  enum class Steps : uint8_t { One, Two };
+  // The most evaluations the ANE's client holds in flight for a program (its
+  // queue depth, macOS 26.5 and 27.0), which a command queues all of before
+  // the GPU starts (commit()): one a layer of each step, but a command's
+  // last layer, whose rows are read, runs on the GPU alone. A command of
+  // more would wait 10 s on its client and fail. Qwen3.8-27B's 64 layers
+  // queue 126 in two steps.
+  static constexpr uint32_t kMostInFlight = 127;
+  // Whether a command of `steps` over `layers` FFN layers queues no more
+  // evaluations than kMostInFlight.
+  [[nodiscard]] static constexpr bool fits(uint32_t layers, Steps steps) noexcept {
+    return layers && uint64_t{layers - 1} * (steps == Steps::Two ? 2 : 1) <= kMostInFlight;
+  }
+  // The ANE's units of the units() of intermediate channels in a command of
+  // each kind; none where the split takes no command of that kind.
+  struct Shares final {
+    uint32_t oneStep = 0, twoSteps = 0;
+    [[nodiscard]] uint32_t most() const noexcept { return oneStep > twoSteps ? oneStep : twoSteps; }
+  };
+  // The least rows of a command the split takes in one step, and of one it
+  // takes in two, from which every larger command runs in two; none of
+  // either kind it takes no command of.
+  struct Rows final {
+    uint32_t oneStep = 0, twoSteps = 0;
+  };
+
+  // The ANE takes `shares` of the units() of intermediate channels, and the
+  // GPU the rest through `linear`'s prefill plans, in commands of `rows`:
+  // its program holds the functions programRows(shares) gives. The program
+  // is compiled and loaded here, and the wait for the ANE's service ends with
+  // ane::Interrupted once `interrupted` returns true. Throws
+  // std::invalid_argument for a kind of command without its share or rows,
+  // or rows no function holds.
   AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
-         uint32_t aneUnits, std::function<bool()> interrupted);
+         Shares shares, Rows rows, std::function<bool()> interrupted);
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
@@ -64,8 +116,17 @@ public:
   // The units the split moves intermediate channels in, of `layers`, which
   // it takes: the ANE takes from one to all but one of them.
   [[nodiscard]] static uint32_t units(std::span<const SwiGluProjections> layers);
-  // The Metal memory of the split of `layers` with the ANE taking `aneUnits`.
-  [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
+  // The Metal memory of the split of `layers` with the ANE taking `shares`.
+  [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, Shares shares);
+  // The rows of the functions of a split of `shares`, ascending, by kind of
+  // command: of one share, one step's every kProgramStep rows from
+  // kMinimumRows to kMaximumRows (13), 1.7.0's; of both, one step's to
+  // kTwoStepRows (5), whose last holds the chunks below it, and the halves'
+  // from kMinimumRows to half the most rows (5). The rows a split takes only
+  // choose among them (setRows), so every split of the same shares runs the
+  // one program, which the ANE's service compiles once: calibration times
+  // the program that serves.
+  [[nodiscard]] static std::array<std::vector<uint32_t>, 2> programRows(Shares shares);
   // What tells this Mac's calibrations of a split of `layers` apart for one
   // macOS version, engine build and most units its plan holds: the layers'
   // shapes and formats, and the Int8Activations of `linear`, whose plans run
@@ -73,14 +134,17 @@ public:
   // 4-bit's takes 10 of 34 with them on, 15 off, on a 20-core M5 Pro).
   [[nodiscard]] static std::string calibrationKey(std::span<const SwiGluProjections> layers, const Linear &linear);
 
-  // The fraction of intermediate channels the ANE takes.
-  [[nodiscard]] double share() const noexcept;
+  // The fraction of intermediate channels the ANE takes in a command of
+  // `steps`; 0 for a kind the split takes none of.
+  [[nodiscard]] double share(Steps steps) const noexcept;
   // What Metal allocated for the split, which plannedBytes() bounds.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return allocatedBytes_; }
-  // The least rows of a chunk the split takes (ane_ffn::minimumRows), from
-  // kMinimumRows to kMaximumRows.
-  [[nodiscard]] uint32_t minimumRows() const noexcept { return minimumRows_; }
-  void setMinimumRows(uint32_t rows);
+  // The least rows of a command the split takes, of either kind.
+  [[nodiscard]] uint32_t minimumRows() const noexcept;
+  [[nodiscard]] const Rows &rows() const noexcept { return rows_; }
+  // Takes commands of `rows`, which its shares and functions hold. Throws
+  // std::invalid_argument otherwise.
+  void setRows(Rows rows);
   // Stops the split once it loses to the GPU alone: `breaker` judges each
   // command finish() finds split, and `lost` runs once when it trips. Until
   // this is called, none does.
@@ -113,23 +177,38 @@ public:
   [[nodiscard]] double verify(std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
                               const std::array<metal::MetalBuffer, 2> &hidden);
 
-  // Whether the split takes a chunk of `rows` rows: from minimumRows() to
+  // Whether the split takes a command of `rows` rows: from minimumRows() to
   // kMaximumRows, until it stops.
   [[nodiscard]] bool splits(uint32_t rows) const;
+  // The kind of a command of `rows` rows the split takes: two steps from
+  // rows().twoSteps, one below.
+  [[nodiscard]] Steps steps(uint32_t rows) const noexcept;
+  // The rows of the first step of a command of `rows` rows: the first half
+  // of one the split takes in two steps; all of them otherwise.
+  [[nodiscard]] uint32_t firstStepRows(uint32_t rows) const;
   // Whether the split stopped, and why.
   [[nodiscard]] bool retired() const { return handoff_.retired(); }
   [[nodiscard]] std::string reason() const { return handoff_.reason(); }
 
-  // Starts encoding a command; false once the split stopped.
-  bool begin();
-  // Layer `layer`'s FFN of a chunk of `rows` rows, from kMinimumRows to
-  // kMaximumRows, encoded in layer order from layer 0 after begin(): output =
-  // residual + FFN of ffn.normalized.
+  // Starts encoding a command of `steps`, whose share its layers take; false
+  // once the split stopped. A command of a kind the split takes none of adds
+  // no layer (std::logic_error).
+  bool begin(Steps steps);
+  // Layer `layer`'s FFN of a step of `rows` rows, from kMinimumRows to
+  // kMaximumRows, after begin(): output = residual + FFN of ffn.normalized,
+  // whose ANE part join() adds. Each step adds its layers in order from layer
+  // 0, the steps of a layer one after the other, and join() comes between
+  // adds: the first step's join once the second step's mixer is encoded, the
+  // second's once the first step's next mixer is.
   void add(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
            metal::MetalBuffer output, uint32_t rows);
+  // Encodes the join of the step added last, if not joined: the wait for its
+  // ANE evaluation and the addition of its part to the output.
+  void join(metal::CommandGraph &graph);
   // Starts the ANE's evaluations of the command encoded since begin(), then
   // submits it (MetalBackend::submitCommandAsync). A submission that throws
-  // stops the split before the exception goes on.
+  // stops the split before the exception goes on. Throws std::logic_error
+  // for a step not joined.
   [[nodiscard]] metal::CommandTicket commit(const metal::CommandGraph &graph, metal::CommandCompletion completion);
   // After the command committed last has completed: whether its outputs hold
   // the split's FFN. False when its ANE work failed, which stops the split
@@ -178,7 +257,7 @@ private:
   // reads a partial value or token scale that is not finite sets the status
   // word (ane_ffn_join).
   struct Memory final {
-    metal::MetalBuffer signs, rowScales, rotated, status;
+    metal::MetalBuffer signs, rotated, status;
     std::vector<ane::Surface> inputs;
     ane::Surface tokenScale, partial;
     std::array<Weights, 2> sets;
@@ -195,12 +274,9 @@ private:
   // A matrix of a layer: its index in Layer::planes, and the part of the
   // layer's per-row int8 scales rowScales() views.
   enum class Matrix : uint8_t { Gate, Up, Down };
-  // A layer, held by value: the planes of its gate, up and down, from which
-  // the GPU stages the ANE's int8 weights, and the GPU's share of it: gate
-  // and up over views of their leading rows, down over the leading inputs of
-  // its rows.
-  struct Layer final {
-    std::array<Planes, 3> planes;
+  // A layer's GPU part in a share: gate and up over views of their leading
+  // rows, down over the leading inputs of its rows.
+  struct GpuPart final {
     Projection gate, up, down;
   };
   // An input of the ANE program's functions: its name, the surface each
@@ -228,29 +304,49 @@ private:
     uint32_t evaluation, set;
     uint64_t ready, done;
   };
+  // A step's join that join() encodes: into `output`, of `rows` rows, after
+  // the event reaches `done` (none for the GPU's part alone).
+  struct Join final {
+    metal::MetalBuffer output;
+    uint32_t rows = 0;
+    uint64_t done = 0;
+  };
 
-  // The split with a function of each of `functionRows` rows, ascending.
+  // A kind of command's share: its channels (a Shape of its own), its layers'
+  // GPU parts, every layer's per-row int8 scales of the ANE's weights over
+  // its channels, and its program's functions, by rows, ascending.
+  struct Share final {
+    Shape shape;
+    std::vector<GpuPart> layers;
+    metal::MetalBuffer rowScales;
+    std::vector<Evaluation> evaluations;
+  };
+
+  // The split with a function of each of `functionRows` rows, ascending, by
+  // kind of command, and no rows set: every command of a function's rows.
   AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
-         uint32_t aneUnits, std::function<bool()> interrupted, std::span<const uint32_t> functionRows);
+         Shares shares, std::function<bool()> interrupted, const std::array<std::vector<uint32_t>, 2> &functionRows);
   [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
   // Every allocation of the split, which `buffer` and `surface` make:
-  // plannedBytes() counts them and the constructor allocates them.
+  // plannedBytes() counts them and the constructor allocates them: the
+  // surfaces of the most units, and each share's row scales.
   template <class MakeBuffer, class MakeSurface>
   [[nodiscard]] static Memory allocate(const Shape &shape, MakeBuffer &&buffer, MakeSurface &&surface);
-  // The program's inputs; the program over them, with a function of each of
-  // `rows` rows; and its function of `rows` rows.
+  [[nodiscard]] static uint64_t rowScaleBytes(const Shape &shape);
+  // A share's program inputs, the leading rows and columns of the surfaces
+  // its channels take, and its function of `rows` rows over them.
   [[nodiscard]] static std::vector<Input> programInputs(const Shape &shape, const Memory &memory);
-  [[nodiscard]] static std::string program(const Shape &shape, std::span<const Input> inputs,
-                                           const ane::Surface &output, std::span<const uint32_t> rows);
   [[nodiscard]] static std::string function(const Shape &shape, std::span<const Input> inputs,
                                             const ane::Surface &output, uint32_t rows);
+  // The share of the command being encoded.
+  [[nodiscard]] const Share &share() const;
   // Fills the CPU-visible bf16 rows `normalized` with the same values of a
   // normalized row's magnitude each time.
   static void fillNormalized(const metal::MetalBuffer &normalized);
   void encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
               metal::MetalBuffer output, uint32_t rows, Parts parts);
   void addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set) const;
-  [[nodiscard]] metal::MetalBuffer rowScales(uint32_t layer, Matrix matrix) const;
+  [[nodiscard]] metal::MetalBuffer rowScales(const Share &share, uint32_t layer, Matrix matrix) const;
   // Starts `job` on the ANE through the handoff.
   void queue(const Job &job);
   // finish() but for its log line and judgment: if every evaluation of the
@@ -263,19 +359,26 @@ private:
 
   metal::MetalBackend &backend_;
   const Linear linear_;
+  // The surfaces' channels: the most units of the shares.
   Shape shape_;
-  uint32_t minimumRows_ = kMinimumRows;
-  std::vector<Layer> layers_;
+  Rows rows_;
+  // Each layer's planes, from which the GPU stages the ANE's int8 weights.
+  std::vector<std::array<Planes, 3>> planes_;
   Memory memory_;
   std::unique_ptr<ane::Program> program_;
-  // By rows, ascending.
-  std::vector<Evaluation> evaluations_;
-  // The jobs of the command being encoded, which commit() starts, and the
-  // layer it adds next.
+  // By kind of command; none for a kind the split takes none of.
+  std::array<std::optional<Share>, 2> shares_;
+  // The kind of the command being encoded.
+  Steps steps_ = Steps::One;
+  // The jobs of the command being encoded, which commit() starts; the
+  // layers it has added, and the join of the step added last until join()
+  // encodes it.
   std::vector<Job> jobs_;
-  uint32_t nextLayer_ = 0;
-  // The evaluations of the command committed last, and its function's rows.
-  uint32_t committedEvaluations_ = 0, committedRows_ = 0;
+  uint32_t layersAdded_ = 0;
+  std::optional<Join> pending_;
+  // The layers and evaluations of the command committed last, and its
+  // evaluations' function rows over a layer.
+  uint32_t committedLayers_ = 0, committedEvaluations_ = 0, committedRows_ = 0;
   ane_ffn::Breaker breaker_;
   std::function<void()> lost_;
   Served served_;

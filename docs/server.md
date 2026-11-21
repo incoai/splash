@@ -323,9 +323,10 @@ also runs other applications, `--max-memory` leaves them room whatever they hold
 later: the automatic expert store and PLE row cache are planned smaller with it.
 The budget caps Metal allocations, not combined process RSS. The context limit
 is the model's native window, 256K tokens for every supported family, when the
-budget holds it beside the weights and, unless `--disable-ane`, the
-[Neural Engine split](internals.md#neural-engine-prefill) this Mac's calibration of a dense
-model takes, and otherwise as much as the budget holds beside them.
+budget holds it beside the weights and, unless `--disable-ane`, the largest
+[Neural Engine split](internals.md#neural-engine-prefill) a dense model could
+take (none once this Mac's calibration found no split gains enough), and
+otherwise as much as the budget holds beside them.
 `--max-context` sets it, such as `--max-context 100K` (K is 1024 tokens, M a
 million), up to what the budget holds without the split: beyond what the split
 leaves, the split takes fewer channels or the GPU runs alone, with a warning.

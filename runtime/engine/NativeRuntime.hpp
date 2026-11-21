@@ -92,6 +92,8 @@ public:
     return closeConnection_;
   }
   [[nodiscard]] bool engineHealthy() const noexcept { return engineHealthy_; }
+  // Before Ready: the model's command limits changed (Engine::refreshCommandLimits).
+  void refreshCommandLimits() noexcept { core_.refreshCommandLimits(); }
   // Code and message of the failure that stopped the engine, for the log.
   [[nodiscard]] const std::string &engineFailure() const noexcept {
     return engineFailure_;

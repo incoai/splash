@@ -230,8 +230,14 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # cache's off reason, its reads and a request's reuse in /status and usage,
 # the automatic budget's unwired tenth, a state at a prompt's head,
 # forgetting a lane count's step costs, and the lanes a start asks for in its
-# memory plan, warmups, scheduler, refusal, log line and /status.
-ENGINE_LINE_BUDGET = 30_746
+# memory plan, warmups, scheduler, refusal, log line and /status. 30,980
+# adds 234 for the Neural Engine split's two steps: the start's second share
+# and record, each kind of command on its own evidence, and the split set up
+# as the warmup's last step, at the least memory the engine holds, with the
+# GPU time of its prefill of a full chunk, which gives the mixer without a
+# runtime of its own (the start's pending split, its resources, the warmup's
+# step, stage and second audit, and the scheduler's limits).
+ENGINE_LINE_BUDGET = 30_980
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
