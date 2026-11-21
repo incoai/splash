@@ -316,9 +316,10 @@ std::optional<Late> late(double longestBuffer, double medianBuffer, double longe
 // busy and memory at the system's warning, the most a 640-row command in one
 // step, whose GPU alone counts no mixer; beside another process keeping the
 // GPU busy with compute buffers of 1 s, 10.6-21.1. Three times sits over
-// twice the first and under a third of the second.
-bool shared(double gpuMilliseconds, double aloneMilliseconds) noexcept {
-  return gpuMilliseconds >= 3.0 * aloneMilliseconds;
+// twice the first and under a third of the second. The image encodes ahead of
+// a command are no work of its layers.
+bool shared(double gpuMilliseconds, double encodeMilliseconds, double aloneMilliseconds) noexcept {
+  return gpuMilliseconds - encodeMilliseconds >= 3.0 * aloneMilliseconds;
 }
 
 } // namespace splash::ops::ane_ffn

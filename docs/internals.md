@@ -1730,7 +1730,8 @@ Engine was late` when its longest evaluation took half the excess or more,
 which the breaker counts already, and `the GPU was late` otherwise, which it
 does not, as the GPU alone would have been as late (`ane_ffn::late`). A split
 command that took the GPU three times or more what the GPU alone takes its
-layers, the breaker finding it not losing, shared the GPU with another
+layers, on its own time, not the image encodes a prompt's command runs after,
+and the breaker finding it not losing, shared the GPU with another
 process's work, which slows every buffer of it alike: the engine logs
 `Warning · Neural Engine FFN split: a command took N s on the GPU against M s
 on the GPU alone over its layers; the GPU was busy with another process's

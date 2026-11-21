@@ -143,6 +143,7 @@ public:
     CommandTiming timing = ticket_.wait();
     // The command's time counts its encodes', which it also reports apart.
     timing.gpuSeconds += encodes_.gpuSeconds;
+    timing.encodeGpuSeconds = encodes_.gpuSeconds;
     timing.wallSeconds += encodes_.wallSeconds;
     imageEncodeMilliseconds_ = encodes_.wallSeconds * 1000.0;
     const double commandSeconds = timing.wallSeconds;

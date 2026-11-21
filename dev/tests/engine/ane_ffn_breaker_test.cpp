@@ -140,16 +140,19 @@ void testLate() {
 // milliseconds: the longest commands of minutes of cold prompts beside display sleep and wake, a two-step command of
 // 2,048 rows in 2,906 (1.25 of the GPU alone's 2,330) and a one-step command of 640 rows in 641 (1.35 of 474, which
 // counts no mixer); beside another process's compute buffers of 1 s back to back, the same commands in 25,187 (10.8)
-// and 10,194 (21.5), the Neural Engine's time over them as it was alone. Three times the GPU alone's is the line.
+// and 10,194 (21.5), the Neural Engine's time over them as it was alone. Three times the GPU alone's is the line, on
+// the command's own time: the image encodes a prompt's command ran after count in its GPU time but not in the line.
 void testShared() {
   const double twoSteps = *kM5Pro.alone(2048, kLayers, true), oneStep = *kM5Pro.alone(640, kLayers, false);
-  require(!shared(2906.0, twoSteps) && !shared(641.0, oneStep),
+  require(!shared(2906.0, 0.0, twoSteps) && !shared(641.0, 0.0, oneStep),
           "a command of minutes of cold prompts shared the GPU");
-  require(shared(25187.0, twoSteps) && shared(10194.0, oneStep),
+  require(shared(25187.0, 0.0, twoSteps) && shared(10194.0, 0.0, oneStep),
           "a command beside another process's work did not share the GPU");
-  require(shared(3.0 * twoSteps, twoSteps) && !shared(2.99 * twoSteps, twoSteps) &&
+  require(shared(3.0 * twoSteps, 0.0, twoSteps) && !shared(2.99 * twoSteps, 0.0, twoSteps) &&
               !Breaker().alone(2048, kLayers, true),
           "the line was not three times the GPU alone's, or a breaker never given the GPU alone had a time for it");
+  require(!shared(2906.0 + 8000.0, 8000.0, twoSteps) && shared(25187.0 + 8000.0, 8000.0, twoSteps),
+          "a command's image encodes counted in the line, or hid another process's work");
 }
 
 } // namespace

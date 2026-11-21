@@ -240,11 +240,13 @@ private:
 enum class Late : uint8_t { NeuralEngine, Gpu };
 [[nodiscard]] std::optional<Late> late(double longestBuffer, double medianBuffer, double longestEvaluation) noexcept;
 
-// Whether a split command that took the GPU `gpuMilliseconds`, whose layers
-// the GPU alone takes `aloneMilliseconds` (Breaker::alone), shared the GPU
-// with another process's work: three times as long or more
-// (AneFfnCalibration.cpp). A Neural Engine late enough to hold the GPU that
-// long loses to the GPU alone first, which the breaker reports instead.
-[[nodiscard]] bool shared(double gpuMilliseconds, double aloneMilliseconds) noexcept;
+// Whether a split command that took the GPU `gpuMilliseconds`,
+// `encodeMilliseconds` of them the image encodes it ran after
+// (metal::CommandTiming), whose layers the GPU alone takes
+// `aloneMilliseconds` (Breaker::alone), shared the GPU with another process's
+// work: its own time three times as long or more (AneFfnCalibration.cpp). A
+// Neural Engine late enough to hold the GPU that long loses to the GPU alone
+// first, which the breaker reports instead.
+[[nodiscard]] bool shared(double gpuMilliseconds, double encodeMilliseconds, double aloneMilliseconds) noexcept;
 
 } // namespace splash::ops::ane_ffn

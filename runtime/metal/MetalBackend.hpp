@@ -288,6 +288,9 @@ struct CommandTiming {
   // time its later buffers wait for the other agent or its host steps.
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
+  // Of gpuSeconds, the image encodes' a prefill command ran after
+  // (Runtime.cpp), which the command reports with its own.
+  double encodeGpuSeconds = 0.0;
   // Of a command split at event signals, its longest buffer and its buffers'
   // median, each from its GPU start to its end: a buffer's wait for the other
   // agent counts in it.
