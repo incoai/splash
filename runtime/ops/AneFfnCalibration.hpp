@@ -185,11 +185,15 @@ public:
   // and a mixer of none or more.
   explicit Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu, double mixer);
 
-  // A command the split finished: over each of its `layers` layers,
-  // evaluations of functions of `rows` rows in all, its steps two
-  // (`pipelined`) or one, took the Neural Engine `milliseconds` in all. Why the
-  // split lost to the GPU alone on it, when it took the Neural Engine as long
-  // as the GPU alone takes those layers; empty otherwise.
+  // The GPU alone's milliseconds over a command's `layers` layers of
+  // functions of `rows` rows, its steps two (`pipelined`) or one, the mixers
+  // two steps run beside the Neural Engine's part with them; none for a
+  // breaker that never trips.
+  [[nodiscard]] std::optional<double> alone(uint32_t rows, uint32_t layers, bool pipelined) const;
+  // A command the split finished, as alone() takes it, took the Neural
+  // Engine `milliseconds` in all. Why the split lost to the GPU alone on it,
+  // when it took the Neural Engine as long as the GPU alone takes those
+  // layers; empty otherwise.
   [[nodiscard]] std::string judge(uint32_t rows, uint32_t layers, bool pipelined, double milliseconds) const;
 
 private:
@@ -235,5 +239,12 @@ private:
 // GPU alone would have been as late.
 enum class Late : uint8_t { NeuralEngine, Gpu };
 [[nodiscard]] std::optional<Late> late(double longestBuffer, double medianBuffer, double longestEvaluation) noexcept;
+
+// Whether a split command that took the GPU `gpuMilliseconds`, whose layers
+// the GPU alone takes `aloneMilliseconds` (Breaker::alone), shared the GPU
+// with another process's work: three times as long or more
+// (AneFfnCalibration.cpp). A Neural Engine late enough to hold the GPU that
+// long loses to the GPU alone first, which the breaker reports instead.
+[[nodiscard]] bool shared(double gpuMilliseconds, double aloneMilliseconds) noexcept;
 
 } // namespace splash::ops::ane_ffn

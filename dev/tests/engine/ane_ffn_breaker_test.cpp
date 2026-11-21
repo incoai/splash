@@ -3,7 +3,8 @@
 // took as long as the GPU alone takes its layers pauses the split on its own, for five minutes each time; the commands
 // the GPU runs alone meanwhile neither judge nor end it early; the next command split after it probes, and a probe
 // that wins resumes the split while one that loses too stops it; a healthy split, warm from minutes of prefill, never
-// trips; and of a command whose buffer stalled, the late party (ane_ffn::late).
+// trips; of a command whose buffer stalled, the late party (ane_ffn::late); and a command that shared the GPU with
+// another process's work (ane_ffn::shared).
 
 #include "TestChecks.hpp"
 #include "ops/AneFfnCalibration.hpp"
@@ -134,6 +135,23 @@ void testLate() {
           "a buffer under 1 s or under ten times the median stalled");
 }
 
+// A split command shared the GPU with another process's work where the GPU took three times as long as the GPU alone
+// takes its layers (Breaker::alone). Times as an M5 Pro took them, against the M5 Pro's calibration above, in
+// milliseconds: the longest commands of minutes of cold prompts beside display sleep and wake, a two-step command of
+// 2,048 rows in 2,906 (1.25 of the GPU alone's 2,330) and a one-step command of 640 rows in 641 (1.35 of 474, which
+// counts no mixer); beside another process's compute buffers of 1 s back to back, the same commands in 25,187 (10.8)
+// and 10,194 (21.5), the Neural Engine's time over them as it was alone. Three times the GPU alone's is the line.
+void testShared() {
+  const double twoSteps = *kM5Pro.alone(2048, kLayers, true), oneStep = *kM5Pro.alone(640, kLayers, false);
+  require(!shared(2906.0, twoSteps) && !shared(641.0, oneStep),
+          "a command of minutes of cold prompts shared the GPU");
+  require(shared(25187.0, twoSteps) && shared(10194.0, oneStep),
+          "a command beside another process's work did not share the GPU");
+  require(shared(3.0 * twoSteps, twoSteps) && !shared(2.99 * twoSteps, twoSteps) &&
+              !Breaker().alone(2048, kLayers, true),
+          "the line was not three times the GPU alone's, or a breaker never given the GPU alone had a time for it");
+}
+
 } // namespace
 
 int main() {
@@ -142,6 +160,7 @@ int main() {
     testPause();
     testWarm();
     testLate();
+    testShared();
     std::cout << "ane ffn breaker tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

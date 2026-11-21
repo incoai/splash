@@ -275,10 +275,14 @@ Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu, double mixer) {
   mostRows_ = high.rows;
 }
 
+std::optional<double> Breaker::alone(uint32_t rows, uint32_t layers, bool pipelined) const {
+  if (!gpu_) return std::nullopt;
+  return layers * ((*gpu_)(rows) + (pipelined ? mixer_ * rows / mostRows_ : 0.0));
+}
+
 std::string Breaker::judge(uint32_t rows, uint32_t layers, bool pipelined, double milliseconds) const {
   if (!gpu_) return {};
-  const double ratio = milliseconds / (layers * ((*gpu_)(rows) + (pipelined ? mixer_ * rows / mostRows_ : 0.0))),
-               most = (*gpu_)(mostRows_);
+  const double ratio = milliseconds / *alone(rows, layers, pipelined), most = (*gpu_)(mostRows_);
   if (!(ratio >= 1.0)) return {};
   std::ostringstream reason;
   reason << std::fixed << std::setprecision(1) << "losing to the GPU alone (" << ratio * most
@@ -304,6 +308,17 @@ Pause::Verdict Pause::finished(AwakeClock::time_point now, bool split, bool losi
 std::optional<Late> late(double longestBuffer, double medianBuffer, double longestEvaluation) noexcept {
   if (!(longestBuffer > 1.0 && longestBuffer > 10.0 * medianBuffer)) return std::nullopt;
   return longestEvaluation >= (longestBuffer - medianBuffer) / 2 ? Late::NeuralEngine : Late::Gpu;
+}
+
+// Split commands of Qwen3.8-27B MLX 4-bit on a 20-core M5 Pro took the GPU
+// 0.80-1.33 of the GPU alone's time over their layers through 1,179 commands
+// of cold prompts beside display sleep and wake, the screen saver, every core
+// busy and memory at the system's warning, the most a 640-row command in one
+// step, whose GPU alone counts no mixer; beside another process keeping the
+// GPU busy with compute buffers of 1 s, 10.6-21.1. Three times sits over
+// twice the first and under a third of the second.
+bool shared(double gpuMilliseconds, double aloneMilliseconds) noexcept {
+  return gpuMilliseconds >= 3.0 * aloneMilliseconds;
 }
 
 } // namespace splash::ops::ane_ffn

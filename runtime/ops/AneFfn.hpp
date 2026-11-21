@@ -216,7 +216,9 @@ public:
   // After the command committed last has completed, in `timing`: whether its
   // outputs hold the split's FFN. False when its ANE work failed, which stops
   // the split and logs why, once; true otherwise, also when the breaker stops
-  // the split after it. Logs a buffer of it that stalled (ane_ffn::late).
+  // the split after it. Logs a buffer of it that stalled (ane_ffn::late), and
+  // a command that shared the GPU with another process's work
+  // (ane_ffn::shared).
   [[nodiscard]] bool finish(const metal::CommandTiming &timing = {});
 
   // The engine's idle release (engine::ReleasableMemory). Between commands:

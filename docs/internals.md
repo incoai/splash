@@ -1724,7 +1724,19 @@ and ten times their median stalled: the engine logs `Warning · Neural Engine
 FFN split: a buffer of a command took N s against a median of M ms; the Neural
 Engine was late` when its longest evaluation took half the excess or more,
 which the breaker counts already, and `the GPU was late` otherwise, which it
-does not, as the GPU alone would have been as late (`ane_ffn::late`).
+does not, as the GPU alone would have been as late (`ane_ffn::late`). A split
+command that took the GPU three times or more what the GPU alone takes its
+layers, the breaker finding it not losing, shared the GPU with another
+process's work, which slows every buffer of it alike: the engine logs
+`Warning · Neural Engine FFN split: a command took N s on the GPU against M s
+on the GPU alone over its layers; the GPU was busy with another process's
+work` (`ane_ffn::shared`). On a 20-core M5 Pro with Qwen3.8-27B, beside
+another process's compute buffers of 1 s back to back, split commands took
+10.6-21.1 times the GPU alone's time over their layers and the GPU alone's own
+2,048-row commands 18.4-20.0 s against 2.4, while the Neural Engine's time
+over them stayed as it was; over minutes of cold prompts beside display sleep
+and wake, the screen saver, every core busy and memory at the system's
+warning, split commands took 0.80-1.33 of it.
 The split's int8 rounding moves its next-token distributions: on
 Qwen3.8-27B over prose and code prefixes of 0.8K to 8K tokens (the release
 kit's `logits/natural27.sh`), its KL from the GPU alone in bf16 activations is
@@ -1749,7 +1761,8 @@ baseline does and in two from 1,024 rows. `make test-engine-cpu` runs
 `ane-ffn-calibration`, the fit, the choice, the least chunk, a calibration's
 line of text and the breaker on timings it is given, also under the sanitizers,
 `ane-ffn-breaker`, the breaker on commands Macs timed, healthy and beside
-another client, and the pause and probe, also under the sanitizers,
+another client, the pause and probe, the late party of a stalled buffer and a
+command that shared the GPU, also under the sanitizers,
 and `ane-ffn-startup`, each outcome of a start on a model it plays, a
 remembered calibration and one whose fit at the units it chose moves them among
 them, the automatic context, the same in each

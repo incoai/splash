@@ -829,6 +829,11 @@ bool AneFfn::finish(const metal::CommandTiming &timing) {
     served_.milliseconds += milliseconds;
     const bool pipelined = committedEvaluations_ > committedLayers_;
     losing = breaker_.judge(committedRows_, committedLayers_, pipelined, milliseconds);
+    const std::optional<double> alone = breaker_.alone(committedRows_, committedLayers_, pipelined);
+    if (losing.empty() && alone && ane_ffn::shared(1000.0 * timing.gpuSeconds, *alone))
+      logWarning("Neural Engine FFN split: a command took ", std::fixed, std::setprecision(2), timing.gpuSeconds,
+                 " s on the GPU against ", *alone / 1000.0, " s on the GPU alone over its layers; the GPU was busy "
+                 "with another process's work.");
   }
   const AwakeClock::time_point now = AwakeClock::now();
   const ane_ffn::Pause::Verdict verdict = pause_.finished(now, committedLayers_ != 0, !losing.empty());
