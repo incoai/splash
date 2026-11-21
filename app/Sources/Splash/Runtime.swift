@@ -56,13 +56,18 @@ struct Runtime: Sendable {
 
     /// The command line that downloads and installs `model`, the installer `splash serve` runs
     /// before it serves, reporting download progress as JSON lines.
-    func installCommand(_ model: String) -> [String] {
-        scriptCommand("install/models.py", ["--model", model, "prepare", "--json-progress"])
+    func installCommand(_ model: String, textOnly: Bool = false) -> [String] {
+        scriptCommand("install/models.py",
+                      ["--model", model] + sourceFlags(textOnly) + ["prepare", "--json-progress"])
     }
 
     /// The command line of the installer removing `model`, an installed one.
-    func removeCommand(_ model: String) -> [String] {
-        scriptCommand("install/models.py", ["--model", model, "remove"])
+    func removeCommand(_ model: String, textOnly: Bool = false) -> [String] {
+        scriptCommand("install/models.py", ["--model", model] + sourceFlags(textOnly) + ["remove"])
+    }
+
+    private func sourceFlags(_ textOnly: Bool) -> [String] {
+        textOnly ? ["--language-only"] : []
     }
 
     /// Whether `pid` runs this runtime's installer as an app starts it (`installCommand`), for any
@@ -73,7 +78,8 @@ struct Runtime: Sendable {
         guard let arguments = processArguments(pid), let flag = arguments.firstIndex(of: "--model"),
               flag + 1 < arguments.endIndex
         else { return false }
-        return arguments.dropFirst() == installCommand(arguments[flag + 1]).dropFirst()
+        return arguments.dropFirst()
+            == installCommand(arguments[flag + 1], textOnly: arguments.contains("--language-only")).dropFirst()
     }
 
     /// The command line of the installer of the models the Hugging Face cache holds whole that

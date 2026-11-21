@@ -1178,6 +1178,15 @@ struct ChildRecordTests {
         #expect(defaults.object(forKey: Preference.installerPID) == nil)
     }
 
+    @Test func installerCommandsCarryTextOnly() {
+        let runtime = Runtime(root: URL(filePath: "/"))
+        #expect(Array(runtime.installCommand("a/b").suffix(4)) == ["--model", "a/b", "prepare", "--json-progress"])
+        #expect(Array(runtime.installCommand("a/b", textOnly: true).suffix(5))
+                == ["--model", "a/b", "--language-only", "prepare", "--json-progress"])
+        #expect(Array(runtime.removeCommand("a/b", textOnly: true).suffix(4))
+                == ["--model", "a/b", "--language-only", "remove"])
+    }
+
     /// A leftover server stops by itself once its app has ended, as SIGTERM stops it, and a
     /// Ctrl+C would then stop its engine at once: the next launch sends SIGTERM, which it ignores
     /// by then, and waits for it.
