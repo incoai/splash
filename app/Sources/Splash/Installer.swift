@@ -178,17 +178,17 @@ final class Installer {
     }
 
     /// Downloads `model`, or checks it for updates (`Work`).
-    func install(_ model: String, _ work: Work = .download) {
-        run(model, work)
+    func install(_ model: String, _ work: Work = .download, textOnly: Bool = false) {
+        run(model, work, textOnly: textOnly)
     }
 
     /// Removes `model`, an installed one, with the files of it that no other installation uses
     /// (`install/models.py remove`), which a server serving it refuses.
-    func remove(_ model: String) {
-        run(model, .removal)
+    func remove(_ model: String, textOnly: Bool = false) {
+        run(model, .removal, textOnly: textOnly)
     }
 
-    private func run(_ model: String, _ work: Work) {
+    private func run(_ model: String, _ work: Work, textOnly: Bool) {
         guard child == nil else { return }
         self.model = model
         self.work = work
@@ -203,7 +203,9 @@ final class Installer {
         resetLog(log)
         do {
             child = try record.start(
-                work == .removal ? runtime.removeCommand(model) : runtime.installCommand(model),
+                work == .removal
+                    ? runtime.removeCommand(model, textOnly: textOnly)
+                    : runtime.installCommand(model, textOnly: textOnly),
                 environment: runtime.environment,
                 log: log,
                 line: { [weak self] in self?.received($0) },
