@@ -263,7 +263,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # budget refuses: the states that pin them leave, oldest first, and a Full
 # extent their trims empty beyond the lanes' floors pays for the Slim ones
 # (Cache::releaseTails).
-ENGINE_LINE_BUDGET = 31_209
+# 31,232 adds 23 for Apple8: its attention row and the three-second bound on
+# a lone prefill command.
+ENGINE_LINE_BUDGET = 31_232
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

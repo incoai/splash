@@ -136,8 +136,11 @@ ops::PreparedInput Qwen4ExpTarget::addMix(PrefillStep &step, const Qwen4HyperWei
   const ops::LinearScratch scratch = step.buffers.linearScratch;
   const ops::Linear &linear = this->linear(step);
   const ops::HyperShape hs = hyperShape(geometry_);
+  // Apple8's hyper-connection norm pipeline holds 896 threads, under the
+  // quarter kernel's 1,024: every row runs the 256-thread kernel there, which
+  // sums the same.
   ops::HyperConnection::addNorm(step.graph, h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
-                                step.rows);
+                                step.rows, backend_.capabilities().gpuClass() != GpuClass::Apple8);
   linear.add(step.graph, {.input = h.normalized, .output = h.low, .scratch = scratch}, hyper.down,
              linear.plan(hyper.down, step.rows));
   const ops::LinearPlan upPlan = linear.plan(hyper.up, step.rows);

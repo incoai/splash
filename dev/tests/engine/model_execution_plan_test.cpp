@@ -452,7 +452,10 @@ void checkDecodeArenaPages(const model::LoadedModel &loaded) {
 // chunks' group cell, one GDN layer's state (3.26 MB on Qwen3.8-27B). The
 // 20-core Apple10 (an M5 Pro) runs a MoE target's chunks whose routes average
 // 64 an expert on 64-row expert tiles (the 35B's 2048 rows), whose scratch
-// holds 32 grouped rows more past the routes than the 32-row tiles' (160 KiB).
+// holds 32 grouped rows more past the routes than the 32-row tiles' (160 KiB). The decode figure is this tree's: the 256-thread vocabulary bracket
+// (ExecutionGeometry.h, Apple8's pipeline width) leaves its sampling rows 96 KiB
+// under the 1,024-thread one's, on every family; an upstream tree pins the
+// larger figures.
 void checkArenasHoldTheirLanes(const char *name, const model::LoadedModel &loaded, std::array<uint64_t, 2> decode,
                                std::array<uint64_t, 3> prefill) {
   const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
@@ -779,12 +782,12 @@ int main() {
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
-    checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {450'576'384, 434'864'128},
+    checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {450'478'080, 434'765'824},
                               {749'715'456, 733'609'984, 733'609'984});
-    checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {279'281'664, 273'874'944},
+    checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {279'183'360, 273'776'640},
                               {539'017'216, 533'610'496, 533'446'656});
     checkArenasHoldTheirLanes("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>(),
-                              {409'796'608, 403'963'904}, {1'124'614'144, 1'118'781'440, 1'118'781'440});
+                              {409'698'304, 403'865'600}, {1'124'614'144, 1'118'781'440, 1'118'781'440});
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepRows(loadedModel<model::Qwen3_8Weights>());

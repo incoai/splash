@@ -245,6 +245,17 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.int8Activations = arguments.int8Activations;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
+  // A lone prefill command keeps to three seconds: macOS aborts a command
+  // buffer that holds the GPU while the display needs it
+  // (kIOGPUCommandBufferCallbackErrorImpactingInteractivity), which a
+  // 2,048-row command did on an M2 Max at about 16 s, and the engine treats
+  // the abort as a backend failure and restarts. Eight seconds aborted here
+  // three times (Metal commands 7333 and 856, and 15503 at twelve) while a
+  // host whose swap and compressor were full stalled commands past the
+  // window; three seconds has not aborted once, though it holds about 200
+  // rows of a long history, so the Neural Engine FFN split runs on short
+  // prompts' 2,048-row chunks alone.
+  config.nativeLoop.engine.isolatedPrefillMilliseconds = 3000.0;
   return config;
 }
 
