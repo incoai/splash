@@ -801,15 +801,23 @@ metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::Com
   }
 }
 
-bool AneFfn::finish() {
-  const std::optional<AwakeClock::duration> ran = completed();
+bool AneFfn::finish(const metal::CommandTiming &timing) {
+  const std::optional<ane::Handoff::Ran> ran = completed();
   if (!ran) {
     warnStopped();
     return false;
   }
   std::string losing;
   if (committedLayers_) {
-    const double milliseconds = std::chrono::duration<double, std::milli>(*ran).count();
+    const double milliseconds = std::chrono::duration<double, std::milli>(ran->total).count(),
+                 longest = std::chrono::duration<double>(ran->longest).count();
+    if (const std::optional<ane_ffn::Late> late =
+            ane_ffn::late(timing.longestBufferSeconds, timing.medianBufferSeconds, longest))
+      logWarning("Neural Engine FFN split: a buffer of a command took ", std::fixed, std::setprecision(2),
+                 timing.longestBufferSeconds, " s against a median of ", std::setprecision(1),
+                 1000.0 * timing.medianBufferSeconds, " ms; the ",
+                 *late == ane_ffn::Late::NeuralEngine ? "Neural Engine was late" : "GPU was late",
+                 " (the longest evaluation took ", 1000.0 * longest, " ms from its notice to its report).");
     ++served_.commands;
     served_.evaluations += committedEvaluations_;
     served_.milliseconds += milliseconds;
@@ -830,9 +838,9 @@ bool AneFfn::finish() {
   return true;
 }
 
-std::optional<AwakeClock::duration> AneFfn::completed() {
+std::optional<ane::Handoff::Ran> AneFfn::completed() {
   unfinished_ = false;
-  std::optional<AwakeClock::duration> ran = handoff_.finish();
+  std::optional<ane::Handoff::Ran> ran = handoff_.finish();
   if (std::exchange(*static_cast<uint32_t *>(memory_.status.contents()), 0u) && ran) {
     handoff_.retire("the Neural Engine's output or its scales were not finite");
     ran.reset();

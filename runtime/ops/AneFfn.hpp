@@ -215,11 +215,11 @@ public:
   // stops the split before the exception goes on. Throws std::logic_error
   // for a step not joined.
   [[nodiscard]] metal::CommandTicket commit(const metal::CommandGraph &graph, metal::CommandCompletion completion);
-  // After the command committed last has completed: whether its outputs hold
-  // the split's FFN. False when its ANE work failed, which stops the split
-  // and logs why, once; true otherwise, also when the breaker stops the
-  // split after it.
-  [[nodiscard]] bool finish();
+  // After the command committed last has completed, in `timing`: whether its
+  // outputs hold the split's FFN. False when its ANE work failed, which stops
+  // the split and logs why, once; true otherwise, also when the breaker stops
+  // the split after it. Logs a buffer of it that stalled (ane_ffn::late).
+  [[nodiscard]] bool finish(const metal::CommandTiming &timing = {});
 
   // The engine's idle release (engine::ReleasableMemory). Between commands:
   // unloads the program, whose memory the ANE service gives back, and keeps
@@ -359,7 +359,7 @@ private:
   // command committed last succeeded and its joins read finite values, the
   // Neural Engine's time over them (ane::Handoff::finish); none otherwise,
   // which stops the split.
-  [[nodiscard]] std::optional<AwakeClock::duration> completed();
+  [[nodiscard]] std::optional<ane::Handoff::Ran> completed();
   // Logs, once, that the split stopped.
   void warnStopped();
 

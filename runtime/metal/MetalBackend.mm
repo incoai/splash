@@ -942,6 +942,16 @@ struct CommandTicket::State {
         }
         timing.wallSeconds =
             std::chrono::duration<double>(wallEnd - wallStart).count();
+        if (!leadingCommands.empty()) {
+            std::vector<double> buffers;
+            for (id<MTLCommandBuffer> buffer : leadingCommands) {
+                buffers.push_back(buffer.GPUEndTime - buffer.GPUStartTime);
+            }
+            buffers.push_back(command.GPUEndTime - command.GPUStartTime);
+            std::ranges::nth_element(buffers, buffers.begin() + buffers.size() / 2);
+            timing.medianBufferSeconds = buffers[buffers.size() / 2];
+            timing.longestBufferSeconds = std::ranges::max(buffers);
+        }
 
         std::string error;
         // The first buffer that failed names the error: the buffers after a

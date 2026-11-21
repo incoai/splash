@@ -1701,7 +1701,13 @@ program again after the weights (`AneFfn::restore`), in about 0.1 s, and logs
 load again within 10 s stops the split like a failure while serving, and the
 request runs on the GPU alone. A split that stopped unloads its program at the
 next idle release once the ANE has reported every evaluation, and keeps it
-unloaded. The split's int8 rounding moves its next-token distributions: on
+unloaded. A split command whose longest Metal command buffer took more than 1 s
+and ten times their median stalled: the engine logs `Warning · Neural Engine
+FFN split: a buffer of a command took N s against a median of M ms; the Neural
+Engine was late` when its longest evaluation took half the excess or more,
+which the breaker counts already, and `the GPU was late` otherwise, which it
+does not, as the GPU alone would have been as late (`ane_ffn::late`).
+The split's int8 rounding moves its next-token distributions: on
 Qwen3.8-27B over prose and code prefixes of 0.8K to 8K tokens (the release
 kit's `logits/natural27.sh`), its KL from the GPU alone in bf16 activations is
 about 3e-4 for the split's own rounding at an M5 Max's 0.21 of the channels,

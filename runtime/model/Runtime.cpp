@@ -3671,7 +3671,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // the first run could not read. The first ticket was released before
     // this completion runs (DeferredMetalTicket::wait), so the backend takes
     // the rerun's command, whose time counts in the chunk's.
-    if (impl->aneFfn && !impl->aneFfn->finish()) {
+    if (impl->aneFfn && !impl->aneFfn->finish(timing)) {
       for (uint32_t lane = 0; lane < items.size(); ++lane)
         entries[lane]->rngCounter = draws[lane];
       reads->end();

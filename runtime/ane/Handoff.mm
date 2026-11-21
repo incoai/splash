@@ -2,6 +2,7 @@
 
 #include <dispatch/dispatch.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -164,7 +165,7 @@ void Handoff::queue(uint64_t ready, uint64_t done, const Start &start) {
   state_->fail(state_->jobs.at(id).phase, std::move(failure));
 }
 
-std::optional<AwakeClock::duration> Handoff::finish() {
+std::optional<Handoff::Ran> Handoff::finish() {
   State &state = *state_;
   std::unique_lock lock(state.mutex);
   const auto settled = [&] {
@@ -179,13 +180,14 @@ std::optional<AwakeClock::duration> Handoff::finish() {
     for (auto &[id, job] : state.jobs)
       if (job.phase != Phase::Succeeded)
         state.fail(job.phase, "an evaluation did not report within " + seconds(state.bound) + " s of its command");
-  std::optional<AwakeClock::duration> ran = AwakeClock::duration{};
+  std::optional<Ran> ran = Ran{};
   for (const auto &[id, job] : state.jobs) {
     if (job.phase != Phase::Succeeded) {
       ran.reset();
       break;
     }
-    *ran += job.ran;
+    ran->total += job.ran;
+    ran->longest = std::max(ran->longest, job.ran);
   }
   state.jobs.clear();
   return ran;

@@ -198,4 +198,14 @@ private:
   bool probing_ = false;
 };
 
+// Who was late in a split command whose longest buffer took more than 1 s and
+// ten times its buffers' median (metal::CommandTiming): the Neural Engine when
+// its longest evaluation, from the notice of its `ready` to its report, took
+// half the excess or more, the GPU otherwise; none for a command without such
+// a buffer (AneFfn::finish). The breaker counts the GPU's wait on a late
+// evaluation already, in that evaluation's time; a GPU late on its own, the
+// GPU alone would have been as late.
+enum class Late : uint8_t { NeuralEngine, Gpu };
+[[nodiscard]] std::optional<Late> late(double longestBuffer, double medianBuffer, double longestEvaluation) noexcept;
+
 } // namespace splash::ops::ane_ffn

@@ -276,4 +276,9 @@ Pause::Verdict Pause::finished(AwakeClock::time_point now, bool split, bool losi
   return Verdict::Paused;
 }
 
+std::optional<Late> late(double longestBuffer, double medianBuffer, double longestEvaluation) noexcept {
+  if (!(longestBuffer > 1.0 && longestBuffer > 10.0 * medianBuffer)) return std::nullopt;
+  return longestEvaluation >= (longestBuffer - medianBuffer) / 2 ? Late::NeuralEngine : Late::Gpu;
+}
+
 } // namespace splash::ops::ane_ffn

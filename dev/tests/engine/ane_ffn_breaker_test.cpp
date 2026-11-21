@@ -2,8 +2,8 @@
 // ane_ffn::Pause, ops/AneFfnCalibration.cpp), on times Macs measured: a command whose evaluations
 // took as long as the GPU alone takes its layers pauses the split on its own, for five minutes each time; the commands
 // the GPU runs alone meanwhile neither judge nor end it early; the next command split after it probes, and a probe
-// that wins resumes the split while one that loses too stops it; and a healthy split, warm from minutes of prefill,
-// never trips.
+// that wins resumes the split while one that loses too stops it; a healthy split, warm from minutes of prefill, never
+// trips; and of a command whose buffer stalled, the late party (ane_ffn::late).
 
 #include "TestChecks.hpp"
 #include "ops/AneFfnCalibration.hpp"
@@ -119,6 +119,21 @@ void testWarm() {
     }
 }
 
+// A buffer past 1 s and ten times the command's median stalled: the Neural Engine was late when its longest
+// evaluation took half the excess or more, the GPU otherwise. Times as Macs took them, in seconds: buffers of 17 ms;
+// an evaluation of the fake that ran 1.5 s late (ane::ProgramInstrumentation's delayed evaluation); the GPU of a
+// laptop going to sleep with the command in flight, 1.83 s on a buffer whose evaluation reported in 40 ms; the 13.6 s
+// of GPU time a prompt lost with its evaluations on time (12.4 ms), were it one buffer. Neither a buffer under 1 s
+// nor one under ten times a median of evaluations each kept 0.2 s behind another client stalled: the breaker judges
+// those.
+void testLate() {
+  require(late(1.52, 0.017, 1.51) == Late::NeuralEngine, "a late evaluation's buffer did not name the Neural Engine");
+  require(late(1.83, 0.017, 0.040) == Late::Gpu && late(13.6, 0.017, 0.0124) == Late::Gpu,
+          "a buffer whose evaluations were on time did not name the GPU");
+  require(!late(0.9, 0.017, 0.9) && !late(1.9, 0.2, 0.7) && !late(0.0, 0.0, 0.0),
+          "a buffer under 1 s or under ten times the median stalled");
+}
+
 } // namespace
 
 int main() {
@@ -126,6 +141,7 @@ int main() {
     testCommands();
     testPause();
     testWarm();
+    testLate();
     std::cout << "ane ffn breaker tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

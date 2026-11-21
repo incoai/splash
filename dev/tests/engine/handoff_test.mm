@@ -284,7 +284,8 @@ void behaves(MetalBackend &backend, Behaviour behaviour, uint32_t faulty) {
 }
 
 // finish() reports the agent's time over a command's jobs, each from the notice of its ready to its report: at least
-// the time it took over each, less the notices' delays, and no longer than the command.
+// the time it took over each, less the notices' delays, and no longer than the command; the longest job's no shorter
+// than the time it took, less its notice's delay, and no longer than the command.
 void times(MetalBackend &backend) {
   constexpr auto kPace = std::chrono::milliseconds(20), kNotice = std::chrono::milliseconds(5);
   ane::Handoff handoff(backend, kBound);
@@ -292,10 +293,14 @@ void times(MetalBackend &backend) {
   Agent agent(Behaviour::Succeed, kLayers, markers, kPace);
   Layers layers(backend, markers);
   const double command = layers.run(backend, handoff, agent.start());
-  const std::optional<AwakeClock::duration> ran = handoff.finish();
-  require(ran && milliseconds(*ran) >= kLayers * milliseconds(kPace - kNotice) &&
-              milliseconds(*ran) <= command + milliseconds(kNotice),
-          "finish() reported " + (ran ? std::to_string(milliseconds(*ran)) + " ms" : std::string("a failure")) +
+  const std::optional<ane::Handoff::Ran> ran = handoff.finish();
+  require(ran && milliseconds(ran->total) >= kLayers * milliseconds(kPace - kNotice) &&
+              milliseconds(ran->total) <= command + milliseconds(kNotice) &&
+              milliseconds(ran->longest) >= milliseconds(kPace - kNotice) && ran->longest <= ran->total,
+          "finish() reported " +
+              (ran ? std::to_string(milliseconds(ran->total)) + " ms, " + std::to_string(milliseconds(ran->longest)) +
+                         " ms the longest job"
+                   : std::string("a failure")) +
               " for 8 jobs of " + std::to_string(kPace.count()) + " ms in a command of " + std::to_string(command) +
               " ms");
   std::cout << "PASS finish() reports the agent's time over a command's jobs\n";

@@ -554,12 +554,13 @@ Forward forward(MetalBackend &backend, const Linear &linear, const Model &model,
   }
   Forward result;
   const auto start = AwakeClock::now();
+  metal::CommandTiming timing;
   if (split)
-    static_cast<void>(split->commit(graph, {}).wait());
+    timing = split->commit(graph, {}).wait();
   else
     run(backend, graph);
   result.milliseconds = millisecondsSince(start);
-  result.usable = !split || split->finish();
+  result.usable = !split || split->finish(timing);
   const uint16_t *bits = contents<uint16_t>(hidden[kLayers & 1]);
   result.bits.assign(bits, bits + uint64_t{rows} * kHidden);
   return result;
