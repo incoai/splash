@@ -19,6 +19,15 @@ namespace ane_ffn = ops::ane_ffn;
 using Calibration = ane_ffn::Calibration;
 using Kind = AneFfnOutcome::Kind;
 
+// How much longer a recalled calibration's mixer may read than the one a
+// start's prefill gives, beside the calibration's GPU alone's FFN layer,
+// before the start calibrates again: a Mac busy beside a calibration reads
+// its mixer long (a 20-core M5 Pro's Qwen3.8-27B UD-Q4_K_M 23.84 ms under
+// load against 19.36 idle, +23%), or its GPU alone's FFN, beside which the
+// start's mixer then reads shorter still; it repeats within 0.7% from one
+// start to the next.
+constexpr double kBusier = 0.1;
+
 // `tokens` with its thousands grouped, as the server prints a context.
 std::string grouped(uint32_t tokens) {
   std::string digits = std::to_string(tokens);
@@ -341,16 +350,25 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
     const auto mixerBeside = [&](double gpuAlone) {
       return std::max(0.0, prefillMilliseconds / model.layers - gpuAlone);
     };
-    // The Neural Engine's refusal counts in the split's place; another
-    // failure keeps the calibration.
+    // A recalled calibration serves unless it was taken on a busier Mac than
+    // this one is now: a quieter one serves however busy this start is.
     if (calibration && calibration->aneUnits) {
-      AneFfnPrepared prepared;
-      if (const auto reason =
-              failure([&] { prepared = model.prepare(sharesOf(*calibration), rowsOf(*calibration), false); }))
-        return finished(Kind::Unavailable, "its remembered share's split was not prepared: " + *reason + "; " +
-                                               keep(refusal ? ane_ffn::refused(calibration) : *calibration));
-      take(prepared, *calibration);
-      return serve(std::move(prepared), *calibration, "", "set up as calibrated before");
+      const double now = mixerBeside(calibration->gpu[1].milliseconds);
+      const std::string mixers = "its mixer " + fixed(calibration->mixer) + " ms a full chunk's layer, " +
+                                 fixed(now) + " now";
+      if (calibration->mixer <= (1.0 + kBusier) * now) {
+        // The Neural Engine's refusal counts in the split's place; another
+        // failure keeps the calibration.
+        AneFfnPrepared prepared;
+        if (const auto reason =
+                failure([&] { prepared = model.prepare(sharesOf(*calibration), rowsOf(*calibration), false); }))
+          return finished(Kind::Unavailable, "its remembered share's split was not prepared: " + *reason + "; " +
+                                                 keep(refusal ? ane_ffn::refused(calibration) : *calibration));
+        take(prepared, *calibration);
+        return serve(std::move(prepared), *calibration, "", "set up as calibrated before, " + mixers);
+      }
+      logLine("The Neural Engine FFN split's calibration was taken on a busier Mac (", mixers,
+              "); the start calibrates it again.");
     }
 
     ane_ffn::Timings timings = model.time();

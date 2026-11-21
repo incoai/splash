@@ -165,9 +165,11 @@ startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, RequestedCon
 // The split a start left Pending (startAneFfn), once the engine's runtime has
 // prefilled a full chunk on the GPU alone in `prefillMilliseconds` of GPU
 // time, and how it came out, which it logs; the context and plan stay the
-// start's. It takes this Mac's calibration of the model, as recalled; else it
-// is calibrated (AneFfnStartup.cpp), the mixer the rest of that prefill's
-// layer, and the outcome remembered, a split or none. The split judges itself against the
+// start's. It takes this Mac's calibration of the model, as recalled, unless
+// the calibration's mixer reads more than a tenth longer than the one this
+// start's prefill gives: one taken on a busier Mac. Else it is calibrated
+// (AneFfnStartup.cpp), the mixer the rest of that prefill's layer, and the
+// outcome remembered, a split or none. The split judges itself against the
 // GPU alone as calibrated (ops::ane_ffn::Breaker), which forgets the
 // calibration when it trips; the Neural Engine's refusals count
 // (ops::ane_ffn::Calibration). Fails as startAneFfn does.

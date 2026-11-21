@@ -222,8 +222,9 @@ struct Fake {
 
 // The engine's prefill of a full chunk on the GPU alone that `start` waited for, in milliseconds: each of the
 // model's layers its FFN and the model's mixer beside it. The FFN is the GPU alone's full chunk as the calibration the
-// start recalled timed it, so that the prefill gives the model's mixer beside it; else as time() times it, none where
-// time() fails, as the finish's own timing then does.
+// start recalled timed it, so that the prefill gives the model's mixer beside it (a recalled calibration whose mixer
+// reads more than a tenth longer calibrates again); else as time() times it, none where time() fails, as the
+// finish's own timing then does.
 double prefillMilliseconds(Fake &fake, const AneFfnStart &start) {
   if (start.calibration && start.calibration->aneUnits)
     return (start.calibration->gpu[1].milliseconds + fake.mixer) * fake.layers;
@@ -960,9 +961,10 @@ void testTwoStepsOnlyWhereTheyFit() {
 }
 
 // Each kind of command stands on its own: a split of both shares whose one-step chunks split only from 1,024 rows, or
-// none of them, takes no command in one step and serves two steps alone from 1,024 rows, which it remembers and the
-// next start sets up as remembered; so does a split whose one-step fit chose no units, two steps' naming its program.
-// Neither kind gaining leaves the GPU alone and remembers none; a split of one share takes chunks from 1,024 rows.
+// none of them, takes no command in one step and serves two steps alone from 1,024 rows, which it remembers; the next
+// start sets that up as remembered, and a start whose mixer reads the record's busier calibrates it again. So does a
+// split whose one-step fit chose no units, two steps' naming its program. Neither kind gaining leaves the GPU alone
+// and remembers none; a split of one share takes chunks from 1,024 rows.
 void testTwoStepsStandAlone() {
   // The function of 1024 rows takes 10.195 ms, within 1.02 of the GPU alone's 10.0 at 1,024 rows, not at 1,023.
   const auto from1024 = [](AneFfn::Shares shares, bool timed) {
@@ -1010,6 +1012,11 @@ void testTwoStepsStandAlone() {
                 has(ran.log, "Neural Engine FFN split at share 0.12 in two steps from 1024 rows, 2.5% from the GPU "
                              "alone on the Neural Engine's part (set up as calibrated before"),
             "a start did not set up the remembered two steps alone: " + text(fake.preparations) + ran.log);
+    fake.mixer = 5.0;
+    ran = run(fake);
+    require(fake.timings == 2 && has(ran.log, "taken on a busier Mac (its mixer 9.0 ms a full chunk's layer, 5.0 "
+                                              "now); the start calibrates it again."),
+            "a busier record of two steps alone was not calibrated again: " + ran.log);
   }
   // Where one step's fit chooses no units, two steps are still asked: their units name the program, here beside a
   // mixer of 10 ms where one step's fit, an ANE slower than the GPU's part, gains 4.5% at most.
@@ -1484,6 +1491,64 @@ void testGivenShare() {
           "least rows without a share were taken");
 }
 
+// A recalled calibration taken on a busier Mac, as its mixer shows, is calibrated again at that start: one whose mixer
+// reads more than a tenth longer than the one the start's prefill gives beside the calibration's GPU alone. The real
+// case, a 20-core M5 Pro's Qwen3.8-27B UD-Q4_K_M under load (11-20): its mixer 23.84 ms against 19.36 idle, the GPU
+// alone's FFN 36.95 against 36.92, one step from 1,798 rows and no two steps against 0.41 from 512 and 0.56 in two from
+// 1,127. Within a tenth, and on a start busier than its own, the calibration is set up as recalled, nothing timed: a
+// busy start never drops a quiet calibration.
+void testABusierCalibrationIsTakenAgain() {
+  const Calibration underLoad{13, 1798, {{{512, 9.5659375}, {2048, 36.9545938}}}, 0, 0, 23.8388789};
+  // The start's prefill of a full chunk whose mixer reads `mixer` beside the calibration's GPU alone.
+  const auto prefill = [&](const Fake &fake, double mixer) { return (underLoad.gpu[1].milliseconds + mixer) * fake.layers; };
+  const auto recalled = [&](double mixer) {
+    struct Result {
+      Fake fake;
+      Started started;
+      Finished finished;
+    };
+    auto result = std::make_unique<Result>();
+    result->fake.stored = underLoad;
+    result->started = start(result->fake);
+    require(pending(result->fake, result->started, result->fake.largestUnits()) && result->started.start.calibration &&
+                result->started.start.calibration->minimumRows == 1798,
+            "a start that recalled a calibration did not leave it to the finish");
+    result->finished = finish(result->fake, result->started, prefill(result->fake, mixer));
+    return result;
+  };
+  // Idle now: the M5 Pro's idle prefill, 56.29 ms a layer, gives 19.33 ms beside the record's 36.95.
+  const auto idle = recalled(36.9225625 + 19.3630671 - underLoad.gpu[1].milliseconds);
+  require(has(idle->finished.log, "The Neural Engine FFN split's calibration was taken on a busier Mac (its mixer 23.8 "
+                                  "ms a full chunk's layer, 19.3 now); the start calibrates it again.") &&
+              idle->fake.timings == 1 && idle->fake.remembered && idle->fake.remembered->minimumRows != 1798 &&
+              idle->finished.finished.outcome.kind == Kind::Split && has(idle->finished.log, "(calibrated in"),
+          "a calibration taken on a busier Mac was not calibrated again: " + idle->finished.log);
+  // The edge: 23.84 against 21.7, a tenth less 0.01, is set up; against 21.6 calibrated again.
+  const auto within = recalled(21.7), past = recalled(21.6);
+  require(!within->fake.timings && !within->fake.remembered &&
+              within->fake.preparations == std::vector<Preparation>{{13, 0, 1798, 0, false}} &&
+              has(within->finished.log, "set up as calibrated before, its mixer 23.8 ms a full chunk's layer, 21.7 now") &&
+              past->fake.timings == 1 && has(past->finished.log, "busier Mac"),
+          "a calibration within a tenth of the start's mixer was not set up, or one past it was");
+  // A later start whose prefill reads as the calibrating one's sets its record up: the record keeps its mixer beside
+  // its own GPU alone (the chunks' 20 ms), which the check reads beside, not beside time()'s 18.99, which would read
+  // the same prefill a mixer of 2 against 0.99 and calibrate again at every start.
+  Fake same;
+  const double samePrefill = (18.990 + 2.0) * same.layers;
+  Started first = start(same);
+  static_cast<void>(finish(same, first, samePrefill));
+  Started second = start(same);
+  Finished again = finish(same, second, samePrefill);
+  require(same.timings == 1 && again.finished.outcome.kind == Kind::Split &&
+              has(again.log, "set up as calibrated before, its mixer 1.0 ms a full chunk's layer, 1.0 now"),
+          "a start whose prefill read as its calibration's calibrated again: " + again.log);
+  // A busier start sets the quiet calibration up.
+  const auto busier = recalled(30.0);
+  require(!busier->fake.timings && !busier->fake.remembered && busier->finished.finished.outcome.kind == Kind::Split &&
+              has(busier->finished.log, "its mixer 23.8 ms a full chunk's layer, 30.0 now"),
+          "a busier start dropped a quiet calibration: " + busier->finished.log);
+}
+
 } // namespace
 
 int main() {
@@ -1513,6 +1578,7 @@ int main() {
     testARefusedSplitIsNotCalibratedInALoop();
     testAFailureThatIsNotARefusalKeepsTheCalibration();
     testRemembered();
+    testABusierCalibrationIsTakenAgain();
     testGivenShare();
     std::cout << "ane ffn startup tests passed\n";
     return EXIT_SUCCESS;

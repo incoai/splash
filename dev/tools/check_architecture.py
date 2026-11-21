@@ -236,8 +236,10 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # as the warmup's last step, at the least memory the engine holds, with the
 # GPU time of its prefill of a full chunk, which gives the mixer without a
 # runtime of its own (the start's pending split, its resources, the warmup's
-# step, stage and second audit, and the scheduler's limits).
-ENGINE_LINE_BUDGET = 30_980
+# step, stage and second audit, and the scheduler's limits). 31,000 adds 20
+# for a recalled calibration taken on a busier Mac, which the start's mixer
+# shows and calibrates again.
+ENGINE_LINE_BUDGET = 31_000
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

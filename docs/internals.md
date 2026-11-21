@@ -1572,7 +1572,20 @@ plan holds, and remembers what it found (`remembered-*` in the cache directory
 below): the units of each kind, one step's least chunk, the GPU alone's FFN
 layer at 512 and 2048 rows and the mixer beside the latter, or that no split
 gains enough. Later starts take it untimed: they build the split, check it as
-below and serve.
+below and serve, unless it was calibrated on a busier Mac, which its mixer
+shows: where it reads more than a tenth longer than the one the start's
+prefill gives, beside its GPU alone's FFN layer, the start calibrates again. A Mac busy beside a calibration
+reads its mixer long, and its chunks too: on a 20-core M5 Pro, Qwen3.8-27B
+UD-Q4_K_M under load read 23.84 ms against 19.36 idle (+23%), its FFN 36.95
+against 36.92, and split chunks from 1,798 rows in one step and none in two
+against 512 and 1,127 idle. Where the load is another process's prefill, the
+GPU alone's FFN reads long too, and a quiet start's mixer beside it reads
+shorter still: the same Mac's MLX 4-bit under 8K prefills chose no one-step
+units and 0.65 in two steps, whose next quiet start read the record's mixer
+21.6 ms against none and calibrated again (0.29 from 770 rows, 0.41 in two
+steps). The warmup's mixer repeats within 0.7% from one start to the next on
+every Mac measured, a cold first start beside the ANE compiler's work
+included. A start busier than its calibration's never drops it.
 Beside it the start keeps how often the Neural Engine refused a split
 (`ane::Refused`: its service did not compile, load or run the program, or the
 check below failed): the first refusal of a remembered split leaves the next
