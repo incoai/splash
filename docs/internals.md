@@ -1615,7 +1615,9 @@ start to calibrate again, and the second, of a split calibrated, remembered or
 calibrated again, leaves the GPU alone, uncalibrated, until the key changes.
 Any other failure to build the split, as Metal refusing memory, keeps the
 calibration: that start runs the GPU alone, and the log says what the next
-start does.
+start does. A start with `--recalibrate-ane` reads no record: it
+calibrates as a first start does and replaces the record with what it finds,
+its refusals counted from none; no gain leaves the record as it was.
 Across many starts over hours of prefill on those three Macs the timings chose
 the same units within their noise, while timing every start cost 3-8 s, and a
 start whose timings strayed could change the share, each share compiling a
@@ -1699,8 +1701,10 @@ split, and a later loss pauses it for 5 minutes again, so that a server that
 meets a busy ANE now and then never pauses for longer; one that loses too
 stops the split the same way as a failure. The start's calibration is kept: a
 loss says the ANE was busy, not that the calibration is wrong, and a start
-that calibrated again beside the same client would read the ANE slow and keep
-a small share or none (a record taken on a busier Mac is the busy check's).
+that calibrated again beside the same client would read the ANE slow and find
+a small share or none. A record taken beside another client of the ANE, whose
+mixer reads as a quiet Mac's, serves as it is until macOS or the build changes,
+or until a start with `--recalibrate-ane` calibrates again.
 Another client of the ANE
 made a 20-core M5 Pro's split commands take 1.77 times the GPU alone's layers
 at the split's priority and 12.7 times behind a higher one, and the split

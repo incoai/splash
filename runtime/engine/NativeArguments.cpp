@@ -185,6 +185,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--ane-calibration") {
+      if (value != "again")
+        throw UsageError("--ane-calibration requires again");
+      result.recalibrateAne = true;
     } else if (option == "--activations") {
       if (value != "auto" && value != "bf16")
         throw UsageError("--activations requires auto or bf16");

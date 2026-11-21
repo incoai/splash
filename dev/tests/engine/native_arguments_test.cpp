@@ -153,6 +153,7 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"recalibrate_ane", [](NativeArguments &read) { read.recalibrateAne = true; }},
       {"activations_bf16", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // The defaults the server leaves out are the engine's: each meaning
@@ -213,7 +214,8 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
+           read.neuralEngine == meant.neuralEngine && read.recalibrateAne == meant.recalibrateAne &&
+           read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
            read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations &&
@@ -313,6 +315,7 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  refuses({"auto", "auto", "--ane-calibration", "on"}, "--ane-calibration requires again");
   for (const char *value : {"on", "off", "BF16", ""})
     refuses({"auto", "auto", "--activations", value}, "--activations requires auto or bf16");
   for (const char *requests : {"0", "9", "-1", "eight", ""})

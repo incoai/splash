@@ -66,6 +66,10 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --ane-calibration again: the split's start calibrates again instead of
+  // taking this Mac's record (splash serve --recalibrate-ane,
+  // AneFfnSetting::recalibrate).
+  bool recalibrateAne = false;
   // --ple-memory BYTES|auto|off and --expert-memory BYTES|auto|off: a
   // target's per-layer embedding (PLE) table through a row cache of BYTES and
   // a MoE target's routed experts through a store of BYTES, which

@@ -943,7 +943,7 @@ int main(int argc, char **argv) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
-                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
+                   "[--ane-ffn-minimum-rows ROWS]] [--ane-calibration again] [--max-context TOKENS] "
                    "[--activations auto|bf16] [--verify-rows all|auto] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES] [--logits-cache evict|keep]] "
                    "[--context-lengths TOKENS[,TOKENS...]] [--short-idle SECONDS]\n"
@@ -951,6 +951,8 @@ int main(int argc, char **argv) {
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
+                   "  --ane-calibration again: calibrate the split again instead of taking "
+                   "this Mac's record, as serve's --recalibrate-ane\n"
                    "  ROWS: the least rows of a chunk that share takes "
                    "(default: 512)\n"
                    "  TOKENS: the context the engine serves, as serve's "
@@ -979,6 +981,7 @@ int main(int argc, char **argv) {
     std::optional<std::filesystem::path> progressPath;
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
+    bool recalibrateAne = false;
     std::vector<uint32_t> contextLengths{2048, 10000, 50000, 128000};
     uint32_t maxContext = 0;
     ops::Int8Activations int8Activations = ops::Int8Activations::On;
@@ -999,6 +1002,10 @@ int main(int argc, char **argv) {
         selected = parseScenarios(argv[index + 1]);
       } else if (option == "--ane-ffn-share") {
         aneFfnShare = parseAneFfnShare(argv[index + 1]);
+      } else if (option == "--ane-calibration") {
+        if (std::string_view(argv[index + 1]) != "again")
+          throw std::invalid_argument("--ane-calibration takes again");
+        recalibrateAne = true;
       } else if (option == "--ane-ffn-minimum-rows") {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
@@ -1048,6 +1055,7 @@ int main(int argc, char **argv) {
     config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    config.aneFfn.recalibrate = recalibrateAne;
     config.int8Activations = int8Activations;
     config.verifyRows = verifyRows;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;

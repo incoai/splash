@@ -1544,6 +1544,23 @@ void testABusierCalibrationIsTakenAgain() {
           "a busier start dropped a quiet calibration: " + busier->finished.log);
 }
 
+// A start told to calibrate again (splash serve --recalibrate-ane) reads no record: one of a split, as testRemembered
+// sets up without the option, and one of two refusals, which leaves the GPU alone without it, are calibrated as a start
+// without a record is, and the split found replaces them, its refusals counted from none.
+void testRecalibrate() {
+  for (const Calibration &record :
+       {Calibration{9, 700, {{{512, 5.0}, {2048, 20.0}}}}, Calibration{.refusals = Calibration::kRefusals}}) {
+    Fake fake;
+    fake.stored = record;
+    const Ran ran = run(fake, {.recalibrate = true});
+    require(!fake.recalled && !ran.started.start.calibration && ran.outcome().kind == Kind::Split &&
+                fake.timings == 1 && fake.preparations == std::vector<Preparation>{{8, 0, 512, 0, true}} &&
+                fake.stored && fake.stored->aneUnits == 8 && fake.stored->minimumRows == 553 &&
+                !fake.stored->refusals && has(ran.log, "(calibrated in "),
+            "a start told to calibrate again took the record " + record.text() + ": " + ran.log);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -1574,6 +1591,7 @@ int main() {
     testAFailureThatIsNotARefusalKeepsTheCalibration();
     testRemembered();
     testABusierCalibrationIsTakenAgain();
+    testRecalibrate();
     testGivenShare();
     std::cout << "ane ffn startup tests passed\n";
     return EXIT_SUCCESS;

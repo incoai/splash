@@ -897,6 +897,18 @@ SERVE_OPTIONS = (
         needs="dense_ffn",
     ),
     ServeOption(
+        "--recalibrate-ane",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="calibrate the Neural Engine's share of long prompts again at "
+            "this start instead of taking the one this Mac kept",
+        ),
+        engine=EngineArgument("--ane-calibration", text=_spelled("again")),
+        needs="dense_ffn",
+    ),
+    ServeOption(
         "--activations",
         "requests",
         dict(
@@ -976,6 +988,10 @@ def check_serve_arguments(parser, args):
         )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
+    if args.recalibrate_ane and args.disable_ane:
+        parser.error(
+            "--recalibrate-ane needs the Neural Engine --disable-ane turns off"
+        )
     if args.reasoning_effort is not None and args.default_reasoning_effort is not None:
         parser.error(
             "--default-reasoning-effort (SPLASH_DEFAULT_REASONING_EFFORT) sets "

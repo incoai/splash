@@ -256,8 +256,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
   }
   // This Mac's calibration of the model within the units the plan holds: of
   // no split, refused twice, the GPU alone; refused once, calibrated again
-  // (ane_ffn::Calibration).
-  std::optional<Calibration> calibration = model.recall(maxAneUnits);
+  // (ane_ffn::Calibration); none recalled where the setting calibrates again.
+  std::optional<Calibration> calibration = setting.recalibrate ? std::nullopt : model.recall(maxAneUnits);
   if (calibration && !takeable(*calibration, maxAneUnits)) calibration.reset();
   if (calibration && !calibration->aneUnits && calibration->refusals != 1)
     return gpuAlone(Kind::Unavailable, calibration->withoutSplit(), without);
