@@ -19,7 +19,8 @@
 //   sizes, and a program that does not load again after the idle release, stop the split without failing the Metal
 //   command or throwing, and the GPU alone then computes what it computes on its own; a Neural Engine slower than the
 //   GPU alone pauses the split at its first command, whose results stay usable, and the probe after the pause stops
-//   it; an evaluation that signals the shared event below its value leaves the value as it is;
+//   it; a command whose submission throws starts no evaluation and stops the split; an evaluation that signals the
+//   shared event below its value leaves the value as it is;
 // - the program (runtime/ane/Program.mm): an invalid MIL, a function it lacks and a binding short of an input fail as
 //   std::exceptions; a limit that runs out and an interrupted wait end the wait, after which a program still comes up;
 //   unload() and load() round-trip, and load() does not compile; the cache writes a file of other bytes again and
@@ -1012,6 +1013,33 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
   if (split->release()) fail("a slow Neural Engine: the stopped split loaded its program again");
 }
 
+// A command whose submission throws starts none of its evaluations (AneFfn::commit submits it first): the split
+// stops for that, not for the evaluation armed to fail at the program's first enqueue, the backend stays healthy, and
+// the GPU alone then computes what it computes on its own.
+void unsubmitted(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  ane::ProgramInstrumentation::arm({.throwingEnqueue = 1});
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model, {kAneUnits, 0}, kOneStep);
+  const auto &[ffn, hidden] = chunk;
+  CommandGraph graph;
+  if (!split->begin(AneFfn::Steps::One)) fail("unsubmitted: the split does not begin a command");
+  for (uint32_t layer = 0; layer < kLayers; ++layer) {
+    split->join(graph);
+    split->add(graph, layer, ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], kRows);
+  }
+  split->join(graph);
+  graph.add("ane_ffn_no_such_kernel", {hidden[0]}, {1, 1, 1});
+  test::rejects([&] { static_cast<void>(split->commit(graph, {})); }, "ane_ffn_no_such_kernel",
+                "a command of a kernel the library lacks was submitted");
+  if (!split->retired() || !split->reason().starts_with("its Metal command was not submitted"))
+    fail("unsubmitted: the split " + (split->retired() ? "stopped for " + split->reason() : "did not stop"));
+  if (!backend.healthy()) fail("unsubmitted: the backend is unhealthy: " + backend.unhealthyReason());
+  const Forward alone = forward(backend, linear, model, nullptr, chunk, kRows);
+  const Forward after = forward(backend, linear, model, split.get(), chunk, kRows);
+  if (!after.usable || after.bits != alone.bits)
+    fail("unsubmitted: the GPU's forward after the split stopped differs from the GPU's alone");
+}
+
 // A split's program holds the functions of its shares alone (AneFfn::programRows): of one, one step's 13 from 512 to
 // 2048 rows; of both, one step's 5 to 1,024, whose last holds the chunks below two steps', and the halves' 5, which
 // Apple9's compiler takes. A command queues every evaluation before the GPU starts, which the ANE's client holds at
@@ -1145,6 +1173,9 @@ void faults(MetalBackend &backend) {
   loses(backend, linear, model, buffers);
   section("faults: a Neural Engine slower than the GPU alone pauses the split at its first usable command, the GPU "
           "alone runs the next, and the probe after the pause stops the split");
+
+  unsubmitted(backend, linear, model, buffers);
+  section("faults: a command whose submission throws starts no evaluation and stops the split");
 
   // The CPU raises the event past an evaluation's signal before it runs.
   test::AneSum sum(backend);

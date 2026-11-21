@@ -778,7 +778,6 @@ metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::Com
     throw std::logic_error("ANE FFN command queues " + std::to_string(jobs_.size()) +
                            " evaluations, more than the Neural Engine holds in flight");
   const std::vector<Job> jobs = std::exchange(jobs_, {});
-  for (const Job &job : jobs) queue(job);
   unfinished_ = !jobs.empty();
   committedLayers_ = jobs.empty() ? 0 : layersAdded_;
   committedEvaluations_ = static_cast<uint32_t>(jobs.size());
@@ -790,8 +789,9 @@ metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::Com
     handoff_.cancel(reason);
     warnStopped();
   };
+  metal::CommandTicket ticket;
   try {
-    return backend_.submitCommandAsync(graph.command(), std::move(completion));
+    ticket = backend_.submitCommandAsync(graph.command(), std::move(completion));
   } catch (const std::exception &error) {
     cancel(std::string("its Metal command was not submitted: ") + error.what());
     throw;
@@ -799,6 +799,12 @@ metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::Com
     cancel("its Metal command was not submitted");
     throw;
   }
+  // Queued once the command is submitted: after an idle the first request
+  // waits for the Neural Engine to power on and load the program again, which
+  // the GPU's work up to its first wait then overlaps. An evaluation queued
+  // after the GPU raised its `ready` starts at once, its bound from then.
+  for (const Job &job : jobs) queue(job);
+  return ticket;
 }
 
 bool AneFfn::finish(const metal::CommandTiming &timing) {

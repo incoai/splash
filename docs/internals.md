@@ -1416,12 +1416,18 @@ add 20-45% to the program's compile everywhere. The ANE
 service holds memory for a loaded program's intermediate values, which its
 functions share: 13 programs of one function each held it 13 times (3.25 GB at
 the M6's share, against 0.67 GB for the one program). A command queues all its
-evaluations before the GPU starts, one a layer of each step but the last
+evaluations once it is submitted, one a layer of each step but the last
 layer's, whose rows are read and which runs on the GPU alone; the ANE's client
 holds at most 127 in flight for a program (its queue depth, macOS 26.5 and
 27.0) and would make the 128th wait 10 s and fail, so two steps take a model of
 at most 64 layers (Qwen3.8-27B's 64 queue 126) and one step one of at most 128
-(`AneFfn::fits`). The GPU requantizes the
+(`AneFfn::fits`). The ANE's driver powers it off 6-12 s after its last work;
+the next command's first evaluation then waits 56-91 ms in its enqueue while
+the ANE powers on and loads the program again, which the GPU's work up to its
+first wait overlaps: the first token after an idle came 26-94 ms sooner on
+M5 Pros, an M5 Max and an M6 than with the evaluations queued before the
+submission. An evaluation's time, which the breaker judges, starts once its
+enqueue has returned, so the wake stays out of it. The GPU requantizes the
 ANE's weights from the block planes one layer ahead into double-buffered
 IOSurfaces and adds the ANE's partial down projection to its own. Shared
 events order each evaluation between the GPU's packing and that join inside
@@ -1741,7 +1747,8 @@ context where a calibration made anew would serve another.
 against CPU references for every image format under shader
 validation, then, without it, the split's memory and its output against the GPU
 alone, the functions a split's shares give its program, a command of 127
-evaluations and one of 128, which commit() refuses, the same output once its program is unloaded and loaded again, a chunk's
+evaluations and one of 128, which commit() refuses, a command whose submission
+throws, which starts none of its evaluations, the same output once its program is unloaded and loaded again, a chunk's
 rows on the GPU alone as a full chunk's, `verify()` of every function and of a
 function the client's instrumented build
 (`runtime/ane/ProgramInstrumentation.hpp`) binds to another's procedure, each

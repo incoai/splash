@@ -75,8 +75,8 @@ public:
   // The kinds of command: one step, or two pipelined steps.
   enum class Steps : uint8_t { One, Two };
   // The most evaluations the ANE's client holds in flight for a program (its
-  // queue depth, macOS 26.5 and 27.0), which a command queues all of before
-  // the GPU starts (commit()): one a layer of each step, but a command's
+  // queue depth, macOS 26.5 and 27.0), which a command queues all of as the
+  // GPU starts it (commit()): one a layer of each step, but a command's
   // last layer, whose rows are read, runs on the GPU alone. A command of
   // more would wait 10 s on its client and fail. Qwen3.8-27B's 64 layers
   // queue 126 in two steps.
@@ -210,10 +210,11 @@ public:
   // Encodes the join of the step added last, if not joined: the wait for its
   // ANE evaluation and the addition of its part to the output.
   void join(metal::CommandGraph &graph);
-  // Starts the ANE's evaluations of the command encoded since begin(), then
-  // submits it (MetalBackend::submitCommandAsync). A submission that throws
-  // stops the split before the exception goes on. Throws std::logic_error
-  // for a step not joined.
+  // Submits the command encoded since begin()
+  // (MetalBackend::submitCommandAsync), then starts its ANE evaluations, at
+  // most kMostInFlight. A submission that throws starts none and stops the
+  // split before the exception goes on. Throws std::logic_error for a step
+  // not joined.
   [[nodiscard]] metal::CommandTicket commit(const metal::CommandGraph &graph, metal::CommandCompletion completion);
   // After the command committed last has completed, in `timing`: whether its
   // outputs hold the split's FFN. False when its ANE work failed, which stops
