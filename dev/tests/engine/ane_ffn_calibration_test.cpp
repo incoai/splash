@@ -249,9 +249,10 @@ void testSlowerNowhere() {
 }
 
 // A calibration as a line of text comes back as it was, its refusals too, and one of no split as none with its
-// refusals; one of one step alone too, and of two steps alone; a line of another tag or version, with more or fewer
-// fields, units without least rows or two steps, least rows or two steps without units of one step, the GPU alone out of order or unusable, a mixer below none,
-// more refusals than kRefusals or a split beside kRefusals is not one.
+// refusals, one or kRefusals; one of one step alone too, and of two steps alone; a line of another tag or version,
+// with more or fewer fields, units without least rows or two steps, least rows or two steps without units of one
+// step, the GPU alone out of order or unusable, a mixer below none, no split and no refusals, more refusals than
+// kRefusals or a split beside kRefusals is not one.
 void testCalibrationText() {
   const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 1, 15, 13.5};
   const std::optional<Calibration> back = Calibration::parse(made.text());
@@ -268,11 +269,12 @@ void testCalibrationText() {
   require(twoOnly && twoOnly->aneUnits == 8 && !twoOnly->minimumRows && twoOnly->twoStepUnits == 15 &&
               twoOnly->mixer == 13.5,
           "a calibration of two steps alone did not come back");
-  const std::optional<Calibration> none = Calibration::parse(Calibration{}.text()),
+  // A record of no split holds only the Neural Engine's refusals: no gain is not remembered.
+  const std::optional<Calibration> once = Calibration::parse(Calibration{.refusals = 1}.text()),
                                    refused = Calibration::parse(Calibration{.refusals = 2}.text());
-  require(none && !none->aneUnits && !none->minimumRows && !none->refusals && refused && !refused->aneUnits &&
-              refused->refusals == 2,
-          "a calibration of no split did not come back");
+  require(once && !once->aneUnits && !once->minimumRows && once->refusals == 1 && refused && !refused->aneUnits &&
+              refused->refusals == 2 && !Calibration::parse(Calibration{}.text()),
+          "a record of no split came back other than of its refusals");
   for (const std::string_view line : {"", "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 15 806 13.5",
                                       "ane-ffn-calibration-4 8 655 512 5.25 2048 19.375 0 0",
                                       "ane-ffn-calibration-4 8 655 512 5.25 2048 19.375 0 0 0 1",

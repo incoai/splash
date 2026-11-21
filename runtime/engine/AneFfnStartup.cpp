@@ -255,12 +255,12 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     return start;
   }
   // This Mac's calibration of the model within the units the plan holds: of
-  // no split, the GPU alone, unless the Neural Engine refused one once, which
-  // calibrates again (ane_ffn::Calibration).
+  // no split, refused twice, the GPU alone; refused once, calibrated again
+  // (ane_ffn::Calibration).
   std::optional<Calibration> calibration = model.recall(maxAneUnits);
   if (calibration && !takeable(*calibration, maxAneUnits)) calibration.reset();
   if (calibration && !calibration->aneUnits && calibration->refusals != 1)
-    return gpuAlone(calibration->refusals ? Kind::Unavailable : Kind::NoGain, calibration->withoutSplit(), without);
+    return gpuAlone(Kind::Unavailable, calibration->withoutSplit(), without);
   AneFfnStart start = planned(maxAneUnits, Kind::Pending, "set up once the engine has prefilled a full chunk");
   start.maxAneUnits = maxAneUnits;
   start.calibration = std::move(calibration);
@@ -376,11 +376,11 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
       return ane_ffn::choose(fitted, alone, model.units, maxAneUnits);
     };
     const std::string layer = " ms per " + std::to_string(ops::AneFfn::kMaximumRows) + "-row FFN layer";
-    // No split gains enough: the start remembers so, and the next one leaves
-    // the GPU alone.
+    // No split gains enough: the start keeps nothing of it, so the next one
+    // calibrates again (ane_ffn::Calibration).
     const auto noGain = [&](std::string reason) {
-      model.remember(maxAneUnits, {});
-      return finished(Kind::NoGain, std::move(reason) + " (calibrated in " + secondsSince(started) + ")");
+      return finished(Kind::NoGain, std::move(reason) + " (calibrated in " + secondsSince(started) +
+                                        "; the next start calibrates again)");
     };
     const ane_ffn::Model fitted = ane_ffn::fit(timings.low, timings.high);
     const std::optional<uint32_t> first = choice(fitted, timings.gpuAlone);

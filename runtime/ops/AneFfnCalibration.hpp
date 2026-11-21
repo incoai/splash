@@ -132,21 +132,23 @@ struct ChunkTimings final {
 // (AneFfnCalibration.cpp).
 [[nodiscard]] bool slowerNowhere(const ChunkTimings &candidate, const ChunkTimings &incumbent);
 
-// What one calibration of the split on this Mac decided, which later starts
-// take again (engine::finishAneFfn): the ANE's units of a command of one
-// step, which name the split's program, one step's fit's or two steps' where
-// that chose none, and the least rows of a chunk the split takes in one step,
-// none where one step splits no chunk below two steps' commands; the ANE's
-// units of a command of two steps, which take every command from
-// ops::AneFfn::kTwoStepRows, none where two would not gain; none of any when
-// no split gained enough; the GPU alone's FFN layer at the least rows and a
-// full chunk's, and the rest of its layer of a full chunk beside that (the
-// mixer), which the breaker judges the split against. Beside it, how often
-// the Neural Engine refused a split of the model (ane::Refused) since the
-// start that first calibrated it: a record of no split and one refusal
-// calibrates again, and the next refusal leaves no split and kRefusals, the
-// GPU alone, so that a split the Neural Engine refuses each time costs two
-// calibrations at most, not one every other start.
+// The split one calibration of it on this Mac found, which later starts take
+// again (engine::finishAneFfn): the ANE's units of a command of one step,
+// which name the split's program, one step's fit's or two steps' where that
+// chose none, and the least rows of a chunk the split takes in one step, none
+// where one step splits no chunk below two steps' commands; the ANE's units of
+// a command of two steps, which take every command from
+// ops::AneFfn::kTwoStepRows, none where two would not gain; the GPU alone's
+// FFN layer at the least rows and a full chunk's, and the rest of its layer of
+// a full chunk beside that (the mixer), which the breaker judges the split
+// against. A calibration that finds no split gains enough is not kept: one
+// start beside other work, or on a GPU whose pace moved, would decide for
+// every later one. Beside it, how often the Neural Engine refused a split of
+// the model (ane::Refused) since the start that first calibrated it, kept
+// without a split too: a record of one refusal calibrates again, and the
+// next refusal leaves kRefusals, the GPU alone, so that a split the Neural
+// Engine refuses each time costs two calibrations at most, not one every
+// other start.
 struct Calibration final {
   static constexpr uint32_t kRefusals = 2;
   uint32_t aneUnits = 0, minimumRows = 0;
@@ -159,7 +161,7 @@ struct Calibration final {
   // sets its split up, calibrates again or leaves the GPU alone.
   [[nodiscard]] static std::string nextStart(const std::optional<Calibration> &record);
   // Why a start that takes this record, of no split, leaves the GPU alone, in
-  // a log's words: no split gained enough, or the Neural Engine refused one.
+  // a log's words: the Neural Engine refused its split twice.
   [[nodiscard]] std::string withoutSplit() const;
   // As one line of text, and back: none for text that is not such a line.
   [[nodiscard]] std::string text() const;

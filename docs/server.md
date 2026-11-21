@@ -325,7 +325,7 @@ The budget caps Metal allocations, not combined process RSS. The context limit
 is the model's native window, 256K tokens for every supported family, when the
 budget holds it beside the weights and, unless `--disable-ane`, the largest
 [Neural Engine split](internals.md#neural-engine-prefill) a dense model could
-take (none once this Mac's calibration found no split gains enough), and
+take (none once the Neural Engine refused this Mac's split twice), and
 otherwise as much as the budget holds beside them.
 `--max-context` sets it, such as `--max-context 100K` (K is 1024 tokens, M a
 million), up to what the budget holds without the split: beyond what the split

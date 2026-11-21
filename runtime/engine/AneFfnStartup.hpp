@@ -98,8 +98,8 @@ struct AneFfnOutcome final {
   // the memory plan holds without the split. While the split may run, the
   // first is what the plan holds with the largest split the model could take,
   // whatever the start makes of it, so that every start of the model on this
-  // Mac serves the same; once this Mac's calibration found no gain, the GPU
-  // alone's. Otherwise both are the same. For a split refused a context asked
+  // Mac serves the same; once the Neural Engine refused its split twice, the
+  // GPU alone's. Otherwise both are the same. For a split refused a context asked
   // for, the first is the most context a split leaves instead.
   // The split's bytes the plan of the first holds, none where it is the GPU
   // alone's.
@@ -146,9 +146,9 @@ struct AneFfnStart final {
 // one whose plan still holds the context `requested` asks for, or with none
 // the automatic context (AneFfnOutcome::context). Every step is arithmetic
 // but a given split's, which is set up here and takes the given least chunk,
-// no breaker, and nothing remembered. Where this Mac's calibration of the
-// model, within the units the plan holds, found no gain or the Neural Engine
-// refused its split twice, the GPU runs alone; otherwise the split is
+// no breaker, and nothing remembered. Where the Neural Engine refused this
+// Mac's split of the model, within the units the plan holds, twice, the GPU
+// runs alone; otherwise the split is
 // Pending: the plan holds the most units, and finishAneFfn sets it up. Logs
 // the outcome, a split a relaunch's context refuses in a plain line: the
 // server, not the user, asked for that context. A failure leaves the GPU
@@ -167,8 +167,8 @@ startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, RequestedCon
 // start's. It takes this Mac's calibration of the model, as recalled, unless
 // the calibration's mixer reads more than a tenth longer than the one this
 // start's prefill gives: one taken on a busier Mac. Else it is calibrated
-// (AneFfnStartup.cpp), the mixer the rest of that prefill's layer, and the
-// outcome remembered, a split or none. The split judges itself against the
+// (AneFfnStartup.cpp), the mixer the rest of that prefill's layer, and a
+// split it finds remembered, no split not. The split judges itself against the
 // GPU alone as calibrated (ops::ane_ffn::Breaker), and a split that stops for
 // losing keeps the calibration; the Neural Engine's refusals count
 // (ops::ane_ffn::Calibration). Fails as startAneFfn does.

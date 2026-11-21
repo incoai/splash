@@ -479,7 +479,7 @@ void testFinishingAStartNotPendingThrows() {
     AneFfnSetting setting;
     RequestedContext context;
   };
-  std::vector<Case> cases(6);
+  std::vector<Case> cases(5);
   cases[0].name = "--disable-ane";
   cases[0].setting = {.enabled = false};
   cases[1].name = "a MoE model";
@@ -488,10 +488,8 @@ void testFinishingAStartNotPendingThrows() {
   cases[2].context = {contextWith(0) - 1};
   cases[3].name = "a given split";
   cases[3].setting = {.given = AneFfnSetting::Given{0.2}};
-  cases[4].name = "a record of no gain";
-  cases[4].fake.stored = Calibration{};
-  cases[5].name = "a record of two refusals";
-  cases[5].fake.stored = Calibration{.refusals = Calibration::kRefusals};
+  cases[4].name = "a record of two refusals";
+  cases[4].fake.stored = Calibration{.refusals = Calibration::kRefusals};
   for (Case &test : cases) {
     const Started started = start(test.fake, test.setting, test.context);
     const size_t preparations = test.fake.preparations.size();
@@ -559,7 +557,7 @@ void testDeterministicContext() {
     Fake fake;
     AneFfnSetting setting;
   };
-  std::vector<Case> cases(10);
+  std::vector<Case> cases(9);
   cases[1].fake.stored = nine;
   cases[2].fake.time = noGain;
   cases[3].fake.prepare = slowChunks;
@@ -568,10 +566,9 @@ void testDeterministicContext() {
   cases[6].setting = {.given = AneFfnSetting::Given{0.2}};
   cases[7].fake.stored = nine;
   cases[7].fake.prepare = fails;
-  cases[8].fake.stored = Calibration{};
-  cases[9].fake.stored = Calibration{.refusals = Calibration::kRefusals};
+  cases[8].fake.stored = Calibration{.refusals = Calibration::kRefusals};
   const auto split = [](uint32_t aneUnits) { return contextWith(Fake{}.bytes(aneUnits)); };
-  const std::array<std::pair<Kind, uint32_t>, 10> expected{{{Kind::Split, most},
+  const std::array<std::pair<Kind, uint32_t>, 9> expected{{{Kind::Split, most},
                                                             {Kind::Split, most},
                                                             {Kind::NoGain, most},
                                                             {Kind::NoGain, most},
@@ -579,7 +576,6 @@ void testDeterministicContext() {
                                                             {Kind::Unavailable, most},
                                                             {Kind::Split, split(7)},
                                                             {Kind::Unavailable, most},
-                                                            {Kind::NoGain, contextWith(0)},
                                                             {Kind::Unavailable, contextWith(0)}}};
   for (size_t index = 0; index < cases.size(); ++index) {
     Case &test = cases[index];
@@ -595,12 +591,12 @@ void testDeterministicContext() {
                 start.plan.has_value() == (context != contextWith(0)) && named == (context != contextWith(0)),
             "start " + std::to_string(index) + " did not serve the largest split's context: " + ran.log);
   }
-  // The start after one whose calibration found no gain serves the GPU alone's context, untimed.
+  // The start after one whose calibration found no gain calibrates again, at the largest split's context.
   Fake &found = cases[2].fake;
   const Ran after = run(found);
-  require(after.outcome().kind == Kind::NoGain && !after.finished && found.timings == 1 &&
-              after.outcome().context == contextWith(0) && !after.started.start.plan,
-          "the start after a calibration of no gain did not serve the GPU alone's context: " + after.log);
+  require(after.outcome().kind == Kind::NoGain && after.finished && found.timings == 2 && !found.remembered &&
+              after.outcome().context == most && after.started.start.plan,
+          "the start after a calibration of no gain did not calibrate again at the split's context: " + after.log);
   // A start that takes the calibration a start remembered serves the context that start served.
   Fake fake;
   const uint32_t first = run(fake).outcome().context;
@@ -791,8 +787,10 @@ void testACommandOutOfMemoryIsCommandMemory() {
   require(startFailedEvent(refused).kind == FailureKind::Model, "a load the loader refused was not Model");
 }
 
-// No share predicted to gain enough, or no chunk timed to, leaves the GPU alone and remembers that none does; the
-// next start then leaves the GPU alone at once.
+// No share predicted to gain enough, or no chunk timed to, leaves the GPU alone and remembers nothing, so the next
+// start calibrates again, at the plan's context: one start beside other work (an M3 Ultra beside two serving servers
+// timed 84.0 ms a split layer against its GPU alone's 62.8, where a quiet start splits 0.41) or on a GPU whose pace
+// moved would otherwise decide for every later start.
 void testNoGain() {
   Fake fake;
   fake.time = [] {
@@ -801,16 +799,15 @@ void testNoGain() {
     return timings;
   };
   Ran ran = run(fake);
-  require(ran.outcome().kind == Kind::NoGain && !fake.prepared && fake.remembered && !fake.remembered->aneUnits &&
-              !fake.remembered->twoStepUnits && !ran.split() &&
+  require(ran.outcome().kind == Kind::NoGain && !fake.prepared && !fake.remembered && !ran.split() &&
               has(ran.log, "The GPU runs the prefill FFN alone: no Neural Engine split beats its 14.5 ms per "
-                           "2048-row FFN layer by enough (calibrated in "),
-          "a share predicted to gain too little split: " + ran.log);
+                           "2048-row FFN layer by enough (calibrated in ") &&
+              has(ran.log, "; the next start calibrates again)"),
+          "a share predicted to gain too little split, or was remembered: " + ran.log);
   ran = run(fake);
-  require(ran.outcome().kind == Kind::NoGain && !ran.finished && fake.timings == 1 &&
-              ran.outcome().context == contextWith(0) &&
-              has(ran.log, "no Neural Engine split beat it by enough when this Mac calibrated it"),
-          "the start after a calibration of no gain did not leave the GPU alone: " + ran.log);
+  require(ran.outcome().kind == Kind::NoGain && ran.finished && fake.timings == 2 && !fake.remembered &&
+              ran.outcome().context == fake.largestSplitContext() && ran.started.start.plan,
+          "the start after a calibration of no gain did not calibrate again at the plan's context: " + ran.log);
   fake = {};
   fake.prepare = [](AneFfn::Shares, bool) {
     AneFfnPrepared prepared;
@@ -818,8 +815,8 @@ void testNoGain() {
     return prepared;
   };
   ran = run(fake);
-  require(ran.outcome().kind == Kind::NoGain && fake.preparedUnits == std::vector{8u} && fake.remembered &&
-              !fake.remembered->aneUnits && !ran.split() &&
+  require(ran.outcome().kind == Kind::NoGain && fake.preparedUnits == std::vector{8u} && !fake.remembered &&
+              !ran.split() &&
               has(ran.log, "no chunk of the Neural Engine split beats it by enough, 21.0 ms per 2048-row FFN "
                            "layer against 20.0 on the GPU alone (calibrated in "),
           "a split of no chunk that gains split: " + ran.log);
@@ -1037,8 +1034,7 @@ void testTwoStepsStandAlone() {
   Fake fake;
   fake.prepare = splitsNone;
   Ran ran = run(fake);
-  require(ran.outcome().kind == Kind::NoGain && fake.remembered && !fake.remembered->aneUnits &&
-              !fake.remembered->twoStepUnits &&
+  require(ran.outcome().kind == Kind::NoGain && !fake.remembered &&
               has(ran.log, "The GPU runs the prefill FFN alone: no chunk of the Neural Engine split beats it by "
                            "enough, 11.0 ms per 1024-row FFN layer against 10.0 on the GPU alone (calibrated in "),
           "a split that gains in neither kind split: " + ran.log);
@@ -1370,9 +1366,9 @@ void testAFailureThatIsNotARefusalKeepsTheCalibration() {
 // A start takes this Mac's calibration once remembered, and leaves it to its finish: the start sets nothing up, and
 // the finish neither times nor remembers, prepares the remembered units untimed with the remembered least chunk, of
 // one step and of two from 1,024 rows where the record has a share of two, or of two steps alone, and says so. A
-// remembered calibration of no split leaves the GPU alone at once. One of more units than the plan holds, of either
-// kind, of least rows no function of one step holds, below two steps' 1,024 where it has a share of two, or of
-// neither least rows nor two steps, is calibrated again.
+// remembered record of no split, of two refusals, leaves the GPU alone at once. One of more units than the plan
+// holds, of either kind, of least rows no function of one step holds, below two steps' 1,024 where it has a share of
+// two, or of neither least rows nor two steps, is calibrated again.
 void testRemembered() {
   const std::array<ChunkTimings::Gpu, 2> gpu{{{512, 5.0}, {2048, 20.0}}};
   Fake fake;
@@ -1409,12 +1405,12 @@ void testRemembered() {
               has(alone.log, "at share 0.12 in two steps from 1024 rows, 2.5% from the GPU alone"),
           "the remembered two steps alone were not taken: " + text(fake.preparations) + alone.log);
   fake = {};
-  fake.stored = Calibration{};
+  fake.stored = Calibration{.refusals = Calibration::kRefusals};
   Ran ran = run(fake);
-  require(ran.outcome().kind == Kind::NoGain && !ran.finished && !fake.timings && !fake.prepared &&
+  require(ran.outcome().kind == Kind::Unavailable && !ran.finished && !fake.timings && !fake.prepared &&
               !fake.remembered && !ran.started.start.plan &&
-              has(ran.log, "The GPU runs the prefill FFN alone: no Neural Engine split beat it by enough when "
-                           "this Mac calibrated it"),
+              has(ran.log, "the Neural Engine refused its split twice; starts leave the GPU alone until Splash, "
+                           "macOS or the model changes"),
           "a remembered calibration of no split did not leave the GPU alone: " + ran.log);
   for (const Calibration &unusable :
        {Calibration{34, 700, gpu}, Calibration{9, AneFfn::kMinimumRows - 1, gpu},

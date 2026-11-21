@@ -1482,9 +1482,9 @@ channel units but one, or the most whose plan holds the context asked, or with
 none asked any), whatever the split then takes, so that without
 `--max-context` every start of a model on a Mac serves the same automatic
 context, which the log line names beside the context without the split
-(`context 61,433 tokens (73,721 with --disable-ane)`); once this Mac's
-calibration of the model found no split gains enough the plan holds none, and
-the start serves the GPU alone's. A split that fails leaves the GPU alone at
+(`context 61,433 tokens (73,721 with --disable-ane)`); once the Neural Engine
+refused this Mac's split of the model twice the plan holds none, and the start
+serves the GPU alone's. A split that fails leaves the GPU alone at
 the same context, and the memory the split would hold stays with the KV cache.
 The server's relaunch of the engine after a failure keeps the first engine's
 context: the server passes that context
@@ -1586,10 +1586,14 @@ holds both kinds' functions (above): the start times its one-step functions
 (below) on a split of its own before it builds the split that serves, which
 loads the same program. A start calibrates the split once for a Mac, a model, a
 macOS version, an engine build, `--activations` and the most units its memory
-plan holds, and remembers what it found (`remembered-*` in the cache directory
-below): the units of each kind, one step's least chunk, the GPU alone's FFN
-layer at 512 and 2048 rows and the mixer beside the latter, or that no split
-gains enough. Later starts take it untimed: they build the split, check it as
+plan holds, and remembers a split it found (`remembered-*` in the cache
+directory below): the units of each kind, one step's least chunk, the GPU
+alone's FFN layer at 512 and 2048 rows and the mixer beside the latter. That no
+split gains enough is not remembered, and the next start calibrates again: an
+M3 Ultra calibrated beside two serving servers found no chunk that beat the GPU
+alone (84.0 ms a full chunk's split layer against 62.8) where a quiet one
+splits 0.41 and prefills 32-34% faster, and remembering that served every
+later server on the Mac the GPU alone. Later starts take a split untimed: they build it, check it as
 below and serve, unless it was calibrated on a busier Mac, which its mixer
 shows: where it reads more than a tenth longer than the one the start's
 prefill gives, beside its GPU alone's FFN layer, the start calibrates again. A Mac busy beside a calibration

@@ -210,8 +210,7 @@ std::string Calibration::nextStart(const std::optional<Calibration> &record) {
 }
 
 std::string Calibration::withoutSplit() const {
-  return refusals ? "the Neural Engine refused its split twice; " + nextStart(*this)
-                  : "no Neural Engine split beat it by enough when this Mac calibrated it";
+  return "the Neural Engine refused its split twice; " + nextStart(*this);
 }
 
 std::string Calibration::text() const {
@@ -224,7 +223,8 @@ std::string Calibration::text() const {
 
 // A record of units holds least rows of one step or units of two steps, or
 // both, the GPU alone at ascending rows of usable milliseconds, and fewer
-// than kRefusals refusals; one of none holds neither, and at most kRefusals.
+// than kRefusals refusals; one of none holds neither, and one refusal or
+// kRefusals.
 std::optional<Calibration> Calibration::parse(std::string_view text) {
   std::istringstream in{std::string(text)};
   std::string tag;
@@ -237,7 +237,7 @@ std::optional<Calibration> Calibration::parse(std::string_view text) {
   const auto &[low, high] = calibration.gpu;
   const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
   if (!calibration.aneUnits)
-    return calibration.minimumRows || calibration.twoStepUnits
+    return calibration.minimumRows || calibration.twoStepUnits || !calibration.refusals
                ? std::nullopt
                : std::optional(Calibration{.refusals = calibration.refusals});
   if (calibration.refusals == kRefusals) return std::nullopt;
