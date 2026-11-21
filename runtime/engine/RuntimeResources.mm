@@ -1609,9 +1609,9 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     measured([&](ops::ane_ffn::Measurement &measurement) { timings = measurement.time(); });
     return timings;
   };
-  model.timeAt = [measured](uint32_t aneUnits, double gpuAlone) {
+  model.timeAt = [measured](uint32_t aneUnits) {
     ops::ane_ffn::Timing timing;
-    measured([&](ops::ane_ffn::Measurement &measurement) { timing = measurement.time(aneUnits, gpuAlone); });
+    measured([&](ops::ane_ffn::Measurement &measurement) { timing = measurement.time(aneUnits); });
     return timing;
   };
   model.prepare = [&backend, &linear, layers, cancelled, on](ops::AneFfn::Shares shares, ops::AneFfn::Rows rows,

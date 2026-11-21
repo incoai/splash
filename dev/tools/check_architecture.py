@@ -239,7 +239,8 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # step, stage and second audit, and the scheduler's limits). 31,000 adds 20
 # for a recalled calibration taken on a busier Mac, which the start's mixer
 # shows and calibrates again.
-ENGINE_LINE_BUDGET = 31_000
+# 30,996 takes 4 away: the refit reads its own GPU alone beside its split.
+ENGINE_LINE_BUDGET = 30_996
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

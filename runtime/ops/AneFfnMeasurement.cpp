@@ -12,8 +12,6 @@
 namespace splash::ops::ane_ffn {
 namespace {
 
-// The shares calibration times the split at.
-constexpr std::array<double, 2> kTimedShares{0.4, 0.8};
 // The layers time() and chunks() spread over the model; each of their
 // commands takes all but the last, which gives the last one's next weights
 // to stage.
@@ -121,30 +119,31 @@ std::vector<SwiGluProjections> Measurement::sampled() const {
   return layers;
 }
 
-Timings Measurement::time() {
-  const uint32_t units = AneFfn::units(layers_);
-  constexpr uint32_t kRows = AneFfn::kMaximumRows, kHalf = kRows / 2;
-  const std::vector<SwiGluProjections> layers = sampled();
-  Timings timings;
-  timings.gpuAlone = layer(layers, kSampledLayers - 1, kRows);
-  timings.low = time(nearestUnits(kTimedShares[0], units), timings.gpuAlone);
-  // The high share's split also takes a step of half the rows, on a program
-  // of both functions.
-  const uint32_t high = nearestUnits(kTimedShares[1], units);
-  AneFfn split(backend_, linear_, layers, {high, 0}, interrupted_, {std::vector{kHalf, kRows}, {}});
-  timings.high = {static_cast<double>(high) / units, gpuPart(layers, split),
-                  layer(layers, kSampledLayers - 1, kRows, &split, timings.gpuAlone)};
-  timings.highHalf =
-      layer(layers, kSampledLayers - 1, kHalf, &split, layer(layers, kSampledLayers - 1, kHalf));
-  return timings;
+Readers Measurement::readers(std::span<const SwiGluProjections> layers, std::unique_ptr<AneFfn> &split) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows, kCount = kSampledLayers - 1;
+  return {[this, layers, &split](uint32_t aneUnits, bool half) {
+            // No two splits are held at once.
+            split.reset();
+            split.reset(new AneFfn(backend_, linear_, layers, {aneUnits, 0}, interrupted_,
+                                   {half ? std::vector{kRows / 2, kRows} : std::vector{kRows}, {}}));
+          },
+          [this, layers, &split] { return gpuPart(layers, *split); },
+          [this, layers](uint32_t rows) { return layer(layers, kCount, rows); },
+          [this, layers, &split](uint32_t rows, double standIn) {
+            return layer(layers, kCount, rows, split.get(), standIn);
+          }};
 }
 
-Timing Measurement::time(uint32_t aneUnits, double gpuAlone) {
+Timings Measurement::time() {
   const std::vector<SwiGluProjections> layers = sampled();
-  constexpr uint32_t kRows = AneFfn::kMaximumRows;
-  AneFfn split(backend_, linear_, layers, {aneUnits, 0}, interrupted_, {std::vector{kRows}, {}});
-  return Timing{static_cast<double>(aneUnits) / AneFfn::units(layers_), gpuPart(layers, split),
-                layer(layers, kSampledLayers - 1, kRows, &split, gpuAlone)};
+  std::unique_ptr<AneFfn> split;
+  return ane_ffn::time(AneFfn::units(layers_), AneFfn::kMaximumRows, readers(layers, split));
+}
+
+Timing Measurement::time(uint32_t aneUnits) {
+  const std::vector<SwiGluProjections> layers = sampled();
+  std::unique_ptr<AneFfn> split;
+  return ane_ffn::time(aneUnits, AneFfn::units(layers_), AneFfn::kMaximumRows, readers(layers, split));
 }
 
 // On the layers time() timed, as many to a command, so that the splits

@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -18,9 +19,10 @@ namespace splash::ops::ane_ffn {
 
 // The split's per-layer milliseconds of a full chunk with the ANE taking
 // `share` of the intermediate channels (its channel units over all of
-// them), as the split runs them: its GPU part alone, and the split layer.
+// them), as the split runs them: its GPU part alone, and the split layer;
+// and the GPU's FFN layer alone read right before it.
 struct Timing final {
-  double share = 0.0, gpu = 0.0, split = 0.0;
+  double share = 0.0, gpu = 0.0, split = 0.0, alone = 0.0;
 };
 // What calibration times: the split at two shares, a full chunk's FFN layer
 // on the GPU alone, the high share's split layer of a step of half a full
@@ -31,6 +33,30 @@ struct Timings final {
   Timing low, high;
   double gpuAlone = 0.0, highHalf = 0.0, mixer = 0.0;
 };
+
+// What calibration reads, in the order time() below reads it: a split of
+// `aneUnits` made ready to time, its program of one function of a full
+// chunk's rows and, with `half`, of half as many too (`load`); that split's
+// GPU part alone (`gpuPart`); the GPU's FFN layer alone of a step of `rows`
+// rows (`alone`); and the split's layer of `rows` rows after its stand-in,
+// less `standIn` (`split`): Measurement's Metal commands, or a test's own.
+struct Readers final {
+  std::function<void(uint32_t aneUnits, bool half)> load;
+  std::function<double()> gpuPart;
+  std::function<double(uint32_t rows)> alone;
+  std::function<double(uint32_t rows, double standIn)> split;
+};
+// The split's timings at the channel units of `units` nearest two shares,
+// each split layer less the GPU alone read right before it, in the state its
+// command finds the GPU in: the GPU's pace moves as the ANE's programs
+// compile (an M4 MacBook Air read 352.9 ms a full chunk's FFN layer first and
+// 470 once it settled), and a GPU alone read earlier made the split layers
+// longer by the difference. The GPU alone the fit's gate takes is the high
+// share's, read last, beside the timings that set the units it chooses.
+// `rows` are a full chunk's.
+[[nodiscard]] Timings time(uint32_t units, uint32_t rows, const Readers &read);
+// The same of a split of `aneUnits` alone, with the GPU alone read beside it.
+[[nodiscard]] Timing time(uint32_t aneUnits, uint32_t units, uint32_t rows, const Readers &read);
 
 // `milliseconds`, which a measurement takes only as a duration it measured:
 // finite and positive. Throws "calibration timings are not usable"

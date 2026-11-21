@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -342,6 +343,51 @@ void testBreaker() {
 
 } // namespace
 
+// A GPU whose FFN layer alone of a full chunk reads `first` ms until a program has loaded and 470 after, as an M4
+// MacBook Air's settled while calibration compiled its programs (352.9 ms first, 470.2 in the chunks timed next), with
+// that Mac's GPU parts and split layers of Qwen3.8-27B MLX 4-bit at 14 and 27 of 34 units (its second calibration's,
+// whose split layers, 445.3 and 297.3 less 352.9, were 328.2 and 180.2 less 470), and a split of half the rows of 95.
+Readers settling(double first) {
+  struct State {
+    double pace;
+    uint32_t units = 0;
+  };
+  const auto state = std::make_shared<State>(State{first});
+  return {[state](uint32_t units, bool) {
+            state->pace = 470.0;
+            state->units = units;
+          },
+          [state] { return state->units == 14 ? 318.9 : 108.6; },
+          [state](uint32_t rows) { return state->pace * rows / 2048; },
+          [state](uint32_t rows, double standIn) {
+            const double split = rows == 2048 ? (state->units == 14 ? 328.2 : 180.2) : 95.0;
+            return state->pace * rows / 2048 + split - standIn;
+          }};
+}
+
+// Each share's split layer is read beside the GPU alone read right before it, so a GPU that settles while the
+// programs compile times the split as one that ran at its settled pace throughout: an M4 MacBook Air's 352.9 ms read
+// first had made its split layers 117 ms longer and its gate 117 ms shorter, which chose 30 units 1.2% short of no
+// gain; read beside them, 328.2 and 180.2 ms against 470, whose fit puts the units it chooses under half the GPU
+// alone's layer.
+void testSharesAreTimedBesideTheirGpuAlone() {
+  const Timings settled = splash::ops::ane_ffn::time(34, 2048, settling(352.9)),
+                steady = splash::ops::ane_ffn::time(34, 2048, settling(470.0));
+  const auto same = [](const Timing &a, const Timing &b) {
+    return near(a.share, b.share) && near(a.gpu, b.gpu) && near(a.split, b.split) && near(a.alone, b.alone);
+  };
+  require(same(settled.low, steady.low) && same(settled.high, steady.high) && near(settled.gpuAlone, 470.0) &&
+              near(settled.low.split, 328.2) && near(settled.high.split, 180.2) && near(settled.highHalf, 95.0) &&
+              near(settled.low.alone, 470.0),
+          "a GPU that settled while the programs compiled moved the split's timings");
+  const Model model = fit(settled.low, settled.high);
+  const std::optional<uint32_t> units = choose(model, settled.gpuAlone, 34, 33);
+  require(units && model(*units / 34.0) < 0.5 * settled.gpuAlone,
+          "the settled timings chose " + (units ? std::to_string(*units) : "no") + " units");
+  const Timing alone = splash::ops::ane_ffn::time(20, 34, 2048, settling(352.9));
+  require(near(alone.split, 180.2) && near(alone.alone, 470.0), "a split of given units was timed apart from its GPU alone");
+}
+
 int main() {
   try {
     testFit();
@@ -351,6 +397,7 @@ int main() {
     testUnusable();
     testMostUnits();
     testTwoSteps();
+    testSharesAreTimedBesideTheirGpuAlone();
     testNoGain();
     testUsable();
     testNearestUnits();

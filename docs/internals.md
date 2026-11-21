@@ -1517,7 +1517,12 @@ above, and, when it calibrates (below), times the split as a prefill runs it
 (`runtime/ops/AneFfnMeasurement.cpp`): commands of layers through `begin()`,
 `add()`, `commit()` and the handoff, each split layer after the GPU alone's FFN
 of the same layer, a stand-in for the mixer, which the GPU's layer alone timed
-alike takes away again, the median of three. On five FFN layers spread over the
+alike right before it takes away again, the median of three: the GPU's pace
+moves as the ANE's programs compile (an M4 MacBook Air's full-chunk layer read
+352.9 ms first and 470 once it settled), and a GPU alone read before them had
+made its split layers 117 ms longer and its fit's gate 117 ms shorter, 1.2%
+short of no gain on a Mac where the split prefills 77-93% faster. The gate
+takes the GPU alone read beside the 0.8 share, last. On five FFN layers spread over the
 model's depth, with the ANE taking the 512-channel units nearest 0.4 and 0.8 of
 them in programs of one 2048-row function, which the ANE service keeps once
 compiled, it times the split layer and its GPU part alone, and the GPU's layer

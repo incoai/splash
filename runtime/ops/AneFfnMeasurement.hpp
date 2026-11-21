@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -33,10 +34,9 @@ public:
   // too at the higher share, which the ANE's service keeps once compiled.
   // Not the mixer (Timings::mixer), which the model's side times.
   [[nodiscard]] Timings time();
-  // The same at `aneUnits`, the split layer less `gpuAlone`, the GPU's FFN
-  // alone that time() timed: what calibration fits again at the units it
+  // The same at `aneUnits`: what calibration fits again at the units it
   // first chooses (ane_ffn::refit), on the layers it fitted.
-  [[nodiscard]] Timing time(uint32_t aneUnits, double gpuAlone);
+  [[nodiscard]] Timing time(uint32_t aneUnits);
   // The GPU alone at the least rows and a full chunk, and the split of
   // `shares` over a step of the rows of each of its one-step functions, on
   // the layers time() times: on the program a split of `shares` serves
@@ -54,6 +54,9 @@ private:
   // The kSampledLayers layers time() spreads over the model, first and last
   // among them (AneFfnMeasurement.cpp).
   [[nodiscard]] std::vector<SwiGluProjections> sampled() const;
+  // The Metal readers of `layers` through the split `split` holds, which
+  // load() makes, one at a time.
+  [[nodiscard]] Readers readers(std::span<const SwiGluProjections> layers, std::unique_ptr<AneFfn> &split);
 
   metal::MetalBackend &backend_;
   std::span<const SwiGluProjections> layers_;

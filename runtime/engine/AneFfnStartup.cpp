@@ -421,9 +421,8 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
     std::optional<uint32_t> refitted;
     if (first)
       refitting("found", [&] {
-        refitted = choice(ane_ffn::refit(fitted, static_cast<double>(units) / model.units,
-                                         model.timeAt(units, timings.gpuAlone).split),
-                          timings.gpuAlone);
+        const ane_ffn::Timing at = model.timeAt(units);
+        refitted = choice(ane_ffn::refit(fitted, at.share, at.split), at.alone);
       });
     AneFfnPrepared prepared = timedSplit(units);
     uint32_t chosen = units;

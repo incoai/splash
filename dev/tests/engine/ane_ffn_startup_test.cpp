@@ -193,10 +193,10 @@ struct Fake {
       timed.mixer = 0.0;
       return timed;
     };
-    result.timeAt = [this](uint32_t aneUnits, double gpuAlone) {
-      if (gpuAlone != time().gpuAlone) throw std::logic_error("a split was timed against another GPU alone");
+    // Beside the same GPU alone as time()'s high share.
+    result.timeAt = [this](uint32_t aneUnits) {
       timedUnits.push_back(aneUnits);
-      return Timing{aneUnits / 34.0, 0.0, timeAt(aneUnits)};
+      return Timing{aneUnits / 34.0, 0.0, timeAt(aneUnits), time().gpuAlone};
     };
     result.prepare = [this](AneFfn::Shares shares, AneFfn::Rows rows, bool timeChunks) {
       prepared = {shares.oneStep, timeChunks};

@@ -43,7 +43,32 @@ double functionLayer(const ChunkTimings &timings, uint32_t rows) {
   return function == timings.functions.end() ? std::numeric_limits<double>::infinity() : function->split;
 }
 
+// The shares calibration times the split at.
+constexpr std::array<double, 2> kTimedShares{0.4, 0.8};
+
+// A share's timing: its split's GPU part, and its layer less the GPU alone
+// read right before it. The high share's program also holds a function of
+// half the rows.
+Timing share(uint32_t aneUnits, uint32_t units, uint32_t rows, bool half, const Readers &read) {
+  read.load(aneUnits, half);
+  const double gpu = read.gpuPart(), alone = read.alone(rows);
+  return {static_cast<double>(aneUnits) / units, gpu, read.split(rows, alone), alone};
+}
+
 } // namespace
+
+Timings time(uint32_t units, uint32_t rows, const Readers &read) {
+  Timings timings;
+  timings.low = share(nearestUnits(kTimedShares[0], units), units, rows, false, read);
+  timings.high = share(nearestUnits(kTimedShares[1], units), units, rows, true, read);
+  timings.gpuAlone = timings.high.alone;
+  timings.highHalf = read.split(rows / 2, read.alone(rows / 2));
+  return timings;
+}
+
+Timing time(uint32_t aneUnits, uint32_t units, uint32_t rows, const Readers &read) {
+  return share(aneUnits, units, rows, false, read);
+}
 
 double usable(double milliseconds) {
   if (!(milliseconds > 0.0 && std::isfinite(milliseconds)))
