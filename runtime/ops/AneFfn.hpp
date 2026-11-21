@@ -41,8 +41,9 @@ class Measurement;
 // failure of the ANE's work stops the split for the life of the process:
 // finish() then reports the command's results unusable, and the caller runs
 // the command again on the GPU alone, which every later command runs too. A
-// split that loses to the GPU alone stops the same way, after a command whose
-// results are usable (setBreaker).
+// split that loses to the GPU alone pauses after a command whose results are
+// usable, and stops the same way once a probe after the pause loses too
+// (setBreaker, ane_ffn::Pause).
 class AneFfn final {
 public:
   // A step runs on the smallest of the program's functions that holds it,
@@ -146,12 +147,15 @@ public:
   // Takes commands of `rows`, which its shares and functions hold. Throws
   // std::invalid_argument otherwise.
   void setRows(Rows rows);
-  // Stops the split once it loses to the GPU alone: `breaker` judges each
-  // command finish() finds split, and `lost` runs once when it trips. Until
-  // this is called, none does.
-  void setBreaker(ane_ffn::Breaker breaker, std::function<void()> lost) noexcept {
+  // Pauses the split for `pause` once it loses to the GPU alone, and stops
+  // it once a probe loses too (ane_ffn::Pause): `breaker` judges each command
+  // finish() finds split, and `lost` runs once when it stops. Until this is
+  // called, none does.
+  void setBreaker(ane_ffn::Breaker breaker, std::function<void()> lost,
+                  AwakeClock::duration pause = ane_ffn::Pause::kLength) noexcept {
     breaker_ = std::move(breaker);
     lost_ = std::move(lost);
+    pause_ = ane_ffn::Pause(pause);
   }
 
   // The commands finish() found split since the split was built, their
@@ -179,7 +183,7 @@ public:
                               const std::array<metal::MetalBuffer, 2> &hidden);
 
   // Whether the split takes a command of `rows` rows: from minimumRows() to
-  // kMaximumRows, until it stops.
+  // kMaximumRows, but not while it pauses (setBreaker) and not once it stops.
   [[nodiscard]] bool splits(uint32_t rows) const;
   // The kind of a command of `rows` rows the split takes: two steps from
   // rows().twoSteps, one below.
@@ -383,6 +387,7 @@ private:
   uint32_t committedLayers_ = 0, committedEvaluations_ = 0, committedRows_ = 0;
   ane_ffn::Breaker breaker_;
   std::function<void()> lost_;
+  ane_ffn::Pause pause_;
   Served served_;
   // Whether a command committed jobs that finish() has not yet judged.
   bool unfinished_ = false;

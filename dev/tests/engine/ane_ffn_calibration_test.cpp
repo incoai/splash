@@ -287,46 +287,46 @@ void testCalibrationText() {
     require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
 }
 
-// The breaker against the GPU alone on the line through 8 ms at 512 rows and 20 at 2048, 4 ms + rows / 128: a window
-// of 8 commands whose evaluations take as long as the GPU alone's layers trips it on its 8th command, one a little
-// faster never does, nor one that never was given the GPU alone. An evaluation of fewer rows counts against the GPU
-// alone's layer of its rows, not against its rows' part of the most rows', and each window is judged on its own.
+// The breaker against the GPU alone on the line through 8 ms at 512 rows and 20 at 2048, 4 ms + rows / 128: a command
+// whose evaluations take as long as the GPU alone's layers loses on its own, one a little faster never does, nor one
+// a breaker never given the GPU alone judges. An evaluation of fewer rows counts against the GPU alone's layer of its
+// rows, not against its rows' part of the most rows', and each command is judged on its own.
 void testBreaker() {
   ChunkTimings timings;
   timings.gpu = {{{512, 8.0}, {2048, 20.0}}};
   // `count` commands of 64 evaluations of the function of `rows` rows, each `ratio` of the GPU alone's layer of
-  // those rows: the first reason the breaker gives, and after how many commands.
-  const auto run = [](Breaker &breaker, uint32_t count, uint32_t rows, double ratio, bool pipelined = false) {
+  // those rows: the first reason the breaker gives, and at which command.
+  const auto run = [](const Breaker &breaker, uint32_t count, uint32_t rows, double ratio, bool pipelined = false) {
     for (uint32_t command = 1; command <= count; ++command) {
-      std::string reason = breaker.add(rows, 64, pipelined, 64 * ratio * (4.0 + rows / 128.0));
+      std::string reason = breaker.judge(rows, 64, pipelined, 64 * ratio * (4.0 + rows / 128.0));
       if (!reason.empty()) return std::pair{command, reason};
     }
     return std::pair{0u, std::string()};
   };
-  Breaker breaker(timings.gpu, 10.0);
+  const Breaker breaker(timings.gpu, 10.0);
   require(run(breaker, 8, 2048, 1.0) ==
-              std::pair{8u, std::string("losing to the GPU alone (20.0 ms on the Neural Engine per 2048-row layer "
+              std::pair{1u, std::string("losing to the GPU alone (20.0 ms on the Neural Engine per 2048-row layer "
                                         "against 20.0 ms on the GPU alone)")},
-          "evaluations as long as the GPU alone's layers did not trip the breaker on the 8th command");
-  Breaker faster(timings.gpu, 10.0);
+          "a command whose evaluations took as long as the GPU alone's layers did not lose on its own");
+  const Breaker faster(timings.gpu, 10.0);
   require(run(faster, 80, 2048, 0.99).first == 0, "evaluations faster than the GPU alone's layers tripped it");
-  Breaker off;
+  const Breaker off;
   require(run(off, 80, 2048, 100.0).first == 0, "a breaker given no GPU alone tripped");
   // 1024 rows: the GPU alone takes 12 ms, more than half its 20 ms at 2048 rows.
-  Breaker fewer(timings.gpu, 10.0);
+  const Breaker fewer(timings.gpu, 10.0);
   require(run(fewer, 80, 1024, 0.99).first == 0,
           "evaluations of 1024 rows faster than the GPU alone's layer of 1024 rows tripped it");
   require(run(fewer, 8, 1024, 1.25) ==
-              std::pair{8u, std::string("losing to the GPU alone (25.0 ms on the Neural Engine per 2048-row layer "
+              std::pair{1u, std::string("losing to the GPU alone (25.0 ms on the Neural Engine per 2048-row layer "
                                         "against 20.0 ms on the GPU alone)")},
-          "evaluations of 1024 rows slower than the GPU alone's layer of 1024 rows did not trip it");
-  Breaker windows(timings.gpu, 10.0);
-  require(run(windows, 8, 2048, 0.5).first == 0 && run(windows, 8, 2048, 1.5).first == 8,
-          "a window was not judged on its own commands");
+          "evaluations of 1024 rows slower than the GPU alone's layer of 1024 rows did not lose on their own");
+  const Breaker commands(timings.gpu, 10.0);
+  require(run(commands, 8, 2048, 0.5).first == 0 && run(commands, 8, 2048, 1.5).first == 1,
+          "a command was not judged on its own");
   // Two steps run beside the mixer, 10 ms of a 2048-row layer: their evaluations count against the GPU alone's whole
   // layer, 30 ms; 1.2 times its FFN does not trip it, 1.6 times does.
-  Breaker pipelined(timings.gpu, 10.0);
-  require(run(pipelined, 80, 2048, 1.2, true).first == 0 && run(pipelined, 8, 2048, 1.6, true).first == 8,
+  const Breaker pipelined(timings.gpu, 10.0);
+  require(run(pipelined, 80, 2048, 1.2, true).first == 0 && run(pipelined, 8, 2048, 1.6, true).first == 1,
           "two steps' evaluations were not judged against the GPU alone's whole layers");
   rejects([&] { static_cast<void>(Breaker(timings.gpu, -1.0)); }, "mixer is not usable",
           "a breaker took a mixer below none");

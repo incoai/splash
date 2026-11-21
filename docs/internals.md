@@ -1670,16 +1670,28 @@ event (Metal fails a command buffer whose wait stays unmet for 5 s), or a value
 the join reads that is not finite. The CPU then raises the event to the GPU's
 last wait, the chunk runs again on the GPU alone, which computes what it would
 have, as does every chunk after it, and the engine logs `Warning · Neural
-Engine FFN split stopped (...)`. A split that loses to the GPU alone stops the
-same way, after a chunk whose results it keeps (`ops::ane_ffn::Breaker`): over
-each 8 commands it ran, the ANE's evaluations, each from the GPU's signal to
-start it to its report, took as long as the GPU alone's FFN layers of their
-functions' rows, on the line through the timings calibration took, or for
-pipelined steps its whole layers, the mixer calibration took added; the start's
-calibration is then forgotten, so that the next start calibrates again. The GPU
-then waits on the ANE at every layer, so the split is slower than the GPU
-alone; another process keeping the ANE busy costs the split 2-8% and a minute
-of prefill slows the M6's ANE by a third, far short of that. A given share
+Engine FFN split stopped (...)`. A split that loses to the GPU alone pauses,
+after a chunk whose results it keeps (`ops::ane_ffn::Breaker`,
+`ops::ane_ffn::Pause`): a command whose ANE evaluations, each from the notice
+of the GPU's signal to start it to its report, took as long as the GPU alone's
+FFN layers of their functions' rows, on the line through the timings
+calibration took, or for pipelined steps its whole layers, the mixer
+calibration took added. The GPU waits on the ANE at every layer, so such a
+command was slower than the GPU alone. The GPU then runs every chunk alone for
+5 minutes and the engine logs `Warning · Neural Engine FFN split paused
+(...)`; the next command split after that probes: one that wins resumes the
+split, and a later loss pauses it for 5 minutes again, so that a server that
+meets a busy ANE now and then never pauses for longer; one that loses too
+stops the split the same way as a failure, and the start's calibration is then
+forgotten, so that the next start calibrates again. Another client of the ANE
+made a 20-core M5 Pro's split commands take 1.77 times the GPU alone's layers
+at the split's priority and 12.7 times behind a higher one, and the split
+paused after the first; a healthy split's commands come nearest the line at
+one step's least rows, where calibration lets a chunk split at up to 1.02 of
+the GPU alone but the breaker judges the ANE's part over the function's own
+rows: 0.83 of it after 15 s idle and 0.82 after minutes of prefill on that M5
+Pro, 0.77 and 0.76 on a 16-core one, 0.88-0.90 and 0.86-0.87 on an M5 Max and
+0.53 and 0.52 on an M6 (Qwen3.8-27B); two steps 0.37-0.76. A given share
 (`--ane-ffn-share`) takes no timings and never stops for it. The idle release
 (`--idle-release`) unloads the program, so that the ANE's service gives its
 buffers back while the engine is idle, and keeps the split's own, which the
@@ -1712,6 +1724,8 @@ so that the candidate runs the baseline's share in one step where the
 baseline does and in two from 1,024 rows. `make test-engine-cpu` runs
 `ane-ffn-calibration`, the fit, the choice, the least chunk, a calibration's
 line of text and the breaker on timings it is given, also under the sanitizers,
+`ane-ffn-breaker`, the breaker on commands Macs timed, healthy and beside
+another client, and the pause and probe, also under the sanitizers,
 and `ane-ffn-startup`, each outcome of a start on a model it plays, a
 remembered calibration and one whose fit at the units it chose moves them among
 them, the automatic context, the same in each
@@ -1726,8 +1740,9 @@ rows on the GPU alone as a full chunk's, `verify()` of every function and of a
 function the client's instrumented build
 (`runtime/ane/ProgramInstrumentation.hpp`) binds to another's procedure, each
 fault of an evaluation it injects at each layer, a program that does not load
-again and evaluations slower than the GPU alone, which the breaker stops after
-8 commands, telling the start to forget its calibration, and the private
+again and evaluations slower than the GPU alone, which the breaker pauses at
+the first command and stops at the probe after it, telling the start to forget
+its calibration, and the private
 client's failures, limits, unload and load, and cache files on a small program.
 `handoff` runs the event handoff against an agent the CPU plays in each way it
 can fail, and `ane-program-faults` checks that an Objective-C exception and a

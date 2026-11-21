@@ -1,6 +1,9 @@
 #pragma once
 
+#include "AwakeClock.hpp"
+
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -142,12 +145,10 @@ struct Calibration final {
 [[nodiscard]] Calibration refused(const std::optional<Calibration> &recalled, Calibration kept = {});
 
 // When a split that serves loses to the GPU alone (AneFfnCalibration.cpp):
-// over each kWindow commands it finishes, the Neural Engine's milliseconds
-// against the GPU alone's of as many layers.
+// each command it finishes, the Neural Engine's milliseconds over it against
+// the GPU alone's of its layers.
 class Breaker final {
 public:
-  static constexpr uint32_t kWindow = 8;
-
   // One that never trips, for a split whose GPU alone was not timed.
   Breaker() = default;
   // One against the GPU alone's FFN layer as timed at the least and the most
@@ -159,19 +160,42 @@ public:
   // A command the split finished: over each of its `layers` layers,
   // evaluations of functions of `rows` rows in all, its steps two
   // (`pipelined`) or one, took the Neural Engine `milliseconds` in all. Why the
-  // split loses to the GPU alone, once a window of commands shows it; empty
-  // otherwise.
-  [[nodiscard]] std::string add(uint32_t rows, uint32_t layers, bool pipelined, double milliseconds);
+  // split lost to the GPU alone on it, when it took the Neural Engine as long
+  // as the GPU alone takes those layers; empty otherwise.
+  [[nodiscard]] std::string judge(uint32_t rows, uint32_t layers, bool pipelined, double milliseconds) const;
 
 private:
   // The GPU alone's milliseconds of a layer by its rows, and the most rows.
   std::optional<Line> gpu_;
   double mixer_ = 0.0;
   uint32_t mostRows_ = 0;
-  // The window's commands, the Neural Engine's milliseconds over them and the
-  // GPU alone's of their layers.
-  uint32_t commands_ = 0;
-  double ane_ = 0.0, alone_ = 0.0;
+};
+
+// What a split does once its breaker finds a command losing
+// (AneFfn::setBreaker): it pauses for `length`, the GPU running every command
+// alone until the first that finishes past the pause; the next command it
+// splits probes, and a probe that loses stops it for good. One loss says the
+// Neural Engine was slow then (another of its clients, heat), not that the
+// calibration is wrong; a probe that loses too says it stays slow, and one
+// that wins says it passed, so a later loss pauses the split as long again.
+class Pause final {
+public:
+  // What a command changes: nothing, a pause begins, or the split stops.
+  enum class Verdict : uint8_t { Kept, Paused, Stopped };
+  static constexpr AwakeClock::duration kLength = std::chrono::minutes(5);
+
+  explicit Pause(AwakeClock::duration length = kLength) noexcept : length_(length) {}
+  [[nodiscard]] bool paused() const noexcept { return until_.has_value(); }
+  // When the pause ends; only while paused().
+  [[nodiscard]] AwakeClock::time_point until() const { return until_.value(); }
+  // A command finished at `now`, split or on the GPU alone, and its breaker
+  // found it `losing` or not.
+  Verdict finished(AwakeClock::time_point now, bool split, bool losing);
+
+private:
+  std::optional<AwakeClock::time_point> until_;
+  AwakeClock::duration length_;
+  bool probing_ = false;
 };
 
 } // namespace splash::ops::ane_ffn

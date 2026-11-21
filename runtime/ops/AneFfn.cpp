@@ -631,7 +631,7 @@ uint32_t AneFfn::minimumRows() const noexcept {
 }
 
 bool AneFfn::splits(uint32_t rows) const {
-  return rows >= minimumRows() && rows <= kMaximumRows && !handoff_.retired();
+  return rows >= minimumRows() && rows <= kMaximumRows && !handoff_.retired() && !pause_.paused();
 }
 
 AneFfn::Steps AneFfn::steps(uint32_t rows) const noexcept {
@@ -807,13 +807,22 @@ bool AneFfn::finish() {
     warnStopped();
     return false;
   }
-  if (!committedLayers_) return true;
-  const double milliseconds = std::chrono::duration<double, std::milli>(*ran).count();
-  ++served_.commands;
-  served_.evaluations += committedEvaluations_;
-  served_.milliseconds += milliseconds;
-  const bool pipelined = committedEvaluations_ > committedLayers_;
-  if (std::string losing = breaker_.add(committedRows_, committedLayers_, pipelined, milliseconds); !losing.empty()) {
+  std::string losing;
+  if (committedLayers_) {
+    const double milliseconds = std::chrono::duration<double, std::milli>(*ran).count();
+    ++served_.commands;
+    served_.evaluations += committedEvaluations_;
+    served_.milliseconds += milliseconds;
+    const bool pipelined = committedEvaluations_ > committedLayers_;
+    losing = breaker_.judge(committedRows_, committedLayers_, pipelined, milliseconds);
+  }
+  const AwakeClock::time_point now = AwakeClock::now();
+  const ane_ffn::Pause::Verdict verdict = pause_.finished(now, committedLayers_ != 0, !losing.empty());
+  if (verdict == ane_ffn::Pause::Verdict::Paused)
+    logWarning("Neural Engine FFN split paused (", losing, "); the GPU runs the prefill FFN alone for ",
+               std::chrono::duration_cast<std::chrono::minutes>(pause_.until() - now).count(),
+               " min, then the split tries again.");
+  if (verdict == ane_ffn::Pause::Verdict::Stopped) {
     handoff_.retire(std::move(losing));
     warnStopped();
     if (lost_) std::exchange(lost_, {})();

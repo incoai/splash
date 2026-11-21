@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace splash::ops::ane_ffn {
 namespace {
@@ -229,14 +230,15 @@ std::optional<Calibration> Calibration::parse(std::string_view text) {
 // the rest of the layer takes: the breaker trips there, and never short of it. An
 // evaluation counts against the GPU alone's layer of its function's rows,
 // which the chunk pads up to, so the GPU alone would take no longer over the
-// chunk; the reason scales the window's ratio to a layer of the most rows.
+// chunk; the reason scales the command's ratio to a layer of the most rows.
 // At the units calibration chooses, at or just below where the parts meet
 // (choose), an evaluation takes at most about as long as the GPU's part
-// (Qwen3.8-27B on an M5 Max: 13.2 ms against the GPU alone's 19.0), and
-// another process keeping the ANE busy costs the split 2-8%: far short of
-// the trip point. Judging kWindow commands at once, it weighs one slow
-// evaluation, as a function's first after its program loads again, among all
-// of theirs.
+// (Qwen3.8-27B on an M5 Max: 13.2 ms against the GPU alone's 19.0). An M5
+// Pro's commands of two steps took 0.66-0.67 of the GPU alone's layers
+// through seven minutes of prefill; beside another client of the ANE at their
+// priority, 1.77; behind one at a higher priority, 12.7. Each command is
+// judged on its own: one slow evaluation, as a function's first after its
+// program loads again, weighs little among a command's.
 Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu, double mixer) {
   const auto &[low, high] = gpu;
   if (!(low.rows < high.rows)) throw std::invalid_argument("ANE FFN breaker needs the GPU alone at two row counts");
@@ -248,19 +250,30 @@ Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu, double mixer) {
   mostRows_ = high.rows;
 }
 
-std::string Breaker::add(uint32_t rows, uint32_t layers, bool pipelined, double milliseconds) {
+std::string Breaker::judge(uint32_t rows, uint32_t layers, bool pipelined, double milliseconds) const {
   if (!gpu_) return {};
-  ane_ += milliseconds;
-  alone_ += layers * ((*gpu_)(rows) + (pipelined ? mixer_ * rows / mostRows_ : 0.0));
-  if (++commands_ < kWindow) return {};
-  const double ratio = ane_ / alone_, most = (*gpu_)(mostRows_);
-  commands_ = 0;
-  ane_ = alone_ = 0.0;
+  const double ratio = milliseconds / (layers * ((*gpu_)(rows) + (pipelined ? mixer_ * rows / mostRows_ : 0.0))),
+               most = (*gpu_)(mostRows_);
   if (!(ratio >= 1.0)) return {};
   std::ostringstream reason;
   reason << std::fixed << std::setprecision(1) << "losing to the GPU alone (" << ratio * most
          << " ms on the Neural Engine per " << mostRows_ << "-row layer against " << most << " ms on the GPU alone)";
   return reason.str();
+}
+
+Pause::Verdict Pause::finished(AwakeClock::time_point now, bool split, bool losing) {
+  if (until_ && now >= *until_) {
+    until_.reset();
+    probing_ = true;
+  }
+  if (!split) return Verdict::Kept;
+  if (!losing) {
+    probing_ = false;
+    return Verdict::Kept;
+  }
+  if (std::exchange(probing_, false)) return Verdict::Stopped;
+  until_ = now + length_;
+  return Verdict::Paused;
 }
 
 } // namespace splash::ops::ane_ffn
