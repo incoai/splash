@@ -1506,7 +1506,9 @@ keep idle, so the split is calibrated and loaded at the least memory the
 engine holds, as 1.7.0's was before the KV pool and the warmup took theirs
 (on a 16 GB M4 the split's set-up after the prefill of the most rows found
 1.5 GiB reclaimable against macOS's 1.6, where 1.7.0's split started), and on
-the runtime's own prefill buffers, so that it holds no memory past the plan's;
+the runtime's own prefill buffers, so that once it serves it holds no memory
+past the plan's (calibration first times a larger split, at 0.8 of the units,
+while the pools are still at their floors);
 the audit runs again with it. The runtime and the scheduler take the split
 from their next command (`RuntimeModel::setAneFfn`), and a prefill of the
 least rows it takes creates its kernels, one per GGUF format, before a
@@ -1641,9 +1643,9 @@ stands on its own: two steps are asked whatever one step's fit chose, and
 where one step splits no chunk below two steps' 1,024 rows they serve alone
 from 1,024 where they gain (the record keeps the units that name the program,
 one step's, or two steps' where one step's fit chose none, and no least rows).
-Where neither kind gains the GPU alone serves, and that record is not looked
-at again until macOS or the build changes. Six calibrations of
-Qwen3.8-27B MLX 4-bit on the Studio (M5 Max) timed each function's split layer
+Where neither kind gains the GPU alone serves, and nothing is remembered: the
+next start calibrates again. Six calibrations of
+Qwen3.8-27B MLX 4-bit on an M5 Max timed each function's split layer
 within a range of 3.2% of its mean for the median function, 6.1% at most,
 where over the model's first layers, about 4,096 rows of layers to a command,
 it was 3.6% and 10.9%; both chose 7 units, from 822-1,028 rows against
@@ -1669,7 +1671,7 @@ an M5 Max (27 s for calibration's share 0.8) and half a minute on an M6; the
 ANE service keeps them under a hash of their source, which stays in
 `splash-ane` of the per-user cache directory (`getconf DARWIN_USER_CACHE_DIR`),
 so later starts load them, in about 0.1 s, until macOS clears that directory.
-Startup gives the service 120 s to compile and load a program, after which the
+Startup gives the service 210 s to compile and load a program, after which the
 GPU runs alone: the private client's work for every program runs in turn on one
 queue (`runtime/ane/Program.mm`), so work queued behind a service that stopped
 answering runs out of its time too. Its requests run at user-initiated QoS,
