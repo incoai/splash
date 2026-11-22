@@ -110,13 +110,22 @@ struct QwenTargetDimensions {
   // The sparse MoE's routed experts, those each token takes, and the width of
   // each; how its router weights them, and its shared expert: as wide as
   // sharedExpertSlices routed experts and weighted by the sigmoid of the
-  // block's scalar gate or, without sharedExpertGate, by 1 (ops::MoeShape).
+  // block's scalar gate or, without sharedExpertGate, by 1 (ops::MoeShape),
+  // none at zero slices. A biased selection (expertSelectionBias) ranks the
+  // experts by score plus each one's bias and scales their weights by
+  // expertRoutedScale (1 otherwise); its experts' SwiGLU softcaps its gate
+  // and up at expertGateSoftcap and expertUpSoftcap (c tanh(x / c); 0 for
+  // silu(gate) * up).
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
   ops::MoeRouter moeRouter = ops::MoeRouter::Softmax;
   uint32_t sharedExpertSlices = 1;
   bool sharedExpertGate = true;
+  bool expertSelectionBias = false;
+  float expertRoutedScale = 1.0F;
+  uint32_t expertGateSoftcap = 0;
+  uint32_t expertUpSoftcap = 0;
   // The first layers of a sparse MoE target, which run a dense FFN of
   // intermediateSize instead (a config's mlp_only_layers); its MoE blocks
   // are those of the layers after them, in layer order.
@@ -168,7 +177,11 @@ struct QwenTargetDimensions {
             .expertIntermediateSize = expertIntermediateSize,
             .router = moeRouter,
             .sharedSlices = sharedExpertSlices,
-            .sharedGate = sharedExpertGate};
+            .sharedGate = sharedExpertGate,
+            .selectionBias = expertSelectionBias,
+            .routedScale = expertRoutedScale,
+            .gateSoftcap = expertGateSoftcap,
+            .upSoftcap = expertUpSoftcap};
   }
   // The window the target serves with `scaling`: the native one, or YaRN's,
   // the native one times its factor, rounded to the nearest token so that a

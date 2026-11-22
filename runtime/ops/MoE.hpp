@@ -31,7 +31,10 @@ enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized };
 // scalar gate or none (MoeShape), the most experts its selection and
 // grouping are compiled for (MoeShape::routerWidth), and their kernels' name
 // suffixes: the selection's, which reads all three, and slicesSuffix of the
-// grouping and the expert passes, which read the slices alone.
+// grouping and the expert passes, which read the slices alone. A biased
+// selection (MoeShape::selectionBias) and a softcapped activation
+// (MoeShape::gateSoftcap, upSoftcap; 0 for SiLU) are a routing's too, the
+// activation's suffix the gate/up pass's.
 struct CompiledMoeRouting final {
   MoeRouter router;
   uint32_t sharedSlices;
@@ -39,13 +42,31 @@ struct CompiledMoeRouting final {
   uint32_t maximumExperts;
   std::string_view selectSuffix;
   std::string_view slicesSuffix;
+  bool selectionBias = false;
+  uint32_t gateSoftcap = 0;
+  uint32_t upSoftcap = 0;
+  std::string_view activationSuffix = "";
 };
 inline constexpr std::array kCompiledMoeRoutings{
     CompiledMoeRouting{MoeRouter::Softmax, 1, true, SPLASH_MOE_WIDE_EXPERT_SLOTS, "", ""},
     // Flint's: a sigmoid router, and an ungated shared expert twice the
     // routed experts' width.
     CompiledMoeRouting{MoeRouter::SigmoidNormalized, 2, false, SPLASH_MOE_EXPERT_SLOTS, "_sigmoid_s2", "_s2"},
+    // A sigmoid router selecting by score plus a per-expert bias, no shared
+    // expert, and SwiGLU softcapped at 4 (gate) and 25 (up).
+    CompiledMoeRouting{MoeRouter::SigmoidNormalized, 0, false, SPLASH_MOE_EXPERT_SLOTS, "_sigmoid_biased_s0", "_s0",
+                       true, 4, 25, "_softcap4_25"},
 };
+
+// A biased selection is the sigmoid router's, of a block without a shared
+// expert (moe_route_select_f32_sigmoid_biased_s0).
+static_assert(std::ranges::all_of(kCompiledMoeRoutings,
+                                  [](const CompiledMoeRouting &compiled) {
+                                    return !compiled.selectionBias ||
+                                           (compiled.router == MoeRouter::SigmoidNormalized &&
+                                            !compiled.sharedSlices && !compiled.sharedGate);
+                                  }),
+              "a biased selection is a sigmoid router's without a shared expert");
 
 // The shared expert is sharedSlices experts every row visits after its
 // routed ones, ids experts to experts + sharedSlices - 1: each has the
@@ -66,19 +87,30 @@ struct MoeShape final {
   // plans then run the int8 passes and size their scratch
   // (MoeConfig::int8Passes).
   bool int8Experts = false;
+  // A biased selection ranks the experts by sigmoid(score) plus each one's
+  // bias (BlockMoeWeights::selectionBias) and scales its weights by
+  // routedScale, which is 1 for every other selection.
+  bool selectionBias = false;
+  float routedScale = 1.0f;
+  // The softcaps of a SwiGLU's gate factor and up value
+  // (kernels/common/softcapped_swiglu.h); 0 for silu(gate) * up.
+  uint32_t gateSoftcap = 0;
+  uint32_t upSoftcap = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     // Experts of an intermediate width that fills 64-column tiles, and a
     // routing compiled for the router, shared slices, gate and experts.
     return hiddenSize && hiddenSize % 256 == 0 && experts && expertsPerToken && expertsPerToken <= experts &&
-           expertIntermediateSize && expertIntermediateSize % 64 == 0 && compiledRouting();
+           expertIntermediateSize && expertIntermediateSize % 64 == 0 && compiledRouting() &&
+           (selectionBias || routedScale == 1.0f);
   }
   // The compiled routing of the router, the shared slices and the experts,
   // or none.
   [[nodiscard]] constexpr const CompiledMoeRouting *compiledRouting() const noexcept {
     for (const CompiledMoeRouting &compiled : kCompiledMoeRoutings)
       if (compiled.router == router && compiled.sharedSlices == sharedSlices && compiled.sharedGate == sharedGate &&
-          experts <= compiled.maximumExperts)
+          compiled.selectionBias == selectionBias && compiled.gateSoftcap == gateSoftcap &&
+          compiled.upSoftcap == upSoftcap && experts <= compiled.maximumExperts)
         return &compiled;
     return nullptr;
   }
@@ -224,6 +256,8 @@ struct BlockMoeWeights final {
   uint32_t streamBlock = 0;
   metal::MetalBuffer loadSlotTable = {};
   ExpertChunks chunks = {};
+  // A biased selection's bias (MoeShape::selectionBias), F32 [experts].
+  metal::MetalBuffer selectionBias = {};
 };
 
 // The one chunk of a block whose routed segments hold all its `slots`
@@ -429,13 +463,15 @@ struct MoE final {
                           const BlockMoeWeights &weights, const MoePlan &plan);
   static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                         const BlockMoeWeights &weights, const MoePlan &plan);
-  // The routing of `rows` rows of `input` by a block's `router` and
-  // `sharedScalarGate` (unread without shape.sharedGate): the router's fp32
+  // The routing of `rows` rows of `input` by a block's `router`,
+  // `sharedScalarGate` (unread without shape.sharedGate) and `selectionBias`
+  // (unread without shape.selectionBias): the router's fp32
   // scores in `scores` (rows of shape.routerWidth()), then each row's top-k
   // experts and the shared slices with their routing weights in `selected`
   // and `routingWeights` (shape.routesPerToken() per row).
   static void addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
-                        const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
+                        const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &selectionBias,
+                        const metal::MetalBuffer &scores,
                         const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
                         MoeShape shape, FloatTile routerTile);
   // A streamed experts' load (MoeExpertStream::addLoad): the gate, up and

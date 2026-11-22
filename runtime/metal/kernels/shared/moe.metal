@@ -159,6 +159,68 @@ MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_sigmoid_s2, SPLASH_MOE_EXPER
 #undef MOE_ROUTE_SELECT_ENTRY
 #undef MOE_ROUTE_SELECT_BODY
 
+// A biased selection (ops::MoeShape::selectionBias) of a sigmoid router
+// without a shared expert, on Slots expert slots: thread e ranks expert e by
+// sigmoid(score) + bias[e], simdgroup 0 orders them as moe_route_select does
+// (descending, the lower id among ties), and the top_k take their sigmoids
+// over the sum of theirs plus 1e-20, summed in rank order, times the
+// routing's scale.
+template <uint Slots>
+inline void moe_route_select_biased(device const float *scores, device const float *bias, device uint *selected,
+                                    device float *routing_weights, constant MoeBiasedRouteParams &p, uint row,
+                                    uint thread_index, uint simd_lane, uint simd_group,
+                                    threadgroup float *row_scores, threadgroup float *ordered) {
+  constexpr uint ExpertsPerLane = Slots / 32;
+  if (row >= p.route.rows) return;
+  device const float *row_logits = scores + ulong(row) * Slots;
+  row_scores[thread_index] = thread_index < p.route.experts
+                                 ? splash_sigmoid(row_logits[thread_index]) + bias[thread_index]
+                                 : -numeric_limits<float>::infinity();
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group != 0) return;
+  const ulong row_routes = ulong(row) * p.route.top_k;
+  float lane_scores[ExpertsPerLane];
+  for (uint slot = 0; slot < ExpertsPerLane; ++slot) lane_scores[slot] = row_scores[simd_lane + 32 * slot];
+  for (uint rank = 0; rank < p.route.top_k; ++rank) {
+    float best = -numeric_limits<float>::infinity();
+    uint best_slot = 0;
+    for (uint slot = 0; slot < ExpertsPerLane; ++slot)
+      if (lane_scores[slot] > best) {
+        best = lane_scores[slot];
+        best_slot = slot;
+      }
+    const float row_best = simd_max(best);
+    const uint candidate = best == row_best ? simd_lane + 32 * best_slot : 0xFFFFFFFFu;
+    const uint winner = simd_min(candidate);
+    if (candidate == winner) lane_scores[best_slot] = -numeric_limits<float>::infinity();
+    if (simd_lane == 0) {
+      // The winner's sigmoid weighs it; its bias only ranked it.
+      ordered[rank] = splash_sigmoid(row_logits[winner]);
+      selected[row_routes + rank] = winner;
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint rank = simd_lane; rank < p.route.top_k; rank += 32) {
+    float denominator = 0.0f;
+    for (uint other = 0; other < p.route.top_k; ++other) denominator += ordered[other];
+    routing_weights[row_routes + rank] = ordered[rank] / (denominator + 1e-20f) * p.scale;
+  }
+}
+kernel void moe_route_select_f32_sigmoid_biased_s0(device const float *scores [[buffer(0)]],
+                                                   device const float *bias [[buffer(1)]],
+                                                   device uint *selected [[buffer(2)]],
+                                                   device float *routing_weights [[buffer(3)]],
+                                                   constant MoeBiasedRouteParams &p [[buffer(4)]],
+                                                   uint group [[threadgroup_position_in_grid]],
+                                                   uint thread_index [[thread_index_in_threadgroup]],
+                                                   uint simd_lane [[thread_index_in_simdgroup]],
+                                                   uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float row_scores[SPLASH_MOE_EXPERT_SLOTS];
+  threadgroup float ordered[SPLASH_MOE_EXPERT_SLOTS];
+  moe_route_select_biased<SPLASH_MOE_EXPERT_SLOTS>(scores, bias, selected, routing_weights, p, group, thread_index,
+                                                   simd_lane, simd_group, row_scores, ordered);
+}
+
 // Whether a verified grouping leaves routed route `route` out: its row lies
 // in no lane's rows, which no lane verifies (MoeGroupParams).
 template <uint Shared, bool Verified>
@@ -336,6 +398,8 @@ MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified, SPLASH_MOE_EXPERT_SLO
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
+MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s0, SPLASH_MOE_EXPERT_SLOTS, 0)
+MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s0, SPLASH_MOE_EXPERT_SLOTS, 0)
 #undef MOE_GROUP_ROUTES_VERIFIED_ENTRY
 #undef MOE_GROUP_ROUTES_ENTRY
 #undef MOE_GROUP_ROUTES_BODY
