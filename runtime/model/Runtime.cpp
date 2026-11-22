@@ -4779,6 +4779,24 @@ std::span<const uint16_t> RuntimeInstrumentation::lastCapturedRows(const Runtime
   return {contents<uint16_t>(captured, "captured target rows"), captured.sizeBytes() / sizeof(uint16_t)};
 }
 
+// The selector's buffers (Impl::encodeDraftBatchGraph): its candidates and
+// unary scores a lane's positions after another's, its edge tables after the
+// step's shard partials (draft_select_edges), its trees a verify block a lane.
+RuntimeInstrumentation::DraftLattice RuntimeInstrumentation::lastDraftLattice(const Runtime &runtime, uint32_t lane,
+                                                                              uint32_t lanes) {
+  constexpr uint64_t positions = SPLASH_DRAFT_PROPOSAL_TOKENS, candidates = SPLASH_DRAFT_CANDIDATES;
+  if (!lanes || lane >= lanes || lanes > kLaneCount) throw std::invalid_argument("invalid draft lattice lane");
+  const DecodeArena &arena = *runtime.impl_->decodeArena;
+  const uint64_t cells = positions * candidates, table = cells * candidates;
+  const auto *ids = contents<uint32_t>(arena.all(DecodeTensor::Candidates), "draft candidates") + lane * cells;
+  const auto *unary = contents<float>(arena.all(DecodeTensor::Unary), "draft unary scores") + lane * cells;
+  const auto *edges = contents<float>(arena.all(DecodeTensor::TopPartialValues), "draft edges") +
+                      lanes * positions * SPLASH_DRAFT_SAMPLING_SHARDS * candidates + lane * table;
+  const auto *next = contents<float>(arena.all(DecodeTensor::DraftTreeNext), "draft tree next") +
+                     uint64_t{lane} * SPLASH_TARGET_VERIFY_ROWS * candidates;
+  return {{ids, ids + cells}, {unary, unary + cells}, {edges, edges + table}, {next, next + candidates}};
+}
+
 uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t lane) {
   return runtime.impl_->laneRows(lane).rows;
 }

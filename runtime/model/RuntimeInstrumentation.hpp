@@ -35,6 +35,21 @@ public:
   // rows), the captured rows in the order the draft's context plan captured
   // them (a cold prompt's first command: its rows).
   [[nodiscard]] static std::span<const uint16_t> lastCapturedRows(const Runtime &runtime, uint32_t chunk);
+  // The draft's lattice of batch lane `lane` of the last decode step of
+  // `lanes` lanes, until the next decode step, as ops::DraftSelector left
+  // it: each proposal position's candidates, their unary scores (the
+  // draft's logits of them, its head's finish but its softcap applied) and
+  // the edges to them from each candidate of the position before (from the
+  // anchor alone, predecessor 0, for the first position), each
+  // [position][predecessor][candidate]; and the probabilities of the first
+  // position's candidates after the anchor, which its tree's first row holds.
+  struct DraftLattice final {
+    std::vector<uint32_t> candidates;
+    std::vector<float> unary;
+    std::vector<float> edges;
+    std::vector<float> first;
+  };
+  [[nodiscard]] static DraftLattice lastDraftLattice(const Runtime &runtime, uint32_t lane, uint32_t lanes);
   // The rows batch lane `lane` of the last decode step verified, its rows of
   // the step as its selector laid them out (ops::DraftSelector::
   // addVerifyRows), until the next command that selects.

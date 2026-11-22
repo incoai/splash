@@ -335,13 +335,26 @@ positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
 also takes `--kv-format`, `--state-format`, `--activations`,
 `--expert-memory` and `--ple-memory`, and, with `--captures yes`, writes the
-output rows of the target layers the model's draft reads (its
-`target_layer_ids`) at the positions a window's prefill computed, in one
-command, to `OUTPUT-END.captures.f32` (fp32, a row per position of each
-layer's hidden values in the draft's layer order), which a reference's
-residuals after those layers compare with (`dev/tools/flint_reference.py`
-writes Flint's, `residuals.npy`): a draft of the layers to compare, such as a
-test draft whose `fc` reads them, makes them its captures.
+rows of the target layers the model's draft reads (its `target_layer_ids`: each
+layer's output rows, or, for Inkling 2, the rows passed into each application
+and at id 48 the final norm's, [Drafts](models.md#drafts)) at the positions a
+window's prefill computed, in one command, to `OUTPUT-END.captures.f32` (fp32,
+a row per position of each layer's hidden values in the draft's layer order),
+which a reference's residuals after those layers compare with, or Inkling 2's
+after the application before each id
+(`dev/tools/flint_reference.py` writes Flint's and
+`dev/tools/inkling2_reference.py` Inkling 2's, `residuals.npy`): a draft of
+the layers to compare, such as a test draft whose `fc` reads them, makes them
+its captures. With `--draft yes` it writes the draft's lattice of each
+window's first decode cycle to `OUTPUT-END.draft.json`: the cycle's anchor
+(the first forced id) and its position, each of the seven proposal
+positions' sixteen candidates and their unary scores (the draft's logits of
+them, finished as the target's head but for its softcap), the edges to them
+from each candidate of the position before (from the anchor for the first),
+and the first position's probabilities after the anchor, softcapped where
+the draft takes the head's softcap (`RuntimeInstrumentation::
+lastDraftLattice`), which a reference forward of the draft fed the same
+captured rows and ids compares with.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that
