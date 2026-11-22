@@ -497,15 +497,17 @@ void mixerImage(Builder &b, const QwenTargetDimensions &g, const std::string &p,
 
 // Layer `index`'s dense FFN or sparse MoE, which every family's layers hold:
 // a MoE layer's router, routed experts and shared expert of its slices
-// (QwenTargetDimensions::sharedExpertSlices) and, where its blocks have one,
-// the shared expert's scalar gate; a dense layer's SwiGLU.
+// (QwenTargetDimensions::sharedExpertSlices), none for 0, and, where its
+// blocks have them, the shared expert's scalar gate and a biased router's F32
+// selection bias (ops::MoeRouter::SigmoidBiased); a dense layer's SwiGLU.
 void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p, uint32_t index) {
   if (g.isMoeLayer(index)) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.router(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
     b.routedExperts(p, routed, width, g.hiddenSize);
-    b.sharedExpert(p, g.sharedExpertSlices, width, g.hiddenSize);
+    if (g.sharedExpertSlices) b.sharedExpert(p, g.sharedExpertSlices, width, g.hiddenSize);
     if (g.sharedExpertGate) b.floatRows(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize, true);
+    if (g.moeRouter == ops::MoeRouter::SigmoidBiased) b.floatRows(p + "exp_probs_b.bias", 1, routed, true);
   } else {
     b.quantized(p + "ffn_gate.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
@@ -923,11 +925,23 @@ void requireMetadata(const GgufFile &file, std::string_view architecture, const 
     expect("expert_count", geometry.experts);
     expect("expert_used_count", geometry.expertsPerToken);
     expect("expert_feed_forward_length", geometry.expertIntermediateSize);
-    expect("expert_shared_feed_forward_length",
-           uint64_t{geometry.sharedExpertSlices} * geometry.expertIntermediateSize);
+    // A block without a shared expert states none; a scaled router its
+    // scale; SiTU experts the softcaps the kernels hold (ops::MoeActivation).
+    if (geometry.sharedExpertSlices)
+      expect("expert_shared_feed_forward_length",
+             uint64_t{geometry.sharedExpertSlices} * geometry.expertIntermediateSize);
+    if (geometry.routeScale != 1.0F) expectFloat("expert_weights_scale", geometry.routeScale);
+    if (geometry.moeActivation == ops::MoeActivation::Situ) {
+      expectFloat("activation.situ_beta", 4.0);
+      expectFloat("activation.situ_linear_beta", 25.0);
+    }
   } else {
     expect("feed_forward_length", geometry.intermediateSize);
   }
+  // The head's softcap and the vocabulary its padding rows follow
+  // (QwenTargetDimensions::logitCap), where the target has them.
+  if (geometry.logitSoftcap != 0.0F) expectFloat("final_logit_softcapping", geometry.logitSoftcap);
+  if (geometry.validVocabularySize) expect("vocab_size_unpadded", geometry.validVocabularySize);
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 

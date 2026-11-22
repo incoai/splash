@@ -730,7 +730,8 @@ protected:
   // again: on a 12-core M6 the 27B's Q6_K head took 19.1 ms at 128 rows in
   // two passes against 27.0 on the staged tile's two row groups, which took
   // 13.9 against 17.5 at 96 rows (level or faster on a 20-core M5 Pro and an
-  // M4).
+  // M4). Its logits are then capped as the family's layout states
+  // (ops::addLogitCap).
   [[nodiscard]] ops::LinearInput headInput(const ops::Linear &linear, uint32_t rows) const;
   void addHead(metal::CommandGraph &graph, const ops::Linear &linear, metal::MetalBuffer input,
                metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch,

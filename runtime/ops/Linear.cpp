@@ -144,11 +144,11 @@ uint64_t LinearPlan::gateScratchBytes() const noexcept {
 LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destination)
     : workload_(w), config_(config), destination_(destination) {
   validate(w);
-  // Only the decode tiles have fp32 instances, of their plain projection.
+  // The decode tiles and the prefill tile have fp32 instances of their plain
+  // projection; the int8 prefill tile has none.
   if (destination == FloatOutput::Float32 &&
-      (config.tile == LinearTile::GgufPrefill || config.tile == LinearTile::GgufPrefillInt8 ||
-       w.epilogue != LinearEpilogue::None))
-    throw std::invalid_argument("an fp32 destination takes a plain projection on the decode tiles");
+      (w.epilogue != LinearEpilogue::None || config.tile == LinearTile::GgufPrefillInt8))
+    throw std::invalid_argument("an fp32 destination takes a plain projection on the decode or prefill tiles");
   // Kernel names follow the segment formats (LinearGguf.cpp).
   requireConfiguration();
 }

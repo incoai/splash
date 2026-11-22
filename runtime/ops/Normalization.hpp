@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "ops/FloatRows.hpp"
 #include "ops/Linear.hpp"
 
 #include <cstdint>
@@ -54,6 +55,13 @@ public:
                               uint32_t width, uint32_t rows,
                               LinearScratch scratch = {},
                               LinearInput layout = LinearInput::Plain);
+  // The RMS norm of `rows` rows of `width` input elements into rows of
+  // output elements, one of them fp32 and the other bf16: a residual kept
+  // in fp32 normed into the bf16 rows its projections read, or bf16
+  // embedding rows into an fp32 residual (Inkling 2's). Plain rows only.
+  static void addRmsRows(metal::CommandGraph &graph, metal::MetalBuffer input, FloatElement inputElement,
+                         const NormWeights &weight, metal::MetalBuffer output, FloatElement outputElement,
+                         uint32_t width, uint32_t rows);
 };
 
 } // namespace splash::ops

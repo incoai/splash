@@ -85,12 +85,15 @@ ops::BlockMoeWeights readMoeBlock(WeightFile &file, const QwenTargetDimensions &
     ffn.slots = experts.experts;
     ffn.chunks = ops::residentExpertChunks(ffn);
   }
-  ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
-  ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");
-  ffn.down.shared = readQuantizedSegment(file, "shared-expert-down");
+  if (target.sharedExpertSlices) {
+    ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
+    ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");
+    ffn.down.shared = readQuantizedSegment(file, "shared-expert-down");
+  }
   if (target.sharedExpertGate) ffn.sharedScalarGate = readQuantizedSegment(file, "shared-expert-scalar-gate");
-  // The store keeps the block's router and scalar gate, which predict its
-  // routes.
+  if (target.moeRouter == ops::MoeRouter::SigmoidBiased) ffn.routerBias = readQuantizedSegment(file, "router-bias");
+  // The store keeps the block's router, scalar gate and selection bias, which
+  // predict its routes.
   if (experts.store) experts.store->bind(block, ffn);
   return ffn;
 }

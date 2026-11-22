@@ -12,6 +12,7 @@
 #include "ops/Normalization.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -80,8 +81,9 @@ struct MoeExperts final {
 
 // A MoE block of `target`'s sections in image order: its router, its routed
 // experts' gate, up and down (none when they stream), its shared expert's
-// gate, up and down and, where the target's has one, its scalar gate. Block
-// `block` of the store when its experts stream.
+// gate, up and down (none without one) and, where the target's has them, its
+// scalar gate and its router's selection bias. Block `block` of the store
+// when its experts stream.
 [[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, const QwenTargetDimensions &target,
                                                 const MoeExperts &experts, uint32_t block);
 
@@ -140,22 +142,27 @@ readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetForm
 // dimensions agree with each other: the GDN's where it has GDN layers (and
 // none without), the packed attention rows of every query head's queries and,
 // gated, gates (attentionGate), a MoE target's leading dense layers
-// (intermediateSize wide) before at least one MoE layer, the sliding and
-// unrotated layers among the attention layers, and its drafts' subset of the
-// vocabulary (draftVocabulary) in it, whole QUANT_TILE_ROWS tiles of its
-// head's rows (DFlashDraft's view of them): a subset past the vocabulary
-// would wrap its logits width. The image planners hold each tensor to whole
-// plane tiles.
+// (intermediateSize wide) before at least one MoE layer and blocks of a
+// compiled routing (ops::MoeShape::valid; a shared expert of no slices is
+// none), the sliding and unrotated layers among the attention layers, its
+// drafts' subset of the vocabulary (draftVocabulary) in it, whole
+// QUANT_TILE_ROWS tiles of its head's rows (DFlashDraft's view of them): a
+// subset past the vocabulary would wrap its logits width, and its logit cap
+// (logitCap) a finite softcap of zero or more and a valid vocabulary inside
+// the head's. The image planners hold each tensor to whole plane tiles.
 template <class Layout> void requireQwenLayout(const Layout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
   const auto nonzero = [](auto... dimensions) { return ((dimensions != 0) || ...); };
   const bool dense = layout.ffnKind == QwenFfnKind::Dense;
   const uint32_t ffnWidth = dense ? layout.intermediateSize : layout.expertIntermediateSize;
   const bool ffnZero = dense ? zero(ffnWidth)
-                             : zero(layout.experts, layout.expertsPerToken, ffnWidth, layout.sharedExpertSlices) ||
+                             : zero(layout.experts, layout.expertsPerToken, ffnWidth) ||
                                    (layout.leadingDenseLayers && zero(layout.intermediateSize));
   const bool routingInconsistent =
-      !dense && (layout.expertsPerToken > layout.experts || layout.leadingDenseLayers >= layout.layers);
+      !dense && (layout.expertsPerToken > layout.experts || layout.leadingDenseLayers >= layout.layers ||
+                 !layout.moeBlockShape().valid());
+  const bool logitCapInvalid = !(layout.logitSoftcap >= 0.0F && std::isfinite(layout.logitSoftcap)) ||
+                               layout.validVocabularySize > layout.vocabularySize;
   const bool gdn = layout.gdnLayerCount() != 0;
   const bool gdnZero = zero(layout.packedGdnWidth, layout.convolutionDimension, layout.gdnKeyHeads,
                             layout.gdnValueHeads, layout.gdnHeadDimension);
@@ -186,7 +193,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
       layout.attentionWidth != layout.attentionQueryHeads * layout.attentionHeadDimension ||
       layout.packedFullWidth != (layout.attentionGate ? 2 : 1) * layout.attentionWidth + kvWidth ||
       !attentionMask(layout.unrotatedLayers) || !layout.kvLayout().valid() || !layout.gdnStateLayout().valid() ||
-      draftRowsOutside)
+      draftRowsOutside || logitCapInvalid)
     throw WeightStoreError("Qwen target layout is inconsistent");
 }
 

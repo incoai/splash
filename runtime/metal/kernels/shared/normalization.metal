@@ -155,6 +155,34 @@ kernel void norm_layer(
     }
 }
 
+// Norms between a residual kept in fp32 and its bf16 rows (Inkling 2's, ops::Normalization::addRmsRows): the norm
+// of rows of In into rows of Out, one of them fp32 and the other bf16, a 256-thread group per row whose squares
+// rms_inverse sums, as norm_rms's streaming rows do.
+template <class In, class W, class Out>
+inline void norm_rms_rows(device const In *input, device const W *weight, device Out *output, uint width, uint row,
+                          uint tid, uint lane, uint sg, threadgroup float *reductions) {
+#pragma clang fp reassociate(off)
+  device const In *row_input = input + ulong(row) * width;
+  const float inverse =
+      rms_inverse_of_sums(row_squares(row_input, width, tid), width, reductions, tid, lane, sg);
+  for (uint column = tid; column < width; column += kNormThreads)
+    output[ulong(row) * width + column] = Out((float(row_input[column]) * inverse) * float(weight[column]));
+}
+#define NORM_RMS_ROWS(Name, In, W, Out) \
+  kernel void Name(device const In *input [[buffer(0)]], \
+      device const W *weight [[buffer(1)]], device Out *output [[buffer(2)]], \
+      constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
+      uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
+      uint sg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float reductions[8]; \
+    norm_rms_rows(input, weight, output, width, row, tid, lane, sg, reductions); \
+  }
+NORM_RMS_ROWS(norm_rms_rows_f32_bf16, float, bfloat, bfloat)
+NORM_RMS_ROWS(norm_rms_rows_f32_bf16_f32, float, float, bfloat)
+NORM_RMS_ROWS(norm_rms_rows_bf16_f32, bfloat, bfloat, float)
+NORM_RMS_ROWS(norm_rms_rows_bf16_f32_f32, bfloat, float, float)
+#undef NORM_RMS_ROWS
+
 // Plain norms of few rows of at most 2048 columns (ops/Normalization.cpp)
 // load each row once into threadgroup memory, a vector per thread of a
 // 1024-thread group, and scale it from there instead of reading it from

@@ -176,6 +176,17 @@ public:
                                     {b, kv::kPageTokens}, queryHeads, layout, variant);
     });
   }
+  // A relative geometry's prepare (PagedAttention::addRelativeProjection).
+  void relativeProjection(const std::string &where, uint32_t queryHeads, kv::Layout layout,
+                          AttentionVariant variant) {
+    encode(where, true, [&](metal::CommandGraph &graph) {
+      const metal::MetalBuffer &b = buffer_;
+      const std::array sequences{PagedAttention::chunkParams(0, kv::kPageTokens, kv::kPageTokens, 1)};
+      const std::array tables{b};
+      PagedAttention::addRelativeProjection(graph, {b, b, b, b, b}, b, b, SplashKvLayer{}, tables, sequences,
+                                            {b, kv::kPageTokens}, queryHeads, layout, variant);
+    });
+  }
 
   // The pipelines no function of the library makes, each with the first plan
   // that names it, and the q/k norms that could not be encoded.
@@ -596,7 +607,7 @@ std::string describe(const AttentionPlan &plan) {
     line += " [" + std::to_string(dispatch.sequences) + " tiles " + std::to_string(dispatch.tiles) + " groups " +
             describe(plan.splitGroups(dispatch)) + " " + describe(plan.reduceGroups(dispatch)) + "]";
   return line + " workspace " + describe(plan.workspace()) + " sparse " + std::to_string(plan.sparse) + " sinks " +
-         std::to_string(plan.sinks);
+         std::to_string(plan.sinks) + (plan.relative ? " relative" : "");
 }
 
 // A sequence of `rows` rows after `history` tokens, staged in whole KV
@@ -638,6 +649,34 @@ template <class Family> std::vector<AttentionVariant> attentionVariants(const Fa
   return variants;
 }
 
+// The attention every plan check covers: each family's, its variants its
+// layers', and each compiled geometry no family runs yet, under the name of
+// its shape: the relative geometry (ops::RelativeProjection, Inkling 2's
+// attention), whose window layers attend the 1023 keys before each row and
+// whose global layers scale their queries by tau.
+struct AttentionTarget final {
+  std::string name;
+  uint32_t queryHeads;
+  kv::Layout layout;
+  std::vector<AttentionVariant> variants;
+  bool relative = false;
+};
+
+std::vector<AttentionTarget> attentionTargets() {
+  std::vector<AttentionTarget> targets;
+  model::forEachFamily([&](const auto &family) {
+    targets.push_back({std::string(family.family), family.attentionQueryHeads, family.kvLayout(),
+                       attentionVariants(family)});
+  });
+  targets.push_back({"relative-24q-8kv-d128",
+                     24,
+                     {.attentionLayers = 1, .kvHeads = 8, .headDimension = 128},
+                     {{.rotated = false, .windowTokens = 1023, .positionScaled = false},
+                      {.rotated = false, .windowTokens = 0, .positionScaled = true}},
+                     true});
+  return targets;
+}
+
 // A verify's lanes after `history` tokens: the first of several after half.
 std::vector<uint32_t> verifyHistories(uint32_t lanes, uint32_t history) {
   std::vector<uint32_t> each(lanes, history);
@@ -646,10 +685,10 @@ std::vector<uint32_t> verifyHistories(uint32_t lanes, uint32_t history) {
 }
 
 void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlans &plans, Pipelines *library) {
-  model::forEachFamily([&](const auto &family) {
-    const std::string f(family.family);
-    const std::vector<AttentionVariant> variants = attentionVariants(family);
-    const kv::Layout base = family.kvLayout();
+  for (const AttentionTarget &family : attentionTargets()) {
+    const std::string &f = family.name;
+    const std::vector<AttentionVariant> &variants = family.variants;
+    const kv::Layout base = family.layout;
     Group &prefill = golden.group(name, "attention-prefill", f);
     Group &verify = golden.group(name, "attention-verify", f);
     // A verify of five to eight lanes.
@@ -674,29 +713,32 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
         for (const uint32_t rows : kAttentionRows)
           for (const uint32_t history : kAttentionHistories)
             prefill.add(planned(variant + " rows " + std::to_string(rows) + " history " + std::to_string(history), [&] {
-              return chunkPlan(plans, rows, history, family.attentionQueryHeads, layout, v);
+              return chunkPlan(plans, rows, history, family.queryHeads, layout, v);
             }));
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
           for (const uint32_t history : kAttentionHistories) {
             const std::vector<uint32_t> each = verifyHistories(lanes, history);
             (lanes <= SPLASH_DEFAULT_LANES ? verify : verifyWide).add(planned(variant + " lanes " + std::to_string(lanes) + " history " + std::to_string(history),
-                               [&] { return stepPlan(plans, each, family.attentionQueryHeads, layout, v); }));
+                               [&] { return stepPlan(plans, each, family.queryHeads, layout, v); }));
           }
-        // The q/k norms of each type the family's loaders store (test::familyNorms).
+        // The q/k norms of each type the family's loaders store
+        // (test::familyNorms); a relative geometry's prepare in their place.
         const auto ofFamily = [&](const auto &other) { return std::string_view(other.family) == f; };
-        if (library)
+        if (library && family.relative)
+          library->relativeProjection(name + " " + f + " " + variant + " relative", family.queryHeads, layout, v);
+        else if (library)
           for (const bool float32 : test::normsOfFamilies(ofFamily))
             library->queryKeyNorms(name + " " + f + " " + variant + (float32 ? " f32" : " bf16") + " norms",
-                                   family.attentionQueryHeads, layout, v, float32);
+                                   family.queryHeads, layout, v, float32);
       }
       workspace.add(fmt + " prefill chunk: " + attempt([&] {
-                      return describe(plans.sequenceAttentionWorkspace(family.attentionQueryHeads, layout));
+                      return describe(plans.sequenceAttentionWorkspace(family.queryHeads, layout));
                     }));
       workspace.add(fmt + " decode per lane: " + attempt([&] {
-                      return describe(plans.laneAttentionWorkspace(family.attentionQueryHeads, layout));
+                      return describe(plans.laneAttentionWorkspace(family.queryHeads, layout));
                     }));
     }
-  });
+  }
 }
 
 // ---- Int8 activations off -------------------------------------------------
@@ -816,9 +858,9 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
              label + "'s prefill bound " + bound + " is not its bound with them on less the int8 codes and scales");
     }
   }
-  model::forEachFamily([&](const auto &family) {
-    const std::string f(family.family);
-    const uint32_t heads = family.attentionQueryHeads;
+  for (const AttentionTarget &family : attentionTargets()) {
+    const std::string &f = family.name;
+    const uint32_t heads = family.queryHeads;
     // On's plan line, counting its INT8 queries, against off's.
     const auto compareLines = [&](const std::string &withInt8, const std::string &without) {
       paths.queries += withInt8.find("q8q_") != std::string::npos;
@@ -826,9 +868,9 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
                                                     " is not its plan with them on with bf16 queries");
     };
     for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
-      kv::Layout layout = family.kvLayout();
+      kv::Layout layout = family.layout;
       layout.format = format;
-      for (const AttentionVariant &v : attentionVariants(family)) {
+      for (const AttentionVariant &v : family.variants) {
         for (const uint32_t rows : kAttentionRows)
           for (const uint32_t history : kAttentionHistories)
             compareLines(attempt([&] { return describe(chunkPlan(on, rows, history, heads, layout, v)); }),
@@ -841,7 +883,7 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
           }
       }
     }
-  });
+  }
   return paths;
 }
 
@@ -972,22 +1014,23 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
               [&](uint32_t rows, uint32_t) { return config(rows).ggufRouterTile; }, 0, chunks);
       }
     }
-    for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
-      kv::Layout layout = family.kvLayout();
-      layout.format = format;
-      for (const AttentionVariant &v : attentionVariants(family))
-        check("attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
-                  std::to_string(v.windowTokens) + (v.rotated ? " rope" : " nope"),
-              kAttentionHistories, [&](uint32_t rows, uint32_t history) {
-                const AttentionPlan plan = chunkPlan(plans, rows, history, family.attentionQueryHeads, layout, v);
-                return plan.splitPipeline() + " " + plan.reducePipeline();
-              });
-    }
     if (const uint32_t top = family.indexerTopBlocks)
       check("block indexer " + f, kAttentionHistories,
             [&](uint32_t rows, uint32_t history) { return BlockIndexer::sparse(history, rows, top); },
             family.nativeContextTokens);
   });
+  for (const AttentionTarget &target : attentionTargets())
+    for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+      kv::Layout layout = target.layout;
+      layout.format = format;
+      for (const AttentionVariant &v : target.variants)
+        check("attention " + target.name + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
+                  std::to_string(v.windowTokens) + (v.rotated ? " rope" : " nope"),
+              kAttentionHistories, [&](uint32_t rows, uint32_t history) {
+                const AttentionPlan plan = chunkPlan(plans, rows, history, target.queryHeads, layout, v);
+                return plan.splitPipeline() + " " + plan.reducePipeline();
+              });
+    }
 }
 
 // ---- Decode classes ---------------------------------------------------------

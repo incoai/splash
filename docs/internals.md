@@ -961,15 +961,20 @@ by width on the 10-core M4, where eight instead took up to 21% more). The MoE ex
 (`kernels/shared/moe_gguf.metal`). A block routes as one of the routings the kernels compile
 (`ops::kCompiledMoeRoutings`): its router weights a row's top k experts by the softmax of their
 scores (`MoeRouter::Softmax`, the Qwen families) or by each one's sigmoid over the sum of theirs
-(`SigmoidNormalized`, Flint), and every row also visits the `MoeShape::sharedSlices` slices of the
+(`SigmoidNormalized`, Flint), or selects them by sigmoid plus a per-expert selection bias and
+weights them by their unbiased sigmoids so (`SigmoidBiased`, Inkling), every routed weight times
+`MoeShape::routeScale`; and every row also visits the `MoeShape::sharedSlices` slices of the
 shared expert, ids `experts` on, of the routed experts' width, each weighted by the sigmoid of the
-block's scalar gate (`sharedGate`) or by 1. A shared expert wider than the routed ones runs as such
+block's scalar gate (`sharedGate`) or by 1, or none (Inkling's 0 slices: no shared tile, no shared
+segment bound). The gate/up pass applies the routing's activation (`MoeShape::activation`): SwiGLU,
+or Inkling's SiTU `4 tanh(g/4) sigmoid(g) 25 tanh(u/25)`. A shared expert wider than the routed ones runs as such
 slices in the grouped passes: the planner keeps its gate and up rows and lays its down projection
 out as column windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow
 slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select suffix
-(`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
-(`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`); the softmax router's one gated slice is the
-unsuffixed instances. The grouping packs the tiles' rows, a grouped row per route, each tile's after
+(`moe_route_select_f32_sigmoid_s2`), the grouping and down pass its slices suffix
+(`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`) and the gate/up pass its gate/up suffix, the
+slices' and the activation's (`moe_expert_gguf_m8_gate_up_s0_situ`); the softmax router's one gated
+slice is the unsuffixed instances. The grouping packs the tiles' rows, a grouped row per route, each tile's after
 the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16- or 32-row matmul reads past
 its live rows into the next tile's, or past the last tile into the `tileRows - 1` rows the scratch
 holds past the routes', and stores its live rows alone.
@@ -1115,7 +1120,10 @@ lanes' rows alone, no row of no lane, and with the experts in
 permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
 bitwise as in one chunk, and refuses floor and elastic chunks one unit short, a malformed chunk list
 or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts
-and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
+and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices,
+and `gguf-moe-inkling` at Inkling's, a biased sigmoid router's top 8 of 128 scaled by 8, SiTU
+experts 1152 wide and no shared expert, in its GGUFs' expert formats; `logit-cap`, a head's softcap
+and padded-vocabulary mask (`ops::addLogitCap`) against fp64 and the policies over them;
 and `expert-store`, streamed experts at four shapes bitwise against the resident ones, in loads
 of every kind, through a release and a restore, in a floor and three smaller elastic chunks,
 beside a size of one block, which the store reads whole into its floor
@@ -3368,9 +3376,13 @@ server and the engine must speak the same native wire version. Scoring requires
 2–255 distinct, in-vocabulary tokens, no images or generation constraints, and a
 zero output budget. It may use the full context window because no generated
 token needs a reserved position. The final prefill chunk runs the target head
-but no sampling policy or DFlash decode. Successful scoring emits no Tokens
-event, finishes with Stop, and reports zero decode time. Cancelled requests
-carry no logits.
+but no sampling policy or DFlash decode. A family whose head softcaps its
+logits or pads its vocabulary to whole tiles (`QwenTargetDimensions::logitCap`,
+Inkling's softcap 30 and 200,058 of 201,024 tokens) caps them in place right
+after the head (`ops::addLogitCap`), so its policies, acceptance and scores
+all read the capped logits, the padded tokens' at -inf. Successful scoring
+emits no Tokens event, finishes with Stop, and reports zero decode time.
+Cancelled requests carry no logits.
 
 A Stop frame, its payload a request's u64 id, ends a request whose output
 matched a client stop condition: the engine finishes the request as Stop, a

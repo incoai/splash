@@ -104,14 +104,15 @@ inline splash::metal::MetalBuffer bfloatBuffer(splash::metal::MetalBackend &back
 }
 
 // A block of `shape`: its router, shared expert scalar gate (none without
-// shape.sharedGate), routed experts' and shared expert's gate, up and down,
-// the shared expert's shape.sharedSlices slices in the order the kernels read
-// them (ops::BlockExpertProjection), their weights with expert e in slot e of
-// one chunk of the routed segments (ops::residentExpertChunks), and the
-// formats of the six projections.
+// shape.sharedGate), a biased router's selection bias (none for another
+// router), routed experts' and shared expert's gate, up and down (none
+// without shared slices), the shared expert's shape.sharedSlices slices in
+// the order the kernels read them (ops::BlockExpertProjection), their weights
+// with expert e in slot e of one chunk of the routed segments
+// (ops::residentExpertChunks), and the formats of the six projections.
 struct Model {
   splash::ops::MoeShape shape;
-  Tensor router, sharedGate;
+  Tensor router, sharedGate, routerBias;
   std::array<Tensor, 3> routed;   // gate, up, down: experts * N rows
   std::array<Tensor, 3> shared;   // sharedSlices * N rows
   splash::ops::BlockMoeWeights weights;
@@ -131,31 +132,28 @@ inline gguf_reference::Fmt fitting(size_t i, uint32_t K) {
   throw std::logic_error("no format fits the row");
 }
 
-// The model of `shape` and format f: gate, up and down in f and the next two
-// formats, cyclically, and the shared expert's in the three after them, each
-// the next that fits its rows; with upInGateFormats, up in the gate's
-// formats; with oneFormat, all six in f.
-inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::MoeShape &shape, int f,
-                       bool upInGateFormats, bool oneFormat = false) {
+// The model of `shape` in `formats`: gate, up and down, then the shared
+// expert's gate, up and down (unused without shared slices).
+inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::MoeShape &shape,
+                       const std::array<gguf_reference::Fmt, 6> &formats) {
   const uint32_t hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
   const uint32_t n[3] = {intermediate, intermediate, hidden}, k[3] = {hidden, hidden, intermediate};
   Model m;
   m.shape = shape;
-  for (size_t i = 0; i < m.formats.size(); ++i)
-    m.formats[i] = oneFormat ? gguf_reference::Fmt(f) : fitting(f + i, k[i % 3]);
-  if (upInGateFormats) {
-    m.formats[1] = m.formats[0];
-    m.formats[4] = m.formats[3];
-  }
+  m.formats = formats;
   m.router = floating(backend, shape.experts, hidden, 0.05f);
   if (shape.sharedGate) m.sharedGate = floating(backend, 1, hidden, 0.05f);
+  // A selection bias of about half the spread of the experts' sigmoids, which
+  // moves most rows' top-k.
+  if (shape.router == splash::ops::MoeRouter::SigmoidBiased) m.routerBias = floating(backend, 1, shape.experts, 0.05f);
   for (int p = 0; p < 3; ++p) {
     m.routed[p] = quantized(backend, m.formats[p], shape.experts * n[p], k[p]);
-    m.shared[p] = quantized(backend, m.formats[3 + p], shape.sharedSlices * n[p], k[p]);
+    if (shape.sharedSlices) m.shared[p] = quantized(backend, m.formats[3 + p], shape.sharedSlices * n[p], k[p]);
   }
   splash::ops::BlockMoeWeights gguf;
   gguf.router = m.router.segment;
   gguf.sharedScalarGate = m.sharedGate.segment;
+  gguf.routerBias = m.routerBias.segment;
   gguf.gate = {m.routed[0].segment, m.shared[0].segment};
   gguf.up = {m.routed[1].segment, m.shared[1].segment};
   gguf.down = {m.routed[2].segment, m.shared[2].segment};
@@ -164,6 +162,24 @@ inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::
   gguf.chunks = splash::ops::residentExpertChunks(gguf);
   m.weights = gguf;
   return m;
+}
+
+// The model of `shape` and format f: gate, up and down in f and the next two
+// formats, cyclically, and the shared expert's in the three after them, each
+// the next that fits its rows; with upInGateFormats, up in the gate's
+// formats; with oneFormat, all six in f.
+inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::MoeShape &shape, int f,
+                       bool upInGateFormats, bool oneFormat = false) {
+  const uint32_t hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
+  const uint32_t k[3] = {hidden, hidden, intermediate};
+  std::array<gguf_reference::Fmt, 6> formats{};
+  for (size_t i = 0; i < formats.size(); ++i)
+    formats[i] = oneFormat ? gguf_reference::Fmt(f) : fitting(f + i, k[i % 3]);
+  if (upInGateFormats) {
+    formats[1] = formats[0];
+    formats[4] = formats[3];
+  }
+  return makeModel(backend, shape, formats);
 }
 
 // The weights of `m` with its routed experts copied into a floor chunk of
@@ -216,11 +232,12 @@ inline splash::ops::BlockMoeWeights chunkedWeights(splash::metal::MetalBackend &
   return weights;
 }
 
-// The model's six formats, "gate/up/down/shared gate/shared up/shared down".
+// The model's six formats, "gate/up/down/shared gate/shared up/shared down",
+// or its three without a shared expert.
 inline std::string formatNames(const Model &m) {
   std::string names;
-  for (const gguf_reference::Fmt format : m.formats)
-    names += std::string(names.empty() ? "" : "/") + gguf_reference::fmtName(format);
+  for (size_t i = 0; i < (m.shape.sharedSlices ? m.formats.size() : 3); ++i)
+    names += std::string(names.empty() ? "" : "/") + gguf_reference::fmtName(m.formats[i]);
   return names;
 }
 

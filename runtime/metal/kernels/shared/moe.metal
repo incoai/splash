@@ -5,24 +5,27 @@
 // Routes group rows by expert so each tile streams its weights once. Each row
 // carries top_k routed experts plus the Shared slices of the shared expert
 // (ids `experts` on, moe_shared_slice), weighted by the sigmoid of the
-// block's scalar gate (SharedGate) or by 1.
+// block's scalar gate (SharedGate) or by 1; a block of no shared expert
+// (Shared 0) carries its routed experts alone.
 //
-// One row per threadgroup: thread e holds expert e's score, the threadgroup
-// reduces the shared expert's F32 scalar gate with a fixed partial-sum order,
-// and simdgroup 0 orders the experts, descending score then ascending id,
-// which is the order the shape's routing and tie-break contract requires.
-// Scores and routing weights are fp32: on real 35B router rows, top-8 sets
-// chosen from bf16-rounded scores differ from the fp64 choice on 12-15% of
-// rows (fp32: at most 0.0024%), and bf16 weights round a fifth of the
-// combine's outputs away from bf16 of its exact sum. The router
-// (ops::MoeRouter) then weights the top_k experts by the softmax of their
-// scores, or by each one's sigmoid over the sum of theirs
-// (SigmoidNormalized), summed in rank order.
-enum class MoeRouter : uint { Softmax, SigmoidNormalized };
+// One row per threadgroup: thread e holds expert e's selection key, the
+// threadgroup reduces the shared expert's F32 scalar gate with a fixed
+// partial-sum order, and simdgroup 0 orders the experts, descending key then
+// ascending id, which is the order the shape's routing and tie-break
+// contract requires. Scores and routing weights are fp32: on real 35B router
+// rows, top-8 sets chosen from bf16-rounded scores differ from the fp64
+// choice on 12-15% of rows (fp32: at most 0.0024%), and bf16 weights round a
+// fifth of the combine's outputs away from bf16 of its exact sum. The router
+// (ops::MoeRouter) selects by score, or by sigmoid(score) plus the expert's
+// F32 selection bias (SigmoidBiased), and then weights the top_k experts by
+// the softmax of their scores, or by each one's sigmoid over the sum of
+// theirs (SigmoidNormalized, and SigmoidBiased from the unbiased sigmoids),
+// summed in rank order, each times route_scale.
+enum class MoeRouter : uint { Softmax, SigmoidNormalized, SigmoidBiased };
 template <uint Slots, MoeRouter Router, uint Shared, bool SharedGate>
 inline void moe_route_select(device const float *scores, device bfloat *input,
-                             device const float *shared_gate, device uint *selected,
-                             device float *routing_weights,
+                             device const float *shared_gate, device const float *bias,
+                             device uint *selected, device float *routing_weights,
                              constant MoeRouteParams &params, uint group,
                              uint thread_index, uint simd_lane,
                              uint simd_group, threadgroup float *row_scores,
@@ -31,13 +34,18 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
   // Slots expert slots, one per thread.
   constexpr uint Simdgroups = Slots / 32;
   constexpr uint ExpertsPerLane = Slots / 32;
+  constexpr bool Biased = Router == MoeRouter::SigmoidBiased;
   const uint row = group;
   if (row >= params.rows)
     return;
-  row_scores[thread_index] =
-      thread_index < params.experts
-          ? scores[ulong(row) * Slots + thread_index]
-          : -numeric_limits<float>::infinity();
+  device const float *row_logits = scores + ulong(row) * Slots;
+  float key = -numeric_limits<float>::infinity();
+  if (thread_index < params.experts) {
+    key = row_logits[thread_index];
+    if constexpr (Biased)
+      key = splash_sigmoid(key) + bias[thread_index];
+  }
+  row_scores[thread_index] = key;
 
   if constexpr (SharedGate) {
     device bfloat *row_input = input + ulong(row) * params.input_size;
@@ -83,46 +91,56 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
     const uint candidate =
         best == row_best ? simd_lane + 32 * best_slot : 0xFFFFFFFFu;
     const uint winner = simd_min(candidate);
-    if (candidate == winner)
+    // A biased router weights its winner by the sigmoid of its own score,
+    // which the bias does not move.
+    if (candidate == winner) {
       lane_scores[best_slot] = -numeric_limits<float>::infinity();
+      if constexpr (Biased)
+        ordered[rank] = splash_sigmoid(row_logits[winner]);
+    }
     if (simd_lane == 0) {
-      ordered[rank] = row_best;
+      if constexpr (!Biased)
+        ordered[rank] = row_best;
       selected[row_routes + rank] = winner;
     }
   }
   simdgroup_barrier(mem_flags::mem_threadgroup);
   for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
-    float denominator = 0.0f;
+    float denominator = 0.0f, weight;
     if constexpr (Router == MoeRouter::Softmax) {
       for (uint other = 0; other < params.top_k; ++other) {
         denominator +=
             fast::exp2((ordered[other] - ordered[0]) * 1.44269504089f);
       }
-      routing_weights[row_routes + rank] =
-          fast::exp2((ordered[rank] - ordered[0]) * 1.44269504089f) /
-          denominator;
+      weight = fast::exp2((ordered[rank] - ordered[0]) * 1.44269504089f) /
+               denominator;
+    } else if constexpr (Biased) {
+      for (uint other = 0; other < params.top_k; ++other)
+        denominator += ordered[other];
+      weight = ordered[rank] / (denominator + 1e-20f);
     } else {
       for (uint other = 0; other < params.top_k; ++other)
         denominator += splash_sigmoid(ordered[other]);
-      routing_weights[row_routes + rank] =
-          splash_sigmoid(ordered[rank]) / (denominator + 1e-20f);
+      weight = splash_sigmoid(ordered[rank]) / (denominator + 1e-20f);
     }
+    routing_weights[row_routes + rank] = weight * params.route_scale;
   }
 }
 
 // The router's fp32 scores (kernels/shared/gguf_float.metal) in rows of
 // Slots expert slots and, with a gated shared expert, the F32 shared-expert
-// scalar gate, each routing a compiled routing (ops::kCompiledMoeRoutings)
-// under its select suffix: the softmax one on SPLASH_MOE_EXPERT_SLOTS slots
-// or (_e512) SPLASH_MOE_WIDE_EXPERT_SLOTS, Qwen3.8-Flash-Next's 512 experts,
-// and Flint's on SPLASH_MOE_EXPERT_SLOTS, its 256.
-#define MOE_ROUTE_SELECT_BODY(Slots, Router, Shared, SharedGate, input, shared_gate) \
+// scalar gate, or a biased router's F32 selection bias, each routing a
+// compiled routing (ops::kCompiledMoeRoutings) under its select suffix: the
+// softmax one on SPLASH_MOE_EXPERT_SLOTS slots or (_e512)
+// SPLASH_MOE_WIDE_EXPERT_SLOTS, Qwen3.8-Flash-Next's 512 experts, Flint's on
+// SPLASH_MOE_EXPERT_SLOTS, its 256, and Inkling's on as many, its 128.
+#define MOE_ROUTE_SELECT_BODY(Slots, Router, Shared, SharedGate, input, shared_gate, bias) \
     threadgroup float row_scores[Slots];                                       \
     threadgroup float ordered[Slots];                                          \
     threadgroup float scalar_partials[Slots / 32];                             \
     moe_route_select<Slots, Router, Shared, SharedGate>(                       \
-        scores, input, shared_gate, selected, routing_weights, params, group,  \
-        thread_index, simd_lane, simd_group, row_scores, ordered,              \
+        scores, input, shared_gate, bias, selected, routing_weights, params,   \
+        group, thread_index, simd_lane, simd_group, row_scores, ordered,       \
         scalar_partials);
 #define MOE_ROUTE_SELECT_ENTRY(Name, Slots, Router, Shared)                    \
   kernel void Name(                                                            \
@@ -136,7 +154,8 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    MOE_ROUTE_SELECT_BODY(Slots, Router, Shared, true, input, shared_gate)     \
+    MOE_ROUTE_SELECT_BODY(Slots, Router, Shared, true, input, shared_gate,     \
+                          nullptr)                                             \
   }
 // A shared expert without the gate, which reads neither the input nor a gate.
 #define MOE_ROUTE_SELECT_UNGATED_ENTRY(Name, Slots, Router, Shared)            \
@@ -149,12 +168,30 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    MOE_ROUTE_SELECT_BODY(Slots, Router, Shared, false, nullptr, nullptr)      \
+    MOE_ROUTE_SELECT_BODY(Slots, Router, Shared, false, nullptr, nullptr,      \
+                          nullptr)                                             \
+  }
+// A biased router of an ungated shared expert or none, which reads its bias.
+#define MOE_ROUTE_SELECT_BIASED_ENTRY(Name, Slots, Shared)                     \
+  kernel void Name(                                                            \
+      device const float *scores [[buffer(0)]],                                \
+      device const float *bias [[buffer(1)]],                                  \
+      device uint *selected [[buffer(2)]],                                     \
+      device float *routing_weights [[buffer(3)]],                             \
+      constant MoeRouteParams &params [[buffer(4)]],                           \
+      uint group [[threadgroup_position_in_grid]],                             \
+      uint thread_index [[thread_index_in_threadgroup]],                       \
+      uint simd_lane [[thread_index_in_simdgroup]],                            \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
+    MOE_ROUTE_SELECT_BODY(Slots, MoeRouter::SigmoidBiased, Shared, false,      \
+                          nullptr, nullptr, bias)                              \
   }
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32, SPLASH_MOE_EXPERT_SLOTS, MoeRouter::Softmax, 1)
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, MoeRouter::Softmax, 1)
 MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_sigmoid_s2, SPLASH_MOE_EXPERT_SLOTS,
                                MoeRouter::SigmoidNormalized, 2)
+MOE_ROUTE_SELECT_BIASED_ENTRY(moe_route_select_f32_sigmoid_bias_s0, SPLASH_MOE_EXPERT_SLOTS, 0)
+#undef MOE_ROUTE_SELECT_BIASED_ENTRY
 #undef MOE_ROUTE_SELECT_UNGATED_ENTRY
 #undef MOE_ROUTE_SELECT_ENTRY
 #undef MOE_ROUTE_SELECT_BODY
@@ -336,6 +373,8 @@ MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified, SPLASH_MOE_EXPERT_SLO
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
+MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s0, SPLASH_MOE_EXPERT_SLOTS, 0)
+MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s0, SPLASH_MOE_EXPERT_SLOTS, 0)
 #undef MOE_GROUP_ROUTES_VERIFIED_ENTRY
 #undef MOE_GROUP_ROUTES_ENTRY
 #undef MOE_GROUP_ROUTES_BODY

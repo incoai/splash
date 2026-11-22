@@ -271,6 +271,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/HyperConnection.cpp \
 	runtime/ops/NgramEmbedding.cpp \
 	runtime/ops/BlockIndexer.cpp \
+	runtime/ops/ShortConvolution.cpp \
+	runtime/ops/BlockResidual.cpp \
+	runtime/ops/LoopControl.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
 	runtime/ops/KvSlotFormat.cpp \

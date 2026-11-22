@@ -270,8 +270,9 @@ struct ExpertStore::Impl {
     gguf::StreamedExperts experts;
     std::vector<uint32_t> slot; // each expert's, kNoSlot when not resident
     uint32_t resident = 0;      // the experts that have a slot
-    // Its router and shared-expert gate (bind), which predict its routes.
-    ops::QuantizedSegment router, scalarGate;
+    // Its router, shared-expert gate and selection bias (bind), which
+    // predict its routes.
+    ops::QuantizedSegment router, scalarGate, routerBias;
   };
   // A step's tiles (ops::MoeLoadPart): the grouping's descriptors and count.
   struct PartTiles final {
@@ -1293,6 +1294,7 @@ void ExpertStore::bind(uint32_t block, ops::BlockMoeWeights &weights) {
   Impl::Block &streamed = impl.blocks.at(block);
   streamed.router = weights.router;
   streamed.scalarGate = weights.sharedScalarGate;
+  streamed.routerBias = weights.routerBias;
   const Impl::Size &size = impl.sizes[streamed.size];
   // The routed segments give the slots' format and size; their planes are
   // the chunks'.
@@ -1345,7 +1347,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
     const ops::MoeBuffers &step = *parts.front().buffers;
     routed = {step.lanes, step.laneRows};
     const Impl::Block &next = impl.blocks[block + 1];
-    ops::MoE::addRoutes(graph, step.input, next.router, next.scalarGate, impl.predictionScores,
+    ops::MoE::addRoutes(graph, step.input, next.router, next.scalarGate, next.routerBias, impl.predictionScores,
                         impl.predictionRoutes, impl.predictionWeights, rows, shape,
                         parts.front().plan->configuration().ggufRouterTile);
   }

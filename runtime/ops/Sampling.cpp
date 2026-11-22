@@ -327,6 +327,19 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
             cutoffs.params, {lanes, 1, 1}, {1, 1, 1});
 }
 
+void addLogitCap(metal::CommandGraph &graph, const metal::MetalBuffer &logits, uint32_t rows, uint32_t vocabulary,
+                 LogitCap cap) {
+  if (!cap.active(vocabulary)) return;
+  if (!(cap.softcap >= 0.0F && cap.softcap <= std::numeric_limits<float>::max()))
+    throw std::invalid_argument("a logit softcap is negative or not finite");
+  if (cap.validVocabulary > vocabulary) throw std::invalid_argument("the valid vocabulary is past the vocabulary");
+  if (!rows || !vocabulary) throw std::invalid_argument("a logit cap has no logits");
+  requireBytes(logits, uint64_t{rows} * vocabulary * sizeof(float), "capped logits");
+  graph.add("head_logit_cap", {logits},
+            LogitCapParams{rows, vocabulary, cap.validVocabulary ? cap.validVocabulary : vocabulary, cap.softcap},
+            {(vocabulary + LOGIT_CAP_TOKENS - 1) / LOGIT_CAP_TOKENS, rows, 1}, {LOGIT_CAP_THREADS, 1, 1});
+}
+
 void Sampling::addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffers, const StepRows &step,
                              std::span<const uint32_t> maximumRetained, const StopTokens &stopTokens) const {
   requireStepRows(step);

@@ -736,6 +736,57 @@ void checkDraftVocabulary() {
           "a subset whose parts cross was accepted");
 }
 
+// A MoE layout's blocks are of a compiled routing (ops::MoeShape::valid):
+// Qwen3.6-35B-A3B's experts without a shared expert pass with Inkling's
+// routing (a biased sigmoid router scaling by 8, SiTU experts) and are refused
+// with a softmax router or SwiGLU experts, which no compiled routing pairs
+// with no shared expert, and with a route scale of 0.
+void checkMoeRouting() {
+  auto inkling = model::Qwen3_6MoeLayout{};
+  inkling.moeRouter = ops::MoeRouter::SigmoidBiased;
+  inkling.sharedExpertSlices = 0;
+  inkling.sharedExpertGate = false;
+  inkling.routeScale = 8.0F;
+  inkling.moeActivation = ops::MoeActivation::Situ;
+  model::requireQwenLayout(inkling);
+  for (const auto &[change, what] :
+       std::initializer_list<std::pair<void (*)(model::Qwen3_6MoeLayout &), const char *>>{
+           {[](model::Qwen3_6MoeLayout &l) { l.moeRouter = ops::MoeRouter::Softmax; }, "a softmax router"},
+           {[](model::Qwen3_6MoeLayout &l) { l.moeActivation = ops::MoeActivation::SwiGlu; }, "SwiGLU experts"},
+           {[](model::Qwen3_6MoeLayout &l) { l.routeScale = 0.0F; }, "a route scale of 0"}}) {
+    auto changed = inkling;
+    change(changed);
+    rejects([&] { model::requireQwenLayout(changed); }, "Qwen target layout is inconsistent",
+            std::string("a MoE layout without a shared expert was accepted with ") + what);
+  }
+}
+
+// A head's logit cap (logitCap) is its family's: a layout that sets none
+// caps nothing and selects from its whole vocabulary; Inkling's softcap and
+// valid vocabulary pass, and a negative softcap or a valid vocabulary past
+// the head's are refused.
+void checkLogitCap() {
+  const model::Qwen3_6MoeLayout shipped;
+  require(!shipped.logitCap().active(shipped.vocabularySize) &&
+              shipped.selectableVocabularySize() == shipped.vocabularySize,
+          "a layout that sets no logit cap caps its logits");
+  auto capped = shipped;
+  capped.logitSoftcap = 30.0F;
+  capped.validVocabularySize = shipped.vocabularySize - 966;
+  model::requireQwenLayout(capped);
+  require(capped.logitCap() == ops::LogitCap{30.0F, shipped.vocabularySize - 966} &&
+              capped.selectableVocabularySize() == shipped.vocabularySize - 966,
+          "a layout's logit cap is not its softcap and valid vocabulary");
+  auto negative = capped;
+  negative.logitSoftcap = -30.0F;
+  rejects([&] { model::requireQwenLayout(negative); }, "Qwen target layout is inconsistent",
+          "a negative logit softcap was accepted");
+  auto past = capped;
+  past.validVocabularySize = shipped.vocabularySize + 64;
+  rejects([&] { model::requireQwenLayout(past); }, "Qwen target layout is inconsistent",
+          "a valid vocabulary past the head's was accepted");
+}
+
 } // namespace
 
 // A prefill chunk's attention plan follows the history its chunk committed:
@@ -766,6 +817,8 @@ int main() {
     checkCaptureLayers();
     checkGdnWidths();
     checkDraftVocabulary();
+    checkMoeRouting();
+    checkLogitCap();
     checkGateUpLayers();
     checkYarnGeometry();
     checkIndexTables();

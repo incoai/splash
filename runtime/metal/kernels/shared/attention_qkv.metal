@@ -89,3 +89,52 @@ ATTENTION_QKV_NOPE(attention_bf16_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, f
 #undef ATTENTION_QKV_FORMATS
 #undef ATTENTION_QKV_NOPE
 #undef ATTENTION_QKV
+
+// A relative geometry's prepare (relative_qkv_storage_phase) of a layer's
+// query side rows and its keys and values after their convolutions, with
+// its F32 query and relative-state scales, staging its queries and writing
+// its relative states; a position-scaled layer's (_scaled) multiplies both by
+// tau. A decode step binds its tree rows, whose depths place its rows; a
+// prompt binds another buffer of the dispatch in their place, of which it
+// reads nothing.
+#define ATTENTION_RELATIVE_QKV(Name, QHeads, KHeads, HeadDim, PositionScaled, CacheElement)                  \
+  kernel void Name(                                                                                          \
+      device const float *query_side [[buffer(0)]],                                                          \
+      device const float *keys [[buffer(1)]],                                                                \
+      device const float *values [[buffer(2)]],                                                              \
+      device const float *query_scale [[buffer(3)]],                                                         \
+      device const float *relative_scale [[buffer(4)]],                                                      \
+      device bfloat *queries [[buffer(5)]],                                                                  \
+      device float *relative [[buffer(6)]],                                                                  \
+      device const SplashKvPage *page_table0 [[buffer(7)]],                                                  \
+      device const SplashKvPage *page_table1 [[buffer(8)]],                                                  \
+      device const SplashKvPage *page_table2 [[buffer(9)]],                                                  \
+      device const SplashKvPage *page_table3 [[buffer(10)]],                                                 \
+      device const SplashKvPage *page_table4 [[buffer(11)]],                                                 \
+      device const SplashKvPage *page_table5 [[buffer(12)]],                                                 \
+      device const SplashKvPage *page_table6 [[buffer(13)]],                                                 \
+      device const SplashKvPage *page_table7 [[buffer(14)]],                                                 \
+      device const SplashTreeRow *tree [[buffer(15)]],                                                       \
+      device const SplashLaneRows *layout [[buffer(16)]],                                                    \
+      constant SplashAttentionParams &params [[buffer(17)]],                                                 \
+      uint3 group [[threadgroup_position_in_grid]],                                                          \
+      uint thread_index [[thread_index_in_threadgroup]],                                                     \
+      uint lane [[thread_index_in_simdgroup]],                                                               \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                                                  \
+    threadgroup float2 partials[HeadDim / 32];                                                               \
+    SPLASH_STORE_MAXIMA_##CacheElement(HeadDim)                                                              \
+    relative_qkv_storage_phase<QHeads, KHeads, HeadDim, PositionScaled, CacheElement>(                       \
+        query_side, keys, values, query_scale, relative_scale, queries, relative,                            \
+        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3, page_table4,        \
+                            page_table5, page_table6, page_table7),                                          \
+        tree, layout, params, partials, maxima, group, thread_index, lane, simd_group);                      \
+  }
+#define ATTENTION_RELATIVE_QKV_FORMATS(Suffix, QHeads, KHeads, HeadDim)                                      \
+  ATTENTION_RELATIVE_QKV(attention_q8_qkv##Suffix, QHeads, KHeads, HeadDim, false, int8_t)                   \
+  ATTENTION_RELATIVE_QKV(attention_bf16_qkv##Suffix, QHeads, KHeads, HeadDim, false, bfloat)                 \
+  ATTENTION_RELATIVE_QKV(attention_q8_qkv##Suffix##_scaled, QHeads, KHeads, HeadDim, true, int8_t)           \
+  ATTENTION_RELATIVE_QKV(attention_bf16_qkv##Suffix##_scaled, QHeads, KHeads, HeadDim, true, bfloat)
+// Eight KV heads of 128 dimensions under 24 query heads (Inkling 2's).
+ATTENTION_RELATIVE_QKV_FORMATS(_kv8_g3_d128, 24, 8, 128)
+#undef ATTENTION_RELATIVE_QKV_FORMATS
+#undef ATTENTION_RELATIVE_QKV

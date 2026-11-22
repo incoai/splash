@@ -83,6 +83,30 @@ inline TargetRow selected_row(device const float *logits,
           0.0f};
 }
 
+// A head's logits made final in place (LogitCapParams, ops::addLogitCap),
+// before every policy, acceptance and readout reads them: a token from the
+// valid vocabulary on takes -inf, which no policy selects and a softmax
+// weighs at nothing (shard_mass), and every other token's logit is softcapped
+// where softcap is non-zero. tanh is the precise one, so a capped logit keeps
+// the relative precision of a small one. Thread t of a threadgroup takes the
+// group's tokens t, t + LOGIT_CAP_THREADS, ..., in turn.
+kernel void head_logit_cap(device float *logits [[buffer(0)]],
+                           constant LogitCapParams &params [[buffer(1)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           uint thread_index [[thread_index_in_threadgroup]]) {
+  if (group.y >= params.rows)
+    return;
+  device float *row = logits + ulong(group.y) * params.vocabulary;
+  for (uint token = group.x * LOGIT_CAP_TOKENS + thread_index;
+       token < min(params.vocabulary, (group.x + 1) * LOGIT_CAP_TOKENS);
+       token += LOGIT_CAP_THREADS) {
+    if (token >= params.valid_vocabulary)
+      row[token] = -INFINITY;
+    else if (params.softcap != 0.0f)
+      row[token] = params.softcap * precise::tanh(row[token] / params.softcap);
+  }
+}
+
 // Each lane's lane rows and tree row for the selection of its first token
 // after its prompt (SampleFirstRowsParams), one group a lane: its one row of
 // the logits, a tree's root, which the selection's kernels read as a decode

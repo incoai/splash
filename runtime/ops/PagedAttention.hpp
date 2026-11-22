@@ -94,14 +94,56 @@ inline constexpr uint32_t kAttentionSequenceSplits = 2 * kv::kAttentionMaximumSp
 
 // How one attention layer attends, of the variants its geometry is compiled
 // for (kCompiledAttention, PagedAttention.cpp): its queries and keys rotated
-// by the geometry's RoPE, or unrotated (NoPE); and each row over its whole
+// by the geometry's RoPE, or unrotated (NoPE); each row over its whole
 // history, or over a window of the windowTokens keys before it (keys
-// p - windowTokens to p, a sliding-window layer's). The default is every
-// geometry's.
+// p - windowTokens to p, a sliding-window layer's); and, of a relative
+// geometry (RelativeProjection), its queries and relative states multiplied
+// by the log position scale tau of their row's position or not
+// (positionScaled, metal/abi/PagedAttention.h). The default is every
+// rotated geometry's.
 struct AttentionVariant final {
   bool rotated = true;
   uint32_t windowTokens = 0;
+  bool positionScaled = false;
   bool operator==(const AttentionVariant &) const = default;
+};
+
+// A relative geometry's attention (kCompiledAttention, metal/abi/
+// PagedAttention.h): no RoPE; each score biased by its key's distance back
+// from its row, of the row's relative state of its query head
+// (kRelativeWidth F32) and the layer's table of kRelativeExtent rows; each
+// row's own sink logit of each query head and its output gates, read from
+// its query side row; clipped queries and keys and RMS-normalized values.
+inline constexpr uint32_t kRelativeWidth = SPLASH_RELATIVE_WIDTH;
+inline constexpr uint32_t kRelativeExtent = SPLASH_RELATIVE_EXTENT;
+// The F32 values of a query side row of a relative geometry of `queryHeads`
+// heads of headDimension dimensions: each query head's queries, its gates,
+// its relative states and sink logits, padded to a multiple of 64.
+[[nodiscard]] constexpr uint32_t relativeQuerySideWidth(uint32_t queryHeads, uint32_t headDimension) noexcept {
+  return SPLASH_RELATIVE_QUERY_SIDE(queryHeads, headDimension);
+}
+
+// A layer's inputs of a relative geometry's prepare (PagedAttention::
+// addRelativeProjection), each a packed row's: its query side row
+// (relativeQuerySideWidth F32); its keys and values after their
+// convolutions, each [KV head][dimension] F32; and the layer's F32 scales of
+// its queries, [query head][dimension], and of its relative states, [query
+// head][kRelativeWidth].
+struct RelativeProjection final {
+  metal::MetalBuffer querySide;
+  metal::MetalBuffer keys;
+  metal::MetalBuffer values;
+  metal::MetalBuffer queryScale;
+  metal::MetalBuffer relativeScale;
+};
+
+// What a relative geometry's attention biases its scores by: its rows'
+// relative states, [packed row][query head][kRelativeWidth] F32, as the
+// prepare writes them, and the layer's table, kRelativeExtent rows of
+// kRelativeWidth F32, a row a key distance.
+struct RelativeBias final {
+  metal::MetalBuffer states;
+  metal::MetalBuffer table;
 };
 
 // The block lists a sparse plan's tiles attend through (metal/abi/
@@ -159,10 +201,11 @@ enum class AttentionOutput : uint8_t { Every, Last };
 // Where a layer's attention writes its rows (addAttention): as the
 // out-projection's input rows `hidden`, each multiplied by the sigmoid of its
 // query head's gate in its packed row of `packed` where the geometry is
-// gated, or for an ungated one gathered as they are, which reads no packed
-// row; the rows `output` names, every row as its packed row or each
-// sequence's last row as row s; and, when `input` is not Plain, the
-// out-projection's table of them in `scratch` too.
+// gated (a relative geometry's query side rows, RelativeProjection, which
+// hold the rows' sinks too), or for an ungated one gathered as they are,
+// which reads no packed row; the rows `output` names, every row as its
+// packed row or each sequence's last row as row s; and, when `input` is not
+// Plain, the out-projection's table of them in `scratch` too.
 struct AttentionOutputRows final {
   metal::MetalBuffer packed;
   metal::MetalBuffer hidden;
@@ -204,6 +247,10 @@ public:
   // Whether the reduce adds the layer's learned sinks, which addAttention
   // then takes: its geometry's (kCompiledAttention).
   const bool sinks;
+  // Whether its geometry is relative: the split biases its scores, which
+  // addAttention then takes (RelativeBias), and the reduce adds each row's
+  // sinks and gates from its query side row.
+  const bool relative;
   // The tile splits the workspace holds, which each dispatch's fit.
   const uint32_t workspaceSlots;
 
@@ -222,8 +269,10 @@ public:
 
 private:
   friend class PagedAttention;
-  AttentionPlan(kv::Layout layout, uint32_t queryHeads, bool sparse, bool sinks, uint32_t workspaceSlots)
-      : layout(layout), queryHeads(queryHeads), sparse(sparse), sinks(sinks), workspaceSlots(workspaceSlots) {}
+  AttentionPlan(kv::Layout layout, uint32_t queryHeads, bool sparse, bool sinks, bool relative,
+                uint32_t workspaceSlots)
+      : layout(layout), queryHeads(queryHeads), sparse(sparse), sinks(sinks), relative(relative),
+        workspaceSlots(workspaceSlots) {}
   std::array<Sequence, SPLASH_MAXIMUM_BATCH_WIDTH> sequences_{};
   uint32_t sequenceCount_ = 0;
   std::array<Dispatch, SPLASH_MAXIMUM_BATCH_WIDTH> dispatches_{};
@@ -282,10 +331,11 @@ public:
   [[nodiscard]] static AttentionWorkspace workspace(uint32_t slots, uint32_t queryHeads, kv::Layout layout);
   // Whether the compiled geometry of `queryHeads` over a layout's KV heads
   // (kCompiledAttention) computes attention as a target's layout states it:
-  // gated or not, rotating `rotaryPairs` pairs. Throws for a geometry with
+  // gated or not, rotating `rotaryPairs` pairs (none for a geometry without
+  // RoPE), relative or not (RelativeProjection). Throws for a geometry with
   // no kernels.
   [[nodiscard]] static bool compiles(uint32_t queryHeads, kv::Layout layout, bool gated,
-                                     uint32_t rotaryPairs);
+                                     uint32_t rotaryPairs, bool relative = false);
 
   // A sequence's chunk: `chunkTokens` rows after `logicalPosition`, staged
   // `chunkStride` rows per KV head, its page table `pageTableEntries` long.
@@ -309,6 +359,22 @@ public:
                             std::span<const metal::MetalBuffer> pageTables,
                             std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
                             uint32_t queryHeads, kv::Layout layout, AttentionVariant variant = {});
+  // A relative geometry's prepare of the sequences' rows (`inputs`, a
+  // RelativeProjection a packed row), as addProjection's of another
+  // geometry, in one dispatch before the attention: each query head's
+  // q = clip(s_q . q) staged in `queries` as addProjection stages them, its
+  // r = clip(s_r . r) at its packed row of `states` ([row][query head]
+  // [kRelativeWidth] F32, RelativeBias), both times tau of the row's
+  // position on a positionScaled variant (a row's position its sequence's
+  // committed tokens plus its row, or with rows' tree plus its depth); and
+  // each KV head's clipped key and RMS-normalized value stored in the pages
+  // of `layer` through each sequence's page table (metal/abi/
+  // PagedAttention.h). The variant is unrotated.
+  static void addRelativeProjection(metal::CommandGraph &graph, const RelativeProjection &inputs,
+                                    metal::MetalBuffer queries, metal::MetalBuffer states, SplashKvLayer layer,
+                                    std::span<const metal::MetalBuffer> pageTables,
+                                    std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
+                                    uint32_t queryHeads, kv::Layout layout, AttentionVariant variant);
   // The plan's dispatches over the staged queries into the out-projection's
   // input rows (`output`, AttentionOutputRows), which must not alias them,
   // each sequence reading its history where `histories` say: each reduce
@@ -318,16 +384,20 @@ public:
   // and statistics hold its workspace. A dispatch whose sequences read their
   // layer in two placements (`kv`) runs as a dispatch per run of them that
   // reads one. `sinks` holds the layer's learned sinks, an F32 per query
-  // head, for a plan whose reduce adds them (its `sinks`). With rows' tree,
-  // each sequence is a decode lane's block of at most 32 rows whose rows
-  // attend their paths (SplashAttentionParams::trees). An output of each
-  // sequence's last row takes the plan of its last tiles (lastTiles).
+  // head, for a plan whose reduce adds them (its `sinks`). A relative plan
+  // (its `relative`) biases its scores by `relative`, its rows' states and
+  // the layer's table, and reads its rows' sinks and gates from their query
+  // side rows (output.packed); another takes no bias. With rows' tree, each
+  // sequence is a decode lane's block of at most 32 rows whose rows attend
+  // their paths (SplashAttentionParams::trees). An output of each sequence's
+  // last row takes the plan of its last tiles (lastTiles).
   static PreparedInput addAttention(metal::CommandGraph &graph, const AttentionPlan &plan,
                                     metal::MetalBuffer queries, const metal::MetalBuffer &partials,
                                     const metal::MetalBuffer &statistics,
                                     std::span<const kv::ChunkedPrefillParams> sequences,
                                     std::span<const AttentionHistory> histories, const AttentionRows &rows,
-                                    const AttentionOutputRows &output, metal::MetalBuffer sinks = {});
+                                    const AttentionOutputRows &output, metal::MetalBuffer sinks = {},
+                                    const RelativeBias &relative = {});
   // One dispatch of the block lists of up to a batch of sequences of a
   // command's rows (`rows`, whose tree it does not read), whose block masks
   // are rows of `mask`, one a packed row, `maskWords` words each

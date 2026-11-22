@@ -5,6 +5,7 @@
 #include "ops/DraftSelector.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedKv.hpp"
+#include "ops/Sampling.hpp"
 #include "ops/StopTokens.hpp"
 
 #include <array>
@@ -43,6 +44,14 @@ struct QwenTargetDimensions {
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;
+  // What the head makes of its logits before any reader (logitCap): where
+  // logitSoftcap is non-zero, softcap * tanh(logit / softcap) (a config's
+  // final_logit_softcapping, Inkling's 30), and where validVocabularySize is,
+  // -inf for the tokens from it on, the rows that pad the head's
+  // vocabularySize to whole tiles (Inkling's 200,058 of 201,024), which no
+  // policy may select. The other families leave both zero.
+  float logitSoftcap = 0.0F;
+  uint32_t validVocabularySize = 0;
   uint32_t packedGdnWidth = 0;
   uint32_t packedFullWidth = 0;
   uint32_t convolutionDimension = 0;
@@ -108,15 +117,19 @@ struct QwenTargetDimensions {
   // The dense FFN's width.
   uint32_t intermediateSize = 0;
   // The sparse MoE's routed experts, those each token takes, and the width of
-  // each; how its router weights them, and its shared expert: as wide as
-  // sharedExpertSlices routed experts and weighted by the sigmoid of the
-  // block's scalar gate or, without sharedExpertGate, by 1 (ops::MoeShape).
+  // each; how its router selects and weights them, and its shared expert: as
+  // wide as sharedExpertSlices routed experts (none for 0) and weighted by
+  // the sigmoid of the block's scalar gate or, without sharedExpertGate, by 1;
+  // the factor of the routed experts' weights and their activation
+  // (ops::MoeShape).
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
   ops::MoeRouter moeRouter = ops::MoeRouter::Softmax;
   uint32_t sharedExpertSlices = 1;
   bool sharedExpertGate = true;
+  float routeScale = 1.0F;
+  ops::MoeActivation moeActivation = ops::MoeActivation::SwiGlu;
   // The first layers of a sparse MoE target, which run a dense FFN of
   // intermediateSize instead (a config's mlp_only_layers); its MoE blocks
   // are those of the layers after them, in layer order.
@@ -168,7 +181,17 @@ struct QwenTargetDimensions {
             .expertIntermediateSize = expertIntermediateSize,
             .router = moeRouter,
             .sharedSlices = sharedExpertSlices,
-            .sharedGate = sharedExpertGate};
+            .sharedGate = sharedExpertGate,
+            .routeScale = routeScale,
+            .activation = moeActivation};
+  }
+  // What the head does to its logits (ops::LogitCap), nothing unless the
+  // family sets a softcap or a valid vocabulary.
+  [[nodiscard]] constexpr ops::LogitCap logitCap() const noexcept { return {logitSoftcap, validVocabularySize}; }
+  // The tokens a policy may select: the valid vocabulary, or the head's
+  // whole vocabulary where the family sets none.
+  [[nodiscard]] constexpr uint32_t selectableVocabularySize() const noexcept {
+    return validVocabularySize ? validVocabularySize : vocabularySize;
   }
   // The window the target serves with `scaling`: the native one, or YaRN's,
   // the native one times its factor, rounded to the nearest token so that a

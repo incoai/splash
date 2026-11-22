@@ -20,19 +20,22 @@
 #define SPLASH_MOE_EXPERT_SLOTS 256u
 #define SPLASH_MOE_WIDE_EXPERT_SLOTS 512u
 
+// The selection of each row's top_k of `experts` experts, whose routing
+// weights it scales by route_scale (ops::MoeShape::routeScale).
 struct MoeRouteParams {
   uint32_t rows;
   uint32_t input_size;
   uint32_t experts;
   uint32_t top_k;
+  float route_scale;
 };
 
-static_assert(sizeof(MoeRouteParams) == 16,
-              "MoE routing parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeRouteParams) == 20,
+              "MoE routing parameters are 20 bytes on both sides");
 
 // Every row carries top_k routed experts followed by the slices of the shared
 // expert, ids `experts` on, whose routing weight is the sigmoid of the
-// block's scalar gate or 1 (ops::MoeShape). Routes are sorted by expert into
+// block's scalar gate or 1 (ops::MoeShape), if it has one. Routes are sorted by expert into
 // tiles of at most tile_rows routes of one expert: a tile covers grouped rows
 // [first_row, first_row + rows), each tile's following the tile before it's,
 // a grouped row per route.

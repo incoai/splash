@@ -56,6 +56,39 @@ static_assert(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS 
                   1u << (32 - SPLASH_ATTENTION_BLOCK_ROW_BITS),
               "A list entry's bits above its rows' hold any block");
 
+// A relative geometry (ops::PagedAttention's kCompiledAttention, Inkling 2's
+// attention) has no RoPE: positions enter each score as an additive bias by
+// the key's distance d = p_query - p_key, the row's relative state r of a
+// query head (SPLASH_RELATIVE_WIDTH floats) times row d of the layer's F32
+// table of SPLASH_RELATIVE_EXTENT rows, b(d) = r . P[d], added after the
+// scaled q . k for 0 <= d < SPLASH_RELATIVE_EXTENT and none past it. Each row
+// takes the projections of one query side row, F32,
+// SPLASH_RELATIVE_QUERY_SIDE(heads, dimension) floats wide: every query head's
+// queries (head-major), then its output gates (before their sigmoid), its
+// relative states before their scale and clip, its sink logits, and padding
+// to a multiple of 64. Its prepare (kernels/common/attention_qkv_prepare.h,
+// relative_qkv_storage_phase) writes each query head's
+// q = clip_QK(s_q . q) and r = clip_STATE(s_r . r), both times
+// tau(p) = 1 + ALPHA ln(max(1, (p + 1) / FLOOR)) on a position-scaled layer
+// (ops::AttentionVariant), where clip_c(x) = x min(1, c / (|x| + EPSILON)) of
+// a head's vector, and stores each KV head's k = clip_QK(k) and v = v / rms(v)
+// (no gamma). Its reduce adds each row's sink logit of its query head, which
+// has no value, to the softmax and multiplies the row by the sigmoid of its
+// query head's gates, both read from the row's query side.
+#define SPLASH_RELATIVE_WIDTH 16u
+#define SPLASH_RELATIVE_EXTENT 1024u
+#define SPLASH_RELATIVE_QK_CLIP 22.627416997969522f
+#define SPLASH_RELATIVE_STATE_CLIP 8.0f
+#define SPLASH_RELATIVE_CLIP_EPSILON 1e-6f
+#define SPLASH_RELATIVE_LOG_SCALE_FLOOR 8192.0f
+#define SPLASH_RELATIVE_LOG_SCALE_ALPHA 0.1f
+#define SPLASH_RELATIVE_GATES(heads, dimension) ((heads) * (dimension))
+#define SPLASH_RELATIVE_STATES(heads, dimension) (2u * (heads) * (dimension))
+#define SPLASH_RELATIVE_SINKS(heads, dimension) \
+  (SPLASH_RELATIVE_STATES(heads, dimension) + (heads) * SPLASH_RELATIVE_WIDTH)
+#define SPLASH_RELATIVE_QUERY_SIDE(heads, dimension) \
+  ((SPLASH_RELATIVE_SINKS(heads, dimension) + (heads) + 63u) / 64u * 64u)
+
 // A list's blocks may sit outside the tile's page table (ops::AttentionBlocks
 // locations, the blocks a spilled request's hot block cache holds), which the
 // located split reads: a location per entry, in an array of the lists'

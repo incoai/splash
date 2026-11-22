@@ -33,7 +33,18 @@ constant bool kMoeColumnTiles = !is_function_constant_defined(kMoeStagedOnly) ||
 
 // The down pass of the MoE experts (ops/MoE.cpp; kernels/shared/moe.metal groups the rows): projection 2 of the
 // tiles' experts over the intermediate, the routed ones in the chunks of the table at the index after the parameters
-// (metal/abi/MoE.h), into bf16 outputs (moe_gguf_expert_tile).
+// (metal/abi/MoE.h), into bf16 outputs (moe_gguf_expert_tile). A block of no shared expert binds no shared planes
+// (moe_expert_gguf_down_routed, the _s0 instances); both kernels inline the pass.
+template <ushort Rows, uint Shared>
+__attribute__((always_inline)) inline void
+moe_down_pass(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
+              device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *output, device const uint *slots,
+              constant MoeGgufExpertParams &p, constant ulong *chunks, uint2 group, uint simd_lane, uint simd_group,
+              threadgroup half (&stage)[kStagedStages], threadgroup half2 (&tl)[kQuantPairTableEntries]) {
+  moe_gguf_expert_tile<Rows, Shared, 2>(input, tiles, tile_count, sw0, sw1, smeta, slots, p, chunks, group, simd_lane,
+                                        simd_group, stage, tl, [&](ulong o, float v) { output[o] = bfloat(v); },
+                                        moe_formats<2>(), kMoeColumnTiles);
+}
 template <ushort Rows, uint Shared>
 kernel void moe_expert_gguf_down(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
                                  device const uint *tile_count [[buffer(2)]], device uchar *sw0 [[buffer(3)]],
@@ -44,17 +55,35 @@ kernel void moe_expert_gguf_down(device bfloat *input [[buffer(0)]], device cons
                                  uint simd_lane [[thread_index_in_simdgroup]],
                                  uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
-  moe_gguf_expert_tile<Rows, Shared, 2>(input, tiles, tile_count, sw0, sw1, smeta, slots, p, chunks, group, simd_lane,
-                                        simd_group, stage, tl, [&](ulong o, float v) { output[o] = bfloat(v); },
-                                        moe_formats<2>(), kMoeColumnTiles);
+  moe_down_pass<Rows, Shared>(input, tiles, tile_count, sw0, sw1, smeta, output, slots, p, chunks, group, simd_lane,
+                              simd_group, stage, tl);
+}
+template <ushort Rows>
+kernel void moe_expert_gguf_down_routed(device bfloat *input [[buffer(0)]],
+                                        device const MoeTileDescriptor *tiles [[buffer(1)]],
+                                        device const uint *tile_count [[buffer(2)]], device bfloat *output [[buffer(3)]],
+                                        device const uint *slots [[buffer(4)]],
+                                        constant MoeGgufExpertParams &p [[buffer(5)]],
+                                        constant ulong *chunks [[buffer(6)]],
+                                        uint2 group [[threadgroup_position_in_grid]],
+                                        uint simd_lane [[thread_index_in_simdgroup]],
+                                        uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
+  moe_down_pass<Rows, 0>(input, tiles, tile_count, nullptr, nullptr, nullptr, output, slots, p, chunks, group,
+                         simd_lane, simd_group, stage, tl);
 }
 using MoeExpertGgufKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *, device uchar *,
                                  device uchar *, device uchar *, device bfloat *, device const uint *,
                                  constant MoeGgufExpertParams &, constant ulong *, uint2, uint, uint);
+using MoeExpertGgufRoutedKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
+                                       device bfloat *, device const uint *, constant MoeGgufExpertParams &,
+                                       constant ulong *, uint2, uint, uint);
 template [[host_name("moe_expert_gguf_m8_down")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<8, 1>;
 template [[host_name("moe_expert_gguf_m32_down")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<32, 1>;
 template [[host_name("moe_expert_gguf_m8_down_s2")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<8, 2>;
 template [[host_name("moe_expert_gguf_m32_down_s2")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<32, 2>;
+template [[host_name("moe_expert_gguf_m8_down_s0")]] kernel MoeExpertGgufRoutedKernel moe_expert_gguf_down_routed<8>;
+template [[host_name("moe_expert_gguf_m32_down_s0")]] kernel MoeExpertGgufRoutedKernel moe_expert_gguf_down_routed<32>;
 
 // The gate and up passes in one (ops/MoE.cpp): threadgroup (x, y) runs a gate simdgroup and an up simdgroup on the same
 // 32 columns of tile y, grid (N / 32, tiles), each through its own stage in its own pass's formats, as in
@@ -64,11 +93,13 @@ template [[host_name("moe_expert_gguf_m32_down_s2")]] kernel MoeExpertGgufKernel
 // and up in different formats) each its own, a kilobyte more threadgroup memory that costs up to 5%. Every thread fills
 // the tables before one barrier (none without a table), so the simdgroups' walks, of different formats, meet no barrier
 // but their own. Each simdgroup parks bf16 of its sums in its stage, which its loop no longer reads, and the up
-// simdgroup writes bf16(up) * silu(gate) as gguf_epilogue<EpUpWithGate> does, so the intermediate is bitwise that of
-// the gate and up passes apart (moe_gguf_expert_tile of projections 0 and 1), which gguf-moe's reference runs.
+// simdgroup writes bf16(up) * silu(gate) as gguf_epilogue<EpUpWithGate> does, or SiTU of the two bf16 sums for a
+// block of SiTU experts (moe_activation, the _situ instances), so the intermediate is bitwise that of the gate and up
+// passes apart (moe_gguf_expert_tile of projections 0 and 1), which gguf-moe's reference runs.
 // The gate/up pass's column tile (moe_column_tile), out of line: inlined in every format, it grew the 32-row kernel
 // until a 10-core M4 (Apple9) under shader validation summed one element of the staged accumulator wrongly, the same
 // kernel right without validation.
+template <MoeActivation Activation>
 __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, uint K, uint N, MoeGgufSegment s,
                                                   uint origin, uint simd_lane, threadgroup half2 *table, bool up,
                                                   threadgroup bfloat *gate, device bfloat *output, ulong out) {
@@ -82,8 +113,8 @@ __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, u
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (up)
     for (uint row = 0; row < rows; ++row)
-      output[out + ulong(row) * N + origin + simd_lane] =
-          bfloat(float(bfloat(sums[row])) * splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
+      output[out + ulong(row) * N + origin + simd_lane] = bfloat(moe_activation<Activation>(
+          float(gate[row * GGUF_STAGED_COLUMNS + simd_lane]), float(bfloat(sums[row]))));
 }
 // A gate/up simdgroup's staged tile of R rows in format F (moe_expert_gguf_gate_up), out of line as the column tile
 // is: its sums parked as bf16 in `park`, its stage, which its loop no longer reads. Inlined in the pass, a 10-core M4
@@ -99,20 +130,16 @@ __attribute__((noinline)) void moe_gate_up_staged(device bfloat *x, MoeGgufSegme
                                                                  simd_lane, 0, K / GGUF_STAGED_STEP, 0, acc);
   gguf_elements(acc, [&](uint row, uint column, float v) { park[row * GGUF_STAGED_COLUMNS + column] = bfloat(v); });
 }
-template <ushort Rows, ushort Tables, uint Shared>
-kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
-                                    device const MoeTileDescriptor *tiles [[buffer(1)]],
-                                    device const uint *tile_count [[buffer(2)]], device uchar *gsw0 [[buffer(3)]],
-                                    device uchar *gsw1 [[buffer(4)]], device uchar *gsmeta [[buffer(5)]],
-                                    device uchar *usw0 [[buffer(6)]], device uchar *usw1 [[buffer(7)]],
-                                    device uchar *usmeta [[buffer(8)]], device bfloat *output [[buffer(9)]],
-                                    device const uint *slots [[buffer(10)]],
-                                    constant MoeGgufGateUpParams &p [[buffer(11)]],
-                                    constant ulong *chunks [[buffer(12)]],
-                                    uint2 group [[threadgroup_position_in_grid]],
-                                    uint simd_lane [[thread_index_in_simdgroup]],
-                                    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup half stage[kStagedStages]; threadgroup half2 tl[Tables * kQuantPairTableEntries];
+// The gate/up pass's work, of the shared planes gsw* and usw* (unread without a shared expert) and the threadgroup's
+// stage and pair tables (Tables of them), inlined into each kernel as it was written in it, the kernel's own arrays
+// by reference: a call, or pointers to them that its lambdas capture, would change the code of every pass's pipeline.
+template <ushort Rows, ushort Tables, uint Shared, MoeActivation Activation>
+__attribute__((always_inline)) inline void
+moe_gate_up_pass(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
+                 device uchar *gsw0, device uchar *gsw1, device uchar *gsmeta, device uchar *usw0, device uchar *usw1,
+                 device uchar *usmeta, device bfloat *output, device const uint *slots, constant MoeGgufGateUpParams &p,
+                 constant ulong *chunks, uint2 group, uint simd_lane, uint simd_group,
+                 threadgroup half (&stage)[kStagedStages], threadgroup half2 (&tl)[Tables * kQuantPairTableEntries]) {
   const uint t = moe_first_tile(tile_count, p.tiles) + group.y;
   if (t >= moe_end_tile(tile_count, p.tiles)) return;
   const MoeTileDescriptor tile = tiles[t];
@@ -142,7 +169,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
   if (kMoeColumnTiles && moe_column_tile(tiles, t)) {
-    moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out);
+    moe_gate_up_column<Activation>(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out);
     return;
   }
   const auto run = [&](auto rows) {
@@ -157,29 +184,75 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (up)
       for (uint row = 0; row < tile.rows; ++row)
-        output[out + ulong(row) * N + origin + simd_lane] =
-            bfloat(float(park[row * GGUF_STAGED_COLUMNS + simd_lane]) *
-                   splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
+        output[out + ulong(row) * N + origin + simd_lane] = bfloat(moe_activation<Activation>(
+            float(gate[row * GGUF_STAGED_COLUMNS + simd_lane]), float(park[row * GGUF_STAGED_COLUMNS + simd_lane])));
   };
   moe_live_rows<Rows>(tile.rows, run);
+}
+template <ushort Rows, ushort Tables, uint Shared, MoeActivation Activation>
+kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
+                                    device const MoeTileDescriptor *tiles [[buffer(1)]],
+                                    device const uint *tile_count [[buffer(2)]], device uchar *gsw0 [[buffer(3)]],
+                                    device uchar *gsw1 [[buffer(4)]], device uchar *gsmeta [[buffer(5)]],
+                                    device uchar *usw0 [[buffer(6)]], device uchar *usw1 [[buffer(7)]],
+                                    device uchar *usmeta [[buffer(8)]], device bfloat *output [[buffer(9)]],
+                                    device const uint *slots [[buffer(10)]],
+                                    constant MoeGgufGateUpParams &p [[buffer(11)]],
+                                    constant ulong *chunks [[buffer(12)]],
+                                    uint2 group [[threadgroup_position_in_grid]],
+                                    uint simd_lane [[thread_index_in_simdgroup]],
+                                    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[kStagedStages]; threadgroup half2 tl[Tables * kQuantPairTableEntries];
+  moe_gate_up_pass<Rows, Tables, Shared, Activation>(input, tiles, tile_count, gsw0, gsw1, gsmeta, usw0, usw1, usmeta,
+                                                     output, slots, p, chunks, group, simd_lane, simd_group, stage,
+                                                     tl);
+}
+// A block of no shared expert, which binds no shared planes (the _s0 instances).
+template <ushort Rows, ushort Tables, MoeActivation Activation>
+kernel void moe_expert_gguf_gate_up_routed(device bfloat *input [[buffer(0)]],
+                                           device const MoeTileDescriptor *tiles [[buffer(1)]],
+                                           device const uint *tile_count [[buffer(2)]],
+                                           device bfloat *output [[buffer(3)]],
+                                           device const uint *slots [[buffer(4)]],
+                                           constant MoeGgufGateUpParams &p [[buffer(5)]],
+                                           constant ulong *chunks [[buffer(6)]],
+                                           uint2 group [[threadgroup_position_in_grid]],
+                                           uint simd_lane [[thread_index_in_simdgroup]],
+                                           uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[kStagedStages]; threadgroup half2 tl[Tables * kQuantPairTableEntries];
+  moe_gate_up_pass<Rows, Tables, 0, Activation>(input, tiles, tile_count, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                nullptr, output, slots, p, chunks, group, simd_lane, simd_group, stage,
+                                                tl);
 }
 using MoeExpertGgufGateUpKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
                                        device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
                                        device uchar *, device bfloat *, device const uint *,
                                        constant MoeGgufGateUpParams &, constant ulong *, uint2, uint, uint);
+using MoeExpertGgufGateUpRoutedKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
+                                             device bfloat *, device const uint *, constant MoeGgufGateUpParams &,
+                                             constant ulong *, uint2, uint, uint);
+// Each compiled routing's (ops::kCompiledMoeRoutings), under its gate/up suffix.
 template [[host_name("moe_expert_gguf_m8_gate_up")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<8, 1, 1>;
+    moe_expert_gguf_gate_up<8, 1, 1, MoeActivation::SwiGlu>;
 template [[host_name("moe_expert_gguf_m32_gate_up")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<32, 1, 1>;
+    moe_expert_gguf_gate_up<32, 1, 1, MoeActivation::SwiGlu>;
 template [[host_name("moe_expert_gguf_m8_gate_up_mixed")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<8, 2, 1>;
+    moe_expert_gguf_gate_up<8, 2, 1, MoeActivation::SwiGlu>;
 template [[host_name("moe_expert_gguf_m32_gate_up_mixed")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<32, 2, 1>;
+    moe_expert_gguf_gate_up<32, 2, 1, MoeActivation::SwiGlu>;
 template [[host_name("moe_expert_gguf_m8_gate_up_s2")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<8, 1, 2>;
+    moe_expert_gguf_gate_up<8, 1, 2, MoeActivation::SwiGlu>;
 template [[host_name("moe_expert_gguf_m32_gate_up_s2")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<32, 1, 2>;
+    moe_expert_gguf_gate_up<32, 1, 2, MoeActivation::SwiGlu>;
 template [[host_name("moe_expert_gguf_m8_gate_up_mixed_s2")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<8, 2, 2>;
+    moe_expert_gguf_gate_up<8, 2, 2, MoeActivation::SwiGlu>;
 template [[host_name("moe_expert_gguf_m32_gate_up_mixed_s2")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<32, 2, 2>;
+    moe_expert_gguf_gate_up<32, 2, 2, MoeActivation::SwiGlu>;
+template [[host_name("moe_expert_gguf_m8_gate_up_s0_situ")]] kernel MoeExpertGgufGateUpRoutedKernel
+    moe_expert_gguf_gate_up_routed<8, 1, MoeActivation::Situ>;
+template [[host_name("moe_expert_gguf_m32_gate_up_s0_situ")]] kernel MoeExpertGgufGateUpRoutedKernel
+    moe_expert_gguf_gate_up_routed<32, 1, MoeActivation::Situ>;
+template [[host_name("moe_expert_gguf_m8_gate_up_mixed_s0_situ")]] kernel MoeExpertGgufGateUpRoutedKernel
+    moe_expert_gguf_gate_up_routed<8, 2, MoeActivation::Situ>;
+template [[host_name("moe_expert_gguf_m32_gate_up_mixed_s0_situ")]] kernel MoeExpertGgufGateUpRoutedKernel
+    moe_expert_gguf_gate_up_routed<32, 2, MoeActivation::Situ>;

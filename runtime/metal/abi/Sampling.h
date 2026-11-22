@@ -117,6 +117,25 @@ struct TargetVocabularyRange {
 static_assert(sizeof(TargetVocabularyRange) == 8,
               "Target vocabulary ranges are 8 bytes on both sides");
 
+// A head's logits made final before any policy reads them
+// (ops::addLogitCap): `rows` rows of `vocabulary` fp32 logits, each of a
+// token below valid_vocabulary softcap * tanh(logit / softcap) unless
+// softcap is 0, which leaves it, each from valid_vocabulary on -inf. The
+// threadgroups of a row (LOGIT_CAP_TOKENS tokens each, LOGIT_CAP_THREADS
+// threads) are the grid's x, its rows its y.
+struct LogitCapParams {
+  uint32_t rows;
+  uint32_t vocabulary;
+  uint32_t valid_vocabulary;
+  float softcap;
+};
+
+static_assert(sizeof(LogitCapParams) == 16,
+              "Logit cap parameters are 16 bytes on both sides");
+
+#define LOGIT_CAP_THREADS 256u
+#define LOGIT_CAP_TOKENS (4u * LOGIT_CAP_THREADS)
+
 // A penalized request's word for each vocabulary token, in its state lane's
 // row of the penalty table (ops::Sampling::rebuildPenaltyWords): the
 // prompt bit marks a prompt token, and the count is how often the target
