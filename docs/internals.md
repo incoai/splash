@@ -281,7 +281,14 @@ and plans the `MDGG0001` layout. A Flint GGUF's family keys hold its window,
 leading dense layers, shared expert's slices, sigmoid router and normalized,
 unscaled routing weights (`expert_weights_scale` 1) and its two layer
 patterns to the family's, and a router bias (`ffn_exp_probs_b`), which its
-blocks would not add, is refused.
+blocks would not add, is refused. A family whose layer images are not one for
+each layer the runtime runs plans through its own `ggufTargetPlan`
+(`GgufTarget.hpp`): the count of its layer images, its metadata checked key by
+key (`gguf::MetadataCheck`, which the shared check is written with), and the
+sections each image holds, which the shared planner lays out
+(`gguf::planTargetImages`, `gguf::Section`). Inkling 2's
+(`Inkling2LoopGguf.cpp`) plans its 24 weight layers, which its steps run as 48
+applications.
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and
@@ -406,7 +413,19 @@ layers' FFN is dense and the others' a MoE of a sigmoid router and an ungated
 shared expert of two slices; its norms are plain, as its GGUFs store them. Its
 layer images (`GgufImage.cpp`, `FlintGguf`) hold its input norm, attention,
 sinks, the norm before its FFN and its FFN, which `loadFlintWeights` reads with
-the Qwen readers.
+the Qwen readers. Inkling 2 (`Inkling2Loop.hpp`) states the shared dimensions
+as the layers its steps run, one per layer application, every one attending,
+and keeps its weight layers, its loop's schedule (`Inkling2LoopSchedule`) and
+its own values in its layout; its own loader reads a layer image a weight
+layer, and its target (`Inkling2LoopTarget.hpp`) runs its own operators. Its
+draft reads it as its producer captured it (`QwenTargetDimensions`'s
+`draftReadsLayerInputs`): the target captures, at an id the draft reads, the
+rows passed into that application, its block residual's partial sum before it,
+and at id 48 the final norm's rows the head reads; its draft's own rows are the
+token table's through the table's norm (`draftEmbeddingNorm`,
+`QwenTarget::addDraftEmbedding`); and the draft's logits take the head's
+finish, no padding row and the softcap after the selector's edges
+(`logitSoftcap`, `vocabularyTokens`, `DFlashDraft`).
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
@@ -2721,8 +2740,9 @@ cells beside the lanes' cells (`state.idle_cached_cells` 2 beside
 `idle_gdn_cells` 8 after four lanes' 300-token replies at a 22 GB limit, where
 1.6.2 leaves 8 cells), which a claim takes first (step 1 above). A target
 whose state commit writes auxiliary state after its retained rows
-(Qwen3.8-Flash-Next) captures none in decode (`Model::capturesInDecode`), and
-its decode writes the rings alone. A target without GDN layers keeps no GDN
+(Qwen3.8-Flash-Next, Inkling 2) captures none in decode
+(`Model::capturesInDecode`), and its decode writes the rings alone. A target
+without GDN layers keeps no GDN
 state: its cells have no bytes, every lane and state shares one empty cell
 that holds no memory, so a lane holds the draft's rings and window and a
 cached state the window alone, and `state.idle_gdn_cells` and

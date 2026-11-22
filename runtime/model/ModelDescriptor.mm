@@ -235,27 +235,45 @@ struct SizeDifference final {
   size_t matched;
   std::string difference;
 };
-std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
-                                             TargetSource source) {
-  const std::initializer_list<ExpectedNumber> sizes{
-      {"hidden_size", target.hiddenSize},
-      {"num_hidden_layers", target.layers},
-      {"vocab_size", target.vocabularySize},
-      {"max_position_embeddings", target.nativeContextTokens},
-      {"num_attention_heads", target.attentionQueryHeads},
-      {"num_key_value_heads", target.attentionKvHeads},
-      {"head_dim", target.attentionHeadDimension}};
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, std::string_view family, TargetSource source,
+                                             std::initializer_list<ExpectedNumber> sizes) {
   size_t matched = 0;
   for (const ExpectedNumber &size : sizes) {
     const std::string label = std::string("text config ") + size.key;
     NSNumber *value = requireNumber(text[@(size.key)], label);
     if (value.doubleValue != size.value)
       return SizeDifference{matched, label + ": " + std::string(sourceName(source)) + " " +
-                                         value.description.UTF8String + ", " + std::string(target.family) +
-                                         " " + @(size.value).description.UTF8String};
+                                         value.description.UTF8String + ", " + std::string(family) + " " +
+                                         @(size.value).description.UTF8String};
     ++matched;
   }
   return std::nullopt;
+}
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
+                                             TargetSource source) {
+  return sizeDifference(text, target.family, source,
+                        {{"hidden_size", target.hiddenSize},
+                         {"num_hidden_layers", target.layers},
+                         {"vocab_size", target.vocabularySize},
+                         {"max_position_embeddings", target.nativeContextTokens},
+                         {"num_attention_heads", target.attentionQueryHeads},
+                         {"num_key_value_heads", target.attentionKvHeads},
+                         {"head_dim", target.attentionHeadDimension}});
+}
+// Inkling-2-Mini's sizes: its weight layers, which its steps run more
+// applications of, and its own window (modelContextTokens, above the context
+// it is served at) at model_max_length, its release config's key, which the
+// config the installer derives states too.
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const Inkling2LoopLayout &target,
+                                             TargetSource source) {
+  return sizeDifference(text, target.family, source,
+                        {{"hidden_size", target.hiddenSize},
+                         {"num_hidden_layers", target.weightLayers},
+                         {"vocab_size", target.vocabularySize},
+                         {"model_max_length", target.modelContextTokens},
+                         {"num_attention_heads", target.attentionQueryHeads},
+                         {"num_key_value_heads", target.attentionKvHeads},
+                         {"head_dim", target.attentionHeadDimension}});
 }
 
 // The target's text configuration, of its family (describeSourceModel), whose
@@ -407,6 +425,75 @@ void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSou
     requireEqual(requireString(text, @"hidden_act", "text config hidden_act"), "silu", name, "text config hidden_act");
   for (const char *key : {"attention_bias", "tie_word_embeddings"})
     if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
+}
+
+// Inkling-2-Mini's text configuration, in its config.json's text_config (its
+// release's, or the one the installer derives from its GGUF), of a GGUF
+// target alone, whose metadata its plan checks (ggufTargetPlan): the sizes
+// (sizeDifference), then the rest as the layout's values make them: its
+// tokens (unpadded_vocab_size), its window and sliding layers
+// (local_layer_ids), its loop (loop_config: its layers, passes and gate
+// rank, the same passes for every token), and the experts a token takes and
+// their width (intermediate_size). Where a config states them (the release's
+// states most, the derived one those its header holds), its sliding heads,
+// relative bias, clips, log scaling, value norm, convolutions, block
+// residual, softcaps, router bias and scale, shared experts (none), stop
+// token, RMS epsilon and bias-free attention; its clip and log-scaling alpha
+// are held as the layout's F32 values, the nearest F32 of the config's.
+void validateTextConfig(NSDictionary *text, const Inkling2LoopLayout &target, TargetSource source) {
+  const std::string_view name = sourceName(source);
+  if (source != TargetSource::Gguf)
+    throw std::invalid_argument(std::string(target.family) + " loads from a GGUF, not a " + std::string(name) +
+                                " checkpoint");
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  requireNumbers(text, name, "text config",
+                 {{"unpadded_vocab_size", target.vocabularyTokens},
+                  {"sliding_window_size", target.slidingWindow},
+                  {"num_experts_per_tok", target.expertsPerToken},
+                  {"intermediate_size", target.expertIntermediateSize}});
+  std::vector<uint32_t> sliding;
+  for (uint32_t layer = 0; layer < target.weightLayers; ++layer)
+    if (target.slides(layer)) sliding.push_back(layer);
+  requireWholes(requireArray(text, @"local_layer_ids", "text config local_layer_ids"), sliding, name,
+                "text config local_layer_ids");
+  NSDictionary *loop = requireObject(text, @"loop_config", "text config loop_config");
+  requireNumbers(loop, name, "text config loop_config",
+                 {{"core_start", target.loopFirstLayer},
+                  {"core_end", target.loopEndLayer},
+                  {"num_passes", target.loopPasses},
+                  {"gate_rank", target.loopGateRank}});
+  if (loop[@"is_varloop"]) requireBooleans(loop, "text config loop_config", {{"is_varloop", false}});
+  for (const ExpectedNumber &stated : {ExpectedNumber{"swa_head_dim", target.attentionHeadDimension},
+                                       ExpectedNumber{"swa_num_attention_heads", target.attentionQueryHeads},
+                                       ExpectedNumber{"swa_num_key_value_heads", target.attentionKvHeads},
+                                       ExpectedNumber{"d_rel", target.relativeRank},
+                                       ExpectedNumber{"rel_extent", target.relativeExtent},
+                                       ExpectedNumber{"rel_l2_clip_threshold", target.relativeClip},
+                                       ExpectedNumber{"log_scaling_n_floor", target.logScalingFloor},
+                                       ExpectedNumber{"sconv_kernel_size", target.convolutionTaps},
+                                       ExpectedNumber{"n_layers_per_attn_res_block", target.blockResidualPeriod},
+                                       ExpectedNumber{"mlp_gate_softcap", target.expertGateSoftcap},
+                                       ExpectedNumber{"mlp_up_softcap", target.expertUpSoftcap},
+                                       ExpectedNumber{"final_logit_softcapping", target.logitSoftcap},
+                                       ExpectedNumber{"route_scale", target.expertRoutedScale},
+                                       ExpectedNumber{"n_shared_experts", target.sharedExpertSlices},
+                                       ExpectedNumber{"eos_token_id", target.stopTokens.ids[0]},
+                                       ExpectedNumber{"rms_norm_eps", SPLASH_RMS_EPSILON}})
+    if (text[@(stated.key)]) requireNumbers(text, name, "text config", {stated});
+  for (const auto &[key, expected] : {std::pair{"qk_l2_clip_threshold", target.queryClip},
+                                      std::pair{"log_scaling_alpha", target.logScalingAlpha}}) {
+    if (!text[@(key)]) continue;
+    const std::string label = std::string("text config ") + key;
+    NSNumber *number = requireNumber(text[@(key)], label);
+    if (number.floatValue != expected)
+      throw std::invalid_argument(label + " mismatch: " + std::string(name) + " " + number.description.UTF8String +
+                                  ", runtime " + @(expected).description.UTF8String);
+  }
+  for (const auto &[key, expected] : {std::pair{"use_value_norm_no_gamma", true},
+                                      std::pair{"attn_res_normalize_values", true},
+                                      std::pair{"use_gate_bias", true}, std::pair{"q_bias", false},
+                                      std::pair{"o_bias", false}})
+    if (text[@(key)]) requireBooleans(text, "text config", {{key, expected}});
 }
 
 // The mask token a DFlash2 draft of a family whose drafts choose theirs

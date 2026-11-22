@@ -1,13 +1,17 @@
 // The GGUF image planner on the small dense and MoE targets, a rotated dense
-// one and a small Flash-Next one: where each tensor goes and in which row
+// one, a small Flash-Next one, a small Flint one and a small Inkling-2-Mini
+// one, whose family lists its images' tensors (gguf::planTargetImages): where
+// each tensor goes and in which row
 // order, which F32 tensors it narrows to bf16, which float projections it
 // quantizes to Q8_0, where a streamed table's rows are, which part of a split
 // GGUF each tensor is read from, and the sources it refuses.
 //   gguf-planner
 #include "GgufFixtures.hpp"
+#include "Inkling2Fixtures.hpp"
 #include "metal/abi/Gguf.h"
 #include "model/GgufPreparation.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/Inkling2Loop.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/WeightStore.hpp"
 
@@ -1090,6 +1094,151 @@ void checkNvfp4InputScale(const std::filesystem::path &directory) {
   }
 }
 
+// A small inkling2_loop target, its GGUF as llama.cpp's converter writes
+// Inkling-2-Mini's: six weight layers of 256, layers 2 and 3 looped twice
+// (blocks of two layers), so eight applications; layers 1, 3 and 5 attend
+// every key, the others slide; four query heads of 128 over one KV head, a
+// relative score of 16 per head; four experts of 256, their fused gate and
+// up and their down NVFP4 with an F32 .scale per expert but in the last block,
+// Q5_K and Q8_0 (inkling2Tensors); 250 of its 256 vocabulary rows tokens.
+model::Inkling2LoopLayout inkling2Layout() {
+  model::Inkling2LoopLayout g;
+  g.weightLayers = 6;
+  g.loopFirstLayer = 2;
+  g.loopEndLayer = 4;
+  g.loopPasses = 2;
+  g.blockResidualPeriod = 2;
+  g.slidingWeightLayers = 0b010101;
+  g.layers = g.schedule().applications();
+  g.hiddenSize = 256;
+  g.vocabularySize = 256;
+  g.vocabularyTokens = 250;
+  g.attentionWidth = 512;
+  g.attentionQueryHeads = 4;
+  g.attentionKvHeads = 1;
+  g.attentionHeadDimension = 128;
+  g.packedFullWidth = g.queryProjectionWidth();
+  g.relativeExtent = 32;
+  g.slidingWindow = 33;
+  g.slidingLayers = g.schedule().slidingApplications();
+  g.unrotatedLayers = (uint64_t{1} << g.layers) - 1;
+  g.experts = 4;
+  g.expertsPerToken = 2;
+  g.expertIntermediateSize = 256;
+  return g;
+}
+
+// Inkling-2-Mini's GGUF plans an image per weight layer (not per
+// application), then the head's and the embedding's: each layer's queries,
+// gate and relative scores beside its BF16 sink projection as stored, a full
+// layer's BF16 tap projections, a loop layer's F32 gates as stored, its NVFP4
+// experts each read with its expert's scale, and the experts that stream its
+// layers'. Its metadata names each mismatch (a head count of a layer, the
+// loop's passes, the tokens) and its tensors a missing sink projection and a
+// shared expert no section reads.
+void checkInkling2(const std::filesystem::path &directory) {
+  const model::Inkling2LoopLayout g = inkling2Layout();
+  std::vector<Tensor> tensors = inkling2Tensors(g, 1200);
+  const auto path = directory / "inkling2.gguf";
+  const auto planned = [&](const std::vector<test_gguf::Key> &keys, const std::vector<Tensor> &written,
+                           model::gguf::PlanOptions options = {}) -> Plan {
+    splash::test::writeFile(path, test_gguf::file(keys, written));
+    try {
+      model::WeightSource source(path);
+      const model::GgufFile gguf(source);
+      return {model::ggufTargetPlan(g).images(gguf, options), std::nullopt};
+    } catch (const model::GgufError &error) {
+      return {{}, error.what()};
+    }
+  };
+  const Plan plan = planned(inkling2Metadata(g), tensors);
+  check(!plan.error && plan.images.size() == g.weightLayers + 2,
+        "planner plans the Inkling-2-Mini target, an image per weight layer" + (plan.error ? ": " + *plan.error : ""));
+  if (plan.error) return;
+  for (uint32_t layer = 0; layer < g.weightLayers; ++layer) {
+    const model::gguf::Image &image = plan.images[layer];
+    const std::string p = "blk." + std::to_string(layer) + ".", which = "layer " + std::to_string(layer) + "'s ";
+    const auto *rel = repackOf(image, p + "attn_rel.weight");
+    const std::string sinks = p + "attn_sink_proj.weight";
+    check(image.type == 1 && rel && rel->rows == g.relativeWidth() &&
+              asStored(copyOf(image, sinks), tensorNamed(tensors, sinks).data),
+          "planner plans " + which + "relative scores and its BF16 sink projection as stored");
+    check(bool(copyOf(image, p + "attn_k_conv_proj.weight")) == !g.slides(layer) &&
+              bool(copyOf(image, p + "attn_norm.weight")) == g.slides(layer) &&
+              bool(copyOf(image, p + "attn_res_query.weight")) == (layer != 0),
+          "planner plans " + which + "input norms, taps and block mix queries by its kind");
+    const bool looped = layer >= g.loopFirstLayer && layer < g.loopEndLayer;
+    check(bool(copyOf(image, p + "loop_q_ctrl_down.weight")) == looped &&
+              bool(copyOf(image, p + "loop_msg_query.weight")) == looped,
+          "planner plans " + which + "message gates where it loops");
+    const auto *gate = repackOf(image, p + "ffn_gate_up_exps.weight");
+    const auto *down = repackOf(image, p + "ffn_down_exps.weight");
+    // NVFP4 experts with a scale per expert but in the last block, whose are Q5_K and Q8_0.
+    const bool nvfp4 = layer + g.blockResidualPeriod < g.weightLayers;
+    check(gate && down && gate->sources.size() == g.experts &&
+              gate->format == (nvfp4 ? GGUF_FMT_NVFP4 : GGUF_FMT_Q5K) &&
+              down->format == (nvfp4 ? GGUF_FMT_NVFP4 : GGUF_FMT_Q80) &&
+              (!nvfp4 || (gate->sources.front().scale.rowsPerValue == 2 * g.expertIntermediateSize &&
+                          down->sources.front().scale.rowsPerValue == g.hiddenSize)),
+          "planner reads " + which + "experts, NVFP4 with one scale per expert of the fused gate/up and of down");
+  }
+  const Plan streamed = planned(inkling2Metadata(g), tensors, {.streamExperts = true});
+  check(!streamed.error && streamsExperts(plan, streamed), "planner streams the experts of every weight layer");
+  // Experts 320 wide: the down projection's NVFP4 rows are not whole 256-element blocks, and take NVFP4's form of
+  // 64-element blocks; the gate and up, of 256 inputs, NVFP4's own.
+  {
+    model::Inkling2LoopLayout wide = g;
+    wide.expertIntermediateSize = 320;
+    splash::test::writeFile(path, test_gguf::file(inkling2Metadata(wide), inkling2Tensors(wide, 1300)));
+    model::WeightSource source(path);
+    const model::GgufFile gguf(source);
+    const std::vector<model::gguf::Image> images = model::ggufTargetPlan(wide).images(gguf, {});
+    const auto *down = repackOf(images[0], "blk.0.ffn_down_exps.weight");
+    const auto *gate = repackOf(images[0], "blk.0.ffn_gate_up_exps.weight");
+    check(down && gate && down->format == GGUF_FMT_NVFP464 && down->columns == 320 &&
+              gate->format == GGUF_FMT_NVFP4,
+          "planner holds NVFP4 rows that are not whole 256-element blocks in NVFP4's 64-element form");
+  }
+
+  // The engine test's target (Inkling2Fixtures.hpp inkling2EngineLayout), of seeded values: a layout its loader
+  // takes, and a GGUF that plans.
+  {
+    const model::Inkling2LoopLayout engine = inkling2EngineLayout();
+    model::requireInkling2Layout(engine);
+    writeInkling2Gguf(path, engine, 1400);
+    model::WeightSource source(path);
+    const model::GgufFile gguf(source);
+    check(model::ggufTargetPlan(engine).images(gguf, {}).size() == engine.weightLayers + 2,
+          "planner plans the engine test's Inkling-2-Mini target");
+  }
+  const auto withKey = [&](const test_gguf::Key &replacement) {
+    std::vector<test_gguf::Key> keys = inkling2Metadata(g);
+    for (test_gguf::Key &key : keys)
+      if (key.name == replacement.name) key = replacement;
+    return keys;
+  };
+  std::vector<int32_t> heads(g.weightLayers, int32_t(g.attentionQueryHeads));
+  heads[3] = 8;
+  check(names(planned(withKey(test_gguf::int32ArrayKey("inkling2_loop.attention.head_count", heads)), tensors),
+              {"does not match the target: attention.head_count"}),
+        "planner names a layer's other head count");
+  check(names(planned(withKey(test_gguf::uint32Key("inkling2_loop.loop.count", 3)), tensors),
+              {"loop.count 3 (expected 2)"}),
+        "planner names other loop passes");
+  check(names(planned(withKey(test_gguf::uint32Key("inkling2_loop.vocab_size_unpadded", 256)), tensors),
+              {"vocab_size_unpadded 256 (expected 250)"}),
+        "planner names other tokens of the vocabulary");
+  std::vector<Tensor> sinkless = tensors;
+  std::erase_if(sinkless, [](const Tensor &tensor) { return tensor.name == "blk.4.attn_sink_proj.weight"; });
+  check(names(planned(inkling2Metadata(g), sinkless), {"attn_sink_proj.weight (missing) in 1 layer"}),
+        "planner names a missing sink projection");
+  std::vector<Tensor> shared = tensors;
+  shared.push_back({"blk.1.ffn_gate_shexp.weight", {g.hiddenSize, g.expertIntermediateSize}, kQ8_0,
+                    test_gguf::Bytes(g.hiddenSize * g.expertIntermediateSize / 32 * 34)});
+  check(names(planned(inkling2Metadata(g), shared), {"ffn_gate_shexp.weight (unused) in 1 layer"}),
+        "planner refuses a shared expert no section reads");
+}
+
 } // namespace
 
 int main() {
@@ -1106,6 +1255,7 @@ int main() {
     guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
     guarded("planner on Flint", [&] { checkFlint(directory.path()); });
     guarded("planner on NVFP4 activation scales", [&] { checkNvfp4InputScale(directory.path()); });
+    guarded("planner on Inkling-2-Mini", [&] { checkInkling2(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

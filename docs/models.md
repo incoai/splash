@@ -29,9 +29,10 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
-`runtime/model/`) is an architecture, whose code its families share, and each
-family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp`,
+`Inkling2Loop.hpp` in `runtime/model/`) is an architecture, whose code its
+families share, and each family is a value of it in one list,
+`model::kFamilies` (`ModelDescriptor.hpp`):
 another size of an architecture is one more value there, built by the
 constructor from a `QwenHybridLayout` its layout type gains with its second
 family (as `Qwen3_6MoeLayout`'s builds `kQwen3_5_122BLayout`), its draft in
@@ -46,6 +47,21 @@ reads only for a model type whose configs are flat (a layout type's
 Flint's values key by key (its widths, router, window, `layer_types`,
 `no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
 `rope_theta` and the rest where it states them).
+Inkling 2's layout states the dimensions the shared runtime runs on as the
+layers a step runs, one per layer application (48: its 24 weight layers, the
+loop's twelve three times), and keeps its weight layers, its loop and the
+mapping of an application to its weight layer in its own members
+(`Inkling2LoopSchedule`); its layers attend through its own operator, not the
+shared attention (a layout type's `sharedAttention`), so the kernel tests'
+attention shapes leave it out. It is served up to Splash's serving ceiling,
+1,010,000 tokens, below its own window of 1,048,576. It loads from a GGUF
+alone; its configuration, under `text_config`, is held to its values key by
+key (its weight layers, its own window at `model_max_length`,
+`unpadded_vocab_size`, `local_layer_ids`, `loop_config`, its experts' width;
+the relative bias, clips, softcaps, routing and the rest where it states
+them), its clip and log-scaling alpha as F32 values. Its vocabulary keeps
+no mask token: its draft reads its last unused special token,
+`<|unused_200056|>` ([Drafts](#drafts)).
 An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.
@@ -334,20 +350,27 @@ cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
 `readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
 whole 16-channel convolution groups. How a draft reads its target is its
 target's family's, as its drafts' producer captured it
-(`QwenTargetDimensions`): at each id the rows that target layer writes, or,
-for a family whose drafts read layer inputs (`draftReadsLayerInputs`), the
-rows the layer reads and at the id past its layers the final norm's rows the
-head reads (`dflash_config.capture_final_norm`); and its own rows, its
-anchor's and its mask's, are the token table's rows as the target's first
-layer reads them, through the table's norm where the family's input takes
-one (`draftEmbeddingNorm`, `embedding_normalization` `folded_rmsnorm`). Its
-logits take the finish of its target's head (`QwenTargetDimensions::logitSoftcap` and `vocabularyTokens`,
+(`QwenTargetDimensions`): at each id the rows that target layer writes, or, for
+a family whose drafts read layer inputs (`draftReadsLayerInputs`), the rows
+passed into the layer, as the layer before wrote them, and at the id past its
+layers the final norm's rows the head reads
+(`dflash_config.capture_final_norm`); and its own rows, its anchor's and its
+mask's, are the token table's rows as the target's first layer reads them,
+through the table's norm where the family's input takes one (`draftEmbeddingNorm`,
+`embedding_normalization` `folded_rmsnorm`). Inkling 2's drafts read layer
+inputs, as its producer captures its block residual's partial sum before each
+layer application, with no shift by one: its draft's ids 5, 23 and 41 read the
+rows passed into those applications, the outputs of applications 4, 22 and 40
+(not the mixes of the block residual their norms read), and 48 its final
+norm's; their own rows take its table's norm. Its logits take the finish of its
+target's head (`QwenTargetDimensions::logitSoftcap` and `vocabularyTokens`,
 `DFlashDraft`): no padding row past the head's tokens is a candidate
 (`dflash_config.valid_vocab_size`), and the head's softcap
 (`final_logit_softcapping`) applies to each candidate's score after the
-selector's edge (`selector_softcap_mode` `after_correction`, the one
-placement the selector runs), before the probabilities its tree and a
-sampled verify read; a config states each where its target's head has one.
+selector's edge (`selector_softcap_mode` `after_correction`, the one placement
+the selector runs), before the probabilities its tree and a sampled verify
+read; a config states each where its target's head has one (Inkling 2's:
+200,058 tokens of 201,024 rows, and a softcap of 30).
 A draft's rows after its anchor read the
 target's token table row of the mask token, unless its release ships that
 token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
@@ -539,7 +562,10 @@ target's projections run on.
 
 The draft's logits are its target's vocabulary head's, which a cycle runs twice,
 for the draft's proposals and for the target's verify; the draft's pass reads
-only the head's rows of the tokens it may propose (`DFlashDraft`). The Qwen
+the head's rows of the tokens it may propose (`DFlashDraft`), a padded head's
+rows past its tokens too, which its logits leave out (Inkling 2's 966: its
+200,058 tokens end inside a 64-row tile of the head, and the last tile's 58
+tokens hold its chat format's message tags, which its drafts propose). The Qwen
 families' vocabulary of 248,320 holds English and code first, Chinese from
 95,726 to 148,274, then its other scripts, and its chat, tool and thinking
 tokens from 248,044: a step's draft proposes from its first 148,288 tokens and

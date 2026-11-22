@@ -65,6 +65,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const FlintLayout &layout
   return loadFlintWeights(backend, layout, files);
 }
 
+TargetWeights readTarget(metal::MetalBackend &backend, const Inkling2LoopLayout &layout,
+                         const QwenTargetFiles &files) {
+  return loadInkling2LoopWeights(backend, layout, files);
+}
+
 } // namespace
 
 SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }

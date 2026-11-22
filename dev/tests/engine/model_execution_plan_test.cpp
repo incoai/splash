@@ -26,6 +26,11 @@ using namespace splash;
 using splash::test::rejects;
 using splash::test::require;
 
+// A family's layout check: its architecture's own where it has one, else the
+// Qwen hybrid's.
+template <class Layout> void requireLayout(const Layout &layout) { model::requireQwenLayout(layout); }
+void requireLayout(const model::Inkling2LoopLayout &layout) { model::requireInkling2Layout(layout); }
+
 template <class Weights>
 model::DFlashDraftLayout draftOf() {
   if constexpr (std::is_same_v<Weights, model::Qwen3_6MoeWeights>)
@@ -655,8 +660,9 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
-  // Every family's layout, the 122B's among them, passes the layout check.
-  model::forEachFamily([](const auto &family) { model::requireQwenLayout(family); });
+  // Every family's layout, the 122B's among them, passes its architecture's
+  // layout check.
+  model::forEachFamily([](const auto &family) { requireLayout(family); });
   // A layout without GDN layers sets none of the GDN dimensions.
   auto strayGdn = model::FlintLayout{};
   strayGdn.gdnKeyHeads = 16;

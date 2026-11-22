@@ -323,8 +323,9 @@ than the host's memory leaves the engine when it starts (below); on a Mac that
 also runs other applications, `--max-memory` leaves them room whatever they hold
 later: the automatic expert store and PLE row cache are planned smaller with it.
 The budget caps Metal allocations, not combined process RSS. The context limit
-is the model's native window, 256K tokens for every supported family, when the
-budget holds it beside the weights and, unless `--disable-ane`, the largest
+is the model's native window, 256K tokens for the Qwen families and Flint and
+1,010,000 for Inkling 2, when the budget holds it beside the weights and,
+unless `--disable-ane`, the largest
 [Neural Engine split](internals.md#neural-engine-prefill) a dense model could
 take (none once the Neural Engine refused this Mac's split twice), and
 otherwise as much as the budget holds beside them.
@@ -412,7 +413,9 @@ as Qwen describes for them: the factor is the context over the native window,
 so that the stretched window is the context asked for, such as 2 for
 `--max-context 512K` and about 3.81 for `1M`. Flint's full layers have no RoPE
 to stretch, so its native window is its most, and a longer `--max-context`
-stops its startup. Without `--max-context`, or at 256K or less, YaRN stays off, so
+stops its startup. Inkling 2 has no RoPE either; its own window is 1,048,576
+tokens, and it is served up to Splash's ceiling of 1,010,000. Without
+`--max-context`, or at 256K or less, YaRN stays off, so
 answers and the persistent cache are the native window's. The budget must
 hold the context: about a million tokens of the 27B's int8 KV on a 64 GB Mac,
 more of the 35B's, whose KV per token is a third of the 27B's; where it does
