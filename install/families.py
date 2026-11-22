@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
     __package__ = "install"
 
 from server import serve_options
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, INKLING2, QWEN, ChatFormat
 
 from . import models
 
@@ -46,12 +46,16 @@ QWEN_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
 # What Flint's GGUF release states (general.sampling.temp, top_p, top_k),
 # which are Qwen's numbers.
 FLINT_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
+# What Inkling 2's GGUF release states (general.sampling.temp, top_p, top_k):
+# temperature 1.0 over every token.
+INKLING2_SAMPLING = SamplingDefaults(temperature=1.0, top_p=1.0, top_k=0)
 
 
 @dataclass(frozen=True)
 class ModelFamily:
     # The family's name, as the engine names it (each target layout's family,
-    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp and Flint.hpp).
+    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp, Flint.hpp and
+    # Inkling2Loop.hpp).
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
@@ -86,6 +90,14 @@ FAMILIES = (
     ),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
+    # Its draft is an internal preview. Its vision tower is not served yet.
+    ModelFamily(
+        "Inkling-2-Mini",
+        "incoai-internal/Inkling-2-Mini-DFlash2",
+        INKLING2,
+        INKLING2_SAMPLING,
+        vision=False,
+    ),
 )
 
 

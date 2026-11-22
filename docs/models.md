@@ -222,6 +222,35 @@ token, one of them its EOS; the engine's check holds each to the family's,
 and the header's layer patterns to them. The token table must be of a format:
 RecursiveSI's int4 GGUF, whose table is F32, is refused before its download.
 
+Inkling 2's GGUFs (`inkling2_loop`) state their head counts once per layer,
+which every layer must share. Their derived configuration holds the text model
+under `text_config`, as Inkling 2's config.json does, with the keys of that
+`text_config` the header states (`gguf.inkling2_text_config`): every size, the
+vocabulary padded to the token table's rows (`vocab_size`) and its tokens
+(`unpadded_vocab_size`, which must be the tokenizer's), the relative bias
+(`d_rel` from `attention.relative_length`, `rel_extent`), the full layers'
+log scaling, the clips, `local_layer_ids` from
+`attention.sliding_window_pattern` with the window and heads of those layers,
+`sconv_kernel_size` from `shortconv.l_cache`, `n_layers_per_attn_res_block`
+from `attn_res.block_size`, the logits' and the experts' softcaps
+(`mlp_gate_softcap` and `mlp_up_softcap` from `activation.situ_beta` and
+`situ_linear_beta`), the experts each token takes, their width and
+`route_scale` from `expert_weights_scale`, and `loop_config` from the `loop`
+keys; besides those, the sizes every family's configuration states
+(`max_position_embeddings`, `num_experts`) and `eos_token_id`, which the
+release states beside `text_config`. A float is the shortest decimal of the
+header's float32 (`1e-06`), as the release writes it.
+`unsloth/Inkling-2-Mini-GGUF` keeps these GGUFs in `Mainline_Support/` with
+the extension `.gguf_file`, which target selection does not read: such a file
+installs from a local copy named `.gguf` ([Local model
+files](#local-model-files)). An installation of one holds its draft,
+`incoai-internal/Inkling-2-Mini-DFlash2`, an internal preview that installs
+with a Hub token that reads it or from a local copy (`--draft-model`,
+[Drafts](#drafts)), and serves text only ([Vision](#vision)). Its states are
+captured in prefill alone ([Replay points and
+checkpoints](internals.md#replay-points-and-checkpoints)), so a conversation's
+next turn finds its earlier prompts in the cache but prefills each reply again.
+
 A split GGUF is the parts of one name, `NAME-0000K-of-0000N.gguf`: every part
 from 1 to N must be present, at the root or in its folder, and a folder that
 mixes the parts of several names is refused (`upstream.split_order`, and
@@ -605,8 +634,9 @@ BF16. The processor configuration (MLX `preprocessor_config.json`, or the
 releases save it; the GGUF's `clip.vision` metadata) must describe the one
 preprocessing Splash implements (`server/images.py`); it is checked before any
 weight download and not installed. The models of a family without a vision
-tower (Flint; `vision` in `install/families.py`) serve text only: their
-installation reads no projector, with or without `--language-only`.
+tower (Flint; `vision` in `install/families.py`), or whose tower Splash does
+not serve yet (Inkling 2), serve text only: their installation reads no
+projector, with or without `--language-only`.
 
 Both sources are written into one image, which the one BF16 vision operator
 reads: BF16 tensors are
@@ -648,8 +678,10 @@ ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
 come from that file; the supported profiles supply the pre-tokenization
 algorithms: `gpt2/qwen35` NFC and Qwen's split, `gpt2/flint` Flint's three
 splits (digits in runs of up to three, runs of Han and kana, then o200k's
-pattern) without a normalizer, each before byte-level BPE, as the release's
-own tokenizer.json has them. Unknown profiles, malformed metadata
+pattern) without a normalizer, `gpt2/inkling2` o200k's pattern alone without a
+normalizer, its BPE taking a piece its vocabulary holds whole as that token
+before any merge (`ignore_merges`), each before byte-level BPE, as the
+release's own tokenizer.json has them. Unknown profiles, malformed metadata
 and automatic BOS/EOS insertion are rejected, with no cross-repository
 fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
 Model geometry is translated from the same metadata, subtracting any declared
