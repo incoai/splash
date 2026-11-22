@@ -9,16 +9,20 @@
 // the application before it, so a run whose draft reads those ids checks
 // those outputs. Within bounds, as under shader validation too:
 // - the output rows of every application another reads (all but each loop
-//   pass's last before a restart and the last application) at the sampled
-//   rows of a 1100-token prompt, past the window (1024 keys) and the
-//   relative extent, and the logits of the prompt's last row;
+//   pass's last before a restart and the last application) and the final
+//   norm's rows, which the draft reads at the id past the applications, at
+//   the sampled rows of a 1100-token prompt, past the window (1024 keys) and
+//   the relative extent, and the logits of the prompt's last row;
 // - the same prompt in two commands, split inside a page, the second reading
 //   the state and the K/V the first left;
 // - four lanes at once, a prefill command of four sequences and a decode step
 //   of the four, which run;
 // - the prompt and the four lanes with the routed experts streamed through
 //   the smallest store (--expert-memory), whose every load evicts another
-//   block's experts and whose decode step predicts the next application's.
+//   block's experts and whose decode step predicts the next application's;
+// - a draft that passes its rows through to the head: its candidates,
+//   unary scores and first position's probabilities against the fixture's
+//   tables (its token rows through the table's norm, its logits' finish).
 // What only an uninstrumented run holds (`bitwise`), as shader validation
 // compiles the kernels apart (qwen4_kernels_test.mm):
 // - bit for bit: the prompt run in passes of one application each, a command
@@ -58,6 +62,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -139,6 +144,27 @@ Fixture writeFixture(const std::filesystem::path &root) {
   return fixture;
 }
 
+// A model root of the fixture whose draft passes its own rows through to the
+// head: all its weights zero but its final norm's, `finalNorm` (bf16 bits),
+// so that its layers add nothing to its rows and its head reads its rows of
+// its tokens (the token table's rows through the table's norm, as the
+// family's drafts read them) through that norm.
+std::filesystem::path writePassThroughRoot(const Fixture &fixture, const std::filesystem::path &root,
+                                           std::span<const uint16_t> finalNorm) {
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "target");
+  std::filesystem::copy_file(fixture.root / "target" / "inkling2-fixture.gguf",
+                             root / "target" / "inkling2-fixture.gguf");
+  std::vector<test::SyntheticTensor> tensors = test::draftTensors(draftReading(fixture.layout, captureIds(1)));
+  for (test::SyntheticTensor &tensor : tensors)
+    if (tensor.name == "norm.weight") {
+      tensor.data.resize(finalNorm.size_bytes());
+      std::memcpy(tensor.data.data(), finalNorm.data(), finalNorm.size_bytes());
+    }
+  test::writeSyntheticShard(root / "draft" / "model.safetensors", tensors);
+  return root;
+}
+
 // What a prompt's run leaves: the output rows of the applications it captured
 // (each prefill row's, the applications' hidden values in their order) and
 // its last row's logits.
@@ -215,6 +241,32 @@ public:
     return result;
   }
 
+  // The draft's lattice of the first decode step after the prompt `ids`, in
+  // one command (RuntimeInstrumentation::lastDraftLattice).
+  model::RuntimeInstrumentation::DraftLattice latticeAfter(std::span<const uint32_t> ids) {
+    model::RuntimeContext context{backend_, model_, *pages_, *states_, operators_};
+    model::Runtime executor(context);
+    EngineRequest request;
+    request.id = ++id_;
+    request.prompt.assign(ids.begin(), ids.end());
+    request.maxNewTokens = 8;
+    executor.beginColdRequest(request.modelView(), 0);
+    const auto rows = static_cast<uint32_t>(ids.size());
+    BatchPlan prefill{.kind = WorkKind::Prefill, .items = {{request.id, rows, 0}}, .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item{request.id, 0, rows, pageTable_, 1};
+    item.inputTokens = ids;
+    const std::vector<ModelStepResult> prefilled = executor.prefill(prefill, std::span(&item, 1));
+    require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].firstToken,
+            "the prompt's prefill failed");
+    BatchPlan decode{.kind = WorkKind::Decode, .items = {{request.id, 0}}, .decodeStage = DecodeStage::Regular};
+    ModelBatchItem step{request.id, rows, 0, pageTable_, 1};
+    const std::vector<ModelStepResult> decoded = executor.decode(decode, std::span(&step, 1));
+    require(decoded.size() == 1 && decoded[0].failure.empty(), "the decode step failed");
+    model::RuntimeInstrumentation::DraftLattice lattice = model::RuntimeInstrumentation::lastDraftLattice(executor, 0, 1);
+    executor.end(request.id);
+    return lattice;
+  }
+
   // The prompt in commands of `commands` rows each (their sum the prompt's),
   // each in `passes` passes over the applications (BatchPlan::passes).
   Run run(std::span<const uint32_t> ids, std::span<const uint32_t> commands, uint32_t passes) {
@@ -265,19 +317,29 @@ private:
 };
 
 // The reference's outputs: each application's output at the sampled rows,
-// then the last row's logits over the tokens.
+// the last row's logits over the tokens, and the final norm's rows (the
+// head's input, which the draft captures at the id past the applications) at
+// the sampled rows.
 struct Expected final {
   std::vector<float> outputs;
   std::vector<float> logits;
+  std::vector<float> finalNorm;
+
+  // An application's output rows, or the final norm's past the applications.
+  [[nodiscard]] std::span<const float> rows(uint32_t application, uint32_t applications, uint32_t hidden) const {
+    const uint64_t count = uint64_t{kSampledRows.size()} * hidden;
+    return application == applications ? std::span<const float>(finalNorm)
+                                       : std::span<const float>(outputs).subspan(application * count, count);
+  }
 };
 
 Expected readExpected(const std::filesystem::path &directory, const model::Inkling2LoopLayout &layout) {
   std::ifstream file(directory / "expected.f32", std::ios::binary);
-  const uint64_t outputs = uint64_t{layout.layers} * kSampledRows.size() * layout.hiddenSize;
-  Expected expected{std::vector<float>(outputs), std::vector<float>(layout.tokens())};
-  file.read(reinterpret_cast<char *>(expected.outputs.data()), static_cast<std::streamsize>(outputs * 4));
-  file.read(reinterpret_cast<char *>(expected.logits.data()),
-            static_cast<std::streamsize>(expected.logits.size() * 4));
+  const uint64_t rows = uint64_t{kSampledRows.size()} * layout.hiddenSize;
+  Expected expected{std::vector<float>(layout.layers * rows), std::vector<float>(layout.tokens()),
+                    std::vector<float>(rows)};
+  for (std::vector<float> *values : {&expected.outputs, &expected.logits, &expected.finalNorm})
+    file.read(reinterpret_cast<char *>(values->data()), static_cast<std::streamsize>(values->size() * 4));
   require(file && file.peek() == EOF, "expected.f32 is not the fixture's outputs (" + directory.string() + ")");
   return expected;
 }
@@ -294,6 +356,10 @@ Expected readExpected(const std::filesystem::path &directory, const model::Inkli
 constexpr std::array<double, 24> kOutputBounds{
     0.0161, 0.0205, 0.0223, 0.0281, 0.0296, 0.0321, 0.0404, 0.0456, 0.0459, 0.0770, 0.0775, 0.0961,
     0.1665, 0.1846, 0.1844, 0.3472, 0.3059, 0.3280, 0.3765, 0.4390, 0.4584, 0.6012, 0.6439, 0.6661};
+// The final norm's rows, the final mix of the stack and the last
+// application's output through output_norm: twice what an M5 Pro measured
+// (0.216, 2026-11-22).
+constexpr double kFinalNormBound = 0.4324;
 // The last row's logits against the reference's, and a run's against another
 // run of the same rows in other commands (KL). Rounding moved them by at most
 // 0.0028 (an M5 Pro and an M6, with and without shader validation: a
@@ -313,17 +379,15 @@ constexpr double kLogitsBound = 0.02;
 // and states, which its decode step reads.
 constexpr double kLanePrefillBound = 0.001, kLaneDecodeBound = 0.22;
 
-// An application's output against the reference: the mean absolute
-// difference over the mean absolute value at the sampled rows.
-double relativeError(const Run &run, uint32_t slot, const Expected &expected, uint32_t application,
-                     uint32_t hidden) {
+// A captured slot's rows against the reference's (`want`, the sampled
+// rows'): the mean absolute difference over the mean absolute value.
+double relativeError(const Run &run, uint32_t slot, std::span<const float> want, uint32_t hidden) {
   double difference = 0.0, magnitude = 0.0;
   for (uint32_t sample = 0; sample < kSampledRows.size(); ++sample)
     for (uint32_t column = 0; column < hidden; ++column) {
       const float got = run.captured[(uint64_t{kSampledRows[sample]} * kCaptured + slot) * hidden + column];
-      const float want = expected.outputs[(uint64_t{application} * kSampledRows.size() + sample) * hidden + column];
-      difference += std::abs(got - want);
-      magnitude += std::abs(want);
+      difference += std::abs(got - want[uint64_t{sample} * hidden + column]);
+      magnitude += std::abs(want[uint64_t{sample} * hidden + column]);
     }
   return difference / magnitude;
 }
@@ -395,6 +459,125 @@ std::vector<std::vector<uint32_t>> lanePrompts(const std::vector<uint32_t> &ids)
   return {{ids[0]}, {ids[1]}, {ids[2]}, std::vector<uint32_t>(ids.begin() + 3, ids.begin() + 1000)};
 }
 
+// The draft's rows and logits finish against the fixture's tables, through
+// a draft that passes its rows through (writePassThroughRoot): its token
+// rows reach its head as the token table's rows through the table's norm
+// (bf16), then through its final norm, so every proposal position's
+// candidates are the 16 tokens of the most logits of the mask token's row,
+// none past the head's tokens; its unary scores those logits; its edges none,
+// its codebooks and selector projection zero; and its first position's
+// probabilities the softmax of its scores softcapped at the head's softcap.
+// Its final norm's weights favour the head's first padding row, the row's
+// values times that row's, so that the row would lead the logits it leaves
+// out. A lost norm moves the logits (the table's norm weights are not
+// uniform), a lost finish proposes the padding row or leaves the scores
+// uncapped.
+int runDraftRows(Loaded &loaded) {
+  const model::Inkling2LoopLayout &layout = loaded.fixture.layout;
+  const uint32_t hidden = layout.hiddenSize, tokens = layout.tokens(), candidates = SPLASH_DRAFT_CANDIDATES;
+  const std::vector<gguf_fixtures::Tensor> tensors = gguf_fixtures::inkling2Tensors(layout, kSeed);
+  const auto tensor = [&](std::string_view name) -> const gguf_fixtures::Tensor & {
+    const auto found = std::ranges::find_if(tensors, [&](const gguf_fixtures::Tensor &t) { return t.name == name; });
+    require(found != tensors.end(), "the fixture has no " + std::string(name));
+    return *found;
+  };
+  const auto tableRow = [&](const gguf_fixtures::Tensor &table, uint32_t row) {
+    std::vector<float> values(hidden);
+    const uint32_t bytes = gguf_reference::rowBytes(gguf_reference::Q80, hidden);
+    gguf_reference::rowValues(gguf_reference::Q80, table.data.data() + uint64_t{row} * bytes, hidden, values.data());
+    return values;
+  };
+  const auto bf16 = [](float value) { return gguf_reference::bf2f(gguf_reference::f2bf(value)); };
+  // An RMS norm in fp32 into bf16 rows, as the engine's.
+  const auto normed = [&](std::vector<float> rows, const auto &weight) {
+    double squares = 0.0;
+    for (const float value : rows) squares += double(value) * value;
+    const float scale = 1.0F / std::sqrt(float(squares / hidden) + SPLASH_RMS_EPSILON);
+    for (uint32_t i = 0; i < hidden; ++i) rows[i] = bf16(rows[i] * scale * weight(i));
+    return rows;
+  };
+  const gguf_fixtures::Tensor &norm = tensor("token_embd_norm.weight"), &head = tensor("output.weight");
+  std::vector<float> row = tableRow(tensor("token_embd.weight"), layout.maskToken);
+  for (float &value : row) value = bf16(value);
+  row = normed(row, [&](uint32_t i) { return gguf_fixtures::loadFloat(norm.data, i); });
+  // The final norm's weights: the row's values times the first padding
+  // row's, of a root mean square of 1, in bf16.
+  const std::vector<float> padding = tableRow(head, tokens);
+  std::vector<float> weights(hidden);
+  double squares = 0.0;
+  for (uint32_t i = 0; i < hidden; ++i) {
+    weights[i] = row[i] * padding[i];
+    squares += double(weights[i]) * weights[i];
+  }
+  std::vector<uint16_t> finalNorm(hidden);
+  for (uint32_t i = 0; i < hidden; ++i) {
+    finalNorm[i] = gguf_reference::f2bf(float(weights[i] / std::sqrt(squares / hidden)));
+    weights[i] = gguf_reference::bf2f(finalNorm[i]);
+  }
+  row = normed(row, [&](uint32_t i) { return weights[i]; });
+  std::vector<float> logits(layout.vocabularySize);
+  for (uint32_t token = 0; token < layout.vocabularySize; ++token) {
+    const std::vector<float> values = tableRow(head, token);
+    double sum = 0.0;
+    for (uint32_t i = 0; i < hidden; ++i) sum += double(row[i]) * values[i];
+    logits[token] = float(sum);
+  }
+  std::vector<uint32_t> order(tokens);
+  std::iota(order.begin(), order.end(), 0u);
+  std::ranges::sort(order, [&](uint32_t a, uint32_t b) { return logits[a] > logits[b]; });
+  require(logits[tokens] > logits[order[0]], "the first padding row does not lead the pass-through draft's logits");
+  // Splash's lattice after a prompt of 100 of the fixture's ids.
+  const std::filesystem::path root = loaded.root.string() + "-pass-through";
+  writePassThroughRoot(loaded.fixture, root, finalNorm);
+  model::LoadedModel model = model::loadModel(loaded.backend, root, loaded.fixture.descriptor(captureIds(1)));
+  Harness harness(loaded.backend, model);
+  const model::RuntimeInstrumentation::DraftLattice lattice =
+      harness.latticeAfter(std::span(loaded.ids).first(100));
+  std::filesystem::remove_all(root);
+  const uint32_t positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  require(lattice.candidates.size() == positions * candidates && lattice.first.size() == candidates,
+          "the draft's lattice is not a cycle's");
+  // A candidate past the 16th logit only within the rounding of the 16th.
+  double unaryDifference = 0.0;
+  bool sameCandidates = true, noPadding = true;
+  for (uint32_t position = 0; position < positions; ++position)
+    for (uint32_t i = 0; i < candidates; ++i) {
+      const uint32_t token = lattice.candidates[position * candidates + i];
+      noPadding = noPadding && token < tokens;
+      if (token >= tokens) continue;
+      sameCandidates = sameCandidates && logits[token] >= logits[order[candidates - 1]] - 1e-3F;
+      unaryDifference = std::max(unaryDifference, double(std::abs(lattice.unary[position * candidates + i] - logits[token])));
+    }
+  const bool noEdges = std::ranges::all_of(lattice.edges, [](float edge) { return edge == 0.0F; });
+  // The first position's probabilities from its own unary scores, softcapped
+  // and not.
+  const auto softmax = [&](float softcap) {
+    std::vector<double> p(candidates);
+    double top = -INFINITY, sum = 0.0;
+    for (uint32_t i = 0; i < candidates; ++i) {
+      const double unary = lattice.unary[i];
+      p[i] = softcap > 0.0F ? softcap * std::tanh(unary / softcap) : unary;
+      top = std::max(top, p[i]);
+    }
+    for (double &value : p) sum += value = std::exp(value - top);
+    for (double &value : p) value /= sum;
+    return p;
+  };
+  const auto distance = [&](const std::vector<double> &p) {
+    double most = 0.0;
+    for (uint32_t i = 0; i < candidates; ++i) most = std::max(most, std::abs(p[i] - lattice.first[i]));
+    return most;
+  };
+  const double capped = distance(softmax(layout.logitSoftcap)), uncapped = distance(softmax(0.0F));
+  const bool within = sameCandidates && noPadding && noEdges && unaryDifference <= 5e-3 && capped <= 1e-5;
+  std::printf("%sa pass-through draft: candidates the mask row's 16 most logits %s, none past %u tokens %s, "
+              "unary within %.2g of them, no edges %s, first position's probabilities %.2g from its softcapped "
+              "scores (%.2g uncapped)\n",
+              within ? "" : "FAIL: ", sameCandidates ? "yes" : "no", tokens, noPadding ? "yes" : "no", unaryDifference,
+              noEdges ? "yes" : "no", capped, uncapped);
+  return within ? 0 : 1;
+}
+
 // The comparisons within bounds.
 int runComparisons(Loaded &loaded) {
   const model::Inkling2LoopLayout &layout = loaded.fixture.layout;
@@ -405,19 +588,24 @@ int runComparisons(Loaded &loaded) {
   int failures = 0;
   std::optional<Run> wholeRun;
   // The ids 1 to the applications: the rows passed into each application, the
-  // output of the application before it; the last, the final norm's, compares
-  // with nothing the reference wrote but the logits it makes.
+  // output of the application before it; the last, the final norm's.
   require(applications % kCaptured == 0, "the fixture's ids are not whole runs of a draft's");
   for (uint32_t first = 1; first + kCaptured - 1 <= applications; first += kCaptured) {
     model::LoadedModel model = loaded.capturing(first);
     Harness harness(loaded.backend, model);
     const Run run = harness.run(ids, whole, 1);
-    for (uint32_t slot = 0; slot < kCaptured && first + slot < applications; ++slot) {
-      const uint32_t application = writer(schedule, first + slot);
-      const double error = relativeError(run, slot, loaded.expected, application, hidden);
-      const bool within = error <= kOutputBounds[application];
-      std::printf("%sid %2u, application %2u's output: mean|d|/mean|ref| %.5f (bound %.4f)\n",
-                  within ? "" : "FAIL: ", first + slot, application, error, kOutputBounds[application]);
+    for (uint32_t slot = 0; slot < kCaptured; ++slot) {
+      const uint32_t id = first + slot, application = id == applications ? id : writer(schedule, id);
+      const double error =
+          relativeError(run, slot, loaded.expected.rows(application, applications, hidden), hidden);
+      const double bound = id == applications ? kFinalNormBound : kOutputBounds[application];
+      const bool within = error <= bound;
+      if (id == applications)
+        std::printf("%sid %2u, the final norm's rows: mean|d|/mean|ref| %.5f (bound %.4f)\n", within ? "" : "FAIL: ",
+                    id, error, bound);
+      else
+        std::printf("%sid %2u, application %2u's output: mean|d|/mean|ref| %.5f (bound %.4f)\n",
+                    within ? "" : "FAIL: ", id, application, error, bound);
       failures += !within;
     }
     if (first == 1) wholeRun = run;
@@ -461,7 +649,7 @@ int runComparisons(Loaded &loaded) {
   std::printf("%sstreamed experts, four lanes: a prefill of four sequences and a decode step of the four ran\n",
               finite ? "" : "FAIL: ");
   failures += !finite;
-  return failures;
+  return failures + runDraftRows(loaded);
 }
 
 // What an uninstrumented run holds: the runs that compute the same bits, and

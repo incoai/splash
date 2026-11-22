@@ -734,6 +734,8 @@ class Forward:
     experts: np.ndarray
     expert_weights: np.ndarray
     trace: dict = field(default_factory=dict)
+    # Every row's final block mix, which output_norm and the head then read.
+    final: np.ndarray | None = None
 
 
 def forward(
@@ -839,6 +841,7 @@ def forward(
         experts,
         expert_weights,
         trace.values,
+        final[:, 0],
     )
 
 

@@ -16,7 +16,7 @@
   ],
   "hidden": 256,
   "tokens": 314,
-  "layout": "fp32 [applications][rows][hidden] outputs, then fp32 [tokens] logits of the last row",
+  "layout": "fp32 [applications][rows][hidden] outputs, then fp32 [tokens] logits of the last row, then fp32 [rows][hidden] final norm rows",
   "regenerate": [
     "build/engine-tests/inkling2-target build/splash.metallib --write-fixture DIR",
     "python -m dev.tools.inkling2_target_fixture DIR dev/tests/fixtures/inkling2-target"
