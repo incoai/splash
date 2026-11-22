@@ -174,7 +174,8 @@ void VaeDecoder::head(Encoder &e, int32_t tiles, size_t outRow0) {
 }
 
 void VaeDecoder::decode(const float *latents, int32_t latentFrames, const VideoGeometry &geometry,
-                        const VaePlan &plan, uint8_t *frames, DecodeStats &stats) {
+                        const VaePlan &plan, uint8_t *frames, DecodeStats &stats,
+                        const std::function<bool()> &cancelled) {
   const auto tStart = splash::AwakeClock::now();
   stats = DecodeStats{};
   const int32_t LH = geometry.latentHeight, LW = geometry.latentWidth;
@@ -227,6 +228,12 @@ void VaeDecoder::decode(const float *latents, int32_t latentFrames, const VideoG
   };
   metal::CommandTicket previous;
   for (int32_t c = 0; c < plan.chunks; ++c) {
+    if (cancelled && cancelled()) {
+      if (c > 0) stats.gpuS += wait(previous);  // its buffers are this decoder's, reused by the next decode
+      stats.cancelled = true;
+      stats.wallS = secondsSince(tStart);
+      return;
+    }
     // the clip's command: its batches of tile-clips, then its finish
     Encoder e(b_);
     const int32_t t0 = c * plan.ct;

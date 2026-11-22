@@ -338,7 +338,8 @@ void Dit::encodeBlock(int block, const BlockBinding &bind, Encoder &e) const {
 }
 
 void Dit::forward(const uint16_t *adaBlocks, const uint16_t *adaFinal, const float *videoIn, const float *audioIn,
-                  float *videoOut, float *audioOut, ForwardStats &stats) {
+                  float *videoOut, float *audioOut, ForwardStats &stats,
+                  const std::function<bool()> &cancelled) {
   const auto t0 = splash::AwakeClock::now();
   stats = ForwardStats{};
   const size_t videoBytes = static_cast<size_t>(layout_.frames) * layout_.tokensPerFrame * H3_DIT_VIDEO_CHANNELS * 4;
@@ -377,6 +378,15 @@ void Dit::forward(const uint16_t *adaBlocks, const uint16_t *adaFinal, const flo
   bool pending = false;
   model::WeightStream::Slot *runningSlot = nullptr, *runningQkFix = nullptr;
   for (int block = 0; block < blocks_; ++block) {
+    if (cancelled && cancelled()) {
+      // The block in flight may still read its slots: wait for it before handing them back. The stream itself is
+      // the request's (Dit owns it), so its reads ahead stop when the request's Dit is destroyed.
+      if (pending) {
+        stats.blocksGpuMs += wait(running) * 1e3;
+        if (runningSlot) stream_->release(*runningSlot, runningQkFix);
+      }
+      throw Cancelled{};
+    }
     BlockBinding binding = residentBinding(block);
     model::WeightStream::Slot *slot = nullptr, *qkfixSlot = nullptr;
     if (stream_) {
@@ -448,7 +458,8 @@ void DenoisingStage::forward(VideoBatch &batch, StageEvents &events) {
     for (int32_t step = 0; step < p.steps; ++step) {
       ForwardStats stats;
       dit.forward(p.adaBlocks.data() + size_t(step) * adaStepBlocks, p.adaFinal.data() + size_t(step) * adaStepFinal,
-                  video.data(), audio.data(), videoV.data(), audioV.data(), stats);
+                  video.data(), audio.data(), videoV.data(), audioV.data(), stats,
+                  [&events] { return events.cancelled(); });
       if (!allFinite(videoV) || !allFinite(audioV)) splash::logWarning("H3 non-finite velocity at step ", step);
       if (step == 0) {
         batch.step0Video = videoV;

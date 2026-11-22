@@ -10,7 +10,7 @@
 
 namespace splash::video {
 
-void DecodingStage::forward(VideoBatch &batch, StageEvents &) {
+void DecodingStage::forward(VideoBatch &batch, StageEvents &events) {
   const ops::VideoGeometry &g = batch.geometry;
   const ops::VaePlan plan = ops::planVaeDecode(g);
   ops::VaeDecoder decoder(backend_, model::loadVaeDecoder(backend_, (weights_ / "vae").string()));
@@ -28,7 +28,9 @@ void DecodingStage::forward(VideoBatch &batch, StageEvents &) {
                 frameFloats * 4);
   batch.frames.assign(size_t(g.width) * g.height * 3 * plan.outputFrames(), 0);
   ops::DecodeStats stats;
-  decoder.decode(z.data(), g.latentFrames + plan.padTokens, g, plan, batch.frames.data(), stats);
+  decoder.decode(z.data(), g.latentFrames + plan.padTokens, g, plan, batch.frames.data(), stats,
+                 [&events] { return events.cancelled(); });
+  if (stats.cancelled) throw Cancelled{};
   splash::logLine(std::format("H3 decode {} frames wall {:.1f}s gpu {:.1f}s nonfinite {} device_MB {:.0f}",
                               plan.outputFrames(), stats.wallS, stats.gpuS, stats.nonfinite, stats.deviceMb));
 }

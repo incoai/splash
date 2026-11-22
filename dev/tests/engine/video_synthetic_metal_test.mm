@@ -1,7 +1,8 @@
 // The video engine (runtime/video) on deterministic synthetic weights and
 // inputs (VideoSynthetic.hpp): one 3 s forward of the DiT's embedding,
 // block 0 and final layer, whose video and audio velocities must hash to a
-// reference implementation's of the same weights and inputs.
+// reference implementation's of the same weights and inputs, also after a
+// forward that a Cancel stopped before its first block.
 // The int8 MPP kernels need an Apple10 GPU (M5); earlier GPUs skip the test.
 #include "TestChecks.hpp"
 #include "VideoSynthetic.hpp"
@@ -69,7 +70,18 @@ int main(int argc, char **argv) {
       syntheticF32(seed(4), audio.size(), 1.7f, 0.0f, audio.data());
       std::vector<float> videoOut(video.size()), audioOut(audio.size());
       ForwardStats stats;
-      dit.forward(blocks.data(), final.data(), video.data(), audio.data(), videoOut.data(), audioOut.data(), stats);
+      // A Cancel seen before a block stops the forward there (Cancelled); the Dit stays usable, and the forward
+      // after it must still hash to the references below.
+      bool stopped = false;
+      try {
+        dit.forward(blocks.data(), final.data(), video.data(), audio.data(), videoOut.data(), audioOut.data(), stats,
+                    [] { return true; });
+      } catch (const Cancelled &) {
+        stopped = true;
+      }
+      require(stopped, "a cancelled forward did not stop at its first block");
+      dit.forward(blocks.data(), final.data(), video.data(), audio.data(), videoOut.data(), audioOut.data(), stats,
+                  [] { return false; });
       require(sha256(videoOut) == "48d1344755caf3081c03e3525a904b1e7b6b2cd345a70df97f2ff7f22da55da4" &&
                   sha256(audioOut) == "14835bdc152f36c39aaed79143a74f5a465b687a3b937176f6347aaa400d8ec7",
               "synthetic velocities differ from the references");
