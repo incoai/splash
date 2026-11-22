@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 14;
+inline constexpr uint16_t kProtocolVersion = 15;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -138,9 +138,10 @@ validateLimits(const ProtocolLimits &limits);
 //  102 u32 thinkingBudget.tokens, kNoThinkingBudget for none
 //  106 u32 thinking end token count, u32 thinkingBudget.alsoEnds, zero
 //      without a budget
+//  114 u32 headTokens
 // then the prompt tokens, the 32-byte image spans, the image pixels, the
 // score tokens and the thinking end tokens.
-inline constexpr uint64_t kRequestFixedBytes = 114;
+inline constexpr uint64_t kRequestFixedBytes = 118;
 inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
 // A thinking budget's end holds 1 to this many tokens.
 inline constexpr uint32_t kMaximumThinkingEndTokens = 64;
@@ -178,6 +179,9 @@ struct RequestFrame {
   // Trailing prompt tokens of the chat template's generation prompt; zero
   // when unknown. It must leave at least one prompt token.
   uint32_t generationPromptTokens = 0;
+  // Where the prompt's head (a system prompt and tools) ends; zero
+  // without one. It must leave at least one prompt token.
+  uint32_t headTokens = 0;
   // RequestFlag bits and kReturnProgressFlag.
   uint32_t flags = 0;
   // The request's cache_salt as the server hashed it; zero without one.
@@ -200,7 +204,8 @@ struct RequestFrame {
 //   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision,
 //                  u32 vocabularySize, u32 maskRows, u32 stop token count,
 //                  u32 stop tokens
-//   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
+//   Start          u64 requestId, u32 lane, u32 matchedPromptTokens,
+//                  u32 prefixTokens, u8 stateSource, u8 lostState
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
 //   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
@@ -293,8 +298,11 @@ struct ReadyEvent {
 struct StartEvent {
   uint64_t requestId = 0;
   uint32_t lane = 0;
-  // The cached prefix the request starts from; zero for a cold start.
+  // What the request found in the cache (engine::StartFound).
   uint32_t matchedPromptTokens = 0;
+  uint32_t prefixTokens = 0;
+  engine::StateSource stateSource = engine::StateSource::None;
+  bool lostState = false;
 
   bool operator==(const StartEvent &) const = default;
 };

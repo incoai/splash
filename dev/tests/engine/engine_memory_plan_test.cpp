@@ -147,12 +147,12 @@ void testMinimumRequiredBytesIsThePlans() {
     profile.targetKvLayout.format = format;
     const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
     const EngineMemoryBreakdown &budget = plan.breakdown();
-    require(minimumRequiredBytes(budget.fixedRuntimeBytes, budget.laneStateBytes,
-                                 profile.targetKvLayout) == budget.minimumRequiredBytes,
+    require(minimumRequiredBytes(budget.fixedRuntimeBytes, budget.laneStateBytes, profile.targetKvLayout,
+                                 budget.maximumBatchWidth) == budget.minimumRequiredBytes,
             "the minimum differs from the plan's");
   }
-  require(!minimumRequiredBytes(std::numeric_limits<uint64_t>::max(), 1,
-                                model().targetKvLayout),
+  require(!minimumRequiredBytes(std::numeric_limits<uint64_t>::max(), 1, model().targetKvLayout,
+                                model::ExecutionLimits::defaultLanes),
           "an overflowing minimum was not refused");
 }
 
@@ -281,19 +281,47 @@ void testReservesAreTheModelConstants() {
 }
 
 void testHardBudgetBoundaries() {
-  require(EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 0) == 11 * kGiB &&
-              EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 8 * kGiB) ==
+  require(EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 0, 16 * kGiB) == 11 * kGiB &&
+              EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 8 * kGiB, 16 * kGiB) ==
                   8 * kGiB &&
-              EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 16 * kGiB) ==
+              EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 16 * kGiB, 16 * kGiB) ==
                   11 * kGiB,
           "preflight ceiling disagrees with automatic or explicit policy");
-  require(EngineMemoryPolicy::hardBudgetBytes(0, 0) == 0 &&
-              EngineMemoryPolicy::hardBudgetBytes(kGiB, 1) == 0,
+  require(EngineMemoryPolicy::hardBudgetBytes(0, 0, 0) == 0 &&
+              EngineMemoryPolicy::hardBudgetBytes(kGiB, 1, 16 * kGiB) == 0,
           "insufficient working set underflowed the preflight ceiling");
   constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
-  require(EngineMemoryPolicy::hardBudgetBytes(maximum, maximum) ==
+  require(EngineMemoryPolicy::hardBudgetBytes(maximum, maximum, maximum) ==
               maximum - EngineMemoryPolicy::workingSetMarginBytes(maximum),
           "maximum working set overflowed the preflight ceiling");
+}
+
+// A recommendation raised past 90% of the Mac's memory (iogpu.wired_limit_mb, #735's 124,518 MiB on a 128 GB M5 Max)
+// leaves the automatic budget at the Mac's memory less a tenth; an explicit --max-memory is the user's, capped by the
+// recommendation alone. On the Macs measured (recommendations as Metal reports them, no raised limit), nothing
+// changes: the budget is the recommendation less its margin.
+void testTheAutomaticBudgetLeavesATenthUnwired() {
+  constexpr uint64_t memory = 128 * kGiB, raised = 124'518ULL << 20;
+  const uint64_t recommended = raised - EngineMemoryPolicy::workingSetMarginBytes(raised);
+  require(EngineMemoryPolicy::hardBudgetBytes(raised, 0, memory) == memory - memory / 100 * 10,
+          "the automatic budget of a Mac with a raised wired limit left less than a tenth of its memory unwired: " +
+              std::to_string(EngineMemoryPolicy::hardBudgetBytes(raised, 0, memory)));
+  require(EngineMemoryPolicy::hardBudgetBytes(raised, 120 * kGiB, memory) == recommended &&
+              EngineMemoryPolicy::hardBudgetBytes(raised, 116 * kGiB, memory) == 116 * kGiB,
+          "an explicit --max-memory was held to the unwired floor, or past the recommendation");
+  struct Measured {
+    const char *mac;
+    uint64_t memory, recommendation;
+  };
+  constexpr Measured measured[] = {{"M4 16 GB", 16 * kGiB, 12'713'115'648},
+                                   {"M6 24 GB", 24 * kGiB, 19'069'665'280},
+                                   {"M5 Max 36 GB", 36 * kGiB, 30'150'672'384},
+                                   {"M5 Pro 48 GB", 48 * kGiB, 40'200'896'512},
+                                   {"M5 Pro 64 GB", 64 * kGiB, 55'662'788'608}};
+  for (const Measured &each : measured)
+    require(EngineMemoryPolicy::hardBudgetBytes(each.recommendation, 0, each.memory) ==
+                each.recommendation - EngineMemoryPolicy::workingSetMarginBytes(each.recommendation),
+            std::string("the unwired floor changed the budget of the ") + each.mac);
 }
 
 void testModelProvidedKvGeometry() {
@@ -407,7 +435,7 @@ constexpr Mac kStudio{"M5 Max 36 GB", 36 * kGiB, 30'150'672'384, 32 * kGiB};
 constexpr Mac kM5Pro{"M5 Pro 64 GB", 64 * kGiB, 55'662'788'608, 32 * kGiB};
 constexpr Mac kMacs[] = {kM6, kStudio, kM5Pro};
 
-uint64_t hardBudget(const Mac &mac) { return EngineMemoryPolicy::hardBudgetBytes(mac.workingSet, 0); }
+uint64_t hardBudget(const Mac &mac) { return EngineMemoryPolicy::hardBudgetBytes(mac.workingSet, 0, mac.memory); }
 
 DeviceCapabilities deviceOf(const Mac &mac) {
   DeviceCapabilities result = device();
@@ -654,6 +682,43 @@ void testDense35BKeepsMainsPlan() {
                 mains.breakdown().contextBounds.bound() != std::string_view("disk") &&
                 test::jsonOf(mains).find("\"kv_spill\":null") != std::string::npos,
             std::string("the 35B's plan on the ") + mac.name + " is not main's");
+  }
+}
+
+// A runtime of eight lanes is planned as eight: its arenas, which hold
+// 191.6 MB more decode and 1.0 MB more prefill than four lanes' on the 35B
+// (model::plannedDecodeBytes, Apple10), and their KV runway are in the plan
+// and its minimum. Where memory bounds the context, the 35B's on a 24 GB M6, the
+// plan offers less than four lanes' and carries what four would leave
+// (EngineMemoryPlan::compareDefaultLanes); where it holds the window beside
+// them, a 36 GB M5 Max's, it carries nothing.
+void testEightLanesArePlannedAsEight() {
+  constexpr uint64_t kDecode = 191'643'648, kPrefill = 1'015'808;
+  for (const auto &[mac, target, costs] : {std::tuple{kM6, k35BQ2, true}, {kStudio, k35BQ4, false}}) {
+    const EngineMemoryPlan four = test::requireMemoryPlan(deviceOf(mac), target.profile());
+    Target wide = target;
+    wide.chunk.sharedDecodePlannedAllocatedBytes += kDecode;
+    wide.chunk.sharedPrefillPlannedAllocatedBytes += kPrefill;
+    wide.chunk.lanes = 8;
+    EngineMemoryPlan eight = test::requireMemoryPlan(deviceOf(mac), wide.profile());
+    const EngineMemoryBreakdown &a = four.breakdown(), &b = eight.breakdown();
+    const uint32_t extent = target.layout.minimumExtentPages();
+    const uint64_t runway =
+        (model::ExecutionLimits::runwayPages(extent, 8) - model::ExecutionLimits::runwayPages(extent, 4)) *
+        (target.layout.bytesPerModelPage() + kv::kPageTokens * model::kLookupIndexTokenBytes);
+    require(a.maximumBatchWidth == 4 && b.maximumBatchWidth == 8 &&
+                b.fixedRuntimeBytes == a.fixedRuntimeBytes + kDecode + kPrefill &&
+                b.minimumRequiredBytes == a.minimumRequiredBytes + kDecode + kPrefill + runway,
+            std::string("eight lanes of the 35B on the ") + mac.name + " were not planned as eight");
+    require((eight.maximumContextTokens() < four.maximumContextTokens()) == costs,
+            std::string("eight lanes of the 35B on the ") + mac.name + (costs ? " cost no" : " cost") + " context");
+    eight.compareDefaultLanes(four, eight.maximumContextTokens(), 0);
+    require(b.defaultLanesContextTokens == (costs ? four.maximumContextTokens() : 0),
+            std::string("eight lanes of the 35B on the ") + mac.name + " did not carry four lanes' context");
+    // A --max-context both hold is served alike: nothing to say.
+    eight.compareDefaultLanes(four, 65'536, 65'536);
+    require(b.defaultLanesContextTokens == 0,
+            std::string("eight lanes of the 35B on the ") + mac.name + " said a cost a 64K context does not pay");
   }
 }
 
@@ -997,7 +1062,7 @@ void testSecondStagingBufferOnlyWhereFree() {
   require(bound.stagingBuffers == 1 && bound.readerBytes() == bound.hotTargetBytes,
           "the M6 at a 384K-token context staged a second buffer in the table's share");
   StreamedMemoryInputs capped = kFlashNext.inputs(kM5Pro);
-  capped.hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(kM5Pro.workingSet, 44 * kGiB);
+  capped.hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(kM5Pro.workingSet, 44 * kGiB, kM5Pro.memory);
   const StreamedMemoryPlan whole = requirePlan(capped);
   require(!whole.expertBytes && whole.tableBytes == kFlashNextTableShare && whole.spill.stagingBuffers == 2 &&
               whole.spill.readerBytes() > whole.spill.hotTargetBytes,
@@ -1220,6 +1285,7 @@ int main() {
     testStreamedTableIsBudgeted();
     testReservesAreTheModelConstants();
     testHardBudgetBoundaries();
+    testTheAutomaticBudgetLeavesATenthUnwired();
     testModelProvidedKvGeometry();
     testWindowedKvCostsSlimPages();
     testExtentSizeFollowsThePool();
@@ -1228,6 +1294,7 @@ int main() {
     testAutoStreamsTheTableWhereMemoryHoldsIt();
     testSpillAllowanceFollowsASmallerRequestedContext();
     testDense35BKeepsMainsPlan();
+    testEightLanesArePlannedAsEight();
     testDenseExplicitContextKeepsMainsExperts();
     testDenseExplicitContextStreamsExperts();
     testDense35BContextGrowsWithTheBudget();

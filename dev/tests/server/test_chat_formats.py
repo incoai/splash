@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import transformers
 from llguidance import LLMatcher
 from tokenizers import (
     AddedToken,
@@ -361,7 +362,12 @@ class GlmGrammarTests(unittest.TestCase):
         cls.tokenizer = flint_tokenizer()
         cls.chat_format = flint_format(cls.tokenizer)
         cls.ready = flint_ready(cls.tokenizer)
-        cls.factory = constraints.ConstraintFactory(cls.tokenizer, cls.ready)
+        cls.factory = constraints.ConstraintFactory(
+            constraints.ConstraintFactory.table(
+                cls.tokenizer, cls.chat_format, cls.ready.vocabulary_size
+            ),
+            cls.ready,
+        )
 
     def policy(self, choice="auto", parallel=True, strict=False):
         tools = [
@@ -907,7 +913,7 @@ class ServedFamilyTests(unittest.TestCase):
             fixtures.unprepared_hold(family),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=tokenizer
+                transformers.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer") as validate,
             mock.patch.object(api, "check_capabilities") as check,
@@ -949,8 +955,14 @@ class ServedFamilyTests(unittest.TestCase):
                 started.check.assert_called_once_with(
                     started.tokenizer, family.chat_format, fixtures.engine_ready(131072)
                 )
+                # The table, built while the engine loads, covers the
+                # installation's vocabulary and stops as the format does.
+                started.factory_type.table.assert_called_once_with(
+                    started.tokenizer, family.chat_format, 248320
+                )
                 started.factory_type.assert_called_once_with(
-                    started.tokenizer, fixtures.engine_ready(131072)
+                    started.factory_type.table.return_value,
+                    fixtures.engine_ready(131072),
                 )
                 self.assertIs(
                     started.app_type.call_args.kwargs["chat_format"], family.chat_format

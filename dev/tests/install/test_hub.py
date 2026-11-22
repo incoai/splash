@@ -165,19 +165,19 @@ class DownloadTest(unittest.TestCase):
             time.sleep(0.001)
 
     def test_a_download_reports_the_bytes_of_the_blobs_it_fetches(self):
-        self.after_chunk = self.wait_for_report
+        # The blob the cache has, config.json's 2 bytes, counts as done.
+        self.after_chunk = lambda done: self.wait_for_report(2 + done)
         paths = self.download(WEIGHTS | {"config.json"})
         self.assertEqual(paths["config.json"], self.snapshot / "config.json")
         events = self.events()
-        # Only the blobs the cache lacked count: 300 + 200 bytes.
         self.assertEqual(
-            events[0], {"event": "download", "repo": REPO, "done": 0, "total": 500}
+            events[0], {"event": "download", "repo": REPO, "done": 2, "total": 502}
         )
-        self.assertEqual({event["total"] for event in events}, {500})
+        self.assertEqual({event["total"] for event in events}, {502})
         dones = [event["done"] for event in events]
         self.assertEqual(dones, sorted(dones))
-        self.assertEqual(set(dones), {0, 100, 200, 300, 400, 500})
-        self.assertEqual(dones[-1], 500)
+        self.assertEqual(set(dones), {2, 102, 202, 302, 402, 502})
+        self.assertEqual(dones[-1], 502)
         # Each event is one write of its whole line, flushed at once.
         for index, call in enumerate(self.stdout.calls):
             if call and call.startswith("{"):
@@ -189,6 +189,27 @@ class DownloadTest(unittest.TestCase):
             "cached files are reused.\n",
             self.stdout.getvalue(),
         )
+
+    def test_a_download_started_again_goes_on_from_the_files_finished(self):
+        """A download cancelled or cut off kept the files it finished, whose
+        bytes count as done from the first report on; a file it was writing
+        was left partial, which is removed and fetched from its start."""
+        self.blobs.joinpath(blob("model-1.safetensors")).write_bytes(
+            FILES["model-1.safetensors"]
+        )
+        partial = self.blobs / f"{blob('model-2.safetensors')}.dead1234.incomplete"
+        partial.write_bytes(FILES["model-2.safetensors"][:CHUNK])
+        self.after_chunk = lambda done: self.wait_for_report(300 + done)
+        self.download()
+        events = self.events()
+        self.assertEqual(
+            events[0], {"event": "download", "repo": REPO, "done": 300, "total": 500}
+        )
+        dones = [event["done"] for event in events]
+        self.assertEqual(dones, sorted(dones))
+        self.assertEqual(set(dones), {300, 400, 500})
+        self.assertFalse(partial.exists())
+        self.assertIn("Fetching 1 file(s)", self.stdout.getvalue())
 
     def test_a_xet_download_reports_the_bytes_the_network_brought(self):
         # The folder holds nothing of a file until all its chunks have come.
@@ -400,7 +421,9 @@ class PinTest(unittest.TestCase):
 
 class FailureKindTest(unittest.TestCase):
     def test_hub_failures_carry_their_kind(self):
-        """A Hub or network failure says which, as the app words it. A gated
+        """A Hub, network or disk failure says which, as the app words it:
+        a connection that dropped during the download, and a disk that
+        filled after the room check, by the error, not its text. A gated
         repository exists, though huggingface_hub refuses it as a
         RepositoryNotFoundError, and a revision or file the Hub lacks is not
         a missing repository: the message names it."""
@@ -430,6 +453,10 @@ class FailureKindTest(unittest.TestCase):
             (refused(403), "auth"),
             (httpx.ConnectError("no route", request=request), "offline"),
             (httpx.ReadTimeout("slow", request=request), "offline"),
+            (httpx.ReadError("connection reset", request=request), "interrupted"),
+            (httpx.RemoteProtocolError("peer closed", request=request), "interrupted"),
+            (OSError(errno.ENOSPC, "No space left on device"), "disk"),
+            (OSError(errno.EDQUOT, "Disc quota exceeded"), "disk"),
             (OSError(errno.EACCES, "Permission denied"), None),
             (refused(500), None),
         ):

@@ -148,15 +148,33 @@ inline void ane_ffn_gguf_values(thread float (&value)[4], device uchar *plane0, 
 // One simdgroup per weight row, ANE_FFN_WEIGHT_ROWS rows x one rotation block
 // of K * 128 inputs per threadgroup: the int8 rows under their shared scale,
 // which the first block also copies into the ANE's scale surface.
+//
+// The ANE's channels lie in its surfaces in descending units of
+// ANE_FFN_INTERMEDIATE_BLOCK, the last first, so that each share of them
+// (ops::AneFfn::Shares) is their leading rows: gate's and up's output rows
+// (the _inputs kernels, over the hidden inputs) and down's inputs (the
+// _intermediate kernels, whose rotation block is that unit). `index` is the
+// place in the surface of the `span` channels from params.row or
+// params.input, and this its channel's offset.
+inline uint ane_ffn_descending(uint index, uint span) {
+  return span - (index / ANE_FFN_INTERMEDIATE_BLOCK + 1) * ANE_FFN_INTERMEDIATE_BLOCK +
+         index % ANE_FFN_INTERMEDIATE_BLOCK;
+}
+template <uint K>
+constexpr bool ane_ffn_rows_descend() {
+  return K * ANE_FFN_ROTATION_UNIT == ANE_FFN_INPUT_BLOCK;
+}
+
 template <uint K, class F>
 inline void ane_ffn_weight_rows(device uchar *a, device uchar *b, device uchar *c, device const half *row_scale,
                                 device char *output, device half *scale, device const float *sign,
                                 constant AneFfnWeightParams &params, uint2 tile, uint simd_group, uint lane) {
   const uint row = tile.x * ANE_FFN_WEIGHT_ROWS + simd_group, block = tile.y * K * ANE_FFN_ROTATION_UNIT;
+  const uint source = params.row + (ane_ffn_rows_descend<K>() ? ane_ffn_descending(row, params.rows) : row),
+             inputs = params.input + (ane_ffn_rows_descend<K>() ? block : ane_ffn_descending(block, params.width));
   float value[K][4];
   for (uint k = 0; k < K; ++k)
-    ane_ffn_gguf_values<F>(value[k], a, b, c, params.groups, params.row + row,
-                           params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
+    ane_ffn_gguf_values<F>(value[k], a, b, c, params.groups, source, inputs + k * ANE_FFN_ROTATION_UNIT + lane * 4);
   ane_ffn_rotate_block<K>(value, lane, sign);
   const float inverse = ANE_FFN_INT8_UNIT / float(row_scale[row]);
   for (uint k = 0; k < K; ++k)
@@ -174,11 +192,12 @@ inline void ane_ffn_row_scales(device uchar *a, device uchar *b, device uchar *c
                                device const float *sign, constant AneFfnWeightParams &params, uint tile,
                                uint simd_group, uint lane) {
   const uint row = tile * ANE_FFN_WEIGHT_ROWS + simd_group;
+  const uint source = params.row + (ane_ffn_rows_descend<K>() ? ane_ffn_descending(row, params.rows) : row);
   float peak = 0.0f;
   for (uint block = 0; block < params.width; block += K * ANE_FFN_ROTATION_UNIT) {
     float value[K][4];
     for (uint k = 0; k < K; ++k)
-      ane_ffn_gguf_values<F>(value[k], a, b, c, params.groups, params.row + row,
+      ane_ffn_gguf_values<F>(value[k], a, b, c, params.groups, source,
                              params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
     ane_ffn_rotate_block<K>(value, lane, sign);
     for (uint k = 0; k < K; ++k)

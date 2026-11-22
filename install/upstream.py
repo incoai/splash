@@ -432,23 +432,32 @@ def gguf_target(repo, names, scratch, *, projector=None):
 
 
 def mlx_target(repo, language_only):
-    """The MLX target in repo, which serves images unless language_only."""
+    """The MLX target in repo, which serves images unless language_only or
+    its family has no vision tower (family.vision), as _gguf_target's."""
     required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
     missing = sorted(required - repo.files)
-    # Serving text only drops the processor requirement and no other.
-    processor = language_only or any(n in repo.files for n in PROCESSOR_FILES)
-    if missing or not processor:
-        # A checkpoint that lacks only the processor can serve text.
-        refusal = models.ModelError if missing else models.VisionError
-        if not processor:
-            missing.append(" or ".join(PROCESSOR_FILES))
+    processor = any(n in repo.files for n in PROCESSOR_FILES)
+
+    def refuse(refusal, missing):
         raise refusal(
             f"target repository {repo.name} is missing: {', '.join(missing)}. "
             "Configuration, tokenizer and processor must come from the target "
             "repository"
         )
+
+    if missing:
+        # Before the family is known, a processor is asked for unless text only.
+        if not (language_only or processor):
+            missing.append(" or ".join(PROCESSOR_FILES))
+        refuse(models.ModelError, missing)
     config = repo.file("config.json")
     family = check_model("mlx-affine", "none", config)
+    # Serving text only drops the processor requirement and no other; so does
+    # a family without a vision tower, which serves text only.
+    vision = not language_only and family.vision
+    if vision and not processor:
+        # A checkpoint that lacks only the processor can serve text.
+        refuse(models.VisionError, [" or ".join(PROCESSOR_FILES)])
     files = {path: "config.json" for path in ("config.json", "tokenizer/config.json")}
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     # The target's shards: those holding a tensor other than the tower's. A
@@ -456,7 +465,7 @@ def mlx_target(repo, language_only):
     # keeps it in a subdirectory).
     files |= {"target/" + n: n for n in _weight_files(repo, exclude=VISION_TOWER)}
     vision_format = "none"
-    if not language_only:
+    if vision:
         # The text passed, so a refusal of the tower's processor, shards or
         # configuration refuses the vision alone.
         try:
@@ -764,14 +773,19 @@ def _install(selection, repo, installed, draft=None):
         )
         if draft is None:
             draft = _resolve_draft(target.family, selection, installed, repo)
-        draft, files = _draft(target, installed, draft)
+        # The target's files download after the draft's, which makes room for
+        # both first. A file the assembly links at two paths, such as a shard
+        # holding the tower and text tensors, downloads once.
+        names = set(target.files.values())
+        following = sum(size for size, _ in repo.missing(names))
+        draft, files = _draft(target, installed, draft, following)
         vision = "disabled" if target.vision_format == "none" else "enabled"
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
             f"draft {draft.name}; vision {vision}.",
             flush=True,
         )
-        downloaded = repo.download(set(target.files.values()))
+        downloaded = repo.download(names)
     files |= {path: downloaded[name] for path, name in target.files.items()}
     publish(
         selection.models_root,
@@ -909,17 +923,18 @@ def _resolve_draft(family, selection, installed, target):
         )
 
 
-def _draft(target, installed, draft):
+def _draft(target, installed, draft, following=0):
     """The draft repository and its downloaded files, by assembly path: draft,
     as this start resolved it, when it is not the installed draft, or else
     the installed one, which is kept too when draft cannot be fetched
-    (downloaded and checked for the target)."""
+    (downloaded and checked for the target). following is the bytes of the
+    downloads after it (Repository.download's reserve)."""
     family = target.family
     recorded = installed and installed["sources"]["draft"]
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):
-                return draft, draft_files(draft, target)
+                return draft, draft_files(draft, target, following)
         except models.ModelError as error:
             if not recorded:
                 raise
@@ -928,7 +943,7 @@ def _draft(target, installed, draft):
                 f"keeping the installed one: {error}"
             )
     repo = assembly.source(installed, "draft")
-    return repo, draft_files(repo, target)
+    return repo, draft_files(repo, target, following)
 
 
 def _answered(repo):
@@ -942,12 +957,13 @@ def _at(repo):
     return f"{repo.name}@{repo.revision[:12]}" if repo.revision else repo.name
 
 
-def draft_files(repo, target):
+def draft_files(repo, target, following=0):
     """The DFlash2 draft in repo for target's family, downloaded, by assembly
     path: config.json, the safetensors weights and the mask embedding when
     shipped (DRAFT_MASK_EMBEDDING), at the repository's root. The weights
     download only once the engine accepts its configuration with the
-    target's (check_model)."""
+    target's (check_model); following is the bytes of the downloads after
+    them (Repository.download's reserve)."""
     family = target.family
     try:
         if "config.json" not in repo.files:
@@ -973,5 +989,5 @@ def draft_files(repo, target):
             f"{error}"
         ) from error
     mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
-    downloaded = repo.download({"config.json", *weights, *mask})
+    downloaded = repo.download({"config.json", *weights, *mask}, reserve=following)
     return {"draft/" + name: path for name, path in downloaded.items()}

@@ -7,16 +7,21 @@ import SwiftUI
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
-    /// The Advanced row, which opening it scrolls to the top, the options under it in view.
-    @State private var row = ScrollTarget()
+    /// The Advanced row, which opening it scrolls to the top, the options under it in view, and
+    /// closing it leaves where it is.
+    @State var row = ScrollTarget()
 
     var body: some View {
         let family = state.family(of: state.selection)
         GroupedSection {
             ForEach(Self.options(.main, for: family)) { OptionRow(option: $0, family: family) }
+            // What the model running pays in context for answering more requests at once than four.
+            if state.server.phase == .ready, let cost = state.server.lanesCost {
+                LanesCostNote(cost: cost)
+            }
             DisclosureRow(title: "Advanced", open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
-                .onChange(of: advanced) { if advanced { row.scrollToTop() } }
+                .onChange(of: advanced) { if advanced { row.scrollToTop() } else { row.stop() } }
             if advanced {
                 ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
                     let options = Self.options(section, for: family)
@@ -31,6 +36,11 @@ struct LaunchOptions: View {
                             .padding(.vertical, 6)
                             .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 6))
                         ForEach(options) { OptionRow(option: $0, family: family) }
+                        // The server running says when the cache its options asked for is off:
+                        // the options show what they ask for, whatever the server made of it.
+                        if section == .cache, state.server.phase == .ready, let off = state.server.cacheOff {
+                            CacheOffNote(reason: off)
+                        }
                     }
                 }
             }
@@ -54,6 +64,12 @@ struct LaunchOptions: View {
                     .accessibilityHidden(!changed)
             }
         }
+        // Two points SwiftUI moves frame by frame, at the card's top and its foot, which the options
+        // Advanced opens push down, and the card's height as laid out: the scroll to the options
+        // goes as far as the foot has gone toward where the layout puts it.
+        .background(alignment: .top) { ViewAnchor { row.top = $0 }.frame(width: 1, height: 1) }
+        .background(alignment: .bottom) { ViewAnchor { row.pushed = $0 }.frame(width: 1, height: 1) }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { row.height = $0 }
     }
 
     /// The options of `section` the models of `family` can use.
@@ -68,6 +84,35 @@ extension EnvironmentValues {
     /// What the launch option of the row the view is in lacks to apply, while it doesn't
     /// (`LaunchOption.lacks`).
     @Entry var optionRowNeeds: String?
+}
+
+/// What the server running pays in context for a concurrency limit past four.
+private struct LanesCostNote: View {
+    let cost: Server.LanesCost
+
+    var body: some View {
+        Label("The model running answers \(cost.lanes) requests at once, which leaves \(ContextLength.title(cost.context)) of context; 4 would leave \(ContextLength.title(cost.defaultContext)).",
+              systemImage: "info.circle")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Why the server running has the SSD cache off though its options asked for one, in the
+/// engine's words, as on a disk with too little room beyond the space it keeps free.
+private struct CacheOffNote: View {
+    let reason: String
+
+    var body: some View {
+        Label("The model running has the SSD cache off: \(reason).", systemImage: "exclamationmark.triangle.fill")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .symbolRenderingMode(.multicolor)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
 }
 
 /// An option's name, with an info button that shows what it does, and what it needs while it is

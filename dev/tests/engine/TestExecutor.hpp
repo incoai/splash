@@ -217,7 +217,7 @@ private:
 class Executor final : public model::Model {
 public:
   explicit Executor(
-      uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth)
+      uint32_t maximumLanes = model::ExecutionLimits::defaultLanes)
       : maximumLanes(maximumLanes) {}
 
   void checkHealth() override {
@@ -568,12 +568,13 @@ public:
   }
   // A command holds groupRows rows in up to `passes` passes over as many
   // layers, the rows of one lane at most past a chunk, and streams the
-  // history of one lane at most.
+  // history of one lane at most; it runs `lanes` lanes.
   model::CommandLimits commandLimits() const noexcept override {
     return {.commandRows = groupRows,
             .layers = passes,
             .maximumPasses = passes,
             .lanesPastChunk = 1,
+            .lanes = lanes,
             .indexPageLanes = 1,
             .streamsWeights = streamedExperts};
   }
@@ -876,7 +877,10 @@ public:
   // Requests the engine ended (end()).
   uint32_t ends = 0;
   bool resumeDenied = false;
-  uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth;
+  uint32_t maximumLanes = model::ExecutionLimits::defaultLanes;
+  // The lanes the model runs (CommandLimits::lanes), which bound the engine's
+  // admission; maximumLanes, the states it can begin, may refuse sooner.
+  uint32_t lanes = model::ExecutionLimits::defaultLanes;
   std::function<void()> beginObserver;
   std::function<void()> reservationObserver;
   std::function<bool()> reservationRoom;

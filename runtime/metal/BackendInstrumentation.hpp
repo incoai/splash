@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace splash::metal {
@@ -25,6 +26,9 @@ public:
   // Commands that passed the submission gate since construction.
   [[nodiscard]] static uint64_t submittedCommands(const MetalBackend &backend);
   [[nodiscard]] static size_t cachedPipelines(const MetalBackend &backend);
+  // Whether the library holds function `name`, which a pipeline of that name
+  // needs, looked up without compiling anything.
+  [[nodiscard]] static bool hasFunction(const MetalBackend &backend, std::string_view name);
   // The Metal command buffers the last command submitted takes: one, and one
   // more per buffer its event steps add, which the queue holds 512 of.
   [[nodiscard]] static uint64_t lastCommandBuffers(const MetalBackend &backend);
@@ -53,6 +57,22 @@ public:
   // was seen, false once awake steps were found not to spin, nothing while
   // no check decided (awake steps then run as plain ones).
   [[nodiscard]] static std::optional<bool> hostStepSpinDecision(const MetalBackend &backend);
+  // Every pipeline the backend creates from now on whose function declares
+  // function constant kMoeStagedOnly defines it true: the GGUF expert passes
+  // run every tile on the staged tile and none on the column tile
+  // (kernels/shared/moe_gguf.metal), so that a route's output depends on its
+  // own row alone, not on how many rows its step routes to its expert.
+  // Production defines it nowhere. Throws once the backend has created a
+  // pipeline of its cache, which would keep its own.
+  static void stageExpertTiles(MetalBackend &backend);
+  // The next command submitted whole (submitCommandAsync) that holds a
+  // dispatch of pipeline `pipeline` runs a host step after the first such
+  // dispatch that copies the views that
+  // dispatch binds at `bindings`, as the work before the step left them.
+  // takeSnapshot() reads and clears the copies, a byte vector a binding (none
+  // until such a command ran), and disarms the step.
+  static void snapshotAfter(MetalBackend &backend, std::string pipeline, std::vector<uint32_t> bindings);
+  [[nodiscard]] static std::vector<std::vector<uint8_t>> takeSnapshot(MetalBackend &backend);
 };
 
 } // namespace splash::metal

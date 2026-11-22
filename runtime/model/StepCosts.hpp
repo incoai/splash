@@ -59,16 +59,24 @@ public:
   // by a median of 2-6% and a p90 of 5-10%, as routing varies; Qwen3.8-27B's
   // by 0.5% and 1.1%.
   static constexpr uint32_t kReplays = 3;
-  // Two replays that other work slowed can: then a point's median is past its
-  // fastest replay by what slowed them. A lane count's costs whose every
-  // median is at most kSteadySpread past its point's fastest replay are kept
-  // for later starts (Runtime::warmupDecodeBatch); others are measured again
-  // at the next start. A fifth is twice the 35B's p90 above: routing alone
-  // puts a median past its fastest replay by no more than its cycles differ.
-  // On a 36 GB M5 Max with nothing else on its GPU, the runtime oracle's
-  // tables were within 6.7-10.4% on Qwen3.6-35B-A3B and 1.2-6.3% on
-  // Qwen3.8-27B.
-  static constexpr double kSteadySpread = 0.2;
+  // Work that slows a whole measurement, another app's or model's on the
+  // GPU, slows every replay alike, which no spread between replays shows: on
+  // a 64 GB M5 Pro beside a model decoding eight lanes, the tables of
+  // Qwen3.6-35B-A3B and both Flint targets came out 134-384% above the same
+  // start's on a quiet Mac, while quiet starts' tables repeated within 1.2%.
+  // The kept tables are one start's, measured together, so they are quiet or
+  // busy together (Runtime::warmupDecodeBatch): a start that recalls them
+  // checks their level once, on its first lane count's, on the GPU as cool
+  // as when it was measured: its largest step, whose median repeated within
+  // 0.6% over those quiet starts, timed kReplays times now. Where the table
+  // is more than kStale above that median, the tables were measured on a
+  // busier Mac, or this Mac changed: the start measures them as a first
+  // start does and replaces them. At or below it they stay, since other work
+  // only slows a step. A table whose shape intermittent work distorted while
+  // it spared the checked step stays too: it needs that work in two of a
+  // point's three replays, which run in separate passes, and costs that
+  // model and build a worse step choice, not a wrong output.
+  static constexpr double kStale = 0.2;
   // A step costs its price plus k times its passes over history: the sum
   // over its lanes of each lane's history, in thousands of tokens, times the
   // attention passes its rows take, a pass a draft's block of rows. The start
@@ -127,16 +135,22 @@ public:
   // The steps that measure a lane count's points, in the points' order.
   [[nodiscard]] std::vector<ops::StepRows> steps(uint32_t lanes) const;
   // The KV pages of a lane of a measurement of `points` points
-  // (Runtime::measureDecodeSteps): its prompt's token, a verify block a
-  // point and one more.
+  // (Runtime::measureDecodeSteps), or of a level check's kReplays steps:
+  // its prompt's token, a verify block a point and one more.
   static uint32_t lanePages(size_t points);
-  // Throws where a lane count's measurement, its lanes laid from page
-  // `first`, runs past the `runway` pages it is measured on.
-  void requireRunway(uint32_t first, uint32_t runway) const;
+  // Throws where the measurement of a lane count up to `lanes`, its lanes laid
+  // from page `first`, runs past the `runway` pages it is measured on.
+  void requireRunway(uint32_t first, uint32_t runway, uint32_t lanes) const;
   // A lane count's points' costs from its steps' replays: `replays[r][p]`
-  // the wall milliseconds of replay r of point p's step. Returns its spread:
-  // the most a point's median is past its fastest replay, a fraction of it.
-  double measure(uint32_t lanes, std::span<const std::vector<double>> replays);
+  // the wall milliseconds of replay r of point p's step.
+  void measure(uint32_t lanes, std::span<const std::vector<double>> replays);
+  // A measured lane count's level: the cost of its largest step,
+  // steps(lanes).back(), over the median of `replays`, that step's wall
+  // milliseconds now. A table of a level more than kStale past 1 is stale.
+  [[nodiscard]] double level(uint32_t lanes, std::span<const double> replays) const;
+  [[nodiscard]] static bool stale(double level) noexcept { return level > 1.0 + kStale; }
+  // Every lane count unmeasured, as before a first start.
+  void forget();
   // Whether a lane count's points are measured.
   [[nodiscard]] bool measured(uint32_t lanes) const;
   // A measured lane count's points as a line of text, each point's last
@@ -293,7 +307,11 @@ public:
   static constexpr double kPriorCycles = 5.0;
 
   // Over `classes`, the fewest rows of each class of a decode step's kernels
-  // (ops::ExecutionPlans::decodeRowClasses).
+  // (ops::ExecutionPlans::decodeRowClasses), up to the store's round
+  // (ExpertStore::cycleRows), which bounds every step the line chooses
+  // (Runtime::Impl::chooseStep): at eight lanes of Qwen3.6-35B-A3B on a
+  // 10-core M4, a step past it, which loads its experts in two rounds, took
+  // 11.05 ms a token where steps within it took 8.15.
   explicit CostLine(std::span<const uint32_t> classes);
 
   // The shape of a cycle's cost by its rows (a cycle of every row costs 1),

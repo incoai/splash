@@ -235,6 +235,8 @@ struct Case {
   // each row holds: themselves, or for a chain of a tree's path its rows'.
   std::vector<uint32_t> tokens;
   std::vector<uint32_t> queryRows;
+  // The factor of the rows' queries over their pattern (queryPattern).
+  float queryGain = 1.0f;
 
   uint32_t token(uint32_t slot) const { return tokens.empty() ? slot : tokens[slot]; }
   uint32_t queryRow(uint32_t row) const { return queryRows.empty() ? row : queryRows[row]; }
@@ -455,7 +457,7 @@ void fill(Case &data) {
     for (uint32_t row = 0; row < data.params.row_bound; ++row)
       for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension)
         queries[data.queryIndex(head, row, dimension)] =
-            floatToBFloat16(queryPattern(data.queryRow(row), head, dimension));
+            floatToBFloat16(queryPattern(data.queryRow(row), head, dimension) * data.queryGain);
 }
 
 float loadKey(const Case &data, uint32_t token, uint32_t head,
@@ -657,15 +659,16 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:queries offset:0 atIndex:0];
   [encoder setBuffer:partials offset:0 atIndex:1];
   [encoder setBuffer:statistics offset:0 atIndex:2];
-  for (uint32_t index = 3; index < 7; ++index)
+  constexpr NSUInteger kTables = SPLASH_MAXIMUM_BATCH_WIDTH;
+  for (NSUInteger index = 3; index < 3 + kTables; ++index)
     [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
   // A split binds the tree rows, or without them another buffer of the
   // dispatch, then the layout, and a sparse split the lists, their counts and
   // the row masks, or without lists another buffer of the dispatch, of which
   // it reads nothing.
-  [encoder setBuffer:tree offset:0 atIndex:7];
-  [encoder setBuffer:layout offset:0 atIndex:8];
-  NSUInteger paramsIndex = 9;
+  [encoder setBuffer:tree offset:0 atIndex:3 + kTables];
+  [encoder setBuffer:layout offset:0 atIndex:4 + kTables];
+  NSUInteger paramsIndex = 5 + kTables;
   if (shape.sparse()) {
     [encoder setBuffer:blocks.lists offset:0 atIndex:paramsIndex++];
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
@@ -1007,6 +1010,21 @@ void raggedTrees(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pipeline
 }
 
 
+// A case whose rows' running maxima grow on later pages of a split, each
+// row's on pages of its own. The patterns in order give a row scores within
+// 1.1 of each other, and 13 rows of 32 their largest on their first page.
+// Queries 32 times the pattern's spread a row's scores over 23 to 35 units,
+// and the slots hold the tokens' patterns out of order (slot s token
+// 1237 s mod 4099's): over 129 pages every row's maximum then grows on 2 to
+// 11 pages after its first, by 2.5 on average, so a running output left at
+// an earlier maximum's scale is off by e to that growth (the 24-head
+// geometry's rows, its heads 0, 5, 13 and 20).
+void growingMaxima(Case &data) {
+  data.queryGain = 32.0f;
+  for (uint32_t slot = 0; slot < data.params.committed_tokens + data.params.row_bound; ++slot)
+    data.tokens.push_back(slot * 1237 % 4099);
+}
+
 // Keep the CPU reference gates and verify that a second independent
 // submission, and the same pages in one extent, produce identical output and
 // scratch, of a dispatch of `width` lanes of the case's rows.
@@ -1014,11 +1032,12 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
              const Pipelines &pipelines, Shape shape,
              uint32_t committed, uint32_t activeRows, uint32_t width,
              bool qualityGate = true, uint32_t splits = 32,
-             bool qsa = false, bool tree = false) {
+             bool qsa = false, bool tree = false, void (*prepare)(Case &) = nullptr) {
   require(width >= 1 && width <= 4 && activeRows >= 1 && activeRows <= kRows &&
               splits <= kAttentionMaximumSplits,
           "invalid attention case");
   Case data = makeCase(device, shape, committed, activeRows, splits);
+  if (prepare) prepare(data);
   fill(data);
   if (qsa) setQsaMask(data);
   if (tree) {
@@ -1202,6 +1221,16 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 8'192, 5, 1, false);
     runCase(device, queue, pipelines, shape, 32'768, 7, 1, false);
     runCase(device, queue, pipelines, shape, 32'768, 8, 2, false, 65);
+    // Rows whose maxima grow on later pages (growingMaxima): one split of
+    // 128 pages, three of 43 and 32 of four, of eight rows and of three.
+    for (const uint32_t splits : {1U, 3U, 32U}) {
+      runCase(device, queue, pipelines, shape, 4'093, 8, 1, false, splits, false, false, growingMaxima);
+      runCase(device, queue, pipelines, shape, 4'093, 3, 2, false, splits, false, false, growingMaxima);
+    }
+    // A tile of at most four rows over several pages a split.
+    runCase(device, queue, pipelines, shape, 4'093, 4, 1, false);
+    runCase(device, queue, pipelines, shape, 4'093, 2, 2, false, 65);
+    runCase(device, queue, pipelines, shape, 32'768, 3, 1, false, 65);
     // Tree rows: each sees only its path's rows of the block, over a short
     // history and a long one, a lane alone and four.
     runCase(device, queue, pipelines, shape, 0, 8, 1, true, 32, false, true);
@@ -1216,6 +1245,10 @@ void run(const char *libraryPath) {
     raggedTrees(device, queue, pipelines, shape, 0, 32, true);
     raggedTrees(device, queue, pipelines, shape, 127, 32, true);
     raggedTrees(device, queue, pipelines, shape, 4'083, 65, false);
+    // A block whose first eight rows end a page: its lanes' second tiles
+    // read that page whole below their first rows, off their paths' rows
+    // too.
+    raggedTrees(device, queue, pipelines, shape, 120, 32, true);
     if (shape.queryHeadsPerKvHead == 12) {
       // Tree rows through QSA lists and row masks, causal and sparse, and
       // against their paths as chains.

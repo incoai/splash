@@ -50,15 +50,15 @@ inline void splash_path_commit_phase(device const SplashKvPage *page_table, uint
   kernel void Name(device const SplashKvPage *page_table0 [[buffer(0)]],                                         \
                    device const SplashKvPage *page_table1 [[buffer(1)]],                                         \
                    device const SplashKvPage *page_table2 [[buffer(2)]],                                         \
-                   device const SplashKvPage *page_table3 [[buffer(3)]],                                         \
-                   device const uint *paths [[buffer(4)]],                                                       \
-                   constant SplashKvPathCommitParams &params [[buffer(5)]],                                      \
+                   device const SplashKvPage *page_table3 [[buffer(3)]], device const SplashKvPage *page_table4 [[buffer(4)]], device const SplashKvPage *page_table5 [[buffer(5)]], device const SplashKvPage *page_table6 [[buffer(6)]], device const SplashKvPage *page_table7 [[buffer(7)]],                                         \
+                   device const uint *paths [[buffer(8)]],                                                       \
+                   constant SplashKvPathCommitParams &params [[buffer(9)]],                                      \
                    uint2 group [[threadgroup_position_in_grid]],                                                 \
                    uint thread_index [[thread_index_in_threadgroup]]) {                                          \
     using Bytes = SplashKvPageBytes<Heads, HeadDim, CacheElement>;                                               \
     const uint lane = group.y;                                                                                   \
     splash_path_commit_phase<Heads, HeadDim, CacheElement, ValuesTokenMajor>(                                    \
-        SPLASH_LANE_BINDING(lane, page_table0, page_table1, page_table2, page_table3), paths[lane],              \
+        SPLASH_LANE_BINDING(lane, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7), paths[lane],              \
         params.committed_tokens[lane],                                                                           \
         splash_kv_layer(params.extent_pages, Bytes::Data, Bytes::Scale, group.x / Heads), group.x % Heads,       \
         thread_index);                                                                                           \

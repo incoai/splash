@@ -256,6 +256,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/AneFfn.cpp \
 	runtime/ops/AneFfnCalibration.cpp \
 	runtime/ops/AneFfnMeasurement.cpp \
+	runtime/ops/DenseAttention.cpp \
+	runtime/ops/DenseLinear.cpp \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/DraftSelector.cpp \
 	runtime/ops/Embedding.cpp \
@@ -454,16 +456,18 @@ $(PRODUCTION_FLAG_TOOLS): BUILD_CONFIG := $(NATIVE_CONFIG_DIGEST)
 $(TEST_CONFIG_TARGETS): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
 $(SANITIZER_CONFIG_TARGETS): BUILD_CONFIG := $(SANITIZER_CONFIG_DIGEST)
 $(TEST_KERNEL_CONFIG_TARGETS): BUILD_CONFIG := $(TEST_KERNEL_CONFIG)
-stale-config = $(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale --config $(1) $(2))
-STALE_CONFIG_TARGETS := \
-	$(call stale-config,$(CONFIG_DIGEST),$(PRODUCTION_CONFIG_TARGETS)) \
-	$(call stale-config,$(METAL_CONFIG_DIGEST),$(HOST_STEP_LIB)) \
-	$(call stale-config,$(PRODUCTION_AIR_CONFIG),$(PRODUCTION_AIRS)) \
-	$(call stale-config,$(PRODUCTION_LIB_CONFIG),$(LIB)) \
-	$(call stale-config,$(NATIVE_CONFIG_DIGEST),$(PRODUCTION_FLAG_TOOLS)) \
-	$(call stale-config,$(TEST_CONFIG_DIGEST),$(TEST_CONFIG_TARGETS)) \
-	$(call stale-config,$(SANITIZER_CONFIG_DIGEST),$(SANITIZER_CONFIG_TARGETS)) \
-	$(call stale-config,$(TEST_KERNEL_CONFIG),$(TEST_KERNEL_CONFIG_TARGETS))
+# Each output named with the configuration it was built with, all in one call
+# of the tool: every make parses this, the launcher's start three times.
+config-pairs = $(foreach output,$(2),$(1)=$(output))
+STALE_CONFIG_TARGETS := $(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
+	$(call config-pairs,$(CONFIG_DIGEST),$(PRODUCTION_CONFIG_TARGETS)) \
+	$(call config-pairs,$(METAL_CONFIG_DIGEST),$(HOST_STEP_LIB)) \
+	$(call config-pairs,$(PRODUCTION_AIR_CONFIG),$(PRODUCTION_AIRS)) \
+	$(call config-pairs,$(PRODUCTION_LIB_CONFIG),$(LIB)) \
+	$(call config-pairs,$(NATIVE_CONFIG_DIGEST),$(PRODUCTION_FLAG_TOOLS)) \
+	$(call config-pairs,$(TEST_CONFIG_DIGEST),$(TEST_CONFIG_TARGETS)) \
+	$(call config-pairs,$(SANITIZER_CONFIG_DIGEST),$(SANITIZER_CONFIG_TARGETS)) \
+	$(call config-pairs,$(TEST_KERNEL_CONFIG),$(TEST_KERNEL_CONFIG_TARGETS)))
 ifneq ($(strip $(STALE_CONFIG_TARGETS)),)
 $(STALE_CONFIG_TARGETS): force-build-config
 endif

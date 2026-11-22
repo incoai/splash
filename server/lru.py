@@ -26,6 +26,10 @@ class LRUCache:
         """The keys, the least recently used first."""
         return iter(self._entries)
 
+    def items(self):
+        """Keys and values in LRU order, without touching their recency."""
+        return ((key, value) for key, (value, _) in self._entries.items())
+
     def get(self, key):
         """The value kept for `key`, now the most recently used; None when
         none is kept."""

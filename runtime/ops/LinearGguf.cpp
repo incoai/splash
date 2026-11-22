@@ -108,6 +108,9 @@ void addDecodeTensor(const LinearBuffers &b, LinearEpilogue epilogue, const Quan
   }
   const std::vector<QuantizedSegment> &gates = gate->blocks().segments;
   if (gates.size() != 1) throw std::invalid_argument("block gate/up takes single tensors");
+  // The gate pass runs the tile's kernel of the gate's format, which F32 or
+  // BF16 rows have none of: no source instantiates gguf_decode_f32_m8_a.
+  if (gates.front().isFloat()) throw std::invalid_argument("float segments take no epilogue");
   tensor(gates.front(), epilogueSuffix(LinearEpilogue::None), b.gateScratch, b.gateScratch);
   tensor(segment, epilogueSuffix(LinearEpilogue::UpWithGate), b.output, b.gateScratch);
 }
@@ -126,7 +129,7 @@ std::pair<const QuantizedSegment &, const QuantizedSegment &> onePassTensors(con
 void LinearPlan::requireConfiguration() const {
   const uint32_t k = workload_.matrix.inputSize;
   const LinearConfig &c = config_;
-  const bool decodeTiles = workload_.rows <= kMaximumDecodeTileRows;
+  const bool decodeTiles = workload_.rows <= kMaximumStagedRows;
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && ((c.tile != LinearTile::GgufStaged && c.tile != LinearTile::GgufColumn) ||
@@ -134,10 +137,8 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only a staged or column block gate/up of up to 32 rows runs gate and up in one pass");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || workload_.rows > 8))
     throw std::invalid_argument("only a staged block plan of at most 8 rows runs the 16-row tile");
-  if (c.decodeInt8 && (c.tile != LinearTile::GgufStaged || workload_.rows > kMaximumInt8Rows ||
-                       !decodeInt8TakesSplits(k, c.splits)))
-    throw std::invalid_argument("only a staged block plan of up to 32 rows of whole PQ2_0 blocks per split runs "
-                                "int8 activations");
+  if (c.decodeInt8 && (c.tile != LinearTile::GgufStaged || !decodeInt8TakesSplits(k, c.splits)))
+    throw std::invalid_argument("only a staged block plan of whole PQ2_0 blocks per split runs int8 activations");
   if (c.tile == LinearTile::GgufColumn) {
     // The column tile reads its rows alone, a gate/up pair's both tensors in
     // one pass, and splits K inside its threadgroup alone.
@@ -159,7 +160,7 @@ void LinearPlan::requireConfiguration() const {
   }
   if (!c.validSplits() || (k / 32) % c.splits)
     throw std::invalid_argument("staged block splits take whole 32-input groups");
-  if (!decodeTiles) throw std::invalid_argument("the staged block tile runs plans of up to 64 rows");
+  if (!decodeTiles) throw std::invalid_argument("the staged block tile runs plans of up to 128 rows");
 }
 
 uint32_t LinearPlan::storageRows() const noexcept {
@@ -187,24 +188,28 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   if (config_.tile == LinearTile::GgufPrefillInt8)
     return {gguf_prefill_int8_table_bytes(k, storageRows()), gguf_prefill_int8_scale_bytes(k, storageRows()), 0, 0};
   // Staged split-K: [split][row][column] fp32 partials over the tile's rows,
-  // a one-pass gate/up's of both tensors, and one counter per column tile (a
-  // tile covers every row of the dispatch): 64 columns, 32 in one pass. The
+  // a one-pass gate/up's of both tensors, and one counter per column tile of
+  // each row group (a tile covers every row of its group): 64 columns, 32 in
+  // one pass. Two row groups keep the first's partials, then the second's. The
   // prefill tile never splits.
   const uint64_t columns = config_.oneGateUpPass ? 2 * uint64_t{n} : n;
   const uint32_t tile = config_.oneGateUpPass ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS;
+  const uint32_t rowGroups =
+      config_.decodeInt8 ? int8RowGroups(storageRows()).groups : stagedRowGroups(workload_.rows).groups;
   return config_.splits > 1
       ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * columns * sizeof(float),
-                          uint64_t{n / tile} * sizeof(uint32_t)}
+                          uint64_t{rowGroups} * (n / tile) * sizeof(uint32_t)}
       : LinearScratchSize{};
 }
 
-LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {
+LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, const UnitFormats &unit) const {
   // Every format the register tile takes K inputs in has one register plan,
   // whose partitions keep whole coefficient units of each (kRegisterTiers);
   // a projection of segments the tile does not take has none. One lane on the
-  // 16-row tile runs unsplit, without partials.
+  // 16-row tile runs unsplit, without partials. An int8 form counts its row
+  // groups' counters (int8RowGroups).
   LinearScratchSize size;
-  for (const LinearConfig &config : decodeConfigurations(calibration_, w, registerFormats))
+  for (const LinearConfig &config : decodeConfigurations(calibration_, int8Activations_, step_, w, unit))
     size.include(LinearPlan(w, config).scratchSize());
   return size;
 }
@@ -248,11 +253,14 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     plain.rotation = {};
     if (plan.configuration().decodeInt8) {
       // In int8 activations the rotation writes int8 rows and their scales for the plan's storage rows
-      // (gguf_rotate_int8), which the staged plan's int8 tiles read.
+      // (gguf_rotate_int8), which the staged plan's int8 tiles read, in their row groups: one group's rows of the
+      // workload, or every group's rows, as the tiles compute them.
       const uint32_t rows = plan.storageRows();
+      const Int8RowGroups groups = int8RowGroups(rows);
       requireBytes(b.scratch.rotated, gguf_rotation_int8_bytes(k, rows), "projection int8 rows");
-      graph.add("gguf_rotate_int8", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationInt8Params{k, rows},
-                {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
+      graph.add("gguf_rotate_int8", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationInt8Params{k, groups.rows},
+                {k / GGUF_ROTATION_BLOCK, std::min(w.rows, groups.rows), groups.groups}, {GGUF_ROTATION_THREADS, 1, 1});
+      graph.specialize(std::array<uint32_t, 1>{groups.groups});
       addGgufStaged(graph, rotated, plain, plan, gate);
       return;
     }
@@ -270,9 +278,10 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   }
 }
 
-// The staged tiles, for plans of up to kMaximumDecodeTileRows rows: every row
+// The staged tiles, for plans of up to kMaximumStagedRows rows: every row
 // of the plan's storage in each threadgroup's tile, grid
-// (64-column tiles, K splits). A gate/up runs as two passes, or, where
+// (64-column tiles, K splits), or past one tile's rows its two row groups,
+// grid (row groups, 64-column tiles, K splits). A gate/up runs as two passes, or, where
 // selectProjection sets LinearConfig::oneGateUpPass, as one pass over
 // 32-column threadgroups of one simdgroup each. In int8 activations
 // (LinearConfig::decodeInt8) the same dispatches run the int8 tiles of the
@@ -287,6 +296,15 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   const uint32_t rows = plan.storageRows(), splits = config.splits;
   const auto [partials, counters] = splitScratch(b, splits);
+  // The grid over `columns` columns, its row groups in z, and the height its
+  // kernels are named by: past one tile's rows two of the tile of half of
+  // them (stagedRowGroups), on the int8 tiles groups of 16 or 32 rows
+  // (int8RowGroups).
+  const uint32_t groups = config.decodeInt8 ? int8RowGroups(rows).groups : stagedRowGroups(w.rows).groups;
+  const uint32_t height = rows / groups;
+  const auto tileGrid = [&](uint32_t columns) {
+    return metal::DispatchSize{columns / GGUF_TILE_COLUMNS, splits, groups};
+  };
   if (config.decodeInt8)
     for (const Projection *q : {&p, gate})
       if (q)
@@ -295,11 +313,11 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
             throw std::invalid_argument("the int8 tiles take segments of one format, whole blocks of it per split");
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(decodeKernel(config.decodeInt8, s.name(), rows, std::string_view(&epilogue, 1)),
+    graph.add(kernelInstance(decodeKernel(config.decodeInt8, s.name(), height, std::string_view(&epilogue, 1)),
                              plan.destination()),
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset, config.spread},
-              {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+              tileGrid(s.outputSize), {GGUF_STAGED_THREADS, 1, 1});
   };
   // A fused projection's segments in one dispatch (gguf_decode_fused_m*),
   // in tile order: segments with the most bytes per tile first, so their
@@ -318,14 +336,15 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
     if (config.decodeInt8) {
-      // The int8 tiles take segments of one format, each format a kernel of its own.
-      graph.add(std::string("gguf_decode_int8_") + segments.front().name() + "_fused_m" + std::to_string(rows),
-                std::move(bindings), params, {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1},
-                {GGUF_STAGED_THREADS, 1, 1});
+      // The int8 tiles take segments of one format, each format a kernel of its own, specialized to the dispatch's
+      // row groups (function constant 3; 0-2 are the bf16 fused pipelines' formats).
+      graph.add(std::string("gguf_decode_int8_") + segments.front().name() + "_fused_m" + std::to_string(height),
+                std::move(bindings), params, tileGrid(segmentColumns(p)), {GGUF_STAGED_THREADS, 1, 1});
+      graph.specialize(std::array<uint32_t, 4>{0, 0, 0, groups});
       return;
     }
-    graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
-              {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+    graph.add("gguf_decode_fused_m" + std::to_string(height), std::move(bindings), params, tileGrid(segmentColumns(p)),
+              {GGUF_STAGED_THREADS, 1, 1});
     // The pipeline decodes the segments' formats alone, each once in
     // ascending order and the last repeated to three, so projections of one
     // format set share it (gguf_linear.metal, fused_formats).
@@ -351,8 +370,12 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   // dispatch than in one per segment (32-core M5 Max). Each segment with an
   // epilogue runs its own, and so does each of fp32 rows (the draft's
   // vocabulary head over a subset of its rows, DFlashDraft): the fused
-  // kernels write bf16.
-  if (segments.size() > 1 && w.epilogue == LinearEpilogue::None && plan.destination() == FloatOutput::BFloat16) {
+  // kernels write bf16. The bf16 fused kernel runs one row group: past one
+  // tile's rows the segments run their own dispatches on the row groups (an
+  // input offset per group in the fused kernel computed wrong rows for one
+  // format set on an M4 under shader validation).
+  if (segments.size() > 1 && w.epilogue == LinearEpilogue::None && plan.destination() == FloatOutput::BFloat16 &&
+      (groups == 1 || config.decodeInt8)) {
     fused();
     return;
   }
@@ -361,7 +384,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   for (const QuantizedSegment &s : segments) addDecodeTensor(b, w.epilogue, s, gate, tensor);
 }
 
-// The prefill tile, which runs plans of more than kMaximumDecodeTileRows rows
+// The prefill tile, which runs plans of more than kMaximumStagedRows rows
 // over 128-row tiles: a plain projection in one
 // dispatch per format, over the column tiles of its segments of that format
 // (a fused projection's segments otherwise run as small grids of their own),
@@ -426,16 +449,13 @@ void Linear::addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers 
                                 const LinearPlan &plan) const {
   const LinearWorkload w = plan.workload();
   const auto [n, k] = w.matrix;
-  const uint32_t storage = plan.storageRows(), groups = k / GGUF_PREFILL_INT8_GROUP,
+  const uint32_t storage = plan.storageRows(),
                  rowTiles = (w.rows + GGUF_PREFILL_INT8_ROWS - 1) / GGUF_PREFILL_INT8_ROWS;
   for (const QuantizedSegment &s : p.blocks().segments)
     if (!quant_prefill_int8_format(s.formatId))
       throw std::invalid_argument(std::string("the int8 prefill tile does not take ") + s.name() + " weights");
   if (b.prepared.layout != LinearInput::PrefillInt8 || !b.prepared.source.sameView(b.input))
-    graph.add("gguf_prefill_int8_quantize", {b.input, b.scratch.input, b.scratch.sums},
-              GgufPrefillInt8QuantizeParams{k, w.rows, storage},
-              {(groups + GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS - 1) / GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS, w.rows, 1},
-              {GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS * 32, 1, 1});
+    addGgufPrefillInt8Quantize(graph, b.input, b.scratch.input, b.scratch.sums, k, w.rows, storage);
   const std::string epilogue(1, epilogueSuffix(w.epilogue));
   for (const QuantizedSegment &s : p.blocks().segments) {
     const uint32_t columnTiles = s.outputSize / GGUF_TILE_COLUMNS;
@@ -542,6 +562,18 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize, uint32_t formatId) const noexcept {
   return selectFloatTile(calibration_, rows, outputSize, formatId);
+}
+
+// A row's GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS groups of 64 inputs a
+// threadgroup, a simdgroup a group.
+void addGgufPrefillInt8Quantize(metal::CommandGraph &graph, const metal::MetalBuffer &input,
+                                const metal::MetalBuffer &codes, const metal::MetalBuffer &scales, uint32_t inputSize,
+                                uint32_t rows, uint32_t scaleStride) {
+  const uint32_t groups = inputSize / GGUF_PREFILL_INT8_GROUP;
+  graph.add("gguf_prefill_int8_quantize", {input, codes, scales},
+            GgufPrefillInt8QuantizeParams{inputSize, rows, scaleStride},
+            {(groups + GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS - 1) / GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS, rows, 1},
+            {GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS * 32, 1, 1});
 }
 
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const QuantizedSegment &weights,

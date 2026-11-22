@@ -1,6 +1,7 @@
 #include "Normalization.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Normalization.h"
 #include "ops/BufferExtent.hpp"
 
 #include <utility>
@@ -11,6 +12,21 @@ namespace splash::ops {
 std::string normKernel(std::string_view name, const NormWeights &weights, uint32_t width) {
   requireBytes(weights.buffer, weights.bytes(width), "norm weight");
   return std::string(name) + (weights.float32 ? "_f32" : "");
+}
+
+void Normalization::requireLayer(const LayerNormWeights &weights, uint32_t width, const std::string &name) {
+  requireBytes(weights.weight, uint64_t{width} * 2, name + " weight");
+  requireBytes(weights.bias, uint64_t{width} * 2, name + " bias");
+}
+
+void Normalization::addLayer(metal::CommandGraph &graph, const metal::MetalBuffer &input,
+                             const LayerNormWeights &weights, const metal::MetalBuffer &output, uint32_t width,
+                             uint32_t rows, float epsilon) {
+  // The weights are requireLayer's, which their owner checks once.
+  requireBytes(input, uint64_t{rows} * width * 4, "norm input");
+  requireBytes(output, uint64_t{rows} * width * 2, "norm output");
+  graph.add("norm_layer", {input, weights.weight, weights.bias, output}, LayerNormParams{width, epsilon},
+            {rows, 1, 1});
 }
 
 PreparedInput Normalization::addRms(metal::CommandGraph &graph,

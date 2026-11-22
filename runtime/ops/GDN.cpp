@@ -38,8 +38,9 @@ static_assert(SPLASH_TARGET_VERIFY_ROWS == 16 && SPLASH_GDN_NARROW_ROWS < SPLASH
 // of either gate, and their kernels' name suffix. The scan reads no packed
 // rows, so shapes of one head layout share its kernel (scanSuffix). The
 // kernels that read the norm take the norm types the shape's families store
-// (normKernel): F32 and bf16, or F32 alone for Qwen3.8-Flash-Next's, which
-// loads from GGUFs only.
+// (normKernel): F32 and bf16, or F32 alone for Qwen3.8-Flash-Next's, whose
+// norms load as F32 from its GGUFs and its MLX images
+// (model/SafetensorsImage.hpp float32Norms).
 struct CompiledGdn final {
   GdnShape shape;
   std::string_view suffix;

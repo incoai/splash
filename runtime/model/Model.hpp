@@ -26,6 +26,13 @@
 #include <vector>
 
 namespace splash {
+namespace metal {
+class MetalBuffer;
+} // namespace metal
+namespace ops {
+class AneFfn;
+struct PrefillFfnBuffers;
+} // namespace ops
 
 namespace model {
 class KvPageSources;
@@ -657,6 +664,35 @@ struct ExecutionLimits final {
   // (engine::KvPool::RunwayHold).
   static constexpr uint32_t warmupKvPages =
       (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
+  // The lanes a runtime runs unless its start asks for others
+  // (RuntimeResourcesConfig::lanes).
+  static constexpr uint32_t defaultLanes = SPLASH_DEFAULT_LANES;
+  // The startup runway of a runtime of `lanes` lanes in extents of
+  // `extentPages` pages: the whole extents that hold warmupKvPages, and 16
+  // pages a lane past the default's four. A start measures each lane count's
+  // decode steps on it from page 5 (Runtime::measureDecodeSteps), a lane
+  // taking StepCosts::lanePages of its table's points: 8 pages for the 14
+  // points of a MoE target's table, the most today, so four lanes take 37 of
+  // the 64 pages and eight 69 of 128. 16 pages a lane hold tables of up to
+  // 28 points (StepCosts::requireRunway refuses more) and keep eight lanes'
+  // runway to 128 pages: one extent where extents are 128 pages or more.
+  [[nodiscard]] static constexpr uint32_t runwayPages(uint32_t extentPages, uint32_t lanes) noexcept {
+    const uint32_t pages = warmupKvPages * (lanes > defaultLanes ? lanes : defaultLanes) / defaultLanes;
+    return (pages + extentPages - 1) / extentPages * extentPages;
+  }
+  // The most rows of a decode step of `lanes` lanes: a verify block a lane,
+  // 64 at four lanes and 128 at eight. A step of 64 rows bound five
+  // to eight lanes of predictable text (2K-token code prompts on a 64 GB M5
+  // Pro: 53-100% of the steps of Qwen3.6-35B-A3B and Qwen3.8-27B took all 64,
+  // chat at most 48). Past 64 rows a step's projections run two row groups of
+  // the staged decode tile (ops::stagedRowGroups) and its head passes of at
+  // most 64 rows, every one on a decode step's plans (ops::StepKind), which
+  // take no int8 prefill path at any rows: a lane's logits keep their
+  // precision whatever the other lanes' load, but where a rotated PQ2_0
+  // unit's plan stores fewer than 16 rows (one or two rows on the column
+  // tile, three to eight split: a lone lane's short step, a head's short last
+  // pass), which keeps bf16 activations.
+  [[nodiscard]] static constexpr uint32_t stepRows(uint32_t lanes) noexcept { return lanes * targetVerifyRows; }
   static constexpr uint32_t draftQueryRows = SPLASH_DRAFT_QUERY_ROWS;
   static constexpr uint32_t draftProposalTokens = SPLASH_DRAFT_PROPOSAL_TOKENS;
   // The most rows of a lane's verify block, which every target kernel takes.
@@ -678,7 +714,7 @@ static_assert(ExecutionLimits::draftQueryRows ==
               ExecutionLimits::draftProposalTokens + 1);
 static_assert(ExecutionLimits::draftQueryRows <= ExecutionLimits::targetVerifyRows);
 
-// The first rule a command breaks, or none: at most maximumBatchWidth
+// The first rule a command breaks, or none: at most the runtime's
 // lanes; and for a prefill, pass `pass` of at most maximumPasses passes,
 // from layer 0 for the first and past it for a later one, with no more
 // passes left than layers left of the target's `layers`, at most
@@ -692,7 +728,7 @@ static_assert(ExecutionLimits::draftQueryRows <= ExecutionLimits::targetVerifyRo
 [[nodiscard]] inline std::optional<std::string_view>
 commandViolation(const CommandLimits &limits, const BatchPlan &plan,
                  std::span<const ModelBatchItem> items) noexcept {
-  if (items.size() > ExecutionLimits::maximumBatchWidth)
+  if (items.size() > limits.lanes)
     return "a command's lanes exceed the batch width";
   if (plan.kind != WorkKind::Prefill)
     return std::nullopt;
@@ -730,6 +766,8 @@ struct ModelMemoryPlan final {
   uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
+  // The lanes the arenas hold (QwenTargetGeometry::lanes).
+  uint32_t lanes = ExecutionLimits::defaultLanes;
 };
 
 // Fixed reserves the memory plan carries beside the planned arenas: Metal
@@ -969,12 +1007,30 @@ class RuntimeModel : public Model {
 public:
   ~RuntimeModel() override = default;
 
+  // The fewest rows of each class of prefill chunk whose kernels the start
+  // warms (ops::ExecutionPlans::prefillRowClasses, of the target's MoE
+  // blocks).
+  [[nodiscard]] virtual std::vector<uint32_t> prefillRowClasses() const = 0;
   // Actual rows, not padded dispatch rows; valid range is 1..prefillTokenBudget.
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;
   [[nodiscard]] virtual ModelTelemetry telemetry() const noexcept = 0;
+  // The prefill FFN's Neural Engine split the runtime's next commands take,
+  // set between commands, and the command limits that follow from it
+  // (commandLimits()); none for the GPU alone. A runtime without a dense
+  // target's prefill ignores it.
+  virtual void setAneFfn(ops::AneFfn *split) { static_cast<void>(split); }
+  // Runs `use` between commands on the runtime's own prefill buffers of a
+  // dense FFN and the hidden rows its layers alternate between, which `use`
+  // may overwrite: the split's set-up. Throws for a runtime without them.
+  using PrefillFfnUse =
+      std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)>;
+  virtual void withPrefillFfn(const PrefillFfnUse &use) {
+    static_cast<void>(use);
+    throw std::logic_error("the runtime has no prefill buffers of a dense FFN");
+  }
 };
 
 } // namespace model

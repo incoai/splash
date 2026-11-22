@@ -20,7 +20,6 @@ struct Qwen3_6MoeLayout final : QwenHybridLayout {
   // checkpoint of it loads too.
   static constexpr std::string_view modelType = "qwen3_5_moe_text";
   static constexpr std::string_view ggufArchitecture = "qwen35moe";
-  static constexpr bool loadsSafetensors = true;
 
   // Qwen3.6-35B-A3B's, its first family (kFamilies).
   constexpr Qwen3_6MoeLayout()
@@ -39,6 +38,7 @@ struct Qwen3_6MoeLayout final : QwenHybridLayout {
                           .attentionQueryHeads = 16,
                           .attentionKvHeads = 2,
                           .attentionHeadDimension = 256,
+                          .attentionNormMean = 1.490F,
                           .rotaryPairs = SPLASH_TARGET_ROPE_PAIRS,
                           .rotaryTheta = 10'000'000.0F,
                           .fullAttentionPeriod = 4,
@@ -72,6 +72,7 @@ inline constexpr Qwen3_6MoeLayout kQwen3_5_122BLayout{
                       .attentionQueryHeads = 32,
                       .attentionKvHeads = 2,
                       .attentionHeadDimension = 256,
+                      .attentionNormMean = 1.414F,
                       .rotaryPairs = SPLASH_TARGET_ROPE_PAIRS,
                       .rotaryTheta = 10'000'000.0F,
                       .fullAttentionPeriod = 4,

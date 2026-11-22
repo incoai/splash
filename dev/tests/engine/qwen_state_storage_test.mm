@@ -228,9 +228,7 @@ void testLayoutFormulas() {
           "context window formula is wrong");
   require(kStateLayout.laneBytes() == 356'122'624,
           "per-lane byte formula is wrong");
-  require(uint64_t{model::ExecutionLimits::maximumBatchWidth} *
-                  kStateLayout.laneBytes() ==
-              1'424'490'496,
+  require(uint64_t{4} * kStateLayout.laneBytes() == 1'424'490'496,
           "four-lane byte formula is wrong");
   // A cached state's recurrent layer: a byte of code per value and a bf16
   // scale per 32 of them.
@@ -1129,8 +1127,8 @@ void run(const std::string &metallib) {
          lane < model::ExecutionLimits::maximumBatchWidth;
          ++lane)
       require(!storage.metadata(lane).assigned(), "lane was assigned eagerly");
-    rejects([&] { static_cast<void>(storage.current(4)); }, "invalid Qwen lane",
-            "storage exposed more than four lanes");
+    rejects([&] { static_cast<void>(storage.current(model::ExecutionLimits::maximumBatchWidth)); },
+            "invalid Qwen lane", "storage exposed more lanes than a step holds");
 
     require(static_cast<bool>(storage.tryActivateLane(0, 101)),
             "lane activation failed");

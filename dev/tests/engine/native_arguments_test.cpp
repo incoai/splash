@@ -153,12 +153,15 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"recalibrate_ane", [](NativeArguments &read) { read.recalibrateAne = true; }},
       {"activations_bf16", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // The defaults the server leaves out are the engine's: each meaning
       // names the value, so a change of the engine's default fails it.
       {"verify_rows_auto", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::Auto; }},
       {"activations_auto", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::On; }},
+      {"max_concurrent_requests", [](NativeArguments &read) { read.lanes = 8; }},
+      {"max_concurrent_requests_default", [](NativeArguments &read) { read.lanes = 4; }},
       {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
       {"state_format_default",
        [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
@@ -211,10 +214,12 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
+           read.neuralEngine == meant.neuralEngine && read.recalibrateAne == meant.recalibrateAne &&
+           read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations;
+           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations &&
+           read.lanes == meant.lanes;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -310,8 +315,12 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  refuses({"auto", "auto", "--ane-calibration", "on"}, "--ane-calibration requires again");
   for (const char *value : {"on", "off", "BF16", ""})
     refuses({"auto", "auto", "--activations", value}, "--activations requires auto or bf16");
+  for (const char *requests : {"0", "9", "-1", "eight", ""})
+    refuses({"auto", "auto", "--max-concurrent-requests", requests},
+            "--max-concurrent-requests requires an integer in [1, 8]");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
   // The server passes bytes, auto or off.

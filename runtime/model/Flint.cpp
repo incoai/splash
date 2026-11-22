@@ -1,6 +1,5 @@
 #include "model/Flint.hpp"
 
-#include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
 
 namespace splash::model {
@@ -8,15 +7,17 @@ namespace splash::model {
 // A layer image holds its input norm, its attention (readQwenAttention), the
 // attention's sinks, the norm before its FFN and the FFN: a leading layer's
 // dense gate, up and down, another's MoE block (readMoeBlock), whose blocks
-// are the MoE layers' in order (GgufImage.cpp FlintGguf).
+// are the MoE layers' in order (GgufImage.cpp FlintGguf, and
+// SafetensorsImage.cpp layer, by the geometry's attentionSinks, for an MLX
+// checkpoint).
 FlintWeights loadFlintWeights(metal::MetalBackend &backend, FlintLayout layout, const QwenTargetFiles &files) {
   return loadQwenTarget<FlintWeights>(
-      backend, layout, files, [&](GgufTargetLoader &gguf, const BlockTargetFormat &format, const MoeExperts &experts) {
+      backend, layout, files, [&](auto &loader, const BlockTargetFormat &format, const MoeExperts &experts) {
         FlintWeights result;
         result.layout = layout;
         result.layers.reserve(layout.layers);
         for (uint32_t index = 0; index < layout.layers; ++index) {
-          WeightFile file = gguf.layer(index);
+          WeightFile file = loader.layer(index);
           FlintLayerWeights &layer = result.layers.emplace_back();
           layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
           QwenAttentionWeights attention = readQwenAttention(file, format, layout);
@@ -34,7 +35,7 @@ FlintWeights loadFlintWeights(metal::MetalBackend &backend, FlintLayout layout, 
           file.finish();
           result.files.push_back(file.record());
         }
-        readQwenTargetHead(result, layout, gguf, format);
+        readQwenTargetHead(result, layout, loader, format);
         return result;
       });
 }

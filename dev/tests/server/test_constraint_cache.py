@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import threading
 import unittest
@@ -9,6 +10,15 @@ from dev.tests.server_fixtures import READY, grammar_tokenizers
 from server import constraints
 from server import server as api
 from server.chat_format import QWEN
+
+# A grammars' table of READY's vocabulary, for factories whose matchers the
+# tests replace.
+TABLE = SimpleNamespace(vocab_size=READY.vocabulary_size)
+
+
+def ready_for(table):
+    """READY with the vocabulary of a real table."""
+    return dataclasses.replace(READY, vocabulary_size=table.vocab_size)
 
 
 class ConstraintCacheTests(unittest.TestCase):
@@ -29,7 +39,6 @@ class ConstraintCacheTests(unittest.TestCase):
 
         constraint = mock.Mock(side_effect=lambda matcher, _format: matcher)
         for target, replacement in (
-            ("guidance_tokenizer", lambda *args, **kwargs: None),
             ("LLMatcher", Matcher),
             ("TokenConstraint", constraint),
         ):
@@ -39,7 +48,27 @@ class ConstraintCacheTests(unittest.TestCase):
                 constraints.ConstraintFactory, "CACHE_SOURCE_BYTES", budget
             )
         )
-        return constraints.ConstraintFactory(object(), READY)
+        return constraints.ConstraintFactory(TABLE, READY)
+
+    def test_table_takes_the_installations_vocabulary_and_the_formats_stops(self):
+        """The table is built before Ready, of the installation's vocabulary
+        and the chat format's stop texts."""
+        tokenizer, _ = grammar_tokenizers()
+        fast = SimpleNamespace(
+            encode=lambda text, add_special_tokens: [tokenizer.token_to_id(text)]
+        )
+        chat_format = SimpleNamespace(stop_tokens=("<eos>",))
+        with mock.patch.object(constraints, "guidance_tokenizer") as build:
+            build.return_value = SimpleNamespace(vocab_size=300)
+            table = constraints.ConstraintFactory.table(fast, chat_format, 300)
+        build.assert_called_once()
+        self.assertIs(build.call_args.args[0], fast)
+        self.assertEqual(build.call_args.kwargs["n_vocab"], 300)
+        self.assertEqual(
+            build.call_args.kwargs["eos_token"], [tokenizer.token_to_id("<eos>")]
+        )
+        ready = dataclasses.replace(READY, vocabulary_size=300)
+        self.assertIs(constraints.ConstraintFactory(table, ready).tokenizer, table)
 
     def test_byte_budget_evicts_lru_and_counts_utf8(self):
         factory = self.factory()
@@ -165,12 +194,7 @@ class ConstraintCacheTests(unittest.TestCase):
         from server import tool_schema
 
         _, guidance = grammar_tokenizers()
-        with mock.patch.object(
-            constraints,
-            "guidance_tokenizer",
-            return_value=guidance,
-        ):
-            factory = constraints.ConstraintFactory(object(), READY)
+        factory = constraints.ConstraintFactory(guidance, ready_for(guidance))
         unsatisfiable = {"type": "array", "minItems": 5, "maxItems": 2}
         # More grammar symbols than the compiler can index make it panic.
         array = {"type": "array", "maxItems": tool_schema.MAX_GRAMMAR_BOUND}
@@ -193,12 +217,7 @@ class ConstraintCacheTests(unittest.TestCase):
 
     def test_real_matchers_compile_and_copy_independently_under_concurrency(self):
         tokenizer, guidance = grammar_tokenizers()
-        with mock.patch.object(
-            constraints,
-            "guidance_tokenizer",
-            return_value=guidance,
-        ):
-            factory = constraints.ConstraintFactory(object(), READY)
+        factory = constraints.ConstraintFactory(guidance, ready_for(guidance))
         barrier = threading.Barrier(8)
 
         def generate(index):
@@ -227,11 +246,11 @@ class ConstraintCacheTests(unittest.TestCase):
 
             @staticmethod
             def validate_grammar(grammar, tokenizer):
-                testcase.assertEqual(tokenizer, "guidance-tokenizer")
+                testcase.assertIs(tokenizer, TABLE)
                 return "invalid" if grammar == "bad" else None
 
             def __init__(self, tokenizer, grammar, log_level=0):
-                testcase.assertEqual((tokenizer, log_level), ("guidance-tokenizer", 0))
+                testcase.assertEqual((tokenizer, log_level), (TABLE, 0))
                 self.grammar = grammar
                 self.builds.append(grammar)
 
@@ -245,17 +264,13 @@ class ConstraintCacheTests(unittest.TestCase):
             mock.patch.object(constraints.ConstraintFactory, "CACHE_SIZE", 2)
         )
         with (
-            mock.patch(
-                "server.constraints.guidance_tokenizer",
-                return_value="guidance-tokenizer",
-            ),
             mock.patch("server.constraints.LLMatcher", Matcher),
             mock.patch(
                 "server.constraints.TokenConstraint",
                 side_effect=lambda matcher, _format: (matcher,),
             ),
         ):
-            factory = constraints.ConstraintFactory(object(), READY)
+            factory = constraints.ConstraintFactory(TABLE, READY)
             first = factory.create("one")
             second = factory.create("one")
             factory.create("two")
@@ -297,14 +312,13 @@ class ConstraintCacheTests(unittest.TestCase):
                 return SimpleNamespace(grammar=self.grammar)
 
         with (
-            mock.patch("server.constraints.guidance_tokenizer", return_value=object()),
             mock.patch("server.constraints.LLMatcher", Matcher),
             mock.patch(
                 "server.constraints.TokenConstraint",
                 side_effect=lambda matcher, _format: matcher,
             ),
         ):
-            factory = constraints.ConstraintFactory(object(), READY)
+            factory = constraints.ConstraintFactory(TABLE, READY)
             with ThreadPoolExecutor(max_workers=4) as executor:
                 results = list(executor.map(factory.create, ["shared"] * 4))
 
@@ -337,14 +351,13 @@ class ConstraintCacheTests(unittest.TestCase):
             return [([1], "fine"), *extra]
 
         with (
-            mock.patch("server.constraints.guidance_tokenizer", return_value=object()),
             mock.patch("server.constraints.LLMatcher", Matcher),
             mock.patch(
                 "server.constraints.TokenConstraint",
                 side_effect=lambda matcher, _format: matcher,
             ),
         ):
-            factory = constraints.ConstraintFactory(object(), READY)
+            factory = constraints.ConstraintFactory(TABLE, READY)
             for _ in range(2):
                 with self.assertRaisesRegex(api.APIError, "^too wide$") as caught:
                     factory.create("wide", prefixes=lambda: prefixes(([9], "too wide")))

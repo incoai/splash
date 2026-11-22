@@ -21,19 +21,12 @@ namespace splash::engine {
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
 inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 
-// The pages of the KV runway in extents of extentPages pages: the whole
-// extents that hold the pages startup warmup runs on, which the KV pool
-// allocates when it is built.
-[[nodiscard]] constexpr uint64_t kvRunwayPages(uint32_t extentPages) noexcept {
-  return (uint64_t{model::ExecutionLimits::warmupKvPages} + extentPages - 1) /
-         extentPages * extentPages;
-}
-
 // What one request needs at the least: the fixed bytes, one lane's state and
-// the KV runway (smallest extents, lookup index too); nullopt on overflow.
+// the KV runway of `lanes` lanes (smallest extents, lookup index too);
+// nullopt on overflow.
 [[nodiscard]] std::optional<uint64_t>
 minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
-                     const kv::Layout &layout) noexcept;
+                     const kv::Layout &layout, uint32_t lanes) noexcept;
 
 // One request's KV capacity, in pages, of a budget of `pages` pages: the
 // whole extents of the size a pool of them takes (kv::Layout::extentPagesFor).
@@ -200,16 +193,28 @@ struct EngineMemoryPolicy {
                : minimumWorkingSetMarginBytes;
   }
 
+  // The automatic budget leaves this share of the Mac's memory unwired. At
+  // their default wired limit, the 16, 24, 36, 48 and 64 GB Macs measured
+  // leave 32, 30, 25, 24 and 21%, a 128 GB Mac about 12%; larger Macs were
+  // not measured. A 128 GB M5 Max whose `iogpu.wired_limit_mb` was raised,
+  // the engine and two other GPU processes wiring 96% of its memory,
+  // stalled 91 s in the kernel and panicked (#735).
+  static constexpr uint32_t unwiredFloorPercent = 10;
+
+  // The recommendation less the margin; automatically also no more than the
+  // Mac's memory less the unwired floor. An explicit `maximumMemoryBytes`
+  // is the user's, capped by the recommendation alone.
   [[nodiscard]] static constexpr uint64_t
   hardBudgetBytes(uint64_t recommendedWorkingSetBytes,
-                  uint64_t maximumMemoryBytes) noexcept {
+                  uint64_t maximumMemoryBytes, uint64_t physicalMemoryBytes) noexcept {
     const uint64_t margin = workingSetMarginBytes(recommendedWorkingSetBytes);
-    const uint64_t automatic = recommendedWorkingSetBytes > margin
-                                   ? recommendedWorkingSetBytes - margin
-                                   : 0;
-    return maximumMemoryBytes && maximumMemoryBytes < automatic
-               ? maximumMemoryBytes
-               : automatic;
+    const uint64_t recommended = recommendedWorkingSetBytes > margin
+                                     ? recommendedWorkingSetBytes - margin
+                                     : 0;
+    if (maximumMemoryBytes)
+      return maximumMemoryBytes < recommended ? maximumMemoryBytes : recommended;
+    const uint64_t floored = physicalMemoryBytes - physicalMemoryBytes / 100 * unwiredFloorPercent;
+    return floored < recommended ? floored : recommended;
   }
 
   // A bounded host cushion, independent of the engine's Metal capacity.
@@ -264,7 +269,9 @@ struct EngineMemoryBreakdown {
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
   uint64_t visionWeightsBytes = 0;
-  uint32_t maximumBatchWidth = model::ExecutionLimits::maximumBatchWidth;
+  // The lanes and the default's context (EngineMemoryPlan::compareDefaultLanes).
+  uint32_t maximumBatchWidth = model::ExecutionLimits::defaultLanes;
+  uint32_t defaultLanesContextTokens = 0;
   uint64_t laneStateBytes = 0;
   uint64_t sharedPrefillBytes = 0;
   uint64_t sharedDecodeBytes = 0;
@@ -388,6 +395,13 @@ public:
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
   // What admission decides which requests spill by (EngineSpillConfig).
   [[nodiscard]] SpillGeometry spillGeometry() const noexcept;
+  // Takes the context a first start of `defaultLanes`, the plan of the
+  // default's lanes, would serve, its most capped by `askedTokens`
+  // (--max-context, none uncapped), where it is more than `servedTokens`,
+  // this start's (EngineMemoryBreakdown::defaultLanesContextTokens), and
+  // returns it.
+  uint32_t compareDefaultLanes(const EngineMemoryPlan &defaultLanes, uint32_t servedTokens,
+                               uint32_t askedTokens) noexcept;
 
   // The plan as /status reports it (memory_plan): the device, the model and
   // the budget.

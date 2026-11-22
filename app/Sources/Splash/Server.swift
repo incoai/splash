@@ -40,8 +40,8 @@ final class Server {
 
     /// What a start does, as the server's serve record gives it: the server starts, reads the
     /// model's weights into memory, then runs the model once at full size so that its first answer
-    /// comes quickly; the first start after an update also prepares the GPU's programs then, which
-    /// can take a couple of minutes.
+    /// comes quickly; a model's first start on this install, new or updated, also prepares the GPU's
+    /// programs and measures the model's decode steps then, which can take a couple of minutes.
     enum Step: String {
         case starting = "Starting"
         case loading = "Loading weights"
@@ -50,7 +50,7 @@ final class Server {
         /// Why the step can take long, which the window says while it runs; nil for a step that
         /// doesn't.
         var note: String? {
-            self == .warming ? "The first start after an update prepares the GPU and can take a couple of minutes." : nil
+            self == .warming ? "A model's first start after an install or an update prepares the GPU and can take a couple of minutes." : nil
         }
 
         /// The step of a start at `phase`; nil once the start has ended.
@@ -102,6 +102,12 @@ final class Server {
     private(set) var recovering = false
     /// Once ready: the tokens the model's context holds, as the option set it or Auto fitted it.
     private(set) var context: Int?
+    /// Once ready: why the SSD cache the options asked for is off, in the engine's words, as on a
+    /// disk with too little room beyond the space it keeps free (`disk.off_reason`); nil while it
+    /// is on, or set Off.
+    private(set) var cacheOff: String?
+    /// What the server running pays in context for its concurrency limit, where it pays any.
+    private(set) var lanesCost: LanesCost?
     /// Once ready: whether the model takes images and PDFs, which come together (`input_modalities`).
     private(set) var acceptsImages = false
     /// Once ready: what a request to it may carry, as `/v1/models` says.
@@ -260,6 +266,8 @@ final class Server {
         asleep = false
         recovering = false
         context = nil
+        cacheOff = nil
+        lanesCost = nil
         activity = Activity()
         requests = []
         acceptsImages = false
@@ -374,7 +382,8 @@ final class Server {
     /// needs more memory than the limit set or this Mac gives; the context length set is more than
     /// the memory left, or the SSD cache, holds; other apps hold the memory, GPU memory or port it
     /// needs; an update holds Splash; its files could not be prepared, or Splash cannot serve them;
-    /// a failure of no class, which the log tells more of; else the failure's own message.
+    /// a failure of no class, which the log tells more of; a launch option's value the launcher
+    /// refused, by the option's title; else the failure's own message.
     nonisolated static func problem(_ failure: ServeRecord.Failure, port: Int) -> String {
         switch (failure.kind, failure.bound) {
         case ("memory_budget", "max_memory"):
@@ -407,9 +416,21 @@ final class Server {
             return "Splash can’t serve this model: \(failure.message)"
         case ("internal", _):
             return "It stopped: \(failure.message). The log has the details."
+        case ("configuration", _):
+            return refusedOption(failure.message) ?? failure.message
         default:
             return failure.message
         }
+    }
+
+    /// The launcher's refusal of a value on its command line, as argparse words it, "argument
+    /// --FLAG: MESSAGE", as the title of the launch option that sets FLAG and the message; nil for
+    /// any other message, as the engine's refusal of a context past the model's.
+    nonisolated static func refusedOption(_ message: String) -> String? {
+        guard let refusal = message.wholeMatch(of: /argument (--[a-z0-9-]+): (.+)/),
+              let option = LaunchOption.all.first(where: { $0.flag == refusal.1 })
+        else { return nil }
+        return "\(option.title): \(refusal.2)"
     }
 
     /// Follows this start's server through its start, as its serve record gives it, until it
@@ -460,6 +481,16 @@ final class Server {
         requests = ServedRequest.taking(report.live, taken: report.taken, into: requests)
         // A relaunched engine may serve less context than the first did.
         if let served = report.context { context = served }
+        cacheOff = report.cacheOff
+        lanesCost = report.lanesCost
+    }
+
+    /// The requests a server answers at once past the default's, the context it serves with them
+    /// and the context the default's four would leave (`memory_plan.budget`).
+    struct LanesCost: Equatable {
+        var lanes: Int
+        var context: Int
+        var defaultContext: Int
     }
 
     /// What the server's status says: the work it has done, whether it has given the weights back
@@ -470,6 +501,10 @@ final class Server {
         var recovering = false
         /// The tokens of context the server serves now.
         var context: Int?
+        /// Why the SSD cache asked for is off.
+        var cacheOff: String?
+        /// What its concurrency limit costs in context, where it costs any.
+        var lanesCost: LanesCost?
         /// The requests the engine works on, as they were at `taken`.
         var live: [LiveRequest] = []
         /// When the engine's requests were as `live` has them, at the earliest: as the status was
@@ -498,6 +533,13 @@ final class Server {
             asleep: status.weights?.released ?? false,
             recovering: status.transport?.recovering ?? false,
             context: status.capabilities?.max_context_tokens,
+            cacheOff: status.disk?.off_reason,
+            // The context it serves, against what four lanes would serve.
+            lanesCost: status.memory_plan?.budget.flatMap { budget in
+                guard let lanes = budget.maximum_batch_width, let more = budget.default_lanes_context_tokens,
+                      more > 0, let context = status.capabilities?.max_context_tokens else { return nil }
+                return LanesCost(lanes: lanes, context: context, defaultContext: more)
+            },
             // A request without the engine's id has none: no line or later status could be told
             // from it.
             live: (status.active_requests ?? []).compactMap { request in
@@ -540,6 +582,14 @@ final class Server {
         }
         struct Cache: Decodable { let reused_tokens: Int? }
         struct Memory: Decodable { let current_bytes: Int64? }
+        struct Disk: Decodable { let off_reason: String? }
+        struct MemoryPlan: Decodable {
+            struct Budget: Decodable {
+                let maximum_batch_width: Int?
+                let default_lanes_context_tokens: Int?
+            }
+            let budget: Budget?
+        }
         let capabilities: Capabilities?
         let weights: Weights?
         let transport: Transport?
@@ -547,7 +597,9 @@ final class Server {
         let active_requests: [Request]?
         let metrics: Metrics?
         let cache: Cache?
+        let memory_plan: MemoryPlan?
         let memory_actual: Memory?
+        let disk: Disk?
     }
 
     private struct ServedModel: Decodable {

@@ -14,12 +14,12 @@ namespace splash::test {
 // Each buffer a MoE plan reaches, at its extent and one element short: the
 // rows' bf16 input, residual and output, and every scratch field the plan's
 // workspace sizes, of expert ids, fp32 routing weights, tile descriptors, the
-// tile count, routes, route rows and expert slots, and bf16 grouped rows,
-// intermediates and outputs.
+// tile count, routes, route rows and expert slots, bf16 grouped rows,
+// intermediates and outputs, and the int8 passes' codes and scales.
 inline void requireMoeExtents(metal::MetalBackend &backend, const ops::MoeBuffers &buffers,
                               const ops::BlockMoeWeights &weights, const ops::MoePlan &plan) {
   constexpr std::array<uint64_t, ops::kMoeScratchFields.size()> elements{4, 4, sizeof(MoeTileDescriptor), 4, 4,
-                                                                          4, 4, 2, 2, 2};
+                                                                          4, 4, 2, 2, 2, 1, 8, 1, 8};
   const auto encode = [&](metal::CommandGraph &graph, const ops::MoeBuffers &changed) {
     addMoeStep(graph, changed, weights, plan);
   };

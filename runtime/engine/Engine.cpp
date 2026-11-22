@@ -704,7 +704,7 @@ bool Engine::admitQueued(double now) {
   const bool lanesFull =
       std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
         return entry.second.lane.has_value();
-      }) >= model::ExecutionLimits::maximumBatchWidth;
+      }) >= model_.commandLimits().lanes;
   bool laneSought = false;
   const auto waitForLane = [&](uint64_t id, Request &active) {
     scheduler_.waitForResources(id);
@@ -1173,7 +1173,11 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   }
   scheduler_.resourcesReady(active.request.id, resumeBoundary);
   cache_.recordLookup(lookup);
-  events_.started(active.request.id, resumeBoundary, *active.lane);
+  // A state no RAM holds is the SSD cache's copy (Cache::recordLookup).
+  const StateSource source = !lookup.state ? StateSource::None
+                             : lookup.state->state()->residentBytes() ? StateSource::Memory
+                                                                       : StateSource::Disk;
+  events_.started(active.request.id, {resumeBoundary, lookup.kvBoundary, source, lookup.lostState}, *active.lane);
   if (active.request.returnProgress) {
     active.reportedPromptTokens = resumeBoundary;
     events_.promptProgress(active.request.id, resumeBoundary);
@@ -1264,6 +1268,11 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   }
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
+  // The head's end, so that the next conversation sharing the head resumes there on first use. An ordinary state,
+  // which a reclaim writes to the SSD as any other.
+  if (const uint32_t head = active.request.headTokens / KvCache::pageTokens * KvCache::pageTokens;
+      head >= stateBoundary + kMinimumJunctionGain)
+    addStateBoundary(active, stateBoundary, head, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);
   // A resumed lane below its prompt's replay point lost that state; it

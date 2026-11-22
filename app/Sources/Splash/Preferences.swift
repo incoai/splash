@@ -343,6 +343,11 @@ extension LaunchOption {
                                         parse: { Int($0.trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? "\($0)G" : nil } },
                                         text: { String($0.dropLast()) }, title: { "\($0.dropLast()) GB" }))),
         LaunchOption(
+            flag: "--max-concurrent-requests", title: "Concurrency limit",
+            help: "How many requests the model answers at the same time. More give many chats or agents more words a second together, each a little slower, and take memory, which can stream more of the model from the disk or leave less context: where it leaves less, the app says how much while the model runs.",
+            section: .main,
+            kind: .choice(standard: "4", choices: [1, 2, 3, 5, 6, 7, 8].map { (String($0), String($0)) }, custom: nil)),
+        LaunchOption(
             flag: "--idle-release", title: "Free memory when idle",
             help: "An idle model frees its memory and loads again with the next message.",
             section: .main,
@@ -476,6 +481,13 @@ extension LaunchOption {
             help: "Replies and the model list give the first served model name rather than the model’s own.",
             section: .api, kind: .toggle(on: true),
             requires: [Requirement("Needs a served model name.") { $0["--served-model-name"] != nil }]),
+        LaunchOption(
+            flag: "--sampling-default", title: "Sampling defaults",
+            help: "The value of a sampling setting for requests that set none, as name=value, such as temperature=0.7.",
+            section: .api,
+            kind: .text(Value(prompt: "temperature=0.7",
+                              message: "Name=value pairs, split at commas, each name one of \(samplingNames.formatted(.list(type: .or))); top_k a whole number.",
+                              parse: { samplingDefaults($0) }), list: true)),
     ]
 
     private static let requests: [LaunchOption] = [
@@ -516,6 +528,11 @@ extension LaunchOption {
             help: "Reads long prompts faster on models that can use it.",
             section: .requests, kind: .toggle(on: false)),
         LaunchOption(
+            flag: "--recalibrate-ane", title: "Recalibrate Neural Engine",
+            help: "Measures again at each start how much of a long prompt the Neural Engine reads, which makes the start longer. Turn it on if long prompts read slower than they should, start the model once, then turn it off.",
+            section: .requests, kind: .toggle(on: true),
+            requires: [Requirement("Needs Neural Engine for long prompts on.") { $0["--disable-ane"] != "true" }]),
+        LaunchOption(
             flag: "--activations", title: "Activations",
             help: "Auto does some of the GPU’s math in 8 bits where M5 and later Macs run it faster, at a small cost in precision. 16-bit does none.",
             section: .requests, kind: .choice(standard: "Auto", choices: [("bf16", "16-bit")], custom: nil)),
@@ -545,6 +562,22 @@ extension LaunchOption {
                   let value = text.trimmingCharacters(in: .whitespaces).lowercased()
                   return value.wholeMatch(of: /\d+[smh]?/) != nil ? value : nil
               })
+    }
+
+    /// The sampling settings server/serve_options.py's `parse_sampling_default` takes.
+    private static let samplingNames = ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty", "min_p"]
+
+    /// `text` as name=value pairs split at commas and spaces, each a sampling setting and a number,
+    /// a whole one for top_k, as the server parses them, or nil for anything else. The server
+    /// refuses a value out of a setting's range as it starts.
+    private static let samplingDefaults: @Sendable (String) -> String? = { text in
+        let pairs = items(text)
+        let valid = pairs.allSatisfy { pair in
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, samplingNames.contains(String(parts[0])) else { return false }
+            return parts[0] == "top_k" ? Int(parts[1]) != nil : Double(parts[1]) != nil
+        }
+        return !pairs.isEmpty && valid ? pairs.joined(separator: ", ") : nil
     }
 
     private static let whole: @Sendable (String) -> String? = { Int($0.trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? String($0) : nil } }

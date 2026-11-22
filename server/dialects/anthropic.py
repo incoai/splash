@@ -683,6 +683,7 @@ def message_usage(prompt_tokens, output_tokens, cache, thinking_tokens=None):
     usage = {
         "input_tokens": prompt_tokens - cache.matched_tokens,
         "cache_read_input_tokens": cache.matched_tokens,
+        **cache.reuse(),
         "output_tokens": output_tokens,
     }
     if thinking_tokens is not None:

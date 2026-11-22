@@ -35,9 +35,10 @@ public:
     draftedTokens += drafted;
     acceptedDraftTokens += accepted;
   }
-  void started(uint64_t requestId, uint32_t matched, uint32_t) override {
+  void started(uint64_t requestId, const engine::StartFound &found, uint32_t) override {
     startIds.push_back(requestId);
-    starts.push_back(matched);
+    starts.push_back(found.matchedPromptTokens);
+    startsFound.push_back(found);
   }
   void promptProgress(uint64_t id, uint32_t processed) override {
     progress[id].push_back(processed);
@@ -83,6 +84,8 @@ public:
   std::unordered_map<uint64_t, std::vector<uint32_t>> progress;
   // The matched prompt tokens of each start, zero for a cold one.
   std::vector<uint32_t> starts;
+  // What each start found in the cache, in order.
+  std::vector<engine::StartFound> startsFound;
   std::vector<uint64_t> startIds;
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;

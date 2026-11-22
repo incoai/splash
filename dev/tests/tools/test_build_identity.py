@@ -517,6 +517,50 @@ class CompileConfigurationTests(unittest.TestCase):
             self.assertEqual(build_config.run_configured(output, "A", command), 0)
             self.assertTrue(build_config.matches(output, "A"))
 
+    # Every configuration group the Makefile checks for stale outputs: its
+    # configuration and its outputs.
+    CONFIG_GROUPS = (
+        ("CONFIG_DIGEST", "PRODUCTION_CONFIG_TARGETS"),
+        ("METAL_CONFIG_DIGEST", "HOST_STEP_LIB"),
+        ("PRODUCTION_AIR_CONFIG", "PRODUCTION_AIRS"),
+        ("PRODUCTION_LIB_CONFIG", "LIB"),
+        ("NATIVE_CONFIG_DIGEST", "PRODUCTION_FLAG_TOOLS"),
+        ("TEST_CONFIG_DIGEST", "TEST_CONFIG_TARGETS"),
+        ("SANITIZER_CONFIG_DIGEST", "SANITIZER_CONFIG_TARGETS"),
+        ("TEST_KERNEL_CONFIG", "TEST_KERNEL_CONFIG_TARGETS"),
+    )
+
+    def test_every_groups_outputs_are_judged_against_their_own_configuration(self):
+        # One tool call judges every group's outputs: every output recorded
+        # with its own group's configuration is current, and every output
+        # recorded with the previous group's is stale.
+        def database(build):
+            result = self.make("-pn", f"BUILD={build}", "platform-check")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return dict(re.findall(r"^(\w+) :?= (.*)$", result.stdout, re.MULTILINE))
+
+        def stale_when_recorded_with(build, variables, shift):
+            for index, (_, outputs) in enumerate(self.CONFIG_GROUPS):
+                recorded = variables[self.CONFIG_GROUPS[index - shift][0]]
+                for path in variables[outputs].split():
+                    record = build_config.record_path(path)
+                    record.parent.mkdir(parents=True, exist_ok=True)
+                    record.write_text(recorded + "\n")
+            return set(database(build)["STALE_CONFIG_TARGETS"].split())
+
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory) / "build"
+            variables = database(build)
+            outputs = set()
+            for index, (config, group) in enumerate(self.CONFIG_GROUPS):
+                with self.subTest(group=group):
+                    self.assertTrue(variables[group].split())
+                    other = variables[self.CONFIG_GROUPS[index - 1][0]]
+                    self.assertNotEqual(other, variables[config])
+                    outputs.update(variables[group].split())
+            self.assertEqual(stale_when_recorded_with(build, variables, 0), set())
+            self.assertEqual(stale_when_recorded_with(build, variables, 1), outputs)
+
 
 if __name__ == "__main__":
     unittest.main()

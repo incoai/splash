@@ -19,6 +19,8 @@ inline void splash_attention_split_phase(
     device bfloat *queries, device float *partials, device float *statistics,
     device const SplashKvPage *page_table0, device const SplashKvPage *page_table1,
     device const SplashKvPage *page_table2, device const SplashKvPage *page_table3,
+    device const SplashKvPage *page_table4, device const SplashKvPage *page_table5,
+    device const SplashKvPage *page_table6, device const SplashKvPage *page_table7,
     device const SplashTreeRow *tree, device const SplashLaneRows *layout, constant SplashAttentionParams &params,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum, threadgroup float *previous_scale,
@@ -38,7 +40,7 @@ inline void splash_attention_split_phase(
     return;
   splash_paged_attention_tile<KVHeads, QueryHeadsPerKVHead, SPLASH_ATTENTION_TILE_ROWS / Parts, HeadDim, Window,
                               CacheElement, Int8Queries>(
-      queries + tile.offset, SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3),
+      queries + tile.offset, SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7),
       params.kv, kv_head, tile.first_position, tile.active_rows, tile.splits, split, partials, statistics,
       tile.first_slot + split, scores, probabilities, row_max, row_sum, previous_scale, rescale,
       splash_attention_tree(params, sequence, rows, tree, tile.first_position), thread_index);
@@ -85,10 +87,10 @@ inline void splash_attention_reduce_phase(
       device const SplashKvPage *page_table0 [[buffer(3)]],                                                   \
       device const SplashKvPage *page_table1 [[buffer(4)]],                                                   \
       device const SplashKvPage *page_table2 [[buffer(5)]],                                                   \
-      device const SplashKvPage *page_table3 [[buffer(6)]],                                                   \
-      device const SplashTreeRow *tree [[buffer(7)]],                                                         \
-      device const SplashLaneRows *layout [[buffer(8)]],                                                      \
-      constant SplashAttentionParams &params [[buffer(9)]],                                                   \
+      device const SplashKvPage *page_table3 [[buffer(6)]], device const SplashKvPage *page_table4 [[buffer(7)]], device const SplashKvPage *page_table5 [[buffer(8)]], device const SplashKvPage *page_table6 [[buffer(9)]], device const SplashKvPage *page_table7 [[buffer(10)]],                                                   \
+      device const SplashTreeRow *tree [[buffer(11)]],                                                         \
+      device const SplashLaneRows *layout [[buffer(12)]],                                                      \
+      constant SplashAttentionParams &params [[buffer(13)]],                                                   \
       uint3 group [[threadgroup_position_in_grid]],                                                           \
       uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
     constexpr uint M = Group * SPLASH_ATTENTION_TILE_ROWS / SPLASH_ATTENTION_TILE_PARTS(Group);               \
@@ -100,7 +102,7 @@ inline void splash_attention_reduce_phase(
     threadgroup float previous_scale[M];                                                                      \
     threadgroup atomic_uint rescale;                                                                          \
     splash_attention_split_phase<Heads, Group, HeadDim, Window, CacheElement, Int8Queries>(                   \
-        queries, partials, statistics, page_table0, page_table1, page_table2, page_table3, tree, layout,     \
+        queries, partials, statistics, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7, tree, layout,     \
         params, scores, probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index);      \
   }
 

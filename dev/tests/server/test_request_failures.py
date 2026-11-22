@@ -197,6 +197,45 @@ class RequestFailureTests(HarnessTestCase):
             "plain answer\n",
         )
 
+    def test_a_disconnect_while_a_stream_writes_nothing_cancels(self):
+        # The output projector holds an integer argument until its close, so
+        # the stream has nothing to write that could fail; the request still
+        # finds the client gone and cancels.
+        plan = Plan([[13]] + [[14]] * 400, delay=0.01)
+        runtime = FakeRuntime(plan)
+        harness = self.harness(runtime, timeout=30)
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "integer"}},
+                    },
+                },
+            }
+        ]
+        connection = http.client.HTTPConnection(
+            *harness.server.server_address, timeout=5
+        )
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            json.dumps(chat_body(stream=True, reasoning_effort="none", tools=tools)),
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        response.readline()
+        self.assertTrue(plan.started.wait(2))
+        closed_at = time.monotonic()
+        response.close()
+        connection.close()
+        while runtime.cancel_count == 0 and time.monotonic() < closed_at + 3:
+            time.sleep(0.01)
+        self.assertEqual(runtime.cancel_count, 1)
+
     def test_stream_disconnect_before_headers_cancels(self):
         waiting = Plan([[4]], block=True, before_start=True)
         runtime = FakeRuntime(waiting)

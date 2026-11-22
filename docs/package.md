@@ -40,8 +40,13 @@ bottle on a supported Mac without developer tools; building from the source tree
 is not an installation check.
 
 The runtime package allowlists engine, Python, server and launcher files; tests,
-benchmarks and developer documents are excluded. User model links survive
-upgrades; downloads remain in the Hugging Face cache.
+benchmarks and developer documents are excluded. It ships its modules'
+bytecode, compiled at the build, as the runtime writes none and each process
+would otherwise compile what it imports (a one-shot `splash --version` starts
+in 47 ms instead of 170, the server's imports take 0.53 s instead of 1.14); it
+is checked by no time stamp, as the signed runtime's sources never change, and
+each build writes the same bytes. User model links survive upgrades; downloads
+remain in the Hugging Face cache.
 
 ## Desktop app
 
@@ -70,6 +75,9 @@ job, with its output appended to a log in `~/Library/Logs/Splash`:
 `splash serve --model ID --port PORT --offline` serves an installed one, with
 the launch options picked in the app that differ from the server's defaults,
 ready once that process's [serve record](server.md#serve-record) says it is,
+which the app reads in its own home's Application Support, the account's
+whatever `HOME` says, and so runs the runtime's commands with that home as
+their `HOME`, where a packaged runtime keeps its data (`install/paths.py`),
 or that it already starts a failed engine again, which the Server shows as
 recovering; while the engine warms up,
 the record counts its steps, and the Server shows them with why the first
@@ -140,7 +148,9 @@ model or with the context length on Auto. Its chat is its own, not the chat page
 own in that folder's `Attachments`, so a conversation outlives a switch of
 models. A message attaches images and PDFs, a PDF shown by its name and pages,
 where the model takes them, and is held back where the limits `/v1/models`
-gives leave them out. Each chat keeps its own draft, the new chat too; New Chat
+gives leave them out. Each chat keeps its own draft, the new chat too, kept in
+that folder's `Drafts.plist` a second after the typing pauses and as the app
+quits, so that the drafts come back as the app opens again; New Chat
 takes along a draft the open chat's context cannot hold, as the composer says to
 start a new chat for it, unless the new chat holds a draft of its own. A
 message is its chat's once the server takes it, which
@@ -169,8 +179,8 @@ a terminal runs; one from a script, the system as it logs out, a signal or an
 update quits at once. Its icon is `app/AppIcon.icon`, an Icon Composer document
 `actool` compiles, which needs the full Xcode; its mark, three arcs of water
 springing from a rippled surface, is the menu bar's too (`SplashMark`), and the
-chat page's (`server/favicon.svg`). `swift test --package-path app` runs its
-tests; with `SPLASH_RUNTIME` naming a packaged runtime and `SPLASH_APP_MODELS`
+chat page's (`server/favicon.svg`). `make check-app` runs its tests, one at a
+time; with `SPLASH_RUNTIME` naming a packaged runtime and `SPLASH_APP_MODELS`
 installed models, they also drive the app end to end and, with
 `SPLASH_APP_SNAPSHOTS`, render its windows to that folder.
 

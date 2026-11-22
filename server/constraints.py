@@ -4,7 +4,6 @@ import threading
 from concurrent.futures import Future, wait
 
 from llguidance import LLMatcher, LLTokenizer
-from llguidance.hf import from_tokenizer as guidance_tokenizer
 from llguidance.numpy import allocate_token_bitmask, fill_next_token_bitmask
 
 from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
@@ -12,6 +11,15 @@ from .errors import APIError, ConstraintError
 from .lru import LRUCache
 from .protocol import NO_PARENT
 from .tokenization import added_tokens
+
+
+def guidance_tokenizer(tokenizer, **options):
+    """llguidance's table of a fast tokenizer (llguidance.hf.from_tokenizer).
+    Imported when a table is built: llguidance.hf imports transformers, which
+    the server imports only once its engine has started (server.main)."""
+    from llguidance.hf import from_tokenizer
+
+    return from_tokenizer(tokenizer, **options)
 
 
 class TokenConstraint:
@@ -50,11 +58,17 @@ class TokenConstraint:
         protocol.MaskResponseFrame carries: a cycle whose retained path ends
         at a row, its anchor's at least, proposes them next, and a first
         token's request reads its one row. The grammar walks the tree depth
-        first in one matcher, each token consumed over its parent's state and
-        rolled back after its subtree. A token the grammar rejects there, or
-        a stop token, which ends the output, is a row the target never
-        accepts, nor any row below it; those rows take their parent's mask,
-        which admits a token as every mask must, and force nothing."""
+        first and only forward: the committed matcher fills row 0 and moves
+        on by commits alone, the tree is walked on a copy of it, and a row
+        with several children gives each but the last a copy of its own
+        matcher. No matcher takes a token back: LLGuidance 1.8.0 keeps the
+        last mask it computed keyed by the lexer state and the parser's row
+        index, which another branch reaches again after a rollback with other
+        parser rows under it, and then gets the mask of the branch it left
+        (the fix, llguidance #390, is in no release). A token the grammar
+        rejects, or a stop token, which ends the output, is a row the target
+        never accepts, nor any row below it; those rows take their parent's
+        mask, which admits a token as every mask must, and force nothing."""
         self._consume_committed()
         rows = len(simulation_tokens) + 1
         if rows > self.rows:
@@ -65,8 +79,10 @@ class TokenConstraint:
         for row, parent_row in enumerate(follows, 1):
             children[parent_row].append(row)
         reached, forced = [False] * rows, [()] * rows
-        self._reach(0, reached, forced)
-        self._walk(0, simulation_tokens, children, reached, forced)
+        self._reach(self.matcher, 0, reached, forced)
+        if simulation_tokens:
+            walker = self.matcher.deep_copy()
+            self._walk(walker, 0, simulation_tokens, children, reached, forced)
         # A parent's row comes before its children's.
         for row in range(1, rows):
             if not reached[row]:
@@ -83,7 +99,7 @@ class TokenConstraint:
         )
         return self.bitmask[:rows].tobytes(), pairs
 
-    def _reach(self, row, reached, forced):
+    def _reach(self, matcher, row, reached, forced):
         """Mask row `row` of the matcher's state and, where the engine reads
         them, the tokens the grammar forces there: after each verify row's
         path (mask rows from 1, as a cycle retains its anchor at least), or
@@ -94,27 +110,24 @@ class TokenConstraint:
         would otherwise send a response past its frame and close the
         connection, as a run of 13 tokens, a named tool call's opening, did
         an 8-token request's when a request simulated 8 tokens."""
-        fill_next_token_bitmask(self.matcher, self.bitmask, row)
+        fill_next_token_bitmask(matcher, self.bitmask, row)
         reached[row] = True
         if row or len(forced) == 1:
-            forced[row] = tuple(self.matcher.compute_ff_tokens()[: self.rows - 1])
+            forced[row] = tuple(matcher.compute_ff_tokens()[: self.rows - 1])
 
-    def _walk(self, row, tokens, children, reached, forced):
-        """Fills the rows below mask row `row`, whose state the matcher is
-        in, and leaves it there."""
-        for child in children[row]:
+    def _walk(self, matcher, row, tokens, children, reached, forced):
+        """Fills the rows below mask row `row`, whose state `matcher` is in:
+        the last child goes on in it, each other child in a copy. A token
+        the grammar refuses leaves its matcher where it was."""
+        last = len(children[row]) - 1
+        for index, child in enumerate(children[row]):
             token = tokens[child - 1]
-            if (
-                0 <= token < self.vocabulary
-                and token not in self.eos_tokens
-                and self.matcher.try_consume_tokens([token])
-            ):
-                self._reach(child, reached, forced)
-                self._walk(child, tokens, children, reached, forced)
-                if not self.matcher.rollback(1):
-                    raise ConstraintError(
-                        "output grammar did not take back a simulated token"
-                    )
+            if not 0 <= token < self.vocabulary or token in self.eos_tokens:
+                continue
+            branch = matcher if index == last else matcher.deep_copy()
+            if branch.try_consume_tokens([token]):
+                self._reach(branch, child, reached, forced)
+                self._walk(branch, child, tokens, children, reached, forced)
 
     def _consume_committed(self):
         with self._lock:
@@ -182,6 +195,15 @@ def validate_tokenizer(tokenizer, chat_format):
             )
 
 
+def stop_token_ids(tokenizer, chat_format):
+    """The tokens the tokenizer encodes the chat format's stop texts as, one
+    each (validate_tokenizer), which the engine's Ready must state too."""
+    return tuple(
+        tokenizer.encode(stop, add_special_tokens=False)[0]
+        for stop in chat_format.stop_tokens
+    )
+
+
 def check_capabilities(tokenizer, chat_format, ready):
     """Once the engine is Ready, refuse a tokenizer that does not fit what it
     serves: its vocabulary must fit the engine's, its stop texts encode as
@@ -195,10 +217,7 @@ def check_capabilities(tokenizer, chat_format, ready):
         raise TokenizerContractError(
             "tokenizer vocabulary does not fit the native model"
         )
-    stops = tuple(
-        tokenizer.encode(stop, add_special_tokens=False)[0]
-        for stop in chat_format.stop_tokens
-    )
+    stops = stop_token_ids(tokenizer, chat_format)
     if sorted(stops) != sorted(ready.stop_token_ids):
         raise TokenizerContractError(
             f"the tokenizer encodes the stop texts {chat_format.stop_tokens} as "
@@ -233,16 +252,28 @@ class ConstraintFactory:
     CACHE_SIZE = 32
     CACHE_SOURCE_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, tokenizer, ready):
-        # The engine's Ready, whose vocabulary, stop tokens and mask rows its
-        # constraints are sized by.
-        self.ready = ready
-        self.tokenizer = guidance_tokenizer(
+    @staticmethod
+    def table(tokenizer, chat_format, vocabulary):
+        """llguidance's table of `tokenizer`, which every grammar's masks
+        cover: the installation's `vocabulary` (assembly.vocabulary) and the
+        chat format's stop tokens. The server builds it while the engine
+        loads its weights (server.main): it takes 0.82 s on a 32-core M5
+        Max."""
+        return guidance_tokenizer(
             tokenizer,
-            n_vocab=ready.vocabulary_size,
-            eos_token=list(ready.stop_token_ids),
+            n_vocab=vocabulary,
+            eos_token=list(stop_token_ids(tokenizer, chat_format)),
             slices=LLTokenizer.json_slices(),
         )
+
+    def __init__(self, table, ready):
+        # The engine's Ready, whose vocabulary, stop tokens and mask rows its
+        # constraints are sized by, and the table built before it (table) of
+        # the installation's vocabulary, which the engine checks against its
+        # own as it loads; its stop tokens are those check_capabilities found
+        # the Ready's.
+        self.ready = ready
+        self.tokenizer = table
         # Compiled matchers by grammar, within a budget of grammar bytes.
         self.cache = LRUCache(self.CACHE_SOURCE_BYTES, self.CACHE_SIZE)
         self.lock = threading.Lock()

@@ -222,6 +222,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.priority = request.priority;
     engineRequest.prompt = std::move(request.promptTokens);
     engineRequest.generationPromptTokens = request.generationPromptTokens;
+    engineRequest.headTokens = request.headTokens;
     engineRequest.images = std::move(request.imageSpans);
     engineRequest.imagePixels = std::move(request.imagePixels);
     engineRequest.maxNewTokens = request.logicalMaxOutputTokens;
@@ -397,11 +398,12 @@ void NativeRuntime::batchCompleted(WorkKind kind, uint32_t width,
                                   wallMilliseconds, cycleMilliseconds);
 }
 
-void NativeRuntime::started(uint64_t requestId, uint32_t matchedTokens,
+void NativeRuntime::started(uint64_t requestId, const engine::StartFound &found,
                             uint32_t lane) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   telemetry.startedMilliseconds = config_.monotonicMilliseconds();
-  send(protocol::StartEvent{requestId, lane, matchedTokens});
+  send(protocol::StartEvent{requestId, lane, found.matchedPromptTokens, found.prefixTokens,
+                            found.stateSource, found.lostState});
 }
 
 void NativeRuntime::promptProgress(uint64_t requestId,

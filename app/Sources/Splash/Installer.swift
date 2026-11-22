@@ -27,11 +27,17 @@ final class Installer {
     }
 
     /// A failure the installer reports as it ends: its class, which the app words, and its own
-    /// message for the rest; for a disk without room, that names the bytes needed and free.
+    /// message for the rest, which the log keeps.
     struct Failure: Decodable, Equatable {
-        /// "not_found", "offline" and "auth" are worded by the app; any other shows the message.
+        /// "not_found", "offline", "interrupted", "auth" and "disk" are worded by the app; any
+        /// other shows the message.
         let kind: String?
         let message: String
+        /// For a disk without room before the download, the bytes the model's download still
+        /// needs and those free on the Hugging Face cache's volume (install/hub.py _require_room);
+        /// none for one that filled during it.
+        var needed: Int64?
+        var available: Int64?
 
         /// The failure a line of the installer's output reports, if it is an error event.
         init?(line: String) {
@@ -97,14 +103,26 @@ final class Installer {
         }
     }
 
-    /// A failure installing `model`, in words a user can act on.
+    /// A failure installing `model`, in words a user can act on. A disk without room is worded for
+    /// the model asked for, whichever of its repositories was downloading, its draft's first: by its
+    /// figures, where the check before the download found it: what it needs and how much more than
+    /// is free, two figures that read apart however they round; without, where the disk filled
+    /// during it.
     nonisolated static func problem(_ failure: Failure, model: String) -> String {
         let name = model.split(separator: ":")[0]
         switch failure.kind {
+        case "disk":
+            if let needed = failure.needed, let available = failure.available {
+                return "It needs \(Format.size(needed)) of disk space, \(Format.size(needed - available)) more than is free. "
+                    + "Free some space, then try again."
+            }
+            return "The disk is full. Free some space, then try again."
         case "not_found":
             return "Hugging Face has no public model named \(name). Check the name, then try again."
         case "offline":
             return "Splash couldn’t reach Hugging Face. Check the internet connection, then try again."
+        case "interrupted":
+            return "The connection to Hugging Face dropped during the download. Check the internet connection, then try again."
         case "auth":
             return "Hugging Face refused access to \(name). Sign in with an account that can read it (hf auth login) and, "
                 + "if the model asks, accept its terms at huggingface.co/\(name), then try again."

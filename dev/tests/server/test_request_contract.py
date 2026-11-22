@@ -236,6 +236,18 @@ class RequestContractTests(HarnessTestCase):
             "call_42",
         )
 
+    def test_a_message_of_an_unknown_role_is_refused_not_dropped(self):
+        for role in ("usr", "assistan", "USER", None):
+            with self.subTest(role=role):
+                with self.assertRaisesRegex(APIError, "unsupported message role"):
+                    normalize_messages(
+                        [
+                            {"role": "user", "content": "Hi"},
+                            {"role": role, "content": "lost?"},
+                        ],
+                        vision=True,
+                    )
+
     def test_history_reads_reasoning_and_text_parts_as_clients_send_them(self):
         image = "data:image/png;base64,AAAA"
         normalized = normalize_messages(

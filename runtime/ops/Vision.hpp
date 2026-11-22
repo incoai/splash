@@ -2,6 +2,8 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "ops/DenseLinear.hpp"
+#include "ops/Normalization.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -29,33 +31,23 @@ struct VisionLayout final {
   bool operator==(const VisionLayout &) const = default;
 };
 
-struct VisionAffine final {
-  metal::MetalBuffer weight;
-  metal::MetalBuffer bias;
-};
-
-struct VisionNorm final {
-  metal::MetalBuffer weight;
-  metal::MetalBuffer bias;
-};
-
 struct VisionBlock final {
-  VisionNorm norm1;
-  VisionAffine qkv;
-  VisionAffine projection;
-  VisionNorm norm2;
-  VisionAffine upProjection;
-  VisionAffine downProjection;
+  LayerNormWeights norm1;
+  DenseWeights qkv;
+  DenseWeights projection;
+  LayerNormWeights norm2;
+  DenseWeights upProjection;
+  DenseWeights downProjection;
 };
 
 struct VisionWeights final {
   VisionLayout layout;
-  VisionAffine patchEmbedding;
+  DenseWeights patchEmbedding;
   metal::MetalBuffer positionTable;
   std::vector<VisionBlock> blocks;
-  VisionNorm mergerNorm;
-  VisionAffine mergerUpProjection;
-  VisionAffine mergerDownProjection;
+  LayerNormWeights mergerNorm;
+  DenseWeights mergerUpProjection;
+  DenseWeights mergerDownProjection;
 };
 
 // Input geometry shared by the frontend and runtime: RGB patch size and the
@@ -91,17 +83,17 @@ struct ImageGrid final {
 
 // GPU vision encoder with one reusable scratch arena sized for maximumPatches.
 // encode() appends one image's dispatches, from resized uint8 RGB pixels to
-// bf16 language embeddings in the caller's buffer, so the arena can be
-// released after encoding while later chunks copy the image's rows into their
-// hidden rows (ops::RowCopy).
+// bf16 language embeddings in the caller's buffer, a row of
+// layout.outputHiddenSize per merged token, so the arena can be released
+// after encoding while later chunks copy the image's rows into their hidden
+// rows (ops::RowCopy). The tower's projections, LayerNorms and attention are
+// the shared dense operators (ops/DenseLinear.hpp, ops/Normalization.hpp,
+// ops/DenseAttention.hpp).
 class Vision final {
 public:
   // Scratch footprint before construction, so the caller can reserve it.
   [[nodiscard]] static uint64_t
   scratchBytes(const VisionLayout &layout, uint32_t maximumPatches);
-  // Embedding buffers are written in whole merger tiles: the caller allocates
-  // this many rows of layout.outputHiddenSize bf16 values per image.
-  [[nodiscard]] static uint32_t embeddingRows(ImageGrid grid) noexcept;
 
   // Throws unless `model` holds every weight of the tower its layout names.
   Vision(metal::MetalBackend &backend, const VisionWeights &model,
@@ -133,7 +125,6 @@ private:
     Queries,
     Keys,
     Values,
-    Attention,
     Context,
     Count,
   };
@@ -141,19 +132,9 @@ private:
   [[nodiscard]] const metal::MetalBuffer &scratch(Scratch tensor) const noexcept {
     return scratch_[static_cast<uint32_t>(tensor)];
   }
-  void addGemm(metal::CommandGraph &graph, const char *pipeline,
-               const metal::MetalBuffer &input,
-               const VisionAffine &weights,
-               const metal::MetalBuffer &output,
-               const metal::MetalBuffer &residual, uint32_t outputSize,
-               uint32_t inputSize, uint32_t rows, uint32_t tileRows,
-               uint32_t tileColumns) const;
-  void addNorm(metal::CommandGraph &graph, const metal::MetalBuffer &input,
-               const VisionNorm &weights,
-               const metal::MetalBuffer &output, uint32_t rows) const;
-
   const VisionWeights &model_;
   uint32_t maximumPatches_ = 0;
+  DenseLinear dense_;
   metal::MetalBuffer arena_;
   metal::MetalBuffer scratch_[static_cast<uint32_t>(Scratch::Count)];
 };

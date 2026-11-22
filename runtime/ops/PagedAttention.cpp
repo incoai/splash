@@ -45,8 +45,9 @@ uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
 //   each row as well as over the whole history, for an AttentionVariant of
 //   that window; 0 without.
 // Its q/k norm kernels take the norm types its families store (normKernel):
-// F32 and bf16, or F32 alone for the geometries of families that load from
-// GGUFs only (Qwen3.8-Flash-Next's, Flint's).
+// F32 and bf16, or F32 alone for the geometries of families whose norms load
+// as F32 from GGUFs and MLX images alike (Qwen3.8-Flash-Next's, Flint's:
+// model/SafetensorsImage.hpp float32Norms).
 struct CompiledAttention final {
   uint32_t queryHeads;
   uint32_t kvHeads;

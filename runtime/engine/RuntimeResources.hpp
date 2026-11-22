@@ -166,6 +166,8 @@ struct RuntimeResourcesConfig {
   // benchmark round verifies every row of a draft's block a lane (all) so
   // that rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --max-concurrent-requests: the lanes the runtime runs and plans for.
+  uint32_t lanes = model::ExecutionLimits::defaultLanes;
   // --activations: whether the plans may round activations to int8
   // where an int8-activation path takes them, or keep every activation bf16
   // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
@@ -324,12 +326,22 @@ public:
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }
-  // The share the prefill FFN's Neural Engine split runs at and the least
-  // rows of a chunk it takes; 0 for none.
-  [[nodiscard]] double aneFfnShare() const noexcept { return aneFfn_ ? aneFfn_->share() : 0.0; }
+  // The larger share the prefill FFN's Neural Engine split runs at, of one
+  // step or two, and the least rows of a command it takes; 0 for none.
+  [[nodiscard]] double aneFfnShare() const noexcept {
+    using Steps = ops::AneFfn::Steps;
+    return aneFfn_ ? std::max(aneFfn_->share(Steps::One), aneFfn_->share(Steps::Two)) : 0.0;
+  }
   [[nodiscard]] uint32_t aneFfnMinimumRows() const noexcept { return aneFfn_ ? aneFfn_->minimumRows() : 0; }
   // How the start's split came out, and the automatic context.
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
+  // Whether the start left the split to set up once `runtime`, the engine's,
+  // has prefilled a full chunk on the GPU alone; and setting it up then, on
+  // `runtime`'s prefill buffers, with that prefill's `prefillMilliseconds`
+  // of GPU time (engine::finishAneFfn), which `runtime` takes from its next
+  // command on (model::RuntimeModel::setAneFfn).
+  [[nodiscard]] bool aneFfnPending() const noexcept { return aneFfnPending_.has_value(); }
+  void finishAneFfn(double prefillMilliseconds, model::RuntimeModel &runtime);
   // The split as it stands now, for /status.
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
   // The streamed PLE table's store (--ple-memory), if the model has one.
@@ -369,7 +381,7 @@ private:
                    std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+                   AneFfnStart aneFfn, kv::Format kvFormat, std::string buildId, std::function<bool()> cancelled,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
                    model::VerifyRows verifyRows);
@@ -406,6 +418,12 @@ private:
   // Over model_'s images, its expert store if it has one, and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
+  // The start's split left to set up (aneFfnPending), and what its model
+  // needs then: the KV format, the build and the start's cancellation.
+  std::optional<AneFfnStart> aneFfnPending_;
+  kv::Format kvFormat_;
+  std::string buildId_;
+  std::function<bool()> cancelled_;
   // --kv-spill always.
   bool spillAlways_ = false;
   // --verify-rows, which modelContext() passes on.
@@ -417,16 +435,26 @@ private:
   bool probationStopped_ = false;
 };
 
+// Where the model's side of the split (aneFfnModel) times and prepares it:
+// with `buffers`, on the prefill buffers of a dense FFN and the hidden rows
+// its layers alternate between that `buffers` hands its use, the engine's
+// own; without, on a prefill arena allocated for each call. Its programs wait
+// for the ANE's service until `cancelled` returns true.
+struct AneFfnTiming final {
+  using Use = std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)>;
+  std::function<bool()> cancelled;
+  std::function<void(const Use &)> buffers;
+};
+
 // The model's side of the split of `loaded`'s target on `backend`, valid
-// while `backend`, `loaded` and `operators` are: its timing and prepared split
-// run on a prefill arena of their own, its programs wait for the ANE's
-// service until `cancelled` returns true, and its calibrations are
-// remembered beside the programs (ane::recall) under its layers' shapes and
-// formats and the Int8Activations its GPU part plans with
-// (ops::AneFfn::calibrationKey), the device, the macOS version, the engine's
-// `buildId` and the most units the plan holds.
+// while `backend`, `loaded` and `operators` are: it times and prepares the
+// split as `timing` says, and its calibrations are remembered beside the
+// programs (ane::recall) under its layers' shapes and formats and the
+// Int8Activations its GPU part plans with (ops::AneFfn::calibrationKey), the
+// device, the macOS version, the engine's `buildId` and the most units the
+// plan holds.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
-                                      std::string_view buildId, std::function<bool()> cancelled);
+                                      std::string_view buildId, AneFfnTiming timing);
 
 } // namespace splash::engine

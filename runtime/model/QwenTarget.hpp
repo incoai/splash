@@ -87,6 +87,19 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
   ops::NormWeights finalNorm;
 };
 
+// The rows every tensor a decode step's plans store rows in holds, for steps
+// of up to `lanes` lanes: the most the decode tiles store a step of the most
+// rows in (ops::stagedStorageRows), its rows on the staged tile and its row
+// groups, and past 32 rows the int8 tiles' groups of 32 (96 rows at five
+// lanes, 128 at seven): the decode arena's row and target step tensors, and a
+// target's own step scratch (Qwen4Steps).
+[[nodiscard]] constexpr uint32_t decodeStorageRows(uint32_t lanes) noexcept {
+  static_assert(ExecutionLimits::stepRows(SPLASH_MAXIMUM_BATCH_WIDTH) <= ops::kMaximumStagedRows,
+                "the decode tiles hold a decode step of the most lanes");
+  const uint32_t rows = ExecutionLimits::stepRows(lanes);
+  return std::max(ops::stagedStorageRows(rows, false), ops::stagedStorageRows(rows, false, true));
+}
+
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
 // targets: the target's dimensions, the layers the draft reads and what its
 // loaded weights add. It describes semantics only; operators remain
@@ -102,9 +115,24 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       std::ranges::copy(captureLayers, captureLayerValues.begin());
   }
 
+  // The lanes the runtime runs, its concurrency limit, which its arenas
+  // and a target's own scratch hold, as its start chose them
+  // (RuntimeResourcesConfig::lanes).
+  uint32_t lanes = ExecutionLimits::defaultLanes;
+  // The most rows of its decode steps (ExecutionLimits::stepRows).
+  [[nodiscard]] constexpr uint32_t stepRows() const noexcept { return ExecutionLimits::stepRows(lanes); }
   // The format of the sparse MoE blocks' routers, which their plans follow
   // (ops::moeRouterFormat).
   uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
+  // Whether the blocks' experts take the int8 prefill passes: their formats
+  // (ops::moeInt8Experts), and resident (RuntimeGeometry::from).
+  bool moeInt8Experts = false;
+  // The blocks' shape as their plans take it.
+  [[nodiscard]] ops::MoeShape moeShape() const noexcept {
+    ops::MoeShape shape = moeBlockShape();
+    shape.int8Experts = moeInt8Experts;
+    return shape;
+  }
   // The layers whose output rows the DFlash2 draft reads, ascending.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
@@ -452,22 +480,17 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
-  // Lanes of storage, a draft's block of rows each, the vocabulary
-  // projection binds over a draft step of `lanes` lanes, which runs the
-  // target's head: its tile may hold more rows than the step's
-  // (LinearPlan::storageRows; a three-lane step on the staged tile runs its
-  // 32-row tile over four lanes). The head still processes the step's lanes;
-  // padding rows read stale activations and write results no row reads.
-  [[nodiscard]] uint32_t headStorageLanes(uint32_t lanes) const;
   // A prefill command of one or more chunks (a prefill group), run layer by
   // layer: a layer of each chunk in turn, then the next layer, so that a
   // layer whose experts stream loads the union of the chunks' experts once.
   // A chunk's sequences read the states and KV that the chunks before it
   // wrote, in `kv`, and a sequence whose history holds Index pages reads its
   // K/V through `spilled` (the command's SpilledKvReads, the null one for
-  // none). The dense FFN of a command of one chunk the split takes
-  // (AneFfn::splits) runs split with the Neural Engine on `aneFfn`, when
-  // given. Of the command, this runs `layers`, all of them or a pass's:
+  // none). The dense FFN of a command the split takes (AneFfn::splits) runs
+  // split with the Neural Engine on `aneFfn`, when given: a command of one
+  // chunk, or of the two its first step's rows cut it into
+  // (AneFfn::firstStepRows), whose layers pipeline (addPrefillLayers). Of
+  // the command, this runs `layers`, all of them or a pass's:
   // what the layers before left in the chunks' buffers and the target's
   // prefill scratch the layers after read on, from another command, with no
   // other prefill between. With the last layer, returns each chunk's buffer
@@ -593,11 +616,12 @@ protected:
                                                std::span<const QwenTargetPrefillChunk> chunks,
                                                const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                QwenPrefillLayers layers, ops::AneFfn *aneFfn) const {
-    requirePrefill(chunks, kv, layers, aneFfn);
+    ops::AneFfn *split = splitOf(chunks, layers, aneFfn);
+    requirePrefill(chunks, kv, layers);
     std::vector<Step> steps;
     steps.reserve(chunks.size());
     for (const QwenTargetPrefillChunk &chunk : chunks)
-      steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, aneFfn)});
+      steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, split)});
     return steps;
   }
   // A prefill's layers `range` over its steps (addPrefill), through a
@@ -628,6 +652,13 @@ protected:
     for (uint32_t index = range.first; index < range.end; ++index) {
       const uint32_t attentionLayer = steps.front().attentionLayer;
       for (Step &step : steps) layers.addPrefillLayer(step, index);
+      // The last step's split FFN joins once the first step's next mixer is
+      // encoded, so that the Neural Engine runs it beside that mixer
+      // (AneFfn); here where no other step's mixer comes next, or where the
+      // layer's output rows are read before it.
+      if (auto *split = steps.front().aneFfn;
+          split && (steps.size() == 1 || index + 1 == range.end || geometry_.captureSlot(index)))
+        split->join(steps.front().graph);
       if (steps.front().attentionLayer != attentionLayer)
         steps.front().spilled.layerEnd(steps.front().graph, attentionLayer);
       const ops::BlockMoeWeights *ffn = layers.moe(index);
@@ -683,10 +714,30 @@ protected:
   void addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
                             metal::MetalBuffer residual, metal::MetalBuffer output) const;
   // The head of a target whose last layer's rows read a final RMS norm,
-  // `finalNorm`, into `finalHidden`, as addHeadBatch takes them.
-  void addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm, metal::MetalBuffer hidden,
-                         metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t rows,
-                         ops::LinearScratch scratch) const;
+  // `finalNorm`, into `finalHidden`, as addHeadBatch takes them, on
+  // `linear`'s plans (addHead).
+  void addNormalizedHead(metal::CommandGraph &graph, const ops::Linear &linear, const ops::NormWeights &finalNorm,
+                         metal::MetalBuffer hidden, metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
+                         uint32_t rows, ops::LinearScratch scratch) const;
+  // The vocabulary head of `rows` rows of `input` into fp32 logits on
+  // `linear`, its command's plans as every other projection's (a decode
+  // step's linear(step), a batch of first tokens' operators_.linear()), and
+  // the layout its producer writes (`prepared` describes it). A step of more
+  // rows than one decode tile holds (more than four lanes) runs it in passes
+  // of at most ops::kMaximumDecodeTileRows rows, each reading the weights
+  // again: on a 12-core M6 the 27B's Q6_K head took 19.1 ms at 128 rows in
+  // two passes against 27.0 on the staged tile's two row groups, which took
+  // 13.9 against 17.5 at 96 rows (level or faster on a 20-core M5 Pro and an
+  // M4).
+  [[nodiscard]] ops::LinearInput headInput(const ops::Linear &linear, uint32_t rows) const;
+  void addHead(metal::CommandGraph &graph, const ops::Linear &linear, metal::MetalBuffer input,
+               metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch,
+               ops::PreparedInput prepared) const;
+  // The plans of a step's projections: a decode step's or a prompt chunk's
+  // (ops::StepKind).
+  [[nodiscard]] const ops::Linear &linear(const PrefillStep &step) const noexcept {
+    return step.decode ? operators_.decodeLinear() : operators_.linear();
+  }
   // Copies `rows` rows of a layer's output rows, from row `sourceRow` of
   // `output`, into capture slot `slot` of the captured hidden rows from row
   // `destinationRow`: the draft's capture of a layer whose output is one row
@@ -725,7 +776,11 @@ protected:
 
 private:
   void requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
-                      QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const;
+                      QwenPrefillLayers layers) const;
+  // `aneFfn` where it splits the command of `chunks`, which it then takes
+  // whole and cut as its first step's rows say; null where it does not.
+  [[nodiscard]] ops::AneFfn *splitOf(std::span<const QwenTargetPrefillChunk> chunks, QwenPrefillLayers layers,
+                                     ops::AneFfn *aneFfn) const;
   [[nodiscard]] PrefillStep prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                         const kv::PageStorage &kv, SpilledKvReads &spilled,
                                         ops::AneFfn *aneFfn) const;

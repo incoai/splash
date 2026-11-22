@@ -422,6 +422,9 @@ void testQuantization(const std::filesystem::path &fixtures) {
            {dense, "language_model.model.layers.0.linear_attn.in_proj_qkv"},
            {dense, "language_model.model.layers.0.mlp.up_proj"},
            {dense, "language_model.lm_head"},
+           // By mlx-lm's names, which a config does not tell from mlx-vlm's.
+           {dense, "model.layers.3.self_attn.q_proj"},
+           {dense, "lm_head"},
            {moe, "language_model.model.layers.0.mlp.switch_mlp.down_proj"},
            {moe, "language_model.model.layers.0.mlp.shared_expert.gate_proj"},
        })
@@ -779,7 +782,7 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     require(at != std::string::npos, "the config has no " + std::string(from));
     return json.replace(at, from.size(), to);
   };
-  // Qwen3.8-Flash-Next loads from a GGUF only; its metadata also states the
+  // Qwen3.8-Flash-Next from a GGUF: its metadata also states the
   // hyper-connections, the QSA indexer and the PLE n-gram embedding.
   const std::string flashConfig = text(fixtures / "qwen3.8-flash-next" / "config.json");
   const GgufHeaders flashHeaders = ggufHeaders(model::Qwen4ExpLayout{});
@@ -802,8 +805,15 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashHeaders, otherReduction)); },
           "draft config dflash_config target_hidden_reduction mismatch: checkpoint none, runtime stream_mean",
           "a draft of another reduction was accepted");
+  // mlx-community's MLX checkpoint (its quantization trimmed to a few
+  // layers' entries) is the family too, with its vision tower; the GGUF's
+  // config, which holds the sizes alone, is no MLX checkpoint's.
+  const std::string flashMlxConfig = text(fixtures / "qwen3.8-flash-next" / "mlx-config.json");
+  require(check("mlx-affine", "safetensors", flashMlxConfig, std::nullopt, flashDraft) == "Qwen3.8-Flash-Next" &&
+              check("mlx-affine", "none", flashMlxConfig, std::nullopt, std::nullopt) == "Qwen3.8-Flash-Next",
+          "Qwen3.8-Flash-Next's MLX config was not found to be its family");
   rejects([&] { static_cast<void>(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt)); },
-          "Qwen3.8-Flash-Next loads from a GGUF only", "Qwen3.8-Flash-Next was accepted from MLX");
+          "text config", "Qwen3.8-Flash-Next's GGUF config was accepted as an MLX checkpoint's");
   // Its scalars and its arrays, each layer's QSA compress ratio and the PLE
   // layer, are the planner's.
   std::vector<int32_t> ratios(48, 0);
@@ -1002,8 +1012,16 @@ void testFlint(const std::filesystem::path &fixtures) {
   for (const uint32_t token : {150018u, 150144u, 248077u})
     refuses(masked(token), "is not one of the target's reserved tokens 150019 to 150143",
             "a Flint draft's mask token outside the reserved tokens was accepted");
-  refuses(flint.with(&SourceModel::record, R"("gguf")", R"("mlx-affine")"), "Flint loads from a GGUF only",
-          "an MLX Flint was accepted");
+  // mlx-community's MLX Flint (its quantization trimmed to a few layers'
+  // entries) makes the same layout from safetensors; the release's
+  // config.json, which states no quantization, is no MLX checkpoint.
+  SourceModel mlx = flint.with(&SourceModel::record, R"("gguf")", R"("mlx-affine")");
+  refuses(mlx, "this model requires an MLX checkpoint", "an MLX Flint without its quantization was accepted");
+  mlx.config = text(fixtures / "flint" / "mlx-config.json");
+  const model::ModelDescriptor mlxDescriptor = inspect(mlx);
+  require(mlxDescriptor.targetSource == model::TargetSource::Safetensors && mlxDescriptor.family() == "Flint" &&
+              mlxDescriptor.target == descriptor.target && mlxDescriptor.valid(),
+          "an MLX Flint made another descriptor than its GGUF");
   // Each key Flint's values make is held to them by name.
   struct Refused final {
     std::string_view from, to, error;

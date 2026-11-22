@@ -328,6 +328,7 @@ class Plan:
         after_terminal=False,
         matched_tokens=1,
         logits=None,
+        start=None,
     ):
         self.batches = list(batches)
         self.reason = reason
@@ -336,6 +337,13 @@ class Plan:
         self.delay = delay
         self.matched_tokens = matched_tokens
         self.logits = logits
+        # What the start found beside matched_tokens: prefix tokens, state
+        # source and lost state; by default the matched prefix, in RAM.
+        self.start = start or (
+            matched_tokens,
+            wire.StateSource.MEMORY if matched_tokens else wire.StateSource.NONE,
+            False,
+        )
         self.started = threading.Event()
         self.release = threading.Event()
         if not block:
@@ -466,6 +474,10 @@ class FakeRuntime:
     def pending_count(self):
         return sum(not call.done for call in self.calls)
 
+    def start(self):
+        # The fake starts no engine: wait_ready reads it as the test sets it.
+        pass
+
     def wait_ready(self, timeout=None):
         # The fake starts no engine: it is as ready as the test sets it.
         return self.ready
@@ -511,7 +523,7 @@ class FakeRuntime:
         plan.start_release.wait(2)
         if call.done:
             return
-        call.emit(wire.StartEvent(call.request_id, 0, plan.matched_tokens))
+        call.emit(wire.StartEvent(call.request_id, 0, plan.matched_tokens, *plan.start))
         plan.started.set()
         plan.release.wait(2)
         if plan.exception:
@@ -895,6 +907,7 @@ def main_args(**overrides):
             "served_model_name": [],
             "announce_served_name": False,
             "reasoning_effort": None,
+            "sampling_default": [],
             "default_reasoning_effort": None,
             "thinking_token_budget": None,
             "thinking_end_text": None,
@@ -907,7 +920,9 @@ def main_args(**overrides):
             "persistent_cache": False,
             "cache_dir": None,
             "decode_share": None,
+            "max_concurrent_requests": serve_options.DEFAULT_CONCURRENT_REQUESTS,
             "disable_ane": False,
+            "recalibrate_ane": False,
             "activations": "auto",
             "verify_rows": "auto",
             "max_image_pixels": images.MAX_PIXELS,
@@ -938,10 +953,11 @@ def main_args(**overrides):
 def unprepared_hold(family="Qwen3.8-27B"):
     """main()'s hold of its model directory, for a test of a directory Splash
     did not prepare: the directory as it is, held by nothing, and a model of
-    `family` by its family's name."""
+    `family` by its family's name, of the Qwen families' vocabulary."""
     with (
         mock.patch.object(api.assembly, "hold", side_effect=lambda path: (path, None)),
         mock.patch.object(api.assembly, "family", return_value=families.named(family)),
+        mock.patch.object(api.assembly, "vocabulary", return_value=248320),
     ):
         yield
 

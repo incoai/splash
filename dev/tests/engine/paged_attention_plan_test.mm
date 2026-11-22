@@ -172,8 +172,9 @@ void checkSplitRule(uint32_t queryHeads, kv::Layout layout) {
 // A command's sequences share dispatches while their tiles' splits fit the
 // workspace, in order, each sequence in one, and keep the splits each takes
 // alone. The plan of their last tiles keeps every sequence's splits and
-// kernels. A decode step's four lanes at the most splits fit four lanes'
-// workspaces in one dispatch, and a decode lane of up to 16 rows one lane's.
+// kernels. A decode step's lanes, as many as a batch holds, at the most
+// splits fit as many lanes' workspaces in one dispatch, and a decode lane of
+// up to 16 rows one lane's.
 void checkGrouping(uint32_t queryHeads, kv::Layout layout) {
   const std::array sequences{sequenceOf(4000, 13), sequenceOf(0, 1), sequenceOf(65'536, 40), sequenceOf(300, 5)};
   const auto together = planOf(sequences, queryHeads, layout);
@@ -209,16 +210,17 @@ void checkGrouping(uint32_t queryHeads, kv::Layout layout) {
     require(tails.sequences()[s].firstTile == kv::attentionTiles(sequences[s].chunk_tokens) - 1 &&
                 tails.sequences()[s].splits == together.sequences()[s].splits,
             "a sequence's last tile does not keep its splits");
-  std::array<kv::ChunkedPrefillParams, 4> lanes{};
-  for (uint32_t lane = 0; lane < 4; ++lane) lanes[lane] = sequenceOf(1'000'000 - lane, kLaneRows);
-  const auto step = planOf(lanes, queryHeads, layout, kBf16, 4 * kv::kAttentionMaximumSplits);
-  require(step.dispatches().size() == 1 && step.dispatches()[0].slots == 4 * kv::kAttentionMaximumSplits,
+  constexpr uint32_t kStepSlots = SPLASH_MAXIMUM_BATCH_WIDTH * kv::kAttentionMaximumSplits;
+  std::array<kv::ChunkedPrefillParams, SPLASH_MAXIMUM_BATCH_WIDTH> lanes{};
+  for (uint32_t lane = 0; lane < lanes.size(); ++lane) lanes[lane] = sequenceOf(1'000'000 - lane, kLaneRows);
+  const auto step = planOf(lanes, queryHeads, layout, kBf16, kStepSlots);
+  require(step.dispatches().size() == 1 && step.dispatches()[0].slots == kStepSlots,
           "a decode step's lanes at the most splits do not attend in one dispatch");
   // A decode lane of up to SPLASH_TARGET_VERIFY_ROWS rows takes at most a
   // lane's workspace, kAttentionMaximumSplits tile splits, after any history
   // up to the longest context: its one tile up to 128 splits, or a 9-16-row
-  // lane's two tiles up to 32 each. Four 16-row lanes at the longest context
-  // attend in one dispatch of four lanes' workspaces.
+  // lane's two tiles up to 32 each. A batch of 16-row lanes at the longest
+  // context attends in one dispatch of as many lanes' workspaces.
   for (uint32_t rows = 1; rows <= SPLASH_TARGET_VERIFY_ROWS; ++rows)
     for (const uint32_t history : {0U, 65'536U, 131'072U, SPLASH_MAXIMUM_CONTEXT_TOKENS - rows}) {
       const uint32_t tiles = kv::attentionTiles(rows);
@@ -227,13 +229,13 @@ void checkGrouping(uint32_t queryHeads, kv::Layout layout) {
               "a decode lane's splits exceed a lane's workspace: " + std::to_string(rows) + " rows after " +
                   std::to_string(history));
     }
-  for (uint32_t lane = 0; lane < 4; ++lane)
+  for (uint32_t lane = 0; lane < lanes.size(); ++lane)
     lanes[lane] = sequenceOf(SPLASH_MAXIMUM_CONTEXT_TOKENS - SPLASH_TARGET_VERIFY_ROWS - lane,
                              SPLASH_TARGET_VERIFY_ROWS);
-  const auto wide = planOf(lanes, queryHeads, layout, kBf16, 4 * kv::kAttentionMaximumSplits);
-  require(wide.dispatches().size() == 1 && wide.dispatches()[0].slots <= 4 * kv::kAttentionMaximumSplits,
+  const auto wide = planOf(lanes, queryHeads, layout, kBf16, kStepSlots);
+  require(wide.dispatches().size() == 1 && wide.dispatches()[0].slots <= kStepSlots,
           "a decode step's 16-row lanes at the longest context do not attend in one dispatch");
-  for (const size_t count : {size_t{0}, size_t{5}}) {
+  for (const size_t count : {size_t{0}, size_t{SPLASH_MAXIMUM_BATCH_WIDTH + 1}}) {
     const std::vector<kv::ChunkedPrefillParams> many(count, sequenceOf(0, 8));
     rejects([&] { (void)planOf(many, queryHeads, layout); }, "invalid attention sequences",
             "an attention of no sequences or more than a batch was accepted");
@@ -282,17 +284,17 @@ struct Case final {
   uint32_t queryHeads;
   kv::Layout layout;
   uint32_t lanes;
-  std::array<uint32_t, 4> rows{};
-  std::array<uint32_t, 4> seeds{};
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> rows{};
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> seeds{};
   HostKvExtents pool;
   SplashKvLayer layer{};
   metal::MetalBuffer keys;
   metal::MetalBuffer values;
   metal::MetalBuffer queries;
-  std::array<metal::MetalBuffer, 4> tables;
+  std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> tables;
   // Each lane's page ids, which its table holds as entries.
-  std::array<std::vector<uint32_t>, 4> pages;
-  std::array<kv::ChunkedPrefillParams, 4> stores{};
+  std::array<std::vector<uint32_t>, SPLASH_MAXIMUM_BATCH_WIDTH> pages;
+  std::array<kv::ChunkedPrefillParams, SPLASH_MAXIMUM_BATCH_WIDTH> stores{};
   // QSA block masks (sparse layouts): maskWords words per row of the
   // command's rows, lane by lane; none when maskWords is 0.
   std::vector<uint32_t> mask;
@@ -405,7 +407,7 @@ struct Lane final {
 // the same bits.
 Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout layout, std::span<const Lane> lanes,
               bool oneExtent = false) {
-  std::array<uint32_t, 4> pageCounts{};
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> pageCounts{};
   uint32_t allPages = 0, extent = 0;
   for (size_t lane = 0; lane < lanes.size(); ++lane) {
     pageCounts[lane] = (lanes[lane].history + lanes[lane].most() + 31) / 32;
@@ -421,7 +423,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout layo
                       : HostKvExtents(backend, poolLayout, spread.extentPages, spread.extents),
             {}, {}, {}, {}, {}, {}, {}, {}, 0};
   data.layer = data.pool.layer(kLayer);
-  data.layoutRows = allocate(backend, 4 * sizeof(SplashLaneRows));
+  data.layoutRows = allocate(backend, SPLASH_MAXIMUM_BATCH_WIDTH * sizeof(SplashLaneRows));
   uint32_t firstPage = 0;
   for (size_t lane = 0; lane < lanes.size(); ++lane) {
     const auto [rows, history, seed, bound] = lanes[lane];
@@ -483,7 +485,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout layo
                           1018.0f);
     }
   }
-  for (uint32_t lane = data.lanes; lane < 4; ++lane) {
+  for (uint32_t lane = data.lanes; lane < SPLASH_MAXIMUM_BATCH_WIDTH; ++lane) {
     data.tables[lane] = data.tables[0];
     data.pages[lane] = data.pages[0];
   }
@@ -1122,8 +1124,10 @@ void checkPackedLanes(metal::MetalBackend &backend, uint32_t heads, kv::Layout l
     }
   };
   for (const std::vector<Lane> &command :
-       {std::vector<Lane>{{1, 300, 0, 8}, {8, 4093, 1, 8}, {5, 0, 2, 8}, {3, 1023, 3, 8}},
-        std::vector<Lane>{{16, 2049, 4, 16}, {9, 31, 5, 16}, {1, 6145, 6, 16}, {12, 700, 7, 16}},
+       {std::vector<Lane>{{1, 300, 0, 8}, {8, 4093, 1, 8}, {5, 0, 2, 8}, {3, 1023, 3, 8}, {8, 0, 15, 8},
+                          {2, 6145, 16, 8}, {6, 31, 17, 8}, {1, 2049, 18, 8}},
+        std::vector<Lane>{{16, 2049, 4, 16}, {9, 31, 5, 16}, {1, 6145, 6, 16}, {12, 700, 7, 16}, {2, 9000, 11, 16},
+                          {6, 4093, 12, 16}, {7, 1, 13, 16}, {10, 255, 14, 16}},
         std::vector<Lane>{{3, 100, 8, 16}, {16, 0, 9, 16}}, std::vector<Lane>{{13, 16'384, 10, 16}}}) {
     auto data = makeCase(backend, heads, layout, command);
     if (masks) setQsaMasks(data);
@@ -1162,14 +1166,15 @@ void checkPackedLanes(metal::MetalBackend &backend, uint32_t heads, kv::Layout l
 }
 
 // The reduce's out-projection rows of a decode step's lanes of a cap of 16
-// rows holding 1, 16, 9 and 6 (ops::AttentionRows), each with gates of its
-// own in its packed row: every row its attention row (the rows of gates of
-// +inf, whose sigmoid is 1) times its query head's gate's sigmoid, rounded
-// once to bf16 (within its ulp, for the device's exp2), and with Table16 the
-// out-projection's table and sums of the rows, bit for bit as the
-// projection's own preparation of them makes them.
+// rows holding 1, 16, 9, 6, 11, 3, 16 and 2 (ops::AttentionRows), each with
+// gates of its own in its packed row: every row its attention row (the rows
+// of gates of +inf, whose sigmoid is 1) times its query head's gate's
+// sigmoid, rounded once to bf16 (within its ulp, for the device's exp2), and
+// with Table16 the out-projection's table and sums of the rows, bit for bit
+// as the projection's own preparation of them makes them.
 void checkPackedGate(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout layout) {
-  const std::vector<Lane> lanes{{1, 300, 0, 16}, {16, 31, 1, 16}, {9, 700, 2, 16}, {6, 0, 3, 16}};
+  const std::vector<Lane> lanes{{1, 300, 0, 16},  {16, 31, 1, 16},  {9, 700, 2, 16},  {6, 0, 3, 16},
+                                {11, 4093, 4, 16}, {3, 2049, 5, 16}, {16, 100, 6, 16}, {2, 6145, 7, 16}};
   auto data = makeCase(backend, queryHeads, layout, lanes);
   if (selectsBlocks(layout)) setQsaMasks(data);
   const std::vector<uint16_t> attention = run(backend, data, {.int8 = kBf16});
@@ -1207,7 +1212,7 @@ void checkPackedGate(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
               !std::memcmp(scratch.sums.contents(), expected.sums.contents(), scratch.sums.sizeBytes()),
           "the reduce's table differs from the projection's preparation of its rows");
   std::cout << "gated rows: format=" << kv::formatName(layout.format) << " q=" << queryHeads
-            << " lanes of 1, 16, 9 and 6 rows of 16, Table16 PASS\n";
+            << " lanes of 1, 16, 9, 6, 11, 3, 16 and 2 rows of 16, Table16 PASS\n";
 }
 
 // The q/k RMS norms, RoPE and K/V store of the attention prepare against
@@ -1710,10 +1715,12 @@ void attentionBlocks(metal::MetalBackend &backend) {
       // layout.
       const auto bindsLists = [&](const metal::ComputeDispatch &split, const metal::ComputeDispatch &reduce,
                                   uint32_t after) {
-        return split.buffers.size() == 9 + 3 + after && split.buffers[7].buffer.sameView(partials) &&
-               split.buffers[8].buffer.sameView(laneRows) && split.buffers[9].buffer.sameView(boundLists) &&
-               split.buffers[10].buffer.sameView(boundCounts) && split.buffers[11].buffer.sameView(partials) &&
-               split.bytes.size() == 1 && split.bytes[0].index == 12 + after && reduce.buffers.size() == 8 &&
+        // The lanes' page tables from index 3, then the tree rows' place.
+        constexpr uint32_t t = 3 + SPLASH_MAXIMUM_BATCH_WIDTH;
+        return split.buffers.size() == t + 5 + after && split.buffers[t].buffer.sameView(partials) &&
+               split.buffers[t + 1].buffer.sameView(laneRows) && split.buffers[t + 2].buffer.sameView(boundLists) &&
+               split.buffers[t + 3].buffer.sameView(boundCounts) && split.buffers[t + 4].buffer.sameView(partials) &&
+               split.bytes.size() == 1 && split.bytes[0].index == t + 5 + after && reduce.buffers.size() == 8 &&
                reduce.buffers[2].buffer.sameView(packed) && reduce.buffers[3].buffer.sameView(hidden) &&
                reduce.buffers[4].buffer.sameView(hidden) && reduce.buffers[5].buffer.sameView(hidden) &&
                reduce.buffers[6].buffer.sameView(laneRows) && reduce.buffers[7].buffer.sameView(boundCounts) &&
@@ -1739,8 +1746,8 @@ void attentionBlocks(metal::MetalBackend &backend) {
         metal::CommandGraph located;
         attend(located, {listBuffer, counts, listStride, first, locations, locationPages});
         const metal::ComputeDispatch &split = located.dispatches()[0];
-        require(bindsLists(split, located.dispatches()[1], 2) && split.buffers[12].buffer.sameView(locations) &&
-                    split.buffers[13].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
+        require(bindsLists(split, located.dispatches()[1], 2) && split.buffers[8 + SPLASH_MAXIMUM_BATCH_WIDTH].buffer.sameView(locations) &&
+                    split.buffers[9 + SPLASH_MAXIMUM_BATCH_WIDTH].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
                 "a located split does not bind its lists' locations and their pages before its parameters");
         rejects([&] { attend(refused, {listBuffer, counts, listStride, first, locations, {}}); },
                 "attention block locations need their pages", "block locations without pages were taken");
@@ -1771,10 +1778,11 @@ void attentionBlocks(metal::MetalBackend &backend) {
     metal::CommandGraph masked, listless, unmasked;
     attendTree(masked, {listBuffer, counts, entries, first, {}, {}, rowMasks});
     attendTree(listless, {listBuffer, counts, 0, 0, {}, {}, rowMasks});
-    require(masked.dispatches()[0].buffers[7].buffer.sameView(treeRows) &&
-                masked.dispatches()[0].buffers[8].buffer.sameView(treeLayout) &&
-                masked.dispatches()[0].buffers[11].buffer.sameView(rowMasks) &&
-                listless.dispatches()[0].buffers[11].buffer.sameView(partials),
+    constexpr uint32_t t = 3 + SPLASH_MAXIMUM_BATCH_WIDTH;
+    require(masked.dispatches()[0].buffers[t].buffer.sameView(treeRows) &&
+                masked.dispatches()[0].buffers[t + 1].buffer.sameView(treeLayout) &&
+                masked.dispatches()[0].buffers[t + 4].buffer.sameView(rowMasks) &&
+                listless.dispatches()[0].buffers[t + 4].buffer.sameView(partials),
             "a sparse split of tree rows does not bind their row masks after its lists' counts");
     rejects([&] { attendTree(unmasked, {listBuffer, counts, entries, first}); },
             "attention row masks buffer holds 0 bytes, needs 64", "tree rows took lists without row masks");
@@ -2060,19 +2068,28 @@ void ropeTargetScaling(metal::MetalBackend &backend) {
 // path's row at depth k moves from its slot, committed plus its row, to
 // committed plus k: its keys, values and, INT8, both scales, each from the
 // bytes before the commit (lane 1's rows 2, 3 and 7 move to 1, 2 and 3,
-// where row 3's target is row 2's source). Every other byte of the pool stays: the
-// rows the path leaves, lanes whose paths are chains (lane 0 the anchor
-// alone, lane 3 every row) and the layers and heads around the moved ones.
-// Lanes' blocks straddle pages of three extents, through tables of
+// where row 3's target is row 2's source; lane 5's row 15 moves to 1 across a
+// page; lane 6's every other row moves; lane 7's rows 13 and 14 move to 2 and
+// 3, its block across a page). Every other byte of the pool stays: the rows the path
+// leaves, lanes whose paths are chains (lane 0 the anchor alone, lane 3 every
+// row, lane 4 three rows) and the layers and heads around the moved ones. A
+// batch's lanes' blocks straddle pages of three extents, through tables of
 // scattered pages.
 void checkPathCommit(metal::MetalBackend &backend, kv::Layout layout) {
   layout.attentionLayers = 3;
   const std::string what = std::string("KV path commit ") + std::string(kv::formatName(layout.format)) + " kv" +
                            std::to_string(layout.kvHeads) + " d" + std::to_string(layout.headDimension) +
                            (layout.valuesTokenMajor ? " token-major values" : "");
-  constexpr uint32_t kLanes = 4, kRows = SPLASH_TARGET_VERIFY_ROWS;
-  const std::array<uint32_t, kLanes> committed{0, 25, 63, 100};
-  const std::array<uint32_t, kLanes> paths{0b1, 0b10001101, 0b1000001000100001, test::chainPath(kRows)};
+  constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH, kRows = SPLASH_TARGET_VERIFY_ROWS;
+  const std::array<uint32_t, kLanes> committed{0, 25, 63, 100, 7, 30, 130, 255};
+  const std::array<uint32_t, kLanes> paths{0b1,
+                                           0b10001101,
+                                           0b1000001000100001,
+                                           test::chainPath(kRows),
+                                           test::chainPath(3),
+                                           0b1000000000000001,
+                                           0b0101010101010101,
+                                           0b0110000000000011};
   std::array<std::vector<uint32_t>, kLanes> pages;
   uint32_t total = 0;
   for (uint32_t lane = 0; lane < kLanes; ++lane) total += (committed[lane] + kRows + kv::kPageTokens - 1) / kv::kPageTokens;
@@ -2196,10 +2213,14 @@ int main(int argc, char **argv) {
     const std::array chunk{ops::PagedAttention::chunkParams(100, 37, 64, 5)};
     const std::array mixed{ops::PagedAttention::chunkParams(0, 5, 32, 1), ops::PagedAttention::chunkParams(3, 13, 32, 1),
                            ops::PagedAttention::chunkParams(40, 8, 32, 2)};
-    // A decode step's lanes of a cap of 16 rows, holding 1, 16, 9 and 3.
-    const std::array capped{ops::PagedAttention::chunkParams(0, 16, 32, 1), ops::PagedAttention::chunkParams(9, 16, 32, 1),
-                            ops::PagedAttention::chunkParams(31, 16, 32, 2), ops::PagedAttention::chunkParams(70, 16, 32, 3)};
-    constexpr std::array<uint32_t, 4> cappedRows{1, 16, 9, 3};
+    // A decode step's lanes of a cap of 16 rows, holding 1, 16, 9, 3, 12, 2,
+    // 16 and 7.
+    const std::array capped{
+        ops::PagedAttention::chunkParams(0, 16, 32, 1),    ops::PagedAttention::chunkParams(9, 16, 32, 1),
+        ops::PagedAttention::chunkParams(31, 16, 32, 2),   ops::PagedAttention::chunkParams(70, 16, 32, 3),
+        ops::PagedAttention::chunkParams(100, 16, 32, 4),  ops::PagedAttention::chunkParams(255, 16, 32, 9),
+        ops::PagedAttention::chunkParams(500, 16, 32, 17), ops::PagedAttention::chunkParams(1023, 16, 32, 33)};
+    constexpr std::array<uint32_t, capped.size()> cappedRows{1, 16, 9, 3, 12, 2, 16, 7};
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
       for (const Geometry geometry : kGeometries)
         for (bool float32 : splash::test::familyNorms(geometry)) {
@@ -2238,9 +2259,10 @@ int main(int argc, char **argv) {
         for (const std::vector<Lane> &lanesOfTails :
              {std::vector<Lane>{{1, 0, 0}}, std::vector<Lane>{{17, 255, 0}}, std::vector<Lane>{{1057, 4093, 0}},
               std::vector<Lane>{{256, 16383, 0}}, std::vector<Lane>{{2048, 6145, 0}},
-              std::vector<Lane>{{13, 4093, 0}, {1, 0, 1}, {40, 1023, 2}, {77, 6145, 3}}})
+              std::vector<Lane>{{13, 4093, 0}, {1, 0, 1}, {40, 1023, 2}, {77, 6145, 3}, {5, 300, 4}, {32, 31, 5},
+                                {2, 2047, 6}, {9, 64, 7}}})
           checkLastTiles(backend, heads, layout, lanesOfTails);
-        for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
           checkLanes(backend, heads, layout, 0, lanes);
           checkLanes(backend, heads, layout, 1023, lanes);
         }

@@ -1,9 +1,15 @@
-"""The request fields every API reads alike, each read in one place."""
+"""The request fields every API reads alike, each read in one place.
+
+Standard library only, with the server modules that are too: the launcher
+checks a --sampling-default by the rule a request's value meets
+(serve_options) before .venv exists.
+"""
 
 import hashlib
 
 from . import protocol as wire
 from .errors import APIError
+from .metrics import is_finite_number
 
 # The priority a request names, by its lowercase wire name.
 _PRIORITIES = {priority.name.lower(): priority for priority in wire.RequestPriority}
@@ -24,6 +30,56 @@ CHAT_GENERATION_FIELDS = (
     "priority",
     "cache_salt",
 )
+
+
+MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
+FLOAT32_MAX = float.fromhex("0x1.fffffep127")
+# The sampling numbers a request may set: each with its default, the value
+# that leaves the logits unchanged, the values the engine accepts and how a
+# 400 names them. The served family's published defaults
+# (Frontend.sampling_defaults) take the place of these. A nonzero top_p or
+# repetition_penalty must not round to zero in the engine's float32, which
+# would make the value invalid.
+SAMPLING_NUMBERS = {
+    "temperature": (
+        1.0,
+        lambda value: 0 <= value <= 2,
+        "a number in [0, 2]",
+    ),
+    "top_p": (
+        1.0,
+        lambda value: MIN_FLOAT32_SUBNORMAL <= value <= 1,
+        "a number in (0, 1]",
+    ),
+    "presence_penalty": (0.0, lambda value: -2 <= value <= 2, "a number in [-2, 2]"),
+    "frequency_penalty": (0.0, lambda value: -2 <= value <= 2, "a number in [-2, 2]"),
+    "repetition_penalty": (
+        1.0,
+        lambda value: MIN_FLOAT32_SUBNORMAL <= value <= FLOAT32_MAX,
+        "a positive number",
+    ),
+    "min_p": (0.0, lambda value: 0 <= value <= 1, "a number in [0, 1]"),
+}
+# With top_k, whose default 0 keeps every token, the table covers every
+# sampling option the frame carries.
+assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
+
+
+def sampling_refusal(name, value):
+    """Why a request may not set the sampling option name to value, as its
+    400 says it; None if it may. A top_k of 0 or -1 keeps every token. A
+    --sampling-default and the served family's sampling are held to the
+    same rule."""
+    if name == "top_k":
+        if isinstance(value, int) and not isinstance(value, bool) and value >= -1:
+            return None
+        return "top_k must be 0 or -1 (disabled) or a positive integer"
+    if name not in SAMPLING_NUMBERS:
+        return f"{name} is not a sampling option"
+    _, accepts, requirement = SAMPLING_NUMBERS[name]
+    if is_finite_number(value) and accepts(value):
+        return None
+    return f"{name} must be {requirement}"
 
 
 def generation(body):

@@ -42,7 +42,7 @@ tests take every family's shapes from that list
 (`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
 under `text_config`; Flint's is flat, its keys at the top level, which the check
 reads only for a model type whose configs are flat (a layout type's
-`flatConfig`). Flint loads from a GGUF only, and its configuration is held to
+`flatConfig`). Flint loads from a GGUF or an MLX checkpoint, and its configuration is held to
 Flint's values key by key (its widths, router, window, `layer_types`,
 `no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
 `rope_theta` and the rest where it states them).
@@ -89,8 +89,15 @@ The MoE router keeps its format too, a quantized one as native rows, an
 unquantized one as its bf16 or F32 rows, which the float projection runs
 ([Kernels](internals.md#kernels)). The MoE selection reads the shared-expert gate in F32,
 so it loads as the F32 values of its quantization, and so do GDN alpha and
-beta unless both are in one format. Norms stay bf16 and the GDN value heads in
-MLX's grouped order.
+beta unless both are in one format. A Qwen hybrid's norms stay bf16 (Flint's
+widen to the F32 its kernels are compiled for) and the GDN value heads in
+MLX's grouped order. A checkpoint's names are mlx-vlm's (`language_model.model.*`,
+as the Qwen releases') or mlx-lm's (`model.*` and `lm_head`, as
+`mlx-community/flint-mixed-3-4bit`'s), told apart by where its token table is,
+and each family's tensors are read in the order its GGUF images hold them
+(`safetensors::planImages`): Flint's sinks (`self_attn.softmax_offset`) widen
+to the F32 its GGUF holds, its leading layers' FFN is dense and its shared
+expert, two routed experts wide and ungated, runs as two slices.
 
 ## Model Optimizer targets
 
@@ -386,15 +393,15 @@ the price at which a row's chance of a token is worth its time. A cycle
 applies the floor twice. Before it runs, the host applies it to the lanes'
 chances, which pick only the kernels that run: the step is the last rows of
 the kernel class that holds the rows the floor passes, no fewer than a
-draft's block in all and at most one a lane. After its draft, the device
-applies it to the trees' own
+draft's block in all and at most one a lane and the store's round of 32
+rows. After its draft, the device applies it to the trees' own
 estimates, which pick the rows: the lanes verify the step's rows at or above
 the floor, and the others belong to no lane and route no expert
 (`VerifyRowsParams`). Before the line's first sample the floor is its seed's,
-and every 32nd cycle of a lane count verifies a draft's block a lane, which
-keeps the line's rows spread. `--verify-rows all` has every cycle's step verify
-every row of a draft's block a lane, so that greedy and seeded outputs
-repeat. The startup log says which rows the cycles
+and every 32nd cycle of a lane count verifies a draft's block a lane within
+the round, which keeps the line's rows spread. `--verify-rows all` has every
+cycle's step verify every row of a draft's block a lane, so that greedy and
+seeded outputs repeat. The startup log says which rows the cycles
 verify and why, and `/status` reports it as `verify_rows`. The selector grows
 each lane's verify rows into a tree over its candidates (`draft_select_tree`):
 from the anchor, best first by the estimate that the target accepts a row's

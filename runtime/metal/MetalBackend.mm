@@ -331,11 +331,14 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
     return library;
 }
 
-// The pipeline of function `name` of `source` at these function constants.
-// It touches no backend state, and Metal's device and library are
-// thread-safe, so any thread may create one.
+// The pipeline of function `name` of `source` at these function constants,
+// and with `stagedExpertTiles` (an instrumented backend's,
+// BackendInstrumentation::stageExpertTiles) kMoeStagedOnly true where the
+// function declares it. It touches no backend state, and Metal's device and
+// library are thread-safe, so any thread may create one.
 id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> source,
-                                           std::string_view name, std::span<const uint32_t> constants) {
+                                           std::string_view name, std::span<const uint32_t> constants,
+                                           [[maybe_unused]] bool stagedExpertTiles) {
     NSString *key = checkedNSString(name, "pipeline name");
     NSError *error = nil;
     id<MTLFunction> function = nil;
@@ -345,6 +348,12 @@ id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> 
         MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
         [values setConstantValues:constants.data() type:MTLDataTypeUInt
                         withRange:NSMakeRange(0, constants.size())];
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+        if (stagedExpertTiles && [source newFunctionWithName:key].functionConstantsDictionary[@"kMoeStagedOnly"]) {
+            const bool staged = true;
+            [values setConstantValue:&staged type:MTLDataTypeBool withName:@"kMoeStagedOnly"];
+        }
+#endif
         function = [source newFunctionWithName:key constantValues:values error:&error];
     }
     if (!function) {
@@ -933,6 +942,16 @@ struct CommandTicket::State {
         }
         timing.wallSeconds =
             std::chrono::duration<double>(wallEnd - wallStart).count();
+        if (!leadingCommands.empty()) {
+            std::vector<double> buffers;
+            for (id<MTLCommandBuffer> buffer : leadingCommands) {
+                buffers.push_back(buffer.GPUEndTime - buffer.GPUStartTime);
+            }
+            buffers.push_back(command.GPUEndTime - command.GPUStartTime);
+            std::ranges::nth_element(buffers, buffers.begin() + buffers.size() / 2);
+            timing.medianBufferSeconds = buffers[buffers.size() / 2];
+            timing.longestBufferSeconds = std::ranges::max(buffers);
+        }
 
         std::string error;
         // The first buffer that failed names the error: the buffers after a
@@ -1249,6 +1268,43 @@ struct MetalBackend::Impl {
     uint64_t lastCommandBuffers = 0;
     // BackendInstrumentation::submitPartsWhole.
     bool wholeParts = false;
+    // BackendInstrumentation::stageExpertTiles.
+    bool stagedExpertTiles = false;
+    // BackendInstrumentation::snapshotAfter: the pipeline a host step follows
+    // the first dispatch of in the next command that holds one, the bindings
+    // it copies, and its copies.
+    std::string snapshotPipeline;
+    std::vector<uint32_t> snapshotBindings;
+    std::vector<std::vector<uint8_t>> snapshot;
+
+    // `command` with the snapshot's host step after its first dispatch of the
+    // snapshot's pipeline, its events in `events`; none if it holds none.
+    std::optional<Command> withSnapshot(const Command &command, std::vector<EventStep> &events) {
+        const auto at = std::ranges::find(command.dispatches, snapshotPipeline, &ComputeDispatch::pipelineName);
+        if (at == command.dispatches.end()) return std::nullopt;
+        std::vector<MetalBuffer> views;
+        for (const uint32_t binding : snapshotBindings) {
+            const auto bound = std::ranges::find(at->buffers, binding, &BufferBinding::index);
+            if (bound == at->buffers.end())
+                throw MetalBackendError("a snapshot's dispatch binds no buffer at " + std::to_string(binding));
+            views.push_back(bound->buffer);
+        }
+        const size_t before = static_cast<size_t>(at - command.dispatches.begin()) + 1;
+        EventStep step;
+        step.before = before;
+        step.kind = EventStep::Kind::Host;
+        step.work = [this, views] {
+            snapshot.clear();
+            for (const MetalBuffer &view : views) {
+                const auto *bytes = static_cast<const uint8_t *>(view.contents());
+                snapshot.emplace_back(bytes, bytes + view.sizeBytes());
+            }
+        };
+        events.assign(command.events.begin(), command.events.end());
+        events.insert(std::ranges::upper_bound(events, before, {}, &EventStep::before), std::move(step));
+        snapshotPipeline.clear();
+        return Command{command.dispatches, events};
+    }
 #endif
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
@@ -1362,6 +1418,11 @@ struct MetalBackend::Impl {
         std::vector<Creation> creations(keys.size());
         Creation *created = creations.data();
         const PipelineKeyView *requested = keys.data();
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+        const bool staged = stagedExpertTiles;
+#else
+        constexpr bool staged = false;
+#endif
         std::atomic<size_t> claimed{0};
         std::atomic<size_t> *next = &claimed;
         // Each worker creates the next pipeline no other has taken.
@@ -1370,8 +1431,8 @@ struct MetalBackend::Impl {
                 @autoreleasepool {
                     const auto started = AwakeClock::now();
                     try {
-                        created[index].pipeline =
-                            createPipeline(device, library, requested[index].name, requested[index].constants);
+                        created[index].pipeline = createPipeline(device, library, requested[index].name,
+                                                                 requested[index].constants, staged);
                     } catch (...) {
                         created[index].failure = std::current_exception();
                     }
@@ -1419,7 +1480,7 @@ struct MetalBackend::Impl {
     // outside the cache.
     id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name) {
         const auto started = AwakeClock::now();
-        id<MTLComputePipelineState> result = createPipeline(device, source, name, {});
+        id<MTLComputePipelineState> result = createPipeline(device, source, name, {}, false);
         noteCreated(name, {}, millisecondsSince(started));
         return result;
     }
@@ -2564,6 +2625,13 @@ CommandTicket MetalBackend::submitCommandAsync(
 CommandTicket MetalBackend::submitCommandAsync(const Command &command,
                                                CommandCompletion completion) {
     checkOperation();
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+    if (!impl_->snapshotPipeline.empty()) {
+        std::vector<EventStep> events;
+        if (const std::optional<Command> snapshotted = impl_->withSnapshot(command, events))
+            return submitCommandAsync(*snapshotted, std::move(completion));
+    }
+#endif
     [[maybe_unused]] const NSUInteger buffers = checkEvents(command.events, command.dispatches.size());
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
     impl_->lastCommandBuffers = buffers;
@@ -2666,6 +2734,28 @@ uint64_t BackendInstrumentation::submittedCommands(
 
 size_t BackendInstrumentation::cachedPipelines(const MetalBackend &backend) {
     return backend.impl_->pipelines.size();
+}
+
+void BackendInstrumentation::snapshotAfter(MetalBackend &backend, std::string pipeline,
+                                           std::vector<uint32_t> bindings) {
+    backend.impl_->snapshotPipeline = std::move(pipeline);
+    backend.impl_->snapshotBindings = std::move(bindings);
+    backend.impl_->snapshot.clear();
+}
+
+std::vector<std::vector<uint8_t>> BackendInstrumentation::takeSnapshot(MetalBackend &backend) {
+    backend.impl_->snapshotPipeline.clear();
+    return std::exchange(backend.impl_->snapshot, {});
+}
+
+void BackendInstrumentation::stageExpertTiles(MetalBackend &backend) {
+    if (!backend.impl_->pipelines.empty())
+        throw MetalBackendError("expert tiles are staged before the backend creates its first pipeline");
+    backend.impl_->stagedExpertTiles = true;
+}
+
+bool BackendInstrumentation::hasFunction(const MetalBackend &backend, std::string_view name) {
+    return [backend.impl_->library.functionNames containsObject:checkedNSString(name, "function name")];
 }
 
 uint64_t BackendInstrumentation::lastCommandBuffers(const MetalBackend &backend) {

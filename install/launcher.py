@@ -462,8 +462,8 @@ def serve(args):
         # A child inherits the environment, not -B: every Python program
         # serve starts writes no bytecode either (the server's PDF workers,
         # started with no environment, have -B of their own), so a runtime
-        # inside a signed app never gains __pycache__ folders, which break
-        # its signature.
+        # inside a signed app gains no bytecode beside what it ships, which
+        # would break its signature.
         os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)

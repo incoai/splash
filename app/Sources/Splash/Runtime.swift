@@ -89,10 +89,16 @@ struct Runtime: Sendable {
     }
 
     /// The environment of the programs the app runs: `userEnvironment`, kept from the user's
-    /// site-packages in the programs Python starts. Run with -B, the launcher keeps them from
-    /// writing bytecode.
+    /// site-packages in the programs Python starts, with the app's own home as their HOME. Run
+    /// with -B, the launcher keeps them from writing bytecode.
+    ///
+    /// A packaged runtime keeps its data in its HOME's Application Support (install/paths.py),
+    /// the serve records the app reads among them, and the app reads them in its own home, which
+    /// Foundation gives whatever HOME says: the account's. Told it, the runtime writes where the
+    /// app reads, whatever HOME the app was opened with (open --env HOME=…).
     var environment: [String: String] {
         var environment = userEnvironment
+        environment["HOME"] = URL.homeDirectory.path
         // Where the Hugging Face cache is, the token and the like, as `splash` in a terminal has them.
         environment.merge(shellSettings.values) { $1 }
         environment["PYTHONNOUSERSITE"] = "1"

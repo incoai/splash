@@ -76,6 +76,7 @@ TEST_ENGINE_SIM_ASAN := $(ENGINE_SANITIZER_BUILD)/engine-sim-asan-ubsan
 TEST_ENGINE_SIM_TSAN := $(ENGINE_SANITIZER_BUILD)/engine-sim-tsan
 TEST_ANE_FFN_CALIBRATION_ASAN := $(ENGINE_SANITIZER_BUILD)/ane-ffn-calibration-asan-ubsan
 TEST_ANE_FFN_CALIBRATION_TSAN := $(ENGINE_SANITIZER_BUILD)/ane-ffn-calibration-tsan
+TEST_ANE_FFN_BREAKER_ASAN := $(ENGINE_SANITIZER_BUILD)/ane-ffn-breaker-asan-ubsan
 TEST_SPARSE_ROW_STORE_ASAN := $(ENGINE_SANITIZER_BUILD)/sparse-row-store-asan-ubsan
 TEST_SPARSE_ROW_STORE_TSAN := $(ENGINE_SANITIZER_BUILD)/sparse-row-store-tsan
 TEST_SSD_READERS_ASAN := $(ENGINE_SANITIZER_BUILD)/ssd-readers-asan-ubsan
@@ -102,6 +103,7 @@ TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
 TEST_GGUF_PROJECTION := $(ENGINE_TEST_BUILD)/gguf-projection
 TEST_ANE_FFN := $(ENGINE_TEST_BUILD)/ane-ffn
 TEST_ANE_FFN_CALIBRATION := $(ENGINE_TEST_BUILD)/ane-ffn-calibration
+TEST_ANE_FFN_BREAKER := $(ENGINE_TEST_BUILD)/ane-ffn-breaker
 TEST_ANE_FFN_STARTUP := $(ENGINE_TEST_BUILD)/ane-ffn-startup
 TEST_ANE_PROGRAM_FAULTS := $(ENGINE_TEST_BUILD)/ane-program-faults
 TEST_GGUF_DEQUANT := $(ENGINE_TEST_BUILD)/gguf-dequant
@@ -176,12 +178,15 @@ TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
 TEST_TARGET_SAMPLING_TEST := $(ENGINE_TEST_BUILD)/target-sampling
 TEST_TARGET_SAMPLING_WIDE_TEST := $(ENGINE_TEST_BUILD)/target-sampling-16
 TEST_VISION_METAL_TEST := $(ENGINE_TEST_BUILD)/vision-metal
-TEST_VISION_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/vision-attention
+TEST_DENSE_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/dense-attention
+TEST_DENSE_LINEAR_TEST := $(ENGINE_TEST_BUILD)/dense-linear
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_TEACHER_LOGITS := $(ENGINE_TEST_BUILD)/teacher-logits
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
+TEST_VISION_TOWER_BENCHMARK := $(ENGINE_TEST_BUILD)/vision-tower-benchmark
+TEST_DENSE_LINEAR_BENCHMARK := $(ENGINE_TEST_BUILD)/dense-linear-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 WEIGHT_DIGESTS := $(ENGINE_TEST_BUILD)/weight-digests
@@ -238,7 +243,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READER
 	$(TEST_GGUF_FILE) \
 	$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) \
 	$(TEST_LINEAR_PLAN) \
-	$(TEST_ANE_FFN_CALIBRATION) \
+	$(TEST_ANE_FFN_CALIBRATION) $(TEST_ANE_FFN_BREAKER) \
 	$(TEST_ANE_FFN_STARTUP) \
 	$(TEST_EXECUTION_PLANS) \
 	$(TEST_KERNEL_SELECTION) \
@@ -288,6 +293,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_ATTENTION_VARIANTS) \
+	$(TEST_KERNEL_SELECTION) \
 	$(TEST_ROPE_TABLES) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
@@ -307,7 +313,8 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_TARGET_SAMPLING_TEST) \
 	$(TEST_TARGET_SAMPLING_WIDE_TEST) \
 	$(TEST_VISION_METAL_TEST) \
-	$(TEST_VISION_ATTENTION_TEST) \
+	$(TEST_DENSE_ATTENTION_TEST) \
+	$(TEST_DENSE_LINEAR_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_HANDOFF_TEST) \
 	$(TEST_PRESSURE_SERVING) \
@@ -319,7 +326,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
 	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
-	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
+	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) $(TEST_STATE_CODEC_AIR)
 # Benchmarks and tools that build with the production flags.
@@ -341,7 +348,7 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
 	$(TEST_NATIVE_LOOP_ASAN) $(TEST_NATIVE_LOOP_TSAN) \
 	$(TEST_ENGINE_SIM_ASAN) $(TEST_ENGINE_SIM_TSAN) \
-	$(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN) \
+	$(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN) $(TEST_ANE_FFN_BREAKER_ASAN) \
 	$(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN) \
 	$(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN) \
 	$(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN) \
@@ -403,7 +410,8 @@ $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE
 		$(TEST_LEGACY_WEIGHT_CACHE) $(TEST_PERSISTENT_CACHE) $(TEST_ENGINE_CACHE_TEST) $(TEST_CACHE_PROPERTY) \
 		$(TEST_PROTOCOL_TEST) \
 		$(TEST_FAKE_MEMORY) $(TEST_TIMING_PROFILE) \
-		$(TEST_ENGINE_TEST) $(TEST_FD_TRANSPORT_TEST) $(TEST_ANE_FFN_CALIBRATION): | $(ENGINE_TEST_BUILD)
+		$(TEST_ENGINE_TEST) $(TEST_FD_TRANSPORT_TEST) $(TEST_ANE_FFN_CALIBRATION) $(TEST_ANE_FFN_BREAKER): | \
+		$(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 # C++ tests linked with the frameworks.
@@ -420,7 +428,7 @@ $(TEST_OPERATOR_WORKSPACE): dev/tests/engine/operator_workspace_test.cc \
 $(TEST_EXECUTION_PLANS): dev/tests/engine/execution_plans_test.cc \
 		$(ENGINE_LIBRARY)
 $(TEST_KERNEL_SELECTION): dev/tests/engine/kernel_selection_test.cc \
-		$(ENGINE_LIBRARY)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY)
 $(TEST_MODEL_EXECUTION_PLANS): dev/tests/engine/model_execution_plan_test.cpp \
 		$(ENGINE_LIBRARY)
 $(TEST_DRAFT_VOCABULARY): dev/tests/engine/draft_vocabulary_test.cpp $(ENGINE_LIBRARY)
@@ -461,17 +469,17 @@ $(TEST_Q8_ATTENTION_TEST): dev/tests/engine/q8_flash_attention_metal_test.mm \
 $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
 		$(ENGINE_LIBRARY) $(TEST_Q8_ATTENTION_LIB)
 $(TEST_GGUF_MOE): dev/tests/engine/gguf_moe_test.mm \
-		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 # The same test at Qwen3.8-Flash-Next's 512 experts, 10 per token and expert
 # width 640.
 $(TEST_GGUF_MOE_E512): dev/tests/engine/gguf_moe_test.mm \
-		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_GGUF_MOE_E512): ENGINE_TEST_CXXFLAGS += -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_INTERMEDIATE=640 \
 		-DGGUF_MOE_EXPERTS=512 -DGGUF_MOE_TOP_K=10
 # The same test at Flint's routing: 256 experts, 6 per token by a sigmoid
 # router, expert width 512, and a shared expert of two ungated slices.
 $(TEST_GGUF_MOE_SIGMOID): dev/tests/engine/gguf_moe_test.mm \
-		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_GGUF_MOE_SIGMOID): ENGINE_TEST_CXXFLAGS += -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_INTERMEDIATE=512 \
 		-DGGUF_MOE_EXPERTS=256 -DGGUF_MOE_TOP_K=6 -DGGUF_MOE_ROUTER=SigmoidNormalized \
 		-DGGUF_MOE_SHARED_SLICES=2 -DGGUF_MOE_SHARED_GATE=false
@@ -509,7 +517,9 @@ $(TEST_TARGET_SAMPLING_TEST): dev/tests/engine/target_sampling_metal_test.mm \
 $(TEST_TARGET_SAMPLING_WIDE_TEST): dev/tests/engine/target_sampling_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_TARGET_SAMPLING_WIDE_TEST): ENGINE_TEST_CXXFLAGS += -DTARGET_SAMPLING_LANE_ROWS=16
-$(TEST_VISION_ATTENTION_TEST): dev/tests/engine/vision_attention_metal_test.mm \
+$(TEST_DENSE_ATTENTION_TEST): dev/tests/engine/dense_attention_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_DENSE_LINEAR_TEST): dev/tests/engine/dense_linear_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm
 $(TEST_Q8_STORAGE_TEST): dev/tests/engine/q8_page_storage_test.mm \
@@ -541,6 +551,8 @@ $(TEST_GGUF_PROJECTION_BENCHMARK): dev/benchmarks/gguf_projection_benchmark.mm \
 $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_VISION_TOWER_BENCHMARK): dev/benchmarks/vision_tower_benchmark.mm $(ENGINE_LIBRARY) $(LIB)
+$(TEST_DENSE_LINEAR_BENCHMARK): dev/benchmarks/dense_linear_benchmark.mm $(ENGINE_LIBRARY) $(LIB)
 
 $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
 		$(TEST_ANE_PROGRAM_FAULTS) $(TEST_GGUF_DEQUANT) $(TEST_GGUF_ROTATION) \
@@ -552,12 +564,13 @@ $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(
 		$(TEST_GDN_METAL_TEST) $(TEST_STATE_CODEC_TEST) $(TEST_ATTENTION_PLAN) $(TEST_LINEAR_PLAN) \
 		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
 		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) \
-		$(TEST_TARGET_SAMPLING_TEST) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(TEST_VISION_ATTENTION_TEST) \
-		$(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) $(TEST_ROPE_TABLES) \
+		$(TEST_TARGET_SAMPLING_TEST) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(TEST_DENSE_ATTENTION_TEST) \
+		$(TEST_DENSE_LINEAR_TEST) $(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) \
+		$(TEST_ROPE_TABLES) \
 		$(TEST_METAL_BACKEND_TEST) $(TEST_HANDOFF_TEST) $(TEST_PRESSURE_SERVING) $(TEST_VISION_ENCODER_TEST) \
 		$(TEST_MODEL_RUNTIME_ORACLE) \
 		$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
-		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK): | $(ENGINE_TEST_BUILD)
+		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
@@ -669,6 +682,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) /bin/sh dev/tests/backend_benchmark_cli.sh $(TEST_BACKEND_BENCHMARK) $(MODEL_CONFIGS)
 	$(ENGINE_CPU_STEP) $(TEST_OPERATOR_WORKSPACE)
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_CALIBRATION)
+	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_BREAKER)
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_STARTUP)
 	$(ENGINE_CPU_STEP) $(TEST_EXECUTION_PLANS)
 	$(ENGINE_CPU_STEP) $(TEST_KERNEL_SELECTION) dev/tests/engine/kernel_selection_golden.txt
@@ -725,6 +739,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(TEST_QWEN4_KERNELS) $(LIB) bitwise
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_KERNEL_SELECTION) --library $(LIB) dev/tests/engine/kernel_selection_golden.txt
 	$(METAL_TEST_ENV) $(TEST_ROPE_TABLES) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)
@@ -744,7 +759,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_METAL_TEST) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_VISION_ATTENTION_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_DENSE_ATTENTION_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_DENSE_LINEAR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_HANDOFF_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_PRESSURE_SERVING) $(LIB)
@@ -753,18 +769,25 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # The vision fixture is named after the installed model's family, which its
 # model.json records. Nothing is printed when the installation serves no
 # vision (vision_format none: --language-only, or a GGUF without an mmproj).
+# vision-encoder runs twice: under shader validation, where it holds the fp32
+# parity on real shapes and compares no embedding digests (validation
+# compiles the shaders to other bits), and without it, where it compares the
+# fixture's pinned digests too.
 # ORACLE_ARGS: options every run of the runtime oracle takes besides its own,
 # as the oracle takes them (model_runtime_oracle_test.mm), an option given
 # twice taking its later value. A block-sparse target's spill check runs in
-# each: by default, with two staging buffers, and at 32K tokens with the
-# cache's default window, so a --spill-tokens here replaces the size of all
-# three. Each stops before its prompts, naming what fits, where the memory
+# each but the last: by default, with two staging buffers, and at 32K tokens
+# with the cache's default window, so a --spill-tokens here replaces the
+# size of each. The last checks a branched lane's path against the
+# same step with its tree's other rows replaced, on a backend that runs every
+# expert tile on the staged tile (--siblings-only). Each stops before its
+# prompts, naming what fits, where the memory
 # plan's limit leaves less than it holds beside the weights: up to 4.3 GB
 # for Qwen3.8-Flash-Next's default checks, and 5.9 GB for its 32K check (on
 # the 24 GB M6, 11-02: the spill runtime's arenas 2.27 GB, four FP32 lane
 # states 1.11 GB, 17 Full extents 1.84 GB, the hot block cache's floor for
-# two lanes 0.61 GB, Index extents and staging). On a 24 GB Mac all three
-# runs take ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M", or
+# two lanes 0.61 GB, Index extents and staging). On a 24 GB Mac every run
+# takes ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M", or
 # "--expert-memory 5632M --ple-memory 237M" where the installation serves
 # vision, whose default checks alone fit only up to about 7700M of experts
 # (docs/validate.md). Without --ple-memory the oracle loads
@@ -780,12 +803,16 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	family=$$($(BUILD_ID_PYTHON) -c '$(VISION_FIXTURE_FAMILY)' "$(MODEL_ROOT)") && \
 		if test -n "$$family"; then \
 			$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
+				dev/tests/fixtures/vision-parity/$$family && \
+			$(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
 				dev/tests/fixtures/vision-parity/$$family; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 \
 		--spill-buffers 2 $(ORACLE_ARGS)
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --lanes 8 $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --lanes 8 --siblings-only $(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep \
@@ -910,6 +937,8 @@ $(TEST_ENGINE_SIM) $(TEST_ENGINE_SIM_ASAN) $(TEST_ENGINE_SIM_TSAN): \
 		dev/tests/engine/engine_sim_test.cpp
 $(TEST_ANE_FFN_CALIBRATION) $(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN): \
 		runtime/ops/AneFfnCalibration.cpp dev/tests/engine/ane_ffn_calibration_test.cpp
+$(TEST_ANE_FFN_BREAKER) $(TEST_ANE_FFN_BREAKER_ASAN): \
+		runtime/ops/AneFfnCalibration.cpp dev/tests/engine/ane_ffn_breaker_test.cpp
 $(TEST_MEMORY_TEST) $(TEST_MEMORY_PLAN_ASAN): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryPlan.cpp runtime/engine/StreamedMemoryPlan.cpp \
 		dev/tests/engine/engine_memory_plan_test.cpp
@@ -977,6 +1006,7 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_ENGINE_SIM_TSAN) --filter $(call engine_sim_sanitizer_scenarios,$(TEST_ENGINE_SIM_TSAN))
 	$(ASAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_ANE_FFN_BREAKER_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_SPARSE_ROW_STORE_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_SPARSE_ROW_STORE_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_SSD_READERS_ASAN)

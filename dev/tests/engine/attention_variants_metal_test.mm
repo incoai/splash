@@ -118,11 +118,11 @@ struct Case final {
   bool int8Queries;
   uint32_t lanes;
   uint32_t rows;
-  std::array<uint32_t, 4> histories;
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories;
   HostKvExtents pool;
   SplashKvLayer layer;
-  std::array<std::vector<uint32_t>, 4> pages;
-  std::array<metal::MetalBuffer, 4> tables;
+  std::array<std::vector<uint32_t>, SPLASH_MAXIMUM_BATCH_WIDTH> pages;
+  std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> tables;
   uint32_t poisoned = 0;
   metal::MetalBuffer sinks;
 
@@ -164,8 +164,8 @@ float query(uint32_t lane, uint32_t head, uint32_t row, uint32_t dimension) {
 }
 
 Case makeCase(metal::MetalBackend &backend, kv::Format format, bool int8Queries, ops::AttentionVariant variant,
-              uint32_t lanes, uint32_t rows, std::array<uint32_t, 4> histories) {
-  std::array<uint32_t, 4> pageCounts{};
+              uint32_t lanes, uint32_t rows, std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories) {
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> pageCounts{};
   uint32_t allPages = 1;  // and the page of NaNs
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     pageCounts[lane] = (histories[lane] + rows + kPageTokens - 1) / kPageTokens;
@@ -226,7 +226,7 @@ Case makeCase(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
         }
       }
   }
-  for (uint32_t lane = lanes; lane < 4; ++lane) data.tables[lane] = data.tables[0];
+  for (uint32_t lane = lanes; lane < data.tables.size(); ++lane) data.tables[lane] = data.tables[0];
   return data;
 }
 
@@ -545,7 +545,7 @@ void checkPrefill(metal::MetalBackend &backend, kv::Format format, bool int8Quer
 
 void checkVerify(metal::MetalBackend &backend, kv::Format format, bool int8Queries, ops::AttentionVariant variant,
                  std::span<const uint32_t> histories) {
-  std::array<uint32_t, 4> lanes{};
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> lanes{};
   std::copy(histories.begin(), histories.end(), lanes.begin());
   const auto count = uint32_t(histories.size());
   const Case data = makeCase(backend, format, int8Queries, variant, count, kLaneRows, lanes);
@@ -665,7 +665,7 @@ void checkTreeVerify(metal::MetalBackend &backend, kv::Format format, bool int8Q
                      std::span<const uint32_t> histories) {
   constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
   static_assert(kRows == 2 * kv::kAttentionTileRows, "a block of two tiles");
-  std::array<uint32_t, 4> lanes{};
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> lanes{};
   std::copy(histories.begin(), histories.end(), lanes.begin());
   const auto count = uint32_t(histories.size());
   const Case data = makeCase(backend, format, int8Queries, variant, count, kRows, lanes);
@@ -703,33 +703,35 @@ void checkTreeVerify(metal::MetalBackend &backend, kv::Format format, bool int8Q
   std::cout << what << ": largest error " << largest << " of its bound PASS\n";
 }
 
-// A verify step whose four lanes hold blocks of 16, 5, 9 and 12 rows packed
-// by their first rows, 0, 16, 21 and 30, as a step's layout places each
-// lane's rows after the lane's before it, each block a tree that branches: a
-// chain with a lookup branch off row 2 at row 8, two children a row, a random
-// tree and two children a row again. Each lane's rows against treeReference
-// at their rows of the step. The tree rows of no lane's row hold 0xFF, whose
-// ancestors read as a chain's, so that a lane that took its tree rows at
-// another row than its first (lanes 2 and 3 at lane x 16) would attend
-// another lane's tree or a chain: over the short histories `histories` gives
-// those lanes, its rows would move past the bound.
+// A verify step whose full batch of lanes holds blocks of 16, 5, 9, 12, 11,
+// 1, 3 and 7 rows, the step's 64, packed by their first rows, 0, 16, 21, 30,
+// 42, 53, 54 and 57, as a step's layout places each lane's rows after the lane's before it,
+// each block a tree that branches, lane by lane in turn: a chain with a
+// lookup branch off row 2 at row 8, two children a row, a random tree and two
+// children a row again. Each lane's rows against treeReference at their rows
+// of the step. The tree rows of no lane's row hold 0xFF, whose ancestors read
+// as a chain's, so that a lane that took its tree rows at another row than
+// its first (lanes 2, 3, 4 and 7 at lane x 16) would attend another lane's
+// tree or a chain: over the short histories `histories` gives those lanes,
+// its rows would move past the bound.
 void checkRaggedTreeVerify(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
-                           ops::AttentionVariant variant, const std::array<uint32_t, 4> &histories) {
-  constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
-  constexpr std::array<uint32_t, 4> kBlockRows{16, 5, 9, 12};
-  const Case data = makeCase(backend, format, int8Queries, variant, 4, kRows, histories);
+                           ops::AttentionVariant variant,
+                           const std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> &histories) {
+  constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS, kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+  constexpr std::array<uint32_t, kLanes> kBlockRows{16, 5, 9, 12, 11, 1, 3, 7};
+  const Case data = makeCase(backend, format, int8Queries, variant, kLanes, kRows, histories);
   const Staging staging = stage(backend, data, 0, kRows, kPageTokens);
-  const metal::MetalBuffer tree = poisoned(backend, uint64_t{4} * kRows * sizeof(SplashTreeRow));
-  std::array<Tree, 4> trees;
-  std::array<SplashLaneRows, 4> blocks{};
-  for (uint32_t lane = 0; lane < 4; ++lane) {
+  const metal::MetalBuffer tree = poisoned(backend, uint64_t{kLanes} * kRows * sizeof(SplashTreeRow));
+  std::array<Tree, kLanes> trees;
+  std::array<SplashLaneRows, kLanes> blocks{};
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
     blocks[lane] = {lane ? blocks[lane - 1].first + blocks[lane - 1].rows : 0, kBlockRows[lane]};
     for (uint32_t row = 0; row < kBlockRows[lane]; ++row) {
       const uint32_t back = std::min(row, 1 + uint32_t((unit(seedOf(5, lane, 0, row, 0)) + 1) * 2) % 4);
-      trees[lane].parent.push_back(!row       ? 0
-                                   : lane == 0 ? (row == 8 ? 2 : row - 1)
-                                   : lane == 2 ? row - back
-                                               : (row - 1) / 2);
+      trees[lane].parent.push_back(!row            ? 0
+                                   : lane % 4 == 0 ? (row == 8 ? 2 : row - 1)
+                                   : lane % 4 == 2 ? row - back
+                                                   : (row - 1) / 2);
       contents<SplashTreeRow>(tree)[blocks[lane].first + row] = trees[lane].place(row);
     }
     contents<SplashLaneRows>(staging.layout)[lane] = blocks[lane];
@@ -737,8 +739,8 @@ void checkRaggedTreeVerify(metal::MetalBackend &backend, kv::Format format, bool
   run(backend, data, staging, planOf(data, staging), tree);
   const std::string what = describe(data, "ragged tree verify");
   const double largest = checkTreeRows(data, staging, trees, blocks, what);
-  std::cout << what << ": lanes of 16, 5, 9 and 12 tree rows at rows 0, 16, 21 and 30, largest error " << largest
-            << " of its bound PASS\n";
+  std::cout << what << ": lanes of 16, 5, 9, 12, 11, 1, 3 and 7 tree rows at rows 0, 16, 21, 30, 42, 53, 54 and 57,"
+            << " largest error " << largest << " of its bound PASS\n";
 }
 
 // Split and reduce derive the same pages from the window for any split
@@ -779,10 +781,10 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
                                  .block_list = 0};
       metal::CommandGraph graph;
       // Without tree rows the split binds another buffer in their place.
-      graph.add(plan.splitPipeline(),
-                {staging.queries, partials, statistics, data.tables[0], data.tables[1], data.tables[2], data.tables[3],
-                 partials, staging.layout},
-                params, {kKvHeads, data.lanes, splits});
+      std::vector<metal::MetalBuffer> split{staging.queries, partials, statistics};
+      split.insert(split.end(), data.tables.begin(), data.tables.end());
+      split.insert(split.end(), {partials, staging.layout});
+      graph.add(plan.splitPipeline(), std::move(split), params, {kKvHeads, data.lanes, splits});
       // The ungated plain reduce reads no packed row and writes no table, so
       // the output rows take those bindings too.
       graph.add(plan.reducePipeline(),
@@ -807,7 +809,7 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
 // splits below the window's pages).
 void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format, bool int8Queries) {
   const auto outputs = [&](ops::AttentionVariant variant, bool verify, uint32_t lanes, uint32_t rows,
-                           std::array<uint32_t, 4> histories) {
+                           std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories) {
     const Case data = makeCase(backend, format, int8Queries, variant, lanes, rows, histories);
     const Staging staging = stage(backend, data, 0, rows, verify ? kPageTokens : (rows + 31) / 32 * 32);
     run(backend, data, staging, planOf(data, staging));
@@ -815,7 +817,8 @@ void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format, b
     return std::vector<uint16_t>(begin, begin + staging.output.sizeBytes() / 2);
   };
   const ops::AttentionVariant whole{.rotated = true, .windowTokens = 0};
-  require(outputs(kWindowed, true, 4, 8, {0, 31, 200, 504}) == outputs(whole, true, 4, 8, {0, 31, 200, 504}),
+  constexpr std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> kWithin{0, 31, 200, 504, 1, 100, 300, 496};
+  require(outputs(kWindowed, true, kWithin.size(), 8, kWithin) == outputs(whole, true, kWithin.size(), 8, kWithin),
           "a windowed verify inside its window differs from the whole history's");
   require(outputs(kWindowed, false, 1, 300, {0, 0, 0, 0}) == outputs(whole, false, 1, 300, {0, 0, 0, 0}) &&
               outputs(kWindowed, false, 1, 24, {200, 0, 0, 0}) == outputs(whole, false, 1, 24, {200, 0, 0, 0}),
@@ -983,7 +986,7 @@ void checkProjection(metal::MetalBackend &backend, kv::Format format, bool rotat
                              (rotated ? "" : "_nope") + (float32 ? "_f32" : "");
   require(graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == kernel &&
               graph.dispatches()[0].threadsPerThreadgroup.x == kHeadDimension &&
-              graph.dispatches()[0].buffers.size() == (rotated ? 11U : 9U),
+              graph.dispatches()[0].buffers.size() == (rotated ? 7U : 5U) + SPLASH_MAXIMUM_BATCH_WIDTH,
           "the projection runs another kernel or binds tables it does not read");
   // A row's stored element of a K/V tensor: a BF16 page's value, or an INT8
   // page's code times its row's scale, and the scale.
@@ -1101,8 +1104,8 @@ void checkOutputRows(metal::MetalBackend &backend) {
   for (const bool lanesOfEight : {false, true}) {
     const uint32_t lanes = lanesOfEight ? 3 : 1, rows = lanesOfEight ? kLaneRows : 37;
     const Case data = makeCase(backend, kv::Format::Int8, false, kWindowed, lanes, rows,
-                               lanesOfEight ? std::array<uint32_t, 4>{0, 505, 4097, 0}
-                                            : std::array<uint32_t, 4>{600, 0, 0, 0});
+                               lanesOfEight ? std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH>{0, 505, 4097, 0}
+                                            : std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH>{600, 0, 0, 0});
     const Staging staging = stage(backend, data, 0, rows, lanesOfEight ? kPageTokens : 64);
     const ops::AttentionPlan plan = planOf(data, staging);
     run(backend, data, staging, plan);
@@ -1184,21 +1187,21 @@ int main(int argc, char **argv) {
       checkPrefill(backend, format, int8Queries, kWindowed, 505, 13, {1, 3});
       checkPrefill(backend, format, int8Queries, kWhole, 0, 300);
       checkPrefill(backend, format, int8Queries, kWhole, 300, 517, {129});
-      // Verify lanes of one to four, each with a history of its own: before,
-      // at and past their windows, up to 10000 tokens.
+      // Verify lanes of one to a full batch, each with a history of its own:
+      // before, at and past their windows, up to 10000 tokens.
       for (const std::vector<uint32_t> &histories : std::vector<std::vector<uint32_t>>{
-               {0}, {511, 512}, {513, 544, 1023}, {0, 505, 4097, 10000}, {31, 32, 4096, 7}})
+               {0}, {511, 512}, {513, 544, 1023}, {0, 505, 4097, 10000}, {31, 32, 4096, 7, 520, 2047, 9000, 1}})
         checkVerify(backend, format, int8Queries, kWindowed, histories);
-      checkVerify(backend, format, int8Queries, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047});
+      checkVerify(backend, format, int8Queries, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047, 5, 4096, 513, 300});
       // Tree blocks of two tiles: before, at and past their windows.
       for (const std::vector<uint32_t> &histories :
            std::vector<std::vector<uint32_t>>{{0, 505, 4097, 10000}, {511, 512, 513, 544}})
         checkTreeVerify(backend, format, int8Queries, kWindowed, histories);
       checkTreeVerify(backend, format, int8Queries, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047});
-      // Tree blocks of ragged lanes: lanes 0 and 1 past and at their windows,
-      // lanes 2 and 3 over short histories.
-      checkRaggedTreeVerify(backend, format, int8Queries, kWindowed, {4097, 512, 7, 0});
-      checkRaggedTreeVerify(backend, format, int8Queries, kWhole, {1000, 31, 40, 2});
+      // Tree blocks of ragged lanes: lanes 0, 1 and 5 past or at their
+      // windows, the others over short histories.
+      checkRaggedTreeVerify(backend, format, int8Queries, kWindowed, {4097, 512, 7, 0, 5, 4600, 9, 2});
+      checkRaggedTreeVerify(backend, format, int8Queries, kWhole, {1000, 31, 40, 2, 3, 2047, 11, 0});
       checkSplitCounts(backend, format, int8Queries);
       checkWindowWithinHistory(backend, format, int8Queries);
     }

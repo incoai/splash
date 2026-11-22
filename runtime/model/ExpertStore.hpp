@@ -32,8 +32,8 @@
 // A streamed block's load runs after its steps' grouping (ops::
 // MoeExpertStream), in rounds: each a host step of the command, which claims
 // a slot for each routed expert that is not resident (in the first round),
-// never one of an expert the same load routes, and reads the native rows of
-// some of them into places of the store's staging, then a repack
+// never one of an expert the same load routes, and reads the rows of some
+// of them into places of the store's staging, then a repack
 // (moe_expert_load) of those places into their slots. A load of at most 32
 // rows (a decode step's, or a prompt chunk's of so few rows)
 // is one round over every place; any other load stages half the places a
@@ -42,8 +42,11 @@
 // experts' rows that a file stores as they are is read straight from it
 // (F_NOCACHE without the buffer cache): its bytes widened to whole pages, into
 // places that start on a page, and the repack starts from the rows' offset
-// in the first page. Rows a loader builds (a quantized safetensors tensor's)
-// are built into the places instead.
+// in the first page. An MLX affine or mxfp4 tensor's experts are read so too,
+// as three such runs, its codes', scales' and biases' planes as the
+// checkpoint stores them (storedPlanes), which the repack interleaves; rows a
+// loader builds (an NVFP4 or FP8 tensor's, or permuted ones) are built into
+// the places instead.
 //
 // Once a round has staged its experts, the next experts are read ahead while
 // the GPU runs, into the places the round left free, an expert at a time in

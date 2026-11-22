@@ -22,8 +22,9 @@ Each is compared in the order it first appears.
 
 By default it compares the kernels the decode path may run: every function
 but those named for prefill (prefill_*, gguf_prefill_*), the vision encoder
-(vision_*) or the prefill FFN's Neural Engine split (ane_ffn_*), which leaves
-the decode, verify and draft kernels and the shared ones. --match takes shell
+and the other towers' dense operators (vision_*, dense_*, norm_layer) or the
+prefill FFN's Neural Engine split (ane_ffn_*), which leaves the decode,
+verify and draft kernels and the shared ones. --match takes shell
 patterns of the names to compare instead. It prints per function whether it
 is identical, different or in one library only, and exits 1 unless every one
 is identical.
@@ -39,8 +40,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-# The kernels only prefill or the vision encoder runs.
-OTHER_PATHS = ("*prefill*", "vision_*", "ane_ffn_*")
+# The kernels only prefill or the towers run.
+OTHER_PATHS = ("*prefill*", "vision_*", "dense_*", "norm_layer", "ane_ffn_*")
 # A function's header in the disassembly: its module's offset, then its name.
 HEADER = re.compile(r"^0x[0-9a-f]+ -- (.+):$", re.MULTILINE)
 # A symbol a module defines: a function, or an internal or private variable.

@@ -275,6 +275,16 @@ def family(path: Path):
     return record and families.named(record["family"])
 
 
+def vocabulary(path: Path) -> int:
+    """The vocabulary the assembly path names serves: its DFlash2 draft's
+    (draft/config.json), which the engine refuses unless it is its target's
+    (ModelDescriptor.mm readDraftLayout)."""
+    size = models.read_json(Path(path) / "draft/config.json").get("vocab_size")
+    if type(size) is not int or size <= 0:
+        raise models.ModelError(f"{path}/draft/config.json names no vocabulary size")
+    return size
+
+
 def _metadata_inputs(files):
     """The assembly paths of the GGUF files the derived metadata comes from,
     in order: the target, then the vision projector."""

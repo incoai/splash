@@ -150,8 +150,10 @@ class SmokeRealTests(unittest.TestCase):
                         ple_memory=None,
                         expert_memory=None,
                         verify_rows=None,
+                        max_concurrent_requests=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
+                        cached_states="exact" if absolute else None,
                     )
                     with (
                         mock.patch.object(
@@ -166,6 +168,12 @@ class SmokeRealTests(unittest.TestCase):
                             self.assertEqual(
                                 command[command.index("--kv-format") + 1],
                                 arguments.kv_format,
+                            )
+                            self.assertEqual(
+                                command[command.index("--cached-states") + 1]
+                                if "--cached-states" in command
+                                else None,
+                                arguments.cached_states,
                             )
                             self.assertEqual(
                                 popen.call_args.kwargs["cwd"], smoke_real.ROOT
@@ -193,8 +201,10 @@ class SmokeRealTests(unittest.TestCase):
             ple_memory=None,
             expert_memory=None,
             verify_rows=None,
+            max_concurrent_requests=None,
             max_image_pixels=None,
             kv_format="int8",
+            cached_states=None,
         )
 
     @contextlib.contextmanager
@@ -304,6 +314,30 @@ class SmokeRealTests(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_lanes_reach_the_server(self):
+        model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
+        self.assertIsNone(smoke_real.parse_args(model).max_concurrent_requests)
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--max-concurrent-requests", command)
+        arguments = self.server_arguments()
+        arguments.max_concurrent_requests = smoke_real.parse_args(
+            [*model, "--max-concurrent-requests", "3"]
+        ).max_concurrent_requests
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(
+                    command[command.index("--max-concurrent-requests") + 1], "3"
+                )
+            finally:
+                server.close()
+
     def test_persistent_cache_scenario_needs_the_ssd_cache(self):
         model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -369,7 +403,7 @@ class SmokeRealTests(unittest.TestCase):
                 with self.assertRaisesRegex(smoke_real.SmokeFailure, "lock"):
                     smoke_real.require_closed_cache(Path(temporary))
 
-    def run_persistent_cache(self, changes=(), switch=True):
+    def run_persistent_cache(self, changes=(), switch=True, source="disk"):
         """Runs the scenario against scripted servers of a model whose
         reasoning a request's effort switches or not, each change (read,
         section, key, value) setting a key of one status read. Returns the
@@ -400,7 +434,15 @@ class SmokeRealTests(unittest.TestCase):
                 "choices": [{"message": {"content": "Done"}}],
                 "usage": {"prompt_tokens": 5980},
             },
-            {"choices": [{"message": {"content": "Again"}}]},
+            {
+                "choices": [{"message": {"content": "Again"}}],
+                "usage": {
+                    "prompt_tokens_details": {
+                        "state_source": source,
+                        "lost_state": False,
+                    }
+                },
+            },
         ]
         turns, starts = [], []
         server = mock.Mock(port=8000)
@@ -474,6 +516,13 @@ class SmokeRealTests(unittest.TestCase):
         }.items():
             with self.subTest(name=name), self.assertRaises(smoke_real.SmokeFailure):
                 self.run_persistent_cache([change])
+        # Usage that does not say the state came from the SSD cache.
+        for source in ("memory", None):
+            with (
+                self.subTest(source=source),
+                self.assertRaises(smoke_real.SmokeFailure),
+            ):
+                self.run_persistent_cache(source=source)
 
     @staticmethod
     def timeout_status(**changes):

@@ -139,21 +139,28 @@ class PromptTokenizer:
     `encode` reads the template's text between two of the tokens the template
     wrote as ordinary text, a marked token as its characters.
 
-    It reuses a cached prompt's tokens up to its last `marker`, the chat
-    template's special token at a message boundary
-    (ChatFormat.message_boundary), where the tokenizer splits its input.
-    It keeps up to CAPACITY prompts, in storage for BUDGET_PROMPTS of
-    `max_context` tokens, the served context. A cached prompt is its text
+    It reuses a cached prompt's tokens up to a message end: a `marker`, the
+    chat template's special token at a message boundary
+    (ChatFormat.message_boundary), where the tokenizer splits its input. A
+    prompt that extends a cached prompt reuses it whole; any other prompt
+    reuses the longest run of whole messages it shares with a
+    cached prompt, which keeps where each of its markers ends. So a branch
+    of a conversation, or a return to an earlier turn, reuses the messages
+    they share: on an M5 Max a 13.8K-token Qwen3.8 prompt whose last
+    message differs encodes in 0.30 ms where it took 9.9 ms. It keeps up
+    to CAPACITY prompts, in storage for BUDGET_PROMPTS of `max_context`
+    tokens, the served context. A cached prompt is its text
     with its marks, which say how it encodes, so a conversation that quotes
     a tag reuses its tokens as any other does: a later turn of a 66K-token
     one tokenizes in 1.0 ms either way."""
 
     MIN_PREFIX_CHARS = 4096
-    # A conversation keeps one prompt, its newest, so the count bounds the
-    # conversations whose next turn reuses it, and agents interleave more of
-    # them than there are lanes: with 4, eight coding agents on 4 lanes
-    # reused 6% of their 44K-token prompts, each miss encoding one in 27 ms;
-    # with 16 every turn found its prompt, 1.8 ms a request.
+    # A conversation keeps one prompt, its newest, and each branch of it its
+    # own, so the count bounds the conversations whose next turn reuses it,
+    # and agents interleave more of them than there are lanes: with 4, eight
+    # coding agents on 4 lanes reused 6% of their 44K-token prompts, each
+    # miss encoding one in 27 ms; with 16 every turn found its prompt, 1.8 ms
+    # a request.
     CAPACITY = 16
     # The storage, which bounds the memory however many prompts it holds.
     BUDGET_PROMPTS = 4
@@ -275,32 +282,75 @@ class PromptTokenizer:
             return self.tokens(text)
         prefix = text[:boundary]
         with self.lock:
+            # An extension, an agent's ordinary request, reuses the longest
+            # cached prompt it extends, whole: one comparison a prompt, which
+            # stops at the first character that differs. Only a prompt that
+            # extends none, which would encode from its start, compares
+            # message by message: over 16 cached 42K-token prompts that
+            # share a head, every request doing so took 0.21 ms more on an
+            # M5 Max. A shorter cached prompt the prompt extends is taken
+            # even where another shares more of its messages: that needs a
+            # stale entry beside a longer branch, and costs encode time,
+            # never a token.
             key = max(
-                (key for key in self.entries if prefix.startswith(key)),
+                (kept for kept in self.entries if prefix.startswith(kept)),
                 key=len,
-                default="",
+                default=None,
             )
-            cached = self.entries.get(key)
-            if cached is not None:
-                self.hits += 1
-                self.reused_tokens += len(cached) // array("I").itemsize
-            else:
+            # How many of its messages: all ([:None]) of one the prompt extends.
+            shared = None
+            reused_chars = 0 if key is None else len(key)
+            if key is None:
+                for kept, (_, ends, _) in self.entries.items():
+                    count = start = 0
+                    for end in ends:
+                        if prefix[start:end] != kept[start:end]:
+                            break
+                        count, start = count + 1, end
+                    if start > reused_chars:
+                        key, shared, reused_chars = kept, count, start
+            if key is None:
                 self.misses += 1
-        tokens = array("I", cached).tolist() if cached is not None else []
-        if key != prefix:
-            tokens.extend(self.tokens(prefix[len(key) :]))
-            # A different added token can consume part of the marker. In that
-            # case this literal occurrence is not a tokenizer boundary.
-            if not tokens or tokens[-1] != self.marker_id:
-                return self.tokens(text)
-            token_bytes = array("I", tokens).tobytes()
-            size = sys.getsizeof(prefix) + sys.getsizeof(token_bytes)
+                reused, char_ends, token_ends = array("I"), array("Q"), array("Q")
+            else:
+                cached_tokens, char_ends, token_ends = self.entries.get(key)
+                char_ends, token_ends = char_ends[:shared], token_ends[:shared]
+                reused = cached_tokens[: token_ends[-1]]
+                self.hits += 1
+                self.reused_tokens += len(reused)
+        tokens = reused.tolist()
+        if reused_chars < boundary:
+            # The rest of the prefix encodes in one call: one call per message
+            # took a cold 800-message, 15.9K-token Qwen3.8 prompt from 11.9 to
+            # 17.1 ms on an M5 Max. Each marker in it is the marker's token,
+            # which no other text encodes to (enabled), so the n-th marker's
+            # token ends the n-th message. A different added token can
+            # consume part of a marker, which is then no tokenizer boundary:
+            # fewer tokens than markers are left, the last marker finds none,
+            # and the prompt encodes whole.
+            index = len(tokens) - 1
+            tokens.extend(self.tokens(prefix[reused_chars:]))
+            end = reused_chars
+            while end < boundary:
+                end = prefix.find(self.marker, end) + len(self.marker)
+                try:
+                    index = tokens.index(self.marker_id, index + 1)
+                except ValueError:
+                    return self.tokens(text)
+                char_ends.append(end)
+                token_ends.append(index + 1)
+            # A cached prompt: its tokens, and where each of its messages
+            # ends, in characters and in tokens.
+            entry = (array("I", tokens), char_ends, token_ends)
+            size = sys.getsizeof(prefix) + sys.getsizeof(entry)
+            size += sum(map(sys.getsizeof, entry))
             if size <= self.entries.budget_bytes:
                 with self.lock:
-                    # An extension replaces its earlier prefix; unrelated
-                    # concurrent conversations retain their own LRU entries.
-                    self.entries.pop(key)
-                    self.entries.put(prefix, token_bytes, size)
+                    # An extension replaces the prompt it extends, whose
+                    # message ends it holds; a branch keeps its own.
+                    if key is not None and prefix.startswith(key):
+                        self.entries.pop(key)
+                    self.entries.put(prefix, entry, size)
         return tokens + self.tokens(text[boundary:])
 
     def split(self, text):

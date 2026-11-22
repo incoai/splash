@@ -39,6 +39,7 @@ REQUEST_FIELDS = (
     "thinking_tokens",
     "thinking_end_count",
     "thinking_also_ends",
+    "head_tokens",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -70,6 +71,7 @@ def example_request():
         seed=0xFEDCBA9876543210,
         constraint=p.ConstraintMode.TOKEN_MASK,
         generation_prompt_tokens=2,
+        head_tokens=2,
         cache_salt=0x00112233445566778899AABBCCDDEEFF,
         thinking_budget=p.ThinkingBudget(4096, (198, 248069), 248058),
     )
@@ -168,7 +170,7 @@ def engine_events():
             b"a start command ran out of GPU memory",
         ),
         "warming": p.WarmingEvent(3, 9),
-        "start": p.StartEvent(91, 2, 4096),
+        "start": p.StartEvent(91, 2, 4096, 4160, p.StateSource.DISK, True),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
         "mask_request_initial": p.MaskRequestEvent(91, 6, 4, (), ()),
@@ -529,6 +531,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.thinking_budget.tokens,
                 len(request.thinking_budget.end),
                 request.thinking_budget.also_ends,
+                request.head_tokens,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
@@ -835,6 +838,19 @@ class ProtocolPythonTests(unittest.TestCase):
                     p.IssueCode.INVALID_COUNT,
                     lambda tokens=tokens: p.serialize_message(
                         replace(request, generation_prompt_tokens=tokens)
+                    ),
+                )
+                self.assertEqual(issue.request_id, request.request_id)
+
+    def test_head_must_leave_a_prompt_token(self):
+        request = example_request()
+        for tokens in (len(request.prompt_tokens), 0xFFFFFFFF):
+            with self.subTest(tokens=tokens):
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda tokens=tokens: p.serialize_message(
+                        replace(request, head_tokens=tokens)
                     ),
                 )
                 self.assertEqual(issue.request_id, request.request_id)

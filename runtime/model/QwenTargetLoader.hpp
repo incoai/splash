@@ -31,8 +31,10 @@ inline constexpr uint64_t kFloat32Bytes = 4;
 // columns in llama.cpp's tiled value-head order, so the GDN writes its output
 // in it (a rotated Prism ML GGUF keeps them grouped, and rotateInputs,
 // Qwen3_8.cpp, switches its GDN to that order); a safetensors target's
-// (model/SafetensorsImage.hpp) keep its grouped value heads and MLX's bf16
-// norms, or the F32 norms of a checkpoint of transformers names.
+// (model/SafetensorsImage.hpp) keep its grouped value heads, and its norms
+// bf16 as stored or F32 as safetensors::float32Norms says: the 1 + w of norms
+// stored 1 below their multipliers, or widened for a geometry whose kernels
+// read F32 norms alone.
 struct BlockTargetFormat final {
   bool float32Norms = true;
   ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Tiled;
@@ -193,8 +195,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
 // with the files' loader, their format and the experts (readQwenTargetWeights,
 // or a family's own order). The target's allocations are all that loading it
 // allocates, its expert store's among them, and its fingerprint is its
-// files'. A family whose weights load from a GGUF only (loadsSafetensors
-// false) reads a GGUF's loader alone.
+// files'.
 template <class Weights, class Layout, class Read>
 [[nodiscard]] Weights
 loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles &files, Read read) {
@@ -205,12 +206,8 @@ loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTar
   Weights weights = [&] {
     if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
       return read(gguf->get(), BlockTargetFormat{}, experts);
-    if constexpr (Layout::loadsSafetensors) {
-      SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
-      return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
-    } else {
-      throw WeightStoreError(std::string(layout.family) + " loads from a GGUF only");
-    }
+    SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
+    return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
   }();
   weights.experts = experts.store;
   weights.manifestFingerprintSha256 = weightManifestFingerprint(weights.files);

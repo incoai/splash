@@ -23,6 +23,14 @@ template <uint Count> struct moe_formats {
   }
 };
 
+// Function constant 4, which production never defines, so that kMoeColumnTiles folds to true and an expert's only
+// tile of at most GGUF_COLUMN_ROWS live rows runs the column tile. The instrumented backend defines it true
+// (metal/BackendInstrumentation.hpp: stageExpertTiles): every tile then runs the staged tile, whose 8-, 16- and 32-row
+// matmuls give a row the same bits (gguf-moe), so that a route's output depends on its own row alone, not on how many
+// rows its step routes to its expert (moe_expert_slab.h).
+constant bool kMoeStagedOnly [[function_constant(4)]];
+constant bool kMoeColumnTiles = !is_function_constant_defined(kMoeStagedOnly) || !kMoeStagedOnly;
+
 // The down pass of the MoE experts (ops/MoE.cpp; kernels/shared/moe.metal groups the rows): projection 2 of the
 // tiles' experts over the intermediate, the routed ones in the chunks of the table at the index after the parameters
 // (metal/abi/MoE.h), into bf16 outputs (moe_gguf_expert_tile).
@@ -38,7 +46,7 @@ kernel void moe_expert_gguf_down(device bfloat *input [[buffer(0)]], device cons
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
   moe_gguf_expert_tile<Rows, Shared, 2>(input, tiles, tile_count, sw0, sw1, smeta, slots, p, chunks, group, simd_lane,
                                         simd_group, stage, tl, [&](ulong o, float v) { output[o] = bfloat(v); },
-                                        moe_formats<2>());
+                                        moe_formats<2>(), kMoeColumnTiles);
 }
 using MoeExpertGgufKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *, device uchar *,
                                  device uchar *, device uchar *, device bfloat *, device const uint *,
@@ -133,7 +141,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   const uint origin = group.x * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
-  if (moe_column_tile(tiles, t)) {
+  if (kMoeColumnTiles && moe_column_tile(tiles, t)) {
     moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out);
     return;
   }

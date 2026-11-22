@@ -129,28 +129,32 @@ struct SchedulerSnapshot final {
 // One single-owner scheduling policy.
 //
 // Prefill takes the ready lanes of the most urgent priority. Within it a
-// request that kMaximumOvertakes prefill commands in a row served later
-// arrivals of its priority and not it, with a lane or waiting for one, is
-// overdue and leads, the oldest first, until a command serves it; otherwise
-// the lane of the fewest remaining rows leads, ties in submission order. A
-// group command, whose
-// target streams experts or whose leader has or may gain Index pages, holds
-// up to the model's command rows and runs in layer passes, contended or not:
-// as many as the last command's measured time at these rows and attention
-// pairs takes of G, every pass before any command was measured. Any other
-// command runs whole: a chunk, or while a lane of its priority or a higher
-// one decodes (contended), the rows the last command ran in G, never fewer
-// than max(512, the model's least rows) but where a layer's attention pairs
-// bound them (cutRows). A lane joins with the rows that spare it a command of
-// its own where the command's rows, lanes past a chunk, Index-page lanes and
-// attention pairs allow. The command between its passes runs its later
-// passes before any other prefill but one of a higher priority. Decode takes
-// the ready lanes of one priority and stage, constrained or not, without
-// waiting for more, so it runs only the four real M8/M16/M24/M32 shapes,
-// between a command's passes too.
+// request that overtakes() prefill commands in a row served later arrivals of
+// its priority and not it, with a lane or waiting for one, is overdue and
+// leads, the oldest first, until a command serves it; otherwise the lane of the
+// fewest remaining rows leads, ties in submission order. At one lane
+// overtakes() is none: every request is overdue, and prompts lead in arrival
+// order, never the shortest first. A group command, whose target streams
+// experts or whose leader has or may gain Index pages, holds up to the model's
+// command rows and runs in layer passes, contended or not: as many as the last
+// command's measured time at these rows and attention pairs takes of G, every
+// pass before any command was measured. Any other command runs whole: a chunk,
+// or while a lane of its priority or a higher one decodes (contended), the rows
+// the last command ran in G, never fewer than max(512, the model's least rows)
+// but where a layer's attention pairs bound them (cutRows). A lane joins with
+// the rows that spare it a command of its own where the command's rows, lanes
+// past a chunk, Index-page lanes and attention pairs allow. The command between
+// its passes runs its later passes before any other prefill but one of a higher
+// priority. Decode takes the ready lanes of one priority and stage, constrained
+// or not, without waiting for more, so it runs only the real shapes of its
+// lanes, M8 to M64, between a command's passes too.
 class Scheduler final {
 public:
   Scheduler(SchedulerConfig config, const model::PrefillWorkSource &work);
+  // What one prefill command may hold from the next plan on, before any
+  // request: a Neural Engine split joined the model's commands
+  // (model::RuntimeModel::setAneFfn).
+  void setLimits(const model::CommandLimits &limits) noexcept { config_.limits = limits; }
 
   void submit(RequestSpec request);
   void deferAdmission(uint64_t requestId);
@@ -256,8 +260,8 @@ private:
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;
     // The prefill commands of its priority in a row that served later
-    // arrivals and not it, up to kMaximumOvertakes, at which it is overdue;
-    // none once a command serves it or its prompt completes.
+    // arrivals and not it, up to overtakes(), at which it is overdue; none
+    // once a command serves it or its prompt completes.
     uint32_t overtaken = 0;
     // The prompt position its committed rows reach in prefillRows, never
     // short of promptProcessed, which rows planned again after their command
@@ -295,6 +299,8 @@ private:
 
   [[nodiscard]] LaneShape shapeOf(uint64_t requestId, const PlanInputs &in) const;
   [[nodiscard]] Lane lane(const Request &request, uint32_t processed, const PlanInputs &in) const;
+  // A full batch's other lanes: a request overtaken so many commands in a row is overdue.
+  [[nodiscard]] uint32_t overtakes() const noexcept { return config_.limits.lanes - 1; }
   [[nodiscard]] std::vector<model::PrefillLane> prefillLanes(std::span<const BatchItem> items,
                                                              const PlanInputs &in) const;
   // Whether the lane's commands are groups, of up to the model's command

@@ -144,8 +144,9 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   uint64_t budget = pages;
   while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
   const uint64_t index = kv::kPageTokens * model::kLookupIndexTokenBytes;
+  const uint64_t runway = model::ExecutionLimits::runwayPages(layout.minimumExtentPages(), config.lanes);
   return kvPagesBytes(layout, budget, kvWindowFloorPages(layout, 0), layout.extentPagesFor(budget)) + budget * index -
-         kvRunwayPages(layout.minimumExtentPages()) * (layout.bytesPerModelPage() + index);
+         runway * (layout.bytesPerModelPage() + index);
 }
 
 // The runtime memory a start plans of a model of `config` before its weights
@@ -469,13 +470,13 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config) {
   const ops::ExecutionPlans operators(backend.capabilities(), config.int8Activations);
   const model::ModelMemoryPlan arenas = model::plannedRuntimeMemory(
       config.model, model::plannedTargetGeometry(backend, config.modelRoot, config.model, 0, nullptr), operators,
-      config.kvFormat, config.stateFormat, {});
+      config.kvFormat, config.stateFormat, {}, config.lanes);
   return minimumRequiredBytes(model::streamableWeights(config.modelRoot, config.model, {}).loadedBytes +
                                   arenas.sharedPrefillPlannedAllocatedBytes +
                                   arenas.sharedDecodePlannedAllocatedBytes + model::kPipelineReserveBytes +
                                   model::kRuntimeOverheadReserveBytes,
                               config.model.stateLayout.laneBytes(),
-                              config.model.targetKvLayout)
+                              config.model.targetKvLayout, config.lanes)
       .value();
 }
 
@@ -612,8 +613,8 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
       }
     }
   }
-  // Without a ceiling, or with one above this Mac's budget, which only a
-  // notice names, the start reaches the loader.
+  // Without a ceiling, or with one above the most it can set on this Mac,
+  // which a notice names, the start reaches the loader.
   for (const uint64_t ceiling : {uint64_t{0}, 1024 * kGiB}) {
     config.maximumMemoryBytes = ceiling;
     const std::string log = test::capturedStderr([&] {
@@ -621,9 +622,9 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
                                 "a sufficient weight budget did not reach the "
                                 "model loader");
     });
-    require((log.find("--max-memory ignored: its 1024.0 GiB exceed this Mac's Metal budget of ") !=
+    require((log.find("--max-memory capped: its 1024.0 GiB exceed the most it can set on this Mac, ") !=
              std::string::npos) == (ceiling != 0),
-            "a ceiling above the budget was ignored without a notice, or no ceiling was named");
+            "a ceiling above the budget was capped without a notice, or no ceiling was named");
   }
 }
 
@@ -723,10 +724,10 @@ void testHostMemoryProbeIsRequired(const char *metallibPath) {
 
 // The 27B under a budget half a GiB above its weights: the weights alone fit,
 // but not with what the runtime needs beside them. Startup refuses it before
-// any weight is loaded, against the bound that binds: --max-memory, or this
-// Mac's Metal budget where that is lower (a 16 GB Mac's 10.8 GiB), which
-// --max-memory can only lower. There, a --max-memory half a GiB below the
-// Metal budget binds instead.
+// any weight is loaded, against the bound that binds: --max-memory, or the
+// most it can set on this Mac where that is lower, the recommended working
+// set less its margin (a 16 GB Mac's 10.8 GiB). There, a --max-memory half a
+// GiB below that binds instead.
 void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
@@ -734,8 +735,9 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
                                             test::qwen3_8Vision(), model::TargetSource::Safetensors,
                                             model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
-  const uint64_t device =
-      EngineMemoryPolicy::hardBudgetBytes(metal::probeDeviceCapabilities().recommendedMaxWorkingSetBytes, 0);
+  const DeviceCapabilities capabilities = metal::probeDeviceCapabilities();
+  const uint64_t device = EngineMemoryPolicy::hardBudgetBytes(capabilities.recommendedMaxWorkingSetBytes,
+                                                              UINT64_MAX, capabilities.physicalMemoryBytes);
   const uint64_t above = model::streamableWeights(root.path(), config.model, {}).loadedBytes + kGiB / 2;
   std::vector<uint64_t> limits{above};
   if (above >= device)
@@ -1080,7 +1082,7 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
           "the runtime's arenas were refused");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1088,6 +1090,58 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
   const std::string log = test::capturedStderr([&] { static_cast<void>(runtime->warmupCompositeStateRestore()); });
   require(backend.pipelinesCreatedWhileServing() == 0,
           "a restore after the start's other warmups created pipelines: " + log);
+}
+
+// A start of any lanes the option offers is a runtime that warms as a start
+// does: its arenas, its sampling policies' pipelines, its prefill and every
+// decode width up to its lanes (a draft step of one lane may store two
+// lanes' rows, decodeArenaLanes) and the state restore, which moves a state
+// to another state lane where it has one. One, two, three and five lanes.
+void testRuntimesOfOtherLanesWarm(const char *metallibPath) {
+  for (const uint32_t lanes : {1U, 2U, 3U, 5U}) {
+    const test::TemporaryDirectory root("splash-lanes-" + std::to_string(lanes));
+    RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "lanes-test");
+    config.lanes = lanes;
+    std::unique_ptr<RuntimeResources> resources;
+    static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+    const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+    require(budget.maximumBatchWidth == lanes, "a start of " + std::to_string(lanes) + " lanes planned others");
+    std::unique_ptr<model::RuntimeModel> runtime;
+    require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+                budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+                [&] { runtime = model::createRuntime(resources->modelContext()); })),
+            "the runtime's arenas were refused");
+    require(runtime->commandLimits().lanes == lanes, "a runtime of " + std::to_string(lanes) + " lanes runs others");
+    const KvPool::RunwayHold runway(resources->kvPool());
+    static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+    for (uint32_t width = 1; width <= lanes; ++width) static_cast<void>(runtime->warmupDecodeBatch(width));
+    static_cast<void>(test::capturedStderr([&] { static_cast<void>(runtime->warmupCompositeStateRestore()); }));
+    rejects([&] { static_cast<void>(runtime->warmupDecodeBatch(lanes + 1)); }, "invalid decode warmup width",
+            "a runtime of " + std::to_string(lanes) + " lanes warmed a wider batch");
+  }
+}
+
+// Where eight lanes leave less context than four would, the start says so
+// (EngineMemoryBreakdown::defaultLanesContextTokens), and a relaunch, which
+// serves its first engine's context, says it again: four's context is capped
+// by --max-context alone, never by the relaunch's.
+void testARelaunchKeepsTheLanesNote(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-lanes-note");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "lanes-note");
+  config.lanes = 8;
+  const auto start = [&] {
+    std::unique_ptr<RuntimeResources> resources;
+    static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+    return std::pair(resources->aneFfnOutcome().context, resources->memoryPlan().breakdown());
+  };
+  // A budget whose memory, not the window, bounds the context.
+  config.maximumMemoryBytes = start().second.minimumRequiredBytes + 64 * kMiB;
+  const auto [served, first] = start();
+  require(first.defaultLanesContextTokens > served,
+          "eight lanes that leave less context than four did not carry four's");
+  config.relaunchContext = served;
+  require(start().second.defaultLanesContextTokens == first.defaultLanesContextTokens,
+          "a relaunch of eight lanes did not carry four lanes' context");
 }
 
 // A verify's kernels follow its lanes' history, which the decode warmups'
@@ -1112,7 +1166,7 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
           "the runtime's arenas were refused");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1172,7 +1226,7 @@ void testAReplyCaptureAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   require(runtime->capturesInDecode(), "the reply capture's model captures no state in decode");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1345,6 +1399,8 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "automatic-test");
   config.diskVolume = reading(localVolume(500 * kGiB));
   uint64_t minimumRequired = 0;
+  // The status's off_reason of the last start.
+  std::string offReason;
   const auto start = [&](uint32_t requestedContextTokens, uint32_t &contextTokens,
                          bool &tier) {
     return test::capturedStderr([&] {
@@ -1352,6 +1408,7 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
       contextTokens = resources->memoryPlan().maximumContextTokens();
       minimumRequired = resources->memoryPlan().breakdown().minimumRequiredBytes;
       tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+      offReason = resources->cache().snapshot().kvTier.offReason;
     });
   };
   uint32_t without = 0, with = 0, yielded = 0;
@@ -1365,13 +1422,14 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
   require(!tier && without, "a start without the SSD cache had one, or no context");
   config.cacheDisk = {.automatic = true};
   static_cast<void>(start(0, with, tier));
-  require(tier && with < without,
+  require(tier && with < without && offReason.empty(),
           "the automatic tier did not start, or its staging cost the plan no context");
   const std::string off = start(without, yielded, tier);
-  require(!tier && yielded == without &&
-              off.find("SSD cache off: the memory plan cannot hold a " + std::to_string(without) +
-                       "-token context beside its state staging") != std::string::npos,
-          "the automatic tier kept staging the requested context needs");
+  const std::string reason =
+      "the memory plan cannot hold a " + std::to_string(without) + "-token context beside its state staging";
+  require(!tier && yielded == without && off.find("SSD cache off: " + reason) != std::string::npos &&
+              offReason == reason,
+          "the automatic tier kept staging the requested context needs, or its status did not say why");
 }
 
 // The automatic tier's staging is decided by memory alone, so a start serves
@@ -1388,7 +1446,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
     uint32_t context = 0, planContext = 0;
     uint64_t staging = 0, minimumRequired = 0;
     bool tier = false, persistent = false;
-    std::string log;
+    std::string log, offReason;
   };
   const auto start = [&] {
     Started started;
@@ -1401,6 +1459,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
       const CacheSnapshot cache = resources->cache().snapshot();
       started.tier = cache.kvTier.capacityBytes != 0;
       started.persistent = cache.persistent;
+      started.offReason = cache.kvTier.offReason;
     });
     return started;
   };
@@ -1420,7 +1479,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
   config.diskVolume = reading(localVolume(500 * kGiB));
   const Started room = start();
   require(!off.tier && room.tier && room.staging == config.model.stateLayout.cachedBytes() &&
-              room.context == room.planContext && room.context < off.context,
+              room.context == room.planContext && room.context < off.context && room.offReason.empty(),
           "the automatic tier did not start beside its staging, or the staging cost no context");
   // A cached state in the running format (--cached-states exact) stages and
   // counts as a lane's cell and window, more than its codes.
@@ -1444,9 +1503,10 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
     config.diskVolume = reading(volume);
     const Started refused = start();
     require(!refused.tier && refused.staging == room.staging && refused.context == room.context &&
-                refused.planContext == room.planContext && offOnce(refused, reason),
+                refused.planContext == room.planContext && offOnce(refused, reason) &&
+                refused.offReason.find(reason) == 0,
             "a volume without room changed the automatic context, or did not leave the tier off "
-            "once (" + reason + ")");
+            "once, saying why in its status (" + reason + ")");
   }
   // A persistent cache's root without room leaves the tier temporary files;
   // with no room for those either, it is off.
@@ -1802,7 +1862,7 @@ void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
   const model::DecodeArena arena(backend, geometry, operators);
-  constexpr uint32_t kStepRows = model::kLaneCount * model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kStepRows = 64;
   const auto at = [](const metal::MetalBuffer &buffer) { return static_cast<const std::byte *>(buffer.contents()); };
   // A lane's rows after lanes of 16 and 5.
   constexpr ops::LaneRows lane{21, 11};
@@ -1815,7 +1875,7 @@ void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
       {model::DecodeTensor::FinalHidden, hiddenRow},
       {model::DecodeTensor::CapturedTargetHidden, uint64_t{geometry.target.capturedHiddenSize()} * sizeof(uint16_t)}};
   for (const auto &[tensor, row] : rowTensors) {
-    const metal::MetalBuffer step = arena.batchSlice(tensor, model::kLaneCount);
+    const metal::MetalBuffer step = arena.all(tensor);
     const metal::MetalBuffer rows = arena.rows(tensor, lane);
     require(step.sizeBytes() == kStepRows * row && arena.rows(tensor, {0, kStepRows}).sizeBytes() == step.sizeBytes() &&
                 at(rows) == at(step) + lane.first * row && rows.sizeBytes() == lane.rows * row,
@@ -2054,6 +2114,8 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
                                                            .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 0,
                                                            .attentionPairs = kLayerPairs},
           "a resident dense runtime's command limits are not a chunk in a pass a layer, with the per-layer bound");
@@ -2086,6 +2148,8 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
                                                            .layers = kMoeLayers,
                                                            .maximumPasses = kMoeLayers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 0,
                                                            .streamsWeights = true,
                                                            .attentionPairs = kLayerPairs},
@@ -2149,6 +2213,8 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
                                                            .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 1,
                                                            .streamsWeights = streamsExperts,
                                                            .attentionPairs = kLayerPairs},
@@ -2287,6 +2353,8 @@ int main(int argc, char **argv) {
       testThePlanCountsEveryBuffer(argv[1]);
       testDecodeArenaHoldsAStepsPackedRows(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
+      testRuntimesOfOtherLanesWarm(argv[1]);
+      testARelaunchKeepsTheLanesNote(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
       testThePlanCountsTheSpilledKvReadersTables(argv[1]);
       {

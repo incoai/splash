@@ -65,6 +65,8 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn('splash_disk_writes_gated{state="budget"} 1', lines)
         self.assertIn('splash_disk_writes_gated{state="no"} 0', lines)
         self.assertIn("splash_disk_read_bytes_total 12345", lines)
+        self.assertIn("splash_disk_spilled_kv_read_bytes_total 559600000", lines)
+        self.assertIn("splash_disk_weights_read_bytes_total 1973022500", lines)
         self.assertIn("splash_disk_written_bytes_total 67890", lines)
         self.assertIn("splash_disk_written_last_hour_bytes 16384", lines)
         self.assertIn("splash_disk_written_last_day_bytes 65536", lines)
@@ -409,6 +411,7 @@ class StatusRouteTests(HarnessTestCase):
                             "request_bytes": serve_options.DEFAULT_MAX_REQUEST_BYTES,
                             "images": 64,
                             "image_bytes": 32 * 1024 * 1024,
+                            "image_aspect": 200,
                             "pdf_bytes": 64 * 1024 * 1024,
                             "pdf_pages": 64,
                         },

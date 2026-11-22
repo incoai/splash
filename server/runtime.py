@@ -541,6 +541,11 @@ class MultiplexedRuntime:
         self._stderr_relay: threading.Thread | None = None
         self._generation = 0
         self._startup_attempt: _StartupAttempt | None = None
+        # The attempt start() began, until a wait takes it. It is the first
+        # wait's, ended or not: an engine that failed before the server waited
+        # reports that failure and is not started again, and a wait after it,
+        # such as a relaunch after a crash, starts a new engine.
+        self._started: _StartupAttempt | None = None
         self._ready_message: wire.ReadyEvent | None = None
         # When the current generation's ReadyEvent arrived.
         self._ready_at: float | None = None
@@ -649,6 +654,13 @@ class MultiplexedRuntime:
     def last_crash_trace(self) -> str | None:
         path = self._crash_trace.last_dump
         return str(path) if path is not None else None
+
+    def start(self) -> None:
+        """Start an engine unless one serves or starts, without waiting for
+        its Ready: the server loads its tokenizer while the engine loads its
+        weights, and wait_ready() then waits for it and raises why its
+        startup failed, if it did."""
+        self._ensure_process(wait=False)
 
     def wait_ready(self, timeout: float | None = None) -> bool:
         """Start an engine unless one serves, and wait for its Ready.
@@ -839,7 +851,7 @@ class MultiplexedRuntime:
             return EngineUnhealthy(issue.describe())
         return ProtocolFatal(issue.describe())
 
-    def _ensure_process(self, timeout: float | None = None) -> None:
+    def _ensure_process(self, timeout: float | None = None, wait: bool = True) -> None:
         if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
             raise ValueError("ready timeout must be positive")
         caller_deadline = None if timeout is None else time.monotonic() + timeout
@@ -849,6 +861,9 @@ class MultiplexedRuntime:
             with self._state_lock:
                 if self._closed:
                     raise RuntimeClosed("runtime is closed")
+                started = self._started
+                if wait:
+                    self._started = None
                 process = self._process
                 if (
                     process is not None
@@ -858,7 +873,9 @@ class MultiplexedRuntime:
                 ):
                     return
                 attempt = self._startup_attempt
-                if attempt is not None and not attempt.event.is_set():
+                if attempt is not None and (
+                    attempt is started or not attempt.event.is_set()
+                ):
                     pass
                 elif process is not None and self._terminal_error is None:
                     stale_generation = self._generation
@@ -868,6 +885,8 @@ class MultiplexedRuntime:
                     old_process = process
                     old_reader = self._reader_thread
                     owner = True
+                    if not wait:
+                        self._started = attempt
 
             if stale_generation is not None:
                 # Deliver terminal callbacks without any startup ownership
@@ -888,6 +907,8 @@ class MultiplexedRuntime:
                     name="splash-native-startup",
                     daemon=True,
                 ).start()
+            if not wait:
+                return
             deadline = min(attempt.deadline, caller_deadline or attempt.deadline)
             if not attempt.event.wait(max(0.0, deadline - time.monotonic())):
                 if time.monotonic() < attempt.deadline:

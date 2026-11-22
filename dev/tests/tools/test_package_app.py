@@ -10,7 +10,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
-from dev.tools import package_app
+from dev.tools import package, package_app
 
 THIN_ARM64 = bytes.fromhex("cffaedfe0c000001")
 # The release key's public half, SPARKLE_PUBLIC_KEY, as generate_keys printed
@@ -281,6 +281,27 @@ class PackageAppTests(unittest.TestCase):
         # xcrun prints nothing on stdout when it finds no actool.
         with self.assertRaises(subprocess.CalledProcessError):
             self.compile_icon(b"", returncode=72)
+
+    def test_the_signed_runtime_keeps_its_bytecode_and_gains_none(self):
+        # The runtime ships its bytecode; a file its smoke run wrote would
+        # break the seal.
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Path(temporary) / "Splash.app"
+            cache = app / "Contents/Resources/splash/server/__pycache__"
+            cache.mkdir(parents=True)
+            (cache / "server.cpython-313.pyc").write_bytes(b"")
+            written = []
+
+            def run(command, **options):
+                if command[-1:] == [package.SMOKE_IMPORTS] and written:
+                    (cache / written[0]).write_bytes(b"")
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(package_app.subprocess, "run", side_effect=run):
+                package_app.check_signed(app)
+                written.append("frontend.cpython-313.pyc")
+                with self.assertRaisesRegex(RuntimeError, "gained bytecode"):
+                    package_app.check_signed(app)
 
     def signing_commands(self, identity):
         """The commands sign runs for a runtime of three Mach-O files, a link

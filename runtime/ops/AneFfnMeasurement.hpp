@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -26,20 +27,21 @@ public:
               std::function<bool()> interrupted);
 
   // The split's GPU part alone and its split layer of full chunks with the
-  // ANE taking the channel units nearest two shares, and the GPU's FFN
-  // alone, on the same four layers spread over the model, whose formats can
-  // differ with depth: a program of one function of a full chunk's rows
-  // each, which the ANE's service keeps once compiled.
+  // ANE taking the channel units nearest two shares, at the higher one also
+  // of a step of half a full chunk's rows, and the GPU's FFN alone, on the
+  // same four layers spread over the model, whose formats can differ with
+  // depth: a program of one function of a full chunk's rows, and of a half's
+  // too at the higher share, which the ANE's service keeps once compiled.
+  // Not the mixer (Timings::mixer), which the model's side times.
   [[nodiscard]] Timings time();
-  // The same at `aneUnits`, the split layer less `gpuAlone`, the GPU's FFN
-  // alone that time() timed: what calibration fits again at the units it
+  // The same at `aneUnits`: what calibration fits again at the units it
   // first chooses (ane_ffn::refit), on the layers it fitted.
-  [[nodiscard]] Timing time(uint32_t aneUnits, double gpuAlone);
-  // The GPU alone over the least and the most rows of the split's
-  // functions, and the split with the ANE taking `aneUnits` over a chunk of
-  // the rows of each of its functions, on the layers time() times: a
-  // program of every function, as the split that serves compiles.
-  [[nodiscard]] ChunkTimings chunks(uint32_t aneUnits);
+  [[nodiscard]] Timing time(uint32_t aneUnits);
+  // The GPU alone at the least rows and a full chunk, and the split of
+  // `shares` over a step of the rows of each of its one-step functions, on
+  // the layers time() times: on the program a split of `shares` serves
+  // (AneFfn::programRows), which its own split then loads.
+  [[nodiscard]] ChunkTimings chunks(AneFfn::Shares shares);
 
 private:
   // The per-layer milliseconds of `count` `rows`-row FFN layers of `layers`
@@ -52,6 +54,9 @@ private:
   // The kSampledLayers layers time() spreads over the model, first and last
   // among them (AneFfnMeasurement.cpp).
   [[nodiscard]] std::vector<SwiGluProjections> sampled() const;
+  // The Metal readers of `layers` through the split `split` holds, which
+  // load() makes, one at a time.
+  [[nodiscard]] Readers readers(std::span<const SwiGluProjections> layers, std::unique_ptr<AneFfn> &split);
 
   metal::MetalBackend &backend_;
   std::span<const SwiGluProjections> layers_;

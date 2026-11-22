@@ -8,7 +8,7 @@
 namespace splash::model {
 namespace {
 
-ops::VisionAffine readAffine(WeightFile &file, uint32_t outputSize,
+ops::DenseWeights readAffine(WeightFile &file, uint32_t outputSize,
                              uint32_t inputSize, std::string_view label) {
   return {
       file.section(checkedMultiply<WeightStoreError>(
@@ -22,8 +22,8 @@ ops::VisionAffine readAffine(WeightFile &file, uint32_t outputSize,
   };
 }
 
-ops::VisionNorm readNorm(WeightFile &file, uint32_t width,
-                         std::string_view label) {
+ops::LayerNormWeights readNorm(WeightFile &file, uint32_t width,
+                               std::string_view label) {
   const uint64_t bytes = checkedMultiply<WeightStoreError>(
       width, kBFloat16Bytes, "vision norm bytes");
   return {file.section(bytes, label), file.section(bytes, label)};

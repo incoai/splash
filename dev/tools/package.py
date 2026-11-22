@@ -172,9 +172,9 @@ def stage_runtime(destination, version):
 def build_runtime(destination, version):
     """Build the complete runtime in destination, an empty directory: the
     files stage_runtime copies and the standalone Python with
-    install/requirements.txt, smoke-tested in place. The release archive and
-    Splash.app (package_app.py) ship this tree as it is: it holds no bytecode
-    and no console script, and the runtime, which runs with
+    install/requirements.txt, smoke-tested in place, and its bytecode. The
+    release archive and Splash.app (package_app.py) ship this tree as it is:
+    it holds no console script, and the runtime, which runs with
     PYTHONDONTWRITEBYTECODE=1, writes nothing into it."""
     distribution = python_distribution()
     stage_runtime(destination, version)
@@ -221,9 +221,39 @@ def build_runtime(destination, version):
     for entry in (destination / "python/bin").iterdir():
         if not re.fullmatch(r"python3(\.\d+)?", entry.name):
             entry.unlink()
-    # The bytecode the distribution ships and pip's run writes.
+    # The bytecode the distribution ships and pip's run writes goes, and all
+    # of it is compiled anew: the runtime writes none, so without it every
+    # process the app starts compiled what it imported (the 1.7.0 runtime on
+    # the M5 Max Studio: `launcher.py --version` 170 ms, 47 ms with it; the
+    # server's imports at each start 1.14 s, 0.53 s). The runtime is signed
+    # and its sources never change, so a check of them at each import buys
+    # nothing: the bytecode is checked by no time stamp or hash
+    # (unchecked-hash), which an installer's copy, changing the times, would
+    # otherwise make stale. It is named by its path in the runtime, its sets
+    # in a fixed hash order, and -B keeps the compiler's own imports from
+    # writing theirs first, stamped with times: each build writes the same
+    # bytes. Transformers' 2,300 model modules stay source: 45 MB of
+    # bytecode, of which the server's start imports three. The archive grows
+    # from 80 to 103 MB.
     for cache in list(destination.rglob("__pycache__")):
         shutil.rmtree(cache)
+    subprocess.run(
+        [
+            str(python),
+            "-B",
+            "-s",
+            "-P",
+            "-m",
+            "compileall",
+            "-q",
+            "--invalidation-mode=unchecked-hash",
+            "-x/transformers/models/",
+            f"-s{destination}",
+            str(destination),
+        ],
+        env={"PYTHONHASHSEED": "0"},
+        check=True,
+    )
 
 
 def formula(version, url, checksum, macos_min):

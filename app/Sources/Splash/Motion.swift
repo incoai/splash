@@ -2,15 +2,15 @@ import AppKit
 import SwiftUI
 
 /// The app's motion, in three meanings, and the one place SwiftUI's durations and curves are named
-/// (their twins keep the same values: AppKit's, in a popup's fade and the scroll to options opened,
-/// and the transcript page's `--quick`, `--settle` and glide to the latest message):
+/// (their twins keep the same values: AppKit's, in a popup's fade, and the transcript page's
+/// `--quick`, `--settle` and glide to the latest message):
 /// - `quick`, touch and feedback: a field's ring, a check, the mark's color, a reply's actions
 ///   coming into view; a SwiftUI hover highlight comes at once, the page's within `quick`;
 /// - `settle`, a change of state or shape: a disclosure, rows and sections coming and going, the
 ///   server's stage across the window, the switch's pill, figures that change, the sidebar and the
 ///   drawer sliding away and back, the composer moving between a new chat and a conversation;
-/// - `glide`, travel: a scroll to the latest message or to options opened, the mark taking its
-///   pose as a model becomes ready.
+/// - `glide`, travel: a scroll to the latest message, the mark taking its pose as a model becomes
+///   ready. The scroll to options opened goes with their unfolding, on `settle` (`ScrollTarget`).
 ///
 /// What appears fades in within `settle`, a section or a row of a page once what makes room for it
 /// has moved, and what goes from a page goes at once (`comingAndGoing`); what the composer holds

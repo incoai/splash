@@ -51,9 +51,10 @@ struct FakeRuntime {
     /// The folder of the chats of `state`.
     var chats: URL { root.appending(path: "chats") }
 
-    /// An app's state on this runtime, its logs and defaults in the runtime's folder.
-    @MainActor func state(keychain: Keychain) -> AppState {
-        AppState(runtime: Runtime(root: root), folders: .init(logs: root, chats: chats), keychain: keychain,
+    /// An app's state on this runtime, its logs and defaults in the runtime's folder, its API key in
+    /// a Keychain service of its own (`Keychain.forTests`).
+    @MainActor func state() -> AppState {
+        AppState(runtime: Runtime(root: root), folders: .init(logs: root, chats: chats), keychain: .forTests(),
                  defaults: .kept(in: root), shell: { .bare })
     }
 }

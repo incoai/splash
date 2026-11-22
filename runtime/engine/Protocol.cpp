@@ -30,7 +30,7 @@ constexpr uint64_t kMaskResponseFixedBytes = 24;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReleaseRequestFixedBytes = 8;
 constexpr uint64_t kReadyFixedBytes = 21;
-constexpr uint64_t kStartFixedBytes = 16;
+constexpr uint64_t kStartFixedBytes = 22;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
@@ -344,6 +344,9 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::InvalidCount,
                    "generation prompt must leave a prompt token");
   }
+  if (request.headTokens >= request.promptTokens.size()) {
+    return invalid(IssueCode::InvalidCount, "head must leave a prompt token");
+  }
   if (scoring) {
     if (!request.imageSpans.empty()) {
       return invalid(IssueCode::InvalidCount,
@@ -649,6 +652,9 @@ EncodedEvent encodeStart(const StartEvent &event) {
   writer.u64(event.requestId);
   writer.u32(event.lane);
   writer.u32(event.matchedPromptTokens);
+  writer.u32(event.prefixTokens);
+  writer.u8(static_cast<uint8_t>(event.stateSource));
+  writer.u8(event.lostState);
   return success(writer.take());
 }
 
@@ -795,7 +801,8 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
       !reader.u32(request.generationPromptTokens) ||
       !reader.u32(request.flags) || !reader.u64(request.cacheSalt.lo) ||
       !reader.u64(request.cacheSalt.hi) || !reader.u32(thinking.tokens) ||
-      !reader.u32(thinkingEndCount) || !reader.u32(thinking.alsoEnds)) {
+      !reader.u32(thinkingEndCount) || !reader.u32(thinking.alsoEnds) ||
+      !reader.u32(request.headTokens)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "request fixed payload is truncated"));

@@ -15,10 +15,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from . import images, origins, unix_socket
+from . import images, origins, request_fields, unix_socket
 from .chat_format import REASONING_EFFORTS
 from .http_security import validate_api_key
-from .protocol import MAX_THINKING_END_TOKENS
+from .protocol import MAX_THINKING_END_TOKENS, SAMPLING_FIELDS
 
 # The most context --max-context takes: the most any family serves
 # (QwenTargetDimensions::maximumContextTokens(), as the engine's families
@@ -29,6 +29,11 @@ MAX_YARN_CONTEXT_TOKENS = 1010000
 _CONTEXT_UNITS = {"K": 1024, "M": 1000000}
 DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 DEFAULT_QUEUE_SIZE = 32
+# The requests the engine decodes at once unless --max-concurrent-requests
+# says otherwise (ExecutionLimits::defaultLanes), and the most it can
+# (SPLASH_MAXIMUM_BATCH_WIDTH).
+DEFAULT_CONCURRENT_REQUESTS = 4
+MAX_CONCURRENT_REQUESTS = 8
 # The port both commands serve on unless --port names another, or for the
 # launcher SPLASH_PORT does.
 DEFAULT_PORT = 8000
@@ -265,6 +270,18 @@ def parse_queue_size(value):
     return size
 
 
+def parse_concurrent_requests(value):
+    try:
+        requests = int(value)
+    except ValueError:
+        requests = 0
+    if not 1 <= requests <= MAX_CONCURRENT_REQUESTS:
+        raise argparse.ArgumentTypeError(
+            f"must be a number of requests from 1 to {MAX_CONCURRENT_REQUESTS}"
+        )
+    return requests
+
+
 def parse_decode_share(value):
     try:
         share = float(value)
@@ -340,6 +357,28 @@ def parse_reasoning_effort(value):
             f"must be one of {', '.join(REASONING_EFFORTS)}"
         )
     return value
+
+
+def parse_sampling_default(value):
+    """A --sampling-default NAME=VALUE as (name, number), a number a request
+    may set (request_fields.sampling_refusal): `splash serve` refuses one
+    before it downloads anything. The app's Sampling defaults field
+    (LaunchOption.samplingDefaults) takes the same names and forms, and
+    leaves the ranges to this check."""
+    name, separator, number = value.partition("=")
+    if not separator or name not in SAMPLING_FIELDS:
+        raise argparse.ArgumentTypeError(
+            f"must be NAME=VALUE, NAME one of {', '.join(SAMPLING_FIELDS)}"
+        )
+    try:
+        parsed = int(number) if name == "top_k" else float(number)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{name} must be {'an integer' if name == 'top_k' else 'a number'}"
+        ) from None
+    if (refusal := request_fields.sampling_refusal(name, parsed)) is not None:
+        raise argparse.ArgumentTypeError(refusal)
+    return name, parsed
 
 
 def parse_thinking_token_budget(value):
@@ -489,8 +528,9 @@ SERVE_OPTIONS = (
             type=parse_max_memory,
             default=None,
             metavar="SIZE",
-            help="Metal memory budget, e.g. 28G; it can only lower the automatic "
-            "budget (default: auto)",
+            help="Metal memory budget in place of the automatic one, e.g. 28G, up "
+            "to the GPU's recommended working set less a margin (default: auto, "
+            "which also leaves a tenth of the Mac's memory unwired)",
         ),
         engine=EngineArgument(1, text=_auto_text, required=True),
     ),
@@ -683,6 +723,23 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--sampling-default",
+        "api",
+        dict(
+            action="append",
+            default=[],
+            type=parse_sampling_default,
+            metavar="NAME=VALUE",
+            help="the value of a sampling parameter for requests that set "
+            "none (repeatable): "
+            + ", ".join(SAMPLING_FIELDS)
+            + " (default: the served family's published sampling for "
+            "temperature, top_p and top_k, else the value that leaves the "
+            "logits unchanged)",
+        ),
+        text=lambda item: f"{item[0]}={item[1]}",
+    ),
+    ServeOption(
         "--reasoning-effort",
         "api",
         dict(
@@ -799,6 +856,23 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--max-concurrent-requests",
+        "requests",
+        dict(
+            type=parse_concurrent_requests,
+            default=DEFAULT_CONCURRENT_REQUESTS,
+            metavar="REQUESTS",
+            help="requests the engine runs at once, 1 to "
+            f"{MAX_CONCURRENT_REQUESTS}; more let more clients be answered "
+            "together, each a little slower, and take memory for their "
+            "states and arenas: where that streams more of the weights or "
+            "leaves less context than four would, the start logs both, and "
+            "/status reports four's context (default: "
+            f"{DEFAULT_CONCURRENT_REQUESTS})",
+        ),
+        engine=EngineArgument("--max-concurrent-requests"),
+    ),
+    ServeOption(
         "--decode-share",
         "requests",
         dict(
@@ -820,6 +894,18 @@ SERVE_OPTIONS = (
             "prompts also use the Neural Engine when that is faster)",
         ),
         engine=EngineArgument("--ane", text=_spelled("off")),
+        needs="dense_ffn",
+    ),
+    ServeOption(
+        "--recalibrate-ane",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="calibrate the Neural Engine's share of long prompts again at "
+            "this start instead of taking the one this Mac kept",
+        ),
+        engine=EngineArgument("--ane-calibration", text=_spelled("again")),
         needs="dense_ffn",
     ),
     ServeOption(
@@ -902,6 +988,10 @@ def check_serve_arguments(parser, args):
         )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
+    if args.recalibrate_ane and args.disable_ane:
+        parser.error(
+            "--recalibrate-ane needs the Neural Engine --disable-ane turns off"
+        )
     if args.reasoning_effort is not None and args.default_reasoning_effort is not None:
         parser.error(
             "--default-reasoning-effort (SPLASH_DEFAULT_REASONING_EFFORT) sets "

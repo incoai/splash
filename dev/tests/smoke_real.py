@@ -128,11 +128,17 @@ class RealServer:
             command.extend(("--expert-memory", arguments.expert_memory))
         if arguments.verify_rows is not None:
             command.extend(("--verify-rows", arguments.verify_rows))
+        if arguments.max_concurrent_requests is not None:
+            command.extend(
+                ("--max-concurrent-requests", str(arguments.max_concurrent_requests))
+            )
         if cache_dir is not None:
             command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
             command.extend(("--max-image-pixels", str(arguments.max_image_pixels)))
         command.extend(("--kv-format", arguments.kv_format))
+        if arguments.cached_states is not None:
+            command.extend(("--cached-states", arguments.cached_states))
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -1750,6 +1756,12 @@ def run_persistent_cache(arguments) -> None:
             )
             reused = after["cache"]["reused_tokens"] - before["cache"]["reused_tokens"]
             require(states >= 1, "the next turn restored no state from disk")
+            # Its usage says so: the state it resumed from was the SSD cache's.
+            details = reply["usage"]["prompt_tokens_details"]
+            require(
+                details["state_source"] == "disk" and not details["lost_state"],
+                f"the next turn's usage said {details!r}",
+            )
             # The tail past the restore point's block boundary is recomputed.
             require(
                 min(restored, reused) * 10 >= prompt_tokens * 9,
@@ -1792,8 +1804,20 @@ def add_server_arguments(parser):
         help="the rows of each draft block decode verifies (splash serve "
         "--verify-rows); a MoE model's greedy output repeats only with all",
     )
+    parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        help="the requests the engine runs at once (splash serve "
+        "--max-concurrent-requests)",
+    )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
+    parser.add_argument(
+        "--cached-states",
+        choices=("int8", "exact"),
+        help="the format of cached recurrent states (splash serve "
+        "--cached-states); exact restores a state as it ran",
+    )
     parser.add_argument("--startup-timeout", type=float, default=1800)
 
 

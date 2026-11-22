@@ -21,21 +21,29 @@ namespace splash::ops {
 class ExecutionPlans final {
 public:
   explicit ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations);
+  // A prefill chunk's plans, and a decode step's, which take no int8 prefill
+  // path whatever its rows (StepKind).
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
+  [[nodiscard]] const Linear &decodeLinear() const noexcept { return decodeLinear_; }
   // A DFlash2 draft's plans: linear()'s in bf16 activations
   // (Int8Activations::Off), so no prefill chunk runs the int8 prefill tile.
   // The draft's prefill gains nothing from it, while its context projection,
   // the widest a prefill runs, would size the tile's scratch: 38 MB on
   // Qwen3.6-35B-A3B GGUF, whose own projections never take the tile.
   [[nodiscard]] const Linear &draftLinear() const noexcept { return draftLinear_; }
+  // The draft's plans of a decode step's rows (its context projections over the
+  // step's rows, DFlashDraft::addContextCommit): draftLinear's in a decode step.
+  [[nodiscard]] const Linear &draftDecodeLinear() const noexcept { return draftDecodeLinear_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
-  // The fewest rows of each class of prefill chunk whose projections run
-  // kernels of their own: each staged tile height a chunk takes, and the
-  // prefill tile (ExecutionPlans.cpp). Startup warmup runs a chunk of each and
-  // one of the most rows; kernel-selection checks that they select every
-  // projection, float and MoE tile a chunk of any rows selects, and its
-  // prefill attention after each history it plans.
-  [[nodiscard]] std::vector<uint32_t> prefillRowClasses() const;
+  // The fewest rows of each class of prefill chunk whose projections or MoE
+  // experts run kernels of their own: each staged tile height a chunk takes,
+  // the prefill tile, and each set of expert passes where `moe` names a MoE
+  // target's blocks' shape and router format (ExecutionPlans.cpp). Startup
+  // warmup runs a chunk of each and one of the most rows; kernel-selection
+  // checks that they select every projection and float tile, MoE expert
+  // passes and router tile a chunk of any rows selects, and its prefill
+  // attention after each history it plans.
+  [[nodiscard]] std::vector<uint32_t> prefillRowClasses(std::optional<std::pair<MoeShape, uint32_t>> moe) const;
   // The fewest rows of each class of decode step of up to `mostRows` rows,
   // at most a verify block a lane, whose kernels it picks by its rows: its
   // projections' tile and staged height, as prefillRowClasses walks them, a
@@ -57,9 +65,10 @@ public:
                                         AttentionVariant variant = {}) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes) const;
-  // The plan of a step of `rows` rows of a MoE target's blocks, whose
-  // routers are in `routerFormat` (moeRouterFormat).
-  [[nodiscard]] MoePlan moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
+  // The plan of `rows` rows of `step`'s work through a MoE target's blocks,
+  // whose routers are in `routerFormat` (moeRouterFormat).
+  [[nodiscard]] MoePlan moe(MoeShape shape, uint32_t routerFormat, uint32_t rows,
+                            StepKind step) const;
 
   // The attention workspace that holds any one sequence's partials, a
   // prompt chunk's; and a decode lane's, the most split slots a lane of up to
@@ -71,16 +80,21 @@ public:
   [[nodiscard]] AttentionWorkspace laneAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] DraftAttentionWorkspace draftAttentionWorkspacePerLane(
       DraftAttentionShape shape) const;
-  // The workspace of every MoE step of 1 to `maximumRows` rows, not just the
-  // most: a prompt chunk's, and a decode step's of its lanes' packed rows.
-  [[nodiscard]] MoeWorkspace moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const;
-  // The gate scratch of every gate/up plan of 1 to `maximumRows` rows of a
-  // pair of `shape`: one whole-command buffer, not a per-lane arena field.
+  // The workspace of every MoE plan of 1 to `maximumRows` rows of `step`'s
+  // work, not just the most: a prompt chunk's, or a decode step's of its
+  // lanes' packed rows (moe).
+  [[nodiscard]] MoeWorkspace moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows,
+                                          StepKind step) const;
+  // The gate scratch of every gate/up plan of a decode step of 1 to
+  // `maximumRows` rows of a pair of `shape` (decodeLinear's): one
+  // whole-command buffer, not a per-lane arena field.
   [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape, uint32_t maximumRows) const;
 
 private:
   Linear linear_;
+  Linear decodeLinear_;
   Linear draftLinear_;
+  Linear draftDecodeLinear_;
 };
 
 } // namespace splash::ops

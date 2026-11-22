@@ -44,6 +44,7 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -142,6 +143,7 @@ public:
     CommandTiming timing = ticket_.wait();
     // The command's time counts its encodes', which it also reports apart.
     timing.gpuSeconds += encodes_.gpuSeconds;
+    timing.encodeGpuSeconds = encodes_.gpuSeconds;
     timing.wallSeconds += encodes_.wallSeconds;
     imageEncodeMilliseconds_ = encodes_.wallSeconds * 1000.0;
     const double commandSeconds = timing.wallSeconds;
@@ -236,9 +238,9 @@ StateAdmission laneAdmission(uint32_t lane, const metal::AllocationResult &resul
 // Any unassigned lane works: its buffers come from the storage's pool, and
 // the governor is asked only for what the pool lacks.
 template <class Activate>
-StateAdmission admitIdleLane(const QwenStateStorage &states,
+StateAdmission admitIdleLane(const QwenStateStorage &states, uint32_t lanes,
                              Activate activate) {
-  for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!states.metadata(lane).assigned())
       return activate(lane);
   }
@@ -562,10 +564,22 @@ struct Runtime::Impl {
   // Keeping the step costs this start measures on this Mac, beside those
   // earlier starts did (RuntimeContext::recallStepCosts).
   std::function<void(uint32_t lanes, std::string_view line)> rememberStepCosts;
+  std::function<void(uint32_t lanes)> forgetStepCosts;
+  // Whether a decode warmup ran, the first of which checks the level of the
+  // tables an earlier start measured (StepCosts::kStale), and whether this
+  // start measured a table, whose set replaces the kept one.
+  bool warmedUp = false, measuredSteps = false;
   // The fewest rows of each class of a decode step's kernels, up to the most
   // rows a step runs in one pass (ops::ExecutionPlans::decodeRowClasses).
   std::vector<uint32_t> stepClasses;
-  uint32_t mostStepRows = kDecodeStepRows;
+  // The fewest rows of each class of a prefill chunk's kernels
+  // (ops::ExecutionPlans::prefillRowClasses).
+  std::vector<uint32_t> prefillClasses;
+  // The most rows a step runs in one pass: a verify block a lane, and no
+  // more than a streamed expert store's round. Every step --verify-rows auto
+  // chooses and every decode warmup's forced step stays within it
+  // (chooseStep).
+  uint32_t mostStepRows = 0;
   // The lookup chains' acceptance, which every unconstrained request's
   // cycles teach under --verify-rows auto, greedy and sampled lanes apart.
   LookupAcceptance lookupAcceptance;
@@ -579,8 +593,9 @@ struct Runtime::Impl {
   // its first pass, so a reservation for another prompt between its passes
   // leaves it the command's too.
   std::vector<uint64_t> stagingRequests;
-  // What one prefill command may hold (Runtime::commandLimits).
-  const CommandLimits limits;
+  // What one prefill command may hold (Runtime::commandLimits), which the
+  // split sets (Runtime::setAneFfn).
+  CommandLimits limits;
 
   // The history's staging (KvHistoryStream) as an elastic pool: a streaming
   // prompt's reservation allocates it, and it goes whole once no prompt
@@ -707,12 +722,18 @@ struct Runtime::Impl {
   // The choices of the cycles the budget sized (RuntimeInstrumentation::
   // takeStepChoices).
   std::vector<RuntimeInstrumentation::StepChoice> stepChoices;
+  // The level check's remembered cost of its step over its median now
+  // (RuntimeInstrumentation::levelRatio; none without a check).
+  std::optional<double> levelRatio;
+  // The tokens a constrained request's next cycle gives rows of its tree,
+  // by request (RuntimeInstrumentation::replaceTreeTokens).
+  std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> treeTokens;
 #endif
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
         geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format, value.stateStorage.layout().target,
-                                       StreamedParts::loaded(value.model, value.blockCache != nullptr))),
+                                       StreamedParts::loaded(value.model, value.blockCache != nullptr), value.lanes)),
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
@@ -735,7 +756,7 @@ struct Runtime::Impl {
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
-        decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
+        decodeArena->all(DecodeTensor::PenaltyState);
     // A decode step's classes, up to the rows a step runs in one pass: a
     // streamed expert store's round (a 48-row step on a 32-row store takes a
     // second round, +30% a step), else a verify block a lane. Under
@@ -745,10 +766,12 @@ struct Runtime::Impl {
     // pricing its rows (CostLine), whose steps end at the classes' last rows.
     std::optional<std::pair<ops::MoeShape, uint32_t>> moe;
     if (geometry.target.ffnKind == QwenFfnKind::SparseMoe)
-      moe.emplace(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat);
+      moe.emplace(geometry.target.moeShape(), geometry.target.moeRouterFormat);
+    mostStepRows = geometry.target.stepRows();
     if (model.expertStore())
-      mostStepRows = std::min(kDecodeStepRows, ExpertStore::cycleRows());
+      mostStepRows = std::min(mostStepRows, ExpertStore::cycleRows());
     stepClasses = operators.decodeRowClasses(mostStepRows, moe);
+    prefillClasses = operators.prefillRowClasses(moe);
     if (value.verifyRows == VerifyRows::Auto) {
       verifyBudget.emplace();
       if (model.expertStore()) {
@@ -757,9 +780,11 @@ struct Runtime::Impl {
         stepCosts.emplace(stepClasses, mostStepRows, geometry.target.ffnKind == QwenFfnKind::SparseMoe);
         // Each lane count's measurement fits the startup runway from its
         // page 5 (Runtime::measureDecodeSteps): the most points today, a MoE
-        // target's 14 at four lanes, take 37 of its 64 pages.
-        stepCosts->requireRunway(5, ExecutionLimits::warmupKvPages);
-        for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
+        // target's 14, take 37 of four lanes' 64 pages and 69 of eight
+        // lanes' 128 (ExecutionLimits::runwayPages).
+        stepCosts->requireRunway(5, ExecutionLimits::runwayPages(value.kvPages.extentPages(), geometry.target.lanes),
+                                 geometry.target.lanes);
+        for (uint32_t lanes = 1; lanes <= geometry.target.lanes; ++lanes) {
           const std::optional<std::string> line = value.recallStepCosts ? value.recallStepCosts(lanes) : std::nullopt;
           if (!line)
             continue;
@@ -771,6 +796,7 @@ struct Runtime::Impl {
       }
     }
     rememberStepCosts = std::move(value.rememberStepCosts);
+    forgetStepCosts = std::move(value.forgetStepCosts);
     if (ExpertStore *store = model.expertStore())
       pools.push_back(&expertPool.emplace(*store));
     if (blockCache) {
@@ -802,12 +828,18 @@ struct Runtime::Impl {
         .thinkingCutoff = ops::ThinkingCutoff{.end = end}};
     const std::array<ops::SamplingPolicy, 2> policies{sampled, {}};
     const std::array<uint32_t, 2> stateLanes{0, 1};
-    const ops::PenaltyTable penalties{penaltyTable, stateLanes};
+    // Both policies in one command of two lanes, or one after the other on a
+    // runtime of one.
+    const uint32_t lanes = std::min<uint32_t>(2, geometry.target.lanes);
     CommandGraph graph;
-    sampling.addInitial(graph, policies, samplingBuffers(2), laneRowsOf(2),
-                        geometry.target.stopTokens, penalties);
-    sampling.addVerify(graph, policies, samplingBuffers(2), stepOf(2, 2 * kDraftRows), geometry.target.stopTokens,
-                       penalties);
+    for (uint32_t first = 0; first < policies.size(); first += lanes) {
+      const auto policy = std::span(policies).subspan(first, lanes);
+      const ops::PenaltyTable penalties{penaltyTable, std::span(stateLanes).first(lanes)};
+      sampling.addInitial(graph, policy, samplingBuffers(lanes), laneRowsOf(lanes), geometry.target.stopTokens,
+                          penalties);
+      sampling.addVerify(graph, policy, samplingBuffers(lanes), stepOf(lanes, lanes * kDraftRows),
+                         geometry.target.stopTokens, penalties);
+    }
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -850,7 +882,7 @@ struct Runtime::Impl {
   }
 
   uint64_t embeddingBytes(const ImageSpan &span) const {
-    return uint64_t{ops::Vision::embeddingRows(span.grid())} *
+    return uint64_t{span.grid().mergedTokens()} *
            geometry.target.hiddenSize * sizeof(uint16_t);
   }
 
@@ -1459,7 +1491,7 @@ struct Runtime::Impl {
 
   // A completed cycle's lane's retained tokens, from its first row.
   const uint32_t *retainedTokens(const DecodeLaneResult &lane) const {
-    return contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::OutputTokens, kLaneCount),
+    return contents<uint32_t>(decodeArena->all(DecodeTensor::OutputTokens),
                               "target output tokens") +
            lane.rows.first;
   }
@@ -1470,7 +1502,7 @@ struct Runtime::Impl {
   ops::LaneRows laneRows(uint32_t lane) const {
     const ops::LaneRows rows = *contents<ops::LaneRows>(decodeArena->get(lane, DecodeTensor::LaneLayout), "lane rows");
     if (!rows.rows || rows.rows > ExecutionLimits::targetVerifyRows ||
-        uint64_t{rows.first} + rows.rows > uint64_t{kLaneCount} * kDecodeRows)
+        uint64_t{rows.first} + rows.rows > geometry.target.stepRows())
       throw std::runtime_error("draft selector produced invalid lane rows");
     return rows;
   }
@@ -1567,7 +1599,7 @@ struct Runtime::Impl {
       path &= path - 1;
     const uint32_t vocabulary = geometry.target.vocabularySize;
     const std::span<const float> row(
-        contents<float>(decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "unselectable logits") +
+        contents<float>(decodeArena->all(DecodeTensor::Logits), "unselectable logits") +
             (uint64_t{first} + std::countr_zero(path)) * vocabulary,
         vocabulary);
     uint32_t nan = 0, positive = 0, negative = 0;
@@ -1608,7 +1640,7 @@ struct Runtime::Impl {
       return;
     graph.host([this, lanes, verify] {
       const uint64_t vocabulary = geometry.target.vocabularySize;
-      const float *logits = contents<float>(decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "logits");
+      const float *logits = contents<float>(decodeArena->all(DecodeTensor::Logits), "logits");
       capturedTargetLogits.resize(lanes);
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         const ops::LaneRows rows = verify ? laneRows(lane) : ops::LaneRows{lane, 1};
@@ -1629,9 +1661,9 @@ struct Runtime::Impl {
   void encodeInitialSelections(CommandGraph &graph,
                                std::span<const InitialSelection> lanes,
                                uint32_t width) {
-    targetModel->addHeadBatch(graph, decodeArena->lanesRows(TargetTensor::Hidden0, kLaneCount),
-                             decodeArena->batchSlice(DecodeTensor::FinalHidden, kLaneCount),
-                             decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), width,
+    targetModel->addHeadBatch(graph, decodeArena->lanesRows(TargetTensor::Hidden0, decodeArena->lanes()),
+                             decodeArena->all(DecodeTensor::FinalHidden),
+                             decodeArena->all(DecodeTensor::Logits), width,
                              decodeArena->linearScratch());
     if (std::ranges::none_of(lanes, &InitialSelection::select))
       return;
@@ -1887,6 +1919,15 @@ struct Runtime::Impl {
   std::vector<PrefillChunk> preparePrefill(std::span<const ModelBatchItem> items,
                                            std::array<Request *, kLaneCount> &entries) {
     std::vector<PrefillChunk> chunks(1);
+    // A chunk holds kPrefillRows rows, but a command the Neural Engine's
+    // split takes ends its first at its first step's rows, which its
+    // pipelined steps run (ops::AneFfn::firstStepRows).
+    uint32_t rows = 0;
+    for (const ModelBatchItem &item : items) rows += item.tokenCount;
+    const uint32_t firstRows = aneFfn ? aneFfn->firstStepRows(rows) : kPrefillRows;
+    const auto full = [&](const PrefillChunk &chunk) {
+      return chunk.rows == (chunks.size() == 1 ? firstRows : kPrefillRows);
+    };
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
       Request &entry = prefillLane(item);
@@ -1896,13 +1937,14 @@ struct Runtime::Impl {
       QwenLogicalLengths lengths = states.metadata(entry.stateLane).lengths;
       size_t nextCapture = 0;
       for (uint32_t offset = 0; offset < item.tokenCount;) {
-        if (chunks.back().rows == kPrefillRows) chunks.emplace_back();
+        if (full(chunks.back())) chunks.emplace_back();
         PrefillChunk &chunk = chunks.back();
         PrefillSequence &sequence = chunk.sequences.emplace_back();
         ModelBatchItem &part = sequence.part;
         part = item;
         part.logicalPosition = item.logicalPosition + offset;
-        part.tokenCount = std::min(kPrefillRows - chunk.rows, item.tokenCount - offset);
+        part.tokenCount = std::min((chunks.size() == 1 ? firstRows : kPrefillRows) - chunk.rows,
+                                   item.tokenCount - offset);
         part.inputTokens = item.inputTokens.subspan(offset, part.tokenCount);
         part.stateCaptures.clear();
         const uint64_t partEnd = part.logicalPosition + part.tokenCount;
@@ -2029,9 +2071,10 @@ struct Runtime::Impl {
       items[lane] = {.requestId = entries[lane]->id, .logicalPosition = history, .pageTable = pages};
     }
     // A step of each class's last rows (ops::ExecutionPlans::
-    // decodeRowClasses, and a draft's block a lane) at each lane cap that
-    // holds them: every kernel a step of any rows and cap runs, so that no
-    // cycle creates one while serving.
+    // decodeRowClasses, and a draft's block a lane) up to mostStepRows at
+    // each lane cap that holds them: every kernel a step of any rows and cap
+    // within mostStepRows runs, so that no cycle --verify-rows auto chooses
+    // creates one while serving.
     const auto lanes = static_cast<uint32_t>(entries.size());
     const uint32_t most = std::min(mostStepRows, lanes * kDecodeRows);
     std::vector<ops::StepRows> steps;
@@ -2410,11 +2453,8 @@ struct Runtime::Impl {
     }
   }
 
-  // Lanes of storage a draft step of `lanes` lanes binds: its own
-  // projections' and the target's vocabulary head's, which it shares.
-  uint32_t draftStorageLanes(uint32_t lanes) const {
-    return std::max(targetModel->headStorageLanes(lanes), draftModel.decodeStorageLanes(lanes));
-  }
+  // Lanes of storage a draft step of `lanes` lanes binds (draftStepLanes).
+  uint32_t draftStorageLanes(uint32_t lanes) const { return draftStepLanes(geometry, operators, lanes); }
 
   // The cycle's step (`step`): each lane's tree of the draft's proposals and
   // its host chain (`proposals`), no deeper than depths[lane], and the rows
@@ -2644,12 +2684,16 @@ struct Runtime::Impl {
 
   // A cycle's step over curves.size() lanes, each holding at most `holds`
   // rows (its output left under --verify-rows auto, or a forced chain): a
-  // forced step (StepCosts::forced); without step costs (--verify-rows all),
-  // a draft's block a lane, no more than each lane holds, so that a cycle's
-  // shape and outputs repeat (StepCosts::block); else the step its lane
-  // count's measured costs choose (StepCosts::choose), or a streamed-expert
-  // target's step and floor by its cost line, constrained cycles' apart
-  // (CostLine::choose).
+  // forced step of the rows its forcer names (StepCosts::forced; a decode
+  // warmup's within mostStepRows); without step costs (--verify-rows all), a
+  // draft's block a lane, no more than each lane holds, so that a cycle's
+  // shape and outputs repeat (StepCosts::block), past a streamed expert
+  // store's round from five lanes, which loads its experts in two rounds;
+  // else the step its lane count's measured costs choose (StepCosts::choose),
+  // whose tables end at mostStepRows, or a streamed-expert target's step and
+  // floor by its cost line, constrained cycles' apart (CostLine::choose), cut
+  // to mostStepRows. Every step --verify-rows auto chooses stays within
+  // mostStepRows.
   StepCosts::Choice chooseStep(std::span<const std::vector<float>> curves, std::span<const uint32_t> holds,
                                std::span<const uint64_t> contexts, bool constrained) const {
     const auto lanes = static_cast<uint32_t>(curves.size());
@@ -2667,6 +2711,7 @@ struct Runtime::Impl {
     if (blockPlans)
       choice.step = StepCosts::block(holds);
 #endif
+    choice.step.rows = std::min(choice.step.rows, mostStepRows);
     return choice;
   }
 
@@ -2689,11 +2734,11 @@ struct Runtime::Impl {
     buffers.laneRows = decodeArena->batchSlice(DecodeTensor::LaneLayout, lanes);
     QwenTargetDecodeBuffers decode;
     decode.step = step;
-    decode.gdnTape = decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount);
+    decode.gdnTape = decodeArena->all(DecodeTensor::GdnTape);
     decode.tree = decodeArena->batchSlice(DecodeTensor::TreeRows, lanes);
-    decode.capturedTargetHidden = decodeArena->batchSlice(DecodeTensor::CapturedTargetHidden, kLaneCount);
-    decode.finalHidden = decodeArena->batchSlice(DecodeTensor::FinalHidden, kLaneCount);
-    decode.logits = decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount);
+    decode.capturedTargetHidden = decodeArena->all(DecodeTensor::CapturedTargetHidden);
+    decode.finalHidden = decodeArena->all(DecodeTensor::FinalHidden);
+    decode.logits = decodeArena->all(DecodeTensor::Logits);
     std::array<QwenTargetPrefillSequence, kLaneCount> sequences{};
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request &entry = laneEntry(entries, lane);
@@ -2865,12 +2910,12 @@ struct Runtime::Impl {
                      const MetalBuffer &window, uint32_t rows, uint32_t position, const ops::StepRows &step) const {
     targetModel->addStateFold(graph,
                               {decodeArena->get(lane, DecodeTensor::RetainedRows), states.next(stateLane).stateBase,
-                               decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
+                               decodeArena->all(DecodeTensor::GdnTape),
                                decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1), fold},
                               rows);
     // The window takes the first rows of the lane's retained path, which
     // its capture holds when the lane retained them.
-    ops::DraftAttention::addWindowCommit(graph, decodeArena->batchSlice(DecodeTensor::ContextHidden, kLaneCount),
+    ops::DraftAttention::addWindowCommit(graph, decodeArena->all(DecodeTensor::ContextHidden),
                                          window, decodeArena->get(lane, DecodeTensor::RetainedRows),
                                          decodeArena->get(lane, DecodeTensor::LaneLayout), step.rows, rows, position,
                                          geometry.draft.hiddenSize);
@@ -3182,12 +3227,20 @@ struct Runtime::Impl {
           // row's path: the rows' tokens from its first row, its anchor's
           // first, each with its parent row.
           const ops::LaneRows block = impl_.laneRows(lane);
-          const uint32_t *rows =
-              contents<uint32_t>(impl_.decodeArena->batchSlice(DecodeTensor::InputTokens, kLaneCount),
+          uint32_t *rows =
+              contents<uint32_t>(impl_.decodeArena->all(DecodeTensor::InputTokens),
                                  "constrained verify rows") +
               block.first;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+          if (const auto replaced = impl_.treeTokens.extract(entry.id))
+            for (const auto &[row, token] : replaced.mapped()) {
+              if (!row || row >= block.rows)
+                throw std::logic_error("a replaced tree token's row is not a row of its lane past the anchor");
+              rows[row] = token;
+            }
+#endif
           const ops::TreeRow *tree =
-              contents<ops::TreeRow>(impl_.decodeArena->batchSlice(DecodeTensor::TreeRows, kLaneCount),
+              contents<ops::TreeRow>(impl_.decodeArena->all(DecodeTensor::TreeRows),
                                      "constrained verify tree") +
               block.first;
           entry.maskWords.clear();
@@ -3385,7 +3438,7 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 StateAdmission Runtime::begin(const ModelRequest &request) {
   Impl::VisionRollback rollback{*impl_, impl_->vision};
   StateAdmission admission = admitIdleLane(
-      impl_->states, [&](uint32_t lane) { return beginAt(request, lane); });
+      impl_->states, impl_->geometry.target.lanes, [&](uint32_t lane) { return beginAt(request, lane); });
   rollback.committed = admission.granted();
   return admission;
 }
@@ -3422,7 +3475,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   }
   Impl::VisionRollback rollback{*impl_, impl_->vision};
   std::vector<Impl::ImageState> images;
-  StateAdmission admission = admitIdleLane(impl_->states, [&](uint32_t lane) {
+  StateAdmission admission = admitIdleLane(impl_->states, impl_->geometry.target.lanes, [&](uint32_t lane) {
     return impl_->activate(request, lane, images);
   });
   if (admission.granted()) {
@@ -3440,7 +3493,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
 }
 
 StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane) {
-  if (!request.id || stateLane >= kLaneCount || request.prompt.empty()) {
+  if (!request.id || stateLane >= impl_->geometry.target.lanes || request.prompt.empty()) {
     throw std::invalid_argument("invalid executor request activation");
   }
   if (impl_->requests.contains(request.id)) {
@@ -3579,7 +3632,9 @@ Runtime::prefillAsync(const BatchPlan &plan,
   if (impl_->aneFfn) {
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       draws[lane] = impl_->request(items[lane].requestId).rngCounter;
-    impl_->aneFfn->begin();
+    uint32_t rows = 0;
+    for (const ModelBatchItem &item : items) rows += item.tokenCount;
+    impl_->aneFfn->begin(impl_->aneFfn->steps(rows));
   }
   const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items, layers);
   CommandGraph encodes;
@@ -3617,7 +3672,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // the first run could not read. The first ticket was released before
     // this completion runs (DeferredMetalTicket::wait), so the backend takes
     // the rerun's command, whose time counts in the chunk's.
-    if (impl->aneFfn && !impl->aneFfn->finish()) {
+    if (impl->aneFfn && !impl->aneFfn->finish(timing)) {
       for (uint32_t lane = 0; lane < items.size(); ++lane)
         entries[lane]->rngCounter = draws[lane];
       reads->end();
@@ -4172,13 +4227,13 @@ void requireLanesSucceeded(std::span<const ModelStepResult> results) {
       throw std::runtime_error(result.failure);
 }
 
-// Warmup runs on the startup runway the engine's KV pool allocated
-// (ExecutionLimits::warmupKvPages), whose pages its caller holds while it
-// runs (engine::KvPool::RunwayHold); it never allocates KV.
-void requireRunwayPages(const kv::PageStorage &storage,
-                        std::span<const uint32_t> pages) {
+// Warmup runs on the startup runway the engine's KV pool allocated for a
+// runtime of `lanes` lanes (ExecutionLimits::runwayPages), whose pages its
+// caller holds while it runs (engine::KvPool::RunwayHold); it never
+// allocates KV.
+void requireRunwayPages(const kv::PageStorage &storage, std::span<const uint32_t> pages, uint32_t lanes) {
   for (uint32_t page : pages) {
-    if (page >= ExecutionLimits::warmupKvPages || !storage.isAllocated(page)) {
+    if (page >= ExecutionLimits::runwayPages(storage.extentPages(), lanes) || !storage.isAllocated(page)) {
       throw std::logic_error("warmup KV page " + std::to_string(page) +
                              " is outside the startup runway");
     }
@@ -4216,6 +4271,8 @@ void Runtime::prepareWarmupDecode(uint64_t requestId, uint32_t anchor) {
   entry.lookup.append({&anchor, 1});
 }
 
+std::vector<uint32_t> Runtime::prefillRowClasses() const { return impl_->prefillClasses; }
+
 WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   if (!rows || rows > kPrefillRows)
     throw std::invalid_argument("invalid prefill warmup row count");
@@ -4231,7 +4288,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   try {
     std::vector<uint32_t> pages((rows + kv::kPageTokens - 1) / kv::kPageTokens);
     std::iota(pages.begin(), pages.end(), 0u);
-    requireRunwayPages(impl_->kvPages, pages);
+    requireRunwayPages(impl_->kvPages, pages, impl_->geometry.target.lanes);
     BatchPlan plan{.kind = WorkKind::Prefill,
                    .items = {{id, rows}},
                    .decodeStage = DecodeStage::Regular};
@@ -4290,17 +4347,17 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
 // along, so that no point always runs first after the prompts: the first
 // pass's first touch of a buffer or an expert's pages, and a cycle slowed by
 // other work on the GPU (an app's rendering), move no point.
-double Runtime::measureDecodeSteps(uint32_t width) {
+void Runtime::measureDecodeSteps(uint32_t width) {
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 120;
   const std::vector<ops::StepRows> steps = impl_->stepCosts->steps(width);
   const auto answer = static_cast<uint32_t>(steps.size()) * ExecutionLimits::targetVerifyRows;
   const uint32_t lanePages = StepCosts::lanePages(steps.size());
-  const auto stateLane = [](uint32_t lane) { return ExecutionLimits::maximumBatchWidth - 1 - lane; };
+  const auto stateLane = [&](uint32_t lane) { return impl_->geometry.target.lanes - 1 - lane; };
   const std::optional<Impl::ForcedStep> forced = impl_->forcedStep;
   std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
   for (uint32_t lane = 0; lane < width; ++lane) {
     for (uint32_t page = 0; page < lanePages; ++page) pages[lane].push_back(5 + lane * lanePages + page);
-    requireRunwayPages(impl_->kvPages, pages[lane]);
+    requireRunwayPages(impl_->kvPages, pages[lane], impl_->geometry.target.lanes);
   }
   std::vector<std::vector<double>> replays(StepCosts::kReplays, std::vector<double>(steps.size()));
   const auto ending = [&] {
@@ -4348,32 +4405,49 @@ double Runtime::measureDecodeSteps(uint32_t width) {
     throw;
   }
   impl_->forcedStep = forced;
-  return impl_->stepCosts->measure(width, replays);
+  impl_->stepCosts->measure(width, replays);
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
-  if (!width || width > ExecutionLimits::maximumBatchWidth) {
+  if (!width || width > impl_->geometry.target.lanes) {
     throw std::invalid_argument("invalid decode warmup width");
   }
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 110;
   // Plan order is deliberately unrelated to state-lane order: DecodeArena
   // lanes follow the BatchPlan, while recurrent and KV state stay addressed
   // by each request's state lane, so plan lane k runs on state lane
-  // maximumBatchWidth - 1 - k and batching never assumes lanes 0..width-1.
-  const auto stateLane = [](uint32_t lane) { return ExecutionLimits::maximumBatchWidth - 1 - lane; };
+  // lanes - 1 - k (QwenTargetGeometry::lanes) and batching never assumes lanes
+  // 0..width-1.
+  const auto stateLane = [&](uint32_t lane) { return impl_->geometry.target.lanes - 1 - lane; };
+  // The kept tables are one start's, of one lane up to the widths it warmed
+  // (Bootstrap: those its memory affords). A start that measures a lane
+  // count, one it has no table for or every one where its check found the
+  // tables stale, measures every width it warms and replaces the kept set,
+  // remembered tables included (below). Its first decode warmup checks the
+  // level of the tables it recalled: kReplays steps of its lane count's
+  // largest after the warmup's own cycle, in its lanes (StepCosts::kStale),
+  // which ignore the stop tokens as the measurement's lanes do, so that no
+  // replay follows a lane's end.
+  const bool first = !std::exchange(impl_->warmedUp, true);
+  const bool checking = first && impl_->stepCosts && impl_->stepCosts->measured(width);
+  const uint32_t lanePages = checking ? StepCosts::lanePages(StepCosts::kReplays) : 1;
   double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
   std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
+  bool stale = false;
   try {
     for (uint32_t lane = 0; lane < width; ++lane) {
       std::vector<uint32_t> warmupPrompt{lane};
       ModelRequest request;
       request.id = firstId + lane;
       request.prompt = warmupPrompt;
-      request.maxNewTokens = 16;
+      // The warmup's cycle and the check's replays, each at most a verify
+      // block and its anchor.
+      request.maxNewTokens = checking ? (2 + StepCosts::kReplays) * ExecutionLimits::targetVerifyRows : 16;
+      if (checking) request.flags = RequestIgnoreEndOfSequence;
       beginColdRequest(request, stateLane(lane));
-      pages[lane] = {5 + lane};
-      requireRunwayPages(impl_->kvPages, pages[lane]);
+      for (uint32_t page = 0; page < lanePages; ++page) pages[lane].push_back(5 + lane * lanePages + page);
+      requireRunwayPages(impl_->kvPages, pages[lane], impl_->geometry.target.lanes);
       BatchPlan prefillPlan{.kind = WorkKind::Prefill,
                             .items = {{request.id, 1}},
                             .decodeStage = DecodeStage::Regular};
@@ -4390,15 +4464,18 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       plan.items.push_back({firstId + lane, 0});
       items.push_back(warmupItem(firstId + lane, 1, 0, pages[lane]));
     }
-    // A forced step of a draft's block a lane: the cycle that creates the
-    // decode's kernels is the run's coldest (a first cycle five times the
-    // next one tilted the costs' lines below zero), and a forced step
-    // teaches nothing.
+    // A forced step of a draft's block a lane, within the rows a step runs
+    // in one pass (a streamed store's round past four lanes): the cycle that
+    // creates the decode's kernels is the run's coldest (a first cycle five
+    // times the next one tilted the costs' lines below zero), and a forced
+    // step teaches nothing.
     struct Forcing final {
       std::optional<Impl::ForcedStep> &step;
       std::optional<Impl::ForcedStep> before;
       ~Forcing() { step = before; }
-    } forcing{impl_->forcedStep, std::exchange(impl_->forcedStep, Impl::ForcedStep{width * kDraftRows, std::nullopt})};
+    } forcing{impl_->forcedStep,
+              std::exchange(impl_->forcedStep,
+                            Impl::ForcedStep{std::min(width * kDraftRows, impl_->mostStepRows), std::nullopt})};
     const auto phaseStart = AwakeClock::now();
     auto decoded = decode(plan, items);
     wallSeconds = std::chrono::duration<double>(AwakeClock::now() - phaseStart).count();
@@ -4431,28 +4508,67 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     // A reply's state is captured in decode at the page its retained rows
     // reach, by a fold no prompt or warmup cycle runs.
     impl_->prepareCapturePipelines(0, stateLane(0));
+    std::array<uint64_t, ExecutionLimits::maximumBatchWidth> positions{};
     for (uint32_t lane = 0; lane < width; ++lane) {
+      positions[lane] = 1 + decoded[lane].outputTokens.size() - decoded[lane].outputTokensWithoutKv;
       lanes.push_back({std::move(decoded[lane]),
                        impl_->request(firstId + lane).pendingToken,
                        impl_->states.metadata(stateLane(lane)).lengths.targetTokens});
-      end(firstId + lane);
     }
+    if (checking) {
+      const ops::StepRows step = impl_->stepCosts->steps(width).back();
+      impl_->forcedStep = Impl::ForcedStep{step.rows, step.laneCap};
+      std::vector<double> replays;
+      for (uint32_t replay = 0; replay < StepCosts::kReplays; ++replay) {
+        for (uint32_t lane = 0; lane < width; ++lane) items[lane] = warmupItem(firstId + lane, positions[lane], 0, pages[lane]);
+        const auto started = AwakeClock::now();
+        const std::vector<ModelStepResult> checked = decode(plan, items);
+        replays.push_back(std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count());
+        requireLanesSucceeded(checked);
+        for (uint32_t lane = 0; lane < width; ++lane)
+          positions[lane] += checked[lane].outputTokens.size() - checked[lane].outputTokensWithoutKv;
+      }
+      const double level = impl_->stepCosts->level(width, replays);
+      stale = StepCosts::stale(level);
+      const double table = impl_->stepCosts->points(width).back().milliseconds;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+      impl_->levelRatio = level;
+#endif
+      std::ostringstream times;
+      times << std::fixed << std::setprecision(2);
+      for (const double ms : replays) times << (times.tellp() > 0 ? " " : "") << ms;
+      logLine("Decode step costs as an earlier start measured them, checked: a step of ", step.rows, " rows over ",
+              width, width == 1 ? " lane" : " lanes", " takes ", times.str(), " ms, the table's ", std::fixed,
+              std::setprecision(2), table, " ms",
+              stale ? ", more than a fifth above its median: measuring them again" : "");
+    }
+    for (uint32_t lane = 0; lane < width; ++lane) end(firstId + lane);
   } catch (...) {
     for (uint32_t lane = 0; lane < width; ++lane)
       end(firstId + lane);
     throw;
   }
+  if (stale)
+    impl_->stepCosts->forget();
   // The steps' costs, which no earlier start of this model and build on this
-  // Mac measured and remembered, for later starts where steady
-  // (StepCosts::kSteadySpread).
+  // Mac measured and remembered (or whose level a check found stale), for
+  // later starts. The first a start measures replaces the kept set: every
+  // table goes, and the widths it warmed before this one are measured too.
+  const auto measure = [&](uint32_t lanes) {
+    measureDecodeSteps(lanes);
+    logLine("Decode step costs of ", lanes, lanes == 1 ? " lane" : " lanes", " measured: ",
+            impl_->stepCosts->text(lanes));
+    if (impl_->rememberStepCosts)
+      impl_->rememberStepCosts(lanes, impl_->stepCosts->text(lanes));
+  };
   if (impl_->stepCosts && !impl_->stepCosts->measured(width)) {
-    const double spread = measureDecodeSteps(width);
-    const bool steady = spread <= StepCosts::kSteadySpread;
-    logLine("Decode step costs of ", width, width == 1 ? " lane" : " lanes", " measured, medians within ", std::fixed,
-            std::setprecision(1), 100.0 * spread, "% of their fastest replays",
-            steady ? "" : ", too far apart to keep for later starts", ": ", impl_->stepCosts->text(width));
-    if (steady && impl_->rememberStepCosts)
-      impl_->rememberStepCosts(width, impl_->stepCosts->text(width));
+    if (!std::exchange(impl_->measuredSteps, true)) {
+      impl_->stepCosts->forget();
+      for (uint32_t lanes = 1; lanes <= ExecutionLimits::maximumBatchWidth && impl_->forgetStepCosts; ++lanes)
+        impl_->forgetStepCosts(lanes);
+      for (uint32_t lanes = 1; lanes < width; ++lanes) measure(lanes);
+    }
+    measure(width);
   }
   return {"real B" + std::to_string(width) + " draft/verify/commit decode",
           wallSeconds, std::move(lanes)};
@@ -4469,12 +4585,15 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   request.prompt = warmupPrompt;
   request.maxNewTokens = 8;
   std::shared_ptr<const CompositeState> cachedState;
+  // The restore moves the state to another state lane, where the runtime has
+  // more than one.
+  const uint32_t restoredLane = std::min<uint32_t>(1, impl_->geometry.target.lanes - 1);
   double wallSeconds = 0.0;
   beginColdRequest(request, 0);
   try {
     // Deliberately non-contiguous physical ids exercise page-table lookup.
     const std::vector<uint32_t> pages{12, 10, 11};
-    requireRunwayPages(impl_->kvPages, pages);
+    requireRunwayPages(impl_->kvPages, pages, impl_->geometry.target.lanes);
     BatchPlan plan{.kind = WorkKind::Prefill,
                    .items = {{id, prefixTokens}},
                    .decodeStage = DecodeStage::Regular};
@@ -4487,11 +4606,11 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     if (!cachedState)
       throw metal::MetalAllocationError("prefix warmup state allocation failed");
     end(id);
-    beginColdRequest(request, 1);
+    beginColdRequest(request, restoredLane);
     if (beginRestore(id, prefixTokens, cachedState, true, {}))
       throw std::logic_error("a resident state restore returned a read");
     setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {}));
-    const auto &restored = impl_->states.metadata(1).lengths;
+    const auto &restored = impl_->states.metadata(restoredLane).lengths;
     if (restored.targetTokens != prefixTokens ||
         !restored.hasCompleteDraftWindow(kDraftCacheStride)) {
       throw std::runtime_error("prefix restore length mismatch");
@@ -4522,7 +4641,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     const double historicalDecodeWallSeconds =
         impl_->counters.lastDecodeWallSeconds;
     wallSeconds += historicalDecodeWallSeconds;
-    const auto &continued = impl_->states.metadata(1).lengths;
+    const auto &continued = impl_->states.metadata(restoredLane).lengths;
     if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
         !continued.hasCompleteDraftWindow(kDraftCacheStride) ||
         continued.targetTokens <= promptTokens ||
@@ -4537,8 +4656,8 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     end(id);
     throw;
   }
-  return {"real paged-KV state restore, arbitrary page table, lane move, "
-          "bounded restore continuation, and decode",
+  return {std::string("real paged-KV state restore, arbitrary page table, ") + (restoredLane ? "lane move, " : "") +
+              "bounded restore continuation, and decode",
           wallSeconds, {}};
 }
 
@@ -4546,6 +4665,16 @@ ModelMemoryActual Runtime::actualRuntimeMemory() const {
   const QwenTargetScratchBytes target = impl_->targetModel->allocatedScratchBytes();
   return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->bytes() + target.prefill,
           impl_->decodeArena->bytes() + target.decode, impl_->states.stagingBytes()};
+}
+
+void Runtime::setAneFfn(ops::AneFfn *split) {
+  impl_->aneFfn = split;
+  impl_->limits = splash::model::commandLimits(impl_->geometry, split ? split->minimumRows() : 0);
+}
+
+void Runtime::withPrefillFfn(const PrefillFfnUse &use) {
+  const QwenTargetPrefillBuffers buffers = prefillBuffers(*impl_->prefillArena, 0);
+  use(buffers.ffn(), buffers.hidden);
 }
 
 ModelTelemetry Runtime::telemetry() const noexcept {
@@ -4598,7 +4727,8 @@ ModelMemoryPlan memoryPlanOf(const ModelDescriptor &descriptor, ops::GdnStateFor
                              const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
   CompositeStateLayout states = descriptor.stateLayout;
   states.target.format = stateFormat;
-  return {states.laneBytes(), plannedPrefillBytes(geometry, operators), plannedDecodeBytes(geometry, operators)};
+  return {states.laneBytes(), plannedPrefillBytes(geometry, operators), plannedDecodeBytes(geometry, operators),
+          geometry.target.lanes};
 }
 
 } // namespace
@@ -4606,18 +4736,18 @@ ModelMemoryPlan memoryPlanOf(const ModelDescriptor &descriptor, ops::GdnStateFor
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format kvFormat,
-                                     ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts, uint32_t lanes) {
   requireCompatibleModel(model);
-  return memoryPlanOf(model.descriptor, stateFormat, RuntimeGeometry::from(model, kvFormat, stateFormat, parts),
+  return memoryPlanOf(model.descriptor, stateFormat, RuntimeGeometry::from(model, kvFormat, stateFormat, parts, lanes),
                       operators);
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor, const QwenTargetGeometry &target,
                                      const ops::ExecutionPlans &operators, kv::Format kvFormat,
-                                     ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts, uint32_t lanes) {
   return memoryPlanOf(
       descriptor, stateFormat,
-      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts), operators);
+      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts, lanes), operators);
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
@@ -4633,7 +4763,7 @@ std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime
   const Runtime::Impl &impl = *runtime.impl_;
   const ops::LaneRows rows = impl.laneRows(lane);
   const uint64_t vocabulary = impl.geometry.target.vocabularySize;
-  return {contents<float>(impl.decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "logits") +
+  return {contents<float>(impl.decodeArena->all(DecodeTensor::Logits), "logits") +
               rows.first * vocabulary,
           rows.rows * vocabulary};
 }
@@ -4657,6 +4787,11 @@ void RuntimeInstrumentation::forceStepRows(Runtime &runtime, std::optional<uint3
     runtime.impl_->forcedStep = Runtime::Impl::ForcedStep{.rows = *rows, .laneCap = std::nullopt, .floor = floor};
 }
 
+void RuntimeInstrumentation::replaceTreeTokens(Runtime &runtime, uint64_t requestId,
+                                               std::vector<std::pair<uint32_t, uint32_t>> tokens) {
+  runtime.impl_->treeTokens[requestId] = std::move(tokens);
+}
+
 void RuntimeInstrumentation::planBlocks(Runtime &runtime, bool enabled) { runtime.impl_->blockPlans = enabled; }
 
 std::vector<RuntimeInstrumentation::StepChoice> RuntimeInstrumentation::takeStepChoices(Runtime &runtime) {
@@ -4668,6 +4803,10 @@ std::vector<StepCosts::Point> RuntimeInstrumentation::stepPoints(const Runtime &
     return {};
   const std::span<const StepCosts::Point> points = runtime.impl_->stepCosts->points(lanes);
   return {points.begin(), points.end()};
+}
+
+std::optional<double> RuntimeInstrumentation::levelRatio(const Runtime &runtime) {
+  return runtime.impl_->levelRatio;
 }
 
 void RuntimeInstrumentation::captureTargetLogits(Runtime &runtime, bool enabled) {
@@ -4721,7 +4860,7 @@ std::vector<uint8_t> RuntimeInstrumentation::pendingGdnRows(const Runtime &runti
   }};
   // The latest step's slot is the one the lane's next step folds from.
   const uint8_t *slot =
-      contents<const uint8_t>(impl.decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount), "GDN tape") +
+      contents<const uint8_t>(impl.decodeArena->all(DecodeTensor::GdnTape), "GDN tape") +
       impl.decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity);
   std::vector<uint8_t> rows;
   for (uint32_t layer = 0; layer < impl.geometry.target.stateLayout.layers; ++layer) {

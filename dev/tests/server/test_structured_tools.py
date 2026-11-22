@@ -729,6 +729,61 @@ class StructuredToolGrammarTest(unittest.TestCase):
             main,
         )
 
+    def test_a_strict_tool_without_parameters_closes_after_its_name(self):
+        # Its arguments are empty, so no whitespace may run on after the
+        # name: the call closes at once.
+        tools = strict_tools(
+            {
+                "function": {
+                    "name": "ping",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            }
+        )
+        grammar = tool_schema.tool_grammar(
+            policy("required", tools=tools), False, chat_format=QWEN
+        )
+        matcher = LLMatcher(self.guidance, grammar)
+        encode = self.tokenizer.encode
+        self.assertTrue(
+            matcher.consume_tokens(encode("<tool_call>\n<function=ping>\n").ids)
+        )
+        self.assertEqual(matcher.validate_tokens(encode(" ").ids), 0)
+        self.assertTrue(matcher.consume_tokens(encode("</function>\n</tool_call>").ids))
+        self.assertTrue(matcher.is_accepting())
+
+    def test_control_tokens_are_masked_inside_json_strings(self):
+        grammar = tool_schema.json_grammar(SCHEMA, False, chat_format=QWEN)
+        matcher = LLMatcher(self.guidance, grammar)
+        self.assertTrue(
+            matcher.consume_tokens(self.tokenizer.encode('{"answer":42,"marker":"').ids)
+        )
+        for tag in ("<tool_call>", "</tool_call>", "</think>", "<eos>"):
+            with self.subTest(tag=tag):
+                self.assertEqual(
+                    matcher.validate_tokens([self.tokenizer.token_to_id(tag)]), 0
+                )
+        self.assertTrue(matcher.consume_tokens(self.tokenizer.encode('a"}').ids))
+        self.assertTrue(matcher.is_accepting())
+
+    def test_a_required_call_opens_once_and_only_after_the_reasoning(self):
+        close = self.tokenizer.token_to_id("</think>")
+        call_open = self.tokenizer.token_to_id("<tool_call>")
+        grammar = tool_schema.tool_grammar(
+            policy("required"),
+            True,
+            chat_format=replace(QWEN, think_end_id=close),
+        )
+        matcher = LLMatcher(self.guidance, grammar)
+        self.assertTrue(matcher.consume_tokens(self.tokenizer.encode("Call it.").ids))
+        self.assertEqual(matcher.validate_tokens([call_open]), 0)
+        self.assertTrue(
+            matcher.consume_tokens(
+                [close, *self.tokenizer.encode("\n\n").ids, call_open]
+            )
+        )
+        self.assertEqual(matcher.validate_tokens([call_open]), 0)
+
     def test_tool_choice_shapes_the_grammar_policy_not_the_prompt(self):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(

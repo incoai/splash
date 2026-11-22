@@ -101,13 +101,16 @@ template <class Family> [[nodiscard]] AttentionGeometry attentionGeometry(const 
 }
 
 // The norms the families that `runs` takes store, as ops::NormWeights::float32
-// values: bf16 first where one of them loads safetensors, whose MLX
-// checkpoints store bf16 norms, then F32, as every family's GGUFs store them.
-// The kernels of a shape that only GGUF-only families run (Qwen3.8-Flash-Next's
-// and Flint's) are compiled for F32 norms alone.
+// values: bf16 first where one of them loads an MLX checkpoint whose images
+// keep its bf16 norms (a family whose kernels do not read F32 norms alone,
+// float32NormsOnly), then F32, as every family's GGUFs store them.
+// The kernels of a shape that only families of F32 norms run
+// (Qwen3.8-Flash-Next's, and Flint's) are compiled for F32 norms alone.
 template <class Runs> [[nodiscard]] std::vector<bool> normsOfFamilies(Runs runs) {
   bool bfloat16 = false;
-  model::forEachFamily([&](const auto &family) { bfloat16 = bfloat16 || (family.loadsSafetensors && runs(family)); });
+  model::forEachFamily([&](const auto &family) {
+    if (runs(family)) bfloat16 = bfloat16 || !family.float32NormsOnly;
+  });
   return bfloat16 ? std::vector<bool>{false, true} : std::vector<bool>{true};
 }
 // The norms the families of a GDN shape store.

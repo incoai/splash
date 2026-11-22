@@ -171,7 +171,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page, `/health` and `/ready`. |
 | `--no-webui` | Off | Disable the chat page. |
-| `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
+| `--max-memory` | Auto | Set the ceiling on Metal allocations in place of the automatic one, e.g. `28G`, up to the GPU's recommended working set less a margin; not combined process RSS. See [memory and context](#memory-and-context). |
 | `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to the model's limit; past the 256K native window a model with YaRN turns it on. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
@@ -186,6 +186,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--sampling-default` | None (the served family's published `temperature`, `top_p` and `top_k`; the neutral value for the rest) | Value of a sampling field that a request leaves out; repeatable, e.g. `temperature=0.6`. See [sampling](api.md#sampling). |
 | `--reasoning-effort` | `SPLASH_REASONING_EFFORT` or each request's own | Effort of every Chat, Responses and Messages request, whatever the request asks; `none` turns thinking off. See [default reasoning effort](#default-reasoning-effort). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
@@ -195,10 +196,12 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
+| `--max-concurrent-requests` | `4` | Requests the engine runs at once, 1 to 8: its lanes, each holding a request from its start to its end, and a decode step holds a verify block of each (64 rows at four, 128 at eight). More let more clients be answered together, each a little slower, and take memory for their states and arenas. Where that streams more of the weights than four lanes would, the start logs both stores; else where it leaves less context than four would serve, with the same SSD cache staging and Neural Engine split and no more than `--max-context`, the start logs both contexts and `/status` reports four's as `memory_plan.budget.default_lanes_context_tokens` (0 otherwise). A step of more than 64 rows runs its projections on two row groups of the decode tiles: a decode step rounds no activations because other requests share it (`--activations`, below). |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. A request waiting for memory on its way back is owed it too, and the prompt's next unit waits for that memory until its last unit has ended for as long as it took, at most 500 ms. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
-| `--activations` | `auto` | On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, `auto` rounds activations to int8 where that is faster and leaves the others bf16: prefill chunks of more than 64 rows through a target's MLX 4- and 5-bit weights in groups of 64 (not a MoE model's routed experts), rounded per row and 64 inputs, about a quarter less time to the first token on Qwen3.8-27B MLX 4-bit; a Ternary-Bonsai (rotated PQ2_0) model's decode, 13-16% less time a cycle on a 20-core M5 Pro; and attention over the INT8 KV cache where a split reads 8 pages or more, 4-7% sooner first tokens at 32K-64K (see [KV cache precision](#kv-cache-precision)). `bf16` is a precision opt-out for evaluations and bf16 parity: every activation stays bf16, though a [persistent cache](#persistent-cache) keeps what an `auto` run prefilled, so a parity run starts in a fresh `--cache-dir`. What `auto` costs, as next-token KL against bf16: about 2.2e-3 for Qwen3.8-27B MLX 4-bit's prefill on the GPU alone, 2.8e-4 for Bonsai's decode, and with INT8 queries 1.37x the KL the INT8 KV cache alone gives Qwen3.8-27B. The Neural Engine split, which multiplies its part in int8 whatever this option, has its own switch, `--disable-ane`. See [kernel selection](internals.md#kernel-selection). |
-| `--verify-rows` | `auto` | The rows decode cycles verify: `auto` gives each cycle the step of the most expected accepted tokens per cost, by the costs the Mac measured at a start and what its cycles show a long history adds to them (on a target whose experts stream, the rows whose chance of a token is worth their time by its cycles' cost line), which is faster but makes greedy and seeded outputs vary from run to run; `all` verifies every row of a draft's block a lane the output limit leaves, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
+| `--recalibrate-ane` | Off | Calibrate the Neural Engine's share of long prompts again at this start instead of taking the one this Mac kept, as after a start beside another client of the Neural Engine; needs the Neural Engine, which `--disable-ane` turns off. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
+| `--activations` | `auto` | On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, `auto` rounds activations to int8 where that is faster and leaves the others bf16: prefill chunks of more than 64 rows through a target's MLX 4- and 5-bit weights in groups of 64, a resident MoE model's experts too in chunks of six or more routes an expert (192 rows on Qwen3.6-35B-A3B), rounded per row and 64 inputs, about a quarter less time to the first token on Qwen3.8-27B MLX 4-bit; a Ternary-Bonsai (rotated PQ2_0) model's decode, its vocabulary heads included, in every projection plan of 16 rows or more whatever its lanes, 13-16% less time a cycle on a 20-core M5 Pro; and attention over the INT8 KV cache where a split reads 8 pages or more, 4-7% sooner first tokens at 32K-64K (see [KV cache precision](#kv-cache-precision)). `bf16` is a precision opt-out for evaluations and bf16 parity: every activation stays bf16, though a [persistent cache](#persistent-cache) keeps what an `auto` run prefilled, so a parity run starts in a fresh `--cache-dir`. What `auto` costs, as next-token KL against bf16: about 2.2e-3 for Qwen3.8-27B MLX 4-bit's prefill on the GPU alone, 2.8e-4 for Bonsai's decode, and with INT8 queries 1.37x the KL the INT8 KV cache alone gives Qwen3.8-27B. The Neural Engine split, which multiplies its part in int8 whatever this option, has its own switch, `--disable-ane`. See [kernel selection](internals.md#kernel-selection). |
+| `--verify-rows` | `auto` | The rows decode cycles verify: `auto` gives each cycle the step of the most expected accepted tokens per cost, by the costs the Mac measured at a start and what its cycles show a long history adds to them (on a target whose experts stream, the rows whose chance of a token is worth their time by its cycles' cost line, within a step of the expert store's 32 rows), which is faster but makes greedy and seeded outputs vary from run to run; `all` verifies every row of a draft's block a lane the output limit leaves, so those outputs repeat when a request runs alone with the same cached prefixes; on a target whose experts stream, its steps of five lanes or more pass the expert store's 32 rows and load their experts in two rounds. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -306,17 +309,25 @@ that includes loopback when launching agents locally.
 ### Memory and context
 
 Splash sizes memory and context when it starts. Its Metal budget is the GPU's
-recommended working set less a small margin; `--max-memory` can only lower it,
-such as `--max-memory 28G`, and the log says when a larger one is ignored. The
+recommended working set less a small margin, and at most nine tenths of the
+Mac's memory: at their default wired limit, the 16 to 128 GB Macs measured
+leave 32 to 12% unwired, more than that tenth; larger Macs were not measured.
+`--max-memory` sets the budget in place of that, such as `--max-memory 28G`, up
+to the recommendation less its margin, and the log says when a larger one is
+capped. On a Mac whose GPU wired limit was raised (`iogpu.wired_limit_mb`), the
+recommendation follows the raised limit: the automatic budget still leaves a
+tenth of the memory unwired, and only an explicit `--max-memory` goes past
+that, up to the recommendation. The
 automatic plan takes the whole budget, its streamed stores starting with no more
 than the host's memory leaves the engine when it starts (below); on a Mac that
 also runs other applications, `--max-memory` leaves them room whatever they hold
 later: the automatic expert store and PLE row cache are planned smaller with it.
 The budget caps Metal allocations, not combined process RSS. The context limit
 is the model's native window, 256K tokens for every supported family, when the
-budget holds it beside the weights and, unless `--disable-ane`, the
-[Neural Engine split](internals.md#neural-engine-prefill) this Mac's calibration of a dense
-model takes, and otherwise as much as the budget holds beside them.
+budget holds it beside the weights and, unless `--disable-ane`, the largest
+[Neural Engine split](internals.md#neural-engine-prefill) a dense model could
+take (none once the Neural Engine refused this Mac's split twice), and
+otherwise as much as the budget holds beside them.
 `--max-context` sets it, such as `--max-context 100K` (K is 1024 tokens, M a
 million), up to what the budget holds without the split: beyond what the split
 leaves, the split takes fewer channels or the GPU runs alone, with a warning.
@@ -448,7 +459,9 @@ cache](#kv-on-the-ssd) holds it names its lane, tokens and
 ### PLE table streaming
 
 Qwen3.8-Flash-Next's PLE n-gram table (`per_layer_token_embd.weight`, 320M rows
-of 160 values, 28.8 GB in IQ4_NL; other row widths come from GGUF metadata)
+of 160 values, 28.8 GB in IQ4_NL; other row widths come from GGUF metadata;
+an MLX checkpoint's is its shards `ple.ple_embedding.ngram_embedding.shards.N`
+of quantized rows, each row read as its codes, scales and biases)
 is read by a handful of rows per token: 16 per position, eight heads each of
 the 2- and 3-gram hashes of the token and the tokens before it. With
 `--ple-memory auto`, the default ([memory and context](#memory-and-context)),
@@ -554,13 +567,14 @@ off` loads every expert, as a SIZE that holds them all does.
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes over them run. A load of at most 32 rows (a decode step's of so
-  few, four lanes of 8, or a prompt chunk's) is one such round; a longer
-  command's loads take as many rounds as its rows may route experts,
-  each staging half of the staging while the other half is read ahead. The
-  kernels find every routed expert through a table of its slot and the
-  chunks that hold its slots, so resident experts, one chunk of every expert,
-  and streamed experts run the same kernels.
+  passes over them run. A load of at most 32 rows (a decode step's under
+  `--verify-rows auto`, which never takes more at any lanes, or a prompt
+  chunk's) is one such round; a longer command's loads, a `--verify-rows all`
+  step's of five lanes or more among them, take as many rounds as its rows may
+  route experts, each staging half of the staging while the other half is
+  read ahead. The kernels find every routed expert through a table of its slot
+  and the chunks that hold its slots, so resident experts, one chunk of every
+  expert, and streamed experts run the same kernels.
 - The grouping puts the tiles of the experts already resident first and those
   a load brings last (their slot-table entry is marked absent). Every
   command's expert passes over the resident ones and the shared expert, each
@@ -574,6 +588,19 @@ off` loads every expert, as a SIZE that holds them all does.
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
   at 9.3 GB/s instead of 8.1, with less than half the CPU).
+- An MLX checkpoint's experts are read the same way as the checkpoint stores
+  them: each projection's codes, scales and biases, nine ranges an expert,
+  and the repack kernel builds the slot's planes from them, bitwise those of
+  the expert loaded whole. Experts a checkpoint stores otherwise (NVFP4 or FP8
+  with a tensor scale, rows the image permutes) are built on the CPU. At the
+  engine's 32 readers an SSD reads these ranges by their bytes: one range an
+  expert reads within 3-12% of nine on a 48 GB M5 Pro and a 24 GB M6, so an
+  MLX target streams at its experts' bytes, 3.1 MB an expert for
+  `mlx-community/Qwen3.8-Flash-Next-4bit` against 1.4 MB for the Q2_0 GGUF.
+  That checkpoint serves by its Hub name (`splash serve --model
+  mlx-community/Qwen3.8-Flash-Next-4bit`, its DFlash2 draft chosen as for the
+  GGUF), its experts and PLE table streamed by default on a Mac that cannot
+  hold its 104 GB.
 - While the GPU repacks a round or runs a layer, the next round's experts or
   the next block's likely experts are read ahead: those the next block's
   router picks from this block's input in a load of a cycle's rows; after a
@@ -866,7 +893,10 @@ keep on the volume by the same count (`file_bytes`),
 `write_budget_bytes`, the bytes the next state's write not in use may take
 now, and `writes_deferred_ms`, how long writes held back for SSD reads a step
 waited for. Without a write budget `writes_gated` is
-never `budget` and `write_budget_bytes` is 0. `written_last_hour_bytes` and
+never `budget` and `write_budget_bytes` is 0. A cache the start asked for that
+is off, as on a volume with too little room beyond the space it keeps free,
+reports why in `off_reason`, the words of its `SSD cache off` line; absent
+while it is on, or set Off. `written_last_hour_bytes` and
 `written_last_day_bytes` are the cache's write rate: what its writes took over
 the last hour and the last day the Mac was awake, counted as the write budget
 counts them, with a budget or without. The day's bytes are the number to set

@@ -1482,6 +1482,9 @@ class AnthropicHTTPContractTest(HarnessTestCase):
             {
                 "input_tokens": 1,
                 "cache_read_input_tokens": 1,
+                "prefix_tokens": 1,
+                "state_source": "memory",
+                "lost_state": False,
                 "output_tokens": 1,
                 "output_tokens_details": {"thinking_tokens": 0},
             },
@@ -1840,6 +1843,9 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                         {
                             "input_tokens": 2 - matched_tokens,
                             "cache_read_input_tokens": matched_tokens,
+                            "prefix_tokens": matched_tokens,
+                            "state_source": "memory" if matched_tokens else None,
+                            "lost_state": False,
                             "output_tokens": 2,
                             "output_tokens_details": {"thinking_tokens": 0},
                         },

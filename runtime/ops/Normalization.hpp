@@ -27,8 +27,25 @@ struct NormWeights final {
 [[nodiscard]] std::string normKernel(std::string_view name, const NormWeights &weights,
                                      uint32_t width);
 
+// A LayerNorm's bf16 weight and bias of every column.
+struct LayerNormWeights final {
+  metal::MetalBuffer weight;
+  metal::MetalBuffer bias;
+};
+
 class Normalization final {
 public:
+  // A LayerNorm's contract, which its owner checks once, where it takes the
+  // weights: a bf16 weight and bias of each of `width` columns. Throws,
+  // naming `name`, otherwise.
+  static void requireLayer(const LayerNormWeights &weights, uint32_t width, const std::string &name);
+  // LayerNorm with bias of `rows` fp32 rows of `width`, a tower's residual
+  // stream, into bf16 rows: (x - mean) / sqrt(variance + epsilon) * weight +
+  // bias, the mean and variance fp32 over the row, of weights requireLayer
+  // took.
+  static void addLayer(metal::CommandGraph &graph, const metal::MetalBuffer &input,
+                       const LayerNormWeights &weights, const metal::MetalBuffer &output, uint32_t width,
+                       uint32_t rows, float epsilon);
   // Also writes the consumer's `layout` table into `scratch` when it is not
   // Plain, and throws when `scratch` cannot hold it; returns what the
   // scratch then describes.

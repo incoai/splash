@@ -4,6 +4,7 @@
 #include "model/Qwen4Exp.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/SparseRowStore.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/BlockIndexer.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/HyperConnection.hpp"
@@ -102,7 +103,7 @@ std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &
       // A decode step's inputs are its lanes' (prepareVerifyLane,
       // addVerifyInput): the QSA blocks a lane's rows may complete from its
       // position.
-      step.scratch = steps_.verifyScratch(ExecutionLimits::maximumBatchWidth * ExecutionLimits::targetVerifyRows);
+      step.scratch = steps_.verifyScratch(decodeStorageRows(geometry_.lanes));
       std::array<uint32_t, ExecutionLimits::maximumBatchWidth> positions{};
       for (uint32_t lane = 0; lane < d->step.lanes; ++lane)
         positions[lane] = static_cast<uint32_t>(step.chunks[lane].committed_tokens);
@@ -128,7 +129,7 @@ ops::PreparedInput Qwen4ExpTarget::addMix(PrefillStep &step, const Qwen4HyperWei
                                           metal::MetalBuffer output, const ops::Projection *next) const {
   const Qwen4Scratch &h = step.scratch;
   const ops::LinearScratch scratch = step.buffers.linearScratch;
-  const ops::Linear &linear = operators_.linear();
+  const ops::Linear &linear = this->linear(step);
   const ops::HyperShape hs = hyperShape(geometry_);
   ops::HyperConnection::addNorm(step.graph, h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
                                 step.rows);
@@ -165,7 +166,7 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
   if (layer.ple) {
     const Qwen4PleWeights &ple = *layer.ple;
     const ops::NgramShape ps = ngramShape(geometry_);
-    const ops::Linear &linear = operators_.linear();
+    const ops::Linear &linear = this->linear(step);
     addPleGather(step.graph, h, rows * geometry_.pleHeads());
     linear.addProjection(step.graph, h.pleRows, ple.key, h.gate, rows, b.linearScratch);
     linear.addProjection(step.graph, h.pleRows, ple.value, h.pleValue, rows, b.linearScratch);
@@ -230,15 +231,12 @@ void Qwen4ExpTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const 
 }
 
 // A decode step's head reads every row of the final mix, which takes the
-// table the head's plan reads.
+// table the head's plan reads where it runs in one pass (addHead).
 metal::MetalBuffer Qwen4ExpTarget::addPrefillEnd(PrefillStep &step) const {
   if (const QwenTargetDecodeBuffers *d = step.decode) {
-    const ops::Linear &linear = operators_.linear();
-    const ops::Projection &head = weights_.logitsProjection;
-    linear.add(step.graph,
-               {.input = d->finalHidden, .output = d->logits, .scratch = step.buffers.linearScratch,
-                .prepared = addMix(step, weights_.finalHyper, d->finalHidden, &head)},
-               head, linear.plan(head, step.rows));
+    const ops::Projection *head = step.rows <= ops::kMaximumDecodeTileRows ? &vocabularyProjection() : nullptr;
+    addHead(step.graph, linear(step), d->finalHidden, d->logits, step.rows, step.buffers.linearScratch,
+            addMix(step, weights_.finalHyper, d->finalHidden, head));
     return d->finalHidden;
   }
   addMix(step, weights_.finalHyper, step.buffers.hidden[1]);
@@ -255,7 +253,7 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
                                                                 const Qwen4IndexerWeights &indexer) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const Qwen4Scratch &h = step.scratch;
-  const ops::Linear &linear = operators_.linear();
+  const ops::Linear &linear = this->linear(step);
   const uint32_t layer = step.attentionLayer, topBlocks = weights_.layout.indexerTopBlocks;
   const uint32_t keyWidth = geometry_.indexerHeadDimension, queryWidth = geometry_.indexerHeads * keyWidth;
   const auto u16Rows = [&](const metal::MetalBuffer &buffer, const QwenTargetPrefillSequence &sequence,
@@ -340,7 +338,7 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addDecodeQsa(PrefillStep &step
   const QwenTargetPrefillBuffers &b = step.buffers;
   const QwenTargetDecodeBuffers &d = *step.decode;
   const Qwen4Scratch &h = step.scratch;
-  const ops::Linear &linear = operators_.linear();
+  const ops::Linear &linear = this->linear(step);
   const uint32_t layer = step.attentionLayer, topBlocks = weights_.layout.indexerTopBlocks;
   const uint32_t keyWidth = geometry_.indexerHeadDimension, queryWidth = geometry_.indexerHeads * keyWidth;
   const uint32_t lanes = d.step.lanes, laneCap = d.step.laneCap;
@@ -400,9 +398,7 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addDecodeQsa(PrefillStep &step
 
 void Qwen4ExpTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer,
                                   metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const {
-  const ops::Linear &linear = operators_.linear();
-  linear.add(graph, {.input = std::move(hidden), .output = std::move(logits), .scratch = scratch},
-             vocabularyProjection(), linear.plan(vocabularyProjection(), rows));
+  addHead(graph, operators_.linear(), std::move(hidden), std::move(logits), rows, scratch, {});
 }
 
 void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,

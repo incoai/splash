@@ -484,6 +484,9 @@ std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
   resident.sample.streamedTable.reset();
   resident.sample.streamedExperts.reset();
   resident.sample.engine.resources.kvTier.writesGated = engine::DiskWritesGate::No;
+  // An SSD cache the start asked for that its volume left off says why.
+  resident.sample.engine.resources.kvTier.offReason =
+      "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free";
   resident.sample.metalHealthy = false;
   resident.sample.metalFailureReason = "command buffer \"decode\" failed:\n\tGPU timeout";
   resident.sample.pipelinesCreatedWhileServing = 2;
@@ -766,6 +769,10 @@ void testStreamedExpertsStatus() {
               "\"total\":240,\"samples\":500},\"resume_ms\":{\"p50\":0.128,\"p95\":0.128,\"p99\":16.384,"
               "\"max\":12.5,\"total\":48.5,\"samples\":500}}},\"failure\":\"injected\"}") != std::string::npos,
           "streamed experts' status differs");
+  // Both uses' reads count among the weights' reads beside the SSD cache's.
+  experts.uses[0].readBytes = 27000;
+  require(status(experts).find("\"weights_read_bytes\":1973027000,") != std::string::npos,
+          "the streamed experts' reads are not the disk's weights_read_bytes");
 }
 
 // A target whose KV can spill reports what spilling does under kv_spill,
@@ -877,6 +884,9 @@ void testKvSpillStatus() {
       "\"p95\":262.144,\"p99\":262.144,\"max\":250,\"total\":5000,\"samples\":24},\"wait_ms\":" +
       none + "}}";
   require(json.find(expected) != std::string::npos, "the spilling target's kv_spill differs:\n" + json);
+  // The spilled K/V the block cache and the history stream read is part of the SSD cache's reads.
+  require(json.find("\"spilled_kv_read_bytes\":25270000000,") != std::string::npos,
+          "the spilled K/V reads are not the disk's spilled_kv_read_bytes:\n" + json);
 }
 
 // A windowed target's KV reports its window under kv.window: the pages a
@@ -936,7 +946,8 @@ void testStreamedTableStatus() {
                         "\"samples\":0},\"prefetch_requested_rows\":32768,") != std::string::npos &&
               json.find("\"prefetch_read_rows\":30000,\"prefetch_dropped_rows\":0,\"poisoned\":true,"
                         "\"failure\":\"injected\"}") != std::string::npos &&
-              json.find("\"schema_version\":8,") != std::string::npos,
+              json.find("\"schema_version\":8,") != std::string::npos &&
+              json.find("\"weights_read_bytes\":22500,") != std::string::npos,
           "the streamed table's status is missing or inaccurate");
 }
 

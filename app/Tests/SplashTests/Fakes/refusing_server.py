@@ -9,7 +9,7 @@
 # request for a title, which streams nothing, gets "A Title". It ends once the tests that
 # started it are gone.
 import json
-import os
+import runpy
 import socket
 import sys
 import threading
@@ -89,13 +89,7 @@ class Handler(BaseHTTPRequestHandler):
             pass  # the client stopped the request meanwhile
 
 
-def end_with_tests():
-    while os.getppid() != 1:
-        time.sleep(0.5)
-    os._exit(0)
-
-
-threading.Thread(target=end_with_tests, daemon=True).start()
+runpy.run_path(str(Path(__file__).with_name("app_bound.py")))["end_with_app"]()
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 print(server.server_port, flush=True)
 server.serve_forever()

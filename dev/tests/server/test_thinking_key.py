@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
+import transformers
 from cryptography.fernet import Fernet
 
 from dev.tests.server_fixtures import (
@@ -158,7 +159,9 @@ class ThinkingKeyTests(unittest.TestCase):
                 "load_thinking_key",
                 side_effect=ThinkingKeyError("invalid key file"),
             ),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained") as tokenizer,
+            mock.patch.object(
+                transformers.AutoTokenizer, "from_pretrained"
+            ) as tokenizer,
             mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
             self.assertRaisesRegex(SystemExit, "1"),

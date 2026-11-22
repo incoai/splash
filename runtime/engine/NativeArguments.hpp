@@ -66,6 +66,10 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --ane-calibration again: the split's start calibrates again instead of
+  // taking this Mac's record (splash serve --recalibrate-ane,
+  // AneFfnSetting::recalibrate).
+  bool recalibrateAne = false;
   // --ple-memory BYTES|auto|off and --expert-memory BYTES|auto|off: a
   // target's per-layer embedding (PLE) table through a row cache of BYTES and
   // a MoE target's routed experts through a store of BYTES, which
@@ -89,6 +93,9 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --max-concurrent-requests REQUESTS: the lanes the runtime runs, 1 to
+  // ExecutionLimits::maximumBatchWidth (RuntimeResourcesConfig::lanes).
+  uint32_t lanes = model::ExecutionLimits::defaultLanes;
   // --activations auto|bf16: whether activations may round to int8 where
   // an int8-activation path takes them
   // (RuntimeResourcesConfig::int8Activations).

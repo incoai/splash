@@ -60,9 +60,13 @@ release-app: install-environment all
 	@test -z "$(filter-out 0 1,$(DRY_RUN))" || { echo "set DRY_RUN to 1 for a dry run, or leave it out"; exit 1; }
 	$(PYTHON) dev/tools/release_app.py $(RELEASE_ARGS)
 
-# The app's own tests; the Python ones cover what packages it.
+# The app's own tests, one at a time; the Python ones cover what packages it.
+# A test that pumps the main thread holds every other main-actor test, and the
+# app's own tasks such as following a server's start, until it returns, so beside
+# it they miss their clocks: run in parallel, a different test failed from run
+# to run (M6, 2 of 4 runs).
 check-app:
-	swift test --package-path app
+	swift test --package-path app --no-parallel
 
 # Uploads the built RELEASE_VERSION archive, its checksum, the tester installer
 # and the `latest` pointer to the private Hugging Face repo testers install
@@ -170,6 +174,12 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
+# The model whose release-check also runs the persistent cache's smoke with
+# --cached-states exact. One recurrent-state family is enough: the option
+# changes the cached state's format, its cache namespace and its restore
+# path, and no family specialises those.
+EXACT_STATES_MODEL ?= mlx-community/Qwen3.8-27B-4bit
+
 # BASELINE is a checkout whose build/ holds another build's splash.metallib,
 # engine-tests/backend-benchmark and engine-tests/weight-digests: this build
 # is compared with it on this machine in ABBA order, and so are their weight
@@ -253,6 +263,8 @@ release-check: preflight
 	$(MAKE) --no-print-directory test-http-real
 	$(MAKE) --no-print-directory test-http-real \
 		HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"
+	$(if $(filter $(EXACT_STATES_MODEL),$(MODEL)),$(MAKE) --no-print-directory test-http-real \
+		HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G --cached-states exact")
 	$(MAKE) --no-print-directory test-performance-real
 	@test -z "$$(git status --porcelain)" || { \
 		echo "error: release checkout is not clean" >&2; \

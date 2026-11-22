@@ -134,14 +134,15 @@ inline gguf_reference::Fmt fitting(size_t i, uint32_t K) {
 // The model of `shape` and format f: gate, up and down in f and the next two
 // formats, cyclically, and the shared expert's in the three after them, each
 // the next that fits its rows; with upInGateFormats, up in the gate's
-// formats.
+// formats; with oneFormat, all six in f.
 inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::MoeShape &shape, int f,
-                       bool upInGateFormats) {
+                       bool upInGateFormats, bool oneFormat = false) {
   const uint32_t hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
   const uint32_t n[3] = {intermediate, intermediate, hidden}, k[3] = {hidden, hidden, intermediate};
   Model m;
   m.shape = shape;
-  for (size_t i = 0; i < m.formats.size(); ++i) m.formats[i] = fitting(f + i, k[i % 3]);
+  for (size_t i = 0; i < m.formats.size(); ++i)
+    m.formats[i] = oneFormat ? gguf_reference::Fmt(f) : fitting(f + i, k[i % 3]);
   if (upInGateFormats) {
     m.formats[1] = m.formats[0];
     m.formats[4] = m.formats[3];

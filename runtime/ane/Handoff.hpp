@@ -61,12 +61,17 @@ public:
   // cannot start, or one queued once retired, has failed: this never throws
   // for the agent's faults.
   void queue(uint64_t ready, uint64_t done, const Start &start);
+  // The agent's time over a command's jobs, each job's from the notice that
+  // the event reached its `ready` to its report (none for a report that came
+  // first), in all and the longest job's.
+  struct Ran final {
+    AwakeClock::duration total{}, longest{};
+  };
   // After the command has completed: if every job it queued succeeded, the
-  // agent's time over them, each job's from the notice that the event reached
-  // its `ready` to its report (none for a report that came first); none
-  // otherwise. Waits at most one bound for their reports: a job that has not
-  // reported by then has failed. Forgets the command's jobs either way.
-  [[nodiscard]] std::optional<AwakeClock::duration> finish();
+  // agent's time over them; none otherwise. Waits at most one bound for their
+  // reports: a job that has not reported by then has failed. Forgets the
+  // command's jobs either way.
+  [[nodiscard]] std::optional<Ran> finish();
   // The command will not be committed: retires with `reason`, forgets its
   // jobs, and waits at most one bound for the agent to report those it
   // started.

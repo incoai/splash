@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 15
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -52,7 +52,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 # Cancel and Stop: one request id.
 _REQUEST_END = struct.Struct("<Q")
@@ -62,7 +62,8 @@ _STATUS_REQUEST = struct.Struct("<Q")
 _RELEASE_REQUEST = struct.Struct("<Q")
 # Concurrent requests, context, vision, vocabulary, mask rows, stop count.
 _READY = struct.Struct("<IIBIII")
-_START = struct.Struct("<QII")
+# Request, lane, matched prompt tokens, prefix tokens, state source, lost state.
+_START = struct.Struct("<QIIIBB")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
@@ -80,10 +81,10 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 114
+assert _REQUEST.size == 118
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 21
-assert _START.size == 16
+assert _START.size == 22
 assert _DONE.size == 62
 assert _ERROR.size == 22
 assert _STATUS_JSON.size == 8
@@ -306,6 +307,9 @@ class RequestFrame:
     # Only a request that generates inside a thinking block has one; a score
     # request never does.
     thinking_budget: ThinkingBudget | None = None
+    # Where the prompt's head (its system prompt and tools) ends; zero
+    # without one. It must leave at least one prompt token.
+    head_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -377,12 +381,28 @@ class ReadyEvent:
     stop_token_ids: tuple[int, ...]
 
 
+# Where the state a request resumes from was: none for a cold start, a RAM
+# copy, or the SSD cache's copy alone; the values are runtime/engine/
+# Types.hpp's.
+class StateSource(IntEnum):
+    NONE = 0
+    MEMORY = 1
+    DISK = 2
+
+
 @dataclass(slots=True, frozen=True)
 class StartEvent:
     request_id: int
     lane: int
-    # The cached prefix the request starts from; zero for a cold start.
+    # What the request found in the cache: the tokens of the state it resumes
+    # from, zero for a cold start; the prompt's tokens whose KV the cache
+    # matched, the state's included; where that state was; and whether a
+    # matched block past the state once held a state that is gone from both
+    # tiers.
     matched_prompt_tokens: int
+    prefix_tokens: int = 0
+    state_source: StateSource = StateSource.NONE
+    lost_state: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -830,6 +850,8 @@ def _validated_request(
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
+        if _u32(request.head_tokens, "head tokens") >= len(prompt):
+            raise ValueError("head must leave a prompt token")
         if scores and (request.image_spans or request.image_pixels):
             raise ValueError("score requests are text-only")
         if scores and (
@@ -968,6 +990,7 @@ def _request_frame(request: RequestFrame) -> bytearray:
                 request.thinking_budget.also_ends,
             )
         ),
+        request.head_tokens,
     )
     for index, span in enumerate(request.image_spans):
         _IMAGE_SPAN.pack_into(
@@ -1239,12 +1262,20 @@ def _decode_event(frame: Frame) -> EngineEvent:
             kind, bound, required, budget, plan_context, payload[_START_FAILED.size :]
         )
     if frame_type is FrameType.START:
-        request_id, lane, matched = _START.unpack(payload)
+        request_id, lane, matched, prefix, source, lost = _START.unpack(payload)
         if not request_id:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "start event request id must be non-zero"
             )
-        return StartEvent(request_id, lane, matched)
+        if source > max(StateSource) or lost > 1:
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "start state source or lost state is invalid",
+                request_id,
+            )
+        return StartEvent(
+            request_id, lane, matched, prefix, StateSource(source), bool(lost)
+        )
     if frame_type is FrameType.PROMPT_PROGRESS:
         request_id, processed, elapsed = _PROMPT_PROGRESS.unpack(payload)
         if not request_id or processed > MAX_PROMPT_TOKENS:

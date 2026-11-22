@@ -136,9 +136,14 @@ struct RuntimeContext final {
   // What a start keeps of the step costs its decode warmups measure on this
   // Mac (Runtime::warmupDecodeBatch, StepCosts::text): the line a lane
   // count's were remembered as, if any, which the runtime reads when it is
-  // made, and remembering one; neither where every start measures them.
+  // made, remembering one and forgetting one; none where every start
+  // measures them.
   std::function<std::optional<std::string>(uint32_t lanes)> recallStepCosts{};
   std::function<void(uint32_t lanes, std::string_view line)> rememberStepCosts{};
+  std::function<void(uint32_t lanes)> forgetStepCosts{};
+  // The lanes its arenas hold, the most requests it runs at once, as its
+  // start chose them (QwenTargetGeometry::lanes).
+  uint32_t lanes = ExecutionLimits::defaultLanes;
 };
 
 // What the step costs a start's decode warmups measure follow
@@ -217,18 +222,21 @@ struct StreamedParts final {
   [[nodiscard]] static StreamedParts loaded(const LoadedModel &model, bool kv = false) noexcept;
 };
 // The lane state and arenas of `model`'s geometry with `parts` streaming,
-// whatever streams of it as it loaded.
+// whatever streams of it as it loaded, of a runtime of `lanes` lanes
+// (QwenTargetGeometry::lanes).
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts,
+                     uint32_t lanes = ExecutionLimits::defaultLanes);
 // Those of a model of `descriptor` whose target's files give `target`
 // (plannedTargetGeometry) with `parts` streaming, before it loads: they plan
 // the stores of every part that may stream (engine::planStreamedMemory).
 [[nodiscard]] ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor,
                                                    const QwenTargetGeometry &target,
                                                    const ops::ExecutionPlans &operators, kv::Format kvFormat,
-                                                   ops::GdnStateFormat stateFormat, StreamedParts parts);
+                                                   ops::GdnStateFormat stateFormat, StreamedParts parts,
+                                                   uint32_t lanes = ExecutionLimits::defaultLanes);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

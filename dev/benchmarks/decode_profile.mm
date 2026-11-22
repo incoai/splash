@@ -11,14 +11,15 @@
 // The fused (unprofiled) GPU time of the same work is reported alongside, so
 // the gap between the sum of parts and the fused command shows how much a
 // cycle pays in dispatch boundaries rather than kernel work. --dispatch-list
-// writes the attributed B1 cycles' dispatches in order, one line each: index,
-// pipeline and GPU microseconds. A lane whose answer ends begins it again
-// between cycles, untimed. --prompt FILE[,FILE...] takes each lane's prompt
+// writes the attributed cycles' dispatches in order, one line each: index,
+// pipeline and GPU microseconds, B1's to FILE and Bn's to FILE.Bn. A lane
+// whose answer ends begins it again between cycles, untimed. --prompt FILE[,FILE...] takes each lane's prompt
 // from a file of token ids, lane i the (i mod n)th of n files, as a served
 // width's lanes read different text; --widths N profiles B1 through BN.
 // --step-rows has every decode step take T
 // rows (at most 16 and at least one a lane: RuntimeInstrumentation::
-// forceStepRows), for the cost of a step by its rows; --attribute off times
+// forceStepRows), for the cost of a step by its rows; --lane-rows R has
+// every width's steps take R rows a lane; --attribute off times
 // the fused cycles alone and the prompt's fused prefill. --answer-tokens
 // sizes each lane's pages too. --block-plans on has a streamed-expert
 // target's cycles plan a draft's block a lane at their floor
@@ -37,6 +38,8 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/ExpertStore.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/SsdReaders.hpp"
 #include "model/VisionLoader.hpp"
 #include "model/WeightImages.hpp"
@@ -235,7 +238,7 @@ void profileImages(metal::MetalBackend &backend,
       }
     }
     const metal::MetalBuffer embeddings = backend.allocateBuffer(
-        uint64_t{ops::Vision::embeddingRows(grid)} *
+        uint64_t{grid.mergedTokens()} *
             vision.tensors.layout.outputHiddenSize * sizeof(uint16_t),
         metal::BufferStorage::Private, "image embeddings");
     const auto encode = [&] {
@@ -337,6 +340,10 @@ struct AnswerCycle final {
   uint32_t lane = 0, cycle = 0, rows = 0, tokens = 0;
 };
 std::vector<AnswerCycle> answerCycles;
+// An FNV-1a digest of every token the timed cycles of a width retained, each
+// lane's in its place, until profileWidth prints it: two builds that lay the
+// same rows (--step-rows) and compute them alike print the same digest.
+uint64_t outputDigest = 0;
 
 CycleTiming decodeCycle(metal::MetalBackend &backend,
                         model::Runtime &executor,
@@ -358,6 +365,9 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   uint64_t tokens = 0;
   for (size_t index = 0; index < lanes.size(); ++index) {
     tokens += results[index].outputTokens.size();
+    for (const uint32_t token : results[index].outputTokens)
+      for (const uint64_t word : {uint64_t{index}, uint64_t{token}})
+        outputDigest = (outputDigest ^ word) * 0x100000001b3ULL;
     if (!results[index].failure.empty())
       throw std::runtime_error(results[index].failure);
     lanes[index].answered += static_cast<uint32_t>(results[index].outputTokens.size());
@@ -384,7 +394,8 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
-                     "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off] [--widths N] "
+                     "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--lane-rows R] [--activations auto|bf16] [--attribute on|off] "
+                     "[--widths N] "
                      "[--warmups on|off] [--prompt chat|counting|FILE[,FILE...]] [--step-log on|off] "
                      "[--block-plans on|off] "
                      "[--temperature T [--seed S]] [--thinking-budget TOKENS] [--answer-tokens N]\n"
@@ -405,8 +416,15 @@ int main(int argc, char **argv) {
       std::string dispatchList;
       model::VerifyRows verifyRows = model::VerifyRows::Auto;
       std::optional<uint32_t> stepRows;
+      // Rows a lane every step takes at every width (--lane-rows), in place
+      // of one count of rows for every width (--step-rows).
+      std::optional<uint32_t> laneRows;
+      // The engine's --activations: auto (int8 where the plans take it) or
+      // bf16 (none: a decode step's attention queries stay bf16).
+      ops::Int8Activations int8Activations = ops::Int8Activations::On;
       bool attribute = true;
-      // The start's decode warmups, which measure the step costs (StepCosts);
+      // The start's warmups (its prefill of the most rows and of each row class, with the pipelines they create,
+      // and its decode warmups, which measure the step costs, StepCosts);
       // the counting prompt, or a file's token ids; and each cycle's choice
       // of its rows.
       bool warmups = false, counting = false, stepLog = false, blockPlans = false;
@@ -428,8 +446,8 @@ int main(int argc, char **argv) {
           cycles = parseCount(argv[index + 1], "--cycles");
         else if (option == "--widths") {
           widths = parseCount(argv[index + 1], "--widths");
-          if (widths > 4)
-            throw std::invalid_argument("--widths takes 1 to 4");
+          if (widths > model::ExecutionLimits::maximumBatchWidth)
+            throw std::invalid_argument("--widths takes 1 to the most lanes of a step");
           textOptions = true;
         }
         else if (option == "--kv-format") {
@@ -493,6 +511,17 @@ int main(int argc, char **argv) {
         } else if (option == "--step-rows") {
           stepRows = parseCount(argv[index + 1], "--step-rows");
           textOptions = true;
+        } else if (option == "--activations") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "auto" && value != "bf16")
+            throw std::invalid_argument("--activations takes auto or bf16");
+          int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+          textOptions = true;
+        } else if (option == "--lane-rows") {
+          laneRows = parseCount(argv[index + 1], "--lane-rows");
+          if (*laneRows > model::ExecutionLimits::targetVerifyRows)
+            throw std::invalid_argument("--lane-rows takes 1 to a verify block's rows");
+          textOptions = true;
         } else if (option == "--dispatch-list") {
           dispatchList = argv[index + 1];
           textOptions = true;
@@ -517,7 +546,7 @@ int main(int argc, char **argv) {
       loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
       model::LoadedModel model =
           model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
-      ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
+      ops::ExecutionPlans operators(backend.capabilities(), int8Activations);
 
       // Enough Page32 pages for each width's lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
@@ -547,9 +576,24 @@ int main(int argc, char **argv) {
                                       model.stateLayout(stateFormat), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
       context.verifyRows = verifyRows;
+      // The lanes a start runs that profiles its widths: the default's, or
+      // more as --max-concurrent-requests asks.
+      context.lanes = std::max(widths, model::ExecutionLimits::defaultLanes);
       model::Runtime executor(context);
       if (warmups) {
-        for (uint32_t width = 1; width <= 4; ++width) {
+        // A start's prefill warmups (Bootstrap): the prefill of the most rows,
+        // then a chunk of each row class, and the pipelines they created.
+        const auto prefillStarted = std::chrono::steady_clock::now();
+        static_cast<void>(executor.warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+        const size_t mostPipelines = BackendInstrumentation::cachedPipelines(backend);
+        const auto classesStarted = std::chrono::steady_clock::now();
+        for (const uint32_t rows : executor.prefillRowClasses()) static_cast<void>(executor.warmupPrefill(rows));
+        std::printf("prefill warmups: most rows %.2f s, %zu row classes %.2f s, pipelines %zu then %zu\n",
+                    std::chrono::duration<double>(classesStarted - prefillStarted).count(),
+                    executor.prefillRowClasses().size(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - classesStarted).count(),
+                    mostPipelines, BackendInstrumentation::cachedPipelines(backend));
+        for (uint32_t width = 1; width <= context.lanes; ++width) {
           // A start's decode warmup of the lane count, which measures its
           // classes' costs, and the costs it measured.
           const auto started = std::chrono::steady_clock::now();
@@ -569,7 +613,7 @@ int main(int argc, char **argv) {
                   backend.capabilities().deviceName.c_str(), promptTokens,
                   cycles, std::string(ops::formatName(stateFormat)).c_str());
 
-      std::array<Lane, 4> lanes;
+      std::array<Lane, model::ExecutionLimits::maximumBatchWidth> lanes;
       for (uint32_t index = 0; index < lanes.size(); ++index) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
@@ -641,11 +685,15 @@ int main(int argc, char **argv) {
         return timing;
       };
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
+        if (laneRows)
+          model::RuntimeInstrumentation::forceStepRows(executor, *laneRows * static_cast<uint32_t>(active.size()));
         std::vector<CycleTiming> fused;
         static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
         answerCycles.clear();
+        outputDigest = 0xcbf29ce484222325ULL;
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           fused.push_back(cycleOf(active));
+        std::printf("%s output digest %016llx\n", title, static_cast<unsigned long long>(outputDigest));
         if (stepLog)
           for (const AnswerCycle &answer : answerCycles)
             std::printf("%s answer cycle: lane %u, cycle %u, rows %u, tokens %u\n", title, answer.lane, answer.cycle,
@@ -692,9 +740,11 @@ int main(int argc, char **argv) {
         BackendInstrumentation::setDispatchProfiling(backend, false);
         const std::vector<metal::DispatchTiming> timings =
             BackendInstrumentation::takeDispatchProfile(backend);
-        if (!dispatchList.empty() && active.size() == 1) {
-          FILE *file = std::fopen(dispatchList.c_str(), "w");
-          if (!file) throw std::runtime_error("cannot write " + dispatchList);
+        if (!dispatchList.empty()) {
+          const std::string path =
+              active.size() == 1 ? dispatchList : dispatchList + ".B" + std::to_string(active.size());
+          FILE *file = std::fopen(path.c_str(), "w");
+          if (!file) throw std::runtime_error("cannot write " + path);
           for (size_t index = 0; index < timings.size(); ++index)
             std::fprintf(file, "%zu %s %.2f\n", index, timings[index].pipelineName.c_str(),
                          timings[index].gpuSeconds * 1e6);
@@ -704,7 +754,27 @@ int main(int argc, char **argv) {
         accumulate(table, timings);
         print(title, table, cycles, median.gpuSeconds);
       };
+      // The streamed experts the B1 cycles read (--expert-memory): per
+      // cycle, the routed experts, those not resident, the bytes read, and
+      // the loads' host steps (work: reading and staging them), which tell
+      // what a cycle waits for the SSD.
+      const model::ExpertStore *experts = model.expertStore();
+      const model::ExpertStoreStats expertsBefore = experts ? experts->stats() : model::ExpertStoreStats{};
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
+      if (experts) {
+        const model::ExpertStoreStats after = experts->stats();
+        const model::ExpertStoreStats::Use &u = after.uses[1], &b = expertsBefore.uses[1];
+        const double perCycle = 1.0 / cycles;
+        std::printf("experts B1: %llu of %llu resident in %llu MiB; per cycle %.1f block loads, %.1f routed, %.1f "
+                    "not resident, %.1f read ahead, %.2f MiB read; host step work mean %.3f p50 %.3f p95 %.3f ms "
+                    "over the run\n",
+                    (unsigned long long)after.resident, (unsigned long long)after.experts,
+                    (unsigned long long)(after.capBytes >> 20), (u.loads - b.loads) * perCycle,
+                    (u.routed - b.routed) * perCycle, (u.read - b.read) * perCycle,
+                    (u.readAhead - b.readAhead) * perCycle, (u.readBytes - b.readBytes) * perCycle / (1 << 20),
+                    u.work.count ? u.work.totalMilliseconds / u.work.count : 0.0, u.work.p50Milliseconds,
+                    u.work.p95Milliseconds);
+      }
       // Add one lane at a time so M16 and M24 paths are measured too.
       for (uint32_t index = 1; index < widths; ++index) {
         prefill(executor, lanes[index], promptOf(index), answer);
@@ -712,6 +782,25 @@ int main(int argc, char **argv) {
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
 
+      // A streamed table's stages and reads over the whole run (--ple-memory),
+      // which tell what reading its rows from its source costs.
+      if (const model::SparseRowStore *store = model.streamedTable()) {
+        const model::SparseRowStats stats = store->stats();
+        for (uint32_t use = 0; use < model::kSparseRowUses; ++use) {
+          const model::SparseRowStats::Use &u = stats.uses[use];
+          std::printf("table %s %s: %llu stages, %llu ids, %llu distinct, %llu hit, %llu read; stage mean %.3f "
+                      "p50 %.3f p95 %.3f p99 %.3f max %.3f ms\n",
+                      stats.table.c_str(), use == 0 ? "prefill" : "decode", (unsigned long long)u.stages,
+                      (unsigned long long)u.requestedRows, (unsigned long long)u.uniqueRows,
+                      (unsigned long long)u.hitRows, (unsigned long long)u.readRows,
+                      u.stage.count ? u.stage.totalMilliseconds / u.stage.count : 0.0, u.stage.p50Milliseconds,
+                      u.stage.p95Milliseconds, u.stage.p99Milliseconds, u.stage.maximumMilliseconds);
+        }
+        std::printf("table %s reads: %llu bytes, %llu prefetched rows; a row's read p50 %.3f p95 %.3f p99 %.3f ms\n",
+                    stats.table.c_str(), (unsigned long long)stats.readBytes,
+                    (unsigned long long)stats.prefetchReadRows, stats.read.p50Milliseconds, stats.read.p95Milliseconds,
+                    stats.read.p99Milliseconds);
+      }
       for (uint32_t index = 0; index < widths; ++index)
         executor.end(lanes[index].id);
       return 0;

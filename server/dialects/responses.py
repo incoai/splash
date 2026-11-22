@@ -748,6 +748,7 @@ def response_object(model, job, conversation, status, output, result=None, error
                 # input_tokens less cached_tokens, as in Messages, which
                 # reports no cache_creation_input_tokens.
                 "cache_write_tokens": 0,
+                **cache.reuse(),
             },
             "output_tokens": result.completion_tokens,
             "output_tokens_details": {"reasoning_tokens": job.reasoning_tokens},

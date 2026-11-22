@@ -312,9 +312,11 @@ struct ServerButton: View {
             HStack(spacing: 7) {
                 indicator
                     .frame(width: 12, height: 12)
+                // Cut at its end: a name cut in its middle keeps its first and last words and cuts
+                // the model away ("DeepSeek-…-4bit-DWQ").
                 Text(state.serverTitle)
                     .lineLimit(1)
-                    .truncationMode(.middle)
+                    .truncationMode(.tail)
                     .frame(maxWidth: 220)
             }
             .font(.callout.weight(.medium))

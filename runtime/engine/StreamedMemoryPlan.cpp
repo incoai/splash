@@ -79,7 +79,7 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
 // tableBytes), as they allocate them: the hot block cache's at a target of
 // `hotTargetBytes` and one for each of `buffers` buffers of staged history.
 uint64_t readerTableBytes(const StreamedMemoryInputs &in, uint64_t hotTargetBytes, uint32_t buffers) {
-  return model::KvBlockCache::tableBytes(in.kvLayout, *in.sparseKv, hotTargetBytes) +
+  return model::KvBlockCache::tableBytes(in.kvLayout, *in.sparseKv, hotTargetBytes, in.lanes) +
          buffers * model::KvHistoryStream::tableBytes(in.kvLayout);
 }
 
@@ -135,7 +135,7 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
     else
       high = middle - 1;
   }
-  const uint64_t states = uint64_t{model::ExecutionLimits::maximumBatchWidth} * in.stateSlotBytes;
+  const uint64_t states = uint64_t{in.lanes} * in.stateSlotBytes;
   spill.enabled = true;
   spill.memoryTokens = low;
   // The room only bounds a first start's context: it follows the volume's
@@ -158,7 +158,7 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   spill.laneSlots = shape.laneSlots();
   spill.hotFloorBytes = spill.hotTargetBytes = spillFloors.hotFloorBytes;
   spill.hotLimitBytes = extentsBytes(
-      layout, shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+      layout, shape.requiredSlots(in.lanes) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
       layout.kvBytesPerModelPage());
   spill.indexRunwayBytes = spillFloors.indexRunwayBytes;
   spill.stagingBytes = spillFloors.stagingBytes(spill.floorTokens, spill.stagingBuffers);
@@ -180,7 +180,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   uint64_t loaded = 0;
   for (const uint64_t bytes : {in.fixedBytes, arenaBytes, experts.charged, table.charged})
     if (!checkedAdd(loaded, bytes, loaded)) return overflow();
-  const std::optional<uint64_t> minimum = minimumRequiredBytes(loaded, in.laneStateBytes, layout);
+  const std::optional<uint64_t> minimum = minimumRequiredBytes(loaded, in.laneStateBytes, layout, in.lanes);
   if (!minimum) return overflow();
   const uint64_t runwayBytes = *minimum - loaded - in.laneStateBytes;
   uint64_t floors = *minimum;

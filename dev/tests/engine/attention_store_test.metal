@@ -36,15 +36,15 @@ inline void splash_test_staged_store(device const SplashLaneRows *layout, device
                    device const SplashKvPage *page_table0 [[buffer(3)]],                                         \
                    device const SplashKvPage *page_table1 [[buffer(4)]],                                         \
                    device const SplashKvPage *page_table2 [[buffer(5)]],                                         \
-                   device const SplashKvPage *page_table3 [[buffer(6)]],                                         \
-                   constant SplashAttentionParams &params [[buffer(7)]],                                         \
+                   device const SplashKvPage *page_table3 [[buffer(6)]], device const SplashKvPage *page_table4 [[buffer(7)]], device const SplashKvPage *page_table5 [[buffer(8)]], device const SplashKvPage *page_table6 [[buffer(9)]], device const SplashKvPage *page_table7 [[buffer(10)]],                                         \
+                   constant SplashAttentionParams &params [[buffer(11)]],                                         \
                    uint3 group [[threadgroup_position_in_grid]],                                                 \
                    uint thread_index [[thread_index_in_threadgroup]],                                            \
                    uint simd_lane [[thread_index_in_simdgroup]],                                                 \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {                                         \
     SPLASH_STORE_MAXIMA_##CacheElement(HeadDim)                                                                  \
     splash_test_staged_store<Heads, HeadDim, CacheElement, ValuesTokenMajor>(                                    \
-        layout, keys, values, SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3), \
+        layout, keys, values, SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7), \
         params, maxima, group, thread_index, simd_lane, simd_group);                                             \
   }
 // By page format and the pages' KV heads, head dimension and value order.

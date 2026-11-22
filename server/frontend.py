@@ -46,52 +46,9 @@ from .tool_schema import (
 
 PREPARATION_WAIT_SECONDS = 30.0
 
-MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
-FLOAT32_MAX = float.fromhex("0x1.fffffep127")
 # vLLM raises a nonzero temperature below this to it (_MAX_TEMP in
 # vllm/sampling_params.py); Splash does the same.
 MIN_SAMPLING_TEMPERATURE = 0.01
-
-# The sampling numbers a request may set: each with its default, the value
-# that leaves the logits unchanged, the values the engine accepts and how a
-# 400 names them. The served family's published defaults
-# (Frontend.sampling_defaults) take the place of these. A nonzero top_p or
-# repetition_penalty must not round to zero in the engine's float32, which
-# would make the value invalid.
-SAMPLING_NUMBERS = {
-    "temperature": (
-        1.0,
-        lambda value: 0 <= value <= 2,
-        "a number in [0, 2]",
-    ),
-    "top_p": (
-        1.0,
-        lambda value: MIN_FLOAT32_SUBNORMAL <= value <= 1,
-        "a number in (0, 1]",
-    ),
-    "presence_penalty": (0.0, lambda value: -2 <= value <= 2, "a number in [-2, 2]"),
-    "frequency_penalty": (0.0, lambda value: -2 <= value <= 2, "a number in [-2, 2]"),
-    "repetition_penalty": (
-        1.0,
-        lambda value: MIN_FLOAT32_SUBNORMAL <= value <= FLOAT32_MAX,
-        "a positive number",
-    ),
-    "min_p": (0.0, lambda value: 0 <= value <= 1, "a number in [0, 1]"),
-}
-# With top_k, whose default 0 keeps every token, the table covers every
-# sampling option the frame carries.
-assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
-
-
-def accepts_sampling(name, value):
-    """Whether a request may set the sampling option name to value. A top_k
-    of 0 or -1 keeps every token."""
-    if name == "top_k":
-        return isinstance(value, int) and not isinstance(value, bool) and value >= -1
-    return name in SAMPLING_NUMBERS and (
-        is_finite_number(value) and SAMPLING_NUMBERS[name][1](value)
-    )
-
 
 # Text completions' output budget when max_tokens is omitted: OpenAI's
 # default for the endpoint, which vLLM and SGLang also use.
@@ -138,6 +95,36 @@ class Prompt:
     template_effort: str | None = None
 
 
+def _head_tokens(messages, tools, tokens, openings):
+    """Where the prompt's head ends: its system message and the tools the
+    template renders before any other message, which other conversations of
+    the same agent or app share, end where the first other message opens
+    (ChatFormat.turn_openings, as `openings`' tokens). The engine keeps a
+    state there on first use, so the next conversation resumes past the
+    head rather than prefill it again. Zero without a system message first
+    or tools, and where no turn opens the format's way, as a custom template
+    (--chat-template-file) may write them. A head holds no image: system
+    content is text, and images come in user and tool turns."""
+    system = bool(messages) and messages[0].get("role") == "system"
+    if not (system or tools):
+        return 0
+    end = len(tokens)
+    for ids in openings:
+        index = -1
+        # Its first token found by list.index, the rest checked there: on an
+        # M5 Max a 15,000-token head takes 0.09 ms, where comparing at every
+        # token took 3.1 ms.
+        while True:
+            try:
+                index = tokens.index(ids[0], index + 1, end)
+            except ValueError:
+                break
+            if tuple(tokens[index : index + len(ids)]) == ids:
+                end = index
+                break
+    return 0 if end >= len(tokens) else end
+
+
 @dataclass
 class RenderedPrompt:
     text: str
@@ -147,6 +134,8 @@ class RenderedPrompt:
     thinking: bool
     # Images precede the generation prompt; expanding them keeps this count.
     generation_prompt_tokens: int
+    # Where the head ends (_head_tokens); zero without one.
+    head_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -187,8 +176,9 @@ class Frontend:
         sampling_defaults=None,
     ):
         # What the engine serves, from its Ready (backend.runtime.capabilities):
-        # the context follows the latest engine (max_context); its lanes and
-        # vision are the model's. Without vision, message normalization
+        # the context follows the latest engine (max_context); its lanes are
+        # the ones the start runs (--max-concurrent-requests) and its vision
+        # the model's. Without vision, message normalization
         # rejects image and PDF input before any decoding.
         served = backend.runtime.capabilities
         preparation_capacity = served.max_concurrent_requests
@@ -203,6 +193,11 @@ class Frontend:
         # Sized by the first engine's context, which every relaunch asks for.
         self.prompt_tokenizer = PromptTokenizer(
             tokenizer, chat_format.message_boundary, served.max_context_tokens
+        )
+        # The tokens of each of its turn openings, where a prompt's head ends.
+        self.turn_openings = tuple(
+            tuple(tokenizer(text, add_special_tokens=False)["input_ids"])
+            for text in chat_format.turn_openings
         )
         self.backend = backend
         # The model id the engine loaded. /status reports it, so an alias
@@ -239,7 +234,7 @@ class Frontend:
         # send, so a request that leaves it out is never refused for it.
         self.sampling_defaults = dict(sampling_defaults or {})
         for name, value in self.sampling_defaults.items():
-            if not accepts_sampling(name, value):
+            if request_fields.sampling_refusal(name, value) is not None:
                 raise ValueError(f"invalid sampling default {name}={value!r}")
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
@@ -780,8 +775,17 @@ class Frontend:
             thinking, generation_prompt_tokens = _generation_prompt(
                 chat_template.generation_prompt(options), rendered, tokens
             )
+        head_tokens = _head_tokens(
+            prompt.messages, prompt.tools, tokens, self.turn_openings
+        )
         return RenderedPrompt(
-            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+            rendered,
+            tokens,
+            images,
+            positions,
+            thinking,
+            generation_prompt_tokens,
+            head_tokens,
         )
 
     def chat_job(
@@ -914,6 +918,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            head_tokens=rendered.head_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
         )
 
@@ -939,10 +944,10 @@ class Frontend:
 
     def _generation_options(self, body, stop_field="stop"):
         numbers = {}
-        for name, (default, _, requirement) in SAMPLING_NUMBERS.items():
+        for name, (default, _, _) in request_fields.SAMPLING_NUMBERS.items():
             value = body.get(name, self.sampling_defaults.get(name, default))
-            if not accepts_sampling(name, value):
-                raise APIError(400, f"{name} must be {requirement}")
+            if (refusal := request_fields.sampling_refusal(name, value)) is not None:
+                raise APIError(400, refusal)
             numbers[name] = float(value)
         if 0 < numbers["temperature"] < MIN_SAMPLING_TEMPERATURE:
             numbers["temperature"] = MIN_SAMPLING_TEMPERATURE
@@ -950,10 +955,8 @@ class Frontend:
         # top_k past the vocabulary keeps every token too, so one past the
         # frame's u32 is sent as its largest value.
         top_k = body.get("top_k", self.sampling_defaults.get("top_k", 0))
-        if not accepts_sampling("top_k", top_k):
-            raise APIError(
-                400, "top_k must be 0 or -1 (disabled) or a positive integer"
-            )
+        if (refusal := request_fields.sampling_refusal("top_k", top_k)) is not None:
+            raise APIError(400, refusal)
         top_k = min(max(top_k, 0), 0xFFFFFFFF)
         # Chat's stop, which another API's dialect converts its own field to.
         stop = body.get("stop")

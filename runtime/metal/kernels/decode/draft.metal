@@ -111,14 +111,14 @@ kernel void draft_context_kv_commit(
     device const float *rope_cos [[buffer(2)]],
     device const float *rope_sin [[buffer(3)]],
     device bfloat *keys0 [[buffer(4)]], device bfloat *keys1 [[buffer(5)]],
-    device bfloat *keys2 [[buffer(6)]], device bfloat *keys3 [[buffer(7)]],
-    device bfloat *values0 [[buffer(8)]],
-    device bfloat *values1 [[buffer(9)]],
-    device bfloat *values2 [[buffer(10)]],
-    device bfloat *values3 [[buffer(11)]],
-    device const uint *retained_rows [[buffer(12)]],
-    device const SplashLaneRows *lane_rows [[buffer(13)]],
-    constant DraftContextBatchParams &params [[buffer(14)]],
+    device bfloat *keys2 [[buffer(6)]], device bfloat *keys3 [[buffer(7)]], device bfloat *keys4 [[buffer(8)]], device bfloat *keys5 [[buffer(9)]], device bfloat *keys6 [[buffer(10)]], device bfloat *keys7 [[buffer(11)]],
+    device bfloat *values0 [[buffer(12)]],
+    device bfloat *values1 [[buffer(13)]],
+    device bfloat *values2 [[buffer(14)]],
+    device bfloat *values3 [[buffer(15)]], device bfloat *values4 [[buffer(16)]], device bfloat *values5 [[buffer(17)]], device bfloat *values6 [[buffer(18)]], device bfloat *values7 [[buffer(19)]],
+    device const uint *retained_rows [[buffer(20)]],
+    device const SplashLaneRows *lane_rows [[buffer(21)]],
+    constant DraftContextBatchParams &params [[buffer(22)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -136,8 +136,8 @@ kernel void draft_context_kv_commit(
     return;
   for (uint earlier = 0; earlier < row; ++earlier)
     path &= path - 1;
-  device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
-  device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
+  device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3, keys4, keys5, keys6, keys7);
+  device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3, values4, values5, values6, values7);
   const ulong rope = ulong(batch) * RopeLaneStride + row * SPLASH_DRAFT_ROPE_PAIRS;
   threadgroup float reductions[8];
   threadgroup bfloat normalized[SPLASH_DRAFT_HEAD_DIMENSION];
@@ -531,14 +531,14 @@ kernel void draft_attention_qkv(
 kernel void draft_attention_bf16_split(
     device bfloat *queries [[buffer(0)]],
     device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
-    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
-    device bfloat *values0 [[buffer(5)]],
-    device bfloat *values1 [[buffer(6)]],
-    device bfloat *values2 [[buffer(7)]],
-    device bfloat *values3 [[buffer(8)]],
-    device bfloat *query_keys [[buffer(9)]],
-    device bfloat *query_values [[buffer(10)]],
-    constant DraftAttentionBatchParams &params [[buffer(11)]],
+    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]], device bfloat *keys4 [[buffer(5)]], device bfloat *keys5 [[buffer(6)]], device bfloat *keys6 [[buffer(7)]], device bfloat *keys7 [[buffer(8)]],
+    device bfloat *values0 [[buffer(9)]],
+    device bfloat *values1 [[buffer(10)]],
+    device bfloat *values2 [[buffer(11)]],
+    device bfloat *values3 [[buffer(12)]], device bfloat *values4 [[buffer(13)]], device bfloat *values5 [[buffer(14)]], device bfloat *values6 [[buffer(15)]], device bfloat *values7 [[buffer(16)]],
+    device bfloat *query_keys [[buffer(17)]],
+    device bfloat *query_values [[buffer(18)]],
+    constant DraftAttentionBatchParams &params [[buffer(19)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -551,8 +551,8 @@ kernel void draft_attention_bf16_split(
   constexpr ulong Window = SPLASH_DRAFT_SLIDING_WINDOW;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
-  device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
-  device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
+  device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3, keys4, keys5, keys6, keys7);
+  device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3, values4, values5, values6, values7);
   device float *partials =
       reinterpret_cast<device float *>(queries +
                                        params.lanes * Rows * Attention) +

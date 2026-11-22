@@ -22,6 +22,8 @@ FACTOR = PATCH * MERGE
 MIN_PIXELS = 65_536
 # Serving default and largest cap: 16,384 patches, the protocol's per-image ceiling.
 MAX_PIXELS = 4_194_304
+# An image's longer side over its shorter one, at most (Qwen2-VL's smart resize).
+MAX_ASPECT = 200
 # Bound codec work before full-resolution decode, independently of the model's
 # resized input budget. Ordinary screenshots and up to 32 MP photos fit here.
 MAX_SOURCE_PIXELS = 32 * 1024 * 1024
@@ -81,8 +83,8 @@ def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
         raise ImageError("image dimensions must be positive")
     if not MIN_PIXELS <= max_pixels <= MAX_PIXELS:
         raise ImageError("invalid image pixel budget")
-    if max(height, width) / min(height, width) > 200:
-        raise ImageError("absolute aspect ratio must be smaller than 200")
+    if max(height, width) / min(height, width) > MAX_ASPECT:
+        raise ImageError(f"absolute aspect ratio must be at most {MAX_ASPECT}")
     h_bar = round(height / FACTOR) * FACTOR
     w_bar = round(width / FACTOR) * FACTOR
     if h_bar * w_bar > max_pixels:

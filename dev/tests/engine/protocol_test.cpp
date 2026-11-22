@@ -74,7 +74,8 @@ constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
 constexpr size_t cacheSalt = flags + 4;
 constexpr size_t thinkingBudget = cacheSalt + 16;
-static_assert(thinkingBudget + 12 == kRequestFixedBytes);
+constexpr size_t headTokens = thinkingBudget + 12;
+static_assert(headTokens + 4 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -178,6 +179,7 @@ RequestFrame exampleRequest() {
   request.sampling.seed = 0xfedcba9876543210ULL;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
+  request.headTokens = 2;
   request.cacheSalt = {0x8899aabbccddeeffULL, 0x0011223344556677ULL};
   request.thinkingBudget = ThinkingBudget{4096, {198, 248069}, 248058};
   return request;
@@ -263,7 +265,7 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
                         {},
                         "a start command ran out of GPU memory"}},
       {"warming", WarmingEvent{3, 9}},
-      {"start", StartEvent{91, 2, 4096}},
+      {"start", StartEvent{91, 2, 4096, 4160, splash::engine::StateSource::Disk, true}},
       {"prompt_progress", PromptProgressEvent{91, 2048, 123456}},
       {"tokens", TokensEvent{91, 17, {10, 11, 12}}},
       {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}, {}}},
@@ -783,6 +785,9 @@ void testPromptAndImageSpanRejections() {
   RequestFrame wholePrompt = exampleRequest();
   wholePrompt.generationPromptTokens = wholePrompt.promptTokens.size();
   expectRequestIssue(test, wholePrompt, IssueCode::InvalidCount);
+  RequestFrame wholeHead = exampleRequest();
+  wholeHead.headTokens = wholeHead.promptTokens.size();
+  expectRequestIssue(test, wholeHead, IssueCode::InvalidCount);
 
   const RequestFrame image = exampleImageRequest();
   auto withSpan = [&](auto change) {

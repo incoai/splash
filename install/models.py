@@ -68,11 +68,14 @@ ENTRY_STAGING = ".loading-"
 class ModelError(RuntimeError):
     """A refusal or failure the installers report without a traceback;
     `kind` classes a Hub or network failure for the app
-    (hub.failure_kind), None for any other."""
+    (hub.failure_kind), or a disk without room ("disk"), None for any other;
+    `details` are the numbers the app words that class by, which the error
+    event carries beside it."""
 
-    def __init__(self, message, kind=None):
+    def __init__(self, message, kind=None, details=None):
         super().__init__(message)
         self.kind = kind
+        self.details = details or {}
 
 
 class VisionError(ModelError):
@@ -445,9 +448,17 @@ def main(argv=None):
         if args.command in ("prepare", "remove"):
             # The app and the launcher word the failure by it, beside any
             # progress and messages.
-            kind = error.kind if isinstance(error, ModelError) else None
+            # An OSError of the installer's own, as a disk that fills while
+            # the model is put together, by the kind a download's has.
+            kind, details = (
+                (error.kind, error.details)
+                if isinstance(error, ModelError)
+                else (hub.failure_kind(error), {})
+            )
             print(
-                json.dumps({"event": "error", "kind": kind, "message": str(error)}),
+                json.dumps(
+                    {"event": "error", "kind": kind, **details, "message": str(error)}
+                ),
                 flush=True,
             )
         print(f"error: {error}", file=sys.stderr)

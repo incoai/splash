@@ -29,8 +29,8 @@ struct UnitFormats final {
   // The int8 decode tiles take every quantized segment: a rotated
   // projection's in a format they take (quant_decode_int8_format), over whose
   // rotated input one int8 scale per rotation block holds each row's values
-  // evenly. Never from a shape: the int8 tiles keep the plan's rows, splits
-  // and scratch, which the shape bounds.
+  // evenly; of a shape, a rotated one's of such formats
+  // (ProjectionShape::decodeInt8Formats).
   bool decodeInt8Takes = false;
   // The int8 prefill tile takes every quantized segment, of which there is
   // one at least (quant_prefill_int8_format).
@@ -60,17 +60,21 @@ struct SplitChoice final {
 [[nodiscard]] bool decodeInt8TakesSplits(uint32_t k, uint32_t splits) noexcept;
 // A dense GGUF projection's configuration: the tile, its splits, spread, one
 // pass and sixteen rows, then, with `int8Activations` on, whether it runs in
-// int8 activations. A gate/up decode's `pairTensors` are its up's and gate's
-// own formats, whose plans decide its 16-row tile; none, it runs none.
+// int8 activations, as `step`'s work takes them (int8PrefillPaths). A gate/up
+// decode's `pairTensors` are its up's and gate's own formats, whose plans
+// decide its 16-row tile; none, it runs none.
 [[nodiscard]] LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
-                                            LinearWorkload workload, const UnitFormats &unit,
+                                            StepKind step, LinearWorkload workload, const UnitFormats &unit,
                                             std::span<const UnitFormats> pairTensors = {});
 // Every configuration a decode plan of the workload may take on the device
-// when only whether the register tile takes its formats is known (arena
-// bounds). Int8 activations keep a plan's tile, rows and splits, and with them
-// its scratch.
+// when only a shape's formats are known (arena bounds): whether the register
+// tile takes them, and whether the int8 decode tiles do, which run a staged
+// configuration where `step`'s plans take them, at its storage rows and its
+// splits or the most fewer that keep whole PQ2_0 blocks, on row groups of
+// their own (int8RowGroups), each with its own counters.
 [[nodiscard]] std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration,
-                                                             LinearWorkload workload, bool registerTakes);
+                                                             Int8Activations int8Activations, StepKind step,
+                                                             LinearWorkload workload, const UnitFormats &unit);
 
 // The tile of a float projection of `rows` rows into `outputSize` columns of
 // rows in `formatId` (QuantizedSegment::rows).
@@ -81,8 +85,18 @@ struct SplitChoice final {
 // every block (QwenTarget.cpp), at the format of most routers' rows, F32 for
 // none.
 [[nodiscard]] uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcept;
-// A MoE plan's configuration of `rows` rows, its routers in `routerFormat`.
-[[nodiscard]] MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape,
-                                  uint32_t routerFormat, uint32_t rows) noexcept;
+// Whether each projection's routed and shared experts are, in every block, in
+// one format the int8 prefill tile takes: what the weights' files say, before
+// and after they load. Whether the experts stream is the start's choice
+// (RuntimeGeometry::from takes it); MoeShape::int8Experts is both.
+[[nodiscard]] bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept;
+// The routes an expert takes on average from which a chunk's experts run the
+// int8 passes (selectMoe).
+inline constexpr uint32_t kInt8PassRoutesPerExpert = 6;
+// A MoE plan's configuration of `rows` rows of `step`'s work, its routers in
+// `routerFormat`, with int8 activations `int8Activations`.
+[[nodiscard]] MoeConfig selectMoe(const KernelCalibration &calibration, Int8Activations int8Activations,
+                                  StepKind step, const MoeShape &shape, uint32_t routerFormat,
+                                  uint32_t rows) noexcept;
 
 } // namespace splash::ops

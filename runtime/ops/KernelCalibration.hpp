@@ -66,12 +66,13 @@ using SplitLaw = std::variant<TierLaw, WaveLaw>;
 
 // Register tile against the staged tile for a plan of `tiles` table tiles
 // (8 rows each, a decode lane's verify rows where it was measured), one to
-// four, the most the register tile holds (Linear.hpp, kMaximumRegisterRows),
-// by the unit's FormatClass: register where 4 * columnTiles * tiles <
-// belowQuarters * cores (in quarter threadgroups per core); kAlways where it
-// takes the formats whatever the grid, 0 never.
+// four (kRegisterTableTiles), the most the register tile holds (Linear.hpp,
+// kMaximumRegisterRows), by the unit's FormatClass: register where
+// 4 * columnTiles * tiles < belowQuarters * cores (in quarter threadgroups
+// per core); kAlways where it takes the formats whatever the grid, 0 never.
+inline constexpr uint32_t kRegisterTableTiles = 4;
 struct RegisterBoundary final {
-  std::array<std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH>, kFormatClasses> belowQuarters;
+  std::array<std::array<uint32_t, kRegisterTableTiles>, kFormatClasses> belowQuarters;
 };
 
 struct ProjectionCalibration final {
@@ -107,6 +108,16 @@ struct FloatTileCalibration final {
   uint32_t bf16Halves, f32Halves, quantizedRowsHalves;
 };
 
+// The dense bf16 projections' tile rule (DenseLinear.cpp), its grids in half
+// 64 x 64 output tiles per core: a projection of at least wideInputs inputs
+// runs 64 x 128 tiles from wideFromHalves, and one of fewer than
+// eightBelowHalves (or of one row tile) runs 64 x 64 tiles on eight
+// simdgroups.
+struct DenseTileCalibration final {
+  uint32_t eightBelowHalves;
+  uint32_t wideInputs, wideFromHalves;
+};
+
 struct AttentionCalibration final {
   // A dense tile of a sequence of tiles, a prompt chunk's or a 9- to 16-row
   // lane's, takes one history split per this many pages its rows read.
@@ -122,6 +133,7 @@ struct KernelCalibration final {
   uint32_t cores;
   ProjectionCalibration projection;
   FloatTileCalibration floatTile;
+  DenseTileCalibration denseTile;
   AttentionCalibration attention;
 
   [[nodiscard]] static KernelCalibration of(const DeviceCapabilities &device) noexcept;
@@ -287,6 +299,37 @@ inline constexpr ProjectionCalibration kApple11Projection = [] {
 inline constexpr FloatTileCalibration kApple9FloatTile{false, 16, 3, 4, 6};
 inline constexpr FloatTileCalibration kApple10FloatTile{true, 16, 3, 4, 6};
 
+// ---- Dense projections ----------------------------------------------------
+
+// Apple10 and Apple11. Measured on the 12-core M6 (dense-linear-benchmark at
+// every tower projection and the rows images of 6x8 to 64x64 patches give it):
+// from 4096 inputs a grid of 12 half tiles a core runs 64 x 128 tiles (the down
+// projection at 4096 rows 2498 us against 3091 on 64 x 64 of four, the merger
+// to 2048 at 1024 rows 1272 against 1624); a single row tile runs eight
+// simdgroups (down at 64 rows 68.2 against 78.0 on four), and so does a grid of
+// fewer than 8 half tiles a core; the rest run four (qkv at 4096 rows 1730
+// against 1841 on eight). The pick is the fastest or within 6% of it at every
+// shape (qkv at 48 rows 35.4 against 33.4). On Apple10 the two chips measured
+// disagree: the 20-core M5 Pro's and the 32-core M5 Max's benchmarks both run
+// the down projection about 4% faster on 64 x 64 of four than this row's 64 x
+// 128 tile at 1024 and 4096 rows (M5 Pro 378 against 393 us and 1566 against
+// 1606), while the M5 Max runs the merger at 1024 rows 8-21% faster on 64 x 128
+// (up 973 against 1055 us; to 5120 1045 against 1268), where the M5 Pro is
+// split (up 1851 against 1891 on 64 x 128; to 2048 670 against 708 and to 5120
+// 2107 against 2155 on 64 x 64); on the M5 Pro the tower's encode is within 1%
+// either way (a row without the 64 x 128 tile: 32x32 patches 48.09 ms against
+// 47.76 on this row, 64x64 297.2 against 297.4). A rule per device would be a
+// block of its own for about a percent of an image's encode.
+inline constexpr DenseTileCalibration kApple10DenseTile{8, 4096, 12};
+// Apple9 (10-core M4, dense-linear-benchmark at the tower's projections and
+// rows): the 64 x 128 tile never won (merger at 1024 rows 13017 us against
+// 12743 on 64 x 64 of four; down at 4096 rows 11190 against 10918), so no
+// projection runs it; one of a single row tile runs fastest on eight
+// simdgroups (the up projection at 48 rows 214.6 us against 244.8 on a
+// 64 x 128 tile of eight, down 226.7 against 253.9), every
+// other on four (qkv at 4096 rows 8646 against 8805 on eight).
+inline constexpr DenseTileCalibration kApple9DenseTile{0, kNever, 0};
+
 // ---- Attention ----------------------------------------------------------
 
 // A chunk of a few hundred rows over a long history otherwise leaves much of
@@ -323,8 +366,8 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   const GpuClass gpu = device.gpuClass();
   if (gpu != GpuClass::Apple9)
     return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
-            kApple10Attention};
-  return {cores, kApple9Projection, kApple9FloatTile,
+            kApple10DenseTile, kApple10Attention};
+  return {cores, kApple9Projection, kApple9FloatTile, kApple9DenseTile,
           cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention};
 }
 

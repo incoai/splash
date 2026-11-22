@@ -501,9 +501,18 @@ void writeState(json::Writer &w, const CacheSnapshot &resources, const model::Mo
   });
 }
 
-void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
+// Of the SSD cache's reads, spilled K/V's; and the streamed weights' reads,
+// which read_bytes does not count: 29 GB in a 50,842-token prompt of
+// Qwen3.6-35B-A3B on a 16 GB M4, where read_bytes stayed 0.
+void writeDisk(json::Writer &w, const engine::EngineSnapshot &core, const StatusSample &sample) {
   const CacheSnapshot &resources = core.resources;
   const auto &tier = resources.kvTier;
+  const std::optional<StatusSample::KvSpill> &spill = sample.kvSpill;
+  const uint64_t spilledKvReadBytes = (spill && spill->blockCache ? spill->blockCache->reads.readBytes : 0) +
+                                      (spill && spill->historyStream ? spill->historyStream->bytes : 0);
+  uint64_t weightsReadBytes = sample.streamedTable ? sample.streamedTable->readBytes : 0;
+  for (size_t use = 0; sample.streamedExperts && use < std::size(kStreamedUses); ++use)
+    weightsReadBytes += sample.streamedExperts->uses[use].readBytes;
   w.object([&] {
     w.field("capacity_bytes", tier.capacityBytes)
         .field("limit_bytes", tier.limitBytes)
@@ -514,6 +523,8 @@ void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("write_budget_bytes", tier.writeBudgetBytes)
         .field("writes_deferred_ms", tier.writesDeferredMicroseconds / 1000.0)
         .field("read_bytes", tier.readBytes)
+        .field("spilled_kv_read_bytes", spilledKvReadBytes)
+        .field("weights_read_bytes", weightsReadBytes)
         .field("written_bytes", tier.writtenBytes)
         .field("written_last_hour_bytes", tier.writeRate.hourBytes)
         .field("written_last_day_bytes", tier.writeRate.dayBytes)
@@ -528,6 +539,9 @@ void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("persistent", resources.persistent)
         .field("kv_copies", tier.copies)
         .field("kv_copy_failures", tier.copyFailures);
+    // Why the SSD cache the start asked for is off; absent while it is on, or set Off.
+    if (!tier.offReason.empty())
+      w.field("off_reason", tier.offReason);
     w.object("taken_back", [&] {
       w.field("states", resources.adoption.states)
           .field("kv_blocks", resources.adoption.blocks)
@@ -596,7 +610,7 @@ void writeModelTiming(json::Writer &w, const model::ModelTelemetry &telemetry) {
   });
 }
 
-void writeScheduler(json::Writer &w, const engine::EngineSnapshot &core) {
+void writeScheduler(json::Writer &w, const engine::EngineSnapshot &core, uint32_t lanes) {
   const auto &scheduler = core.scheduler;
   w.object([&] {
     w.field("queued", scheduler.queued)
@@ -610,7 +624,7 @@ void writeScheduler(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("prefill_rows", scheduler.prefillRows)
         .field("decode_batches", scheduler.decodeBatches);
     w.object("decode_batches_by_width", [&] {
-      for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+      for (uint32_t width = 1; width <= lanes; ++width)
         w.key("b" + std::to_string(width)).value(scheduler.decodeBatchesByWidth[width - 1]);
     });
     w.field("decode_gap_target_ms", scheduler.decodeGapTargetMilliseconds).key("contended_prefill_ms");
@@ -692,11 +706,11 @@ void writeMetrics(json::Writer &w, const RuntimeMetricsSnapshot &metrics, const 
 }
 
 // Each warmup step, whether it ran, and the steps memory kept from running.
-void writeWarmup(json::Writer &w, const WarmupReport &warmup) {
+void writeWarmup(json::Writer &w, const WarmupReport &warmup, uint32_t lanes) {
   std::vector<std::pair<std::string, WarmupStepStatus>> steps{
       {"prefill_" + std::to_string(model::ExecutionLimits::prefillTokenBudget), warmup.maximumPrefill},
       {"prefill_row_classes", warmup.prefillRowClasses}};
-  for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+  for (uint32_t width = 1; width <= lanes; ++width)
     steps.emplace_back("decode_b" + std::to_string(width), warmup.decodeBatches[width - 1]);
   steps.emplace_back("composite_state_restore", warmup.compositeStateRestore);
   w.object([&] {
@@ -786,7 +800,7 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
     w.key("state");
     writeState(w, core.resources, executorTelemetry);
     w.key("disk");
-    writeDisk(w, core);
+    writeDisk(w, core, sample);
     w.key("cache");
     writeCache(w, core);
     w.object("draft_context", [&] {
@@ -821,7 +835,7 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
           .field("rows_bytes", executorTelemetry.imageRowsBytes);
     });
     w.key("scheduler");
-    writeScheduler(w, core);
+    writeScheduler(w, core, plan.breakdown().maximumBatchWidth);
     w.key("active_requests");
     writeActiveRequests(w, core, sample.kvSpill.has_value());
     w.object("requests", [&] {
@@ -833,7 +847,7 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
     w.key("metrics");
     writeMetrics(w, sample.metrics, core);
     w.key("warmup");
-    writeWarmup(w, start.warmup);
+    writeWarmup(w, start.warmup, plan.breakdown().maximumBatchWidth);
     w.object("metal", [&] {
       w.field("healthy", sample.metalHealthy)
           .field("failure_reason", sample.metalFailureReason)

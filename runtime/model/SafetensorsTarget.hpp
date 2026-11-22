@@ -5,53 +5,52 @@
 // written into memory, and QwenTargetLoader reads them as block-quantized
 // weights (BlockTargetFormat).
 
-#include "model/ExpertStore.hpp"
-#include "model/GgufImage.hpp"
 #include "model/QwenHybridLayout.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
-#include "model/WeightImages.hpp"
+#include "model/TargetImages.hpp"
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace splash::model {
 
-class SafetensorsTargetLoader final {
+class SafetensorsTargetLoader final : public TargetImages {
 public:
-  // Plans every image of the checkpoint in directory once. With expert
-  // memory (experts.memoryBytes), a MoE target's routed experts stream
-  // (streamedExperts()) instead of loading with their layers.
+  // Plans every image of the checkpoint in directory once
+  // (safetensors::planImages). With a table store (table.cacheBytes), the
+  // rows of a table the family adds stream through it (streamTable())
+  // instead of loading (table()). With expert memory (experts.memoryBytes),
+  // a MoE target's routed experts stream (streamedExperts()) instead of
+  // loading with their layers.
   SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &directory,
-                          const QwenTargetDimensions &geometry, ExpertStoreOptions experts = {});
-  SafetensorsTargetLoader(const SafetensorsTargetLoader &) = delete;
-  SafetensorsTargetLoader &operator=(const SafetensorsTargetLoader &) = delete;
+                          const QwenTargetDimensions &geometry, SparseRowStoreOptions table = {},
+                          ExpertStoreOptions experts = {});
 
-  [[nodiscard]] WeightFile layer(uint32_t index);
-  [[nodiscard]] WeightFile head();
-  [[nodiscard]] WeightFile embedding();
+  // The streamed table, its store reading the table's native rows from the
+  // checkpoint's open files (readRepackRows over its shards); none when the
+  // table loads.
+  [[nodiscard]] std::optional<StreamedTable> streamTable() const;
+  // The checkpoint, for what a family reads beside its images (Flash-Next's
+  // PLE hash).
+  [[nodiscard]] const SafetensorsCheckpoint &checkpoint() const noexcept { return planned_->checkpoint; }
   // Whether its images hold F32 norms (safetensors::float32Norms).
   [[nodiscard]] bool float32Norms() const noexcept { return float32Norms_; }
-  // Whether the routed experts stream, then the store's options and every
-  // layer's experts, which read the checkpoint's open files.
-  [[nodiscard]] bool streamsExperts() const noexcept { return experts_.memoryBytes != 0; }
-  [[nodiscard]] const ExpertStoreOptions &expertStoreOptions() const noexcept { return experts_; }
-  [[nodiscard]] StreamedBlocks streamedExperts() const;
 
 private:
   // The checkpoint and its images, which their writers share.
   struct Planned {
     explicit Planned(const std::filesystem::path &directory) : checkpoint(directory) {}
     SafetensorsCheckpoint checkpoint;
-    std::vector<gguf::Image> images; // layers, head, embedding
+    std::vector<gguf::Image> images;
   };
-  [[nodiscard]] WeightFile open(size_t index);
+  SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images, std::shared_ptr<Planned> planned,
+                          const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
+                          ExpertStoreOptions experts);
 
-  metal::MetalBackend &backend_;
-  WeightImages &images_;
   std::shared_ptr<Planned> planned_;
   bool float32Norms_ = false;
-  ExpertStoreOptions experts_;
 };
 
 } // namespace splash::model

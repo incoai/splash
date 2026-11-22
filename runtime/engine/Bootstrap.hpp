@@ -27,6 +27,7 @@ enum class RuntimeBootstrapStage {
     PrefillRowClasses,
     DecodeWarmup,
     CompositeStateRestore,
+    AneFfnSetUp,
     MemoryAudit,
     Ready,
 };
@@ -113,11 +114,10 @@ inline constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
 protocolLimitsFor(const model::ModelCapabilities &capabilities,
                   uint32_t maxContext) noexcept;
 
-// What a model served under `engine` and `limits` (protocolLimitsFor)
-// announces in Ready.
+// What a model served under `engine` and `limits` (protocolLimitsFor) on `lanes` lanes announces in Ready.
 [[nodiscard]] protocol::ReadyEvent readyEventFor(
     const model::ModelDescriptor &model, const EngineConfig &engine,
-    const protocol::ProtocolLimits &limits);
+    const protocol::ProtocolLimits &limits, uint32_t lanes);
 
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
@@ -147,15 +147,19 @@ public:
     // kvPool's runway (model::ExecutionLimits::warmupKvPages) and holds its
     // pages while it runs (KvPool::RunwayHold): a prefill of the most rows,
     // one of each of `prefillRowClasses` (ops::ExecutionPlans), each decode
-    // width that fits and a state restore. `progress` takes the steps done of
-    // all (protocol::WarmingEvent) as it begins and as each step ends.
+    // width that fits and a state restore, which `memoryReporter` audits;
+    // then, where given, `setUp` with the first's GPU milliseconds, a prefill
+    // of the rows it returns where memory allows, and the audit again.
+    // `progress` takes the steps done of all (protocol::WarmingEvent) as it
+    // begins and as each step ends.
     [[nodiscard]] static RuntimeBootstrapReport requireWarmup(
         const EngineMemoryPlan &memoryPlan,
         std::span<const uint32_t> prefillRowClasses,
         model::RuntimeModel &modelRuntime,
         KvPool &kvPool,
         WarmupProgress progress,
-        ActualMemoryReporter memoryReporter);
+        ActualMemoryReporter memoryReporter,
+        const std::function<uint32_t(double gpuMilliseconds)> &setUp = {});
 
     ServingRuntime(const ServingRuntime &) = delete;
     ServingRuntime &operator=(const ServingRuntime &) = delete;

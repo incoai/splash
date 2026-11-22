@@ -12,8 +12,6 @@
 namespace splash::ops::ane_ffn {
 namespace {
 
-// The shares calibration times the split at.
-constexpr std::array<double, 2> kTimedShares{0.4, 0.8};
 // The layers time() and chunks() spread over the model; each of their
 // commands takes all but the last, which gives the last one's next weights
 // to stage.
@@ -63,11 +61,13 @@ double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t co
   if (!count || count >= layers.size()) throw std::invalid_argument("ANE FFN layers timed without one to stage");
   const auto command = [&] {
     metal::CommandGraph graph;
-    if (split && !split->begin()) throw std::runtime_error("ANE FFN split stopped (" + split->reason() + ")");
+    if (split && !split->begin(split->steps_))
+      throw std::runtime_error("ANE FFN split stopped (" + split->reason() + ")");
     for (uint32_t index = 0; index < count; ++index) {
       if (split) {
         linear_.addSwiGlu(graph, layers[index], ffn_, hidden_[0], hidden_[1], rows);
         split->add(graph, index, ffn_, hidden_[1], hidden_[0], rows);
+        split->join(graph);
       } else {
         linear_.addSwiGlu(graph, layers[index], ffn_, hidden_[1], hidden_[0], rows);
       }
@@ -96,10 +96,12 @@ double Measurement::gpuPart(std::span<const SwiGluProjections> layers, AneFfn &s
   const auto command = [&](uint32_t count) {
     return median([&] {
       metal::CommandGraph graph;
-      if (!split.begin()) throw std::runtime_error("ANE FFN split stopped (" + split.reason() + ")");
-      for (uint32_t index = 0; index < count; ++index)
+      if (!split.begin(split.steps_)) throw std::runtime_error("ANE FFN split stopped (" + split.reason() + ")");
+      for (uint32_t index = 0; index < count; ++index) {
         split.encode(graph, index, ffn_, hidden_[index & 1], hidden_[(index & 1) ^ 1], AneFfn::kMaximumRows,
                      AneFfn::Parts::Gpu);
+        split.join(graph);
+      }
       const auto start = AwakeClock::now();
       static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
       return millisecondsSince(start);
@@ -117,21 +119,31 @@ std::vector<SwiGluProjections> Measurement::sampled() const {
   return layers;
 }
 
-Timings Measurement::time() {
-  const uint32_t units = AneFfn::units(layers_);
-  Timings timings;
-  timings.gpuAlone = layer(sampled(), kSampledLayers - 1, AneFfn::kMaximumRows);
-  timings.low = time(nearestUnits(kTimedShares[0], units), timings.gpuAlone);
-  timings.high = time(nearestUnits(kTimedShares[1], units), timings.gpuAlone);
-  return timings;
+Readers Measurement::readers(std::span<const SwiGluProjections> layers, std::unique_ptr<AneFfn> &split) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows, kCount = kSampledLayers - 1;
+  return {[this, layers, &split](uint32_t aneUnits, bool half) {
+            // No two splits are held at once.
+            split.reset();
+            split.reset(new AneFfn(backend_, linear_, layers, {aneUnits, 0}, interrupted_,
+                                   {half ? std::vector{kRows / 2, kRows} : std::vector{kRows}, {}}));
+          },
+          [this, layers, &split] { return gpuPart(layers, *split); },
+          [this, layers](uint32_t rows) { return layer(layers, kCount, rows); },
+          [this, layers, &split](uint32_t rows, double standIn) {
+            return layer(layers, kCount, rows, split.get(), standIn);
+          }};
 }
 
-Timing Measurement::time(uint32_t aneUnits, double gpuAlone) {
+Timings Measurement::time() {
   const std::vector<SwiGluProjections> layers = sampled();
-  constexpr uint32_t kRows = AneFfn::kMaximumRows;
-  AneFfn split(backend_, linear_, layers, aneUnits, interrupted_, std::array{kRows});
-  return Timing{static_cast<double>(aneUnits) / AneFfn::units(layers_), gpuPart(layers, split),
-                layer(layers, kSampledLayers - 1, kRows, &split, gpuAlone)};
+  std::unique_ptr<AneFfn> split;
+  return ane_ffn::time(AneFfn::units(layers_), AneFfn::kMaximumRows, readers(layers, split));
+}
+
+Timing Measurement::time(uint32_t aneUnits) {
+  const std::vector<SwiGluProjections> layers = sampled();
+  std::unique_ptr<AneFfn> split;
+  return ane_ffn::time(aneUnits, AneFfn::units(layers_), AneFfn::kMaximumRows, readers(layers, split));
 }
 
 // On the layers time() timed, as many to a command, so that the splits
@@ -141,14 +153,19 @@ Timing Measurement::time(uint32_t aneUnits, double gpuAlone) {
 // this way, against 10.9% (3.6%) over the model's first layers at about
 // 4,096 rows of layers to a command, and chose the same 7 units from about
 // the same least rows (842 the median against 833).
-ChunkTimings Measurement::chunks(uint32_t aneUnits) {
+// The GPU alone's line runs through the least rows and a full chunk, which
+// it follows within 1% between them; from 256 rows it moved Qwen3.8-27B MLX
+// 4-bit's least rows on a 20-core M5 Pro from 1.7.0's 533 to 653, a command
+// of 544 to 640 rows 5-12% slower on the GPU alone.
+ChunkTimings Measurement::chunks(AneFfn::Shares shares) {
   const std::vector<SwiGluProjections> layers = sampled();
-  AneFfn split(backend_, linear_, layers, aneUnits, interrupted_);
-  std::vector<uint32_t> rows;
-  for (const AneFfn::Evaluation &evaluation : split.evaluations_) rows.push_back(evaluation.rows);
+  const std::array<std::vector<uint32_t>, 2> functionRows = AneFfn::programRows(shares);
+  const std::vector<uint32_t> &rows = functionRows[static_cast<size_t>(AneFfn::Steps::One)];
+  if (rows.empty()) throw std::invalid_argument("ANE FFN chunks timed of a split without one step's share");
+  AneFfn split(backend_, linear_, layers, shares, interrupted_, functionRows);
   constexpr uint32_t kCount = kSampledLayers - 1;
   const auto gpu = [&](uint32_t chunk) { return ChunkTimings::Gpu{chunk, layer(layers, kCount, chunk)}; };
-  ChunkTimings timings{{gpu(rows.front()), gpu(rows.back())}, {}};
+  ChunkTimings timings{{gpu(AneFfn::kMinimumRows), gpu(AneFfn::kMaximumRows)}, {}};
   const auto &[low, high] = timings.gpu;
   const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
   for (size_t function = rows.size(); function-- > 0;)

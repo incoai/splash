@@ -85,8 +85,8 @@ struct GDNDecodeBatchParams {
   uint32_t pending_path[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 112,
-              "GDN decode parameters are 112 bytes on both sides");
+static_assert(sizeof(GDNDecodeBatchParams) == 32 + 20 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "GDN decode parameters are the same size on both sides");
 
 // A fold of the first `rows` rows of a lane's accepted path of its step alone
 // (GDN::addFold): the state cells' strides, as in GDNDecodeBatchParams; the
