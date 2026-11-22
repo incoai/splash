@@ -255,7 +255,7 @@ void quantizeQ8_0Block(const float *values, uint8_t *block, const std::string &n
 }
 
 // Native Q8_0 bytes [column, column + span) of `count` rows of a GGUF tensor
-// of BF16 or F16 values from source row `start` on, back to back, each 32
+// of F32, BF16 or F16 values from source row `start` on, back to back, each 32
 // values quantized as quantizeQ8_0Block rounds them. One read per run of rows
 // when they are read whole, else per row.
 void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
@@ -263,18 +263,23 @@ void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t cou
   const QuantFormat &format = kQuantFormats[GGUF_FMT_Q80];
   if (column % format.block_bytes || span % format.block_bytes)
     throw GgufError("Q8_0 rows are built by whole blocks: " + rows.name);
-  const bool float16 = rows.ggufFloatType == ggml::kF16;
+  const bool float32 = rows.ggufFloatType == ggml::kF32, float16 = rows.ggufFloatType == ggml::kF16;
+  const uint64_t valueBytes = float32 ? sizeof(float) : sizeof(uint16_t);
   const uint64_t perRead = span == rows.rowBytes ? count : 1, blocks = span / format.block_bytes;
-  std::vector<uint8_t> source(perRead * blocks * format.block_elements * 2);
-  std::vector<float> values(source.size() / 2);
+  std::vector<float> values(perRead * blocks * format.block_elements);
+  std::vector<uint8_t> source(values.size() * valueBytes);
   for (uint64_t row = 0; row < count; row += perRead) {
     rows.file->readData(rows.offset + (start + row) * rows.ggufFloatRowBytes +
-                            column / format.block_bytes * format.block_elements * 2,
+                            column / format.block_bytes * format.block_elements * valueBytes,
                         source);
-    for (size_t i = 0; i < values.size(); ++i) {
-      uint16_t bits;
-      std::memcpy(&bits, source.data() + 2 * i, 2);
-      values[i] = widenFloat16(bits, float16);
+    if (float32) {
+      std::memcpy(values.data(), source.data(), source.size());
+    } else {
+      for (size_t i = 0; i < values.size(); ++i) {
+        uint16_t bits;
+        std::memcpy(&bits, source.data() + 2 * i, 2);
+        values[i] = widenFloat16(bits, float16);
+      }
     }
     for (uint64_t b = 0; b < perRead * blocks; ++b)
       quantizeQ8_0Block(values.data() + b * format.block_elements, to + row * span + b * format.block_bytes,

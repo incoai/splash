@@ -1035,8 +1035,8 @@ void checkFlint(const std::filesystem::path &directory) {
 // stored; its MoE of no shared expert and its router's bias; the loop's
 // message queries and gates on the loop's weight layers alone. Its metadata
 // names each mismatch, its per-layer head counts and window and its loop
-// among them, and its tensors a side of F32 and a loop gate missing or past
-// the loop.
+// among them, and its tensors a loop gate missing or past the loop; a side's
+// F32 tensors are quantized into its Q8_0 run.
 void checkInkling(const std::filesystem::path &directory) {
   const model::QwenTargetDimensions g = inklingGeometry();
   const model::InklingSides sides = model::InklingSides::of(g);
@@ -1163,12 +1163,30 @@ void checkInkling(const std::filesystem::path &directory) {
   check(names(planned(withKey(test_gguf::uint32Key("inkling2_loop.rope.dimension_count", 128)), tensors),
               {"rope.dimension_count 128 (expected 0)"}),
         "planner refuses a RoPE");
-  std::vector<Tensor> floatSink = tensors;
-  Tensor &sink = tensorNamed(floatSink, "blk.1.attn_sink_proj.weight");
-  sink.type = model::ggml::kF32;
-  sink.data = floatValues(hidden * 4, 1201);
-  check(names(planned(metadata(g), floatSink), {"attn_sink_proj.weight (F32) in 1 layer"}),
-        "planner refuses a side's tensor of F32");
+  // bartowski's GGUFs keep the sinks' and the dynamic taps' projections F32:
+  // they join the side's Q8_0 run as the Q8_0 rows their values quantize to.
+  std::vector<Tensor> floatSides = tensors;
+  for (const std::string name : {"blk.2.attn_sink_proj.weight", "blk.2.attn_k_conv_proj.weight"}) {
+    Tensor &tensor = tensorNamed(floatSides, name);
+    uint64_t rows = 1;
+    for (size_t i = 1; i < tensor.dims.size(); ++i) rows *= tensor.dims[i];
+    tensor.type = model::ggml::kF32;
+    tensor.data = floatValues(tensor.dims[0] * rows, 1201);
+  }
+  const Plan floats = planned(metadata(g), floatSides);
+  const auto *floatQuery = floats.error ? nullptr : repackOf(floats.images[2], "blk.2.attn_q.weight");
+  const auto *floatKeys = floats.error ? nullptr : repackOf(floats.images[2], "blk.2.attn_k.weight");
+  check(stackedOf(floatQuery, sides.query,
+                  {{"blk.2.attn_q.weight", g.attentionWidth},
+                   {"blk.2.attn_gate.weight", g.attentionWidth},
+                   {"blk.2.attn_rel.weight", 4 * g.relativeDimension},
+                   {"blk.2.attn_sink_proj.weight", 4}}) &&
+            stackedOf(floatKeys, 320, {{"blk.2.attn_k.weight", 256}, {"blk.2.attn_k_conv_proj.weight", 8}}) &&
+            floatQuery->format == GGUF_FMT_Q80 && floatQuery->sources[3].type == model::ggml::kQ8_0 &&
+            floatQuery->sources[3].ggufFloatType == model::ggml::kF32 &&
+            floatQuery->sources[3].ggufFloatRowBytes == hidden * sizeof(float) &&
+            floatKeys->sources[1].ggufFloatType == model::ggml::kF32,
+        "planner quantizes a side's F32 tensors into its Q8_0 run" + (floats.error ? ": " + *floats.error : ""));
   std::vector<Tensor> gateless = tensors;
   std::erase_if(gateless, [](const Tensor &tensor) { return tensor.name == "blk.2.loop_k_ctrl_gain.weight"; });
   check(names(planned(metadata(g), gateless), {"loop_k_ctrl_gain.weight (missing) in 1 layer"}),

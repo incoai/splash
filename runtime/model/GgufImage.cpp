@@ -196,13 +196,19 @@ public:
     problems_.read(*tensor);
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
     Repack repack = image_.planes(GGUF_FMT_Q80, rows, columns, name);
-    TensorRows source = tensorRows(*tensor, rows, tensor->bytes / rows);
+    repack.sources.push_back(q8_0Rows(*tensor, rows, columns));
+    image_.repack(std::move(repack));
+  }
+
+  // Rows [0, count) of a tensor of F32, BF16 or F16 values as the Q8_0 rows
+  // the writer quantizes them to (TensorRows::ggufFloatRowBytes).
+  TensorRows q8_0Rows(const GgufTensor &tensor, uint64_t count, uint64_t columns) const {
+    TensorRows source = tensorRows(tensor, count, tensor.bytes / count);
     source.ggufFloatType = source.type;
     source.ggufFloatRowBytes = source.rowBytes;
     source.type = ggml::kQ8_0;
     source.rowBytes = ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], columns);
-    repack.sources.push_back(std::move(source));
-    image_.repack(std::move(repack));
+    return source;
   }
 
   // Tensors [N_i, K] stacked into one projection [rows, K], their rows in
@@ -211,12 +217,16 @@ public:
   // a segment of each run of tensors of one type, repacked in its format at
   // the run's first row, each whole plane tiles. A run but the last must end
   // on a tile, the last takes the zero rows; tensors of one type share a
-  // segment, which a projection runs in one dispatch.
+  // segment, which a projection runs in one dispatch. An F32 tensor (a small
+  // projection some quantizers keep unquantized, as bartowski's Inkling
+  // GGUFs keep the sinks' and the dynamic taps') is one of Q8_0, the rows
+  // its values quantize to (q8_0Rows), as other GGUFs store it.
   void stacked(std::span<const std::pair<std::string, uint64_t>> parts, uint64_t rows, uint64_t columns) {
+    const auto stackedType = [](uint32_t type) { return floatType(type) ? ggml::kQ8_0 : type; };
     std::vector<const GgufTensor *> tensors;
     uint64_t partRows = 0;
     for (const auto &[name, count] : parts) {
-      const GgufTensor *tensor = find(name, quantizedType);
+      const GgufTensor *tensor = find(name, [](uint32_t type) { return quantizedType(type) || floatType(type); });
       if (tensor && (tensor->rows() != count || tensor->columns() != columns))
         throw GgufError("unexpected shape for " + name);
       tensors.push_back(tensor);
@@ -228,15 +238,18 @@ public:
     for (size_t run = 0; run < tensors.size();) {
       size_t end = run;
       uint64_t runRows = 0;
-      while (end < tensors.size() && tensors[end]->type == tensors[run]->type) runRows += parts[end++].second;
+      const uint32_t type = stackedType(tensors[run]->type);
+      while (end < tensors.size() && stackedType(tensors[end]->type) == type) runRows += parts[end++].second;
       const uint64_t segmentRows = end == tensors.size() ? rows - first : runRows;
       if (segmentRows % QUANT_TILE_ROWS)
         throw GgufError("a run of stacked tensors of one type does not end on a tile: " + tensors[end - 1]->name);
-      const uint32_t format = imageFormat(tensors[run]->type);
+      const uint32_t format = imageFormat(type);
       Repack repack = image_.planes(format, segmentRows, columns, tensors[run]->name);
       for (size_t part = run; part < end; ++part)
         repack.sources.push_back(
-            tensorRows(*tensors[part], parts[part].second, ggufRowBytes(kQuantFormats[format], columns)));
+            floatType(tensors[part]->type)
+                ? q8_0Rows(*tensors[part], parts[part].second, columns)
+                : tensorRows(*tensors[part], parts[part].second, ggufRowBytes(kQuantFormats[format], columns)));
       image_.repack(std::move(repack));
       first += segmentRows;
       run = end;
