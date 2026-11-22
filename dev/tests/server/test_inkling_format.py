@@ -16,7 +16,7 @@ from dev.tests.inkling_fixtures import TEMPLATE, inkling_tokenizer
 from dev.tests.tool_output import streamed_arguments, streamed_text, tool_policy
 from install import families
 from server import backend as backend_api
-from server import constraints, tool_schema
+from server import constraints, images, tool_schema
 from server import output as model_output
 from server import protocol as wire
 from server.chat_format import INKLING, INKLING_FRAMES, INKLING_JSON, REASONING_EFFORTS
@@ -846,9 +846,11 @@ class InklingTokenizerContractTests(unittest.TestCase):
     def test_the_family_serves_inkling_s_format(self):
         family = families.named("Inkling-2-Mini")
         self.assertEqual(
-            (family.chat_format, family.draft_repo, family.vision),
-            (INKLING, "unsloth/Inkling-2-Mini-GGUF", False),
+            (family.chat_format, family.draft_repo, family.vision, family.image_format),
+            (INKLING, "unsloth/Inkling-2-Mini-GGUF", True, images.INKLING_IMAGES),
         )
+        # Its publisher's Q8_0 projector first.
+        self.assertEqual(family.projectors[0], "Q8_0")
         self.assertEqual(
             family.sampling,
             families.SamplingDefaults(temperature=1.0, top_p=1.0, top_k=0),

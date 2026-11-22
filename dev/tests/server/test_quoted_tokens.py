@@ -660,16 +660,24 @@ class QuotedTokenTests(unittest.TestCase):
                     ]
                 }
 
-            written = family.controls(family.tokens(body("It ends at ", WORD, ".")))
+            whole = body("It ends at ", WORD, ".")
+            # A template that frames each part apart (Inkling's) never lets
+            # two parts spell a token together: each half stays its own
+            # part's text, beside the frames' tokens alone.
+            framed = "It ends at " + WORD + "." not in family.text(whole)
+            if framed:
+                whole = body("It ends at " + WORD, WORD + ".")
+            written = family.controls(family.tokens(whole))
             for cut in range(1, len(boundary)):
                 with self.subTest(cut=cut):
                     split = body("It ends at " + boundary[:cut], boundary[cut:] + ".")
-                    self.assertEqual(
-                        family.text(split),
-                        family.text(body("It ends at ", WORD, ".")).replace(
-                            WORD, boundary
-                        ),
-                    )
+                    expected = family.text(whole)
+                    if framed:
+                        expected = expected.replace(WORD, boundary[:cut], 1)
+                        expected = expected.replace(WORD, boundary[cut:], 1)
+                    else:
+                        expected = expected.replace(WORD, boundary)
+                    self.assertEqual(family.text(split), expected)
                     self.assertEqual(family.controls(family.tokens(split)), written)
 
     def test_a_token_the_end_of_a_text_cuts_off_is_quoted(self):

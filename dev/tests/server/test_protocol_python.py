@@ -534,7 +534,8 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.head_tokens,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
-            + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
+            # The span's wire fields; its patch side is not one.
+            + struct.pack(p._IMAGE_SPAN.format, *astuple(span)[:6])
             + request.image_pixels
             + struct.pack("<2I", *request.thinking_budget.end)
         )

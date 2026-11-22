@@ -27,6 +27,7 @@ if __name__ == "__main__" and not __package__:
 
 from server import serve_options
 from server.chat_format import FLINT, INKLING, QWEN, ChatFormat
+from server.images import INKLING_IMAGES, QWEN_IMAGES, ImageFormat
 
 from . import models
 
@@ -75,6 +76,14 @@ class ModelFamily:
     # loads from the target repository unless --language-only. The models of
     # a family without one serve text only, whatever their repository holds.
     vision: bool = True
+    # How its tower takes images (server/images.py), and the weight types of
+    # the GGUF vision projectors (mmproj) an installation loads for it, in
+    # the order it prefers them when a repository holds several
+    # (upstream.select_vision). Qwen's tower loads only exact ones, which
+    # preparation copies or converts without rounding; Inkling's also Q8_0,
+    # its publisher's default, whose values preparation rounds to BF16.
+    image_format: ImageFormat = QWEN_IMAGES
+    projectors: tuple[str, ...] = ("BF16", "F32", "F16")
     # Whether the family's models serve without a draft (--draft-model none).
     # Flint's do not: its target keeps no recurrent or auxiliary state, so
     # without a draft a cached state would be empty, which the SSD cache's
@@ -108,14 +117,15 @@ FAMILIES = (
         draftless=False,
     ),
     # Its DSpark draft is the GGUF Unsloth publishes beside its own
-    # quantizations, and it serves text only: its vision tower's projector
-    # (inkling2v) is none Splash loads yet.
+    # quantizations. Its vision tower is an inkling2v projector: ggml-org
+    # publishes it in Q8_0 and BF16, Unsloth in BF16, F16 and F32.
     ModelFamily(
         "Inkling-2-Mini",
         "unsloth/Inkling-2-Mini-GGUF",
         INKLING,
         INKLING_SAMPLING,
-        vision=False,
+        image_format=INKLING_IMAGES,
+        projectors=("Q8_0", "BF16", "F16", "F32"),
     ),
 )
 

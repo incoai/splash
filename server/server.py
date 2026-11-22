@@ -1508,6 +1508,7 @@ def main():
             chat_format=family.chat_format,
             sampling_defaults=_sampling_defaults(family, args),
             max_image_pixels=args.max_image_pixels,
+            image_format=family.image_format,
             thinking_codec=thinking_codec,
             response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,

@@ -31,7 +31,7 @@ from dev.tests.installer_fixtures import (
     write_gguf,
     write_target,
 )
-from install import assembly, gguf, hub, models, upstream
+from install import assembly, families, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -387,39 +387,53 @@ class GgufMetadataTests(unittest.TestCase):
         repo = projectors(
             **{"mmproj-Model-bf16": bf16, "mmproj-Model-f16": f16, "mmproj-x": text}
         )
-        name, header = upstream.select_vision(repo)
+        qwen, inkling = families.named("Qwen3.8-27B"), families.named("Inkling-2-Mini")
+        repo = projectors(
+            **{"mmproj-Model-bf16": bf16, "mmproj-Model-f16": f16, "mmproj-x": text}
+        )
+        name, header = upstream.select_vision(repo, qwen)
         self.assertEqual(name, "mmproj-Model-bf16.gguf")
         self.assertEqual(header.values["general.architecture"], "clip")
         self.assertEqual(
             upstream.select_vision(
-                projectors(**{"mmproj-f16": f16, "mmproj-f32": f32})
+                projectors(**{"mmproj-f16": f16, "mmproj-f32": f32}), qwen
             )[0],
             "mmproj-f32.gguf",
         )
         only_f16 = projectors(**{"mmproj-f16": f16, "mmproj-x": text})
-        self.assertEqual(upstream.select_vision(only_f16)[0], "mmproj-f16.gguf")
+        self.assertEqual(upstream.select_vision(only_f16, qwen)[0], "mmproj-f16.gguf")
         # Text only, the model is served: the caller says how to ask for it.
         with self.assertRaisesRegex(
             models.VisionError,
-            r"no BF16, F32 or F16 vision projector \(mmproj-q8.gguf \(clip: F32, Q8_0\); "
+            r"no BF16, F32, F16 vision projector \(mmproj-q8.gguf \(clip: F32, Q8_0\); "
             r"mmproj-x.gguf \(qwen35moe: BF16, F32\)\)$",
         ):
             upstream.select_vision(
-                projectors(**{"mmproj-q8": quantized, "mmproj-x": text})
+                projectors(**{"mmproj-q8": quantized, "mmproj-x": text}), qwen
             )
+        # Inkling's tower takes its publisher's Q8_0 projector, first.
+        both = projectors(**{"mmproj-Model-Q8_0": quantized, "mmproj-Model-BF16": bf16})
+        self.assertEqual(
+            upstream.select_vision(both, inkling)[0], "mmproj-Model-Q8_0.gguf"
+        )
+        self.assertEqual(
+            upstream.select_vision(both, qwen)[0], "mmproj-Model-BF16.gguf"
+        )
         with self.assertRaisesRegex(
             models.ModelError, "several BF16 vision projectors"
         ):
-            upstream.select_vision(projectors(**{"mmproj-a": bf16, "mmproj-b": bf16}))
+            upstream.select_vision(
+                projectors(**{"mmproj-a": bf16, "mmproj-b": bf16}), qwen
+            )
         # Prism ML prefixes the model's name.
         self.assertEqual(
             upstream.select_vision(
-                projectors(**{"Model-mmproj-BF16": bf16, "Model-PQ2_0": text})
+                projectors(**{"Model-mmproj-BF16": bf16, "Model-PQ2_0": text}), qwen
             )[0],
             "Model-mmproj-BF16.gguf",
         )
         with self.assertRaisesRegex(models.ModelError, "no GGUF named mmproj"):
-            upstream.select_vision(projectors())
+            upstream.select_vision(projectors(), qwen)
 
     def test_metadata_cache_hit_integrity_and_atomic_failure(self):
         path = write_gguf(self.root / "model.gguf", fixture())

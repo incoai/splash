@@ -20,9 +20,11 @@ from pathlib import Path
 from tokenizers import Tokenizer, decoders
 from transformers import AutoTokenizer
 
+from dev.tests import fixture_files
 from dev.tests import inkling_fixtures as inkling
+from dev.tests.installer_fixtures import GGML
 from dev.tests.server_fixtures import NATIVE_CONTEXT
-from install import gguf, models
+from install import families, gguf, hub, models, upstream
 from server import constraints
 from server.chat_format import INKLING
 from server.chat_templates import NATIVE, ChatTemplates
@@ -115,6 +117,71 @@ class InklingGgufTests(unittest.TestCase):
         self.assertEqual(
             (text["rms_norm_eps"], text["log_scaling_alpha"]), (1e-06, 0.1)
         )
+
+    def projector(self, name="mmproj-Inkling-2-Mini-Q8_0.gguf", **changed):
+        """A header like ggml-org's inkling2v mmproj (its metadata, and its
+        projector's two Q8_0 matrices among its tensors)."""
+        values = {
+            "general.architecture": "clip",
+            "general.type": "mmproj",
+            "clip.has_vision_encoder": True,
+            "clip.vision.projection_dim": 2304,
+            "clip.vision.image_size": 640,
+            "clip.vision.patch_size": 20,
+            "clip.vision.embedding_length": 1024,
+            "clip.vision.feed_forward_length": 4096,
+            "clip.vision.block_count": 23,
+            "clip.vision.attention.head_count": 16,
+            "clip.vision.image_mean": [0.5] * 3,
+            "clip.vision.image_std": [0.5] * 3,
+            "clip.vision.projector_type": "inkling2v",
+            "clip.vision.attention.layer_norm_epsilon": 1e-5,
+            "clip.vision.spatial_merge_size": 2,
+        } | changed
+        tensors = [
+            ("v.patch_embd.weight", [20, 20, 3, 1024], GGML["F32"], b""),
+            ("v.blk.0.attn_q.weight", [1024, 1024], GGML["Q8_0"], b""),
+            ("mm.1.weight", [4096, 4096], GGML["Q8_0"], b""),
+            ("mm.2.weight", [4096, 2304], GGML["Q8_0"], b""),
+        ]
+        path = fixture_files.write_gguf(self.root / name, values, tensors)
+        return gguf.Metadata(path, tensors=True)
+
+    def test_the_projector_derives_the_release_s_vision_config(self):
+        # transformers' vision_config as the release's config.json states it,
+        # but for the temporal patches its tower has none of.
+        config = gguf.model_config(self.metadata(), self.projector())
+        release = dict(RELEASE["vision_config"])
+        del release["temporal_patch_size"]
+        self.assertEqual(config["vision_config"], release)
+        self.assertEqual(
+            gguf.processor_config(self.projector()),
+            {
+                "patch_size": 20,
+                "merge_size": 2,
+                "image_mean": [0.5] * 3,
+                "image_std": [0.5] * 3,
+            },
+        )
+        with self.assertRaisesRegex(models.ModelError, "position grid"):
+            gguf.vision_config(self.projector(**{"clip.vision.image_size": 650}))
+
+    def test_the_family_takes_its_q8_0_projector_first(self):
+        family = families.named("Inkling-2-Mini")
+        self.assertTrue(family.vision)
+        quantized = self.projector()
+        self.projector("mmproj-Inkling-2-Mini-BF16.gguf")
+        header, precision, kind = upstream.read_projector(
+            hub.Repository.local_directory(self.root), "mmproj-Inkling-2-Mini-Q8_0.gguf"
+        )
+        self.assertEqual((precision, kind), ("Q8_0", "clip: F32, Q8_0"))
+        self.assertEqual(header.values, quantized.values)
+        # Inkling's processor is its own: 20-pixel patches of one frame.
+        upstream._validate_processor(gguf.processor_config(quantized), family)
+        with self.assertRaisesRegex(models.ModelError, "preprocessing"):
+            upstream._validate_processor(
+                gguf.processor_config(quantized), families.named("Qwen3.8-27B")
+            )
 
     def test_each_derived_value_is_the_header_s(self):
         values = inkling.header_values()

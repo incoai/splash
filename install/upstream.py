@@ -294,17 +294,18 @@ def split_order(names, split):
     return [parts[number][1] for number in sorted(parts)]
 
 
-def select_vision(repo):
-    """The name and header of the GGUF repository's vision projector, chosen
-    by content among its root GGUF files named mmproj, whatever the publisher
-    calls them: a projector Splash loads (read_projector) of BF16, F32 or F16
-    weights, preferred in that order. Each header costs a few range
-    requests."""
-    usable, found = {"BF16": [], "F32": [], "F16": []}, []
+def select_vision(repo, family):
+    """The name and header of the GGUF repository's vision projector for
+    family's tower, chosen by content among its root GGUF files named
+    mmproj, whatever the publisher calls them: a projector Splash loads
+    (read_projector) of a weight type the family's tower takes, preferred in
+    its order (ModelFamily.projectors: BF16, F32, then F16 for Qwen's; Q8_0
+    first for Inkling's). Each header costs a few range requests."""
+    usable, found = {precision: [] for precision in family.projectors}, []
     for name in filter(projector_named, root_ggufs(repo.files)):
         header, precision, kind = read_projector(repo, name)
         found.append(f"{name} ({kind})")
-        if precision:
+        if precision in usable:
             usable[precision].append((name, header))
     for precision, projectors in usable.items():
         if len(projectors) == 1:
@@ -316,20 +317,22 @@ def select_vision(repo):
                 + ", describe no single tower"
             )
     raise models.VisionError(
-        "the GGUF repository has no BF16, F32 or F16 vision projector ("
-        + ("; ".join(found) or "no GGUF named mmproj")
-        + ")"
+        f"the GGUF repository has no {', '.join(family.projectors)} vision "
+        "projector (" + ("; ".join(found) or "no GGUF named mmproj") + ")"
     )
 
 
 def read_projector(repo, name):
     """The header of the GGUF name in repo; the precision of a vision
-    projector Splash loads (a clip model of BF16, F32 or F16 weights), else
-    None; and how a refusal describes it, ARCHITECTURE: TYPES. The tower runs
-    in BF16 and preparation never rounds a weight: it converts F32 and F16
-    only where every value is exact, as in an F16 projector made from a BF16
-    tower, where F16 rounds the smallest BF16 weights onto its subnormal grid
-    and what that keeps is still a BF16."""
+    projector Splash loads (a clip model of BF16, F32 or F16 weights, or of
+    Q8_0 matrices beside them), else None; and how a refusal describes it,
+    ARCHITECTURE: TYPES. The tower runs in BF16 and preparation rounds no
+    float weight: it converts F32 and F16 only where every value is exact,
+    as in an F16 projector made from a BF16 tower, where F16 rounds the
+    smallest BF16 weights onto its subnormal grid and what that keeps is
+    still a BF16. A Q8_0 value, which few BF16s hold, is the one it rounds,
+    for the towers whose family takes Q8_0 projectors
+    (ModelFamily.projectors)."""
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
     architecture = header.values.get("general.architecture")
@@ -337,8 +340,8 @@ def read_projector(repo, name):
         gguf.TENSOR_TYPES.get(kind, f"type {kind}") for kind in header.tensors.values()
     }
     precision = None
-    if architecture == "clip" and types and types <= {"BF16", "F32", "F16"}:
-        precision = next(p for p in ("F16", "BF16", "F32") if p in types)
+    if architecture == "clip" and types and types <= {"BF16", "F32", "F16", "Q8_0"}:
+        precision = next(p for p in ("Q8_0", "F16", "BF16", "F32") if p in types)
     return header, precision, f"{architecture}: {', '.join(sorted(types))}"
 
 
@@ -403,9 +406,9 @@ def gguf_target(repo, names, scratch, *, projector=None):
     """The GGUF target whose files in repo are names, one or a split GGUF's
     parts in split order, its configuration and headers written into
     scratch. projector, for a model that serves images, gives the name and
-    header of its vision projector in repo (select_vision): called once the
-    text configuration passed, for a family whose models have a vision
-    tower; the others serve text only."""
+    header of its vision projector in repo for the family's tower
+    (select_vision): called once the text configuration passed, for a family
+    whose models have a vision tower; the others serve text only."""
     # A split GGUF's parts lie side by side in target/, where the native
     # loader finds them by their -0000K-of-0000N names, and their headers in
     # scratch's target/, where the engine's model check finds them.
@@ -424,9 +427,9 @@ def gguf_target(repo, names, scratch, *, projector=None):
     family = check_model("gguf", "none", config, gguf_headers=target)
     vision_format = "none"
     if projector is not None and family.vision:
-        name, vision_header = projector(repo)
+        name, vision_header = projector(repo, family)
         try:
-            _validate_processor(gguf.processor_config(vision_header))
+            _validate_processor(gguf.processor_config(vision_header), family)
             config.write_bytes(
                 models.json_bytes(gguf.model_config(headers[0], vision_header))
             )
@@ -476,7 +479,7 @@ def mlx_target(repo, language_only):
         # The text passed, so a refusal of the tower's processor, shards or
         # configuration refuses the vision alone.
         try:
-            _validate_processor(_image_processor(repo))
+            _validate_processor(_image_processor(repo), family)
             shards = _weight_files(repo, VISION_TOWER)
         except models.ModelError as error:
             raise models.VisionError(str(error)) from None
@@ -559,18 +562,23 @@ def _safetensors_tensors(repo, name):
     return set(header) - {"__metadata__"}
 
 
-def _validate_processor(config):
-    """Splash prepares images one way (server/images.py): 16-pixel patches in
-    two temporal slices, merged 2x2 and normalized to [-1, 1]. A processor
-    configuration asking for another is rejected before any download; it is
-    not installed, since nothing reads it."""
+def _validate_processor(config, family):
+    """Splash prepares images one way for each family's tower
+    (server/images.py, ModelFamily.image_format): patches of its side (Qwen's
+    16 pixels in two temporal slices, Inkling's 20 in one), merged 2x2 and
+    normalized to [-1, 1]. A processor configuration asking for another is
+    rejected before any download; it is not installed, since nothing reads
+    it."""
     expected = {
-        "patch_size": 16,
-        "temporal_patch_size": 2,
+        "patch_size": family.image_format.patch,
         "merge_size": 2,
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
     }
+    if family.image_format.name == "qwen":
+        expected["temporal_patch_size"] = 2
+    elif "temporal_patch_size" in config:
+        raise models.ModelError("unsupported vision preprocessing configuration")
     if any(config.get(key) != value for key, value in expected.items()):
         raise models.ModelError("unsupported vision preprocessing configuration")
 
