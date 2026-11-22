@@ -14,7 +14,9 @@
 // brute-force reference's, row for row: every path that takes one of a
 // row's `children` likeliest candidates a step and every prefix of the lane's
 // host chain, scored by the product of its steps' estimates (a draft step's
-// by its lane's own calibration, at most what its parent's chain child and
+// by its lane's own calibration of the candidates' probabilities, their
+// scores softcapped after their edges for a softcapped head's draft, at most
+// what its parent's chain child and
 // earlier draws left of 1; a sampled lane's row takes its candidates of the
 // largest log q_T + G, G the Gumbel of the row's key), ranked, one row for
 // each token path, as many as a verify block holds and its depth plus one
@@ -255,17 +257,19 @@ Fixture makeFixture(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, 
 }
 
 
-void run(MetalBackend &backend, const DraftSelector &selector, const Fixture &f, std::span<const DraftTreeLane> lanes) {
+void run(MetalBackend &backend, const DraftSelector &selector, const Fixture &f, std::span<const DraftTreeLane> lanes,
+         float softcap = 0.0F) {
   CommandGraph graph;
-  selector.add(graph, f.buffers, f.codebooks, f.subset, lanes);
+  selector.add(graph, f.buffers, f.codebooks, f.subset, lanes, softcap);
   require(graph.dispatches().size() == 3, "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
 
 // A lane's candidates as the selector scored them: their ids, each one's
 // fp32 score after each predecessor (unary plus edge, as the kernel adds
-// them), its probability in double, and each predecessor's candidates in the
-// order of their scores, the lower index first among equal ones.
+// them, softcapped at `softcap` where it is not 0), its probability in
+// double, and each predecessor's candidates in the order of their scores,
+// the lower index first among equal ones.
 struct Lattice final {
   std::array<std::array<uint32_t, kCandidates>, kPositions> ids{};
   std::array<std::array<std::array<float, kCandidates>, kCandidates>, kPositions> score{};
@@ -273,14 +277,16 @@ struct Lattice final {
   std::array<std::array<std::array<uint32_t, kCandidates>, kCandidates>, kPositions> ranked{};
 };
 
-Lattice latticeOf(const Fixture &f, uint32_t lane) {
+Lattice latticeOf(const Fixture &f, uint32_t lane, float softcap = 0.0F) {
   Lattice l;
   for (uint32_t position = 0; position < kPositions; ++position) {
     std::copy_n(f.candidates(lane) + position * kCandidates, kCandidates, l.ids[position].begin());
     for (uint32_t predecessor = 0; predecessor < (position ? kCandidates : 1); ++predecessor) {
       auto &score = l.score[position][predecessor];
-      for (uint32_t i = 0; i < kCandidates; ++i)
-        score[i] = f.unary(lane)[position * kCandidates + i] + f.edges(lane, position, predecessor)[i];
+      for (uint32_t i = 0; i < kCandidates; ++i) {
+        const float sum = f.unary(lane)[position * kCandidates + i] + f.edges(lane, position, predecessor)[i];
+        score[i] = softcap > 0.0F && sum > -INFINITY ? softcap * std::tanh(sum / softcap) : sum;
+      }
       const float best = *std::max_element(score.begin(), score.end());
       double mass = 0.0;
       for (uint32_t i = 0; i < kCandidates; ++i)
@@ -653,8 +659,9 @@ void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, Draft
 // positions; their rates and each lane's calibration, the identity or another
 // beside lanes of the other, rank them against the draft's rows. Lanes cut
 // their trees at a depth, and at its rows plus one, or take all of their
-// rows.
-void treesMatchTheReference(MetalBackend &backend) {
+// rows. A softcapped head's draft (`softcap`) scores each candidate after its
+// edge through the softcap, a sum of 10 at 30 by 3.5% less.
+void treesMatchTheReference(MetalBackend &backend, float softcap) {
   constexpr uint32_t vocabulary = 1003;
   const std::array patterns{Pattern::Peaked};
   uint32_t checked = 0, drawn = 0;
@@ -688,9 +695,9 @@ void treesMatchTheReference(MetalBackend &backend) {
       }
     }
     // A first run gives the lattices the chains copy from.
-    run(backend, selector, f, trees);
+    run(backend, selector, f, trees, softcap);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
-      const Lattice l = latticeOf(f, lane);
+      const Lattice l = latticeOf(f, lane, softcap);
       // The draft's likeliest path for its first `copied` tokens, then its
       // second candidate once, then the random tokens.
       const uint32_t copied = random.next() % 4;
@@ -706,15 +713,16 @@ void treesMatchTheReference(MetalBackend &backend) {
       for (uint32_t d = 0; d < kChain; ++d)
         std::copy(chains[lane].rates[d].begin(), chains[lane].rates[d].end(), f.chainRates(lane) + d * kAgreements);
     }
-    run(backend, selector, f, trees);
+    run(backend, selector, f, trees, softcap);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       ++drawn;
-      const auto reference = referenceTree(latticeOf(f, lane), trees[lane], chains[lane]);
+      const auto reference = referenceTree(latticeOf(f, lane, softcap), trees[lane], chains[lane]);
       if (!reference)
         continue;
       ++checked;
       requireTree(f, lane, trees[lane].anchor, *reference,
-                  "tree trial " + std::to_string(trial) + " lane " + std::to_string(lane));
+                  "tree trial " + std::to_string(trial) + " lane " + std::to_string(lane) + " softcap " +
+                      std::to_string(softcap));
     }
   }
   require(checked * 4 >= drawn * 3, "most trees were too ambiguous to check");
@@ -1505,7 +1513,8 @@ int main(int argc, char **argv) {
           std::pair{1003U, DraftVocabulary{517, 1003}}, std::pair{1003U, DraftVocabulary{0, 389}}})
       for (const uint32_t lanes : {1U, kLanes})
         chainCase(backend, vocabulary, lanes, tokens);
-    treesMatchTheReference(backend);
+    treesMatchTheReference(backend, 0.0F);
+    treesMatchTheReference(backend, 30.0F);
     sampledChildrenDistribution(backend);
     nonFiniteRowDrawsNothing(backend);
     lowTemperatureDraws(backend);

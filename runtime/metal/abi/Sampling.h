@@ -214,7 +214,10 @@ static_assert(sizeof(SelectorBatchParams) == 20 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH
 // the product over the path of its steps' estimates. A step to a draft
 // candidate at proposal position p, of probability q among the position's
 // candidates after its parent's (the softmax at temperature 1 of their unary
-// scores plus the edge from the parent's candidate), is estimated at
+// scores plus the edge from the parent's candidate, each sum softcapped,
+// softcap tanh(sum / softcap), where the draft's head takes a softcap, as
+// DFlash2 trains a draft of such a head; as it is at a softcap of 0), is
+// estimated at
 // sigmoid(slope[l] * logit(q) + intercept[l][p]), the lane's acceptance model
 // (a greedy lane's or a sampled one's, model::VerifyBudget), at most its cap:
 // what its parent's host chain child and the steps its parent drew before it
@@ -245,13 +248,14 @@ struct DraftTreeParams {
   uint32_t chain[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t children[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
+  float softcap;
   float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
   float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
 };
 
-static_assert(sizeof(DraftTreeParams) == 4 + (32 + 4 * SPLASH_DRAFT_PROPOSAL_TOKENS) * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(DraftTreeParams) == 8 + (32 + 4 * SPLASH_DRAFT_PROPOSAL_TOKENS) * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Draft tree parameters are the same size on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): the `rows` rows of its

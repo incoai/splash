@@ -131,13 +131,17 @@ DFlashContextWindow::~DFlashContextWindow() {
 DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators,
-                         const ops::Projection &head, ops::DraftVocabulary subset)
+                         const ops::Projection &head, ops::DraftVocabulary subset,
+                         ops::LogitFinishValues finish)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize), head_(head), subset_(subset),
+      selector_(weights.layout.vocabularySize), head_(head), subset_(subset), finish_(finish),
       subsetHead_(subsetRows(backend, head, subset)),
       contextKvProjections_(contextKvRows(backend, weights)) {
   if (head.outputSize != weights.layout.vocabularySize)
     throw std::invalid_argument("a draft's head is its vocabulary's");
+  if (!finish.tokens || finish.tokens > head.outputSize || !(finish.softcap >= 0.0F) ||
+      (finish.tokens != head.outputSize && subset != ops::DraftVocabulary{}))
+    throw std::invalid_argument("a draft's head finish holds its tokens, a padded head's over its whole vocabulary");
 }
 
 ops::DraftVocabulary DFlashDraft::vocabulary(ops::DraftVocabulary subset,
@@ -174,7 +178,7 @@ const ops::Projection &DFlashDraft::head(ops::DraftVocabulary vocabulary) const 
 void DFlashDraft::addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
                                const DFlashDraftStep &step) const {
   selector_.add(graph, buffers, {weights_.predecessorCodebook, weights_.successorCodebook}, step.vocabulary,
-                step.lanes);
+                step.lanes, finish_.softcap);
 }
 
 void DFlashDraft::addContextPrefill(
@@ -348,6 +352,12 @@ void DFlashDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buff
   const ops::PreparedInput afterHead = target.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
+  // No candidate of a padded head's rows past its tokens (the constructor
+  // holds such a head to its whole vocabulary: a view of the head holds whole
+  // tiles of its rows, QUANT_TILE_ROWS, which need not end at its tokens);
+  // its softcap waits for the selector's edges (addSelection).
+  if (finish_.tokens != head_.outputSize)
+    ops::LogitFinish::add(graph, buffers.logits, head_.outputSize, rows, {0.0F, finish_.tokens});
   linear.add(graph,
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},

@@ -3,6 +3,7 @@
 #include "model/RopeScaling.hpp"
 #include "model/StateLayout.hpp"
 #include "ops/DraftSelector.hpp"
+#include "ops/LogitFinish.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/StopTokens.hpp"
@@ -104,6 +105,17 @@ struct QwenTargetDimensions {
   // (Flint's mixes its scripts through all its tokens: its first 98,304 hold
   // 98.1% of English text's tokens and 88.5% of Russian text's).
   ops::DraftVocabulary draftVocabulary{};
+  // The finish of its vocabulary head's logits (ops::LogitFinish), zero for
+  // none: a softcap c tanh(l / c) of its tokens' logits, and its tokens, the
+  // first vocabularyTokens of the head's vocabularySize rows, the rows past
+  // them padding its converter added, which nothing selects. Its DFlash2
+  // drafts, which project through the head, take the same finish: their
+  // logits leave the padding out, and the softcap applies to each
+  // candidate's score after its selector's edge, where DFlash2 trains a
+  // draft of a softcapped head to take it (dflash_config
+  // selector_softcap_mode after_correction).
+  float logitSoftcap = 0.0F;
+  uint32_t vocabularyTokens = 0;
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   // The dense FFN's width.
   uint32_t intermediateSize = 0;
@@ -162,6 +174,11 @@ struct QwenTargetDimensions {
   [[nodiscard]] constexpr uint32_t gdnLayerCount() const noexcept { return layers - attentionLayerCount(); }
   // Whether its drafts choose their mask token (firstDraftMaskToken).
   [[nodiscard]] constexpr bool draftChoosesMaskToken() const noexcept { return lastDraftMaskToken != 0; }
+  // The tokens of its head's rows: vocabularyTokens, or every row.
+  [[nodiscard]] constexpr uint32_t tokens() const noexcept {
+    return vocabularyTokens ? vocabularyTokens : vocabularySize;
+  }
+  [[nodiscard]] constexpr ops::LogitFinishValues logitFinish() const noexcept { return {logitSoftcap, tokens()}; }
   // Whether layer `layer`'s FFN is a MoE block, and the block's index among
   // the target's (its ExpertStore block).
   [[nodiscard]] constexpr bool isMoeLayer(uint32_t layer) const noexcept {

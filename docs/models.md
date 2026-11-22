@@ -332,7 +332,15 @@ its reserved special tokens, 150019 to 150143, as its
 those the kernels are built for, and its block at least their 8 rows, of which a
 cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
 `readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
-whole 16-channel convolution groups. A draft's rows after its anchor read the
+whole 16-channel convolution groups. Its logits take the finish of its
+target's head (`QwenTargetDimensions::logitSoftcap` and `vocabularyTokens`,
+`DFlashDraft`): no padding row past the head's tokens is a candidate
+(`dflash_config.valid_vocab_size`), and the head's softcap
+(`final_logit_softcapping`) applies to each candidate's score after the
+selector's edge (`selector_softcap_mode` `after_correction`, the one
+placement the selector runs), before the probabilities its tree and a
+sampled verify read; a config states each where its target's head has one.
+A draft's rows after its anchor read the
 target's token table row of the mask token, unless its release ships that
 token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
 `mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.

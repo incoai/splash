@@ -696,10 +696,10 @@ template <class Layout> void requireQuantization(NSDictionary *config, const Lay
 
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
 // window, convolutions and selector must be those the draft kernels are built
-// for, and its block at least their rows; its hidden size, vocabulary and
-// mask token the target's; and the target layers it reads (target_layer_ids)
-// some of the target's, ascending. Its layers, intermediate size and rotary
-// base are its own.
+// for, and its block at least their rows; its hidden size, vocabulary, mask
+// token and the finish of its logits the target's; and the target layers it
+// reads (target_layer_ids) some of the target's, ascending. Its layers,
+// intermediate size and rotary base are its own.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
@@ -749,6 +749,19 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   if (flash[@"target_hidden_reduction"])
     requireEqual(requireString(flash, @"target_hidden_reduction", "draft config target_hidden_reduction"),
                  reduction, "checkpoint", "draft config dflash_config target_hidden_reduction");
+  // Its head's finish, its target's (QwenTargetDimensions::logitSoftcap and
+  // vocabularyTokens), stated where its target has one: the softcap, which
+  // its selector's scores take after their edges (selector_softcap_mode
+  // after_correction, the one placement the selector runs), and its tokens
+  // (valid_vocab_size).
+  if (target.logitSoftcap != 0.0F || flash[@"final_logit_softcapping"]) {
+    requireNumbers(flash, "checkpoint", "draft config dflash_config",
+                   {{"final_logit_softcapping", target.logitSoftcap}});
+    requireEqual(requireString(flash, @"selector_softcap_mode", "draft config selector_softcap_mode"),
+                 "after_correction", "checkpoint", "draft config dflash_config selector_softcap_mode");
+  }
+  if (target.tokens() != target.vocabularySize || flash[@"valid_vocab_size"])
+    requireNumbers(flash, "checkpoint", "draft config dflash_config", {{"valid_vocab_size", target.tokens()}});
   NSArray *ids = requireArray(flash, @"target_layer_ids", "draft config target_layer_ids");
   std::vector<uint32_t> targetLayers;
   for (id value : ids) {

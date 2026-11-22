@@ -36,9 +36,11 @@ DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
 
 void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
                         const DraftCodebooks &codebooks, DraftVocabulary vocabulary,
-                        std::span<const DraftTreeLane> lanes) const {
+                        std::span<const DraftTreeLane> lanes, float softcap) const {
   if (lanes.empty() || lanes.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
+  if (!(softcap >= 0.0F && std::isfinite(softcap)))
+    throw std::invalid_argument("invalid draft selector softcap");
   if (vocabulary.leading > vocabulary.trailing || vocabulary.trailing > vocabulary_ || !vocabulary.columns(vocabulary_))
     throw std::invalid_argument("a draft's tokens lie in its vocabulary");
   const uint32_t count = static_cast<uint32_t>(lanes.size());
@@ -51,6 +53,7 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   params.trailing = vocabulary.trailing;
   DraftTreeParams tree{};
   tree.lanes = count;
+  tree.softcap = softcap;
   for (uint32_t lane = 0; lane < count; ++lane) {
     const DraftTreeLane &l = lanes[lane];
     // A tree's rows hold its anchor and every row's path below it, a verify
