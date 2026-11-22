@@ -29,6 +29,7 @@
 #include "ops/ExecutionPlans.hpp"
 #include "ops/KernelSelection.hpp"
 #include "ops/LaneRows.hpp"
+#include "ops/RelativeAttention.hpp"
 
 #include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
@@ -161,6 +162,25 @@ public:
     for (const std::string &name : {plan.splitPipeline(), plan.splitPipeline(true), plan.reducePipeline(),
                                     plan.reducePipeline() + tableSuffix(LinearInput::Table16)})
       if (!name.empty()) names_.try_emplace(name, where);
+  }
+  // A relative attention plan's (ops::RelativeAttention) split and reduce
+  // kernels, and a layer's prepare of a variant and the path commit of its
+  // pages.
+  void attention(const std::string &where, const RelativeAttentionPlan &plan) {
+    for (const std::string &name : {plan.splitPipeline(), plan.reducePipeline(),
+                                    plan.reducePipeline() + tableSuffix(LinearInput::Table16)})
+      names_.try_emplace(name, where);
+  }
+  void relativePrepare(const std::string &where, kv::Layout layout, RelativeAttentionVariant variant) {
+    encode(where, true, [&](metal::CommandGraph &graph) {
+      const metal::MetalBuffer &b = buffer_;
+      const std::array sequences{PagedAttention::chunkParams(0, kv::kPageTokens, kv::kPageTokens, 1)};
+      const std::array tables{b};
+      const std::array<uint32_t, 1> committed{0};
+      RelativeAttention::addProjection(graph, {b, b, b}, {b, b, b}, {b, b, b}, SplashKvLayer{}, tables, sequences,
+                                       {b, kv::kPageTokens}, layout, variant);
+      RelativeAttention::addPathCommit(graph, layout, 1, tables, committed, SPLASH_TARGET_VERIFY_ROWS, b);
+    });
   }
   // A layer's q/k norms and RoPE (PagedAttention::addProjection) for norms
   // stored as F32 or as bf16.
@@ -599,6 +619,16 @@ std::string describe(const AttentionPlan &plan) {
          std::to_string(plan.sinks);
 }
 
+std::string describe(const RelativeAttentionPlan &plan) {
+  std::string line = plan.splitPipeline() + " " + plan.reducePipeline() + " splits ";
+  for (const RelativeAttentionPlan::Sequence &sequence : plan.sequences())
+    line += std::to_string(sequence.splits) + (&sequence == &plan.sequences().back() ? "" : ",");
+  for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches())
+    line += " [" + std::to_string(dispatch.sequences) + " tiles " + std::to_string(dispatch.tiles) + " groups " +
+            describe(plan.splitGroups(dispatch)) + " " + describe(plan.reduceGroups(dispatch)) + "]";
+  return line + " workspace " + describe(plan.workspace());
+}
+
 // A sequence of `rows` rows after `history` tokens, staged in whole KV
 // blocks.
 kv::ChunkedPrefillParams sequenceOf(uint32_t history, uint32_t rows) {
@@ -626,9 +656,39 @@ AttentionPlan stepPlan(const ExecutionPlans &plans, std::span<const uint32_t> hi
 constexpr uint32_t kAttentionRows[] = {1, 7, 8, 64, 255, 256, 300, 512, 1024, 2048};
 constexpr uint32_t kAttentionHistories[] = {0, 1, 511, 2047, 4096, 32768, 65536, 131072, 262144};
 
-// The variants a family's attention layers run (QwenTargetGeometry::attentionVariant).
+// The relative attention (ops::RelativeAttention) plans of a layout it
+// stores, as chunkPlan's and stepPlan's.
+RelativeAttentionPlan relativeChunkPlan(const ExecutionPlans &plans, uint32_t rows, uint32_t history,
+                                        const kv::Layout &layout, RelativeAttentionVariant v) {
+  const std::array sequence{sequenceOf(history, rows)};
+  return RelativeAttention::plan(sequence, layout, plans.calibration().attention, plans.linear().int8Activations(),
+                                 RelativeAttention::sequenceWorkspace(layout), v);
+}
+RelativeAttentionPlan relativeStepPlan(const ExecutionPlans &plans, std::span<const uint32_t> histories,
+                                       const kv::Layout &layout, RelativeAttentionVariant v) {
+  std::vector<kv::ChunkedPrefillParams> lanes;
+  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, SPLASH_DRAFT_QUERY_ROWS));
+  const AttentionWorkspace lane = RelativeAttention::laneWorkspace(layout);
+  return RelativeAttention::plan(lanes, layout, plans.calibration().attention, plans.linear().int8Activations(),
+                                 {lane.partialsBytes * histories.size(), lane.statisticsBytes * histories.size()},
+                                 v);
+}
+
+// Whether a family's layers attend through relative attention, and the
+// windows they attend: the whole history's and, with a window, its layout's.
+template <class Family> bool relativeAttention(const Family &family) {
+  return !family.sharedAttention && RelativeAttention::stores(family.kvLayout());
+}
+template <class Family> std::vector<uint32_t> relativeWindows(const Family &family) {
+  const kv::Layout base = family.kvLayout();
+  return base.windowTokens ? std::vector<uint32_t>{0, base.windowTokens} : std::vector<uint32_t>{0};
+}
+
+// The variants a family's attention layers run (QwenTargetGeometry::attentionVariant):
+// none for a family whose layers attend through an operator of its own.
 template <class Family> std::vector<AttentionVariant> attentionVariants(const Family &family) {
   std::vector<AttentionVariant> variants;
+  if (!family.sharedAttention) return variants;
   const kv::Layout base = family.kvLayout();
   for (uint32_t a = 0; a < base.attentionLayers; ++a) {
     const AttentionVariant v{.rotated = a >= 64 || !(family.unrotatedLayers >> a & 1),
@@ -647,6 +707,7 @@ std::vector<uint32_t> verifyHistories(uint32_t lanes, uint32_t history) {
 
 void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlans &plans, Pipelines *library) {
   model::forEachFamily([&](const auto &family) {
+    if (!family.sharedAttention) return;
     const std::string f(family.family);
     const std::vector<AttentionVariant> variants = attentionVariants(family);
     const kv::Layout base = family.kvLayout();
@@ -695,6 +756,59 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
       workspace.add(fmt + " decode per lane: " + attempt([&] {
                       return describe(plans.laneAttentionWorkspace(family.attentionQueryHeads, layout));
                     }));
+    }
+  });
+}
+
+// The relative attention (ops::RelativeAttention) of each family whose
+// layers attend through it, in the groups attentionPlans fills for the shared
+// attention's families, at the same rows, histories and lanes: a prompt
+// chunk's plans and a verify step's of each window it attends, in INT8 and
+// BF16 pages, its workspaces, and with a library its pipelines, its layers'
+// prepare, plain and position-scaled, and its pages' path commit.
+void relativeAttentionPlans(Golden &golden, const std::string &name, const ExecutionPlans &plans,
+                            Pipelines *library) {
+  model::forEachFamily([&](const auto &family) {
+    if (!relativeAttention(family)) return;
+    const std::string f(family.family);
+    Group &prefill = golden.group(name, "attention-prefill", f);
+    Group &verify = golden.group(name, "attention-verify", f);
+    Group &verifyWide = golden.group(name, "attention-verify-wide", f);
+    Group &workspace = golden.group(name, "attention-workspace", f);
+    for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+      kv::Layout layout = family.kvLayout();
+      layout.format = format;
+      const std::string fmt = format == kv::Format::Int8 ? "int8" : "bf16";
+      for (const uint32_t window : relativeWindows(family)) {
+        const RelativeAttentionVariant v{.windowTokens = window};
+        const std::string variant = fmt + " relative window " + std::to_string(window);
+        const auto planned = [&](const std::string &line, const auto &plan) {
+          return line + ": " + attempt([&] {
+                   const RelativeAttentionPlan selected = plan();
+                   if (library) library->attention(name + " " + f + " " + line, selected);
+                   return describe(selected);
+                 });
+        };
+        for (const uint32_t rows : kAttentionRows)
+          for (const uint32_t history : kAttentionHistories)
+            prefill.add(planned(variant + " rows " + std::to_string(rows) + " history " + std::to_string(history),
+                                [&] { return relativeChunkPlan(plans, rows, history, layout, v); }));
+        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+          for (const uint32_t history : kAttentionHistories) {
+            const std::vector<uint32_t> each = verifyHistories(lanes, history);
+            (lanes <= SPLASH_DEFAULT_LANES ? verify : verifyWide)
+                .add(planned(variant + " lanes " + std::to_string(lanes) + " history " + std::to_string(history),
+                             [&] { return relativeStepPlan(plans, each, layout, v); }));
+          }
+        if (library)
+          for (const bool scaled : {false, true})
+            library->relativePrepare(name + " " + f + " " + variant + (scaled ? " scaled" : "") + " prepare", layout,
+                                     {.windowTokens = window, .positionScaled = scaled});
+      }
+      workspace.add(fmt + " prefill chunk: " +
+                    attempt([&] { return describe(RelativeAttention::sequenceWorkspace(layout)); }));
+      workspace.add(fmt + " decode per lane: " +
+                    attempt([&] { return describe(RelativeAttention::laneWorkspace(layout)); }));
     }
   });
 }
@@ -983,6 +1097,18 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
                 return plan.splitPipeline() + " " + plan.reducePipeline();
               });
     }
+    if (relativeAttention(family))
+      for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+        kv::Layout layout = family.kvLayout();
+        layout.format = format;
+        for (const uint32_t window : relativeWindows(family))
+          check("relative attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
+                    std::to_string(window),
+                kAttentionHistories, [&](uint32_t rows, uint32_t history) {
+                  const RelativeAttentionPlan plan = relativeChunkPlan(plans, rows, history, layout, {window});
+                  return plan.splitPipeline() + " " + plan.reducePipeline();
+                });
+      }
     if (const uint32_t top = family.indexerTopBlocks)
       check("block indexer " + f, kAttentionHistories,
             [&](uint32_t rows, uint32_t history) { return BlockIndexer::sparse(history, rows, top); },
@@ -1119,6 +1245,7 @@ Golden selections(bool dump, Pipelines *library) {
     floatTiles(golden, name, plans.linear());
     moePlans(golden, name, plans);
     attentionPlans(golden, name, plans, library);
+    relativeAttentionPlans(golden, name, plans, library);
     // The pipelines of the plans in bf16 activations, which the golden holds
     // as these plans (int8ActivationsOff).
     if (library) {

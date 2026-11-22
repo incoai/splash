@@ -236,9 +236,14 @@ struct QwenTargetDimensions {
 // uses. The type states its config's model type and the architecture of its
 // GGUFs (modelType, ggufArchitecture), and, where its config.json holds the
 // text model's keys at its top level instead of in a text_config (a
-// multimodal Qwen checkpoint's), flatConfig.
+// multimodal Qwen checkpoint's), flatConfig; and whether its layers attend
+// through the shared attention (ops::PagedAttention), sharedAttention, false
+// for an architecture whose attention is an operator of its own: each
+// architecture's target is compiled against it, and the kernel tests take the
+// families' attention kernels from it.
 struct QwenHybridLayout : QwenTargetDimensions {
   static constexpr bool flatConfig = false;
+  static constexpr bool sharedAttention = true;
 
   // The family's name, as the installer pairs its draft (install/families.py).
   std::string_view family;

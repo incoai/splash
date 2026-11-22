@@ -79,6 +79,7 @@ Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetG
                                uint32_t prefillChunks)
     : QwenTarget(weights, geometry, backend, operators), weights_(weights),
       steps_(weights, geometry_, backend, prefillChunks) {
+  static_assert(Qwen4ExpLayout::sharedAttention, "the layout states the attention its target's layers run");
   requireLayers(std::span<const Qwen4ExpLayerWeights>(weights.layers));
   requireSharedAttention();
 }

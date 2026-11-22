@@ -1,5 +1,6 @@
 #include "ops/PagedAttention.hpp"
 
+#include "ops/AttentionPlanning.hpp"
 #include "ops/BufferExtent.hpp"
 #include "ops/LaneBindings.hpp"
 
@@ -116,36 +117,6 @@ std::string splitSuffix(const CompiledAttention &compiled, AttentionVariant vari
 // A layout's KV format, as its kernels' names hold it.
 std::string kernelFormat(kv::Layout layout) { return layout.format == kv::Format::BFloat16 ? "bf16" : "q8"; }
 
-// The pages a tile that sees visibleTokens reads: with a window of
-// windowTokens keys before each row, no more than its window's.
-uint64_t readPages(uint64_t visibleTokens, uint32_t windowTokens) {
-  const uint64_t seen = (visibleTokens + kv::kPageTokens - 1) / kv::kPageTokens;
-  return windowTokens ? std::min<uint64_t>(seen, kv::windowAttentionPages(windowTokens)) : seen;
-}
-
-// The history splits of each of a sequence's `tiles` query tiles, which read
-// `pages` pages. A sequence of one tile (a decode lane's of up to 8 rows)
-// takes a split per kTilePagesPerSplit pages, between kSharedSplits and
-// kAttentionMaximumSplits. A longer one, a lane's of 9 to 16 rows too, takes
-// a whole split per pagesPerSplit pages (AttentionCalibration), at least
-// kSharedSplits shared out over its tiles (all a short history takes) and at
-// most kSharedSplits, nor over all its tiles more than
-// kAttentionSequenceSplits: taking a tile's splits ran a sequence of two to
-// four tiles up to 9% slower (on an M6 at 128K tokens). With a window, no
-// more than the pages it reads (a split each). It depends on the sequence
-// alone, so batching never changes a sequence's partition.
-constexpr uint32_t kSharedSplits = 32;
-constexpr uint32_t kTilePagesPerSplit = 16;
-uint32_t attentionSplits(uint32_t tiles, uint64_t pages, uint32_t windowTokens, uint32_t pagesPerSplit) {
-  const uint32_t fewest = std::clamp(kSharedSplits / tiles, 1U, kSharedSplits);
-  const uint32_t most = std::clamp(kAttentionSequenceSplits / tiles, fewest, kSharedSplits);
-  const uint32_t splits = static_cast<uint32_t>(
-      tiles == 1 ? std::clamp<uint64_t>((pages + kTilePagesPerSplit - 1) / kTilePagesPerSplit, kSharedSplits,
-                                        kv::kAttentionMaximumSplits)
-                 : std::clamp<uint64_t>(pages / pagesPerSplit, fewest, most));
-  return windowTokens ? std::min(splits, kv::windowAttentionPages(windowTokens)) : splits;
-}
-
 // One dispatch normalizes both the queries and the keys, so their norms must
 // share a stored type.
 std::string qkNormKernel(std::string_view name, const NormWeights &queryNorm,
@@ -162,44 +133,6 @@ AttentionWorkspace attentionWorkspace(uint64_t rows, uint32_t headDimension) {
 
 // The fused rows of one tile split's partials, of every KV head and part.
 uint64_t slotRows(uint32_t queryHeads) { return uint64_t{kv::kAttentionTileRows} * queryHeads; }
-
-// The command's sequences' bounds and staging: each sequence's first staged
-// row, the staged KV-head rows of the sequences before it; their bounds'
-// sum and the largest bound, which the per-row kernels' grids span; and the
-// last sequence's staged rows, which end the staging its kernels reach.
-struct CommandRows final {
-  std::array<uint32_t, kMaximumSequences> stageRow{};
-  uint64_t bounds = 0;
-  uint32_t mostRows = 0;
-  uint64_t staged = 0;
-  kv::ChunkedPrefillParams last{};
-  uint32_t kvHeads = 0;
-
-  // The staging's bytes up to the last sequence's last KV head's first
-  // `reach` rows, `width` elements each (queries and attention rows).
-  [[nodiscard]] uint64_t rowBytes(uint64_t width, uint32_t reach) const noexcept {
-    return (staged - kvHeads * uint64_t{last.chunk_stride} + (kvHeads - 1) * uint64_t{last.chunk_stride} + reach) *
-           width * sizeof(uint16_t);
-  }
-};
-CommandRows commandRows(std::span<const kv::ChunkedPrefillParams> sequences, kv::Layout layout) {
-  if (sequences.empty() || sequences.size() > kMaximumSequences)
-    throw std::invalid_argument("invalid attention sequences");
-  CommandRows result;
-  for (size_t s = 0; s < sequences.size(); ++s) {
-    const std::string_view error = kv::chunkedPrefillValidationError(sequences[s]);
-    if (!error.empty()) throw std::invalid_argument(std::string(error));
-    result.stageRow[s] = static_cast<uint32_t>(result.staged);
-    result.bounds += sequences[s].chunk_tokens;
-    result.mostRows = std::max(result.mostRows, sequences[s].chunk_tokens);
-    result.staged += uint64_t{layout.kvHeads} * sequences[s].chunk_stride;
-  }
-  result.last = sequences.back();
-  result.kvHeads = layout.kvHeads;
-  if (result.staged > std::numeric_limits<uint32_t>::max())
-    throw std::invalid_argument("attention staging exceeds the kernel ABI");
-  return result;
-}
 
 // Sequence s's rows from row `first` of its layout entry on.
 SplashAttentionSequence sequenceRows(const kv::ChunkedPrefillParams &chunk, const CommandRows &rows, size_t s,
@@ -398,22 +331,8 @@ AttentionPlan PagedAttention::lastTiles(const AttentionPlan &plan) {
 }
 
 void PagedAttention::group(AttentionPlan &plan) {
-  plan.dispatchCount_ = 0;
-  for (uint32_t s = 0; s < plan.sequenceCount_; ++s) {
-    const AttentionPlan::Sequence &sequence = plan.sequences_[s];
-    const uint32_t tiles = kv::attentionTiles(sequence.rows) - sequence.firstTile;
-    const uint32_t slots = tiles * sequence.splits;
-    if (slots > plan.workspaceSlots)
-      throw std::invalid_argument("the attention workspace holds no sequence's splits");
-    // A sequence that does not fit the last dispatch starts the next.
-    if (!plan.dispatchCount_ || plan.dispatches_[plan.dispatchCount_ - 1].slots + slots > plan.workspaceSlots)
-      plan.dispatches_[plan.dispatchCount_++] = {};
-    AttentionPlan::Dispatch *dispatch = &plan.dispatches_[plan.dispatchCount_ - 1];
-    dispatch->sequence[dispatch->sequences++] = s;
-    dispatch->tiles += tiles;
-    dispatch->splits = std::max(dispatch->splits, sequence.splits);
-    dispatch->slots += slots;
-  }
+  plan.dispatchCount_ = groupDispatches(std::span(plan.sequences_).first(plan.sequenceCount_), plan.workspaceSlots,
+                                        plan.dispatches_);
 }
 
 AttentionWorkspace PagedAttention::workspace(uint32_t slots, uint32_t queryHeads, kv::Layout layout) {
