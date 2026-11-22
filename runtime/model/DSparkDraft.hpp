@@ -72,17 +72,15 @@ struct DSparkDraftWeights final {
   ops::DSparkMarkovWeights markov;
   std::vector<uint16_t> foldRows;
   metal::MetalBuffer foldInput;
-  // Each step's Markov workspace, the lanes' f_rnn rows, gathered from their
-  // rings for the chain, and the chain's lattice (ops::DSparkMarkovBuffers'
-  // candidates and unary), which the selector's tree reads.
+  // Each step's Markov workspace, and the lanes' f_rnn rows, gathered from
+  // their rings for the chain. The chain writes the selector's lattice
+  // (DFlashDecodeBuffers::candidates), not a lattice of its own.
   metal::MetalBuffer markovJoint;
   metal::MetalBuffer markovState;
   metal::MetalBuffer markovPrevious;
   metal::MetalBuffer markovLogits;
   metal::MetalBuffer markovPartialValues;
   metal::MetalBuffer markovPartialIds;
-  metal::MetalBuffer markovCandidates;
-  metal::MetalBuffer markovUnary;
   metal::MetalBuffer frnnRows;
 };
 
@@ -128,10 +126,13 @@ public:
                          std::span<const DFlashDraftRingLayer> ring, uint32_t rows,
                          uint32_t startPosition) const override;
   // The block's rows (the anchor's row normed, the mask rows), its layers,
-  // its final norm and its base logits over the whole vocabulary.
+  // its final norm and its base logits over the whole vocabulary, then each
+  // lane's Markov chain from its f_rnn into the selector's lattice
+  // (buffers.candidates and unary), whose candidates and probabilities the
+  // target's sampled verify rows test the chain's draws against.
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers, const DFlashDraftStep &step) const override;
-  // Each lane's Markov chain from its f_rnn, then its tree of it and its
-  // host chain.
+  // Each lane's tree of its chain and its host chain, over the lattice
+  // addDecode wrote.
   void addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
                     const DFlashDraftStep &step) const override;
   // Nothing: the block's rows are its own (addDecode).

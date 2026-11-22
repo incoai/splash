@@ -11,7 +11,13 @@
 //  - the f_rnn commit of each lane's last retained row;
 //  - the selector's tree of a recurrent chain (DraftSelector::addChain):
 //    a greedy lane's chain of candidate 0 with leaves beside it, a sampled
-//    lane's first child its chain's token.
+//    lane's first child its chain's token;
+//  - sampled cycles end to end, as a decode step runs them (the chain, its
+//    tree beside a lookup chain, the verify's rows, the target's selection
+//    and acceptance): the tokens a lane keeps at each position are draws of
+//    the target's distribution there, Monte Carlo, for a draft that
+//    disagrees with its target; a sampler that reads another lattice than
+//    the chain's (as before this test, all zeros) fails the same check.
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -22,6 +28,7 @@
 #include "ops/DraftAttention.hpp"
 #include "ops/DraftSelector.hpp"
 #include "ops/LaneRows.hpp"
+#include "ops/Sampling.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -32,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -447,6 +455,293 @@ void chainTree(MetalBackend &backend, bool sampled) {
   std::cout << "  chain tree" << (sampled ? " sampled" : " greedy") << ": ok\n";
 }
 
+// A position's draws against the distribution they should follow: the
+// chi-square statistic over the tokens expected at least five times, the
+// others pooled (into the least expected bin where the pool expects fewer),
+// as Wilson and Hilferty's normal score, infinite where a token the
+// distribution never draws was drawn; and the total variation distance.
+struct Fit final {
+  uint64_t draws = 0;
+  double score = 0.0;
+  double variation = 0.0;
+};
+
+Fit fit(std::span<const uint64_t> counts, std::span<const double> p) {
+  Fit result;
+  for (const uint64_t count : counts) result.draws += count;
+  if (!result.draws) return result;
+  const auto n = static_cast<double>(result.draws);
+  std::vector<std::pair<double, double>> bins;
+  double pooledCount = 0.0, pooledExpected = 0.0;
+  for (size_t token = 0; token < p.size(); ++token) {
+    const auto count = static_cast<double>(counts[token]);
+    const double expected = n * p[token];
+    result.variation += 0.5 * std::fabs(count / n - p[token]);
+    if (count > 0.0 && p[token] == 0.0) result.score = INFINITY;
+    if (expected >= 5.0) {
+      bins.emplace_back(count, expected);
+    } else {
+      pooledCount += count;
+      pooledExpected += expected;
+    }
+  }
+  if (pooledExpected >= 5.0 || bins.empty()) {
+    bins.emplace_back(pooledCount, pooledExpected);
+  } else {
+    auto least = std::ranges::min_element(bins, {}, [](const auto &bin) { return bin.second; });
+    least->first += pooledCount;
+    least->second += pooledExpected;
+  }
+  if (bins.size() < 2) return result;
+  double chi = 0.0;
+  for (const auto &[count, expected] : bins) chi += (count - expected) * (count - expected) / expected;
+  const double dof = static_cast<double>(bins.size() - 1), spread = 2.0 / (9.0 * dof);
+  result.score = std::max(result.score, (std::cbrt(chi / dof) - (1.0 - spread)) / std::sqrt(spread));
+  return result;
+}
+
+// The distribution a sampled policy draws from logits: the softmax at its
+// temperature of its top_k (every token at 0).
+std::vector<double> policyDistribution(std::span<const float> logits, const ops::SamplingPolicy &policy) {
+  std::vector<uint32_t> order(logits.size());
+  for (uint32_t token = 0; token < order.size(); ++token) order[token] = token;
+  std::ranges::sort(order, [&](uint32_t a, uint32_t b) { return logits[a] > logits[b] || (logits[a] == logits[b] && a < b); });
+  const size_t kept = policy.topK ? std::min<size_t>(policy.topK, order.size()) : order.size();
+  std::vector<double> p(logits.size(), 0.0);
+  double total = 0.0;
+  for (size_t rank = 0; rank < kept; ++rank) {
+    const uint32_t token = order[rank];
+    p[token] = std::exp((double(logits[token]) - double(logits[order[0]])) / policy.temperature);
+    total += p[token];
+  }
+  for (double &value : p) value /= total;
+  return p;
+}
+
+// Sampled cycles end to end, as model::Runtime runs a DSpark draft's decode
+// step: the Markov chain (ops::DSpark::addMarkov) writes the selector's
+// lattice, its tree grows over it beside the lane's host chain
+// (DraftSelector::addChain), the verify's rows are laid out from the trees
+// (addVerifyRows), and the target selects (Sampling::addVerify, its sampled
+// verify rows testing the children their draft drew against the candidates
+// and probabilities of the selector's lattice and trees) and accepts
+// (addAcceptance). Four lanes draft from one block whose Markov correction
+// makes each step's distribution follow the tokens drawn before it; the
+// target's distribution at each position is fixed whatever the path (its
+// rows' logits by depth), disagreeing with the draft: the draft's base
+// logits plus noise, and tokens the draft never proposes. Lanes 0-1 sample
+// at production's policy (temperature 1, every token), lanes 2-3 at 0.7 over
+// the top 24, beside a host chain of the target's second likeliest tokens.
+// The tokens a lane keeps at each position must be draws of the target's
+// distribution there, in every position with enough draws: no score above
+// 4.5. A sampler that reads another lattice than the chain's, all zeros, as
+// before DSpark's chain wrote the selector's lattice, must fail it.
+void sampledExactness(MetalBackend &backend) {
+  constexpr uint32_t hidden = 256, vocabulary = 64, proposed = 60, lanes = 4, groups = 2;
+  constexpr uint32_t rows = lanes * kRows, width = 2 * kRank + 2 * hidden;
+  constexpr float cap = 30.0F;
+  Random random(0x65786163);
+  std::mt19937_64 rng(0x65786163);
+  const auto zeroed = [&](uint64_t bytes) {
+    MetalBuffer buffer = shared(backend, bytes);
+    std::memset(buffer.contents(), 0, buffer.sizeBytes());
+    return buffer;
+  };
+
+  // The draft: its Markov head, and every lane's block of hidden, base and
+  // f_rnn rows, the same for all.
+  const ops::DSparkMarkovWeights weights{randomBf16(backend, uint64_t{kJoint} * width, random, 0.08F),
+                                         zeroed(kJoint * 4), randomBf16(backend, uint64_t{vocabulary} * kRank, random),
+                                         randomBf16(backend, uint64_t{vocabulary} * kRank, random, 0.3F),
+                                         zeroed(vocabulary * 4)};
+  for (uint32_t i = 0; i < kJoint; ++i) at<float>(weights.jointBias)[i] = 0.3F * random.unit();
+  for (uint32_t i = 0; i < vocabulary; ++i) at<float>(weights.foldBias)[i] = 0.5F * random.unit();
+  const ops::DSparkMarkovWorkspace workspace = ops::DSpark::markovWorkspace(lanes, vocabulary);
+  ops::DSparkMarkovBuffers markov{zeroed(uint64_t{lanes} * kRows * hidden * 2),
+                                  zeroed(uint64_t{lanes} * kRows * vocabulary * 4),
+                                  zeroed(uint64_t{lanes} * hidden * 2),
+                                  zeroed(workspace.jointBytes),
+                                  zeroed(workspace.stateBytes),
+                                  zeroed(workspace.previousBytes),
+                                  zeroed(workspace.logitsBytes),
+                                  zeroed(workspace.partialValuesBytes),
+                                  zeroed(workspace.partialIdsBytes),
+                                  {},
+                                  {}};
+  std::vector<float> base(kRows * vocabulary);
+  for (float &value : base) value = 3.0F * random.unit();
+  std::vector<uint16_t> hiddenRows(kRows * hidden), frnn(hidden);
+  for (uint16_t &value : hiddenRows) value = floatToBf16(random.unit());
+  for (uint16_t &value : frnn) value = floatToBf16(random.unit());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    std::ranges::copy(base, at<float>(markov.base) + uint64_t{lane} * kRows * vocabulary);
+    std::ranges::copy(hiddenRows, at<uint16_t>(markov.hidden) + uint64_t{lane} * kRows * hidden);
+    std::ranges::copy(frnn, at<uint16_t>(markov.frnn) + uint64_t{lane} * hidden);
+  }
+
+  // The target's logits at each depth, and each group's distributions.
+  // Token 0, which a sampler reading a lattice of zeros takes for every
+  // candidate, is among its likelier tokens.
+  std::vector<float> target(kRows * vocabulary);
+  for (uint32_t depth = 0; depth < kRows; ++depth) {
+    float *logits = target.data() + depth * vocabulary;
+    for (uint32_t token = 0; token < vocabulary; ++token)
+      logits[token] = (depth < kSteps ? 0.7F * base[(depth + 1) * vocabulary + token] : 0.0F) + 2.0F * random.unit();
+    logits[0] = *std::max_element(logits + 1, logits + vocabulary) - 2.0F;
+  }
+  const std::array<ops::SamplingPolicy, groups> policies{ops::SamplingPolicy{0, 1.0F, 1.0F},
+                                                         ops::SamplingPolicy{24, 0.7F, 1.0F}};
+  std::array<std::vector<std::vector<double>>, groups> distributions;
+  for (uint32_t group = 0; group < groups; ++group)
+    for (uint32_t depth = 0; depth < kRows; ++depth)
+      distributions[group].push_back(
+          policyDistribution(std::span(target).subspan(depth * vocabulary, vocabulary), policies[group]));
+
+  // The selector's buffers, its host chains, and the target's.
+  const uint64_t lattice = uint64_t{lanes} * kSteps * kCandidates, treeRows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
+  ops::DraftSelectorBuffers selection;
+  selection.partialValues = zeroed(16);
+  selection.candidates = zeroed(lattice * 4);
+  selection.unary = zeroed(lattice * 4);
+  selection.chainTokens = zeroed(uint64_t{lanes} * SPLASH_TREE_CHAIN_TOKENS * 4);
+  selection.chainRates = zeroed(uint64_t{lanes} * SPLASH_TREE_CHAIN_TOKENS * SPLASH_TREE_AGREEMENTS * 4);
+  selection.treeTokens = zeroed(treeRows * 4);
+  selection.trees = zeroed(treeRows * sizeof(ops::TreeRow));
+  selection.treeScores = zeroed(treeRows * 8);
+  selection.treeSizes = zeroed(lanes * 4);
+  selection.treeDraws = zeroed(treeRows * SPLASH_TREE_CHILDREN);
+  selection.treeNext = zeroed(treeRows * kCandidates * 4);
+  selection.treeCaps = zeroed(treeRows * 4);
+  selection.inputTokens = zeroed(rows * 4);
+  selection.treeRows = zeroed(rows * sizeof(ops::TreeRow));
+  selection.laneRows = zeroed(lanes * sizeof(ops::LaneRows));
+  selection.verifySources = zeroed(rows * 4);
+  for (uint32_t lane = 2; lane < lanes; ++lane)
+    for (uint32_t depth = 0; depth < kSteps; ++depth) {
+      const std::vector<double> &p = distributions[1][depth];
+      std::vector<uint32_t> order(vocabulary);
+      for (uint32_t token = 0; token < vocabulary; ++token) order[token] = token;
+      std::ranges::sort(order, [&](uint32_t a, uint32_t b) { return p[a] > p[b]; });
+      at<uint32_t>(selection.chainTokens)[lane * SPLASH_TREE_CHAIN_TOKENS + depth] = order[1];
+      std::fill_n(at<float>(selection.chainRates) + (lane * SPLASH_TREE_CHAIN_TOKENS + depth) * SPLASH_TREE_AGREEMENTS,
+                  SPLASH_TREE_AGREEMENTS, 0.6F);
+    }
+  const ops::SamplingWorkspace space = ops::Sampling::workspace(rows);
+  const uint32_t maskWords = (vocabulary + 31) / 32;
+  ops::SamplingBuffers sampling{.logits = zeroed(uint64_t{rows} * vocabulary * 4),
+                                .partialMasses = zeroed(space.partialMassesBytes),
+                                .vocabularyRows = zeroed(space.vocabularyRowsBytes),
+                                .uniforms = zeroed(uint64_t{lanes} * SPLASH_SAMPLING_UNIFORMS * 4),
+                                .constraintMasks = zeroed(uint64_t{lanes} * (SPLASH_TARGET_VERIFY_ROWS + 1) * maskWords * 4),
+                                .outputTokens = zeroed(rows * 4),
+                                .argmaxValues = zeroed(space.argmaxValuesBytes),
+                                .argmaxIndices = zeroed(space.argmaxIndicesBytes),
+                                .inputTokens = selection.inputTokens,
+                                .treeRows = selection.treeRows,
+                                .vocabularyRanges = zeroed(space.vocabularyRangesBytes),
+                                .vocabularyArrivals = zeroed(space.vocabularyArrivalsBytes),
+                                .laneRows = selection.laneRows,
+                                .verifySources = selection.verifySources,
+                                .candidates = selection.candidates,
+                                .treeDraws = selection.treeDraws,
+                                .treeNext = selection.treeNext};
+  const ops::AcceptanceBuffers acceptance{selection.inputTokens, selection.treeRows, sampling.outputTokens,
+                                          zeroed(lanes * 4),      zeroed(lanes * 4),   zeroed(lanes * 4),
+                                          selection.laneRows};
+  const MetalBuffer penaltyWords = zeroed(uint64_t{lanes} * vocabulary * 4);
+  const std::array<uint32_t, lanes> penaltyRows{0, 1, 2, 3};
+  std::vector<ops::SamplingPolicy> lanePolicies;
+  for (uint32_t lane = 0; lane < lanes; ++lane) lanePolicies.push_back(policies[lane / 2]);
+  const ops::StepRows step{lanes, rows, kRows};
+  const std::array<uint32_t, lanes> maximumRetained{kRows, kRows, kRows, kRows};
+  const ops::DraftSelector selector(vocabulary);
+  const ops::Sampling sampler(vocabulary);
+  // A lattice of the chain's own, which a sampler that reads the selector's
+  // never sees.
+  const MetalBuffer ownCandidates = zeroed(lattice * 4), ownUnary = zeroed(lattice * 4);
+
+  // `cycles` cycles; how often each group kept each token at each position.
+  using Counts = std::array<std::vector<std::vector<uint64_t>>, groups>;
+  const auto cyclesOf = [&](uint32_t cycles, bool samplerReadsChain) {
+    Counts counts;
+    for (auto &group : counts) group.assign(kRows, std::vector<uint64_t>(vocabulary, 0));
+    std::memset(selection.candidates.contents(), 0, selection.candidates.sizeBytes());
+    ops::DraftSelectorBuffers chain = selection;
+    if (!samplerReadsChain) {
+      chain.candidates = ownCandidates;
+      chain.unary = ownUnary;
+    }
+    markov.candidates = chain.candidates;
+    markov.unary = chain.unary;
+    for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
+      std::array<ops::DraftTreeLane, lanes> trees{};
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint32_t group = lane / 2;
+        trees[lane] = {.anchor = 5,
+                       .depth = kSteps,
+                       .chain = group ? kSteps : 0,
+                       .children = SPLASH_TREE_CHILDREN,
+                       .calibration = {},
+                       .temperature = policies[group].temperature,
+                       .noise = rng()};
+      }
+      for (uint32_t i = 0; i < lanes * SPLASH_SAMPLING_UNIFORMS; ++i)
+        at<float>(sampling.uniforms)[i] = static_cast<float>(rng() >> 40) * 0x1p-24F;
+      CommandGraph draft;
+      ops::DSpark::addMarkov(draft, weights, markov, {hidden, vocabulary, proposed, cap}, trees);
+      selector.addChain(draft, chain, trees);
+      ops::DraftSelector::addVerifyRows(draft, selection, step, 0.0F);
+      static_cast<void>(backend.submitCommandAsync(draft.dispatches()).wait());
+      // Each verify row's logits: the target's at its depth.
+      for (uint32_t row = 0; row < rows; ++row) {
+        const uint32_t depth = std::min<uint32_t>(at<ops::TreeRow>(selection.treeRows)[row].depth, kRows - 1);
+        std::copy_n(target.data() + depth * vocabulary, vocabulary,
+                    at<float>(sampling.logits) + uint64_t{row} * vocabulary);
+      }
+      CommandGraph verify;
+      sampler.addVerify(verify, lanePolicies, sampling, step, {}, {penaltyWords, penaltyRows});
+      sampler.addAcceptance(verify, acceptance, step, maximumRetained, {});
+      static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint32_t retained = at<uint32_t>(acceptance.retainedCounts)[lane];
+        const uint32_t first = at<ops::LaneRows>(selection.laneRows)[lane].first;
+        require(retained >= 1 && retained <= kRows, "a sampled lane kept no token, or more than its rows");
+        for (uint32_t position = 0; position < retained; ++position) {
+          const uint32_t token = at<uint32_t>(sampling.outputTokens)[first + position];
+          require(token < vocabulary, "a sampled lane kept a token outside the vocabulary");
+          ++counts[lane / 2][position][token];
+        }
+      }
+    }
+    return counts;
+  };
+  // The largest score of the positions of at least 300 draws, each group's
+  // first two at least where `deep`.
+  const auto worst = [&](const Counts &counts, const std::string &label, bool deep) {
+    double score = 0.0;
+    for (uint32_t group = 0; group < groups; ++group) {
+      uint32_t checked = 0;
+      for (uint32_t position = 0; position < kRows; ++position) {
+        const Fit result = fit(counts[group][position], distributions[group][position]);
+        if (result.draws < 300) continue;
+        ++checked;
+        score = std::max(score, result.score);
+        std::cout << "    " << label << " group " << group << " position " << position << ": " << result.draws
+                    << " draws, score " << result.score << ", total variation " << result.variation << '\n';
+      }
+      require(!deep || checked >= 2, label + ": a group kept too few tokens past its first to check");
+    }
+    return score;
+  };
+  const double exact = worst(cyclesOf(4000, true), "chain's lattice", true);
+  require(exact < 4.5, "a sampled DSpark lane's kept tokens are not its target's draws (score " +
+                           std::to_string(exact) + ")");
+  const double stale = worst(cyclesOf(1000, false), "another lattice", false);
+  require(stale > 10.0, "the exactness check passes a sampler that reads another lattice than the chain's (score " +
+                            std::to_string(stale) + ")");
+  std::cout << "  sampled exactness: ok (score " << exact << ", another lattice's " << stale << ")\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -465,6 +760,7 @@ int main(int argc, char **argv) {
       frnnCommit(backend);
       chainTree(backend, false);
       chainTree(backend, true);
+      sampledExactness(backend);
       std::cout << "dspark_metal_test: PASS\n";
       return 0;
     } catch (const std::exception &error) {

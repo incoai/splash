@@ -247,11 +247,10 @@ uint64_t foldInputBytes(const DFlashDraftLayout &layout) {
 // workspace of every lane and the lanes' f_rnn rows, and the fold's rows.
 uint64_t workspaceBytes(const DFlashDraftLayout &layout) {
   const ops::DSparkMarkovWorkspace markov = ops::DSpark::markovWorkspace(kLanes, layout.vocabularySize);
-  const uint64_t lattice = uint64_t{kLanes} * ExecutionLimits::draftProposalTokens * SPLASH_DRAFT_CANDIDATES;
   return uint64_t{layout.vocabularySize} * kRank * kBFloat16Bytes + uint64_t{layout.vocabularySize} * sizeof(float) +
          markov.jointBytes + markov.stateBytes + markov.previousBytes + markov.logitsBytes +
-         markov.partialValuesBytes + markov.partialIdsBytes + 2 * lattice * sizeof(uint32_t) +
-         uint64_t{kLanes} * layout.hiddenSize * kBFloat16Bytes + foldInputBytes(layout);
+         markov.partialValuesBytes + markov.partialIdsBytes + uint64_t{kLanes} * layout.hiddenSize * kBFloat16Bytes +
+         foldInputBytes(layout);
 }
 
 } // namespace
@@ -405,9 +404,6 @@ DFlashDraftWeights loadDSparkDraftWeights(metal::MetalBackend &backend, WeightIm
   weights->markovLogits = allocate(backend, markov.logitsBytes, BufferStorage::Shared, "step-logits");
   weights->markovPartialValues = allocate(backend, markov.partialValuesBytes, BufferStorage::Private, "partial-values");
   weights->markovPartialIds = allocate(backend, markov.partialIdsBytes, BufferStorage::Private, "partial-ids");
-  const uint64_t lattice = uint64_t{kLanes} * ExecutionLimits::draftProposalTokens * SPLASH_DRAFT_CANDIDATES;
-  weights->markovCandidates = allocate(backend, lattice * sizeof(uint32_t), BufferStorage::Shared, "candidates");
-  weights->markovUnary = allocate(backend, lattice * sizeof(float), BufferStorage::Shared, "candidate-logits");
   weights->frnnRows = allocate(backend, uint64_t{kLanes} * hidden * kBFloat16Bytes, BufferStorage::Private, "frnn");
   // The fold's rows, in whole blocks: a block's plan binds the rows it
   // stores.
@@ -573,7 +569,9 @@ void DSparkDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buff
       graph, buffers.hidden[current], weights_.finalNorm, buffers.finalHidden, hidden, rows, scratch, headPlan.input());
   target.add(graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
              head_, headPlan);
-  // Each lane's Markov chain, from its f_rnn.
+  // Each lane's Markov chain, from its f_rnn, into the selector's lattice,
+  // whose candidates a sampled verify row tests the chain's draws as: the
+  // target's probabilities of those tokens against the chain's.
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!buffers.laneAuxiliary[lane]) throw std::invalid_argument("a DSpark lane has no f_rnn row");
     ops::RowCopy::add(graph, buffers.laneAuxiliary[lane], {0, hidden, 0}, weights_.frnnRows, {lane, hidden, 0}, 1,
@@ -589,17 +587,14 @@ void DSparkDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buff
                           .logits = weights_.markovLogits,
                           .partialValues = weights_.markovPartialValues,
                           .partialIds = weights_.markovPartialIds,
-                          .candidates = weights_.markovCandidates,
-                          .unary = weights_.markovUnary},
+                          .candidates = buffers.candidates,
+                          .unary = buffers.unary},
                          {hidden, layout_.vocabularySize, layout_.proposedVocabulary, layout_.logitCap}, step.lanes);
 }
 
 void DSparkDraft::addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
                                const DFlashDraftStep &step) const {
-  ops::DraftSelectorBuffers chain = buffers;
-  chain.candidates = weights_.markovCandidates;
-  chain.unary = weights_.markovUnary;
-  selector_.addChain(graph, chain, step.lanes);
+  selector_.addChain(graph, buffers, step.lanes);
 }
 
 void DSparkDraft::addContextCommit(metal::CommandGraph &graph, DFlashContextBuffers buffers,

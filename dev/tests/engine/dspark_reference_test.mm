@@ -190,7 +190,6 @@ void runPrompt(MetalBackend &backend, const ops::ExecutionPlans &operators, cons
                const model::DFlashDraftWeights &weights, const Target &target, const Prompt &prompt,
                const std::filesystem::path &reference, Totals &totals) {
   const model::DFlashDraftLayout &layout = weights.layout;
-  const model::DSparkDraftWeights &dspark = *weights.dspark;
   const auto tracker = std::make_shared<model::StateAllocationTracker>();
   const model::DraftStateLayout state = layout.stateLayout();
   model::DFlashDraftRing ring(backend, tracker, state, "dspark-test-ring");
@@ -226,6 +225,8 @@ void runPrompt(MetalBackend &backend, const ops::ExecutionPlans &operators, cons
   decode.intermediate = buffer(backend, uint64_t{kRows} * layout.intermediateSize * 2);
   decode.finalHidden = buffer(backend, kRows * kHidden * 2);
   decode.logits = buffer(backend, uint64_t{kRows} * kVocabulary * 4);
+  decode.candidates = buffer(backend, uint64_t{kSteps} * kCandidates * 4);
+  decode.unary = buffer(backend, uint64_t{kSteps} * kCandidates * 4);
   decode.queryKeys = buffer(backend, attention.queryKeysBytes);
   decode.queryValues = buffer(backend, attention.queryValuesBytes);
   decode.ropeCos = buffer(backend, SPLASH_TARGET_VERIFY_ROWS * kPairs * 4);
@@ -312,8 +313,8 @@ void runPrompt(MetalBackend &backend, const ops::ExecutionPlans &operators, cons
     }
 
     // The chain against the reference's.
-    const auto *candidates = static_cast<const uint32_t *>(dspark.markovCandidates.contents());
-    const auto *unary = static_cast<const float *>(dspark.markovUnary.contents());
+    const auto *candidates = static_cast<const uint32_t *>(decode.candidates.contents());
+    const auto *unary = static_cast<const float *>(decode.unary.contents());
     NSArray *proposals = entry[@"draft"], *targets = entry[@"target"], *tops = entry[@"top"];
     bool agrees = true;
     uint32_t accepted = 0;

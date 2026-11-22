@@ -207,6 +207,12 @@ struct DFlashDecodeBuffers final {
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
   metal::MetalBuffer selectorHidden;
+  // The selector's lattice (ops::DraftSelectorBuffers' candidates and
+  // unary), which the selector's tree and the target's sampled verify rows
+  // read: a DSpark draft's Markov chain writes it here, where a DFlash2
+  // draft's selector writes it in addSelection.
+  metal::MetalBuffer candidates;
+  metal::MetalBuffer unary;
   metal::MetalBuffer queryKeys;
   metal::MetalBuffer queryValues;
   metal::MetalBuffer ropeCos;

@@ -2545,6 +2545,8 @@ struct Runtime::Impl {
     buffers.finalHidden = d(DecodeTensor::DraftFinalHidden);
     buffers.logits = d(DecodeTensor::Logits);
     buffers.selectorHidden = d(DecodeTensor::SelectorHidden);
+    buffers.candidates = selection.candidates;
+    buffers.unary = selection.unary;
     buffers.queryKeys = d(DecodeTensor::DraftQueryKeys);
     buffers.queryValues = d(DecodeTensor::DraftQueryValues);
     buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
