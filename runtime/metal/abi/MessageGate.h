@@ -14,9 +14,26 @@
 
 #define MESSAGE_GATE_THREADS 256u
 
+// The fused gate (ops::MessageGate, a decode step's rows): two kernels, each
+// over groups of MESSAGE_GATE_GROUP_ROWS rows, which read the gate's F32
+// weights once a group. message_gate_down normalizes and concatenates its
+// group's rows itself and writes MESSAGE_GATE_DOWN_OUTPUTS of their rank
+// values a threadgroup (32 threadgroups for a rank of 64; a simdgroup a
+// value, 8 threadgroups, took 2.0 ms of a decode step's 96 gates against
+// 1.25 ms on an M5 Pro); message_gate_apply takes MESSAGE_GATE_THREADS of a
+// row's values a threadgroup (a slice), a thread each: forget, gain and the
+// gated row, whose squares the slices of a group add, the last to arrive in
+// slice order, which then writes the group's normalized rows (slices of 128
+// and 64 values, two and four threads a value, ran no faster). A rank is at
+// most MESSAGE_GATE_MAXIMUM_RANK, a multiple of four.
+#define MESSAGE_GATE_GROUP_ROWS 8u
+#define MESSAGE_GATE_DOWN_OUTPUTS 2u
+#define MESSAGE_GATE_MAXIMUM_RANK 64u
+
 // A gate of `rows` rows of `hidden` values: the row x at column x_column of
 // rows of x_stride values and its message at message_column of rows of
-// message_stride values, both fp32.
+// message_stride values, both fp32; `rank` values a row between its
+// projections.
 struct MessageGateParams {
   uint32_t rows;
   uint32_t hidden;
@@ -24,6 +41,7 @@ struct MessageGateParams {
   uint32_t x_column;
   uint32_t message_stride;
   uint32_t message_column;
+  uint32_t rank;
 };
 
-static_assert(sizeof(MessageGateParams) == 24, "message gate parameters are 24 bytes on both sides");
+static_assert(sizeof(MessageGateParams) == 28, "message gate parameters are 28 bytes on both sides");

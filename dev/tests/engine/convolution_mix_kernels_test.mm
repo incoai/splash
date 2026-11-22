@@ -501,10 +501,12 @@ void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool curre
 
 // The gate of rows whose x is query 1 of a mix of three and whose message
 // is message 2 of four, against fp64 with the source's bf16 roundings of the
-// down projection's input and output.
-void gateTest(MetalBackend &backend) {
+// down projection's input and output: fused (a decode step's rows: one group
+// and a group and a part) and through the float projections (a prompt
+// chunk's), its counters back at zero.
+void gateTest(MetalBackend &backend, uint32_t rows) {
   std::mt19937 rng(31);
-  const uint32_t hidden = 2304, rank = 64, rows = 6;
+  const uint32_t hidden = 2304, rank = 64;
   const auto x = randoms(rng, size_t{rows} * 3 * hidden, 1.5f), message = randoms(rng, size_t{rows} * 4 * hidden, 0.7f),
              down = bf16Values(randoms(rng, size_t{rank} * 2 * hidden, 0.02f)),
              forget = randoms(rng, size_t{hidden} * rank, 0.1f), gain = randoms(rng, size_t{hidden} * rank, 0.1f),
@@ -522,7 +524,9 @@ void gateTest(MetalBackend &backend) {
                                         scratch(backend, size_t{rows} * rank * 2),
                                         scratch(backend, size_t{rows} * hidden * 4),
                                         scratch(backend, size_t{rows} * hidden * 4),
-                                        scratch(backend, size_t{rows} * hidden * 2)};
+                                        scratch(backend, size_t{rows} * hidden * 2),
+                                        scratch(backend, 4096)};
+  std::memset(buffers.counters.contents(), 0, buffers.counters.sizeBytes());
   CommandGraph graph;
   ops::MessageGate::add(graph, buffers, weights, {upload(backend, norm), true}, hidden, rows,
                         ops::FloatTile::Simdgroup);
@@ -563,7 +567,71 @@ void gateTest(MetalBackend &backend) {
     for (uint32_t d = 0; d < hidden; ++d)
       ok &= closeBf16(f32(got[size_t{r} * hidden + d]), v[d] * inverse * norm[d], 2e-3);
   }
-  check(ok, "message gate through its norm, x and the message at columns of wider rows");
+  const auto counters = download<uint32_t>(buffers.counters, 1024);
+  check(ok && std::all_of(counters.begin(), counters.end(), [](uint32_t c) { return c == 0; }),
+        "message gate of " + std::to_string(rows) + " rows (" +
+            (rows <= ops::MessageGate::kFusedRows ? "fused" : "float projections") +
+            ") through its norm, x and the message at columns of wider rows");
+}
+
+// The gate's two paths on the same rows: a call of more rows than
+// MessageGate::kFusedRows (a prompt chunk's: the float projections) against
+// calls of at most that many of those rows (a decode step's: the fused
+// kernels), each over views of the same buffers, row by row. Rounding points
+// are the same; what moves is the order of the rank values', forget's,
+// gain's and the norm's sums, and through it a rank value's bf16 rounding by
+// a step now and then. An M5 Max, an M5 Pro and an M6 (2026-11-21) measured
+// the same: 39 of 460,800 values differ, each by one bf16 step of the larger
+// (a share of 8.5e-5); bounded at twice those, 2 steps and a share of
+// 1.7e-4. A gate that read another row, message, column or rank value moves
+// values by whole units, thousands of steps.
+constexpr double kPathsSteps = 2, kPathsShare = 1.7e-4;
+void gatePathsTest(MetalBackend &backend) {
+  std::mt19937 rng(37);
+  const uint32_t hidden = 2304, rank = 64, rows = ops::MessageGate::kFusedRows + 72;
+  const auto x = randoms(rng, size_t{rows} * 3 * hidden, 1.5f), message = randoms(rng, size_t{rows} * 4 * hidden, 0.7f),
+             down = bf16Values(randoms(rng, size_t{rank} * 2 * hidden, 0.02f)),
+             forget = randoms(rng, size_t{hidden} * rank, 0.1f), gain = randoms(rng, size_t{hidden} * rank, 0.1f),
+             norm = randoms(rng, hidden, 0.5f);
+  const ops::MessageGateWeights weights{ops::QuantizedSegment::floats(rank, 2 * hidden, upload(backend, down)),
+                                        ops::QuantizedSegment::floats(hidden, rank, upload(backend, forget)),
+                                        ops::QuantizedSegment::floats(hidden, rank, upload(backend, gain))};
+  const MetalBuffer xs = upload(backend, x), messages = upload(backend, message), normBuffer = upload(backend, norm),
+                    counters = scratch(backend, 4096);
+  std::memset(counters.contents(), 0, counters.sizeBytes());
+  // Rows [first, first + count) of the shared rows into `output`'s.
+  const auto gate = [&](const MetalBuffer &output, uint32_t first, uint32_t count) {
+    const ops::MessageGateBuffers buffers{
+        backend.view(xs, uint64_t{first} * 3 * hidden * 4, uint64_t{count} * 3 * hidden * 4), 3 * hidden, hidden,
+        backend.view(messages, uint64_t{first} * 4 * hidden * 4, uint64_t{count} * 4 * hidden * 4), 4 * hidden,
+        2 * hidden, scratch(backend, size_t{count} * 2 * hidden * 2), scratch(backend, size_t{count} * rank * 2),
+        scratch(backend, size_t{count} * hidden * 4), scratch(backend, size_t{count} * hidden * 4),
+        backend.view(output, uint64_t{first} * hidden * 2, uint64_t{count} * hidden * 2), counters};
+    CommandGraph graph;
+    ops::MessageGate::add(graph, buffers, weights, {normBuffer, true}, hidden, count, ops::FloatTile::Simdgroup);
+    run(backend, graph);
+  };
+  const MetalBuffer general = scratch(backend, size_t{rows} * hidden * 2), fused = scratch(backend, size_t{rows} * hidden * 2);
+  gate(general, 0, rows);
+  for (uint32_t first = 0; first < rows; first += ops::MessageGate::kFusedRows)
+    gate(fused, first, std::min(ops::MessageGate::kFusedRows, rows - first));
+  const auto a = download<uint16_t>(general, size_t{rows} * hidden), b = download<uint16_t>(fused, size_t{rows} * hidden);
+  double steps = 0;
+  size_t differ = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i] == b[i]) continue;
+    ++differ;
+    const double larger = std::max(std::fabs(f32(a[i])), std::fabs(f32(b[i])));
+    int exponent = 0;
+    std::frexp(larger, &exponent);
+    steps = std::max(steps, std::fabs(double(f32(a[i])) - f32(b[i])) / std::ldexp(1.0, exponent - 8));
+  }
+  const double share = double(differ) / a.size();
+  check(steps <= kPathsSteps && share <= kPathsShare,
+        "message gate of " + std::to_string(rows) + " rows: the float projections' rows and the fused kernels': " +
+            std::to_string(differ) + " of " + std::to_string(a.size()) + " values differ, at most " +
+            std::to_string(steps) + " bf16 steps (bounds " + std::to_string(kPathsShare) + " of them, " +
+            std::to_string(kPathsSteps) + " steps)");
 }
 
 // The finish of rows of logits: the softcap below `tokens`, -inf past it.
@@ -605,7 +673,9 @@ int main(int argc, const char *argv[]) {
           for (uint32_t stack = 1; stack <= 4; ++stack) mixTest(backend, stack, queries, currentFloat);
         mixTest(backend, 0, 1, currentFloat);
       }
-      gateTest(backend);
+      for (const uint32_t rows : {6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1})
+        gateTest(backend, rows);
+      gatePathsTest(backend);
       logitFinishTest(backend);
     } catch (const std::exception &error) {
       std::cerr << "convolution and mix kernel test error: " << error.what() << '\n';

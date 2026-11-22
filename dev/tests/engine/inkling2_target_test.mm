@@ -303,11 +303,14 @@ constexpr std::array<double, 24> kOutputBounds{
 // after other tokens in the three rows before the split by 0.06.
 constexpr double kLogitsBound = 0.02;
 // A lane of a several-lane command against its prompt alone, uninstrumented:
-// its prefill row measured at most 0.00049 and its decode row 0.108 (a
+// its prefill row measured at most 0.00049 and its decode row 0.109 (a
 // one-token lane's), on an M5 Pro and an M6 alike; twice those. The lanes'
-// joint prefill takes other tiles than a prompt's own command, whose other
-// summation order this fixture carries through its 24 applications into the
-// lane's KV and states, which its decode step reads.
+// joint prefill takes other tiles than a prompt's own command, and its 1,000
+// rows run the message gates' float projections where a prompt of at most
+// MessageGate::kFusedRows rows alone, and every decode step, runs the fused
+// gate (ops/MessageGate.hpp): other summation orders of the same roundings,
+// which this fixture carries through its 24 applications into the lane's KV
+// and states, which its decode step reads.
 constexpr double kLanePrefillBound = 0.001, kLaneDecodeBound = 0.22;
 
 // An application's output against the reference: the mean absolute

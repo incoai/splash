@@ -234,7 +234,8 @@ void Inkling2LoopTarget::addGate(const PrefillStep &step, uint32_t application, 
                          .low = s.gateLow,
                          .forget = s.gateForget,
                          .gain = s.gateGain,
-                         .output = std::move(output)},
+                         .output = std::move(output),
+                         .counters = s.gateCounters},
                         weights, norm, hidden, step.rows,
                         linear(step).ggufFloatTile(step.rows, hidden, weights.forget.formatId));
 }

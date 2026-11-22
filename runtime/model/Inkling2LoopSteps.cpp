@@ -3,6 +3,7 @@
 #include "Checked.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "ops/MessageGate.hpp"
 #include "ops/RelativeAttention.hpp"
 
 #include <cstring>
@@ -69,6 +70,7 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
       {&Inkling2LoopScratch::gateLow, bytesFor<uint16_t>(shape.gateRank), 0, false},
       {&Inkling2LoopScratch::gateForget, bytesFor<float>(hidden), 0, false},
       {&Inkling2LoopScratch::gateGain, bytesFor<float>(hidden), 0, false},
+      {&Inkling2LoopScratch::gateCounters, 0, ops::MessageGate::kCountersBytes, false},
       {&Inkling2LoopScratch::zeros, bytesFor<uint16_t>(hidden), 0, false},
   };
   // A decode step's convolution inputs of every application, which its
@@ -125,9 +127,11 @@ Inkling2LoopSteps::Inkling2LoopSteps(const QwenTargetGeometry &geometry, const I
   decodeTensors_ = place(geometry_, shape_, true, 1, decodeBytes);
   prefill_ = backend_.allocateBuffer(prefillBytes, metal::BufferStorage::Shared, "inkling2-prefill-scratch");
   decode_ = backend_.allocateBuffer(decodeBytes, metal::BufferStorage::Shared, "inkling2-decode-scratch");
-  // The rows the MoE adds its weighted sum to, which nothing writes.
-  for (const metal::MetalBuffer &zeros : {prefillScratch(0).zeros, verifyScratch().zeros})
-    std::memset(zeros.contents(), 0, zeros.sizeBytes());
+  // The rows the MoE adds its weighted sum to, which nothing writes, and the
+  // fused gate's counters, which each gate leaves zero.
+  for (const Inkling2LoopScratch &scratch : {prefillScratch(0), verifyScratch()})
+    for (const metal::MetalBuffer &zeros : {scratch.zeros, scratch.gateCounters})
+      std::memset(zeros.contents(), 0, zeros.sizeBytes());
   requireStaging(prefillScratch(0), geometry_, kChunkRows);
   requireStaging(verifyScratch(), geometry_, ExecutionLimits::stepRows(geometry_.lanes));
 }
