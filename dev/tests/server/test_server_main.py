@@ -1214,13 +1214,17 @@ class CustomTemplateStartupTests(unittest.TestCase):
         data = b"{% for m in messages %}{{ m.content }}{% endfor %}\n"
         path = self.template("custom template.jinja", data)
         templates, tokenizer, _, status = self.start(main_args(chat_template_file=path))
+        # A Qwen model's template must end with a generation prompt; only a
+        # model that opens its turn itself takes a template without one.
         templates.assert_called_once_with(
-            tokenizer.return_value, override=data.decode()
+            tokenizer.return_value, override=data.decode(), opens_turn=False
         )
         self.assertEqual(self.file_lines(status), [f"Chat template file · {path}"])
         # Without one, the tokenizer's templates, and no line.
         templates, tokenizer, _, status = self.start(main_args())
-        templates.assert_called_once_with(tokenizer.return_value, override=None)
+        templates.assert_called_once_with(
+            tokenizer.return_value, override=None, opens_turn=False
+        )
         self.assertEqual(self.file_lines(status), [])
 
     def test_a_template_file_it_cannot_use_stops_startup_first(self):

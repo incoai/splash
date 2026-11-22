@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from server.chat_format import FLINT
+from server.chat_format import FLINT, INKLING
 
 from . import models
 from .models import ModelError
@@ -173,12 +173,40 @@ FLINT_PATTERNS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
+# The inkling2 profile, as Inkling 2's own tokenizer.json splits text before
+# its byte-level BPE, without a normalizer: o200k's pattern, whose punctuation
+# runs also take the slashes after them.
+INKLING_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+@dataclass(frozen=True)
+class TokenizerProfile:
+    """How a GGUF tokenizer profile's text becomes tokens before and in its
+    byte-level BPE."""
+
+    # The patterns that split text, each isolating its matches, in order.
+    patterns: tuple[str, ...]
+    # Whether text is NFC-normalized before them.
+    nfc: bool
+    # Whether a split that is itself in the vocabulary is its token, before
+    # any merge, as tiktoken's and Inkling's own tokenizer.json read it
+    # (ignore_merges); llama.cpp merges it, which gives another token
+    # wherever the merges do not rebuild the vocabulary's entry.
+    ignore_merges: bool = False
+
+
 # Each GGUF tokenizer profile (tokenizer.ggml.pre) Splash derives a tokenizer
-# for: the patterns that split text, each isolating its matches, in order,
-# and whether text is NFC-normalized before them.
+# for.
 TOKENIZER_PROFILES = {
-    "qwen35": ((QWEN35_PATTERN,), True),
-    "flint": (FLINT_PATTERNS, False),
+    "qwen35": TokenizerProfile((QWEN35_PATTERN,), nfc=True),
+    "flint": TokenizerProfile(FLINT_PATTERNS, nfc=False),
+    "inkling2": TokenizerProfile((INKLING_PATTERN,), nfc=False, ignore_merges=True),
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
@@ -222,7 +250,6 @@ def tokenizer_files(metadata):
             "unsupported GGUF tokenizer profile; expected gpt2/"
             + " or gpt2/".join(TOKENIZER_PROFILES)
         )
-    patterns, nfc = profile
     tokens = metadata.require("tokenizer.ggml.tokens", list)
     types = metadata.require("tokenizer.ggml.token_type", list)
     merges = metadata.require("tokenizer.ggml.merges", list)
@@ -250,17 +277,21 @@ def tokenizer_files(metadata):
             raise ModelError("GGUF automatic BOS/EOS insertion is unsupported: " + key)
     try:
         backend = Tokenizer(
-            token_models.BPE({t: i for i, t in enumerate(tokens)}, pairs)
+            token_models.BPE(
+                {t: i for i, t in enumerate(tokens)},
+                pairs,
+                ignore_merges=profile.ignore_merges,
+            )
         )
     except Exception as error:
         raise ModelError("invalid GGUF BPE vocabulary or merges") from error
-    if nfc:
+    if profile.nfc:
         backend.normalizer = normalizers.NFC()
     backend.pre_tokenizer = pre_tokenizers.Sequence(
         [
             *(
                 pre_tokenizers.Split(Regex(pattern), behavior="isolated")
-                for pattern in patterns
+                for pattern in profile.patterns
             ),
             pre_tokenizers.ByteLevel(
                 add_prefix_space=False, use_regex=False, trim_offsets=False
@@ -271,9 +302,13 @@ def tokenizer_files(metadata):
         add_prefix_space=False, use_regex=False, trim_offsets=False
     )
     backend.decoder = decoders.ByteLevel()
-    # The index of each added token, and whether it is special.
+    # The index of each added token, and whether it is special: a control
+    # token is, but for one of the tags the server reads its output by that
+    # the architecture's GGUFs type as control tokens (Architecture.text_tags),
+    # which decoding must keep, as Flint's GGUFs type their tags user-defined.
+    text_tags = ARCHITECTURES[text_architecture(metadata)].text_tags
     added = {
-        index: kind == CONTROL_TOKEN
+        index: kind == CONTROL_TOKEN and tokens[index] not in text_tags
         for index, kind in enumerate(types)
         if kind in (CONTROL_TOKEN, USER_DEFINED_TOKEN)
     }
@@ -326,6 +361,16 @@ def tokenizer_files(metadata):
 
 def text_architecture(metadata):
     arch = metadata.require("general.architecture", str)
+    if arch == "inkling2":
+        # Unsloth's own looped layout of Inkling 2, which no llama.cpp of
+        # ggml-org reads either; its repository holds the same tensors in
+        # the inkling2_loop layout as well.
+        raise ModelError(
+            "unsupported GGUF model architecture: inkling2, Unsloth's own "
+            "layout of Inkling 2; use a GGUF of the inkling2_loop layout, such "
+            "as ggml-org/Inkling-2-Mini-GGUF's, or Unsloth's Mainline_Support/ "
+            "file renamed to .gguf, with --model-dir"
+        )
     if arch not in ARCHITECTURES:
         raise ModelError("unsupported GGUF model architecture: " + arch)
     return arch
@@ -348,7 +393,7 @@ def model_config(metadata, vision=None):
         # The routed experts, which a pruned release keeps fewer of than its
         # family; the engine plans, sizes and loads them by this count.
         fields["num_experts"] = "expert_count"
-    text = {name: metadata.positive(arch + "." + key) for name, key in fields.items()}
+    text = {name: layer_number(metadata, arch, key) for name, key in fields.items()}
     text.update(
         num_hidden_layers=loaded_layers(metadata, arch),
         model_type=architecture.model_type,
@@ -365,6 +410,37 @@ def model_config(metadata, vision=None):
     if vision is not None:
         config["vision_config"] = vision_config(vision)
     return config
+
+
+def layer_number(metadata, arch, name):
+    """The header's positive number `name`, which a header may state per
+    layer, as llama.cpp writes Inkling 2's head counts: an array of one
+    value per layer, all the same."""
+    key = f"{arch}.{name}"
+    values = metadata.values.get(key)
+    if type(values) is list:
+        if (
+            len(values) != metadata.positive(arch + ".block_count")
+            or len(set(values)) != 1
+            or type(values[0]) is not int
+            or values[0] <= 0
+        ):
+            raise ModelError("GGUF metadata must be one positive number: " + key)
+        return values[0]
+    return metadata.positive(key)
+
+
+def float32_number(metadata, key):
+    """The header's float32 `key` as the shortest decimal that is the same
+    float32, as a configuration states it: 1e-06, not
+    9.999999974752427e-07."""
+    value = metadata.require(key, float)
+    single = struct.unpack("<f", struct.pack("<f", value))[0]
+    for digits in range(1, 10):
+        text = f"{value:.{digits}g}"
+        if struct.unpack("<f", struct.pack("<f", float(text)))[0] == single:
+            return float(text)
+    return value
 
 
 def loaded_layers(metadata, arch):
@@ -408,12 +484,14 @@ def layer_pattern(metadata, arch, name):
 EXPERT_GATING_FUNCTIONS = {1: "softmax", 2: "sigmoid"}
 
 
-def flint_stop_tokens(metadata):
-    """The tokens that end a Flint turn: the header's
+def stop_tokens(metadata, chat_format, family):
+    """The tokens that end a turn of `family`, whose chat format is
+    chat_format: the header's
     tokenizer.ggml.eog_token_ids where it states them; otherwise the IDs of
-    Flint's stop tokens (FLINT.stop_tokens), each a control token once in the
-    vocabulary, one of them the header's EOS. unsloth/flint-GGUF states the
-    list; other publishers' Flint GGUFs, of the same vocabulary, do not."""
+    the format's stop tokens (chat_format.stop_tokens), each a control token
+    once in the vocabulary, one of them the header's EOS. unsloth/flint-GGUF
+    states the list; other publishers' Flint GGUFs, of the same vocabulary,
+    and Inkling 2's do not."""
     key = "tokenizer.ggml.eog_token_ids"
     if key in metadata.values:
         stops = metadata.values[key]
@@ -427,7 +505,7 @@ def flint_stop_tokens(metadata):
     tokens = metadata.require("tokenizer.ggml.tokens", list)
     types = metadata.require("tokenizer.ggml.token_type", list)
     stops = []
-    for text in FLINT.stop_tokens:
+    for text in chat_format.stop_tokens:
         found = [index for index, token in enumerate(tokens) if token == text]
         if (
             len(found) != 1
@@ -441,7 +519,8 @@ def flint_stop_tokens(metadata):
         stops += found
     if metadata.require("tokenizer.ggml.eos_token_id", int) not in stops:
         raise ModelError(
-            f"GGUF metadata states no {key}, and its EOS is none of Flint's stop tokens"
+            f"GGUF metadata states no {key}, and its EOS is none of {family}'s "
+            "stop tokens"
         )
     return stops
 
@@ -457,7 +536,7 @@ def flint_text_config(metadata, arch):
     gating = metadata.require(arch + ".expert_gating_func", int)
     if gating not in EXPERT_GATING_FUNCTIONS:
         raise ModelError(f"unsupported GGUF expert gating function: {gating}")
-    stops = flint_stop_tokens(metadata)
+    stops = stop_tokens(metadata, FLINT, "Flint")
     sliding = layer_pattern(metadata, arch, "attention.sliding_window_pattern")
     rotated = layer_pattern(metadata, arch, "attention.rope_pattern")
     return {
@@ -480,6 +559,74 @@ def flint_text_config(metadata, arch):
             layer for layer, rotates in enumerate(rotated) if not rotates
         ],
         "eos_token_id": stops,
+    }
+
+
+def inkling_text_config(metadata, arch):
+    """What Inkling 2's config.json states in its text_config beyond the sizes
+    every architecture's does, by its own keys, from its header: the padded
+    vocabulary and the tokens beside the padding, the context, the window
+    and the windowed layers (local_layer_ids, from
+    attention.sliding_window_pattern), the windowed layers' heads, the
+    relative position bias, the clips and log scaling, the short
+    convolutions, the attention residuals' blocks, the routed experts and
+    their router, the expert activation's softcaps, the final softcap, the
+    loop and the tokens that end a turn. The engine's model check holds each
+    to the family's, and the header to them. A value the header states as a
+    float32 is the shortest decimal of that float32 (float32_number)."""
+
+    def number(name):
+        return metadata.positive(f"{arch}.{name}")
+
+    def decimal(name):
+        return float32_number(metadata, f"{arch}.{name}")
+
+    sliding = layer_pattern(metadata, arch, "attention.sliding_window_pattern")
+    unpadded = number("vocab_size_unpadded")
+    if unpadded != len(metadata.require("tokenizer.ggml.tokens", list)):
+        raise ModelError(
+            f"GGUF metadata {arch}.vocab_size_unpadded is not the tokenizer's "
+            "vocabulary"
+        )
+    shared = metadata.values.get(f"{arch}.expert_shared_count", 0)
+    if type(shared) is not int or shared < 0:
+        raise ModelError(f"invalid GGUF metadata: {arch}.expert_shared_count")
+    swa_heads = layer_number(metadata, arch, "attention.head_count")
+    swa_kv_heads = layer_number(metadata, arch, "attention.head_count_kv")
+    return {
+        "vocab_size": number("vocab_size"),
+        "unpadded_vocab_size": unpadded,
+        "model_max_length": number("context_length"),
+        "swa_head_dim": number("attention.key_length_swa"),
+        "swa_num_attention_heads": swa_heads,
+        "swa_num_key_value_heads": swa_kv_heads,
+        "sliding_window_size": number("attention.sliding_window"),
+        "local_layer_ids": [layer for layer, slides in enumerate(sliding) if slides],
+        "d_rel": number("attention.relative_length"),
+        "rel_extent": number("attention.relative_extent"),
+        "qk_l2_clip_threshold": decimal("attention.qk_clip"),
+        "rel_l2_clip_threshold": decimal("attention.relative_clip"),
+        "log_scaling_n_floor": number("attention.log_scale_floor"),
+        "log_scaling_alpha": decimal("attention.log_scale_alpha"),
+        "rms_norm_eps": decimal("attention.layer_norm_rms_epsilon"),
+        "sconv_kernel_size": number("shortconv.l_cache"),
+        "n_layers_per_attn_res_block": number("attn_res.block_size"),
+        "n_routed_experts": number("expert_count"),
+        "num_experts_per_tok": number("expert_used_count"),
+        "n_shared_experts": shared,
+        "intermediate_size": number("expert_feed_forward_length"),
+        "route_scale": decimal("expert_weights_scale"),
+        "mlp_gate_softcap": decimal("activation.situ_beta"),
+        "mlp_up_softcap": decimal("activation.situ_linear_beta"),
+        "final_logit_softcapping": decimal("final_logit_softcapping"),
+        "loop_config": {
+            "core_start": metadata.require(f"{arch}.loop.start", int),
+            "core_end": number("loop.end"),
+            "num_passes": number("loop.count"),
+            "gate_rank": number("loop.gate_rank"),
+            "is_varloop": metadata.require(f"{arch}.loop.varying", bool),
+        },
+        "eos_token_id": stop_tokens(metadata, INKLING, "Inkling 2"),
     }
 
 
@@ -603,6 +750,10 @@ class Architecture:
     # Whether its configuration is flat, the text model's at its top, as
     # Flint's is; otherwise under text_config, as Qwen's is.
     flat: bool = False
+    # The tags the server reads its model's output by that its GGUFs type as
+    # control tokens, which the derived tokenizer adds as tokens that are
+    # not special, so that decoding keeps them (ChatFormat.decoded_tags).
+    text_tags: tuple[str, ...] = ()
 
 
 # The GGUF text architectures Splash serves, by general.architecture.
@@ -616,5 +767,11 @@ ARCHITECTURES = {
         leading_dense=True,
         text_config=flint_text_config,
         flat=True,
+    ),
+    "inkling2_loop": Architecture(
+        "inkling2_loop_text",
+        moe=True,
+        text_config=inkling_text_config,
+        text_tags=INKLING.decoded_tags,
     ),
 }

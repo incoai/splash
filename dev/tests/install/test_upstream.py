@@ -24,6 +24,7 @@ from dev.tests.installer_fixtures import (
     DRAFT_COMMIT,
     FLINT,
     GGUF_CONFIGS,
+    GGUF_ONLY,
     MODEL,
     MOE,
     PROCESSOR,
@@ -83,6 +84,8 @@ class UpstreamTest(unittest.TestCase):
         # The engine's check (its model-check command), with and without the
         # draft, of each family an MLX checkpoint serves.
         for family in families.FAMILIES:
+            if family in GGUF_ONLY:
+                continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
             vision = "safetensors" if family.vision else "none"
@@ -92,11 +95,11 @@ class UpstreamTest(unittest.TestCase):
                     family,
                 )
 
-        # Qwen3.8-Flash-Next and Flint load from a GGUF too: the config the
-        # installer derives from it and its header name the family, with and
-        # without its draft (Flint's flat config, its release's keys, and a
-        # test draft naming one of its reserved tokens as its mask), and
-        # another family's draft is refused.
+        # Qwen3.8-Flash-Next, Flint and Inkling 2 load from a GGUF too: the
+        # config the installer derives from it and its header name the
+        # family, with and without its draft (Flint's flat config, its
+        # release's keys, and a test draft naming one of its reserved tokens
+        # as its mask), and another family's draft is refused.
         def headers(family):
             directory = self.root / family.name / "target"
             directory.mkdir(parents=True, exist_ok=True)
@@ -108,7 +111,11 @@ class UpstreamTest(unittest.TestCase):
         for family in GGUF_CONFIGS:
             configs = CONFIGS / family.name.lower()
             gguf_check = headers(family)
-            for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
+            # A family released without a draft (Inkling 2) is checked alone.
+            drafts = [{}]
+            if family.draft_repo is not None:
+                drafts.append({"draft": configs / "draft" / "config.json"})
+            for arguments in drafts:
                 self.assertIs(
                     upstream.check_model(
                         "gguf",

@@ -454,8 +454,8 @@ class ServeOption:
     # What a model's family must have for the option to act on it, one of
     # the facts install/families.py reports: a fact of its layout, as the
     # engine gives it (experts, recurrent_state, ple_table, sparse_kv,
-    # dense_ffn), or of its release (vision, reasoning_switch). None: every
-    # model.
+    # dense_ffn), or of its release (vision, reasoning_switch,
+    # reasoning_effort). None: every model.
     needs: str | None = None
 
     @property
@@ -753,7 +753,7 @@ SERVE_OPTIONS = (
             "SPLASH_REASONING_EFFORT, else each request's own)",
         ),
         environment="SPLASH_REASONING_EFFORT",
-        needs="reasoning_switch",
+        needs="reasoning_effort",
     ),
     ServeOption(
         "--default-reasoning-effort",
@@ -767,7 +767,7 @@ SERVE_OPTIONS = (
             "SPLASH_DEFAULT_REASONING_EFFORT, else the model template's)",
         ),
         environment="SPLASH_DEFAULT_REASONING_EFFORT",
-        needs="reasoning_switch",
+        needs="reasoning_effort",
     ),
     ServeOption(
         "--thinking-token-budget",

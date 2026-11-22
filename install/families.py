@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
     __package__ = "install"
 
 from server import serve_options
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, INKLING, QWEN, ChatFormat
 
 from . import models
 
@@ -46,6 +46,12 @@ QWEN_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
 # What Flint's GGUF release states (general.sampling.temp, top_p, top_k),
 # which are Qwen's numbers.
 FLINT_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
+# What Inkling 2's release states: generation_config.json's temperature 1.0,
+# and no truncation. It states no top_k, which transformers' generate reads
+# as its default 50, and ggml-org's GGUFs state so (general.sampling.top_k);
+# vLLM and SGLang, which the release names, read none as off, and so do
+# Unsloth's GGUFs and recommendation (top_k 0, top_p 1.0).
+INKLING_SAMPLING = SamplingDefaults(temperature=1.0, top_p=1.0, top_k=0)
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,9 @@ FAMILIES = (
         vision=False,
         draftless=False,
     ),
+    # Released without a draft, and served text only: its vision tower's
+    # projector (inkling2v) is none Splash loads yet.
+    ModelFamily("Inkling-2-Mini", None, INKLING, INKLING_SAMPLING, vision=False),
 )
 
 
@@ -117,8 +126,9 @@ LAUNCHER_NEEDS = {"--language-only": "vision"}
 def option_report(engine_facts):
     """What each family, by name, makes of the options of `splash serve`,
     from its facts: engine_facts, each family's facts of its layout by name,
-    as the engine's families command gives them, and its own vision tower
-    and reasoning switch. Each family's report holds the flags of the
+    as the engine's families command gives them, and its own vision tower,
+    reasoning switch and whether a request's reasoning effort reaches its
+    model. Each family's report holds the flags of the
     options that need a fact it lacks (ServeOption.needs, LAUNCHER_NEEDS),
     which act on none of its models, and the context its models serve:
     their native window, and the most past it, with YaRN."""
@@ -133,6 +143,7 @@ def option_report(engine_facts):
         facts = engine | {
             "vision": family.vision,
             "reasoning_switch": family.chat_format.reasoning_switch,
+            "reasoning_effort": family.chat_format.reasoning_effort,
         }
         report[family.name] = {
             "unusable": [flag for flag, fact in needs.items() if not facts[fact]],

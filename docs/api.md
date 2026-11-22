@@ -516,9 +516,13 @@ syntax ([chat formats](models.md#chat-formats)). In Qwen's XML a call opens at
 `\n</parameter>\n` where the next parameter, `</function>` or `</tool_call>`
 follows; in Flint's GLM tags a call opens at `<tool_call>`, the function's name
 follows it up to the first tag, and a value ends at `</arg_value>` where the
-next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
-other order, as a file an agent writes may. Tags written otherwise are text.
-Besides:
+next `<arg_key>` or `</tool_call>` follows; in Inkling's JSON frames a call
+opens at `<|message_model|>`, the function's name follows it up to
+`<|content_invoke_tool_json|>`, and the call's object runs to
+`<|end_message|>`: its `args` stream as they are read, written compactly and
+closed as valid JSON however the output ends, and its `name` names a call
+whose frame names none. A value may hold the tags in any other order, as a
+file an agent writes may. Tags written otherwise are text. Besides:
 
 - names lose the space around them; an opening that names no function, or a
   name too long to be one, opens no call and reads as the text the model
@@ -701,7 +705,9 @@ assistant prompt boundary. Prompts render without thinking, as effort `none`
 renders them. A model that opens its reasoning itself (Flint), which no effort
 turns off, would open it where the generation prompt ends: its prompt ends with
 an empty think block, `<think></think>`, and the answer slots are read after it,
-where its answer starts. Besides the row it takes `model`, `timeout`,
+where its answer starts; Inkling's ends with its turn's text block opened,
+`<|message_model|><|content_text|>`, as its template renders a turn without
+reasoning. Besides the row it takes `model`, `timeout`,
 `priority` and `cache_salt` as the generation APIs do ([request
 fields](#request-fields)); other generation controls return errors rather than
 silently changing the scoring protocol. A row's text is text to the model, as a
@@ -723,9 +729,10 @@ share the scheduler. Disconnects and timeouts cancel the current question.
 
 Preparation renders each prompt once, then enforces the context limit and the
 batch token budget before the per-slot boundary checks. A label can change only
-the tokens after the prompt's last message boundary (`<|im_end|>`, or Flint's
-`<|assistant|>`), which the tokenizer encodes on its own, so each check encodes
-that end with the option appended rather than the whole prompt. The checks
+the tokens after the prompt's last message boundary (`<|im_end|>`, Flint's
+`<|assistant|>` or Inkling's `<|end_message|>`), which the tokenizer encodes on
+its own, so each check encodes that end with the option appended rather than
+the whole prompt. The checks
 observe the request deadline and stop when the client disconnects.
 Prompts that exceed the context limit are rejected, not truncated.
 
@@ -787,7 +794,7 @@ fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
-| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn, and under `--reasoning-effort`, where the server sets every request's effort |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn, for Inkling 2, whose model opens its reasoning itself at the level its effort sets (`/v1/models` lists its efforts, and `--reasoning-effort` and `--default-reasoning-effort` set them), and under `--reasoning-effort`, where the server sets every request's effort |
 | `reasoning_effort` | The effort `--reasoning-effort` gives every request, whatever it asks; `null` without the option |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row, and the server is exiting ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |

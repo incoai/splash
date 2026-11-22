@@ -1239,6 +1239,13 @@ nothing; a reply whose output opens with `<think>` returns that block as its
 reasoning, and any other reply is all answer
 ([chat formats](models.md#chat-formats)).
 
+Inkling 2's model, too, opens its reasoning itself, and no effort turns it
+off, but its template renders the effort as a level the model reads, a
+`Thinking effort level` system block (`none` 0, `minimal` 0.1, `low` 0.2,
+`medium` 0.7, `high` 0.9, `xhigh` and `max` 0.99; 0.9 without an effort), so
+both options set it, and a request may send a number from 0 to 0.99 as its
+`reasoning_effort` too.
+
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```

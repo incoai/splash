@@ -1,6 +1,7 @@
 """Incremental model-output parsing, output blocks and final answer
 validation."""
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -176,6 +177,126 @@ class ReasoningSplitter:
         kind = "reasoning_content" if self.reasoning else "content"
         text, self.pending = self.pending, ""
         return [(kind, text)]
+
+
+class FrameSplitter:
+    """The reasoning and the answer of output a model frames as blocks
+    (ChatFormat.frames, Inkling's), as the output arrives. A block opens at
+    the frames' header, which a name may follow, and its content token
+    decides what it holds: a reasoning block's text is reasoning, a text
+    block's text content; the frames and the name are dropped. Any other
+    block is a call, which passes on as content whole, from its header
+    through its close, for the projector to read in the call syntax's
+    layout. A content token without a header opens its block too, and one
+    of a call stands for the call's header. Text outside any block, which a
+    model that frames its output does not write, is content. The model's
+    blocks follow each other, so reasoning may come again after its text,
+    as the model's own reader joins each kind."""
+
+    def __init__(self, frames, call_token):
+        self.frames = frames
+        # The content token of a call, after its function's name, as a
+        # block's content token comes after a name.
+        self.call_token = call_token
+        self.content_tokens = frames.content_tokens
+        self.state = "between"
+        self.pending = ""
+
+    @property
+    def reasoning(self):
+        """Whether the output so far ends inside a reasoning block."""
+        return self.state == "reasoning_content"
+
+    def put(self, text):
+        self.pending += text
+        output = []
+        frames = self.frames
+        while self.pending:
+            if self.state == "between":
+                tags = (frames.header, self.call_token, *self.content_tokens)
+                found = [
+                    (index, tag)
+                    for tag in tags
+                    if (index := self.pending.find(tag)) >= 0
+                ]
+                if not found:
+                    ready, self.pending = hold_partial(self.pending, *tags)
+                    output += [("content", ready)] if ready else []
+                    break
+                start, tag = min(found)
+                if start:
+                    output.append(("content", self.pending[:start]))
+                self.pending = self.pending[start + len(tag) :]
+                if tag == frames.header:
+                    self.state = "header"
+                elif tag == self.call_token:
+                    # A call without its header, whose object names it.
+                    output.append(("content", frames.header + tag))
+                    self.state = "call"
+                else:
+                    self.state = self.content_tokens[tag]
+                continue
+            if self.state == "header":
+                # A name may come before the content token, and no name
+                # holds "<", with which every token here begins.
+                start = self.pending.find("<")
+                if start < 0:
+                    if len(self.pending) > MAX_NAME_LENGTH:
+                        # Too long for a name: a call, which the projector
+                        # reads as text.
+                        output.append(("content", frames.header))
+                        self.state = "call"
+                        continue
+                    break
+                rest = self.pending[start:]
+                tag = next((t for t in self.content_tokens if rest.startswith(t)), None)
+                if tag is None:
+                    if any(
+                        len(rest) < len(t) and t.startswith(rest)
+                        for t in self.content_tokens
+                    ):
+                        break
+                    # A call: its header, its name and the rest go on whole.
+                    output.append(("content", frames.header))
+                    self.state = "call"
+                    continue
+                self.pending = rest[len(tag) :]
+                self.state = self.content_tokens[tag]
+                continue
+            # A block's text, or a call, runs to the close.
+            end = self.pending.find(frames.close)
+            if end < 0:
+                ready, self.pending = hold_partial(self.pending, frames.close)
+                if ready:
+                    field = "content" if self.state == "call" else self.state
+                    output.append((field, ready))
+                break
+            if self.state == "call":
+                output.append(("content", self.pending[: end + len(frames.close)]))
+            elif end:
+                output.append((self.state, self.pending[:end]))
+            self.pending = self.pending[end + len(frames.close) :]
+            self.state = "between"
+        return output
+
+    def finish(self):
+        text, self.pending = self.pending, ""
+        if self.state == "header":
+            # A header the output ends after, before its block's kind shows:
+            # a call cut while it named its function, or nothing.
+            return [("content", self.frames.header + text)] if text else []
+        if not text:
+            return []
+        field = "content" if self.state in ("between", "call") else self.state
+        return [(field, text)]
+
+
+def reasoning_splitter(thinking, tool_calls=False, chat_format=None):
+    """The splitter of a job's output: by its blocks where chat_format frames
+    them (FrameSplitter), else by its think block (ReasoningSplitter)."""
+    if chat_format is not None and chat_format.frames is not None:
+        return FrameSplitter(chat_format.frames, chat_format.call_syntax.name_close)
+    return ReasoningSplitter(thinking, tool_calls, chat_format)
 
 
 _NOT_JSON = object()
@@ -539,20 +660,9 @@ class StreamingToolCallProjector:
         """Whether the output so far ends inside a call, past its opening."""
         return self.state in ("name", "arguments", "parameter", "value")
 
-    def finish(self, incomplete):
-        """The content and calls of the output, and the events the stream
-        still owes for what put() held back.
-
-        Output cut short, by the token limit or a stop sequence inside a
-        call, keeps an open call with the arguments it has, and no call
-        whose name it cut; other output that ends inside a call closes the
-        call, what it held back after a value being the start of the value's
-        close. Cut output with a call has the content the stream published,
-        which leaves out whitespace that no visible text has followed since
-        the start or the last call. Otherwise the content is the text
-        outside calls without whitespace that only frames them and, when
-        cut, a trailing partial tag."""
-        events = []
+    def _end_call(self, incomplete, events):
+        """Close the call the output ends inside, unless it was cut, for
+        finish()."""
         if not incomplete:
             if self.state == "name":
                 # A name too long to be one stays text, as the content reads it.
@@ -569,6 +679,22 @@ class StreamingToolCallProjector:
         if self.state == "closing":
             self.pending = ""
             self.state = "content"
+
+    def finish(self, incomplete):
+        """The content and calls of the output, and the events the stream
+        still owes for what put() held back.
+
+        Output cut short, by the token limit or a stop sequence inside a
+        call, keeps an open call with the arguments it has, and no call
+        whose name it cut; other output that ends inside a call closes the
+        call, what it held back after a value being the start of the value's
+        close. Cut output with a call has the content the stream published,
+        which leaves out whitespace that no visible text has followed since
+        the start or the last call. Otherwise the content is the text
+        outside calls without whitespace that only frames them and, when
+        cut, a trailing partial tag."""
+        events = []
+        self._end_call(incomplete, events)
         if (
             self.state in ("content", "output", "json")
             and self.pending
@@ -606,6 +732,493 @@ def argument_deltas(arguments):
     # argument. Callers preserve fragment order.
     for offset in range(0, len(arguments), TOOL_ARGUMENT_DELTA_CHARS):
         yield arguments[offset : offset + TOOL_ARGUMENT_DELTA_CHARS]
+
+
+# What _JsonValue reads: a number or literal's characters, a number, a run
+# of a string's characters that need no escape, a whole escape (a surrogate
+# pair's two), the start of one, and a key.
+_SCALAR = re.compile(r"[A-Za-z0-9+\-.]+")
+_JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+_PLAIN = re.compile(r'[^"\\\x00-\x1f]+')
+_ESCAPE = re.compile(
+    r'\\(?:(["\\/bfnrt])'
+    r"|u([dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2})"
+    r"|u([dD][89abAB][0-9a-fA-F]{2})"
+    r"(?!(?:\\(?:u(?:[dD](?:[c-fC-F][0-9a-fA-F]{0,2})?)?)?)?\Z)"
+    r"|u([dD][c-fC-F][0-9a-fA-F]{2})"
+    r"|u((?![dD][89a-fA-F])[0-9a-fA-F]{4}))"
+)
+_ESCAPE_START = re.compile(
+    r"\\(?:u(?:[0-9a-fA-F]{0,3}|[dD][89abAB][0-9a-fA-F]{2}"
+    r"(?:\\(?:u(?:[dD](?:[c-fC-F][0-9a-fA-F]{0,2})?)?)?)?))?"
+)
+_KEY = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
+_JSON_SPACE = " \t\n\r"
+
+
+class _JsonValue:
+    """One JSON value as its text arrives, written back compactly as it is
+    read, so that what it has written is always the start of valid JSON that
+    close() completes: a separator and a key are written only with the value
+    after them, a number or literal once it ends, an escape once it is whole,
+    and a lone surrogate's escape as U+FFFD's. Text that is not JSON ends the
+    value where it is (failed), as do containers nested deeper than `depth`
+    or, with members, a value that is not an object. The text after the
+    value stays unread in pending. With members it writes an object's members without its braces,
+    as a call's arguments are written inside the projector's own."""
+
+    def __init__(self, depth, members=False):
+        self.depth = depth
+        self.members = members
+        # Each open container's close, and whether it holds an item yet.
+        self.stack = []
+        self.state = "value"
+        # What is written before the next value: a separator and its key.
+        self.prefix = ""
+        self.pending = ""
+        self.output = []
+
+    @property
+    def done(self):
+        return self.state == "done"
+
+    @property
+    def failed(self):
+        return self.state == "failed"
+
+    def _ended(self):
+        """A value ended: the container it is in now holds an item."""
+        if self.stack:
+            self.stack[-1][1] = True
+            self.state = "after"
+        else:
+            self.state = "done"
+
+    def _top(self):
+        """Whether the next value is the outermost one."""
+        return not self.stack
+
+    def _open(self, character):
+        if len(self.stack) >= self.depth or (
+            self.members and self._top() and character != "{"
+        ):
+            self.state = "failed"
+            return
+        if not (self.members and self._top()):
+            self.output.append(self.prefix + character)
+        self.prefix = ""
+        self.stack.append(["}" if character == "{" else "]", False])
+        self.state = "first_key" if character == "{" else "first_value"
+
+    def _close(self):
+        closing, _ = self.stack.pop()
+        if not (self.members and self._top()):
+            self.output.append(closing)
+        self._ended()
+
+    def _scalar(self, token):
+        """Write a number or literal that has ended; else fail."""
+        if (self.members and self._top()) or not (
+            token in ("true", "false", "null")
+            or (_JSON_NUMBER.fullmatch(token) and math.isfinite(float(token)))
+        ):
+            self.state = "failed"
+            return
+        self.output.append(self.prefix + token)
+        self.prefix = ""
+        self._ended()
+
+    def put(self, text):
+        """Read `text`, and return what it writes of it."""
+        self.pending += text
+        while self.pending and self.state not in ("done", "failed"):
+            if not self._step():
+                break
+        if self.state == "failed":
+            self.pending = ""
+        written, self.output = "".join(self.output), []
+        return written
+
+    def _step(self):
+        """Read what the pending text starts with; False where more text
+        must come first."""
+        pending = self.pending
+        if self.state == "string":
+            return self._string()
+        if self.state == "scalar":
+            token = _SCALAR.match(pending).group()
+            if len(token) == len(pending):
+                return False
+            self.pending = pending[len(token) :]
+            self._scalar(token)
+            return True
+        if self.state == "key":
+            if (key := _KEY.match(pending)) is None:
+                return False
+            self.pending = pending[key.end() :]
+            try:
+                name = json_codec.loads(key.group())
+            except ValueError:
+                self.state = "failed"
+                return True
+            separator = "," if self.stack[-1][1] else ""
+            self.prefix = separator + json_codec.dumps(_SURROGATE.sub("�", name))
+            self.state = "colon"
+            return True
+        character = pending[0]
+        self.pending = pending[1:]
+        if character in _JSON_SPACE:
+            return True
+        state = self.state
+        if state == "colon":
+            self.prefix += ":"
+            self.state = "value" if character == ":" else "failed"
+        elif state in ("first_key", "next_key"):
+            if character == "}" and state == "first_key":
+                self._close()
+            elif character == '"':
+                self.pending = character + self.pending
+                self.state = "key"
+            else:
+                self.state = "failed"
+        elif state == "after":
+            closing = self.stack[-1][0]
+            if character == closing:
+                self._close()
+            elif character == "," and closing == "}":
+                self.state = "next_key"
+            elif character == ",":
+                self.prefix = ","
+                self.state = "value"
+            else:
+                self.state = "failed"
+        elif character == "]" and state == "first_value":
+            self._close()
+        elif character in "{[":
+            self._open(character)
+        elif character == '"' and not (self.members and self._top()):
+            self.output.append(self.prefix + '"')
+            self.prefix = ""
+            self.state = "string"
+        elif _SCALAR.match(character):
+            self.pending = character + self.pending
+            self.state = "scalar"
+        else:
+            self.state = "failed"
+        return True
+
+    def _string(self):
+        pending = self.pending
+        if run := _PLAIN.match(pending):
+            self.output.append(run.group())
+            self.pending = pending[run.end() :]
+            return True
+        character = pending[0]
+        if character == '"':
+            self.output.append('"')
+            self.pending = pending[1:]
+            self._ended()
+            return True
+        if character != "\\":
+            # A control character, which a string holds only escaped.
+            self.output.append(json_codec.dumps(character)[1:-1])
+            self.pending = pending[1:]
+            return True
+        escape = _ESCAPE.match(pending)
+        if escape is None:
+            if _ESCAPE_START.fullmatch(pending):
+                return False
+            self.state = "failed"
+            return True
+        simple, pair, high, low, unit = escape.groups()
+        if simple is not None:
+            self.output.append("/" if simple == "/" else "\\" + simple)
+        elif high is not None or low is not None:
+            self.output.append("\\ufffd")
+        else:
+            self.output.append("\\u" + (pair or unit).lower())
+        self.pending = pending[escape.end() :]
+        return True
+
+    def close(self):
+        """What completes the value written so far, ending it where it is:
+        a number or literal it ends inside where it is whole, the open
+        string, then each open container. A key without its value and an
+        escape cut short are left out."""
+        if self.state == "scalar":
+            self._scalar(self.pending)
+        closing = "".join(self.output)
+        if self.state == "string":
+            closing += '"'
+        while self.stack:
+            container, _ = self.stack.pop()
+            if not (self.members and self._top()):
+                closing += container
+        self.state = "done"
+        self.pending = ""
+        self.output = []
+        return closing
+
+
+class _CallObject:
+    """The object of a call a JSON call syntax lays out, as its text arrives:
+    the function's name it names, and its arguments, an object whose members
+    are written as they are read (_JsonValue). Its other members are read
+    and left out, and so is a repeated one. Text that is not such an object
+    ends the reading where it is."""
+
+    def __init__(self, syntax):
+        self.syntax = syntax
+        self.state = "start"
+        self.pending = ""
+        self.key = None
+        self.value = None
+        self.arguments = None
+        self.seen = set()
+
+    def put(self, text):
+        """Read `text`; returns ("name", name) once the object names its
+        function, and ("arguments", text) for what is written of the
+        arguments."""
+        self.pending += text
+        events = []
+        while self.pending and self.state not in ("done", "failed"):
+            if self.state == "value":
+                written = self.value.put(self.pending)
+                self.pending = self.value.pending
+                self.value.pending = ""
+                if self.value is self.arguments and written:
+                    events.append(("arguments", written))
+                elif self.key == self.syntax.name_key:
+                    self.name_text += written
+                if self.value.failed:
+                    self.state = "failed"
+                elif self.value.done:
+                    if self.key == self.syntax.name_key:
+                        name = json_codec.loads(self.name_text)
+                        if isinstance(name, str):
+                            events.append(("name", name))
+                    self.state = "after"
+                else:
+                    break
+                continue
+            if self.state == "key":
+                if (key := _KEY.match(self.pending)) is None:
+                    break
+                self.pending = self.pending[key.end() :]
+                try:
+                    self.key = json_codec.loads(key.group())
+                except ValueError:
+                    self.state = "failed"
+                    continue
+                self.state = "colon"
+                continue
+            character, self.pending = self.pending[0], self.pending[1:]
+            if character in _JSON_SPACE:
+                continue
+            expected = {
+                "start": "{",
+                "first_key": '"}',
+                "next_key": '"',
+                "colon": ":",
+                "after": ",}",
+            }[self.state]
+            if character not in expected:
+                self.state = "failed"
+            elif character == "{":
+                self.state = "first_key"
+            elif character == "}":
+                self.state = "done"
+            elif character == '"':
+                self.pending = character + self.pending
+                self.state = "key"
+            elif character == ",":
+                self.state = "next_key"
+            else:
+                self._begin_value()
+        return events
+
+    def _begin_value(self):
+        """Read the value of the member named self.key."""
+        first = self.key not in self.seen
+        self.seen.add(self.key)
+        self.value = _JsonValue(
+            MAX_ARGUMENTS_DEPTH, members=self.key == self.syntax.arguments_key
+        )
+        if first and self.key == self.syntax.arguments_key:
+            self.arguments = self.value
+        self.name_text = ""
+        if not first and self.key == self.syntax.name_key:
+            self.key = None
+        self.state = "value"
+
+    def close(self):
+        """What completes the arguments written so far."""
+        if self.arguments is None:
+            return ""
+        return self.arguments.close()
+
+
+class JsonCallProjector(StreamingToolCallProjector):
+    """Parse the tool calls a model writes as JSON objects in frames of their
+    own (chat_format.JsonCallSyntax, Inkling's) out of the output as it
+    arrives into OpenAI JSON argument deltas, as StreamingToolCallProjector
+    parses calls laid out in tags; content, whitespace that only frames
+    calls and a structured answer are read as it reads them.
+
+    A call opens at the syntax's call_open, then names its function up to
+    name_close; an opening that names none there, or a name too long to be
+    one, reads as text. Its object follows up to call_close: its arguments,
+    an object, stream as they are read, written compactly (_JsonValue), and
+    so are valid JSON once the call closes; where the frame names no
+    function, the object's name names the call, which streams once named,
+    and a call that names none is left out. Arguments that are not an
+    object, or text that is not JSON, end what the call's arguments hold.
+    Without a tool policy the output has no calls, and nothing it writes is
+    dropped."""
+
+    def __init__(self, policy, request_id, structured=False, syntax=None):
+        super().__init__(policy, request_id, structured, syntax)
+        self.text_tags = (syntax.call_open,) if policy is not None else ()
+        # The object of the open call, and what it wrote of its arguments
+        # before it named the call.
+        self.call_object = None
+        self.held_arguments = []
+
+    def _open_call(self, name, events):
+        if not self.streamed_count:
+            # Whitespace before the first text only framed the calls.
+            self.content_fragments.clear()
+        self.function_name = name
+        self.call_id = f"call_{self.request_id}_{self.call_index}"
+        events.append(
+            (
+                "tool",
+                {
+                    "index": self.call_index,
+                    "id": self.call_id,
+                    "type": "function",
+                    "function": {"name": name},
+                },
+            )
+        )
+        self.argument_fragments = []
+        self._emit_argument("{", events)
+        for fragment in self.held_arguments:
+            self._emit_argument(fragment, events)
+        self.held_arguments = []
+
+    def _read_call(self, text, events):
+        for kind, value in self.call_object.put(text):
+            if kind == "name":
+                name = value.strip(NAME_SPACE)
+                if self.call_id is None and 0 < len(name) <= MAX_NAME_LENGTH:
+                    self._open_call(name, events)
+            elif self.call_id is not None:
+                self._emit_argument(value, events)
+            else:
+                self.held_arguments.append(value)
+
+    def _close_call(self, events):
+        """End the open call at its close: complete its arguments, or leave
+        out a call that named no function."""
+        closing = self.call_object.close()
+        if self.call_id is not None:
+            if closing:
+                self._emit_argument(closing, events)
+            self._finish_call(events)
+        self.call_object = None
+        self.held_arguments = []
+        self.state = "content"
+
+    def put(self, text):
+        self.pending += text
+        events = []
+        syntax = self.syntax
+        while self.pending:
+            if self.state == "output":
+                first = self.pending.lstrip()
+                if not first:
+                    break
+                # A structured answer is one JSON value or tool calls.
+                self.state = "content" if first.startswith("<") else "json"
+            if self.state == "json" or (self.state == "content" and not self.text_tags):
+                self._emit_content(self.pending, events)
+                self.pending = ""
+                break
+            if self.state == "content":
+                start = self.pending.find(syntax.call_open)
+                if start < 0:
+                    ready, self.pending = hold_partial(self.pending, syntax.call_open)
+                    self._emit_content(ready, events)
+                    break
+                self._emit_content(self.pending[:start], events)
+                self.pending = self.pending[start + len(syntax.call_open) :]
+                self.state = "name"
+                continue
+            if self.state == "name":
+                end = self.pending.find(syntax.name_end, 0, MAX_NAME_LENGTH + 1)
+                if end < 0:
+                    if len(self.pending) <= MAX_NAME_LENGTH:
+                        break
+                    end = len(self.pending)
+                rest = self.pending[end:]
+                if len(rest) < len(syntax.name_close) and syntax.name_close.startswith(
+                    rest
+                ):
+                    if rest:
+                        break
+                if not rest.startswith(syntax.name_close):
+                    # No call: the opening and the name are text.
+                    self._emit_content(syntax.call_open + self.pending[:end], events)
+                    self.pending = rest
+                    self.state = "content"
+                    continue
+                name = self.pending[:end].strip(NAME_SPACE)
+                self.pending = rest[len(syntax.name_close) :]
+                self.call_object = _CallObject(syntax)
+                self.state = "call"
+                if name:
+                    self._open_call(name, events)
+                continue
+            if self.state == "call":
+                end = self.pending.find(syntax.call_close)
+                if end < 0:
+                    text, self.pending = hold_partial(self.pending, syntax.call_close)
+                    self._read_call(text, events)
+                    break
+                text = self.pending[:end]
+                self.pending = self.pending[end + len(syntax.call_close) :]
+                self._read_call(text, events)
+                self._close_call(events)
+        return events
+
+    @property
+    def in_call(self):
+        return self.state in ("name", "call")
+
+    def _end_call(self, incomplete, events):
+        if self.state == "name":
+            # An opening the output ends inside its name: no call.
+            self.pending = ""
+            self.state = "content"
+        elif self.state == "call" and not incomplete:
+            text, self.pending = self.pending, ""
+            self._read_call(text, events)
+            self._close_call(events)
+
+
+def tool_call_projector(policy, request_id, structured=False, chat_format=None):
+    """The projector of a chat job's output in its format's call syntax:
+    JSON calls in frames of their own where chat_format frames its blocks,
+    else calls laid out in tags."""
+    if chat_format.frames is not None:
+        return JsonCallProjector(
+            policy, request_id, structured, chat_format.call_syntax
+        )
+    return StreamingToolCallProjector(
+        policy, request_id, structured, chat_format.call_syntax
+    )
 
 
 @dataclass(slots=True)
