@@ -116,6 +116,17 @@ struct QwenTargetDimensions {
   // selector_softcap_mode after_correction).
   float logitSoftcap = 0.0F;
   uint32_t vocabularyTokens = 0;
+  // How its DFlash2 drafts read it, as their producer captured it. At each
+  // target layer id they read (DFlashDraftLayout::targetLayers), the rows
+  // that layer writes; with draftReadsLayerInputs, the rows passed into that
+  // layer, as the layer before wrote them (not a mix of them its norms read,
+  // as Inkling 2's block residual makes), and at id `layers` the rows its
+  // head reads, its final norm's (dflash_config capture_final_norm). Their
+  // rows of their own tokens are the token table's rows as its first layer
+  // reads them, through the table's RMS norm with draftEmbeddingNorm
+  // (dflash_config embedding_normalization folded_rmsnorm).
+  bool draftReadsLayerInputs = false;
+  bool draftEmbeddingNorm = false;
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   // The dense FFN's width.
   uint32_t intermediateSize = 0;
@@ -179,6 +190,11 @@ struct QwenTargetDimensions {
     return vocabularyTokens ? vocabularyTokens : vocabularySize;
   }
   [[nodiscard]] constexpr ops::LogitFinishValues logitFinish() const noexcept { return {logitSoftcap, tokens()}; }
+  // The target layer ids its drafts may read: its layers, and its head's
+  // with draftReadsLayerInputs.
+  [[nodiscard]] constexpr uint32_t draftReadableLayers() const noexcept {
+    return layers + (draftReadsLayerInputs ? 1u : 0u);
+  }
   // Whether layer `layer`'s FFN is a MoE block, and the block's index among
   // the target's (its ExpertStore block).
   [[nodiscard]] constexpr bool isMoeLayer(uint32_t layer) const noexcept {

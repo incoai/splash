@@ -82,6 +82,7 @@ Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetG
   static_assert(Qwen4ExpLayout::sharedAttention, "the layout states the attention its target's layers run");
   requireLayers(std::span<const Qwen4ExpLayerWeights>(weights.layers));
   requireSharedAttention();
+  requireDraftRows(false, false);
 }
 
 QwenTargetScratchBytes Qwen4ExpTarget::allocatedScratchBytes() const noexcept { return steps_.allocatedBytes(); }

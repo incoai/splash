@@ -697,9 +697,9 @@ template <class Layout> void requireQuantization(NSDictionary *config, const Lay
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
 // window, convolutions and selector must be those the draft kernels are built
 // for, and its block at least their rows; its hidden size, vocabulary, mask
-// token and the finish of its logits the target's; and the target layers it
-// reads (target_layer_ids) some of the target's, ascending. Its layers,
-// intermediate size and rotary base are its own.
+// token, the finish of its logits and how it reads its target the target's;
+// and the target layers it reads (target_layer_ids) some of the target's,
+// ascending. Its layers, intermediate size and rotary base are its own.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
@@ -749,6 +749,14 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   if (flash[@"target_hidden_reduction"])
     requireEqual(requireString(flash, @"target_hidden_reduction", "draft config target_hidden_reduction"),
                  reduction, "checkpoint", "draft config dflash_config target_hidden_reduction");
+  // Its rows of its own tokens as they were made (embedding_normalization):
+  // the token table's rows through their norm where its target's first layer
+  // reads them so (QwenTargetDimensions::draftEmbeddingNorm), which its config
+  // then states, else as stored.
+  if (target.draftEmbeddingNorm || flash[@"embedding_normalization"])
+    requireEqual(requireString(flash, @"embedding_normalization", "draft config embedding_normalization"),
+                 target.draftEmbeddingNorm ? "folded_rmsnorm" : "none", "checkpoint",
+                 "draft config dflash_config embedding_normalization");
   // Its head's finish, its target's (QwenTargetDimensions::logitSoftcap and
   // vocabularyTokens), stated where its target has one: the softcap, which
   // its selector's scores take after their edges (selector_softcap_mode
@@ -762,14 +770,21 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   }
   if (target.tokens() != target.vocabularySize || flash[@"valid_vocab_size"])
     requireNumbers(flash, "checkpoint", "draft config dflash_config", {{"valid_vocab_size", target.tokens()}});
+  // The ids of the rows it reads (QwenTargetDimensions::draftReadsLayerInputs):
+  // a target layer's output rows, or the rows passed into a layer, the id
+  // past the target's layers its final norm's rows, which its config then
+  // states it reads (capture_final_norm).
   NSArray *ids = requireArray(flash, @"target_layer_ids", "draft config target_layer_ids");
   std::vector<uint32_t> targetLayers;
   for (id value : ids) {
     targetLayers.push_back(
         requireWhole(value, "draft config target_layer_ids " + std::to_string(targetLayers.size())));
-    if (targetLayers.back() >= target.layers)
+    if (targetLayers.back() >= target.draftReadableLayers())
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
+  const bool finalNorm = !targetLayers.empty() && targetLayers.back() == target.layers;
+  if (finalNorm || flash[@"capture_final_norm"])
+    requireBooleans(flash, "draft config dflash_config", {{"capture_final_norm", finalNorm}});
   const DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
@@ -923,7 +938,7 @@ bool ModelDescriptor::valid() const noexcept {
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
                layout.hiddenSize == draft.hiddenSize &&
                draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+               draft.targetLayers[draft.targetLayerCount - 1] < layout.draftReadableLayers() &&
                // A family whose drafts choose the mask token holds its draft's.
                (!layout.draftChoosesMaskToken() ||
                 (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&

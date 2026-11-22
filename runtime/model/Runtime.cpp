@@ -2939,8 +2939,9 @@ struct Runtime::Impl {
     encodeDecodeCaptures(graph, entries, items, maximumRetained, step);
   }
 
-  // The embedding of the lanes' first `rows` tokens into `output`'s rows (the
-  // target's hidden rows of a step's rows, or the draft's of its blocks).
+  // The embedding of the lanes' first `rows` tokens into `output`'s rows, the
+  // target's hidden rows of a step's rows (a draft's block rows are its own,
+  // QwenTarget::addDraftEmbedding).
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens, const MetalBuffer &output, uint32_t lanes,
                             uint32_t rows) {
     if (!lanes || lanes > kLaneCount)
@@ -4014,9 +4015,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->addRopeTables(draft, {}, 0, impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
                        width * kDecodeRows, {}, {}, impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
                        impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(draft, DecodeTensor::DraftInputTokens,
-                              impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width,
-                              width * kDraftRows);
+  impl_->targetModel->addDraftEmbedding(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftInputTokens, width),
+                                       impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
+                                       width * kDraftRows);
   impl_->draftModel.addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
   impl_->encodeDraftBatchGraph(draft, entries, {logicalPositions.data(), width}, {depths.data(), width},
                                std::span(proposals).first(width), step, choice.floor);

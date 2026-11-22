@@ -106,9 +106,10 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 // responsible for choosing device-specific Metal pipelines and compute tiles.
 struct QwenTargetGeometry final : QwenTargetDimensions {
   QwenTargetGeometry() = default;
-  // A target of `dimensions` whose DFlash2 draft reads the output rows of
-  // `captureLayers` (DFlashDraftLayout::targetLayerIds); more than the
-  // geometry holds leave it invalid.
+  // A target of `dimensions` whose DFlash2 draft reads the rows of
+  // `captureLayers` (DFlashDraftLayout::targetLayerIds), as the dimensions'
+  // draftReadsLayerInputs names them; more than the geometry holds leave it
+  // invalid.
   QwenTargetGeometry(const QwenTargetDimensions &dimensions, std::span<const uint32_t> captureLayers)
       : QwenTargetDimensions(dimensions), captureLayerCount(static_cast<uint32_t>(captureLayers.size())) {
     if (captureLayerCount <= captureLayerValues.size())
@@ -133,7 +134,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     shape.int8Experts = moeInt8Experts;
     return shape;
   }
-  // The layers whose output rows the DFlash2 draft reads, ascending.
+  // The target layer ids whose rows the DFlash2 draft reads, ascending.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   // The target's KV layout in the format the runtime stores KV in, and its
@@ -174,7 +175,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   captureLayers() const noexcept {
     return {captureLayerValues.data(), captureLayerCount};
   }
-  // The capture slot of `layer`, whose output the draft reads.
+  // The capture slot of target layer id `layer`, whose rows the draft reads.
   [[nodiscard]] constexpr std::optional<uint32_t> captureSlot(uint32_t layer) const noexcept {
     const auto layers = captureLayers();
     const auto found = std::find(layers.begin(), layers.end(), layer);
@@ -192,7 +193,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   }
   // The layout itself was checked by requireQwenLayout when the target
   // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
-  // of its layers, ascending. A target without GDN layers has no GDN shape.
+  // of its layers, ascending, or its head's rows past them where it reads
+  // layer inputs (draftReadableLayers). A target without GDN layers has no
+  // GDN shape.
   // The projection lists hold every projection the weights dispatch, which
   // each have sizes; a target with dense FFNs, a MoE target's leading layers
   // too, holds their gate and up projections.
@@ -205,7 +208,8 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     const auto captured = [&] {
       if (!captureLayerCount || captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
       const auto ids = captureLayers();
-      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
+      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() &&
+             ids.back() < draftReadableLayers();
     };
     const bool dense = intermediateSize && sized(gateUpProjections);
     return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
@@ -534,6 +538,12 @@ public:
   virtual void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
+  // The rows a DFlash2 draft reads of `rows` tokens of its own (its anchor and
+  // mask rows): the token table's rows (addEmbedding), but a family's whose
+  // first layer reads them through a norm of their own, which normalizes them
+  // alike (QwenTargetDimensions::draftEmbeddingNorm).
+  virtual void addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                                 metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a decode step (`step`, whose lanes' rows
   // the layout places, QwenTargetCommitBuffers::laneRows): in the step's
   // command after its forward, or for constrained decoding in the next
@@ -692,6 +702,12 @@ protected:
   // geometry's heads, KV layout, output gate and RoPE: the check of a target
   // whose layers attend through it (addPrefillMixer).
   void requireSharedAttention() const;
+  // Throws unless the family's drafts read what the target captures and
+  // embeds for them (QwenTargetDimensions::draftReadsLayerInputs and
+  // draftEmbeddingNorm): the rows passed into its layers or their outputs
+  // (`inputs`), and its token rows through their norm or as stored
+  // (`normedTokens`).
+  void requireDraftRows(bool inputs, bool normedTokens) const;
   // The shared attention's plans of a step's sequences, which every attention
   // layer of a target that attends through it runs, and with a sliding window
   // (kv::Layout::windowTokens) the windowed plan its sliding layers run
@@ -769,6 +785,12 @@ protected:
   // Copies a step's read rows of its output work, rows 0.. of `compact`, to
   // their rows of `output`; nothing when it outputs every row.
   void addReadRows(const PrefillStep &step, const metal::MetalBuffer &compact, const metal::MetalBuffer &output) const;
+  // The draft's capture of `rows`, a step's rows of target layer id `id`
+  // (the layer's output, or the rows passed into it where the family's
+  // drafts read layer inputs, QwenTargetDimensions::draftReadsLayerInputs),
+  // when the draft reads the id: a decode step's every row, a prompt chunk's
+  // those its sequences' captures name (forEachPrefillCapture).
+  void addDraftCapture(const PrefillStep &step, uint32_t id, metal::MetalBuffer rows) const;
   // Each of a prefill step's captures of layer `index`'s output rows, when
   // the draft reads the layer: capture(slot, source row, destination row,
   // rows) of the captured hidden rows' slot `slot`.

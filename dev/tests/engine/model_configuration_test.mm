@@ -1044,8 +1044,12 @@ void testFlint(const std::filesystem::path &fixtures) {
             "text config tie_word_embeddings must be false"}})
     refuses(flint.with(&SourceModel::config, refused.from, refused.to), refused.error,
             "a Flint config with " + std::string(refused.to) + " was accepted");
-  // A family whose head takes no finish refuses a draft trained for one.
-  for (const std::string_view stated : {R"("final_logit_softcapping": 30.0,)", R"("valid_vocab_size": 150000,)"})
+  // A family whose head takes no finish, whose drafts read its layers'
+  // outputs and its token table's rows as stored, refuses a draft trained
+  // otherwise.
+  for (const std::string_view stated :
+       {R"("final_logit_softcapping": 30.0,)", R"("valid_vocab_size": 150000,)", R"("capture_final_norm": true,)",
+        R"("embedding_normalization": "folded_rmsnorm",)"})
     refuses(flint.with(&SourceModel::draft, R"("block_size": 8,)", R"("block_size": 8, )" + std::string(stated)),
             "draft config dflash_config", "a Flint draft with " + std::string(stated) + " was accepted");
   // A flat config is read only for a family whose configs are flat, and

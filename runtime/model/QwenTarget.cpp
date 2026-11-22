@@ -77,6 +77,11 @@ void QwenTarget::requireSharedAttention() const {
     throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
 }
 
+void QwenTarget::requireDraftRows(bool inputs, bool normedTokens) const {
+  if (geometry_.draftReadsLayerInputs != inputs || geometry_.draftEmbeddingNorm != normedTokens)
+    throw std::invalid_argument("the target captures and embeds other rows than its family's drafts read");
+}
+
 QwenTarget::~QwenTarget() = default;
 
 QwenTargetScratchBytes QwenTarget::allocatedScratchBytes() const noexcept { return {}; }
@@ -99,6 +104,11 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               uint32_t rows) const {
   ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, std::move(hidden),
                       rows);
+}
+
+void QwenTarget::addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer hidden,
+                                   uint32_t rows) const {
+  addEmbedding(graph, std::move(tokens), std::move(hidden), rows);
 }
 
 void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers buffers,
@@ -445,6 +455,17 @@ void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::Me
                     {destinationRow, capturedWidth, slot * width}, rows, width);
 }
 
+void QwenTarget::addDraftCapture(const PrefillStep &step, uint32_t id, metal::MetalBuffer rows) const {
+  if (step.decode) {
+    if (const auto slot = geometry_.captureSlot(id))
+      addCapture(step.graph, *slot, rows, 0, step.decode->capturedTargetHidden, 0, step.rows);
+    return;
+  }
+  forEachPrefillCapture(step, id, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t count) {
+    addCapture(step.graph, slot, rows, source, step.buffers.captured, destination, count);
+  });
+}
+
 namespace {
 
 // The rows a mixer's output projection adds to the layer's input rows into.
@@ -471,6 +492,9 @@ public:
     static_assert(Layout::sharedAttention, "the layout states the attention its target's layers run");
     requireLayers(std::span<const Layer>(weights.layers));
     requireSharedAttention();
+    // Its layers' outputs, which their loop captures, and its stored token
+    // rows (addDraftEmbedding).
+    requireDraftRows(false, false);
   }
 
   std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph, std::span<const QwenTargetPrefillChunk> chunks,
@@ -520,15 +544,8 @@ private:
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
     addReadRows(step, b.hidden[index & 1], b.hidden[(index & 1) ^ 1]);
-    // The draft reads a decode step's every row of the layers it captures.
-    if (step.decode) {
-      if (const auto slot = geometry_.captureSlot(index))
-        addCapture(step.graph, *slot, b.hidden[(index & 1) ^ 1], 0, step.decode->capturedTargetHidden, 0, step.rows);
-      return;
-    }
-    forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
-      addCapture(step.graph, slot, b.hidden[(index & 1) ^ 1], source, b.captured, destination, rows);
-    });
+    // The draft reads its layers' output rows.
+    addDraftCapture(step, index, b.hidden[(index & 1) ^ 1]);
   }
   // A decode step's head reads every row's final norm.
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const {

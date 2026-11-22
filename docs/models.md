@@ -322,7 +322,7 @@ configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads.
 
 A draft's `config.json` states its layers, intermediate size, rotary base and
-the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
+the target layers whose rows it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
 its reserved special tokens, 150019 to 150143, as its
@@ -332,8 +332,16 @@ its reserved special tokens, 150019 to 150143, as its
 those the kernels are built for, and its block at least their 8 rows, of which a
 cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
 `readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
-whole 16-channel convolution groups. Its logits take the finish of its
-target's head (`QwenTargetDimensions::logitSoftcap` and `vocabularyTokens`,
+whole 16-channel convolution groups. How a draft reads its target is its
+target's family's, as its drafts' producer captured it
+(`QwenTargetDimensions`): at each id the rows that target layer writes, or,
+for a family whose drafts read layer inputs (`draftReadsLayerInputs`), the
+rows the layer reads and at the id past its layers the final norm's rows the
+head reads (`dflash_config.capture_final_norm`); and its own rows, its
+anchor's and its mask's, are the token table's rows as the target's first
+layer reads them, through the table's norm where the family's input takes
+one (`draftEmbeddingNorm`, `embedding_normalization` `folded_rmsnorm`). Its
+logits take the finish of its target's head (`QwenTargetDimensions::logitSoftcap` and `vocabularyTokens`,
 `DFlashDraft`): no padding row past the head's tokens is a candidate
 (`dflash_config.valid_vocab_size`), and the head's softcap
 (`final_logit_softcapping`) applies to each candidate's score after the
@@ -515,10 +523,10 @@ different text from run to run, even alone on an idle server
 cycle verifies a draft's block a lane whatever output its lanes have left, which caps only what they
 retain, so that an answer under a lower output limit starts the one under a higher. The speculation counts ([Output limits and
 streaming](api.md#output-limits-and-streaming)) count the proposals a cycle verified.
-The target writes the outputs of the layers the draft reads for each row it
-reads; Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams,
-as the streams' mean, summed in fp32 and stored as bf16, as the draft was
-trained on it. `dflash_config.target_hidden_reduction` states that reduction
+The target writes the rows of the layers the draft reads, as its family names
+them, for each row it reads; Qwen3.8-Flash-Next's, whose layers carry four
+hyper-connection streams, as the streams' mean, summed in fp32 and stored as
+bf16, as the draft was trained on it. `dflash_config.target_hidden_reduction` states that reduction
 (`stream_mean` for a hyper-connected target, `none` for another); a config
 without it takes its target's, and one that names another is refused. Native
 loading validates the configuration against the target again and loads the draft

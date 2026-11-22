@@ -86,8 +86,10 @@ struct DFlashDraftLayout final {
   float rotaryTheta = 0.0F;
   uint32_t selectorRank = 0;
   uint32_t kvHeads = 0;
-  // The target layers whose output rows the draft reads, ascending: the
-  // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
+  // The target layer ids whose rows the draft reads, ascending, as its
+  // target's family names them (QwenTargetDimensions::draftReadsLayerInputs):
+  // the first targetLayerCount of targetLayers, targetHiddenSize() values a
+  // row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
 
