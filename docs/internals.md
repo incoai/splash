@@ -1073,10 +1073,7 @@ format's segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize`
 its segments' formats alone, and a `moe_expert_gguf_m<rows>` pipeline its pass's routed and
 shared formats alone, which specialize it as Metal function constants
 (`ComputeDispatch::constants`, a pipeline per name and values), so its first use compiles a
-loop for each of those formats rather than for all 44. A staged `gguf_decode_<format>_m<rows>_<e>`
-pipeline takes its dispatch's row groups the same way (`ops::stagedRowGroups`), as the int8
-tiles' fused one and `gguf_rotate_int8` take theirs (`ops::int8RowGroups`), so that a pipeline of
-one group computes no group offsets. The norm, GDN and attention-reduce
+loop for each of those formats rather than for all 44. The norm, GDN and attention-reduce
 variants that also write the register kernels' input table carry `table16` in their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
 SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
 register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.

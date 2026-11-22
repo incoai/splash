@@ -128,13 +128,6 @@ inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device ucha
     output[o] = gguf_epilogue<Ep, Out>(v, aux, o);
   });
 }
-// A dispatch's row groups, function constant 3, which the host sets on every dispatch of gguf_decode
-// (ops::stagedRowGroups) and of gguf_decode_int8_fused (ops::int8RowGroups): a pipeline of one group takes no group
-// offsets. Zero at one group, they took the int8 fused tile 6.50 ms of a Ternary-Bonsai 16-row cycle against 1.7.0's
-// 6.11 on a 20-core M5 Pro, and under macOS 27.2's shader validation gguf_decode's instrumented pipeline with them read
-// in-bounds IQ4_NL weights as invalid loads and summed them wrong at 8-16 K splits (16-core M5 Pro), which it did not
-// without them.
-constant uint kRowGroups [[function_constant(3)]];
 // The staged decode kernels: grid (column tiles, K partitions, row groups), two simdgroups. A plan of more rows than
 // a tile holds runs two row groups of the tile of half its rows in one dispatch (ops::stagedRowGroups): row group z
 // computes rows [z Rows, (z + 1) Rows) with its own split partials (after the groups before it, splits x Rows rows
@@ -154,17 +147,11 @@ kernel void gguf_decode(device bfloat *input [[buffer(0)]], device uchar *w0 [[b
   quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
   threadgroup half stage[kStagedStages];
   threadgroup uint arrival;
-  // Row group z, in a pipeline of several: its rows' inputs, outputs and epilogue inputs, partials and counters.
-  if (kRowGroups > 1) {
-    const ulong rows = ulong(group.z) * Rows;
-    input += rows * p.input_size;
-    output += rows * p.out_stride;
-    partials += rows * p.splits * p.out_stride;
-    counters += group.z * (p.out_stride / GGUF_TILE_COLUMNS);
-    aux += rows * p.out_stride;
-  }
-  gguf_decode_tile<F, Rows, Ep>(input, w0, w1, meta, output, partials, counters, aux, p, group.xy, simd_lane,
-                                simd_group, stage, tl, &arrival);
+  const ulong rows = ulong(group.z) * Rows;
+  gguf_decode_tile<F, Rows, Ep>(input + rows * p.input_size, w0, w1, meta, output + rows * p.out_stride,
+                                partials + rows * p.splits * p.out_stride,
+                                counters + group.z * (p.out_stride / GGUF_TILE_COLUMNS), aux + rows * p.out_stride, p,
+                                group.xy, simd_lane, simd_group, stage, tl, &arrival);
 }
 template <class Out>
 using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, device uchar *, device Out *,
@@ -467,8 +454,7 @@ kernel void gguf_decode_int8(device char *input [[buffer(0)]], device uchar *w0 
   threadgroup char stages[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][2 * GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
   threadgroup float d[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][GGUF_STAGED_COLUMNS];
   threadgroup uint arrival;
-  // Row group z, in every pipeline of this tile, which the host does not specialize: its int8 rows and scales
-  // (gguf_rotate_int8), outputs, partials and counters.
+  // Row group z (gguf_decode): its int8 rows and scales (gguf_rotate_int8), outputs, partials and counters.
   const ulong group_rows = ulong(group.z) * Rows;
   input += group.z * gguf_rotation_int8_bytes(p.input_size, Rows);
   output += group_rows * p.out_stride;
@@ -488,6 +474,10 @@ kernel void gguf_decode_int8(device char *input [[buffer(0)]], device uchar *w0 
     output[o] = gguf_epilogue<Ep, Out>(v, aux, o);
   });
 }
+// The int8 fused tile's row groups (ops::int8RowGroups), function constant 3, which the host sets on every dispatch: a
+// pipeline of one group takes no group offsets (on a 20-core M5 Pro they took the tile 6.50 ms of a Ternary-Bonsai
+// 16-row cycle against 1.7.0's 6.11).
+constant uint kInt8RowGroups [[function_constant(3)]];
 // A fused projection's segments in one dispatch, as gguf_decode_fused_m<rows> runs them, each of the kernel's format:
 // the threadgroup's tile picks its segment, whose tiles walk as its projection alone would.
 template <class F, ushort Rows>
@@ -502,7 +492,7 @@ kernel void gguf_decode_int8_fused(device char *input [[buffer(0)]], GGUF_SEGMEN
   threadgroup float d[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][GGUF_STAGED_COLUMNS];
   threadgroup uint arrival;
   // Row group z, as gguf_decode_int8's, in a pipeline of several.
-  if (kRowGroups > 1) {
+  if (kInt8RowGroups > 1) {
     const ulong group_rows = ulong(group.z) * Rows;
     input += group.z * gguf_rotation_int8_bytes(p.input_size, Rows);
     output += group_rows * p.out_stride;

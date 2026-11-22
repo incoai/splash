@@ -318,10 +318,6 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset, config.spread},
               tileGrid(s.outputSize), {GGUF_STAGED_THREADS, 1, 1});
-    // The bf16 tile's pipeline is specialized to the dispatch's row groups
-    // (function constant 3, gguf_linear.metal's kRowGroups), so one of one
-    // group takes no group offsets; the int8 tile takes them in every pipeline.
-    if (!config.decodeInt8) graph.specialize(std::array<uint32_t, 4>{0, 0, 0, groups});
   };
   // A fused projection's segments in one dispatch (gguf_decode_fused_m*),
   // in tile order: segments with the most bytes per tile first, so their
