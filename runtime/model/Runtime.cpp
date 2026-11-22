@@ -714,6 +714,11 @@ struct Runtime::Impl {
   // Whether a streamed-expert target's cycles plan a draft's block a lane
   // (RuntimeInstrumentation::planBlocks).
   bool blockPlans = false;
+  // The captured rows of positions 0 .. replacedCaptureRows - 1 that every
+  // prefill command's draft reads in place of those its target captured
+  // (RuntimeInstrumentation::replaceCapturedRows).
+  std::optional<MetalBuffer> replacedCaptures;
+  uint32_t replacedCaptureRows = 0;
   // Whether commands copy the target's logits before their policy
   // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
   // batch lane of the last command that made them.
@@ -2119,6 +2124,20 @@ struct Runtime::Impl {
   void addDraftContext(CommandGraph &graph, std::span<const PrefillChunk> chunks, uint32_t index) {
     const PrefillChunk &chunk = chunks[index];
     if (!chunk.capturedRows) return;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    if (replacedCaptures) {
+      const uint32_t width = geometry.target.capturedHiddenSize();
+      for (const PrefillSequence &sequence : chunk.sequences)
+        for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
+          if (capture.absoluteEnd > replacedCaptureRows)
+            throw std::invalid_argument("the replaced captured rows end before a prompt's");
+          ops::RowCopy::add(graph, *replacedCaptures, {capture.absoluteBegin, width, 0},
+                            prefillArena->get(PrefillTensor::Captured, index),
+                            {sequence.captureBegin + capture.compactDestinationRow, width, 0},
+                            capture.absoluteEnd - capture.absoluteBegin, width);
+        }
+    }
+#endif
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
     std::vector<DFlashWindowCapture> windowCaptures;
@@ -4817,6 +4836,18 @@ void RuntimeInstrumentation::replaceTreeTokens(Runtime &runtime, uint64_t reques
 }
 
 void RuntimeInstrumentation::planBlocks(Runtime &runtime, bool enabled) { runtime.impl_->blockPlans = enabled; }
+
+void RuntimeInstrumentation::replaceCapturedRows(Runtime &runtime, std::span<const uint16_t> rows) {
+  Runtime::Impl &impl = *runtime.impl_;
+  const uint32_t width = impl.geometry.target.capturedHiddenSize();
+  if (rows.size() % width) throw std::invalid_argument("replaced captured rows are not whole rows");
+  impl.replacedCaptures.reset();
+  impl.replacedCaptureRows = static_cast<uint32_t>(rows.size() / width);
+  if (rows.empty()) return;
+  MetalBuffer buffer = impl.backend.allocateBuffer(rows.size_bytes(), BufferStorage::Shared, "replaced captured rows");
+  std::memcpy(contents<uint16_t>(buffer, "replaced captured rows"), rows.data(), rows.size_bytes());
+  impl.replacedCaptures = std::move(buffer);
+}
 
 std::vector<RuntimeInstrumentation::StepChoice> RuntimeInstrumentation::takeStepChoices(Runtime &runtime) {
   return std::exchange(runtime.impl_->stepChoices, {});

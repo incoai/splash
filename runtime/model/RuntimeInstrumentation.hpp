@@ -35,6 +35,12 @@ public:
   // rows), the captured rows in the order the draft's context plan captured
   // them (a cold prompt's first command: its rows).
   [[nodiscard]] static std::span<const uint16_t> lastCapturedRows(const Runtime &runtime, uint32_t chunk);
+  // Has every later prefill command's draft read `rows`, the captured rows of
+  // positions 0 .. their count - 1 (capturedHiddenSize bf16 values each), in
+  // place of those its target captures at those positions, so that a
+  // reference's draft and Splash's read the same rows; no rows restores the
+  // target's.
+  static void replaceCapturedRows(Runtime &runtime, std::span<const uint16_t> rows);
   // The draft's lattice of batch lane `lane` of the last decode step of
   // `lanes` lanes, until the next decode step, as ops::DraftSelector left
   // it: each proposal position's candidates, their unary scores (the

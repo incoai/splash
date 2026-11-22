@@ -354,7 +354,25 @@ from each candidate of the position before (from the anchor for the first),
 and the first position's probabilities after the anchor, softcapped where
 the draft takes the head's softcap (`RuntimeInstrumentation::
 lastDraftLattice`), which a reference forward of the draft fed the same
-captured rows and ids compares with.
+captured rows and ids compares with. `--captured-rows FILE` has the draft
+read FILE's rows (laid out as `--captures yes` writes them, each value a
+bf16) in place of those the target captured at those positions
+(`RuntimeInstrumentation::replaceCapturedRows`), so that the draft and a
+reference's read the same rows.
+
+`python -m dev.tools.draft_golden METALLIB MODEL_ROOT GOLDEN_DIR WORK_DIR`
+grades the installed model's draft against a reference's golden vectors,
+opt-in like `test-real` as it needs the model and the vectors: for each
+golden block, `teacher-logits` runs the block's anchor after the golden
+captured rows (`--captured-rows`, bf16 activations and KV), and the draft's
+candidates, unary scores, softcapped selector scores and greedy proposals
+are held to the golden set's tolerances, by default its `af4g64` outputs,
+the draft as Splash quantizes its projections (the README of the
+Inkling-2-Mini oracle's golden vectors states the layout and the rules). On
+an M5 Pro, the
+Inkling-2-Mini preview draft passes all 33 blocks of the oracle's five
+prompts: unary scores within 0.84 of the reference's (tolerance 1.5),
+softcapped scores within 0.43 (1.0), and its 168 graded proposals equal.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that

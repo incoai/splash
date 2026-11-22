@@ -4,6 +4,7 @@
 //   teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS [--window END:ROWS...]
 //                  [--kv-format int8|bf16] [--state-format fp32|bf16] [--activations auto|bf16]
 //                  [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes] [--draft yes]
+//                  [--captured-rows FILE]
 //
 // TOKENS holds little-endian uint32 token ids, read as they are: no BOS, no
 // chat template. For each window a cold request prefills ids [0, END - ROWS)
@@ -31,7 +32,12 @@
 // each proposal position's candidates, their unary scores and the edges to
 // them from the position before's candidates, and the first position's
 // probabilities after the anchor, which a reference draft fed the same
-// context rows (--captures yes) and ids compares with.
+// context rows (--captures yes) and ids compares with. With --captured-rows
+// FILE, each window's draft reads FILE's rows at positions 0 .. END - ROWS -
+// 1 in place of those its target captured
+// (RuntimeInstrumentation::replaceCapturedRows): fp32 rows laid out as
+// --captures yes writes them, each value a bf16, such as a reference's
+// captured rows, so that Splash's draft and the reference's read the same.
 
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Types.hpp"
@@ -59,6 +65,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -261,11 +268,12 @@ int main(int argc, char **argv) {
         std::cerr << "usage: teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS "
                      "[--window END:ROWS...] [--kv-format int8|bf16] [--state-format fp32|bf16] "
                      "[--activations auto|bf16] [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes] "
-                     "[--draft yes]\n";
+                     "[--draft yes] [--captured-rows FILE]\n";
         return 2;
       }
       std::vector<Window> windows;
       bool captures = false, draft = false;
+      std::string capturedRows;
       ops::Int8Activations int8Activations = ops::Int8Activations::On;
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -277,6 +285,8 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[index + 1]);
         if (option == "--window")
           windows.push_back(parseWindow(value));
+        else if (option == "--captured-rows")
+          capturedRows = value;
         else if (option == "--captures" || option == "--draft") {
           if (value != "yes")
             throw std::invalid_argument(std::string(option) + " takes yes");
@@ -343,9 +353,29 @@ int main(int argc, char **argv) {
       std::printf("device %s, %s KV, %s state, %zu ids\n", backend.capabilities().deviceName.c_str(),
                   format == kv::Format::Int8 ? "int8" : "bf16", std::string(ops::formatName(stateFormat)).c_str(),
                   tokens.size());
+      // The rows its draft reads in place of its target's, as bf16.
+      const uint32_t rowWidth = model.draft.layout.targetHiddenSize();
+      std::vector<uint16_t> replacedRows;
+      if (!capturedRows.empty()) {
+        std::ifstream file(capturedRows, std::ios::binary | std::ios::ate);
+        const auto bytes = static_cast<uint64_t>(file.tellg());
+        require(file && bytes % (uint64_t{rowWidth} * sizeof(float)) == 0,
+                "--captured-rows is not whole rows of " + std::to_string(rowWidth) + " fp32 values");
+        std::vector<float> values(bytes / sizeof(float));
+        file.seekg(0);
+        file.read(reinterpret_cast<char *>(values.data()), static_cast<std::streamsize>(bytes));
+        require(static_cast<bool>(file), "cannot read " + capturedRows);
+        replacedRows.resize(values.size());
+        for (size_t index = 0; index < values.size(); ++index) {
+          const std::optional<uint16_t> bits = model::exactBfloat16(values[index]);
+          require(bits.has_value(), "--captured-rows holds a value that is not a bf16");
+          replacedRows[index] = *bits;
+        }
+      }
+      model::RuntimeInstrumentation::replaceCapturedRows(executor, replacedRows);
       for (size_t index = 0; index < windows.size(); ++index)
         runWindow(executor, tokens, windows[index], index + 1, pageTable, vocabulary, argv[4],
-                  captures ? model.draft.layout.targetHiddenSize() : 0, draft);
+                  captures ? rowWidth : 0, draft);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "teacher-logits: " << error.what() << '\n';
