@@ -3,7 +3,6 @@
 #include "model/Inkling2Loop.hpp"
 #include "ops/AneFfn.hpp"
 #include "ops/BlockResidualMix.hpp"
-#include "ops/LogitFinish.hpp"
 #include "ops/MessageGate.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/RowCopy.hpp"
@@ -366,17 +365,14 @@ metal::MetalBuffer Inkling2LoopTarget::addPrefillEnd(PrefillStep &step) const {
       weights_.outputQuery, std::span(&weights_.finalNorm, 1), std::span(&output, 1),
       {.hidden = geometry_.hiddenSize, .stack = schedule_.headStates(), .queries = 1}, step.rows);
   addDraftCapture(step, schedule_.applications(), output);
-  if (const QwenTargetDecodeBuffers *d = step.decode) {
+  if (const QwenTargetDecodeBuffers *d = step.decode)
     addHead(step.graph, linear(step), d->finalHidden, d->logits, step.rows, step.buffers.linearScratch, {});
-    ops::LogitFinish::add(step.graph, d->logits, geometry_.vocabularySize, step.rows, geometry_.logitFinish());
-  }
   return output;
 }
 
 void Inkling2LoopTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer,
                                       metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const {
-  addHead(graph, operators_.linear(), std::move(hidden), logits, rows, scratch, {});
-  ops::LogitFinish::add(graph, std::move(logits), geometry_.vocabularySize, rows, geometry_.logitFinish());
+  addHead(graph, operators_.linear(), std::move(hidden), std::move(logits), rows, scratch, {});
 }
 
 void Inkling2LoopTarget::addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,

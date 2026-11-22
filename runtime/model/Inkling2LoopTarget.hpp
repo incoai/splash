@@ -10,10 +10,10 @@
 // convolves its keys, values and output (ops/ShortConvolution.hpp); mixes the
 // stack and its residual into its MoE's input; and convolves the MoE's output
 // onto its residual into its output rows. The head reads the output norm of
-// the final mix and finishes its logits (ops/LogitFinish.hpp). Its DFlash2
-// draft reads the rows passed into its captured applications and the final
-// norm's, as its producer captured them, and its token rows through the
-// table's norm.
+// the final mix, and the shared head finishes its logits (QwenTarget::addHead,
+// ops/LogitFinish.hpp). Its DFlash2 draft reads the rows passed into its
+// captured applications and the final norm's, as its producer captured them,
+// and its token rows through the table's norm.
 // Its step scratch is Inkling2LoopSteps'; its convolutions' state is the
 // auxiliary state of a lane's cell, which a decode step's commit writes.
 
@@ -90,7 +90,7 @@ private:
   void addPrefillExperts(PrefillStep &step, uint32_t application) const;
   // The final mix and output norm into buffers.hidden[1], a decode step's
   // into its final hidden rows, which the draft captures at id
-  // applications() and its head and finish then read.
+  // applications() and its head then reads.
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const;
 
   // The bf16 rows a schedule entry names in a step.

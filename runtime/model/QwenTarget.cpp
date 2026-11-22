@@ -6,6 +6,7 @@
 #include "model/WeightStore.hpp"
 #include "ops/AneFfn.hpp"
 #include "ops/Embedding.hpp"
+#include "ops/LogitFinish.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/RowCopy.hpp"
@@ -428,21 +429,23 @@ void QwenTarget::addHead(metal::CommandGraph &graph, const ops::Linear &linear, 
                          ops::PreparedInput prepared) const {
   const ops::Projection &head = vocabularyProjection();
   if (rows <= ops::kMaximumDecodeTileRows) {
-    linear.add(graph, {.input = std::move(input), .output = std::move(logits), .scratch = scratch, .prepared = prepared},
-               head, linear.plan(head, rows));
-    return;
+    linear.add(graph, {.input = std::move(input), .output = logits, .scratch = scratch, .prepared = prepared}, head,
+               linear.plan(head, rows));
+  } else {
+    // Each pass's views hold its plan's storage rows, which a step's row
+    // tensors hold (decodeStorageRows): the first 64 rows and the tile of the
+    // rest, at most 96 rows at five and six lanes and 128 at seven and eight.
+    for (uint32_t first = 0; first < rows; first += ops::kMaximumDecodeTileRows) {
+      const ops::LinearPlan plan = linear.plan(head, std::min(rows - first, ops::kMaximumDecodeTileRows));
+      linear.add(graph,
+                 {.input = rowsOf<uint16_t>(input, first, plan.storageRows(), geometry_.hiddenSize),
+                  .output = rowsOf<float>(logits, first, plan.storageRows(), geometry_.vocabularySize),
+                  .scratch = scratch},
+                 head, plan);
+    }
   }
-  // Each pass's views hold its plan's storage rows, which a step's row
-  // tensors hold (decodeStorageRows): the first 64 rows and the tile of the
-  // rest, at most 96 rows at five and six lanes and 128 at seven and eight.
-  for (uint32_t first = 0; first < rows; first += ops::kMaximumDecodeTileRows) {
-    const ops::LinearPlan plan = linear.plan(head, std::min(rows - first, ops::kMaximumDecodeTileRows));
-    linear.add(graph,
-               {.input = rowsOf<uint16_t>(input, first, plan.storageRows(), geometry_.hiddenSize),
-                .output = rowsOf<float>(logits, first, plan.storageRows(), geometry_.vocabularySize),
-                .scratch = scratch},
-               head, plan);
-  }
+  if (geometry_.finishesLogits())
+    ops::LogitFinish::add(graph, std::move(logits), geometry_.vocabularySize, rows, geometry_.logitFinish());
 }
 
 void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output,

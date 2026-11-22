@@ -105,10 +105,11 @@ struct QwenTargetDimensions {
   // (Flint's mixes its scripts through all its tokens: its first 98,304 hold
   // 98.1% of English text's tokens and 88.5% of Russian text's).
   ops::DraftVocabulary draftVocabulary{};
-  // The finish of its vocabulary head's logits (ops::LogitFinish), zero for
-  // none: a softcap c tanh(l / c) of its tokens' logits, and its tokens, the
-  // first vocabularyTokens of the head's vocabularySize rows, the rows past
-  // them padding its converter added, which nothing selects. Its DFlash2
+  // The finish of its vocabulary head's logits (ops::LogitFinish), which
+  // every target's head applies (QwenTarget::addHead), zero for none: a
+  // softcap c tanh(l / c) of its tokens' logits, and its tokens, the first
+  // vocabularyTokens of the head's vocabularySize rows, the rows past them
+  // padding its converter added, which nothing selects. Its DFlash2
   // drafts, which project through the head, take the same finish: their
   // logits leave the padding out, and the softcap applies to each
   // candidate's score after its selector's edge, where DFlash2 trains a
@@ -190,6 +191,10 @@ struct QwenTargetDimensions {
     return vocabularyTokens ? vocabularyTokens : vocabularySize;
   }
   [[nodiscard]] constexpr ops::LogitFinishValues logitFinish() const noexcept { return {logitSoftcap, tokens()}; }
+  // Whether its head's finish changes its logits (a softcap, or padding).
+  [[nodiscard]] constexpr bool finishesLogits() const noexcept {
+    return logitSoftcap != 0.0F || tokens() != vocabularySize;
+  }
   // The target layer ids its drafts may read: its layers, and its head's
   // with draftReadsLayerInputs.
   [[nodiscard]] constexpr uint32_t draftReadableLayers() const noexcept {

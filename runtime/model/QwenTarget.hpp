@@ -755,7 +755,8 @@ protected:
   // The vocabulary head of `rows` rows of `input` into fp32 logits on
   // `linear`, its command's plans as every other projection's (a decode
   // step's linear(step), a batch of first tokens' operators_.linear()), and
-  // the layout its producer writes (`prepared` describes it). A step of more
+  // the layout its producer writes (`prepared` describes it), then the
+  // head's finish where it has one (QwenTargetDimensions::logitFinish). A step of more
   // rows than one decode tile holds (more than four lanes) runs it in passes
   // of at most ops::kMaximumDecodeTileRows rows, each reading the weights
   // again: on a 12-core M6 the 27B's Q6_K head took 19.1 ms at 128 rows in
