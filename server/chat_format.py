@@ -178,7 +178,8 @@ class ChatFormat:
     # model: the generation prompt opens the reasoning or leaves it out
     # (Qwen's), or the template tells the model the effort (Inkling 2's). A
     # model told nothing decides each turn, whatever the request says
-    # (Flint's).
+    # (Flint's). Whether the effort turns the reasoning on and off is
+    # prompt_switches_reasoning.
     reasoning_switch: bool
     # Whether a call's opening also ends the reasoning where a call may
     # follow. A Qwen model may call a tool in the think block its generation
@@ -207,6 +208,16 @@ class ChatFormat:
     # The template's placeholder for one image, one token, which the server
     # widens to the image's tokens; None for a template without one.
     image_pad: str | None
+
+    @property
+    def prompt_switches_reasoning(self):
+        """Whether a request's effort turns the model's reasoning on and off:
+        where it reaches the model through the generation prompt, which opens
+        the reasoning or leaves it out (Qwen's). A model that opens its
+        reasoning itself (think_start_ids) reasons as it decides, at most
+        told the effort (Inkling 2's, which still reasons at none), and no
+        generation starts in its reasoning, which a thinking budget caps."""
+        return self.reasoning_switch and not self.think_start_ids
 
 
 # The Qwen families' (Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp):

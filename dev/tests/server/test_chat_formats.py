@@ -1368,6 +1368,18 @@ class InklingPromptTests(unittest.TestCase):
             },
         )
 
+    def test_its_effort_reaches_the_model_but_switches_nothing(self):
+        # Its model opens its reasoning itself, and still reasons at effort
+        # none: /status reports no switch, and the thinking budget's options,
+        # which cap a reasoning the generation prompt opens, act on nothing.
+        self.assertTrue(INKLING2.reasoning_switch)
+        self.assertFalse(INKLING2.prompt_switches_reasoning)
+        self.assertFalse(self.frontend().reasoning_switch)
+        self.assertEqual(
+            (QWEN.prompt_switches_reasoning, FLINT.prompt_switches_reasoning),
+            (True, False),
+        )
+
     def test_tools_render_in_its_tool_declaration(self):
         tools = [
             {

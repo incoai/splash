@@ -116,10 +116,12 @@ def option_report(engine_facts):
     """What each family, by name, makes of the options of `splash serve`,
     from its facts: engine_facts, each family's facts of its layout by name,
     as the engine's families command gives them, and its own vision tower
-    and reasoning switch. Each family's report holds the flags of the
-    options that need a fact it lacks (ServeOption.needs, LAUNCHER_NEEDS),
-    which act on none of its models, and the context its models serve:
-    their native window, and the most past it, with YaRN."""
+    and what a request's effort does to its reasoning (whether it reaches
+    the model, and whether it turns the reasoning on and off). Each family's
+    report holds the flags of the options that need a fact it lacks
+    (ServeOption.needs, LAUNCHER_NEEDS), which act on none of its models,
+    and the context its models serve: their native window, and the most past
+    it, with YaRN."""
     needs = {
         option.flag: option.needs
         for option in serve_options.SERVE_OPTIONS
@@ -131,6 +133,7 @@ def option_report(engine_facts):
         facts = engine | {
             "vision": family.vision,
             "reasoning_switch": family.chat_format.reasoning_switch,
+            "prompt_switches_reasoning": family.chat_format.prompt_switches_reasoning,
         }
         report[family.name] = {
             "unusable": [flag for flag, fact in needs.items() if not facts[fact]],

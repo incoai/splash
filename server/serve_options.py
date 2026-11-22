@@ -453,8 +453,9 @@ class ServeOption:
     # What a model's family must have for the option to act on it, one of
     # the facts install/families.py reports: a fact of its layout, as the
     # engine gives it (experts, recurrent_state, ple_table, sparse_kv,
-    # dense_ffn), or of its release (vision, reasoning_switch). None: every
-    # model.
+    # dense_ffn), or of its release (vision; reasoning_switch, its chat
+    # format's effort reaching the model, and prompt_switches_reasoning, the
+    # effort turning its reasoning on and off). None: every model.
     needs: str | None = None
 
     @property
@@ -779,7 +780,7 @@ SERVE_OPTIONS = (
             "SPLASH_THINKING_TOKEN_BUDGET, else no cap)",
         ),
         environment="SPLASH_THINKING_TOKEN_BUDGET",
-        needs="reasoning_switch",
+        needs="prompt_switches_reasoning",
     ),
     ServeOption(
         "--thinking-end-text",
@@ -793,7 +794,7 @@ SERVE_OPTIONS = (
             "after a reasoning)",
         ),
         environment="SPLASH_THINKING_END_TEXT",
-        needs="reasoning_switch",
+        needs="prompt_switches_reasoning",
     ),
     ServeOption(
         "--chat-template-file",

@@ -43,7 +43,8 @@ UNUSABLE = {
         "--thinking-token-budget",
         "--thinking-end-text",
     },
-    # Its effort reaches its template, which tells the model; it has no
+    # Its effort reaches its template, which tells the model, but the model
+    # opens its reasoning itself, which no thinking budget caps; it has no
     # recurrent state and its vision tower is not served yet.
     "Inkling-2-Mini": {
         "--language-only",
@@ -54,6 +55,8 @@ UNUSABLE = {
         "--disable-ane",
         "--recalibrate-ane",
         "--max-image-pixels",
+        "--thinking-token-budget",
+        "--thinking-end-text",
     },
 }
 # The context each family's models serve: their native window, and the most

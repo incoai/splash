@@ -279,18 +279,21 @@ class Frontend:
     def reasoning_switch(self):
         """Whether a request's reasoning effort or enable_thinking turns the
         model's reasoning on and off, as /status reports: where the family's
-        model leaves that to its prompt (ChatFormat.reasoning_switch) and the
+        prompt switches it (ChatFormat.prompt_switches_reasoning) and the
         server has not set every request's effort itself."""
-        return self.chat_format.reasoning_switch and self.reasoning_effort is None
+        return (
+            self.chat_format.prompt_switches_reasoning and self.reasoning_effort is None
+        )
 
     @property
     def reasoning(self):
         """What /v1/models reports of reasoning: the default template's
         (ChatTemplate.reasoning), with the server's default effort in place of
         the template's own, named by the listed effort it renders like; no
-        efforts where a request's effort decides nothing (reasoning_switch),
-        so that a client offers none."""
-        if not self.reasoning_switch:
+        efforts where a request's effort decides nothing, reaching no model
+        (ChatFormat.reasoning_switch) or replaced by the server's, so that a
+        client offers none."""
+        if not self.chat_format.reasoning_switch or self.reasoning_effort is not None:
             return {"thinks": None, "efforts": [], "default": None}
         template = self.chat_templates.select(None)
         reasoning = dict(template.reasoning)
