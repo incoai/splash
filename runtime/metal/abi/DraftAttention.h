@@ -59,14 +59,40 @@ static_assert(sizeof(DraftConvBatchParams) == 8,
 // random, and reports no error, on an M5 Max under full
 // MTL_SHADER_VALIDATION; without validation its output is bitwise that of
 // the run-time stride.
+//
+// A row sees the ring keys of the `window` positions before its own (a
+// DFlash2 draft's rows: SPLASH_DRAFT_SLIDING_WINDOW - 1), or with row_uniform
+// every row of a lane the keys of the `window` positions before its first
+// row, the anchor's (a DSpark draft's layers, whose window is per layer).
+// The reduce writes the rows of `query_heads` query heads, [row][query
+// head][dimension], a lane's rows after the previous lane's: the grouped
+// queries hold SPLASH_DRAFT_QUERY_HEADS, of which a draft of fewer (a DSpark
+// draft's 24, three of each KV head's four) uses each KV head's first
+// query_heads / SPLASH_DRAFT_KV_HEADS, the others zero rows it leaves out.
 struct DraftAttentionBatchParams {
   uint32_t value_stride;
   uint32_t lanes;
+  uint32_t window;
+  uint32_t row_uniform;
+  uint32_t query_heads;
   uint32_t cache_length[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 8 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(DraftAttentionBatchParams) == 20 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Draft attention parameters are the same size on both sides");
+
+// The q/k/v rows the prepare reads (draft_attention_qkv): rows of
+// packed_width values, each `query_heads` query heads' queries, then the KV
+// heads' keys and values. Query head h of a draft of fewer query heads than
+// SPLASH_DRAFT_QUERY_HEADS goes to its KV head's grouped rows as the
+// attention core runs them (DraftAttentionBatchParams), the rest zero.
+struct DraftPrepareParams {
+  uint32_t packed_width;
+  uint32_t query_heads;
+};
+
+static_assert(sizeof(DraftPrepareParams) == 8,
+              "Draft prepare parameters are 8 bytes on both sides");
 
 struct DraftContextParams {
   uint32_t tokens;

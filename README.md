@@ -63,8 +63,8 @@ in Chat. Anthropic Messages requests reason only when they set `thinking`.
 
 ## Models
 
-Splash supports these model families, with a matching DFlash2 draft selected
-automatically:
+Splash supports these model families, with a matching draft selected
+automatically: a DFlash2 draft, or Inkling 2 Mini's DSpark draft:
 
 | Model | GGUF example | MLX 4-bit |
 | --- | --- | --- |
@@ -73,6 +73,7 @@ automatically:
 | Ornith-1.5-122B | `unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL` | `ornith-ai/Ornith-1.5-122B-MLX-4bit` |
 | Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | `mlx-community/Qwen3.8-Flash-Next-4bit` |
 | Flint | `unsloth/flint-GGUF:UD-Q4_K_XL` | `mlx-community/flint-mixed-3-4bit` |
+| Inkling 2 Mini | `ggml-org/Inkling-2-Mini-GGUF:IQ4_NL` | — |
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are

@@ -1590,8 +1590,13 @@ inline void tree_expand(threadgroup TreeLattice &lattice,
     rows.next[row][i] = weight;
     mass += weight;
   }
+  // A recurrent chain's row off its chain has no distribution, nor children
+  // (DraftTreeParams::markov).
+  if (!(mass > 0.0f))
+    return;
   for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
     rows.next[row][i] /= mass;
+  const bool chained = (params.markov >> lane & 1u) != 0;
   float keys[SPLASH_DRAFT_CANDIDATES];
   for (uint i = 0; temperature > 0.0f && i < SPLASH_DRAFT_CANDIDATES; ++i)
     keys[i] = rows.next[row][i] > 0.0f
@@ -1604,6 +1609,9 @@ inline void tree_expand(threadgroup TreeLattice &lattice,
     if (temperature == 0.0f) {
       const uint likeliest = lattice.likeliest[position][predecessor][child];
       drawn = q[likeliest] > 0.0f ? likeliest : drawn;
+    } else if (chained && child == 0) {
+      // The token the chain drew from these probabilities.
+      drawn = q[0] > 0.0f ? 0 : drawn;
     } else {
       for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
         if (!(taken & (1u << i)) && keys[i] > -INFINITY &&
@@ -1680,8 +1688,15 @@ kernel void draft_select_tree(
     const uint position = thread_index / Candidates;
     const uint predecessor = thread_index % Candidates;
     lattice.ids[position][predecessor] = candidates[origin + thread_index];
-    // Position 0 follows the anchor alone.
-    if (position > 0 || predecessor == 0) {
+    const bool chained = (params.markov >> lane & 1u) != 0;
+    if (chained && predecessor > 0) {
+      // A recurrent chain follows its own token, candidate 0, alone.
+      for (uint i = 0; i < Candidates; ++i)
+        lattice.probability[position][predecessor][i] = 0.0f;
+      for (uint child = 0; child < kTreeChildren; ++child)
+        lattice.likeliest[position][predecessor][child] = uchar(child);
+    } else if (position > 0 || predecessor == 0) {
+      // Position 0 follows the anchor alone.
       device const float *edges =
           partial_values +
           ulong(params.lanes) * Positions * Shards * Candidates +
@@ -1689,7 +1704,7 @@ kernel void draft_select_tree(
               Candidates;
       float score[Candidates];
       for (uint i = 0; i < Candidates; ++i)
-        score[i] = unary[origin + position * Candidates + i] + edges[i];
+        score[i] = unary[origin + position * Candidates + i] + (chained ? 0.0f : edges[i]);
       float best = score[0];
       for (uint i = 1; i < Candidates; ++i)
         best = max(best, score[i]);

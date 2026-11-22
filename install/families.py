@@ -59,10 +59,11 @@ class ModelFamily:
     # The family's name, as the engine names it (each target layout's family,
     # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp and Flint.hpp).
     name: str
-    # The repository of the DFlash2 draft released for the family, as its
-    # release publishes it (config.json and BF16 safetensors). Installations
-    # follow its default branch as they follow the target's. None for a
-    # family released without one: its models serve without a draft, as
+    # The repository of the draft released for the family, as its release
+    # publishes it: a DFlash2 checkpoint (config.json and BF16 safetensors),
+    # or a DSpark draft's GGUF (upstream.dspark_gguf). Installations follow
+    # its default branch as they follow the target's. None for a family
+    # released without one: its models serve without a draft, as
     # --draft-model none installs them, unless --draft-model names one.
     draft_repo: str | None
     # How the family's model reasons and calls tools, and the tokens it
@@ -106,9 +107,16 @@ FAMILIES = (
         vision=False,
         draftless=False,
     ),
-    # Released without a draft, and served text only: its vision tower's
-    # projector (inkling2v) is none Splash loads yet.
-    ModelFamily("Inkling-2-Mini", None, INKLING, INKLING_SAMPLING, vision=False),
+    # Its DSpark draft is the GGUF Unsloth publishes beside its own
+    # quantizations, and it serves text only: its vision tower's projector
+    # (inkling2v) is none Splash loads yet.
+    ModelFamily(
+        "Inkling-2-Mini",
+        "unsloth/Inkling-2-Mini-GGUF",
+        INKLING,
+        INKLING_SAMPLING,
+        vision=False,
+    ),
 )
 
 

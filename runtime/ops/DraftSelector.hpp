@@ -141,6 +141,15 @@ public:
   // holds.
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
            DraftVocabulary vocabulary, std::span<const DraftTreeLane> lanes) const;
+  // In add's place for a draft whose proposals are a chain of a recurrent
+  // head (a DSpark draft's, ops::DSpark::addMarkov), which wrote each lane's
+  // candidates (buffers.candidates) and their logits (buffers.unary) at each
+  // position along its chain, the chain's token first: each lane's tree of
+  // its chain, its rows' other candidates beside it and its host chain
+  // (DraftTreeParams::markov). The codebooks, logits and partials are
+  // unread.
+  void addChain(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
+                std::span<const DraftTreeLane> lanes) const;
   // In add's place for a model without a draft, on the host: lane `lane`'s
   // tree as add grows it of its host chain alone (a lane of no children,
   // whose chain token agrees with no draft): its anchor and `chain`'s

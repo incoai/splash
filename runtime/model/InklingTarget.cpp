@@ -7,6 +7,7 @@
 #include "ops/BlockResidual.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PageStorage.hpp"
+#include "ops/RowCopy.hpp"
 #include "ops/Sampling.hpp"
 
 #include <algorithm>
@@ -304,10 +305,30 @@ void InklingTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const {
   const InklingLayerWeights &w = weights_.layers[geometry_.weightLayer(index)];
   ops::MoE::addRouted(step.graph, step.ffn, w.ffn, *step.moe);
   const uint32_t hidden = geometry_.hiddenSize;
+  const ops::StridedRows output = stateRows(step, inklingLayerStates(geometry_, index).output);
   addConvolution(step, index, InklingConvolution::Ffn,
-                 {{step.buffers.attentionOutput, hidden}, {}, w.ffnConvolution,
-                  stateRows(step, inklingLayerStates(geometry_, index).output), true},
-                 {hidden, 0, kBf16});
+                 {{step.buffers.attentionOutput, hidden}, {}, w.ffnConvolution, output, true}, {hidden, 0, kBf16});
+  // The stream after the layer is the next layer's input, which a DSpark
+  // draft reads.
+  addCaptures(step, index, output.buffer, kF32);
+}
+
+void InklingTarget::addCaptures(PrefillStep &step, uint32_t index, metal::MetalBuffer rows,
+                                ops::FloatElement element) const {
+  const std::optional<uint32_t> slot = geometry_.captureSlot(index);
+  if (!slot) return;
+  const uint32_t width = geometry_.hiddenSize, captured = geometry_.capturedHiddenSize();
+  const auto copy = [&](const metal::MetalBuffer &destination, uint32_t source, uint32_t to, uint32_t count) {
+    ops::RowCopy::add(step.graph, rows, {source, width, 0}, destination, {to, captured, *slot * width}, count, width,
+                      element);
+  };
+  if (step.decode) {
+    copy(step.decode->capturedTargetHidden, 0, 0, step.rows);
+    return;
+  }
+  forEachPrefillCapture(step, index, [&](uint32_t, uint32_t source, uint32_t destination, uint32_t count) {
+    copy(step.buffers.captured, source, destination, count);
+  });
 }
 
 // The head's input: the depth mix of every block and the coda's
@@ -324,6 +345,7 @@ metal::MetalBuffer InklingTarget::addPrefillEnd(PrefillStep &step) const {
   const metal::MetalBuffer normalized = d ? d->finalHidden : step.buffers.hidden[1];
   ops::Normalization::addRmsRows(step.graph, s.inputs[0], kF32, weights_.finalNorm, normalized, kBf16, hidden,
                                  step.rows);
+  addCaptures(step, geometry_.layers, normalized, kBf16);
   if (d) addHead(step.graph, linear(step), normalized, d->logits, step.rows, step.buffers.linearScratch, {});
   return normalized;
 }

@@ -343,7 +343,36 @@ holds them. A checkpoint is installed only when the engine accepts its
 configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads.
 
-A draft's `config.json` states its layers, intermediate size, rotary base and
+Inkling 2 Mini's draft is a DSpark draft, which a draft repository without a
+`config.json` supplies as a GGUF at its root: `unsloth/Inkling-2-Mini-GGUF`'s
+`dspark-Inkling-2-Mini-Q8_0.gguf` (0.40 GB; `upstream.dspark_gguf` takes a
+repository's Q8_0 one where it holds several), whose header the engine checks
+with the target's before the download (`readDSparkHeader`, `dsparkLayout`). A
+DSpark draft (`model/DSparkDraft.hpp`) runs a block of 8 rows, the anchor's
+token embedding normed as the target's and 7 mask rows, through 3 layers of
+24 query heads over 8 KV heads of 128 that attend non-causally within the
+block and to its context in rings: layers 0 and 2 the 1,024 positions before
+the anchor, layer 1 its ring's 2,047. Each layer's context row mixes four of
+the target's rows (the outputs of its layers 4, 22 and 40 and its final
+normed row, which `InklingTarget` captures) by its own softmax weights and
+norm. Its rows' base logits are the target's head's; a Markov head over a
+rank-256 state then corrects each position's logits over the whole
+vocabulary from the token the position before chose and the lane's f_rnn
+row, a mix of its last retained row kept beside its rings, its output
+projection folded into the head once at start (`DraftModel::addSetup`). A
+greedy lane's chain takes each position's most likely token; a sampled lane
+draws it from the position's 16 candidates at its temperature, and the target
+accepts its rows with min(1, p/q), so outputs keep the target's distribution.
+Its chain and the lane's host chain grow one tree (`DraftSelector::addChain`).
+Measured on an M3 Ultra (IQ4_NL target, 22G, one greedy lane), it decodes 1.6
+to 1.9 times as many tokens a second as Inkling without a draft on code (89 and
+100 against 55 and 53) and 1.4 times on JSON, about as many on English prose
+(1.07 times) and fewer on Czech prose (0.83 times), whose draft rows the target
+accepts less often (1.4 tokens a cycle, against 2.0 to 3.6 on the others), so
+`--draft-model none` decodes such text faster. At 22G the automatic context is
+195,601 tokens with the draft and 232,465 without it.
+
+A DFlash2 draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of

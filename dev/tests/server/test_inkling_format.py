@@ -847,7 +847,7 @@ class InklingTokenizerContractTests(unittest.TestCase):
         family = families.named("Inkling-2-Mini")
         self.assertEqual(
             (family.chat_format, family.draft_repo, family.vision),
-            (INKLING, None, False),
+            (INKLING, "unsloth/Inkling-2-Mini-GGUF", False),
         )
         self.assertEqual(
             family.sampling,

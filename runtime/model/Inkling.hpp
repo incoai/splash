@@ -136,7 +136,8 @@ struct InklingLayout final : QwenHybridLayout {
                           .loopPasses = kInklingLoop.loopPasses,
                           .relativeDimension = 16,
                           .relativeExtent = 1024,
-                          .shortConvolutionTaps = 4},
+                          .shortConvolutionTaps = 4,
+                          .finalNormCapture = true},
                          "Inkling-2-Mini"} {}
   bool operator==(const InklingLayout &) const = default;
 };

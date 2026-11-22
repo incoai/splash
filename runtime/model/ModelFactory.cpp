@@ -1,4 +1,5 @@
 #include "ModelFactory.hpp"
+#include "model/DSparkDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
@@ -148,11 +149,14 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and any draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
+  const DFlashDraftLayout &layout = result.descriptor.draft;
+  const bool dspark = layout.kind == DraftKind::DSpark;
   std::optional<DraftCheckpointLoader> draft;
-  if (result.descriptor.draft.present())
-    draft.emplace(backend, images, root / "draft", result.descriptor.draft);
+  if (layout.present() && !dspark) draft.emplace(backend, images, root / "draft", layout);
   result.target = loadTarget(backend, images, root, result.descriptor, options);
-  if (draft) result.draft = loadDFlashDraftWeights(backend, *draft, result.descriptor.draft);
+  if (draft) result.draft = loadDFlashDraftWeights(backend, *draft, layout);
+  // A DSpark draft's GGUF is planned and checked as it loads.
+  if (layout.present() && dspark) result.draft = loadDSparkDraftWeights(backend, images, root / "draft", layout);
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),

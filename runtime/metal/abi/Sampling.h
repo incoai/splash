@@ -268,9 +268,17 @@ struct DraftTreeParams {
   float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
+  // Bit l: lane l's draft is a chain of a recurrent head (a DSpark draft's,
+  // DraftSelector::addChain), whose distribution at each position follows
+  // its chain's token before it alone. Its candidates at each position hold
+  // the token its chain took first and its probabilities are the softmax of
+  // their unary scores alone; only that candidate's row has children, a
+  // greedy lane's its most likely candidates, a sampled lane's that token
+  // first, then its draws without replacement of the others.
+  uint32_t markov;
 };
 
-static_assert(sizeof(DraftTreeParams) == 4 + (32 + 4 * SPLASH_DRAFT_PROPOSAL_TOKENS) * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(DraftTreeParams) == 8 + (32 + 4 * SPLASH_DRAFT_PROPOSAL_TOKENS) * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Draft tree parameters are the same size on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): the `rows` rows of its

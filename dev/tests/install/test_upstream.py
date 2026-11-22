@@ -32,6 +32,7 @@ from dev.tests.installer_fixtures import (
     blob_bytes,
     cached_snapshot,
     draft_dir,
+    dspark_dir,
     fake_hub,
     family_config,
     fixture,
@@ -111,10 +112,15 @@ class UpstreamTest(unittest.TestCase):
         for family in GGUF_CONFIGS:
             configs = CONFIGS / family.name.lower()
             gguf_check = headers(family)
-            # A family released without a draft (Inkling 2) is checked alone.
+            # A DFlash2 draft is checked by its config.json, a DSpark draft
+            # (Inkling 2's) by its GGUF's header.
             drafts = [{}]
-            if family.draft_repo is not None:
+            if (configs / "draft" / "config.json").exists():
                 drafts.append({"draft": configs / "draft" / "config.json"})
+            else:
+                drafts.append(
+                    {"draft": dspark_dir(self.root / family.name / "draft", family)}
+                )
             for arguments in drafts:
                 self.assertIs(
                     upstream.check_model(

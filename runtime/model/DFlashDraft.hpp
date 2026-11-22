@@ -23,6 +23,10 @@ struct DFlashDraftRingLayer final {
   metal::MetalBuffer keys;
   // V is [head][dimension][ring_position].
   metal::MetalBuffer values;
+  // The draft's own state of the lane after its rings
+  // (DraftStateLayout::auxiliaryBytes: a DSpark draft's f_rnn row), on the
+  // first layer's entry alone; none on the others, or for a draft of none.
+  metal::MetalBuffer auxiliary{};
 };
 
 // A lane's draft rings: every draft layer's keys and values of the last
@@ -68,14 +72,24 @@ private:
   uint64_t actualAllocatedBytes_ = 0;
 };
 
-// The dimensions of a DFlash2 draft, as its checkpoint's config.json gives
-// them (ModelDescriptor.mm readDraftLayout): every draft's attention widths
-// and selector are those the kernels are built for; its layers, intermediate
-// size, rotary base and the target layers it reads are its own, and its
-// hidden size and vocabulary its target's. A model installed without a draft
-// (--draft-model none) has the zero layout: no draft weights, state or work,
-// and its decode cycles verify each lane's anchor and host chain alone.
+// The kind of a model's draft: a DFlash2 checkpoint's (DFlashDraft), or a
+// DSpark draft's of a GGUF (model/DSparkDraft.hpp, Inkling 2 Mini's).
+enum class DraftKind : uint8_t { DFlash2, DSpark };
+
+// The dimensions of a model's draft. A DFlash2 draft's, as its checkpoint's
+// config.json gives them (ModelDescriptor.mm readDraftLayout): every draft's
+// attention widths and selector are those the kernels are built for; its
+// layers, intermediate size, rotary base and the target layers it reads are
+// its own, and its hidden size and vocabulary its target's. A DSpark draft's,
+// as its GGUF's header gives them (dsparkLayout): its q/k/v rows hold its 24
+// query heads (qkvSize, attentionSize), it has no convolutions (dynamicSize
+// 0), its selector rank is its Markov head's, and it adds its layers'
+// windows, the tokens it proposes and the cap of its logits. A model
+// installed without a draft (--draft-model none) has the zero layout: no
+// draft weights, state or work, and its decode cycles verify each lane's
+// anchor and host chain alone.
 struct DFlashDraftLayout final {
+  DraftKind kind = DraftKind::DFlash2;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;
@@ -89,12 +103,32 @@ struct DFlashDraftLayout final {
   uint32_t kvHeads = 0;
   // The target layers whose output rows the draft reads, ascending: the
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
+  // A DSpark draft's last is the target's layer count: its final normed rows.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
+  // A DSpark draft's: the layers whose rows see the slidingWindow context
+  // positions before their block's anchor alone (bit l for layer l; the
+  // others see their rings' every key), the tokens it proposes, the first
+  // proposedVocabulary of the vocabulary, and the cap of its logits,
+  // logitCap * tanh(x / logitCap).
+  uint32_t slidingLayers = 0;
+  uint32_t slidingWindow = 0;
+  uint32_t proposedVocabulary = 0;
+  float logitCap = 0.0F;
+  // The format its projections load in, which its decode plans store rows
+  // by (draftStepLanes): a DFlash2 checkpoint's af4g64 planes
+  // (DraftCheckpoint), a DSpark GGUF's own, every projection's.
+  uint32_t projectionFormat = GGUF_FMT_AF4G64;
 
   // Whether the model decodes with a draft: a draft has layers.
   [[nodiscard]] constexpr bool present() const noexcept { return layers != 0; }
+  // A DSpark draft's lane keeps each layer's context row of a slot in its
+  // window, three windows of one row each side by side, and its f_rnn row
+  // (bf16) beside its rings.
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
+    if (kind == DraftKind::DSpark)
+      return {layers, kvHeads, attentionHeadDimension, layers * hiddenSize,
+              hiddenSize * DraftStateLayout::bfloat16Bytes};
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};
   }
   [[nodiscard]] constexpr std::span<const uint32_t> targetLayerIds() const noexcept {
@@ -126,8 +160,41 @@ struct DFlashDraftLayout final {
                                             uint32_t intermediateSize, float rotaryTheta,
                                             std::span<const uint32_t> targetLayers);
 
+// What a DSpark draft's GGUF states of it (dsparkLayout): its target's
+// hidden size and vocabulary, which must be its target's; its layers,
+// intermediate size, rotary base, the target features it reads (as the
+// GGUF names them: layer visits whose inputs it reads, the last the visit
+// count, the final norm), its windowed layers and window, its Markov rank,
+// the tokens it proposes, its logits' cap and its projections' format.
+struct DSparkHeader final {
+  uint32_t hiddenSize = 0;
+  uint32_t vocabularySize = 0;
+  uint32_t layers = 0;
+  uint32_t intermediateSize = 0;
+  float rotaryTheta = 0.0F;
+  std::vector<uint32_t> targetFeatures;
+  uint32_t slidingLayers = 0;
+  uint32_t slidingWindow = 0;
+  uint32_t markovRank = 0;
+  uint32_t proposedVocabulary = 0;
+  float logitCap = 0.0F;
+  uint32_t projectionFormat = GGUF_FMT_COUNT;
+};
+
+// The layout of a DSpark draft of `header` over a target of `hiddenSize`,
+// `vocabularySize` and `targetLayers` layers: its attention of the widths the
+// kernels take with 24 query heads, its Markov rank theirs, its windows
+// inside a ring, and its features ascending, the last the target's final
+// norm (targetLayers), each other one the input of a target layer, which it
+// reads as the output of the layer before (its target layers).
+[[nodiscard]] DFlashDraftLayout dsparkLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t targetLayers,
+                                             const DSparkHeader &header);
+
 struct DFlashDecodeBuffers final {
   ops::LinearScratch linearScratch{};
+  // Each lane's draft state beside its rings (DFlashDraftRingLayer::
+  // auxiliary), for a draft that keeps one.
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> laneAuxiliary{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
   metal::MetalBuffer dynamic;
@@ -153,6 +220,8 @@ struct DFlashDecodeBuffers final {
 
 struct DFlashContextBuffers final {
   ops::LinearScratch linearScratch{};
+  // Each lane's draft state beside its rings, as DFlashDecodeBuffers'.
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> laneAuxiliary{};
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
@@ -222,8 +291,13 @@ struct DFlashDraftLayerWeights final {
   ops::Projection downProjection;
 };
 
+struct DSparkDraftWeights;
+
 struct DFlashDraftWeights final {
   DFlashDraftLayout layout;
+  // A DSpark draft's weights (model/DSparkDraft.hpp) in place of the DFlash2
+  // fields below, which it leaves empty; its files and bytes are these'.
+  std::shared_ptr<const DSparkDraftWeights> dspark;
   std::vector<DFlashDraftLayerWeights> layers;
   ops::Projection contextProjection;
   ops::NormWeights hiddenNorm;
@@ -256,13 +330,49 @@ struct DFlashDraftStep final {
   ops::DraftVocabulary vocabulary;
 };
 
+// A model's draft as the runtime drives it (a DFlash2 draft, DFlashDraft, or
+// a DSpark draft, model/DSparkDraft.hpp): its context from its target's
+// captured rows, kept in each lane's rings and window, its block's layers
+// and logits, and its proposals into the selector's trees. DFlashDraft's
+// comments describe each method.
+class DraftModel {
+public:
+  DraftModel() = default;
+  DraftModel(const DraftModel &) = delete;
+  DraftModel &operator=(const DraftModel &) = delete;
+  virtual ~DraftModel() = default;
+
+  [[nodiscard]] virtual DFlashDraftStep step(std::span<const uint32_t> cacheLengths,
+                                             std::span<const std::span<const uint32_t>> tokens,
+                                             std::span<const ops::DraftTreeLane> lanes) const = 0;
+  virtual void addContextPrefill(metal::CommandGraph &graph, DFlashPrefillBuffers buffers, uint32_t rows,
+                                 std::span<const DFlashPrefillSpan> spans,
+                                 std::span<const DFlashWindowCapture> windowCaptures) const = 0;
+  virtual void addContextRebuild(metal::CommandGraph &graph, DFlashPrefillBuffers buffers,
+                                 const metal::MetalBuffer &window, std::span<const DFlashDraftRingLayer> ring,
+                                 uint32_t rows, uint32_t startPosition) const = 0;
+  virtual void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
+                         const DFlashDraftStep &step) const = 0;
+  virtual void addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
+                            const DFlashDraftStep &step) const = 0;
+  virtual void addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const = 0;
+  virtual void addContextCommit(metal::CommandGraph &graph, DFlashContextBuffers buffers,
+                                std::span<const uint32_t> startPositions, const ops::StepRows &step) const = 0;
+  // Work the draft runs once before its first step, with the decode
+  // arena's linear scratch and `rows`, scratch of the vocabulary head's
+  // fp32 output of a decode step of `stepRows` rows, the most of the
+  // runtime's (QwenTargetGeometry::stepRows): none but a DSpark draft's
+  // fold of its Markov head into the head.
+  virtual void addSetup(metal::CommandGraph &, ops::LinearScratch, metal::MetalBuffer, uint32_t) const {}
+};
+
 // Builds the draft layer graph and its proposal selection
 // (ops::DraftSelector) from batch buffers and persistent context; the
 // target's sampling and acceptance policy remain outside the model. Its
 // logits are its target's vocabulary head's, `head`, over the whole
 // vocabulary or over `subset` (QwenTargetDimensions::draftVocabulary), a view
 // of the head's rows that reads that share of its weights.
-class DFlashDraft final {
+class DFlashDraft final : public DraftModel {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
                const ops::ExecutionPlans &operators, const ops::Projection &head,
@@ -289,12 +399,12 @@ public:
   // this draft's subset (vocabulary).
   [[nodiscard]] DFlashDraftStep step(std::span<const uint32_t> cacheLengths,
                                      std::span<const std::span<const uint32_t>> tokens,
-                                     std::span<const ops::DraftTreeLane> lanes) const;
+                                     std::span<const ops::DraftTreeLane> lanes) const override;
 
   void addContextPrefill(metal::CommandGraph &graph,
                          DFlashPrefillBuffers buffers, uint32_t rows,
                          std::span<const DFlashPrefillSpan> spans,
-                         std::span<const DFlashWindowCapture> windowCaptures) const;
+                         std::span<const DFlashWindowCapture> windowCaptures) const override;
   // Computes the rings' keys and values of `rows` positions from
   // startPosition on again from the context window they were kept in, as
   // addContextPrefill writes them from their context rows. The rows pass
@@ -304,17 +414,17 @@ public:
                          DFlashPrefillBuffers buffers,
                          const metal::MetalBuffer &window,
                          std::span<const DFlashDraftRingLayer> ring,
-                         uint32_t rows, uint32_t startPosition) const;
+                         uint32_t rows, uint32_t startPosition) const override;
 
   // A step's draft layers and its logits over its vocabulary, then its
   // proposals from them.
-  void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers, const DFlashDraftStep &step) const;
+  void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers, const DFlashDraftStep &step) const override;
   void addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
-                    const DFlashDraftStep &step) const;
+                    const DFlashDraftStep &step) const override;
   // Sets each of `lanes` lanes' mask rows of the draft input `rows` (all but
   // its anchor's, row 0 of its draftQueryRows) to the mask embedding the
   // checkpoint ships; without one they keep the target table's row.
-  void addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const;
+  void addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const override;
 
   // A decode step's context rows (`step`, among the target's captured rows):
   // those each lane retained, in path order, to its rings from its start
@@ -325,7 +435,7 @@ public:
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions,
-                        const ops::StepRows &step) const;
+                        const ops::StepRows &step) const override;
 
 private:
   // Each layer's context keys and values of the `rows` context rows in the

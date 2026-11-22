@@ -385,8 +385,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--draft-model",
         type=parse_draft_model,
-        help="the DFlash2 draft's repository or local directory, in place of the "
-        "family's released one, or none for no draft",
+        help="the draft's repository or local directory (a DFlash2 checkpoint, or a "
+        "DSpark draft's GGUF), in place of the family's released one, or none for no "
+        "draft",
     )
     parser.add_argument(
         "--language-only",

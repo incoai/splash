@@ -1118,7 +1118,8 @@ void testFlint(const std::filesystem::path &fixtures) {
 // value reads (a whole number a uint32, another number an F32, booleans and
 // their arrays, integer arrays as int32), and its tensor table
 // (gguf-tensors.json: name, ggml type, extents innermost first).
-GgufHeaders fixtureHeaders(const std::filesystem::path &family) {
+GgufHeaders fixtureHeaders(const std::filesystem::path &family, const char *metadataFile = "gguf-metadata.json",
+                           const char *tensorsFile = "gguf-tensors.json") {
   const auto object = [&](const char *name) {
     NSData *data = [NSData dataWithContentsOfFile:@((family / name).c_str())];
     NSDictionary *value = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
@@ -1129,7 +1130,7 @@ GgufHeaders fixtureHeaders(const std::filesystem::path &family) {
     return [value isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID();
   };
   std::vector<test_gguf::Key> keys;
-  NSDictionary *metadata = object("gguf-metadata.json");
+  NSDictionary *metadata = object(metadataFile);
   for (NSString *key in [metadata.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
     const std::string name = key.UTF8String;
     id value = metadata[key];
@@ -1152,7 +1153,7 @@ GgufHeaders fixtureHeaders(const std::filesystem::path &family) {
     }
   }
   std::vector<test_gguf::Tensor> tensors;
-  NSDictionary *table = object("gguf-tensors.json");
+  NSDictionary *table = object(tensorsFile);
   for (NSString *name in table) {
     NSArray *entry = table[name];
     const std::string type = [entry[0] UTF8String];
@@ -1352,6 +1353,62 @@ void testInkling(const std::filesystem::path &fixtures) {
       [](const test_gguf::Tensor &tensor) { return tensor.name != "blk.11.attn_v_conv_proj.weight"; });
   rejects([&] { static_cast<void>(check("gguf", config, tapless)); }, "attn_v_conv_proj.weight (missing) in 1 layer",
           "an Inkling GGUF without a global layer's value taps was accepted");
+
+  // Its DSpark draft, by its GGUF's header (Unsloth's, but its tokenizer),
+  // as the installer checks it before any download: its layout reads the
+  // outputs of the layers before the visits it names and the final norm.
+  const GgufHeaders dspark = fixtureHeaders(family / "draft", "dspark-metadata.json", "dspark-tensors.json");
+  const auto drafted = [&](const GgufHeaders &draft) {
+    const std::filesystem::path root = directory.path() / std::to_string(++checks);
+    std::filesystem::create_directories(root / "target");
+    std::filesystem::create_directories(root / "draft");
+    test::writeFile(root / "config.json", config);
+    test::writeFile(root / "target" / "model.gguf", test_gguf::file(headers.keys.front(), headers.tensors.front()));
+    test::writeFile(root / "draft" / "dspark.gguf", test_gguf::file(draft.keys.front(), draft.tensors.front()));
+    return std::string(
+        model::inspectSourceConfiguration("gguf", "none", root / "config.json", root / "target", root / "draft"));
+  };
+  require(drafted(dspark) == "Inkling-2-Mini", "Inkling's DSpark draft was refused");
+  struct DraftRefused final {
+    test_gguf::Key key;
+    std::string_view error;
+  };
+  for (const DraftRefused &refused : std::initializer_list<DraftRefused>{
+           {test_gguf::uint32Key("dflash.attention.head_count", 32), "dflash.attention.head_count 24"},
+           {test_gguf::uint32Key("dflash.vocab_size", 248320), "hidden size and vocabulary are not its target's"},
+           {test_gguf::uint32Key("dflash.dspark.markov_rank", 128), "a Markov rank of 256"},
+           {test_gguf::int32ArrayKey("dflash.target_layers", {5, 23, 41, 47}), "the last the target's final norm"},
+           {test_gguf::uint32Key("dflash.attention.sliding_window", 4096), "window lies inside its rings"},
+           {test_gguf::boolKey("dflash.attention.causal", true), "dflash.attention.causal 0"}})
+    rejects([&] { static_cast<void>(drafted(dspark.with(refused.key))); }, refused.error,
+            "a DSpark draft of another " + refused.key.name + " was accepted");
+  const GgufHeaders headless =
+      dspark.changed([](const test_gguf::Tensor &tensor) { return tensor.name != "joint_proj.weight"; });
+  rejects([&] { static_cast<void>(drafted(headless)); }, "joint_proj.weight",
+          "a DSpark draft without its Markov head was accepted");
+  model::DSparkHeader header;
+  header.hiddenSize = layout.hiddenSize;
+  header.vocabularySize = layout.vocabularySize;
+  header.layers = 3;
+  header.intermediateSize = 9216;
+  header.rotaryTheta = 1e6F;
+  header.targetFeatures = {5, 23, 41, 48};
+  header.slidingLayers = 0b101;
+  header.slidingWindow = 1024;
+  header.markovRank = 256;
+  header.proposedVocabulary = 200058;
+  header.logitCap = 30.0F;
+  header.projectionFormat = GGUF_FMT_Q80;
+  const model::DFlashDraftLayout draft = model::dsparkLayout(layout.hiddenSize, layout.vocabularySize, layout.layers,
+                                                             header);
+  require(draft.kind == model::DraftKind::DSpark && draft.targetLayerIds().size() == 4 &&
+              draft.targetLayers[0] == 4 && draft.targetLayers[1] == 22 && draft.targetLayers[2] == 40 &&
+              draft.targetLayers[3] == 48 && draft.targetHiddenSize() == 4 * 2304 && draft.qkvSize == 5120 &&
+              draft.attentionSize == 3072 && draft.contextKvSize() == 2048 && draft.projectionFormat == GGUF_FMT_Q80,
+          "Inkling's DSpark layout does not read its taps or attend with its heads");
+  const model::DraftStateLayout lane = draft.stateLayout();
+  require(lane.contextWidth == 3 * 2304 && lane.auxiliaryBytes == 2304 * 2 && lane.valid(),
+          "a DSpark lane does not keep its layers' context rows and its f_rnn row");
 }
 
 int main(int argc, char **argv) {

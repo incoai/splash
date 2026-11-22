@@ -133,7 +133,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     shape.int8Experts = moeInt8Experts;
     return shape;
   }
-  // The layers whose output rows the DFlash2 draft reads, ascending.
+  // The layers whose output rows the draft reads, ascending; `layers`, the
+  // last, names the final normed rows of a target that captures them
+  // (finalNormCapture).
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   // The target's KV layout in the format the runtime stores KV in, and its
@@ -207,7 +209,8 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       if (!captureLayerCount) return true;
       if (captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
       const auto ids = captureLayers();
-      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
+      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() &&
+             ids.back() < layers + finalNormCapture;
     };
     const bool dense = intermediateSize && sized(gateUpProjections);
     return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
@@ -482,6 +485,10 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
+  // The norm of its token embedding rows, which its first layer reads (a
+  // DSpark draft's anchor row takes it): none for a target that reads the
+  // rows as they are.
+  [[nodiscard]] virtual const ops::NormWeights *embeddingNorm() const noexcept { return nullptr; }
   // A prefill command of one or more chunks (a prefill group), run layer by
   // layer: a layer of each chunk in turn, then the next layer, so that a
   // layer whose experts stream loads the union of the chunks' experts once.

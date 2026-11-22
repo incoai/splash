@@ -37,6 +37,7 @@ public:
                 const ops::ExecutionPlans &operators, uint32_t prefillChunks);
 
   [[nodiscard]] QwenTargetScratchBytes allocatedScratchBytes() const noexcept override;
+  [[nodiscard]] const ops::NormWeights *embeddingNorm() const noexcept override { return &weights_.embeddingNorm; }
   [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
                                                            std::span<const QwenTargetPrefillChunk> chunks,
                                                            const kv::PageStorage &kv, SpilledKvReads &spilled,
@@ -90,6 +91,11 @@ private:
                       const ops::ShortConvolutionBuffers &buffers, ops::ShortConvolutionShape shape) const;
   // A state's rows of a step, as the depth attention reads them.
   [[nodiscard]] ops::StridedRows stateRows(const PrefillStep &step, uint32_t state) const;
+  // The draft's capture of layer `index`'s output rows, `rows` of `element`
+  // values (an application's stream, fp32; layer `layers`: the final normed
+  // rows, bf16), when it reads them (QwenTargetGeometry::captureSlot): a
+  // decode step's every row, a prompt's captured rows.
+  void addCaptures(PrefillStep &step, uint32_t index, metal::MetalBuffer rows, ops::FloatElement element) const;
 
   const InklingWeights &weights_;
   InklingSteps steps_;

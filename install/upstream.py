@@ -46,6 +46,12 @@ PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
 # which its draft reads in place of the target's token table row
 # (DraftCheckpoint.hpp kDraftMaskEmbedding; docs/models.md, Drafts).
 DRAFT_MASK_EMBEDDING = "mask_embedding.safetensors"
+# A DSpark draft's GGUF (Inkling 2 Mini's, as Unsloth publishes it beside
+# the target's quantizations): dspark-<model>-<type>.gguf at the repository's
+# root, of which a draft repository holding several takes its Q8_0 one, the
+# one the engine's DSpark tests check (DSparkDraft.hpp).
+DSPARK_DRAFT = re.compile(r"(?i)dspark-.*\.gguf")
+DSPARK_PREFERRED = re.compile(r"(?i)-q8_0\.gguf$")
 # What a prepare did with the model, which `prepare --json-progress` reports
 # last for the app to word (models.main): published a new installation of it;
 # found the Hub to have nothing newer; could not check, the Hub not answering
@@ -342,8 +348,9 @@ def check_model(target_format, vision_format, config, *, gguf_headers=None, draf
     model-check command): config, the target's configuration, with the
     source formats the record names; gguf_headers, the directory of a GGUF
     target's headers (gguf_target), each tensor of which it plans as it
-    loads it; and draft, its draft's config.json once chosen. A ModelError
-    gives the engine's reason when it refuses them."""
+    loads it; and draft, its draft's config.json once chosen, or the
+    directory of a DSpark draft's GGUF header. A ModelError gives the
+    engine's reason when it refuses them."""
     arguments = ["model-check", target_format, vision_format, str(config)]
     if gguf_headers is not None:
         arguments.append(str(gguf_headers))
@@ -974,14 +981,26 @@ def _at(repo):
     return f"{repo.name}@{repo.revision[:12]}" if repo.revision else repo.name
 
 
+def dspark_gguf(repo):
+    """The DSpark draft GGUF at repo's root (DSPARK_DRAFT), its Q8_0 one
+    where it holds several; None for a repository without one."""
+    names = sorted(n for n in repo.files if "/" not in n and DSPARK_DRAFT.fullmatch(n))
+    preferred = [n for n in names if DSPARK_PREFERRED.search(n)]
+    return (preferred or names or [None])[0]
+
+
 def draft_files(repo, target, following=0):
-    """The DFlash2 draft in repo for target's family, downloaded, by assembly
-    path: config.json, the safetensors weights and the mask embedding when
-    shipped (DRAFT_MASK_EMBEDDING), at the repository's root. The weights
-    download only once the engine accepts its configuration with the
-    target's (check_model); following is the bytes of the downloads after
-    them (Repository.download's reserve)."""
+    """The draft in repo for target's family, downloaded, by assembly path:
+    a DFlash2 checkpoint's config.json, the safetensors weights and the mask
+    embedding when shipped (DRAFT_MASK_EMBEDDING), at the repository's root;
+    or, in a repository without a config.json, its DSpark draft's GGUF
+    (dspark_gguf). The weights download only once the engine accepts the
+    draft's configuration, or GGUF header, with the target's (check_model);
+    following is the bytes of the downloads after them
+    (Repository.download's reserve)."""
     family = target.family
+    if "config.json" not in repo.files and (name := dspark_gguf(repo)):
+        return _dspark_files(repo, target, name, following)
     try:
         if "config.json" not in repo.files:
             raise models.ModelError("no config.json")
@@ -1007,4 +1026,32 @@ def draft_files(repo, target, following=0):
         ) from error
     mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
     downloaded = repo.download({"config.json", *weights, *mask}, reserve=following)
+    return {"draft/" + name: path for name, path in downloaded.items()}
+
+
+def _dspark_files(repo, target, name, following=0):
+    """repo's DSpark draft GGUF `name` for target, downloaded once the
+    engine accepts its header, read by range requests, with the target's;
+    following is the bytes of the downloads after it."""
+    family = target.family
+    with tempfile.TemporaryDirectory() as scratch:
+        headers = Path(scratch) / "draft"
+        headers.mkdir()
+        with repo.open(name) as stream:
+            (headers / name).write_bytes(gguf.Metadata(stream, tensors=True).raw)
+        try:
+            check_model(
+                target.format,
+                target.vision_format,
+                target.config,
+                gguf_headers=target.gguf_headers,
+                draft=headers,
+            )
+        except models.ModelError as error:
+            raise models.ModelError(
+                f"{repo.name}'s DSpark draft {name} is incompatible with "
+                f"{family.name}: {error}"
+            ) from error
+    print(f"Selected the DSpark draft {name} from {repo.name}.", flush=True)
+    downloaded = repo.download({name}, reserve=following)
     return {"draft/" + name: path for name, path in downloaded.items()}

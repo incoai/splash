@@ -1,4 +1,5 @@
 #include "ModelDescriptor.hpp"
+#include "DSparkDraft.hpp"
 #include "GgufImage.hpp"
 #include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
@@ -847,6 +848,20 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   return layout;
 }
 
+// A DSpark draft's GGUF header: the draft's layout over a target that
+// captures its final normed rows for it (finalNormCapture), of its hidden
+// size and vocabulary, whose tokens the draft proposes and whose logits'
+// cap it takes.
+DFlashDraftLayout readDSparkLayout(const DSparkHeader &header, const QwenTargetDimensions &target) {
+  if (!target.finalNormCapture) throw std::invalid_argument("this model's target reads no DSpark draft");
+  if (header.hiddenSize != target.hiddenSize || header.vocabularySize != target.vocabularySize)
+    throw std::invalid_argument("the DSpark draft's hidden size and vocabulary are not its target's");
+  if ((target.validVocabularySize && header.proposedVocabulary != target.validVocabularySize) ||
+      (target.logitSoftcap && header.logitCap != target.logitSoftcap))
+    throw std::invalid_argument("the DSpark draft's tokens and logit cap are not its target's");
+  return dsparkLayout(target.hiddenSize, target.vocabularySize, target.layers, header);
+}
+
 // The vision tower's config, config.json's vision_config, which the
 // installer derives from a GGUF's mmproj too: the tower the layout describes,
 // over RGB patches of two frames, without deepstack layers.
@@ -877,7 +892,7 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
 // states (ggufRoutedExperts).
 ModelDescriptor describeSourceModel(std::string name, std::string_view targetFormat,
                                     std::string_view visionFormat, NSDictionary *config,
-                                    NSDictionary *draft) {
+                                    NSDictionary *draft, const std::optional<DSparkHeader> &dspark = std::nullopt) {
   // A family whose config is flat (flatConfig) holds its text model's keys
   // in the config itself, which then names its model type.
   bool flat = false;
@@ -920,6 +935,7 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
       layout.experts = ggufRoutedExperts(text, layout);
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
+    else if (dspark) dflashLayout = readDSparkLayout(*dspark, layout);
   }, *target);
   ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
                                                {.outputHiddenSize = std::visit(
@@ -993,7 +1009,8 @@ bool ModelDescriptor::valid() const noexcept {
                (!draft.present() ||
                 (layout.hiddenSize == draft.hiddenSize && draft.targetLayerCount &&
                  draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-                 draft.targetLayers[draft.targetLayerCount - 1] < layout.layers)) &&
+                 draft.targetLayers[draft.targetLayerCount - 1] <
+                     layout.layers + (draft.kind == DraftKind::DSpark && layout.finalNormCapture))) &&
                // A family whose drafts choose the mask token holds its draft's;
                // a model without a draft reads no mask token.
                (!layout.draftChoosesMaskToken() || !draft.present() ||
@@ -1055,8 +1072,12 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     if (drafted != std::filesystem::exists(root / "draft"))
       throw std::invalid_argument(drafted ? "the model's root holds no draft/ for its DFlash2 draft"
                                           : "the model's root holds a draft/ its record does not name");
-    NSDictionary *draft = drafted ? readObject(root / "draft" / "config.json", "draft config") : nil;
-    ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    // A DFlash2 draft's config.json, or a DSpark draft's GGUF.
+    const bool dflash = drafted && std::filesystem::exists(root / "draft" / "config.json");
+    NSDictionary *draft = dflash ? readObject(root / "draft" / "config.json", "draft config") : nil;
+    std::optional<DSparkHeader> dspark;
+    if (drafted && !dflash) dspark = readDSparkHeader(root / "draft");
+    ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft, dspark);
     result.sourceIdentity = std::move(sourceIdentity);
     // Without a draft a cached state is the target's cell alone, which a
     // target of no recurrent or auxiliary state (Flint's) leaves empty: the
@@ -1075,9 +1096,20 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
                                             const std::optional<std::filesystem::path> &draft) {
   @autoreleasepool {
     NSDictionary *target = readObject(config, "upstream model config");
-    NSDictionary *checkpoint = draft ? readObject(*draft, "draft config") : nil;
+    // A DFlash2 draft's config.json, or a directory of a DSpark draft's GGUF
+    // headers.
+    const bool dspark = draft && std::filesystem::is_directory(*draft);
+    NSDictionary *checkpoint = draft && !dspark ? readObject(*draft, "draft config") : nil;
+    const std::optional<DSparkHeader> header =
+        dspark ? std::optional<DSparkHeader>(readDSparkHeader(*draft)) : std::nullopt;
     // Unnamed: the record names an installation, which this precedes.
-    const ModelDescriptor descriptor = describeSourceModel({}, targetFormat, visionFormat, target, checkpoint);
+    const ModelDescriptor descriptor =
+        describeSourceModel({}, targetFormat, visionFormat, target, checkpoint, header);
+    // A DSpark draft's tensors as its loader plans them.
+    if (header) {
+      const OpenGguf draftHeaders(findTargetGgufs(*draft), GgufContents::Headers);
+      static_cast<void>(planDSparkImages(draftHeaders.file(), descriptor.draft));
+    }
     if (descriptor.targetSource == TargetSource::Gguf) {
       if (!ggufHeaders) throw std::invalid_argument("a GGUF target is checked with its headers");
       const OpenGguf headers(findTargetGgufs(*ggufHeaders), GgufContents::Headers);

@@ -156,8 +156,8 @@ void printUsage(std::string_view executable) {
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
       " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]"
       " [--max-concurrent-requests REQUESTS]");
-  writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
-  writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
+  writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG|DSPARK_HEADERS]");
+  writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG|DSPARK_HEADERS]");
   writeStderrLine("       " + command + " device-check");
   writeStderrLine("       " + command + " families");
 }
@@ -464,8 +464,9 @@ int checkDevice(int argc) {
 // installer applies before any weight download: the family it describes, as
 // JSON, or the refusal (model::inspectSourceConfiguration).
 int checkModel(int argc, char **argv) {
-  // The draft's config, when given, follows the target's: its config, and a
-  // GGUF's directory of headers after it.
+  // The draft's config (or a DSpark draft's directory of GGUF headers), when
+  // given, follows the target's: its config, and a GGUF's directory of
+  // headers after it.
   const int draftIndex = argc > 2 && std::string_view(argv[2]) == "gguf" ? 6 : 5;
   if (argc != draftIndex && argc != draftIndex + 1)
     throw engine::UsageError(

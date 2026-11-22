@@ -1,0 +1,34 @@
+{
+  "general.architecture": "dflash",
+  "dflash.block_count": 3,
+  "dflash.context_length": 1048576,
+  "dflash.embedding_length": 2304,
+  "dflash.feed_forward_length": 9216,
+  "dflash.attention.head_count": 24,
+  "dflash.attention.head_count_kv": 8,
+  "dflash.rope.freq_base": 1000000.0,
+  "dflash.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
+  "dflash.attention.key_length": 128,
+  "dflash.attention.value_length": 128,
+  "dflash.vocab_size": 201024,
+  "dflash.vocab_size_unpadded": 200058,
+  "dflash.block_size": 8,
+  "dflash.target_layers": [
+    5,
+    23,
+    41,
+    48
+  ],
+  "dflash.dspark.markov_rank": 256,
+  "dflash.sample_from_anchor": false,
+  "dflash.has_confidence_head": false,
+  "dflash.attention.causal": false,
+  "dflash.attention.sliding_window": 1024,
+  "dflash.attention.sliding_window_pattern": [
+    true,
+    false,
+    true
+  ],
+  "dflash.rope.dimension_count": 128,
+  "dflash.final_logit_softcapping": 30.0
+}

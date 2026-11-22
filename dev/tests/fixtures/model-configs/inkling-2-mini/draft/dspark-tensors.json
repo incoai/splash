@@ -1,0 +1,357 @@
+{
+  "dspark_fuse.weight": [
+    "F32",
+    [
+      4,
+      4
+    ]
+  ],
+  "dspark_hidden_out.bias": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "dspark_hidden_out.weight": [
+    "BF16",
+    [
+      256,
+      2304
+    ]
+  ],
+  "dspark_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "joint_proj.bias": [
+    "F32",
+    [
+      768
+    ]
+  ],
+  "joint_proj.weight": [
+    "BF16",
+    [
+      5120,
+      768
+    ]
+  ],
+  "markov_w1.weight": [
+    "BF16",
+    [
+      256,
+      201024
+    ]
+  ],
+  "mask_embd.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "output_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.0.attn_k.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.0.attn_k_ctx.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.0.attn_k_ctx_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.0.attn_k_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.0.attn_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.0.attn_output.weight": [
+    "Q8_0",
+    [
+      3072,
+      2304
+    ]
+  ],
+  "blk.0.attn_q.weight": [
+    "Q8_0",
+    [
+      2304,
+      3072
+    ]
+  ],
+  "blk.0.attn_q_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.0.attn_v.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.0.attn_v_ctx.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.0.dflare_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.0.ffn_down.weight": [
+    "Q8_0",
+    [
+      9216,
+      2304
+    ]
+  ],
+  "blk.0.ffn_gate.weight": [
+    "Q8_0",
+    [
+      2304,
+      9216
+    ]
+  ],
+  "blk.0.ffn_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.0.ffn_up.weight": [
+    "Q8_0",
+    [
+      2304,
+      9216
+    ]
+  ],
+  "blk.1.attn_k.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.1.attn_k_ctx.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.1.attn_k_ctx_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.1.attn_k_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.1.attn_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.1.attn_output.weight": [
+    "Q8_0",
+    [
+      3072,
+      2304
+    ]
+  ],
+  "blk.1.attn_q.weight": [
+    "Q8_0",
+    [
+      2304,
+      3072
+    ]
+  ],
+  "blk.1.attn_q_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.1.attn_v.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.1.attn_v_ctx.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.1.dflare_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.1.ffn_down.weight": [
+    "Q8_0",
+    [
+      9216,
+      2304
+    ]
+  ],
+  "blk.1.ffn_gate.weight": [
+    "Q8_0",
+    [
+      2304,
+      9216
+    ]
+  ],
+  "blk.1.ffn_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.1.ffn_up.weight": [
+    "Q8_0",
+    [
+      2304,
+      9216
+    ]
+  ],
+  "blk.2.attn_k.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.2.attn_k_ctx.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.2.attn_k_ctx_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.2.attn_k_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.2.attn_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.2.attn_output.weight": [
+    "Q8_0",
+    [
+      3072,
+      2304
+    ]
+  ],
+  "blk.2.attn_q.weight": [
+    "Q8_0",
+    [
+      2304,
+      3072
+    ]
+  ],
+  "blk.2.attn_q_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.2.attn_v.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.2.attn_v_ctx.weight": [
+    "Q8_0",
+    [
+      2304,
+      1024
+    ]
+  ],
+  "blk.2.dflare_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.2.ffn_down.weight": [
+    "Q8_0",
+    [
+      9216,
+      2304
+    ]
+  ],
+  "blk.2.ffn_gate.weight": [
+    "Q8_0",
+    [
+      2304,
+      9216
+    ]
+  ],
+  "blk.2.ffn_norm.weight": [
+    "F32",
+    [
+      2304
+    ]
+  ],
+  "blk.2.ffn_up.weight": [
+    "Q8_0",
+    [
+      2304,
+      9216
+    ]
+  ]
+}

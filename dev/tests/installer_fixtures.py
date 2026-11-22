@@ -79,7 +79,11 @@ def mlx_target(root, family, *, changes=None):
 
 def draft_dir(root, family, **changes):
     """A DFlash2 release of family's draft: its config.json, with changes
-    (dotted keys), and weights."""
+    (dotted keys), and weights; or, for a family whose draft is a DSpark
+    GGUF (Inkling 2's), that GGUF's header (dspark_dir)."""
+    if (CONFIGS / family.name.lower() / "draft" / "dspark-metadata.json").exists():
+        assert not changes
+        return dspark_dir(root, family)
     root.mkdir(parents=True, exist_ok=True)
     draft = family_config(family, "draft/config.json")
     for key, value in changes.items():
@@ -90,6 +94,26 @@ def draft_dir(root, family, **changes):
         node[name] = value
     (root / "config.json").write_text(json.dumps(draft))
     (root / "model.safetensors").write_bytes(b"draft")
+    return root
+
+
+def dspark_dir(root, family):
+    """A DSpark release of family's draft: its GGUF's header without data,
+    as Unsloth's dspark-Inkling-2-Mini-Q8_0.gguf states it (but its
+    tokenizer, which the draft reads none of): the fixture's
+    draft/dspark-metadata.json and draft/dspark-tensors.json."""
+    root.mkdir(parents=True, exist_ok=True)
+    tensors = [
+        (name, extents, GGML[kind])
+        for name, (kind, extents) in family_config(
+            family, "draft/dspark-tensors.json"
+        ).items()
+    ]
+    write_target(
+        root / f"dspark-{family.name}-Q8_0.gguf",
+        family_config(family, "draft/dspark-metadata.json"),
+        tensors,
+    )
     return root
 
 

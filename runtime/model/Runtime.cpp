@@ -11,6 +11,7 @@
 #include "model/LookupProposals.hpp"
 #include "model/ModelPools.hpp"
 #include "model/QwenState.hpp"
+#include "model/DSparkDraft.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/SpilledKvReads.hpp"
@@ -550,9 +551,10 @@ struct Runtime::Impl {
   ModelTelemetry counters;
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
-  // None for a model installed without a draft (--draft-model none), whose
-  // cycles verify each lane's anchor and host chain alone (writeChainTree).
-  std::optional<DFlashDraft> draftModel;
+  // A DFlash2 or DSpark draft (DraftModel); none for a model installed
+  // without a draft (--draft-model none), whose cycles verify each lane's
+  // anchor and host chain alone (writeChainTree).
+  std::unique_ptr<DraftModel> draftModel;
   // The acceptance model and costs a decode cycle's rows follow
   // (--verify-rows auto): its step's rows, by the costs the start measures
   // (StepCosts), each of which a lane holds it verifies, or for a target
@@ -754,10 +756,18 @@ struct Runtime::Impl {
           "model runtime resources do not match the loaded model");
     }
     if (geometry.draft.present())
-      draftModel.emplace(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
-                         geometry.target.draftVocabulary);
+      draftModel = makeDraftModel(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
+                                  geometry.target.draftVocabulary, targetModel->embeddingNorm());
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
+    // What the draft runs once before its first step (a DSpark draft's fold
+    // of its Markov head into the head), over the decode arena's scratch.
+    if (draftModel) {
+      CommandGraph setup;
+      draftModel->addSetup(setup, decodeArena->linearScratch(), decodeArena->all(DecodeTensor::Logits),
+                           geometry.target.stepRows());
+      if (!setup.dispatches().empty()) static_cast<void>(backend.submitCommandAsync(setup.dispatches()).wait());
+    }
     penaltyTable =
         decodeArena->all(DecodeTensor::PenaltyState);
     // A decode step's classes, up to the rows a step runs in one pass: a
@@ -2460,7 +2470,8 @@ struct Runtime::Impl {
   void bindDraftRings(
       std::span<Request *const> entries,
       std::vector<std::array<MetalBuffer, kLaneCount>> &keys,
-      std::vector<std::array<MetalBuffer, kLaneCount>> &values) const {
+      std::vector<std::array<MetalBuffer, kLaneCount>> &values,
+      std::array<MetalBuffer, kLaneCount> &auxiliary) const {
     keys.resize(geometry.draft.layers);
     values.resize(geometry.draft.layers);
     for (uint32_t layer = 0; layer < geometry.draft.layers; ++layer) {
@@ -2469,6 +2480,8 @@ struct Runtime::Impl {
             states.draft(laneEntry(entries, lane).stateLane)[layer];
         keys[layer][lane] = ring.keys;
         values[layer][lane] = ring.values;
+        // The draft's own state beside the rings, on the first layer's.
+        if (!layer) auxiliary[lane] = ring.auxiliary;
       }
     }
   }
@@ -2537,7 +2550,7 @@ struct Runtime::Impl {
     buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
-    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues, buffers.laneAuxiliary);
     std::array<ops::DraftTreeLane, kLaneCount> trees{};
     std::array<std::span<const uint32_t>, kLaneCount> tokens{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -2856,7 +2869,7 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedRows = d(DecodeTensor::RetainedRows);
     buffers.laneRows = d(DecodeTensor::LaneLayout);
-    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues, buffers.laneAuxiliary);
     draftModel->addContextCommit(graph, std::move(buffers), std::span(startPositions).first(lanes), step);
   }
 

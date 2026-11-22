@@ -184,6 +184,10 @@ struct QwenTargetDimensions {
   uint32_t relativeDimension = 0;
   uint32_t relativeExtent = 0;
   uint32_t shortConvolutionTaps = 0;
+  // Whether its target captures its final normed rows for a draft that
+  // reads them, as capture layer `layers` (a DSpark draft's last feature,
+  // model/DSparkDraft.hpp): Inkling 2 Mini's.
+  bool finalNormCapture = false;
 
   // The weight layers: the layers but for the loop's passes after its first.
   [[nodiscard]] constexpr uint32_t weightLayers() const noexcept {

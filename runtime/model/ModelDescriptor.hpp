@@ -127,8 +127,9 @@ struct FamilyFacts final {
 // headers as the installer read them (its one file's, or each split part's
 // under the part's name), from which it plans the target as every start
 // plans the GGUF (gguf::planImages); and draft, once chosen, the DFlash2
-// draft's config.json. The installer runs it before any weight download
-// (the engine's model-check command).
+// draft's config.json or the directory of a DSpark draft's GGUF headers. The
+// installer runs it before any weight download (the engine's model-check
+// command).
 [[nodiscard]] std::string_view
 inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                            const std::filesystem::path &config,

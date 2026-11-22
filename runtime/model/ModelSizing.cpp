@@ -1,5 +1,6 @@
 #include "model/ModelSizing.hpp"
 
+#include "model/DSparkDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
@@ -99,7 +100,9 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
             streams);
       },
       descriptor.target);
-  if (descriptor.draft.present()) result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
+  if (descriptor.draft.present())
+    result.loadedBytes += descriptor.draft.kind == DraftKind::DSpark ? dsparkDraftBytes(root / "draft", descriptor.draft)
+                                                                     : draftImageBytes(root / "draft", descriptor.draft);
   if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
   return result;
 }
