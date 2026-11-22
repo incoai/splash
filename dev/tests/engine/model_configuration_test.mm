@@ -291,6 +291,12 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
             R"("selector_top_k": 16, "target_hidden_reduction": "stream_mean")",
             "draft config dflash_config target_hidden_reduction mismatch: checkpoint stream_mean, runtime none"},
            {&SourceModel::draft, R"("is_causal": false)", R"("is_causal": 0)", "draft config is_causal must be false"},
+           {&SourceModel::draft, R"("num_target_layers": 64)", R"("num_target_layers": 65)",
+            "draft config num_target_layers mismatch: checkpoint 65, runtime 64"},
+           {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 16, "output_multiplier": 2.0)",
+            "draft config dflash_config output_multiplier mismatch: checkpoint 2, runtime 1"},
+           {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 16, "input_embedding_scale": 0.5)",
+            "draft config dflash_config input_embedding_scale mismatch: checkpoint 0.5, runtime 1"},
        })
     refuses(source.with(refused.file, refused.from, refused.to), refused.error,
             "an upstream config was accepted with " + std::string(refused.to));

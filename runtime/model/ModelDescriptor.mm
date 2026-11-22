@@ -805,6 +805,12 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {{"is_causal", false},
                    {"attention_bias", false},
                    {"tie_word_embeddings", false}});
+  // The count of target layers its ids number, where its config states it
+  // (num_target_layers): its target's, so that its ids name the target's
+  // layers (a draft numbered by another count, such as Inkling 2's weight
+  // layers beside its 48 applications, would read other rows).
+  if (draft[@"num_target_layers"])
+    requireNumbers(draft, "checkpoint", "draft config", {{"num_target_layers", target.layers}});
   requireEqual(requireString(draft, @"hidden_act", "draft config hidden_act"),
                "silu", "checkpoint", "draft config hidden_act");
   NSDictionary *rope =
@@ -820,6 +826,11 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", target.maskToken}});
+  // Scales the draft kernels do not take, 1 where a config states them: its
+  // logits' multiplier before any softcap (output_multiplier) and its token
+  // rows' scale (input_embedding_scale).
+  for (const char *scale : {"output_multiplier", "input_embedding_scale"})
+    if (flash[@(scale)]) requireNumbers(flash, "checkpoint", "draft config dflash_config", {{scale, 1.0}});
   // The block it was trained to fill: the kernels' rows or more, of which a
   // cycle drafts the first (Ornith-1.5-122B's fills 16). Its weights have no
   // part of the block's length.
