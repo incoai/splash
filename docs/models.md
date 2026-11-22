@@ -303,7 +303,8 @@ inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
 
 ## Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
+A model decodes with a DFlash2 draft unless it is installed without one
+(below). Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
@@ -539,6 +540,35 @@ that model, 1.5% and 1.0% on its UD-Q4_K_M GGUF, 2.3% and 1.7% on
 Qwen3.6-35B-A3B UD-Q4_K_M. Flint's vocabulary mixes its scripts through all
 its tokens (its first 98,304 hold 98.1% of English text's tokens and 88.5% of
 Russian text's), so its drafts propose from all of them.
+
+`--draft-model none` installs the target alone: the installer asks the Hub for
+no draft, downloads none and links no `draft/`, and the installation's
+`model.json` records its draft source as `null`, so it is an installation of
+its own beside the drafted one ([Model cache](server.md#model-cache)). A
+family released without a draft (its `families.FAMILIES` draft repository is
+`None`) installs so by default, from the Hub or from local files. The engine
+then loads no draft weights and allocates neither the draft's rings, its
+context windows, its decode rows nor its scratch (`DFlashDraftLayout{}`,
+whose `present()` is false), and the memory they took goes to the KV cache.
+Every decode cycle verifies each lane's anchor and its host chain: the
+tokens its grammar forces or its thinking end, or else its prompt-lookup
+chain, which the host lays out as the lane's tree, a chain whose rows the
+target verifies in one forward and whose acceptance keeps the path its
+selections follow, as with a draft. The chain's tokens are estimated by
+`model::LookupAcceptance` with no agreement with a draft, its counts refined
+by the cycles' outcomes under `--verify-rows auto` as with a draft, and that
+mode's measured step costs choose how many of a chain's rows a cycle
+verifies; under `--verify-rows all` it verifies all of them. A lane with no
+chain verifies its anchor alone, one row. No row is a draft's, so a sampled
+row draws from the target's whole distribution and keeps a chain token only
+where its draw is that token: outputs are the target's, greedy and sampled.
+Without a draft a model needs no mask token. Its cached states are the
+target's cells alone, so a family whose target keeps no recurrent or
+auxiliary state (Flint) serves only with its draft: its states would be
+empty, which the SSD cache's state slots cannot hold, and the installer
+refuses it before any download (`families.FAMILIES`), as the engine does.
+[Local model files](#local-model-files) of a family with a draft are always
+prepared with one: `--draft-model none` cannot be used with `--model-dir`.
 
 ## Vision
 

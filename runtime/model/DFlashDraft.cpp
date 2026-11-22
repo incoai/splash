@@ -86,6 +86,9 @@ DFlashDraftRing::DFlashDraftRing(
     : tracker_(std::move(tracker)), layers_(layout.layers) {
   if (!tracker_)
     throw std::invalid_argument("draft state allocation tracker is empty");
+  // A model without a draft has rings of no layers, which hold nothing.
+  if (!layout.ringBytes())
+    return;
   const uint64_t before = backend.memoryStats().allocatedBytes;
   const metal::MetalBuffer base = backend.allocateBuffer(
       layout.ringBytes(), metal::BufferStorage::Shared, label);
@@ -115,6 +118,9 @@ DFlashContextWindow::DFlashContextWindow(
     : tracker_(std::move(tracker)) {
   if (!tracker_)
     throw std::invalid_argument("draft state allocation tracker is empty");
+  // A model without a draft has an empty window.
+  if (!layout.windowBytes())
+    return;
   const uint64_t before = backend.memoryStats().allocatedBytes;
   buffer_ = backend.allocateBuffer(layout.windowBytes(), metal::BufferStorage::Shared, label);
   actualAllocatedBytes_ =

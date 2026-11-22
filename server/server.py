@@ -1459,8 +1459,8 @@ def main():
                 tokenizer, chat_templates.select(None).thinking_end, family.chat_format
             )
         # The grammars' table, built while the engine loads (0.82 s on a
-        # 32-core M5 Max): its vocabulary is the draft's, which the engine
-        # holds to its target's as it loads, and its stop tokens those
+        # 32-core M5 Max): its vocabulary is the target's, which the engine
+        # holds a draft's to as it loads, and its stop tokens those
         # check_capabilities holds to the Ready's.
         grammar_table = ConstraintFactory.table(
             tokenizer, family.chat_format, vocabulary

@@ -134,7 +134,8 @@ struct DraftStateLayout final {
 // A lane holds two GDN cells, its draft rings and their context window; a
 // cached state one cached cell (GdnStateLayout::cachedCellBytes) and the
 // window, from which a restore that needs the rings computes them again. A
-// cell of no bytes takes no memory (QwenGdnCell).
+// cell of no bytes takes no memory (QwenGdnCell), and a model without a draft
+// has the zero draft layout, whose rings and window hold nothing.
 struct CompositeStateLayout final {
   static constexpr uint32_t kLaneGdnCells = 2;
 
@@ -142,7 +143,7 @@ struct CompositeStateLayout final {
   DraftStateLayout draft;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return target.valid() && draft.valid();
+    return target.valid() && (draft.valid() || draft == DraftStateLayout{});
   }
   [[nodiscard]] constexpr uint64_t laneBytes() const noexcept {
     return kLaneGdnCells * target.cellBytes() + draft.ringBytes() +

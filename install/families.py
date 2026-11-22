@@ -55,8 +55,10 @@ class ModelFamily:
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
-    # follow its default branch as they follow the target's.
-    draft_repo: str
+    # follow its default branch as they follow the target's. None for a
+    # family released without one: its models serve without a draft, as
+    # --draft-model none installs them, unless --draft-model names one.
+    draft_repo: str | None
     # How the family's model reasons and calls tools, and the tokens it
     # shares with the engine (server/chat_format.py).
     chat_format: ChatFormat
@@ -66,6 +68,11 @@ class ModelFamily:
     # loads from the target repository unless --language-only. The models of
     # a family without one serve text only, whatever their repository holds.
     vision: bool = True
+    # Whether the family's models serve without a draft (--draft-model none).
+    # Flint's do not: its target keeps no recurrent or auxiliary state, so
+    # without a draft a cached state would be empty, which the SSD cache's
+    # state slots cannot hold (ModelDescriptor.mm inspectModelRoot).
+    draftless: bool = True
 
 
 FAMILIES = (
@@ -84,8 +91,15 @@ FAMILIES = (
         QWEN,
         QWEN_SAMPLING,
     ),
-    # It has no vision tower.
-    ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
+    # It has no vision tower, and serves only with a draft.
+    ModelFamily(
+        "Flint",
+        "incoai/Flint-DFlash2",
+        FLINT,
+        FLINT_SAMPLING,
+        vision=False,
+        draftless=False,
+    ),
 )
 
 

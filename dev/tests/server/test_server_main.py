@@ -1026,8 +1026,7 @@ class ServerMainTests(unittest.TestCase):
         served = models / ".resolved/assembly"
         served.mkdir(parents=True)
         (served / "model.json").write_text("{}")
-        (served / "draft").mkdir()
-        (served / "draft/config.json").write_text('{"vocab_size": 248320}')
+        (served / "config.json").write_text('{"text_config": {"vocab_size": 248320}}')
         link = models / "owner/model"
         link.parent.mkdir()
         link.symlink_to(served, target_is_directory=True)

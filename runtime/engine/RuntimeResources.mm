@@ -420,10 +420,11 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
 
 // The rows the target's decode cycles verify (--verify-rows), and why: those
 // its cycles' cost line's floor passes where its experts stream
-// (model::CostLine).
-void reportVerifyRows(model::VerifyRows rows, bool streamed) {
+// (model::CostLine), of each lane's anchor and host chain without a draft.
+void reportVerifyRows(model::VerifyRows rows, bool streamed, bool drafted) {
+  if (!drafted) logLine("Decode cycles verify each lane's anchor and host chain: the model has no draft.");
   if (rows == model::VerifyRows::All)
-    logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
+    logLine("Decode cycles verify every row of ", drafted ? "the draft's block" : "them", " (--verify-rows all).");
   else
     logLine("Decode cycles verify the rows ",
             streamed ? "their cost line's floor passes" : "of the step their measured costs choose",
@@ -481,7 +482,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
-      !loaded.draft.actualAllocatedBytes ||
+      (loaded.descriptor.draft.present() && !loaded.draft.actualAllocatedBytes) ||
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {
@@ -1072,7 +1073,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
 
   ready();
-  reportVerifyRows(config.verifyRows, loaded.expertStore() != nullptr);
+  reportVerifyRows(config.verifyRows, loaded.expertStore() != nullptr, loaded.descriptor.draft.present());
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load, or where
