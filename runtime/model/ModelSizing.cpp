@@ -69,7 +69,7 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
                          residentExpertSlotsBytes(layout.experts);
     StreamedBlocks blocks;
     blocks.blocks = gguf::streamedExperts(
-        std::span(streamed).subspan(layout.leadingDenseLayers, layout.layers - layout.leadingDenseLayers));
+        std::span(streamed).subspan(layout.leadingDenseLayers, layout.weightLayers() - layout.leadingDenseLayers));
     result.expertMinimumBytes = ExpertStore::minimumBytes(blocks, layout.moeBlockShape());
   }
   return result;

@@ -28,12 +28,25 @@ enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 // cycles puts what they would lose at 5.5% of their tokens.
 inline constexpr ops::DraftVocabulary kQwenDraftVocabulary{148'288, 248'000};
 
+// The bytes of a value of a short convolution's history in a state cell
+// (QwenTargetDimensions::shortConvolutionStateBytes): bf16, as the GDN's
+// convolution rows are kept. 4 keeps them fp32.
+inline constexpr uint64_t kShortConvolutionStateValueBytes = 2;
+
 // The dimensions and tokens of a Qwen hybrid target: GDN layers, every
 // fullAttentionPeriod-th layer an attention layer instead (every layer with
 // a period of 1, a target without GDN), each followed by a dense FFN or a
 // sparse MoE. A family's layout (QwenHybridLayout) sets them, and every view
 // of a target reads them from there: the target loaders, the GGUF planner
 // and the runtime's QwenTargetGeometry.
+//
+// Its layers are the layers a row runs through in order, each with its own
+// KV and state: everything the runtime, the engine and the KV pages read is
+// per such layer. A looped target (Inkling 2 Mini) runs some of its weight
+// layers more than once: layers loopStart to loopEnd - 1 run loopPasses
+// times in a row, each pass a layer of its own, so its layers outnumber its
+// weight layers, which its GGUF, its images, its config's layer count and its
+// MoE blocks count (weightLayers, weightLayer).
 struct QwenTargetDimensions {
   // The native window, the context max_position_embeddings states, and the
   // most context YaRN stretches it to (servedFor), as the family's model
@@ -83,7 +96,9 @@ struct QwenTargetDimensions {
   // (safetensors::normStorage, where each family's measurement is stated).
   // Every family states it (model::kFamilies).
   float attentionNormMean = 0.0F;
-  // The rotated dimension pairs of each attention head and their RoPE base.
+  // The rotated dimension pairs of each attention head and their RoPE base;
+  // both zero for a target of no RoPE, whose every attention layer is one of
+  // unrotatedLayers.
   uint32_t rotaryPairs = 0;
   float rotaryTheta = 0.0F;
   // How the attention layers attend beyond reading every key up to their row
@@ -155,6 +170,45 @@ struct QwenTargetDimensions {
   uint32_t pleHeadsPerNgram = 0;
   uint32_t pleHeadDimension = 0;
   uint32_t pleConvolutionTaps = 0;
+  // Inkling 2 Mini's additions (model/Inkling.hpp), zero for the other
+  // families. Its loop: weight layers loopStart to loopEnd - 1 run
+  // loopPasses times (weightLayer). The relative-position bias of its
+  // attention: relativeDimension values per query head, scored against a
+  // bank of relativeExtent key distances. Its short convolutions of
+  // shortConvolutionTaps taps on each layer's keys, values, attention output
+  // and FFN output, whose history a state cell keeps
+  // (shortConvolutionStateBytes).
+  uint32_t loopStart = 0;
+  uint32_t loopEnd = 0;
+  uint32_t loopPasses = 0;
+  uint32_t relativeDimension = 0;
+  uint32_t relativeExtent = 0;
+  uint32_t shortConvolutionTaps = 0;
+
+  // The weight layers: the layers but for the loop's passes after its first.
+  [[nodiscard]] constexpr uint32_t weightLayers() const noexcept {
+    return loopPasses ? layers - (loopPasses - 1) * (loopEnd - loopStart) : layers;
+  }
+  // The weight layer layer `layer` runs: itself before the loop, the loop's
+  // layer of its pass within the loop, and after it the one as many layers
+  // past the loop's end as it is past the last pass's.
+  [[nodiscard]] constexpr uint32_t weightLayer(uint32_t layer) const noexcept {
+    if (!loopPasses || layer < loopStart) return layer;
+    const uint32_t loop = loopEnd - loopStart;
+    if (layer < loopStart + loopPasses * loop) return loopStart + (layer - loopStart) % loop;
+    return layer - (loopPasses - 1) * loop;
+  }
+  // The loop's pass layer `layer` belongs to, 0 outside the loop.
+  [[nodiscard]] constexpr uint32_t loopPass(uint32_t layer) const noexcept {
+    if (!loopPasses || layer < loopStart || layer >= loopStart + loopPasses * (loopEnd - loopStart)) return 0;
+    return (layer - loopStart) / (loopEnd - loopStart);
+  }
+  // The first layer that runs weight layer `weightLayer`, which shares its
+  // kind of mixer and window with the others that run it.
+  [[nodiscard]] constexpr uint32_t firstLayer(uint32_t weightLayer) const noexcept {
+    return loopPasses && weightLayer >= loopEnd ? weightLayer + (loopPasses - 1) * (loopEnd - loopStart)
+                                                : weightLayer;
+  }
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
@@ -166,8 +220,9 @@ struct QwenTargetDimensions {
   [[nodiscard]] constexpr uint32_t gdnLayerCount() const noexcept { return layers - attentionLayerCount(); }
   // Whether its drafts choose their mask token (firstDraftMaskToken).
   [[nodiscard]] constexpr bool draftChoosesMaskToken() const noexcept { return lastDraftMaskToken != 0; }
-  // Whether layer `layer`'s FFN is a MoE block, and the block's index among
-  // the target's (its ExpertStore block).
+  // Whether weight layer `layer`'s FFN is a MoE block, and the block's index
+  // among the target's (its ExpertStore block), which every layer that runs
+  // the weight layer shares.
   [[nodiscard]] constexpr bool isMoeLayer(uint32_t layer) const noexcept {
     return ffnKind == QwenFfnKind::SparseMoe && layer >= leadingDenseLayers;
   }
@@ -237,6 +292,22 @@ struct QwenTargetDimensions {
                                     GdnStateLayout::bfloat16Bytes
                               : 0;
   }
+  // The channels of a layer's short convolutions: its keys', its values',
+  // its attention output's and its FFN output's (Inkling's 1,024 + 1,024 +
+  // 2,304 + 2,304).
+  [[nodiscard]] constexpr uint32_t shortConvolutionChannels() const noexcept {
+    return shortConvolutionTaps ? 2 * attentionKvHeads * attentionHeadDimension + 2 * hiddenSize : 0;
+  }
+  // Their history in a state cell, after the QSA pending keys: per layer
+  // (each pass of the loop its own) the inputs of the taps - 1 tokens before
+  // the next of every channel, which the next token's convolutions read, of
+  // kShortConvolutionStateValueBytes each. Inkling's: 48 layers x 3 rows x
+  // 6,656 channels x 2 bytes = 1,916,928 bytes.
+  [[nodiscard]] constexpr uint64_t shortConvolutionStateBytes() const noexcept {
+    return shortConvolutionTaps ? uint64_t{layers} * (shortConvolutionTaps - 1) * shortConvolutionChannels() *
+                                      kShortConvolutionStateValueBytes
+                                : 0;
+  }
   bool operator==(const QwenTargetDimensions &) const = default;
 };
 
@@ -244,11 +315,13 @@ struct QwenTargetDimensions {
 // make. A layout type is an architecture, whose code its families share; each
 // family is a value of it (model::kFamilies) that sets every value its FFN
 // uses. The type states its config's model type and the architecture of its
-// GGUFs (modelType, ggufArchitecture), and, where its config.json holds the
+// GGUFs (modelType, ggufArchitecture), where its config.json holds the
 // text model's keys at its top level instead of in a text_config (a
-// multimodal Qwen checkpoint's), flatConfig.
+// multimodal Qwen checkpoint's), flatConfig, and the key of its text
+// config that states its native window, contextKey.
 struct QwenHybridLayout : QwenTargetDimensions {
   static constexpr bool flatConfig = false;
+  static constexpr std::string_view contextKey = "max_position_embeddings";
 
   // The family's name, as the installer pairs its draft (install/families.py).
   std::string_view family;
@@ -269,7 +342,8 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .reads = reads};
   }
   // The GDN layers' state and, after it in a cell, a PLE convolution's
-  // history and the QSA indexer's pending keys.
+  // history, the QSA indexer's pending keys and the short convolutions'
+  // history.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
     return {.layers = gdnLayerCount(),
             .convolutionHistory = gdnLayerCount() ? kGdnConvolutionTaps - 1 : 0,
@@ -277,7 +351,7 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .recurrentGroups = gdnValueHeads,
             .recurrentRows = gdnHeadDimension,
             .recurrentColumns = gdnHeadDimension,
-            .auxiliaryBytes = pleHistoryBytes() + indexerPendingBytes()};
+            .auxiliaryBytes = pleHistoryBytes() + indexerPendingBytes() + shortConvolutionStateBytes()};
   }
   bool operator==(const QwenHybridLayout &) const = default;
 };

@@ -108,6 +108,9 @@ ENGINE_MODEL_BOUNDARY = frozenset(
 CONCRETE_MODEL_HEADERS = (
     "model/DFlashDraft.hpp",
     "model/Flint.hpp",
+    "model/Inkling.hpp",
+    "model/InklingSteps.hpp",
+    "model/InklingTarget.hpp",
     "model/ModelFactory.hpp",
     "model/Qwen3_6Moe.hpp",
     "model/Qwen3_8.hpp",

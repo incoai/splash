@@ -177,9 +177,9 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
         // The PLE hash first, from the GGUF's metadata or the checkpoint's
         // buffers, before any image loads.
         result.pleHash = readPleHash(loader, layout);
-        result.layers.reserve(layout.layers);
+        result.layers.reserve(layout.weightLayers());
         const uint32_t streams = layout.streamWidth();
-        for (uint32_t index = 0; index < layout.layers; ++index) {
+        for (uint32_t index = 0; index < layout.weightLayers(); ++index) {
           const bool fullAttention = layout.isFullAttentionLayer(index);
           WeightFile file = loader.layer(index);
           Qwen4ExpLayerWeights &layer = result.layers.emplace_back();

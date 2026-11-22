@@ -2,7 +2,7 @@
 # family Splash serves (model::kFamilies), as
 # dev/tests/engine/family_values_test.cpp writes it, family by family in
 # kFamilies' order, each with the draft dev/tests/fixtures/model-configs
-# describes for it:
+# describes for it, or none for a family no draft serves (Inkling-2-Mini):
 #
 #   facts: what the options of a start depend on (model::familyFacts),
 #     1 for yes: a MoE FFN, GDN state, a PLE table, sparse KV, every FFN
@@ -88,3 +88,16 @@ namespace bf16 fp32 b06e435b51f8c94636cf3a72acdcfc26
 state bf16 cell 0 lane 10747904 cached 2359296
 namespace int8 bf16 b0dbac8e4f941ecd3e28c87cc3d2c58a
 namespace bf16 bf16 b06e435b51f8c94636cf3a72acdcfc26
+family Inkling-2-Mini
+facts experts 1 recurrent-state 0 ple-table 0 sparse-kv 0 dense-ffn 0 context 1048576..1048576
+kv layers 48 heads 8 dimension 128 index 0 window 1023 layers 0x7df7df7df7df
+kv int8 page 3244032 index-page 0 slim-page 540672 alignment 64 extents 64..64
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:64 127:64 128:64 129:64 255:64 256:64 257:64 511:64 512:64 1000:64 4095:64 4096:64 10000:64 65535:64 65536:64 100000:64 262144:64 1000000:64
+kv bf16 page 6291456 index-page 0 slim-page 1048576 alignment 1 extents 11..32
+kv bf16 extent-pages 1:0 31:31 32:16 63:21 64:16 127:21 128:16 129:16 255:17 256:16 257:16 511:17 512:16 1000:20 4095:21 4096:16 10000:20 65535:17 65536:16 100000:20 262144:16 1000000:20
+state fp32 cell 1916928 lane 3833856 cached 1916928
+namespace int8 fp32 fc27c2c19b92025f43a857b1b71b48dc
+namespace bf16 fp32 7c3e86d82068899bcf9507faee707c50
+state bf16 cell 1916928 lane 3833856 cached 1916928
+namespace int8 bf16 fc27c2c19b92025f43a857b1b71b48dc
+namespace bf16 bf16 7c3e86d82068899bcf9507faee707c50

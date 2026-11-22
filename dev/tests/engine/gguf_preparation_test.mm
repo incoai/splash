@@ -557,6 +557,94 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   }
 }
 
+// An Inkling target (inklingGeometry) read from a GGUF through the
+// production loader, its images written: a weight of each weight layer,
+// which its passes share; its sides fp32 block projections of InklingSides'
+// rows, a segment per run of tensors of one type (weight layer 2's sinks and
+// key taps BF16, so two each); the depth-attention queries of each layer's
+// inputs but weight layer 0's, a norm of each input (three on a global
+// layer); its MoE without a shared expert and its router's bias, F32 rows;
+// the loop's float gates on the loop's weight layers alone; and the head's
+// query and norms. Read over released images it holds no memory but the
+// routed experts' slot table and has the geometry of its load.
+void checkInklingTarget(MetalBackend &backend, const std::filesystem::path &directory) {
+  model::InklingLayout layout;
+  static_cast<model::QwenTargetDimensions &>(layout) = inklingGeometry();
+  const model::InklingSides sides = model::InklingSides::of(layout);
+  const uint32_t hidden = layout.hiddenSize;
+  TensorTypes types = inklingTypes();
+  types["blk.2.attn_sink_proj.weight"] = model::ggml::kBF16;
+  types["blk.2.attn_k_conv_proj.weight"] = model::ggml::kBF16;
+  const auto target = directory / "inkling";
+  std::filesystem::create_directory(target);
+  writeGguf(target / "target.gguf", targetTensors(layout, types), layout);
+  model::WeightImages images(backend, "fixture");
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout.ggufArchitecture, layout);
+  const model::InklingWeights weights = model::loadInklingWeights(backend, layout, files);
+  check(weights.layers.size() == layout.weightLayers() && weights.files.size() == layout.weightLayers() + 2,
+        "Inkling target: a weight of each weight layer");
+  for (uint32_t index = 0; index < weights.layers.size(); ++index) {
+    const model::InklingLayerWeights &layer = weights.layers[index];
+    const model::InklingAttentionWeights &attention = layer.mixer;
+    const std::string at = "Inkling target weight layer " + std::to_string(index) + ": ";
+    const bool global = index >= 2, core = index == 1 || index == 2, mixed = index == 2;
+    const auto side = [](const ops::Projection &p) { return p.destination == ops::FloatOutput::Float32; };
+    check(blockProjection(attention.querySide, sides.query, hidden,
+                          mixed ? std::vector<uint32_t>{sides.sink, sides.query - sides.sink}
+                                : std::vector<uint32_t>{sides.query}) &&
+              side(attention.querySide) &&
+              attention.querySide.blocks().segments.back().formatId == (mixed ? GGUF_FMT_BF16 : GGUF_FMT_Q80),
+          at + "query side, a segment of each type, into fp32");
+    for (const ops::Projection *keyValue : {&attention.keySide, &attention.valueSide}) {
+      const bool taps = mixed && keyValue == &attention.keySide;
+      check(blockProjection(*keyValue, sides.keyRows(global), hidden,
+                            taps ? std::vector<uint32_t>{sides.lags, sides.globalKey - sides.lags}
+                                 : std::vector<uint32_t>{sides.keyRows(global)}) &&
+                side(*keyValue),
+            at + "key and value sides" + (global ? " with their dynamic taps" : ""));
+    }
+    check(blockProjection(attention.outputProjection, hidden, layout.attentionWidth, {hidden}),
+          at + "attention output block projection");
+    check(bool(attention.residualQueries) == (index != 0) && attention.inputNorms[0].float32 &&
+              attention.inputNorms[2].float32 == global && bool(attention.inputNorms[1].buffer) == global,
+          at + "the depth-attention queries and norms of its inputs");
+    check(attention.queryClip && attention.relativeClip && attention.relativeBias && attention.keyConvolution &&
+              attention.valueConvolution && attention.outputConvolution && layer.ffnConvolution &&
+              layer.ffnResidualQuery && layer.ffnNorm.float32,
+          at + "its F32 clips, bias bank, convolutions and FFN input");
+    check(layer.ffn.router.isFloat() && !layer.ffn.gate.shared.outputSize && layer.ffn.routerBias.isFloat() &&
+              layer.ffn.routerBias.outputSize == 1 && layer.ffn.routerBias.inputSize == layout.experts,
+          at + "MoE without a shared expert, its router's selection bias F32 rows");
+    check(layer.loop.has_value() == core, at + (core ? "the loop's gates" : "no loop gates"));
+    if (layer.loop)
+      for (const model::InklingLoopGateWeights &gate : layer.loop->gates)
+        check(gate.down.outputSize == model::InklingLayout::loopGateRank && gate.down.inputSize == 2 * hidden &&
+                  gate.down.blocks().segments.front().isFloat() && side(gate.down) && gate.gain.outputSize == hidden &&
+                  gate.forget.inputSize == model::InklingLayout::loopGateRank && side(gate.forget),
+              at + "a loop gate's float projections into fp32");
+  }
+  check(weights.outputQuery && weights.finalNorm.float32 && weights.embeddingNorm.float32 &&
+            blockProjection(weights.logitsProjection, layout.vocabularySize, hidden, {layout.vocabularySize}) &&
+            weights.logitsProjection.destination == ops::FloatOutput::Float32,
+        "Inkling target: the head's query, norms and fp32 logits");
+  const std::array<uint32_t, 1> captured{layout.layers - 1};
+  const model::QwenTargetGeometry geometry = model::qwenTargetGeometry(weights, captured);
+  const model::InklingWeights reservedWeights = [&] {
+    model::WeightImages reserved(backend, "fixture");
+    reserved.release();
+    model::GgufTargetLoader planned(backend, reserved, model::findTargetGgufs(target), layout.ggufArchitecture,
+                                    layout);
+    return model::loadInklingWeights(backend, layout, planned);
+  }();
+  const model::QwenTargetGeometry read = model::qwenTargetGeometry(reservedWeights, captured);
+  check(reservedWeights.actualAllocatedBytes <= model::residentExpertSlotsBytes(layout.experts) &&
+            read.prefillProjections == geometry.prefillProjections &&
+            read.decodeProjections == geometry.decodeProjections && read.layers == 6 &&
+            read.kvLayout.attentionLayers == 6 &&
+            read.stateLayout.auxiliaryBytes == layout.shortConvolutionStateBytes(),
+        "Inkling target: its reserved images held memory, or gave another geometry than its load");
+}
+
 // The tensor data section's offset in the executor's source file: not zero,
 // so reads must add it.
 constexpr uint64_t kSourceOffset = 96;
@@ -1137,6 +1225,7 @@ int main(int argc, char **argv) {
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
+    guarded("the Inkling target loader", [&] { checkInklingTarget(backend, directory.path()); });
     guarded("MLX sources", [&] { checkMlxSources(backend, directory.path(), argv[3]); });
     guarded("NVFP4 and FP8 sources", [&] { checkFloatSources(backend, directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",

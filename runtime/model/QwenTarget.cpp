@@ -70,8 +70,8 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
     : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
   if (!geometry_.valid()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
   if (!ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
-                                     geometry_.rotaryPairs))
-    throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
+                                     geometry_.rotaryPairs, geometry_.relativeDimension != 0))
+    throw std::invalid_argument("no attention kernel for the target's output gate, RoPE and relative bias");
 }
 
 QwenTarget::~QwenTarget() = default;
@@ -170,11 +170,14 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
   }
   const ops::AttentionWorkspace workspace{chunk.buffers.attentionPartials.sizeBytes(),
                                           chunk.buffers.attentionStatistics.sizeBytes()};
+  // A target without RoPE plans its layers' unrotated variant.
+  const bool rotated = geometry_.rotaryPairs != 0;
   step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                              geometry_.kvLayout, workspace));
+                                              geometry_.kvLayout, workspace, {.rotated = rotated}));
   if (const uint32_t window = geometry_.kvLayout.windowTokens)
     step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                                        geometry_.kvLayout, workspace, {.windowTokens = window}));
+                                                        geometry_.kvLayout, workspace,
+                                                        {.rotated = rotated, .windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moe(geometry_.moeShape(), geometry_.moeRouterFormat, chunk.rows,
                               chunk.decode ? ops::StepKind::Decode : ops::StepKind::Prefill);
@@ -264,29 +267,10 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
 // pages once stored; a decode step whose lanes hold Index pages attends
 // through its lists, which those reads locate (SpilledKvReads::verify): its
 // rows that read their page tables read only Full pages (SparseKvShape).
-void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
-                                 BlockOutput output, std::span<const ops::AttentionBlocks> blocks) const {
-  const QwenTargetPrefillBuffers &b = step.buffers;
-  const ops::Linear &linear = this->linear(step);
-  const uint32_t layer = step.attentionLayer++;
-  const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
+std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth>
+QwenTarget::attentionHistories(PrefillStep &step, uint32_t layer, std::span<const ops::AttentionBlocks> blocks) const {
   if (!blocks.empty() && blocks.size() != step.sequences.size())
     throw std::invalid_argument("Qwen attention blocks do not match its sequences");
-  // A layer that outputs its read rows alone adds its output to their
-  // residual rows, which it gathers.
-  if (!step.readRows.empty() && !output.residual)
-    throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
-  const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
-  const ops::AttentionRows rows{b.laneRows, step.rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
-  const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
-  linear.add(step.graph,
-             {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
-              .prepared = std::move(normalized)},
-             mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
-  // The q/k projection stores each row's key and value in its page slot.
-  ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
-                                     b.fullQueries, step.kvLayers[layer], pageTables, sequences, rows,
-                                     geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
   std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
   if (step.decode) {
     std::array<ops::AttentionBlocks, ExecutionLimits::maximumBatchWidth> attended{};
@@ -308,19 +292,43 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
         attended[index].list = blocks[index].list;
       }
     }
-    for (size_t index = 0; index < sequences.size(); ++index)
-      histories[index] = {step.kvLayers[layer], pageTables[index], attended[index]};
-  } else {
-    for (size_t index = 0; index < step.sequences.size(); ++index) {
-      const QwenTargetPrefillSequence &sequence = step.sequences[index];
-      const uint32_t firstPage = sequence.chunk.committed_tokens / kv::kPageTokens;
-      const PrefillKv history =
-          step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
-                               kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
-                               {sequence.pageTable, step.kvLayers[layer]});
-      histories[index] = {history.kv, history.table, blocks.empty() ? ops::AttentionBlocks{} : blocks[index]};
-    }
+    for (size_t index = 0; index < step.sequences.size(); ++index)
+      histories[index] = {step.kvLayers[layer], step.pageTables[index], attended[index]};
+    return histories;
   }
+  for (size_t index = 0; index < step.sequences.size(); ++index) {
+    const QwenTargetPrefillSequence &sequence = step.sequences[index];
+    const uint32_t firstPage = sequence.chunk.committed_tokens / kv::kPageTokens;
+    const PrefillKv history = step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
+                                                   kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
+                                                   {sequence.pageTable, step.kvLayers[layer]});
+    histories[index] = {history.kv, history.table, blocks.empty() ? ops::AttentionBlocks{} : blocks[index]};
+  }
+  return histories;
+}
+
+void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
+                                 BlockOutput output, std::span<const ops::AttentionBlocks> blocks) const {
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  const ops::Linear &linear = this->linear(step);
+  const uint32_t layer = step.attentionLayer++;
+  const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
+  // A layer that outputs its read rows alone adds its output to their
+  // residual rows, which it gathers.
+  if (!step.readRows.empty() && !output.residual)
+    throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
+  const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
+  const ops::AttentionRows rows{b.laneRows, step.rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
+  const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
+  linear.add(step.graph,
+             {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
+              .prepared = std::move(normalized)},
+             mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
+  // The q/k projection stores each row's key and value in its page slot.
+  ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
+                                     b.fullQueries, step.kvLayers[layer], pageTables, sequences, rows,
+                                     geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
+  const auto histories = attentionHistories(step, layer, blocks);
   // Only each sequence's last row is read (planOutputRows): the tile that
   // holds it attends as in the chunk (lastTiles), and its gated row is
   // written row `index`.

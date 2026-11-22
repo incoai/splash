@@ -485,14 +485,16 @@ public:
       throw std::logic_error("prefill arena mismatch");
     auto *target = static_cast<float *>(
         get(PrefillTensor::TargetInverseFrequencies).contents());
-    // A model without a draft has no draft RoPE.
+    // A model without a draft has no draft RoPE, and a target without RoPE
+    // (Inkling 2) none of its own.
     auto *draft = static_cast<float *>(
         get(PrefillTensor::DraftInverseFrequencies).contents());
-    if (!target || (geometry.draft.present() && !draft))
+    if ((geometry.target.rotaryPairs && !target) || (geometry.draft.present() && !draft))
       throw std::logic_error("RoPE frequencies are not CPU-visible");
-    rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
-                             geometry.target.ropeScaling,
-                             {target, geometry.target.rotaryPairs});
+    if (geometry.target.rotaryPairs)
+      rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
+                               geometry.target.ropeScaling,
+                               {target, geometry.target.rotaryPairs});
     for (uint32_t dim = 0; dim < geometry.draftRotaryPairs(); ++dim) {
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
                             -static_cast<float>(dim) / geometry.draftRotaryPairs());

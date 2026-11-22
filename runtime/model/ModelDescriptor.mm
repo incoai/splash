@@ -179,22 +179,25 @@ void requireBooleans(NSDictionary *object, std::string_view where,
   }
 }
 
-// Each layer's type in a layer_types array: linear_attention for a GDN
-// layer; for an attention layer, sliding_attention where a window bounds it
-// (kv::Layout::windowed), else full_attention.
+// Each weight layer's type in a layer_types array, as the layers that run it
+// attend: linear_attention for a GDN layer; for an attention layer,
+// sliding_attention where a window bounds it (kv::Layout::windowed), else
+// full_attention.
 void requireLayerTypes(NSArray *types, const QwenHybridLayout &target,
                        std::string_view source, std::string_view label) {
-  if (types.count != target.layers)
+  if (types.count != target.weightLayers())
     throw std::invalid_argument(std::string(label) + " count mismatch: " + std::string(source) +
                                 " " + std::to_string(types.count) + ", runtime " +
-                                std::to_string(target.layers));
+                                std::to_string(target.weightLayers()));
   for (uint32_t layer = 0, attention = 0; layer < target.layers; ++layer) {
-    NSString *expected = !target.isFullAttentionLayer(layer)       ? @"linear_attention"
-                         : target.kvLayout().windowed(attention++) ? @"sliding_attention"
-                                                                   : @"full_attention";
-    if (![types[layer] isEqual:expected])
+    const bool full = target.isFullAttentionLayer(layer);
+    const bool windowed = full && target.kvLayout().windowed(attention++);
+    const uint32_t weightLayer = target.weightLayer(layer);
+    if (target.firstLayer(weightLayer) != layer) continue;
+    NSString *expected = !full ? @"linear_attention" : windowed ? @"sliding_attention" : @"full_attention";
+    if (![types[weightLayer] isEqual:expected])
       throw std::invalid_argument(std::string(label) + " " +
-                                  std::to_string(layer) + " must be " +
+                                  std::to_string(weightLayer) + " must be " +
                                   expected.UTF8String);
   }
 }
@@ -230,18 +233,21 @@ std::invalid_argument unsupportedModel(const std::string &difference) {
 
 // How a text configuration differs from a family in the sizes every one
 // holds, which tell the family's target from other models of its
-// architecture: the first that differs, after `matched` that agree.
+// architecture: the first that differs, after `matched` that agree. Its
+// layers are its weight layers, and its native window is at the layout's
+// contextKey.
 struct SizeDifference final {
   size_t matched;
   std::string difference;
 };
-std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
-                                             TargetSource source) {
+template <class Layout>
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const Layout &target, TargetSource source) {
+  const std::string contextKey(Layout::contextKey);
   const std::initializer_list<ExpectedNumber> sizes{
       {"hidden_size", target.hiddenSize},
-      {"num_hidden_layers", target.layers},
+      {"num_hidden_layers", target.weightLayers()},
       {"vocab_size", target.vocabularySize},
-      {"max_position_embeddings", target.nativeContextTokens},
+      {contextKey.c_str(), target.nativeContextTokens},
       {"num_attention_heads", target.attentionQueryHeads},
       {"num_key_value_heads", target.attentionKvHeads},
       {"head_dim", target.attentionHeadDimension}};
@@ -406,6 +412,81 @@ void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSou
   if (text[@"hidden_act"])
     requireEqual(requireString(text, @"hidden_act", "text config hidden_act"), "silu", name, "text config hidden_act");
   for (const char *key : {"attention_bias", "tie_word_embeddings"})
+    if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
+}
+
+// A number that rounds to the F32 value expected, as a GGUF's F32 metadata
+// holds it: a config derived from a GGUF writes the shortest decimal of that
+// F32 (22.627417 for qk_clip), transformers' its double (22.627416997969522).
+void requireFloat32(id value, float expected, std::string_view source, std::string_view label) {
+  NSNumber *number = requireNumber(value, label);
+  if (static_cast<float>(number.doubleValue) != expected)
+    throw std::invalid_argument(std::string(label) + " mismatch: " + std::string(source) + " " +
+                                number.description.UTF8String + ", runtime " + @(expected).description.UTF8String);
+}
+
+// Inkling 2 Mini's text configuration, config.json's text_config in
+// transformers' names (the installer derives it from a GGUF's metadata in
+// them): the sizes every family's holds (sizeDifference, of its 24 weight
+// layers and its window at model_max_length), then the rest as the layout's
+// values make them: its relative-position bias, window and sliding layers
+// (local_layer_ids), short convolution, depth-attention block, loop, MoE
+// (no shared expert), routing scale, logit softcap and the tokens of its
+// vocabulary. Where a config states them too (transformers' does), its
+// stop tokens, epsilon, clips, log position scale, SiTU softcaps, router
+// bias, the sliding layers' attention sizes and a fixed loop. Its weights
+// load from a GGUF only: no safetensors checkpoint of it is released, and
+// its attention holds no q or k norm to tell one's storage by
+// (safetensors::normStorage).
+void validateTextConfig(NSDictionary *text, const InklingLayout &target, TargetSource source) {
+  if (source != TargetSource::Gguf) throw std::invalid_argument(std::string(target.family) + " loads from a GGUF only");
+  const std::string_view name = sourceName(source);
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  requireNumbers(text, name, "text config",
+                 {{"d_rel", target.relativeDimension},
+                  {"rel_extent", target.relativeExtent},
+                  {"sliding_window_size", target.slidingWindow},
+                  {"sconv_kernel_size", target.shortConvolutionTaps},
+                  {"n_layers_per_attn_res_block", InklingLayout::residualBlockLayers},
+                  {"n_routed_experts", target.experts},
+                  {"num_experts_per_tok", target.expertsPerToken},
+                  {"intermediate_size", target.expertIntermediateSize},
+                  {"n_shared_experts", target.sharedExpertSlices},
+                  {"unpadded_vocab_size", InklingLayout::tokenVocabulary}});
+  requireFloat32(text[@"route_scale"], InklingLayout::expertWeightsScale, name, "text config route_scale");
+  requireFloat32(text[@"final_logit_softcapping"], InklingLayout::finalLogitSoftcap, name,
+                 "text config final_logit_softcapping");
+  std::vector<uint32_t> sliding;
+  for (uint32_t layer = 0; layer < target.weightLayers(); ++layer)
+    if (!inklingGlobalLayer(target, layer)) sliding.push_back(layer);
+  requireWholes(requireArray(text, @"local_layer_ids", "text config local_layer_ids"), sliding, name,
+                "text config local_layer_ids");
+  NSDictionary *loop = requireObject(text, @"loop_config", "text config loop_config");
+  requireNumbers(loop, name, "text config loop_config",
+                 {{"core_start", target.loopStart}, {"core_end", target.loopEnd}, {"num_passes", target.loopPasses}});
+  if (loop[@"gate_rank"])
+    requireNumbers(loop, name, "text config loop_config", {{"gate_rank", InklingLayout::loopGateRank}});
+  if (loop[@"is_varloop"]) requireBooleans(loop, "text config loop_config", {{"is_varloop", false}});
+  if (text[@"eos_token_id"])
+    requireWholes(requireArray(text, @"eos_token_id", "text config eos_token_id"), target.stopTokens.tokens(), name,
+                  "text config eos_token_id");
+  for (const auto &[key, value] : std::initializer_list<std::pair<const char *, uint32_t>>{
+           {"swa_head_dim", target.attentionHeadDimension},
+           {"swa_num_attention_heads", target.attentionQueryHeads},
+           {"swa_num_key_value_heads", target.attentionKvHeads},
+           {"log_scaling_n_floor", InklingLayout::logScaleFloor}})
+    if (text[@(key)]) requireNumbers(text, name, "text config", {{key, value}});
+  for (const auto &[key, value] : std::initializer_list<std::pair<const char *, float>>{
+           {"rms_norm_eps", static_cast<float>(SPLASH_RMS_EPSILON)},
+           {"qk_l2_clip_threshold", InklingLayout::queryKeyClip},
+           {"rel_l2_clip_threshold", InklingLayout::relativeClip},
+           {"log_scaling_alpha", InklingLayout::logScaleAlpha},
+           {"mlp_gate_softcap", InklingLayout::gateSoftcap},
+           {"mlp_up_softcap", InklingLayout::upSoftcap}})
+    if (text[@(key)]) requireFloat32(text[@(key)], value, name, std::string("text config ") + key);
+  for (const char *key : {"use_gate_bias", "use_value_norm_no_gamma", "attn_res_normalize_values"})
+    if (text[@(key)]) requireBooleans(text, "text config", {{key, true}});
+  for (const char *key : {"q_bias", "o_bias"})
     if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
 }
 

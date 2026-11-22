@@ -2,10 +2,11 @@
 
 // Plans the images (model/GgufImageLayout.hpp) of a target read straight
 // from a GGUF of its family's architecture (each layout's ggufArchitecture:
-// qwen35, qwen35moe, qwen4exp or flint), from its metadata alone: section
-// offsets, the header and descriptor bytes, and the source rows each tensor
-// section is written from (model/GgufPreparation.hpp). A 3-D expert tensor
-// is one quantized tensor of experts * N rows.
+// qwen35, qwen35moe, qwen4exp, flint or inkling2_loop), from its metadata
+// alone, an image of each weight layer (QwenTargetDimensions::weightLayers):
+// section offsets, the header and descriptor bytes, and the source rows each
+// tensor section is written from (model/GgufPreparation.hpp). A 3-D expert
+// tensor is one quantized tensor of experts * N rows.
 
 #include <array>
 #include <cstdint>
@@ -251,7 +252,7 @@ private:
 };
 
 // The images of a target from its GGUF of `architecture` (its family's
-// layout's ggufArchitecture): each layer's, then the head's and the
+// layout's ggufArchitecture): each weight layer's, then the head's and the
 // embedding's, then those of the tables its family adds (Qwen3.8-Flash-Next's
 // PLE n-gram table, ple.bin). Checks first that the metadata declares the
 // geometry, the architecture included, with the rotary embedding and norms

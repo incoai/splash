@@ -1,11 +1,11 @@
 #pragma once
 
 // What both sources' loaders of a target (GgufTargetLoader,
-// SafetensorsTargetLoader) hold alike: the images they planned, each layer's
-// then the head's, the embedding's and a table's, which they write into
-// memory as a family reads them, and the routed experts' blocks when those
-// stream. The loaders differ in their source, their planner and how a
-// streamed table's rows are read.
+// SafetensorsTargetLoader) hold alike: the images they planned, each weight
+// layer's (QwenTargetDimensions::weightLayers) then the head's, the
+// embedding's and a table's, which they write into memory as a family reads
+// them, and the routed experts' blocks when those stream. The loaders differ
+// in their source, their planner and how a streamed table's rows are read.
 
 #include "model/ExpertStore.hpp"
 #include "model/GgufImage.hpp"
@@ -52,8 +52,9 @@ public:
     return open(layers_ + 2);
   }
   // Whether the routed experts stream, then the store's options and every
-  // MoE layer's experts (a block each, those of the leading dense layers'
-  // none), which read the source's open files.
+  // MoE weight layer's experts (a block each, which every layer that runs it
+  // shares; those of the leading dense layers' none), which read the
+  // source's open files.
   [[nodiscard]] bool streamsExperts() const noexcept { return experts_.memoryBytes != 0; }
   [[nodiscard]] const ExpertStoreOptions &expertStoreOptions() const noexcept { return experts_; }
   [[nodiscard]] StreamedBlocks streamedExperts() const {
@@ -72,7 +73,7 @@ protected:
                std::function<void()> checkUnchanged, const QwenTargetDimensions &geometry,
                SparseRowStoreOptions table, ExpertStoreOptions experts)
       : backend_(backend), weightImages_(images), images_(std::move(planned)),
-        checkUnchanged_(std::move(checkUnchanged)), layers_(geometry.layers),
+        checkUnchanged_(std::move(checkUnchanged)), layers_(geometry.weightLayers()),
         firstMoeLayer_(geometry.leadingDenseLayers), table_(std::move(table)), experts_(experts) {}
   ~TargetImages() = default;
 

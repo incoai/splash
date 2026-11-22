@@ -412,8 +412,10 @@ as Qwen describes for them: the factor is the context over the native window,
 so that the stretched window is the context asked for, such as 2 for
 `--max-context 512K` and about 3.81 for `1M`. Flint's full layers have no RoPE
 to stretch, so its native window is its most, and a longer `--max-context`
-stops its startup. Without `--max-context`, or at 256K or less, YaRN stays off, so
-answers and the persistent cache are the native window's. The budget must
+stops its startup; Inkling 2 Mini has no RoPE either, and its native window,
+1,048,576 tokens, is the most `--max-context` takes. Without `--max-context`,
+or at 256K or less, YaRN stays off, so answers and the persistent cache are
+the native window's. The budget must
 hold the context: about a million tokens of the 27B's int8 KV on a 64 GB Mac,
 more of the 35B's, whose KV per token is a third of the 27B's; where it does
 not, startup stops with the most it holds, which a `--max-context` of that

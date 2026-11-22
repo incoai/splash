@@ -332,6 +332,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen4Steps.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/Flint.cpp \
+	runtime/model/Inkling.cpp \
+	runtime/model/InklingSteps.cpp \
+	runtime/model/InklingTarget.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \

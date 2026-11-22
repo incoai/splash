@@ -650,10 +650,11 @@ template <class Family> std::vector<AttentionVariant> attentionVariants(const Fa
 }
 
 // The attention every plan check covers: each family's, its variants its
-// layers', and each compiled geometry no family runs yet, under the name of
-// its shape: the relative geometry (ops::RelativeProjection, Inkling 2's
-// attention), whose window layers attend the 1023 keys before each row and
-// whose global layers scale their queries by tau.
+// layers', a relative geometry's (relative) with its prepare in place of q/k
+// norms; and the relative geometry under the name of its shape
+// (ops::RelativeProjection, Inkling 2's attention) in the variants its target
+// runs: window layers over the 1023 keys before each row, and global layers
+// that scale their queries by tau, which no layout's variants name.
 struct AttentionTarget final {
   std::string name;
   uint32_t queryHeads;
@@ -666,7 +667,7 @@ std::vector<AttentionTarget> attentionTargets() {
   std::vector<AttentionTarget> targets;
   model::forEachFamily([&](const auto &family) {
     targets.push_back({std::string(family.family), family.attentionQueryHeads, family.kvLayout(),
-                       attentionVariants(family)});
+                       attentionVariants(family), family.relativeDimension != 0});
   });
   targets.push_back({"relative-24q-8kv-d128",
                      24,

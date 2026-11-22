@@ -29,11 +29,17 @@ void RoPE::addTables(
     metal::MetalBuffer targetCosine, metal::MetalBuffer targetSine,
     metal::MetalBuffer draftCosine, metal::MetalBuffer draftSine,
     RopeTableParams rows, uint32_t maximumRows, uint32_t targetPairs) {
-  const std::string kernel = tableKernel("rope_build_tables", targetPairs);
   if ((!rows.target_rows && !rows.draft_rows) || rows.target_rows > maximumRows ||
       rows.draft_rows > maximumRows) {
     throw std::invalid_argument("invalid RoPE table row count");
   }
+  // A target without RoPE (no pairs, Inkling 2's) has no table: the draft's
+  // rows alone, if any.
+  if (!targetPairs) {
+    rows.target_rows = 0;
+    if (!rows.draft_rows) return;
+  }
+  const std::string kernel = tableKernel("rope_build_tables", targetPairs ? targetPairs : SPLASH_TARGET_ROPE_PAIRS);
   if (!(rows.target_scale > 0.0F))
     throw std::invalid_argument("invalid target RoPE scale");
   const uint64_t targetTable = uint64_t{rows.target_rows} * targetPairs * sizeof(float);
@@ -73,6 +79,8 @@ void RoPE::addTreeTables(metal::CommandGraph &graph, metal::MetalBuffer layout, 
                          std::span<const uint32_t> anchors, metal::MetalBuffer targetInverseFrequencies,
                          metal::MetalBuffer targetCosine, metal::MetalBuffer targetSine, const StepRows &step,
                          float scale, uint32_t targetPairs) {
+  // A target without RoPE has no table.
+  if (!targetPairs) return;
   const std::string kernel = tableKernel("rope_build_tree_tables", targetPairs);
   requireStepRows(step);
   if (anchors.size() != step.lanes)

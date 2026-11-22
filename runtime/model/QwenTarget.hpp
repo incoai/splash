@@ -702,6 +702,13 @@ protected:
   // the input projection's plan's (a table its producer wrote, or plain).
   void addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
                        BlockOutput output) const;
+  // Where each of a step's sequences reads attention layer `layer`'s
+  // history, after the layer's projection stored the step's K/V: a decode
+  // lane its pages, or through its lists of `blocks` (one per sequence, when
+  // given), located where it reads spilled K/V; a prompt sequence its pages,
+  // or the staging the step's reads of spilled K/V fill.
+  [[nodiscard]] std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth>
+  attentionHistories(PrefillStep &step, uint32_t layer, std::span<const ops::AttentionBlocks> blocks = {}) const;
   void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
                        BlockOutput output, std::span<const ops::AttentionBlocks> blocks = {}) const;
   // The FFNs of a layer whose residual is one row of hiddenSize values: each

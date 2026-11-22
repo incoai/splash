@@ -2,8 +2,8 @@
 
 // What the GGUF reference, planner and preparation tests share: their
 // reporting, the golden hashes (dev/tests/fixtures/weight-goldens), random
-// native blocks and F32 values, and small qwen35, qwen35moe and qwen4exp GGUF
-// targets in the shapes GGUF converters write.
+// native blocks and F32 values, and small qwen35, qwen35moe, qwen4exp and
+// inkling2_loop GGUF targets in the shapes GGUF converters write.
 
 #import <Foundation/Foundation.h>
 
@@ -13,6 +13,7 @@
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
 #include "model/GgufImageLayout.hpp"
+#include "model/Inkling.hpp"
 #include "model/WeightSource.hpp"
 #include "model/WeightStore.hpp"
 #include "model/StateLayout.hpp"
@@ -227,16 +228,88 @@ inline uint32_t typeOf(const TensorTypes &types, const std::string &name) {
   return found == types.end() ? model::ggml::kF32 : found->second;
 }
 
+// Whether a fixture geometry is a looped Inkling target's, of a relative
+// position bias.
+inline bool inkling(const model::QwenTargetDimensions &g) { return g.relativeDimension != 0; }
+
 // The architecture of a GGUF of a fixture geometry, each layout's
-// ggufArchitecture: flint for one without GDN layers, qwen4exp for
-// hyper-connected streams, else qwen35moe or qwen35 by its FFN.
+// ggufArchitecture: inkling2_loop for Inkling's, flint for one without GDN
+// layers, qwen4exp for hyper-connected streams, else qwen35moe or qwen35 by
+// its FFN.
 inline std::string architecture(const model::QwenTargetDimensions &g) {
+  if (inkling(g)) return std::string(model::InklingLayout::ggufArchitecture);
   if (g.layers && !g.gdnLayerCount()) return "flint";
   return g.hyperConnected() ? "qwen4exp" : g.ffnKind == model::QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";
 }
 
 // The rows of a fixture's PLE table.
 inline constexpr uint64_t kPleTableRows = 96;
+
+// Every tensor of an Inkling geometry, without data, as llama.cpp's
+// converter writes inkling2_loop's: each weight layer's sides' tensors (the
+// keys' and values' dynamic taps on a global layer), clips, relative-position
+// bank, convolutions and output; the depth-attention queries of its inputs
+// but on weight layer 0, three on a global layer, which takes a norm of each
+// input; its FFN's query, norm, F32 router and selection bias, fused gate
+// and up experts and down experts; on the loop's weight layers its message
+// queries and gates; and the head's query and the embedding's norm.
+inline std::vector<Tensor> inklingTensorTable(const model::QwenTargetDimensions &g, const TensorTypes &types) {
+  std::vector<Tensor> tensors;
+  const auto add = [&](std::string name, std::vector<uint64_t> dims) {
+    tensors.push_back({name, std::move(dims), typeOf(types, name), {}});
+  };
+  const uint64_t hidden = g.hiddenSize, heads = g.attentionQueryHeads, taps = g.shortConvolutionTaps;
+  const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+  const uint64_t rank = model::InklingLayout::loopGateRank;
+  for (uint32_t layer = 0; layer < g.weightLayers(); ++layer) {
+    const std::string p = "blk." + std::to_string(layer) + ".";
+    const bool global = model::inklingGlobalLayer(g, layer);
+    if (layer) add(p + "attn_res_query.weight", global ? std::vector<uint64_t>{hidden, 3} : std::vector{hidden});
+    if (global) {
+      for (const char *input : {"q", "k", "v"}) add(p + "attn_" + input + "_inp_norm.weight", {hidden});
+    } else {
+      add(p + "attn_norm.weight", {hidden});
+    }
+    add(p + "attn_q.weight", {hidden, g.attentionWidth});
+    add(p + "attn_gate.weight", {hidden, g.attentionWidth});
+    add(p + "attn_rel.weight", {hidden, heads * g.relativeDimension});
+    add(p + "attn_sink_proj.weight", {hidden, heads});
+    add(p + "attn_k.weight", {hidden, kvRows});
+    add(p + "attn_v.weight", {hidden, kvRows});
+    if (global) {
+      add(p + "attn_k_conv_proj.weight", {hidden, g.attentionKvHeads * taps});
+      add(p + "attn_v_conv_proj.weight", {hidden, g.attentionKvHeads * taps});
+    }
+    add(p + "attn_q_clip.weight", {g.attentionHeadDimension, heads});
+    add(p + "attn_rel_clip.weight", {g.relativeDimension, heads});
+    add(p + "attn_rel_bias.weight", {g.relativeDimension, g.relativeExtent});
+    add(p + "attn_k_conv.weight", {taps, kvRows});
+    add(p + "attn_v_conv.weight", {taps, kvRows});
+    add(p + "attn_output.weight", {g.attentionWidth, hidden});
+    add(p + "attn_post_conv.weight", {taps, hidden});
+    add(p + "ffn_res_query.weight", {hidden});
+    add(p + "ffn_norm.weight", {hidden});
+    add(p + "ffn_gate_inp.weight", {hidden, g.experts});
+    add(p + "exp_probs_b.bias", {g.experts});
+    add(p + "ffn_gate_up_exps.weight", {hidden, 2ull * g.expertIntermediateSize, g.experts});
+    add(p + "ffn_down_exps.weight", {g.expertIntermediateSize, hidden, g.experts});
+    add(p + "ffn_post_conv.weight", {taps, hidden});
+    if (layer < g.loopStart || layer >= g.loopEnd) continue;
+    add(p + "loop_msg_query.weight", {hidden, model::InklingLayout::loopMessages});
+    for (const char *stream : {"q", "k", "v", "ffn"}) {
+      const std::string gate = p + "loop_" + stream + "_ctrl_";
+      add(gate + "down.weight", {2 * hidden, rank});
+      add(gate + "gain.weight", {rank, hidden});
+      add(gate + "forget.weight", {rank, hidden});
+    }
+  }
+  add("output_res_query.weight", {hidden});
+  add("output_norm.weight", {hidden});
+  add("token_embd_norm.weight", {hidden});
+  add("output.weight", {hidden, g.vocabularySize});
+  add("token_embd.weight", {hidden, g.vocabularySize});
+  return tensors;
+}
 
 // Every tensor of the geometry, without data (a header's tensor table), in
 // the order GGUF converters write them: with hyper-connected streams, mixes
@@ -250,6 +323,7 @@ inline constexpr uint64_t kPleTableRows = 96;
 // wide, with a scalar gate where its blocks have one (sharedExpertGate).
 inline std::vector<Tensor> tensorTable(const model::QwenTargetDimensions &g, const TensorTypes &types,
                                        uint64_t pleRows = kPleTableRows) {
+  if (inkling(g)) return inklingTensorTable(g, types);
   std::vector<Tensor> tensors;
   const auto add = [&](std::string name, std::vector<uint64_t> dims) {
     tensors.push_back({name, std::move(dims), typeOf(types, name), {}});
@@ -506,6 +580,115 @@ inline std::vector<Tensor> withFusedGateUp(std::vector<Tensor> tensors, uint32_t
   return tensors;
 }
 
+// The architecture metadata llama.cpp's converter writes for an Inkling
+// geometry: its sizes, each weight layer's head counts and window, no RoPE,
+// the attention's relative bias, clips and log position scale, the
+// convolutions', depth attention's and loop's values, and its MoE's routing
+// scale and SiTU softcaps, logit softcap and tokens.
+inline std::vector<test_gguf::Key> inklingMetadata(const model::QwenTargetDimensions &g) {
+  using model::InklingLayout;
+  const std::string arch = architecture(g);
+  std::vector<test_gguf::Key> keys{test_gguf::stringKey("general.architecture", arch)};
+  const auto key = [&](const char *name, uint32_t value) {
+    keys.push_back(test_gguf::uint32Key(arch + "." + name, value));
+  };
+  const auto floatKey = [&](const char *name, float value) {
+    keys.push_back(test_gguf::float32Key(arch + "." + name, value));
+  };
+  key("block_count", g.weightLayers());
+  key("context_length", g.nativeContextTokens);
+  key("embedding_length", g.hiddenSize);
+  key("feed_forward_length", g.expertIntermediateSize);
+  std::vector<bool> sliding;
+  for (uint32_t layer = 0; layer < g.weightLayers(); ++layer) sliding.push_back(!model::inklingGlobalLayer(g, layer));
+  keys.push_back(test_gguf::int32ArrayKey(arch + ".attention.head_count",
+                                          std::vector(g.weightLayers(), int32_t(g.attentionQueryHeads))));
+  keys.push_back(test_gguf::int32ArrayKey(arch + ".attention.head_count_kv",
+                                          std::vector(g.weightLayers(), int32_t(g.attentionKvHeads))));
+  floatKey("attention.layer_norm_rms_epsilon", 1e-6F);
+  key("expert_count", g.experts);
+  key("expert_used_count", g.expertsPerToken);
+  key("attention.key_length", g.attentionHeadDimension);
+  key("attention.value_length", g.attentionHeadDimension);
+  key("vocab_size", g.vocabularySize);
+  key("vocab_size_unpadded", std::min(g.vocabularySize, InklingLayout::tokenVocabulary));
+  key("expert_feed_forward_length", g.expertIntermediateSize);
+  key("attention.key_length_swa", g.attentionHeadDimension);
+  key("attention.value_length_swa", g.attentionHeadDimension);
+  key("rope.dimension_count", 0);
+  key("attention.sliding_window", g.slidingWindow);
+  keys.push_back(test_gguf::boolArrayKey(arch + ".attention.sliding_window_pattern", sliding));
+  key("shortconv.l_cache", g.shortConvolutionTaps);
+  floatKey("expert_weights_scale", InklingLayout::expertWeightsScale);
+  floatKey("activation.situ_beta", InklingLayout::gateSoftcap);
+  floatKey("activation.situ_linear_beta", InklingLayout::upSoftcap);
+  key("attn_res.block_size", InklingLayout::residualBlockLayers);
+  floatKey("final_logit_softcapping", InklingLayout::finalLogitSoftcap);
+  key("attention.relative_length", g.relativeDimension);
+  key("attention.relative_extent", g.relativeExtent);
+  floatKey("attention.qk_clip", InklingLayout::queryKeyClip);
+  floatKey("attention.relative_clip", InklingLayout::relativeClip);
+  key("attention.log_scale_floor", InklingLayout::logScaleFloor);
+  floatKey("attention.log_scale_alpha", InklingLayout::logScaleAlpha);
+  key("loop.start", g.loopStart);
+  key("loop.end", g.loopEnd);
+  key("loop.count", g.loopPasses);
+  key("loop.gate_rank", InklingLayout::loopGateRank);
+  keys.push_back(test_gguf::boolKey(arch + ".loop.varying", false));
+  return keys;
+}
+
+// A small Inkling target (model/Inkling.hpp), its GGUF as llama.cpp writes
+// inkling2_loop's: four weight layers, of which the loop's two (1 and 2) run
+// twice, so six layers (0, 1, 2, then 1 and 2 again, 3); weight layers 0 and
+// 1 attend over a sliding window, 2 and 3 every key. Four query heads of 128
+// over two KV heads, relative values of 16 over 64 distances, convolutions of
+// four taps, and a MoE of four SiTU experts of 256 with no shared expert,
+// their weights scaled by 8, as Inkling's.
+inline model::QwenTargetDimensions inklingGeometry() {
+  model::QwenTargetDimensions g;
+  g.nativeContextTokens = 4096;
+  g.layers = 6;
+  g.hiddenSize = 256;
+  g.vocabularySize = 256;
+  g.packedFullWidth = 1536; // q, gate, k and v rows
+  g.attentionWidth = 512;
+  g.attentionQueryHeads = 4;
+  g.attentionKvHeads = 2;
+  g.attentionHeadDimension = 128;
+  g.slidingWindow = 33;
+  g.slidingLayers = 0b001011; // layers 0, 1 and 3: weight layers 0 and 1
+  g.unrotatedLayers = 0b111111;
+  g.fullAttentionPeriod = 1;
+  g.ffnKind = model::QwenFfnKind::SparseMoe;
+  g.experts = 4;
+  g.expertsPerToken = 2;
+  g.expertIntermediateSize = 256;
+  g.moeRouter = splash::ops::MoeRouter::SigmoidBiased;
+  g.sharedExpertSlices = 0;
+  g.sharedExpertGate = false;
+  g.routeScale = model::InklingLayout::expertWeightsScale;
+  g.moeActivation = splash::ops::MoeActivation::Situ;
+  g.loopStart = 1;
+  g.loopEnd = 3;
+  g.loopPasses = 2;
+  g.relativeDimension = 16;
+  g.relativeExtent = 64;
+  g.shortConvolutionTaps = 4;
+  return g;
+}
+
+// Its quantized tensors, Q8_0 as the ggml-org file stores them.
+inline TensorTypes inklingTypes() {
+  TensorTypes types;
+  for (const char *name : {"attn_q.weight", "attn_gate.weight", "attn_rel.weight", "attn_sink_proj.weight",
+                           "attn_k.weight", "attn_v.weight", "attn_k_conv_proj.weight", "attn_v_conv_proj.weight",
+                           "attn_output.weight", "ffn_gate_up_exps.weight", "ffn_down_exps.weight", "output.weight",
+                           "token_embd.weight"})
+    types[name] = kQ8_0;
+  return types;
+}
+
 // The architecture metadata a GGUF of the geometry declares: with
 // hyper-connected streams their keys, with a QSA indexer its keys and each
 // layer's compress ratio, with a PLE embedding its keys and layer, with GDN
@@ -513,6 +696,7 @@ inline std::vector<Tensor> withFusedGateUp(std::vector<Tensor> tensors, uint32_t
 // window, dense layers, shared slices and routing and its two layer
 // patterns.
 inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g) {
+  if (inkling(g)) return inklingMetadata(g);
   const std::string arch = architecture(g);
   const bool hybrid = g.gdnLayerCount() != 0;
   std::vector<test_gguf::Key> keys{test_gguf::stringKey("general.architecture", arch)};
