@@ -550,6 +550,13 @@ public:
   // state, which its commit writes after every retained row, captures no
   // state in decode (Model::capturesInDecode).
   void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const;
+  // The commit of each lane's accepted path's K/V after a decode step, in
+  // every attention layer (ops::PagedAttention::addPathCommit, whose
+  // arguments these are): the shared attention's, or a family's that stores
+  // its K/V through its own operator.
+  virtual void addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+                               std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
+                               uint32_t laneRows, const metal::MetalBuffer &paths) const;
   // The table rows a lane's rows of the last step read (`rows`, its rows of
   // the step), each row's in order, for tests
   // (RuntimeInstrumentation::lastTableRows); none for a target that reads no
@@ -578,7 +585,7 @@ protected:
     std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pageTables{};
     // The sequences' attention plan, which every attention layer runs, and
     // with a sliding window (kv::Layout::windowTokens) their windowed plan,
-    // which the sliding layers run instead.
+    // which the sliding layers run instead (planAttention).
     std::optional<ops::AttentionPlan> attention{};
     std::optional<ops::AttentionPlan> windowedAttention{};
     std::optional<ops::MoePlan> moe{};
@@ -681,6 +688,16 @@ protected:
     }
     return outputs;
   }
+  // Throws unless the shared attention (ops::PagedAttention) compiles the
+  // geometry's heads, KV layout, output gate and RoPE: the check of a target
+  // whose layers attend through it (addPrefillMixer).
+  void requireSharedAttention() const;
+  // The shared attention's plans of a step's sequences, which every attention
+  // layer of a target that attends through it runs, and with a sliding window
+  // (kv::Layout::windowTokens) the windowed plan its sliding layers run
+  // (PrefillStep::attention, windowedAttention): each such target plans each
+  // of its steps after prefillSteps.
+  void planAttention(PrefillStep &step) const;
   // Throws unless a family's `layers` match the geometry's layers and its
   // attention layers.
   template <class Layer> void requireLayers(std::span<const Layer> layers) const {
@@ -800,6 +817,19 @@ template <class Layout>
 [[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const Layout &, const QwenTargetGeometry &, uint32_t,
                                                             uint64_t) {
   return {};
+}
+// The attention workspace a target of its layout's steps take: a prompt
+// chunk's sequence's (StepKind::Prefill) or a decode lane's (StepKind::Decode)
+// partials and statistics, those of the shared attention
+// (ops::PagedAttention), which a family whose attention is its own sizes by
+// its own operator instead.
+template <class Layout>
+[[nodiscard]] ops::AttentionWorkspace qwenTargetAttentionWorkspace(const Layout &, const ops::ExecutionPlans &operators,
+                                                                   const QwenTargetGeometry &geometry,
+                                                                   ops::StepKind step) {
+  return step == ops::StepKind::Decode
+             ? operators.laneAttentionWorkspace(geometry.attentionQueryHeads, geometry.kvLayout)
+             : operators.sequenceAttentionWorkspace(geometry.attentionQueryHeads, geometry.kvLayout);
 }
 
 } // namespace splash::model

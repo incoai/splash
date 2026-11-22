@@ -69,6 +69,9 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
     : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
   if (!geometry_.valid()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
+}
+
+void QwenTarget::requireSharedAttention() const {
   if (!ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
                                      geometry_.rotaryPairs))
     throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
@@ -168,18 +171,27 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     step.chunks[index] = sequence.chunk;
     step.pageTables[index] = sequence.pageTable;
   }
-  const ops::AttentionWorkspace workspace{chunk.buffers.attentionPartials.sizeBytes(),
-                                          chunk.buffers.attentionStatistics.sizeBytes()};
-  step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                              geometry_.kvLayout, workspace));
-  if (const uint32_t window = geometry_.kvLayout.windowTokens)
-    step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                                        geometry_.kvLayout, workspace, {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moe(geometry_.moeShape(), geometry_.moeRouterFormat, chunk.rows,
                               chunk.decode ? ops::StepKind::Decode : ops::StepKind::Prefill);
   step.aneFfn = aneFfn;
   return step;
+}
+
+void QwenTarget::planAttention(PrefillStep &step) const {
+  const ops::AttentionWorkspace workspace{step.buffers.attentionPartials.sizeBytes(),
+                                          step.buffers.attentionStatistics.sizeBytes()};
+  step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
+                                              geometry_.kvLayout, workspace));
+  if (const uint32_t window = geometry_.kvLayout.windowTokens)
+    step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
+                                                        geometry_.kvLayout, workspace, {.windowTokens = window}));
+}
+
+void QwenTarget::addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+                                 std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
+                                 uint32_t laneRows, const metal::MetalBuffer &paths) const {
+  ops::PagedAttention::addPathCommit(graph, layout, extentPages, pageTables, committed, laneRows, paths);
 }
 
 void QwenTarget::planOutputRows(PrefillStep &step, uint32_t index) const {
@@ -457,12 +469,14 @@ public:
                 metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
       : QwenTarget(weights, geometry, backend, operators), weights_(weights) {
     requireLayers(std::span<const Layer>(weights.layers));
+    requireSharedAttention();
   }
 
   std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph, std::span<const QwenTargetPrefillChunk> chunks,
                                              const kv::PageStorage &kv, SpilledKvReads &spilled,
                                              QwenPrefillLayers layers, ops::AneFfn *aneFfn) override {
     std::vector<PrefillStep> steps = prefillSteps(graph, chunks, kv, spilled, layers, aneFfn);
+    for (PrefillStep &step : steps) planAttention(step);
     return addPrefillLayers(std::span(steps), *this, layers);
   }
 

@@ -1337,13 +1337,16 @@ struct Runtime::Impl {
                      uint32_t draftRows, MetalBuffer targetCos,
                      MetalBuffer targetSin, MetalBuffer draftCos,
                      MetalBuffer draftSin) const {
+    // A target without RoPE builds no target tables, its draft's alone.
+    const uint32_t rotatedRows = geometry.target.rotaryPairs ? targetRows : 0;
+    if (!rotatedRows && !draftRows) return;
     ops::RoPE::addTables(
         graph, std::move(targetPositions), std::move(draftPositions),
         prefillArena->get(PrefillTensor::TargetInverseFrequencies),
         prefillArena->get(PrefillTensor::DraftInverseFrequencies),
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
         std::move(draftSin),
-        {.target_rows = targetRows,
+        {.target_rows = rotatedRows,
          .draft_rows = draftRows,
          .target_scale = geometry.target.ropeScaling.attentionFactor()},
         kPrefillRows, geometry.target.rotaryPairs);
@@ -2837,8 +2840,8 @@ struct Runtime::Impl {
         step, maximumRetained, geometry.target.stopTokens);
   }
 
-  // Each lane's accepted path's K/V at the slots of their depths
-  // (ops::PagedAttention::addPathCommit): the verify stored its block's rows
+  // Each lane's accepted path's K/V at the slots of their depths, through the
+  // target (QwenTarget::addKvPathCommit): the verify stored its block's rows
   // at the slots of their rows, from the lane's position.
   void encodeKvPathCommit(CommandGraph &graph, std::span<Request *const> entries,
                           std::span<const ModelBatchItem> items, const ops::StepRows &step) {
@@ -2849,9 +2852,9 @@ struct Runtime::Impl {
       committed[lane] = static_cast<uint32_t>(items[lane].logicalPosition);
     }
     const auto lanes = static_cast<uint32_t>(entries.size());
-    ops::PagedAttention::addPathCommit(graph, kvPages.layout(), kvPages.extentPages(), std::span(tables).first(lanes),
-                                       std::span(committed).first(lanes), step.laneCap,
-                                       decodeArena->batchSlice(DecodeTensor::RetainedRows, lanes));
+    targetModel->addKvPathCommit(graph, kvPages.layout(), kvPages.extentPages(), std::span(tables).first(lanes),
+                                 std::span(committed).first(lanes), step.laneCap,
+                                 decodeArena->batchSlice(DecodeTensor::RetainedRows, lanes));
   }
 
   // The target's commit after acceptance (QwenTarget::addStateCommit): each
@@ -2953,11 +2956,13 @@ struct Runtime::Impl {
     const MetalBuffer layout = decodeArena->batchSlice(DecodeTensor::LaneLayout, step.lanes);
     targetModel->addVerifyInput(graph, {decodeArena->batchSlice(DecodeTensor::InputTokens, step.lanes), tree,
                                         layout, step});
-    ops::RoPE::addTreeTables(graph, layout, tree, anchors.first(step.lanes),
-                             prefillArena->get(PrefillTensor::TargetInverseFrequencies),
-                             decodeArena->lanesRows(TargetTensor::RopeCos, step.lanes),
-                             decodeArena->lanesRows(TargetTensor::RopeSin, step.lanes), step,
-                             geometry.target.ropeScaling.attentionFactor(), geometry.target.rotaryPairs);
+    // A target without RoPE builds no target tables.
+    if (geometry.target.rotaryPairs)
+      ops::RoPE::addTreeTables(graph, layout, tree, anchors.first(step.lanes),
+                               prefillArena->get(PrefillTensor::TargetInverseFrequencies),
+                               decodeArena->lanesRows(TargetTensor::RopeCos, step.lanes),
+                               decodeArena->lanesRows(TargetTensor::RopeSin, step.lanes), step,
+                               geometry.target.ropeScaling.attentionFactor(), geometry.target.rotaryPairs);
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
