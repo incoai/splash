@@ -611,7 +611,11 @@ Images arrive inline as base64 `data:` URLs: Chat `image_url` parts, Responses
 `input_image` items and Messages `image` blocks with a `base64` source; an image
 URL to fetch returns 400. JPEG, PNG, WebP and GIF decode. An image file may
 hold up to 32 MiB and 33,554,432 pixels, with an aspect ratio up to 200:1, and
-is resized to at most `--max-image-pixels` (4,194,304 by default). A request
+is resized to at most `--max-image-pixels` (4,194,304 by default). Inkling 2
+takes an image at its own size, padded to whole 40-pixel tokens, and resizes
+only one of more patches than that cap's (`--max-image-pixels` / 256, 4,096
+tokens at the default), whatever its aspect ratio
+([Vision](models.md#vision)). A request
 carries at most 64 images, PDF pages included.
 
 PDFs arrive inline too: Chat `file` parts with `file_data`, Responses

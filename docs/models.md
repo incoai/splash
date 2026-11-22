@@ -226,8 +226,8 @@ head softcaps its logits at 30, its 966 padding rows past its 200,058 tokens
 at -inf. Its derived configuration is transformers' `text_config` in its own
 keys (`gguf.inkling_text_config`), held key by key to the family's, and the
 header's loop, window pattern, clips, softcaps and head counts (stated per
-weight layer) to them. It loads from a GGUF only, text only: its vision
-projector (`inkling2v`) is not loaded. Unsloth's `inkling2` files (its own
+weight layer) to them. It loads from a GGUF only; its vision tower is an
+`inkling2v` projector ([Vision](#vision)). Unsloth's `inkling2` files (its own
 looped layout) are refused before their download, and its UD-Q8_K_XL's
 NVFP4 down projections, whose 1,152 inputs hold no whole 256-input meta unit,
 cannot be planned.
@@ -635,19 +635,47 @@ embedding is already in the image's order), linking
 only `config.json` and the shards holding them, or the GGUF repository's root
 projector, a GGUF whose name holds `mmproj` (as `mmproj-BF16.gguf` or
 `MODEL-mmproj-BF16.gguf`), chosen by its header: a `clip` projector whose
-weights are BF16, F32 or F16, preferred in that order. An F16 projector made
+weights are a type the family's tower takes, in its order of preference
+(`projectors` in `install/families.py`): BF16, F32 or F16 for the Qwen
+families. An F16 projector made
 from a BF16 tower, llama.cpp's default output, loads exactly: F16 rounds the
 smallest BF16 weights onto its subnormal grid, and what that keeps is still a
 BF16. The processor configuration (MLX `preprocessor_config.json`, or the
 `image_processor` object of `processor_config.json`, where newer Transformers
-releases save it; the GGUF's `clip.vision` metadata) must describe the one
-preprocessing Splash implements (`server/images.py`); it is checked before any
-weight download and not installed. The models of a family without a vision
-tower (Flint; `vision` in `install/families.py`) serve text only: their
-installation reads no projector, with or without `--language-only`.
+releases save it; the GGUF's `clip.vision` metadata) must describe the
+preprocessing Splash implements for the family's tower (`server/images.py`);
+it is checked before any weight download and not installed. The models of a
+family without a vision tower (Flint; `vision` in `install/families.py`) serve
+text only: their installation reads no projector, with or without
+`--language-only`.
 
-Both sources are written into one image, which the one BF16 vision operator
-reads: BF16 tensors are
+Inkling 2's tower is an `inkling2v` projector (`clip.vision.projector_type`),
+loaded from a GGUF only: ggml-org publishes it as Q8_0 and BF16, Unsloth as
+BF16, F16 and F32, and the installer prefers Q8_0, then BF16, F16 and F32. A
+Q8_0 matrix is the one tensor preparation rounds: each value, its block's F16
+scale times its int8 quant, becomes the nearest BF16, as a GPU product of BF16
+operands would round it as it read it (`model/InklingVision.hpp` lays out its
+image); against an fp32 tower of the same Q8_0 weights its embeddings differ
+by about 1% (`vision-encoder`). Its images are not resized but padded right
+and bottom with zeros to whole tokens of 40 x 40 pixels, four 20-pixel
+patches merged 2 x 2: an image of H x W pixels takes ceil(H / 40) x
+ceil(W / 40) tokens (a 640 x 480 chart 192, a 1000 x 620 screenshot 400). A
+transparent image is composited onto its processor's 8-pixel checkerboard of
+greys 204 and 153 first. The reference pads with -1 on the 0-255 scale, which
+no byte holds; zero moves an embedding by about 0.1%. Only an image past the
+patch budget the image cap gives (`--max-image-pixels` / 256 patches, 4,096
+of its tokens at the default, llama.cpp's budget too) is resized, to the
+largest token-aligned size of its aspect ratio within it, a token a side at
+least. One `<|unused_200054|>` per token stands for it in the prompt, between
+`<|content_image|>` and `<|end_message|>`, and its rows take the projector's
+embeddings as they are, without the norm the token embeddings get. Its
+encoder (`ops::InklingVision`) appends a class token to the patches, runs 23
+blocks of 16 heads of 64 with an axial 2D RoPE and LayerScale on the shared
+dense operators Qwen's tower runs, and merges the patch rows 2 x 2 into a
+projector without biases.
+
+Both sources are written into one image, which the tower's BF16 encoder
+(`ops::ImageEncoder`) reads: BF16 tensors are
 copied, and F32 or F16 tensors are converted under the exact-BF16 rule of
 [weight loading](internals.md#weight-loading).
 Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
@@ -919,7 +947,8 @@ default branch records, as `hf download REPO` or `splash serve` leaves it. A
 missing draft is refused with its download instruction; it is never downloaded
 implicitly.
 
-`--mmproj` supplies a local BF16, F32 or F16 GGUF vision projector. Without
+`--mmproj` supplies a local BF16, F32 or F16 GGUF vision projector (or Q8_0,
+for Inkling 2). Without
 one, a GGUF serves text only. An MLX target uses its own vision tower unless
 `--language-only` is set. `--revision` cannot be combined with `--model-dir`,
 and `--mmproj` requires `--model-dir` and cannot be combined with
