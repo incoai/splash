@@ -59,7 +59,7 @@ final class Server {
             case .starting: self = .starting
             case .loading: self = .loading
             case .warming: self = .warming
-            case .ready, .failed: return nil
+            case .ready, .recovering, .failed, .unknown: return nil
             }
         }
     }
@@ -413,7 +413,7 @@ final class Server {
     }
 
     /// Follows this start's server through its start, as its serve record gives it, until it
-    /// answers, then follows its status.
+    /// answers, then follows its status, which says more of a ready server than its record does.
     private func follow(_ pid: pid_t) async {
         while !Task.isCancelled, phase == .starting {
             if let record = runtime.serveRecord(port: settings.port), record.pid == pid {
@@ -422,7 +422,7 @@ final class Server {
                 if let next = Step(record.phase), next != step {
                     step = next
                     stepSince = .now
-                } else if record.phase == .ready {
+                } else if record.phase.started {
                     // What the model takes and holds, known as it shows as ready.
                     let served = await servedModel()
                     guard !Task.isCancelled, phase == .starting else { break }
@@ -430,6 +430,9 @@ final class Server {
                     limits = served?.limits
                     reasoning = served?.reasoning
                     context = served?.context_length
+                    // An engine that failed as the start ended is being started again already:
+                    // the record says so before the first status does.
+                    recovering = record.phase == .recovering
                     phase = .ready
                     break
                 }

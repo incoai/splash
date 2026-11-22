@@ -64,8 +64,10 @@ struct WaveLaw final {
 };
 using SplitLaw = std::variant<TierLaw, WaveLaw>;
 
-// Register tile against the staged tile for a decode step of `lanes` lanes,
-// by the unit's FormatClass: register where 4 * columnTiles * lanes <
+// Register tile against the staged tile for a plan of `tiles` table tiles
+// (8 rows each, a decode lane's verify rows where it was measured), one to
+// four, the most the register tile holds (Linear.hpp, kMaximumRegisterRows),
+// by the unit's FormatClass: register where 4 * columnTiles * tiles <
 // belowQuarters * cores (in quarter threadgroups per core); kAlways where it
 // takes the formats whatever the grid, 0 never.
 struct RegisterBoundary final {
@@ -80,18 +82,15 @@ struct ProjectionCalibration final {
   uint32_t spreadFromCores;
   // From this many cores a gate/up pair of one format may run in one pass.
   uint32_t onePassFromCores;
-  // One unsplit decode lane of fewer bits per weight than this, in
-  // sixteenths, runs the staged 16-row tile; 0 never.
+  // One unsplit table tile of rows (at most 8) of fewer bits per weight than
+  // this, in sixteenths, runs the staged 16-row tile; 0 never.
   uint32_t sixteenRowBelowBits16;
-  // The most waves of the 16-row tile one such lane runs in from there, under
+  // The most waves of the 16-row tile one such plan runs in from there, under
   // a wave law (sixteenRowLane); 0 never.
   uint32_t sixteenRowWaves;
-  // Prefill chunks of up to this many rows run the staged tile
-  // (<= kMaximumStagedPrefillRows); longer ones the prefill tile.
-  uint32_t stagedPrefillRows;
-  // The staged decode of a unit the int8 decode tiles take
-  // (UnitFormats::decodeInt8Takes) runs them on plans of at least this many
-  // rows (one lane's 16-row plan counts 16).
+  // A staged plan on the decode tiles of a unit the int8 decode tiles take
+  // (UnitFormats::decodeInt8Takes) runs them where it stores at least this
+  // many rows (a 16-row plan counts 16).
   uint32_t decodeInt8FromRows;
   // Longer prefill chunks of a unit the int8 prefill tile takes
   // (UnitFormats::prefillInt8Takes) run that tile, where the family's int8
@@ -109,9 +108,9 @@ struct FloatTileCalibration final {
 };
 
 struct AttentionCalibration final {
-  // A dense prefill tile takes one history split per this many pages its
-  // rows read (PagedAttention.cpp).
-  uint32_t prefillPagesPerSplit;
+  // A dense tile of a sequence of tiles, a prompt chunk's or a 9- to 16-row
+  // lane's, takes one history split per this many pages its rows read.
+  uint32_t pagesPerSplit;
   // From this many pages each split of the longest tile or lane reads, a
   // dense split over INT8 pages scores INT8 queries (PagedAttention.cpp).
   uint32_t int8QueriesFromPages;
@@ -216,16 +215,14 @@ inline constexpr uint32_t kApple10SixteenRowBelowBits16 = 72;
 // most waves measured end to end (the 27B's gate/up passes, 17 per core).
 inline constexpr uint32_t kApple10SixteenRowWaves = 2;
 
-// Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile of its
-// rows with the decode split law (the prefill tile's outputs up to fp32
-// reassociation, gguf-projection checks it): 1.8-2.9x faster on a 17408 x
-// 5120 Q4_K (16-core M5 Pro). The prefill tile takes as long for 33 rows as
-// for 64, so up to 64 rows run the staged 64-row tile: 6-43% less time on
-// Apple10, 12-22% on a 10-core M4.
-// Larger Apple9 GPUs, unmeasured, keep the prefill tile past 32 rows.
-inline constexpr uint32_t kApple9StagedPrefillRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
-inline constexpr uint32_t kApple9SmallStagedPrefillRows = 64;
-inline constexpr uint32_t kApple10StagedPrefillRows = 64;
+// Prefill: 128-row tiles, past the decode tiles' 64 rows (KernelSelection.cpp:
+// the staged tile of a chunk's rows with the decode split law ran a 17408 x
+// 5120 Q4_K chunk of up to 32 rows 1.8-2.9x faster than the prefill tile on a
+// 16-core M5 Pro, within fp32 reassociation of its outputs, gguf-projection
+// checks it). The prefill tile takes as long for 33 rows as for 64, the staged
+// 64-row tile 6-43% less on Apple10 and 12-22% less on a 10-core M4; larger
+// Apple9 GPUs, unmeasured, take it too, which computes half the prefill
+// tile's rows.
 
 // Rotated PQ2_0 units decode in int8 activations on Apple10 and Apple11,
 // whose neural accelerators multiply int8 operands, from 16 rows: the 8-row
@@ -245,18 +242,12 @@ inline constexpr ProjectionCalibration kApple9Projection{
     .onePassFromCores = kNever,
     .sixteenRowBelowBits16 = 0,
     .sixteenRowWaves = 0,
-    .stagedPrefillRows = kApple9StagedPrefillRows,
     // Apple9's matrix operations share the FP32 pipe and multiply int8 at
     // 0.9x their bf16 rate (40-core M3 Max, measured): it keeps bf16
     // activations in decode and prefill, end to end unmeasured.
     .decodeInt8FromRows = kNever,
     .prefillInt8 = false,
 };
-inline constexpr ProjectionCalibration kApple9SmallProjection = [] {
-  ProjectionCalibration row = kApple9Projection;
-  row.stagedPrefillRows = kApple9SmallStagedPrefillRows;
-  return row;
-}();
 inline constexpr ProjectionCalibration kApple10Projection{
     .registerSplits = TierLaw{kRegisterTiers},
     .stagedSplits = kApple10StagedLaw,
@@ -265,10 +256,9 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .onePassFromCores = kApple10OnePassFromCores,
     .sixteenRowBelowBits16 = kApple10SixteenRowBelowBits16,
     .sixteenRowWaves = kApple10SixteenRowWaves,
-    .stagedPrefillRows = kApple10StagedPrefillRows,
     .decodeInt8FromRows = kApple10DecodeInt8FromRows,
     // Apple10 and Apple11 multiply int8 faster than bf16, so every chunk past
-    // the staged tile runs the int8 prefill tile where it takes the formats:
+    // the decode tiles runs the int8 prefill tile where it takes the formats:
     // at least 1.13x less time than the bf16 tile over the 27B's projection
     // shapes in af4g64 and af5g64 at 65-2048 rows (M5 Max, M5 Pro and M6,
     // measured).
@@ -306,7 +296,7 @@ inline constexpr FloatTileCalibration kApple10FloatTile{true, 16, 3, 4, 6};
 // of 8 pages or more scores INT8 queries, repaying their quantization once
 // per threadgroup: splits of 1-5 pages took up to 31% more, of 9 less (M6,
 // 20-core M5 Pro).
-inline constexpr AttentionCalibration kApple10Attention{.prefillPagesPerSplit = 32, .int8QueriesFromPages = 8};
+inline constexpr AttentionCalibration kApple10Attention{.pagesPerSplit = 32, .int8QueriesFromPages = 8};
 
 // No Apple9 GPU scores INT8 queries: on a 10-core M4 they took 8-12% longer,
 // its matrix operations sharing the FP32 pipe. Larger Apple9 GPUs, unmeasured,
@@ -322,7 +312,7 @@ inline constexpr AttentionCalibration kApple9Attention = [] {
 // after 4K tokens. Larger Apple9 GPUs, unmeasured, keep 32.
 inline constexpr AttentionCalibration kApple9SmallAttention = [] {
   AttentionCalibration row = kApple9Attention;
-  row.prefillPagesPerSplit = 64;
+  row.pagesPerSplit = 64;
   return row;
 }();
 
@@ -334,9 +324,8 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   if (gpu != GpuClass::Apple9)
     return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
             kApple10Attention};
-  const bool small = cores <= kApple9SmallGpuCores;
-  return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
-          small ? kApple9SmallAttention : kApple9Attention};
+  return {cores, kApple9Projection, kApple9FloatTile,
+          cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention};
 }
 
 } // namespace splash::ops

@@ -489,8 +489,8 @@ class QwenGrammarTests(unittest.TestCase):
         self.assertEqual(
             main,
             "%llguidance {}\n"
-            "start: think WS (call_0) WS\n"
-            "think: TEXT <[248069]>\n"
+            "start: think (call_0) WS\n"
+            "think: TEXT <[248069]> WS\n"
             'call_0: <tool_call> "\\n<function=f>\\n" @free_arguments "</function>\\n" '
             "</tool_call>\n" + tool_schema.WHITESPACE_RULE + "\n"
             r"TEXT: /(?s:.*)/ & ~/(?s:.*)(<tool_call>|<\/think>)(?s:.*)/" + "\n",
@@ -503,7 +503,7 @@ class QwenGrammarTests(unittest.TestCase):
         )
         self.assertEqual(
             tool_schema.json_grammar({"type": "integer"}, False, chat_format=QWEN),
-            "%llguidance {}\nstart: WS %json "
+            "%llguidance {}\nstart: %json "
             + json.dumps(
                 tool_schema._grammar_compatible_schema({"type": "integer"}),
                 separators=(",", ":"),
@@ -922,8 +922,8 @@ class FlintServingTests(fixtures.HarnessTestCase):
         self.assertEqual(status, 200, payload)
         (grammar,) = factory.grammars
         main = json.loads(grammar)["grammars"][0]["lark_grammar"]
-        self.assertIn("start: think? WS (call_0) (TEXT (call_0))* TEXT\n", main)
-        self.assertIn("think: <[40]> TEXT <[42]>\n", main)
+        self.assertIn("start: think? (call_0) (TEXT (call_0))* TEXT\n", main)
+        self.assertIn("think: <[40]> TEXT <[42]> WS\n", main)
         self.assertIn(
             'call_0: <tool_call> "weather" @free_arguments </tool_call>\n', main
         )

@@ -109,6 +109,8 @@ PROMETHEUS_SERIES = {
     "splash_disk_write_budget_bytes": ("disk", "write_budget_bytes"),
     "splash_disk_read_bytes_total": ("disk", "read_bytes"),
     "splash_disk_written_bytes_total": ("disk", "written_bytes"),
+    "splash_disk_written_last_hour_bytes": ("disk", "written_last_hour_bytes"),
+    "splash_disk_written_last_day_bytes": ("disk", "written_last_day_bytes"),
     "splash_cache_hits_total": ("cache", "hits"),
     "splash_cache_cold_misses_total": ("cache", "cold_misses"),
     "splash_cache_reused_tokens_total": ("cache", "reused_tokens"),

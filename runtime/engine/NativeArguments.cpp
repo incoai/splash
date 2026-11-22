@@ -139,6 +139,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
         throw UsageError("--state-format requires fp32 or bf16");
       result.stateFormat =
           value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
+    } else if (option == "--cached-states") {
+      if (value != "int8" && value != "exact")
+        throw UsageError("--cached-states requires int8 or exact");
+      result.exactCachedStates = value == "exact";
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {

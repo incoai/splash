@@ -277,7 +277,7 @@ bool NativeRuntime::handleMask(const protocol::MaskResponseFrame &mask) {
   // Erased before the engine reads the mask: unusable contents fail the
   // request there, and its failure event erases the same entry.
   pendingMasks_.erase(found);
-  core_.provideMask(mask.requestId, mask.maskWords);
+  core_.provideMask(mask.requestId, mask.maskWords, mask.forcedTokens);
   return true;
 }
 
@@ -443,7 +443,7 @@ void NativeRuntime::tokens(uint64_t requestId,
     parts[static_cast<size_t>(TtftPart::Rest)] = std::max(0.0, ttft - counted);
     metrics_.ttftParts(parts);
     logLine("TTFT of request ", requestId, ": ", ttft, " ms: own prefill ", parts[0], ", claim wait ", parts[1],
-            ", decode ", parts[2], ", other prefill ", parts[3], ", rest ", parts[4]);
+            ", decode ", parts[2], ", other prefill ", parts[3], ", unit wait ", parts[4], ", rest ", parts[5]);
   }
   uint32_t offset = telemetry.emittedTokens;
   telemetry.emittedTokens += static_cast<uint32_t>(values.size());
@@ -455,8 +455,8 @@ void NativeRuntime::tokens(uint64_t requestId,
       requestId, offset, std::vector<uint32_t>(values.begin(), values.end())});
 }
 
-void NativeRuntime::maskRequested(uint64_t requestId,
-                                  std::span<const uint32_t> simulationTokens) {
+void NativeRuntime::maskRequested(const ModelMaskRequest &request) {
+  const uint64_t requestId = request.requestId;
   if (pendingMasks_.contains(requestId)) {
     throw std::logic_error("request already has a pending token mask");
   }
@@ -465,15 +465,14 @@ void NativeRuntime::maskRequested(uint64_t requestId,
     maskRequestId = nextMaskRequestId_++;
   const uint32_t wordsPerToken =
       model::maskWordsPerToken(config_.engine.vocabularySize);
-  uint64_t maskRows = uint64_t(simulationTokens.size()) + 1;
+  uint64_t maskRows = uint64_t(request.simulationTokens.size()) + 1;
   uint64_t expectedWords = uint64_t(wordsPerToken) * maskRows;
   if (!expectedWords || expectedWords > limits_.maxMaskWords) {
     throw std::length_error("token mask dimensions exceed wire limits");
   }
   pendingMasks_.emplace(requestId, PendingMask{maskRequestId, expectedWords});
-  send(protocol::MaskRequestEvent{
-      requestId, maskRequestId, wordsPerToken,
-      std::vector<uint32_t>(simulationTokens.begin(), simulationTokens.end())});
+  send(protocol::MaskRequestEvent{requestId, maskRequestId, wordsPerToken, request.simulationTokens,
+                                  request.parents});
 }
 
 void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason, bool bounded,

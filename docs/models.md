@@ -327,65 +327,171 @@ below what the fp16 block scales of Q8_0 and the K-quants hold, so its GGUFs
 read zeros there: on an M5 Max serving unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL
 with every row verified, its draft accepted 2.3 tokens a cycle on code
 without the embedding, 4.7 with it. Every family loads and runs its draft
-alike: a decode cycle drafts eight rows, the anchor and its
-seven proposals, and the target verifies their first rows, as many as the cycle
-chose for the lane (its verify rows, `ops::DraftSelector::addVerifyRows`), never
-more than the lane may still retain: the tokens its output budget leaves, at
-most all eight. A dense target verifies every row up to that limit: its
-projections read their weights once for all of a cycle's rows, so a row costs it
-little. Each row a MoE target verifies routes its own experts, which a rejected
-row reads for nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43
-experts a layer with all eight rows and 17 with two), from the SSD where they
-stream ([Streamed experts](server.md#streamed-experts)), so by default (`--verify-rows
-auto`) a MoE target's cycles choose their rows by expected accepted tokens per
-unit of cost (the verify budget, `model::VerifyBudget`), whether its experts
-stream or not: on an M5 Max serving Qwen3.6-35B-A3B with its experts all loaded,
-one, two and four concurrent agentic requests of 1000 tokens decoded 8.7%, 8.5%
-and 2.1% faster under the budget than with every row verified in GGUF UD-Q4_K_M,
-and 2.1%, 0.9% and 6.0% faster in MLX 4-bit. `--verify-rows all` has every
-target's cycles verify every row. The startup log says which rows the cycles
-verify and why, and `/status` reports it as `verify_rows`. The selector writes
-each lane's confidence at each position, the largest of its candidates'
-probabilities (the softmax at temperature 1 of their scores), which the lane's
-draw there does not change, so a sampled lane's acceptance stays exact. An
-online model, logit(p) = slope * logit(confidence) + intercept[position], gives
-the probability that the target accepts a proposal once it accepted those before
-it; the engine refits it every 64 cycles on the last 4096 proposals the target
-accepted or rejected (each lane's up to its first rejection, but none whose
-confidence is not a probability, which a draft row that is not finite gives), by
-damped Newton steps under a prior fit to Qwen3.8-Flash-Next's and
-Qwen3.6-35B-A3B's cycles, which also stands before any label. A lane's survival
-at a position, the product of p up to it, is what verifying one more row adds to
-its expected tokens; one GPU step after the selector (`draft_verify_rows`) gives
-every lane its anchor and the rows of the largest survivals over the batch, as
-many as maximize the expected tokens over the cycle's cost at that many rows in
-all. The engine takes a cycle's cost at so many rows from the wall times of the
-lane count's latest cycles, which for streamed experts include the store's reads
-of its misses: a least-squares line in the rows over about the last 30 cycles,
-its slope shrunk toward the shape the measured targets share, since what a row
-costs follows the requests served (a Qwen3.6-35B-A3B cycle with 4 GB of experts
-adds about 3 ms a row on prose and 8 ms on reasoning); constrained cycles are fit
-apart, and every 32nd cycle of a lane count verifies every row, which keeps the
-rows of the fit spread. A cycle counts in the fit at most twice the larger of the
-line's cost at its rows and the mean cycle time: one stalled cycle, such as one
-behind a slow SSD read, would otherwise tilt the line so that the next cycles
-verify their anchors alone, and the mean keeps the cap up where the line has
-fallen. The log notes, at most once a minute, the cycles counted at under half
-their time (`Verify budget: a cycle of`). A fixed shorter block would do worse:
-in agentic use about one cycle in six accepts all seven proposals and one in
-five accepts none. Rows past a lane's verify rows still run the target's
-layers, whose kernels take eight rows a lane, but their MoE steps route no
-expert (`moe_group_routes_verified`), their GDN recurrence is skipped and its
-output left zero (`verify_gdn_fused`), and acceptance retains none of them.
-The budget's costs follow wall time and its acceptance
-model every request's labels, so the rows a cycle verifies depend on the
-machine's timing and on what the server served before, and a MoE row's result
-depends on which rows share its expert tiles ([Kernels](internals.md#kernels)): under the
-budget the same greedy (temperature 0) or seeded request can give different text
-from run to run, even alone on an idle server ([Sampling](api.md#sampling)); sampled
-outputs keep their exact distribution. With every row verified (a dense target,
-or `--verify-rows all`), the rows a cycle verifies follow its lanes' output
-budgets alone. The speculation counts ([Output limits and
+alike: a decode cycle drafts eight rows, the anchor and seven proposal
+positions, and the target verifies a tree of the draft's candidates at those
+positions and of its host chain (below), as many of its rows as the cycle's
+step gives the lane, up to sixteen (`ops::DraftSelector::addVerifyRows`), no
+more of them, and none deeper, than the lane may still retain: the tokens its
+output budget leaves. The host chooses a cycle's step
+before the cycle runs (`model::StepCosts::choose`): the rows, from one a
+lane to sixteen, with the most expected accepted tokens over the cost of a
+step of that many rows, from each lane's chances, no more of them than the
+tokens it may still retain past its anchor (its draft's rows' estimates in
+its latest tree with a draft child of its anchor, which grows to the tokens
+the lane may retain whatever its step, every row's 1 before its first, a
+cycle of a forced chain, beside whose tokens the draft's rows are dead,
+leaving them as they were; and its host chain's, or without one those of its
+last chain's path that its draft joined), and a table of what a step costs
+by its class: the steps whose kernels are the same (`ops::ExecutionPlans::
+decodeRowClasses`: a projection's tile and staged height, a float tile, a MoE
+target's expert tile), priced by a step of the class's last rows, up to
+sixteen rows a lane. The start measures the table on the Mac before it serves
+(in the decode warmups, three passes over a step of each class at each lane
+count, each step's median wall time: a first start's decode warmups of
+Qwen3.8-27B on a 48 GB M5 Pro take 11.1 s, a later start's 1.0 s), later
+starts of the same build, models and formats on the Mac read it back from
+beside the Neural Engine's calibrations instead, and no cycle changes it. The
+table's steps ran at a few tokens of history, and each attention pass, one
+for a lane's first eight rows and one more for its rows past them, reads the
+lane's whole history (on Qwen3.6-35B-A3B on a 48 GB M5 Pro a step at 32K
+takes 2.2 to 3.6 ms a pass more than at 2K), so a step costs its table's
+price plus k times its passes
+over history: over its lanes, a lane's history in thousands of tokens times
+the passes its rows take. k is one number for the model, none at each start,
+which serving fits: the slope of its cycles' time less their table's price on
+their passes over history, the latest cycles weighing most, from the cycles
+the costs chose that held no constrained lane
+(`model::StepCosts::observeContext`). A
+lane count whose lanes' state a start cannot hold beside the rest of its
+memory (under `--max-memory`, or where the warmup's allocation fails) is not
+measured: its cycles take a draft's block a lane, `--verify-rows all`'s step,
+as far as the lanes' chances fill it,
+until a start that holds them measures it. A lane holds up to eight rows
+unless the step's rows give one lane more of the lanes' chances, sixteen
+then, at what the 16-row lane cap's GDN kernels and attention tiles add to a
+step of eight rows a lane, which the start also measures. Such a target
+verifies every row of its step that its lanes' trees fill: a dense target's
+projections read their weights once for all of a step's rows, so a row costs
+it little, and a MoE target's step, whose rows each route their own experts,
+which a rejected row reads for nothing (a Qwen3.8-Flash-Next cycle of one
+lane routes about 43 experts a layer with all eight rows and 17 with two),
+is priced by the same costs of its steps' rows. A target whose experts stream
+from the SSD ([Streamed experts](server.md#streamed-experts)) measures no
+table, as what its rows cost follows its store's state, which only serving
+sees: its cycles fit 1.6.2's online cost line, a + b R ms for the R rows a
+cycle's lanes verify at each lane count (`model::CostLine`), and verify a
+row exactly when the estimate that the target accepts it is at least the
+line's floor, b times the tokens per ms of the lane count's latest cycles:
+the price at which a row's chance of a token is worth its time. A cycle
+applies the floor twice. Before it runs, the host applies it to the lanes'
+chances, which pick only the kernels that run: the step is the last rows of
+the kernel class that holds the rows the floor passes, no fewer than a
+draft's block in all and at most one a lane. After its draft, the device
+applies it to the trees' own
+estimates, which pick the rows: the lanes verify the step's rows at or above
+the floor, and the others belong to no lane and route no expert
+(`VerifyRowsParams`). Before the line's first sample the floor is its seed's,
+and every 32nd cycle of a lane count verifies a draft's block a lane, which
+keeps the line's rows spread. `--verify-rows all` has every cycle's step verify
+every row of a draft's block a lane, so that greedy and seeded outputs
+repeat. The startup log says which rows the cycles
+verify and why, and `/status` reports it as `verify_rows`. The selector grows
+each lane's verify rows into a tree over its candidates (`draft_select_tree`):
+from the anchor, best first by the estimate that the target accepts a row's
+path, the product of its steps' estimates, each row taking its most likely
+candidates at the next position as children, and a lane whose thinking end starts at
+its anchor takes the end as a chain of its own, whose rows the target selects
+whatever its logits. A lane not thinking under a budget also proposes a
+prompt-lookup chain beside them:
+the tokens that followed the latest earlier occurrence of its last three or
+more tokens (`model::LookupIndex`), each estimated by the match's length, its
+depth and whether the draft's candidates there hold it
+(`model::LookupAcceptance`, fit on traced cycles and refined by every
+unconstrained cycle's outcome under `--verify-rows auto`, greedy and sampled
+lanes apart: a sampled lane accepts a copied token only as often as it draws
+it); a lookup token that is
+a draft row's joins that row. A
+constrained lane whose grammar forces the tokens after its anchor proposes
+those instead, each estimated at 1: the server finds, with a cycle's masks,
+the tokens the grammar forces after each row's path, and the next cycle takes
+those of the path the lane retained where its anchor begins them (on 15
+structured outputs of Qwen3.8-27B on a 48 GB M5 Pro, the masks admitted the
+forced token alone at every one of 847 forced positions, and the chains
+would add 1.4% to the tokens a cycle accepts, 16% on an answer whose long
+keys only the schema names). A step to a candidate of probability q (the softmax at
+temperature 1 of its position's candidates' scores after its parent's) is
+estimated by an online model, logit(p) = slope * logit(q) +
+intercept[position], the probability that the target accepts it once it
+accepted its parent, at most what the parent's host chain child (at its
+chain's rate) and the candidates the parent drew before it left of 1 (its
+cap), since the target selects one token after the parent: the estimates of a
+row's children sum to at most its own. Before the chain's child counted, on
+Qwen3.6-35B-A3B's 31K-token code prompts, a chain's first rows of rate 0.9 or
+more were retained 0.95-0.99 of the time and the draft rows beside them
+estimated 0.19-0.20 and retained 0.02-0.09, the anchor's children summing to
+1.14-1.16. There is one model for greedy lanes and one for sampled lanes,
+whose drawn children their verify rows' rejection sampling accepts. The
+engine refits each every 64
+cycles on its last 4096 labels: each row of a lane's tree whose parent the
+cycle's walk accepted, labeled with whether the target selected the row's
+token there and carrying the row's cap (a label its cap bounds tells the fit
+nothing), a row its lane did not verify too (its parent's selection
+says whether the target would have accepted it), but none whose probability
+is not one (a lookup chain's row that no draft step joined, a row of a chain
+the target selects whatever its logits, or a draft row that is not finite) and
+none under a selection a thinking cutoff made; by damped Newton steps under a
+prior fit to Qwen3.8-Flash-Next's and Qwen3.6-35B-A3B's cycles, which also
+stands before any label. Labels of a tree's rows, not only of its likeliest
+chain, keep the estimates of a row's siblings true: over 7,309 greedy traced
+cycles of Qwen3.8-27B, each workload under the fit of the others', trees of
+16 rows grown with the fit of their rows' labels had those rows' estimates
+within 0.012 of the rate the target accepted them at (the mean over tenths of
+the estimate), against 0.021 with the fit of their chains' labels, under
+which rows estimated at 0.15 to 0.45 were accepted at 0.10 to 0.38. A row's
+estimate is what verifying it adds to its lane's expected tokens; one GPU
+step after the selector (`draft_verify_rows`) lays out the step's rows: every
+lane its anchor and the rows of the largest estimates over the batch, a
+lane's in the order its tree took them and none past a lane's cap, as many as
+the cycle's rows hold, every one of which its lane verifies. A row's
+admission so reads only the rows ranked above it, never its own descendants,
+whose estimates follow its draws, which keeps a sampled lane's selections
+draws from the target. It numbers a lane's rows in preorder, its likeliest
+path on its first rows, packs the lanes' rows in lane order, and writes each
+lane's rows (`DecodeTensor::LaneLayout`), which the cycle's later kernels
+read on the GPU. Where the trees hold fewer rows than the step (a sampled
+lane at a low temperature draws fewer children than its last tree's chances
+promised), the step's rows past the lanes' belong to no lane: the target's
+projections compute them unread, as a tile's spare rows, each holding lane
+0's anchor, but no attention, GDN recurrence, MoE routing
+(`moe_group_routes_verified`), selection, penalty or acceptance reads them. A sampled lane's draft draws a
+row's children without replacement from its candidates at the lane's
+temperature (their Gumbel-top-k), which its tree takes in the order drawn, and
+each of its verify rows selects by recursive rejection sampling over them: it
+keeps child i, of probability p under the target and q under the draft after
+the children before it, with probability min(1, p / q), the target's
+distribution becoming its residual max(p - q, 0) and the draft's losing the
+child after each rejection, and draws from the last residual where it keeps
+none (`metal/abi/Sampling.h`). Its cycle keeps a proposal only where the row
+before it selected that token, so its acceptance stays exact; with one child
+a row this is the rejection sampling of a chain of draft draws, and every
+child more accepts more. A greedy lane's argmax is the same rule at
+temperature 0, its children its draft's most likely. On Qwen3.8-27B's own
+sampled cycles at temperature 1, top_k 20 and top_p 0.95, a row that selected
+by its draw alone, of its draft's most likely child, kept 0.671 of the
+proposals at each position, where this rule keeps 0.701, and 0.785 and 0.841
+of its proposals with two and four children. A fixed shorter block would do
+worse: in agentic use about one cycle in six accepts all seven proposals and
+one in five accepts none.
+The step costs are those the Mac measured at a start, the cost of history
+they add follows the cycles served, and its acceptance
+model follows every request's labels, so the rows a cycle verifies depend on
+the machine and on what the server served before, and a MoE row's result
+depends on which rows share its expert tiles ([Kernels](internals.md#kernels)): under
+`--verify-rows auto` the same greedy (temperature 0) or seeded request can give
+different text from run to run, even alone on an idle server
+([Sampling](api.md#sampling)); sampled outputs keep their exact distribution. Under `--verify-rows all`, every
+cycle verifies a draft's block a lane whatever output its lanes have left, which caps only what they
+retain, so that an answer under a lower output limit starts the one under a higher. The speculation counts ([Output limits and
 streaming](api.md#output-limits-and-streaming)) count the proposals a cycle verified.
 The target writes the outputs of the layers the draft reads for each row it
 reads; Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams,
@@ -400,6 +506,32 @@ one for the rest, and `GgufPreparation` quantizes each projection into af4g64
 planes, 4 bits in groups of 64 as MLX's affine quantization rounds them, and
 copies every other tensor as stored. The draft runs on the block kernels its
 target's projections run on.
+
+The draft's logits are its target's vocabulary head's, which a cycle runs twice,
+for the draft's proposals and for the target's verify; the draft's pass reads
+only the head's rows of the tokens it may propose (`DFlashDraft`). The Qwen
+families' vocabulary of 248,320 holds English and code first, Chinese from
+95,726 to 148,274, then its other scripts, and its chat, tool and thinking
+tokens from 248,044: a step's draft proposes from its first 148,288 tokens and
+its last 320 (`kQwenDraftVocabulary`, 59.8% of the head's rows) while each of
+its lanes' last 64 tokens, its anchor the last, lie there, and from the whole
+vocabulary otherwise (`DFlashDraft::vocabulary`). The draft proposes no token
+outside the subset (a lane's prompt-lookup chain alone may), so text that
+leaves it, another script or a word of one, drafts over the whole vocabulary
+until 64 tokens have passed inside it. The
+target verifies over its whole head, so a greedy request's output stays the
+target's and a sampled one keeps its exact distribution; only the proposals,
+and with them the tokens a cycle accepts, can change: 99.98% of the tokens
+Qwen3.8-27B and Qwen3.6-35B-A3B committed decoding agents, code and rewrites
+greedily lie in the subset. On 1.6.2, whose cycles held at most eight rows a
+lane, on an M5 Max the draft's head pass took 1.13 ms of a one-lane
+Qwen3.8-27B MLX 4-bit cycle instead of 1.72 ms (a dispatch of the leading rows
+and one of the last 320), and decode steps took less GPU time with the same
+acceptance (`backend_regression`, ABBA): 1.5% at one lane and 0.6% at four on
+that model, 1.5% and 1.0% on its UD-Q4_K_M GGUF, 2.3% and 1.7% on
+Qwen3.6-35B-A3B UD-Q4_K_M. Flint's vocabulary mixes its scripts through all
+its tokens (its first 98,304 hold 98.1% of English text's tokens and 88.5% of
+Russian text's), so its drafts propose from all of them.
 
 ## Vision
 
@@ -482,6 +614,54 @@ Responses and Messages history replay an assistant turn as one message whose
 text precedes its calls, the order the chat template renders, even where the
 response wrote text after a call.
 
+Only the chat template writes control tokens. A tokenizer finds the tokens it
+adds beside its vocabulary wherever a prompt spells them: the turn and role
+tokens, `<tool_call>`, `<tool_response>`, `<think>`, an image's
+`<|image_pad|>`. Text that only quotes one, as a tool result showing a
+parser's `tool_call_start = "<tool_call>"` does, would reach the model as the
+token itself, and a `<|im_end|>` in a fetched page as the end of its turn. So
+request preparation marks every added token of the tokenizer, special or not,
+where it begins in all that a request gives the template: the content of
+messages of every role, an assistant's reasoning and calls, tool results, tool
+definitions, `chat_template_kwargs`, a PDF's text and a judgment's row. It
+marks one a text spells whole, and one the text's end cuts off, which the
+characters the template writes next could complete: Qwen's templates write `>`
+after a call's name and after each of its argument's names, so a name ending
+in `<|im_end|` would end the turn, and a message's text parts follow one
+another. The prompt encodes each marked one as its characters, as a tokenizer
+that had not added it reads them, so the tags the template writes itself are
+the prompt's only control tokens, and each `<|image_pad|>` among them is one
+the template wrote for an image. A prompt that quotes nothing encodes as the
+tokenizer encodes it, token for token.
+
+The template renders marked text as any other text, so it finds no tag in a
+request either. Three templates read tags there, and none does once the tag
+is quoted: Qwen's take a user message that is one
+`<tool_response>…</tool_response>` block for a tool's result where they look
+for the last question, Qwen3.6's split an assistant's content at `</think>`,
+and Flint's deletes `<think>` and `</think>` from a message and rewrites its
+role tokens. Each stays the text the client sent. A client sends an
+assistant's reasoning as `reasoning_content` and a tool's result as a `tool`
+message, which the template frames itself. Flint's template also deletes
+U+0000 from a message, which would write whole a token the text spelled around
+one, where nothing was marked: a U+0000 in a request's text reaches every
+template as U+FFFD. With the templates of the families Splash serves, no text
+of a request is then a token. What remains is a
+[custom template](#custom-chat-templates)'s own doing: one that deletes or
+rewrites characters of a text it is given, or that itself writes the first
+characters of a token before a text, can still put a token together. A text
+completion's prompt and `/tokenize` are raw text, in which a special-token
+string is its token and a U+0000 stays.
+
+Startup refuses a tokenizer whose added tokens it could not keep out of a
+request's text, before the native runtime starts: one without a
+`tokenizer.json`, one that finds an added token other than as its literal text
+(normalized, stripping the space around it or matching whole words only) or
+adds one of a single character, and one whose pipeline is not byte-level BPE
+behind regex splits with NFC or no normalizer, where the text between two
+added tokens might not encode on its own. The tokenizer Splash derives from a
+GGUF is always one it serves.
+
 `server/chat_templates.py` probes each of the tokenizer's templates, including
 each named variant such as `tool_use`, once at startup, right after the
 tokenizer is validated and before the native runtime starts, so a tokenizer
@@ -510,6 +690,50 @@ Every request, including image placeholder, token-count and judgment
 startup; tokenizer files and the tokenizer object are unchanged. The probe's
 upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
+## Custom chat templates
+
+`--chat-template-file FILE`, of `splash serve` or the server, names a UTF-8
+Jinja file that every request renders with, in place of every template the
+tokenizer defines, `tool_use` included; without it, the tokenizer's templates
+serve as before. The server reads the file once at startup, probes it as it
+probes the tokenizer's, and logs its path (`Chat template file · ...`); a
+later change to the file takes effect at the next start. A file that cannot be
+read, is not UTF-8 or is blank stops startup, as does a template that would
+serve no request, before any weights load: one transformers cannot compile
+(the error names the line), one that cannot render a question, a follow-up or
+a tool result (the error names the first of them it cannot, with the
+template's own error), and one whose prompts for the three do not end with one
+generation prompt, which every request's prompt must end with. Splash never
+falls back to the model's templates.
+
+The template supplies formatting alone: the vocabulary, special tokens and the
+[chat format](#chat-formats) the output is read in remain the model's.
+Whether a request thinks, and what `/v1/models` reports of reasoning, follow
+the generation prompt the template renders for the request's effort, as with
+the model's own. Startup does not check that the template writes the family's
+format, so that is the template's to keep: the server reads tool calls only in
+the family's layout, whatever layout the template shows the model, and serves
+an image only where the template writes the family's image placeholder
+(`<|image_pad|>`) once for each image of the request, in their order. The
+server takes each placeholder among the prompt's tokens for an image's, a
+request's own text being no token, and widens it to that image's tokens; a
+request whose placeholders and images differ in number fails with a 400.
+Preparation is unchanged: a GGUF still needs a chat template of its own.
+
+The template must also write each text of a request as it is given. Request
+preparation sets a mark inside every added token that a text begins and takes
+the marks out of the rendered prompt
+([tokenizer and chat templates](#tokenizer-and-chat-templates)), so a template
+that changes a text's case, cuts it or replaces characters in it leaves a
+broken mark in the prompt: `{{ message.content | upper }}` writes
+`<__SPLASH_QUOTED_…__TOOL_CALL>` where a message quotes `<tool_call>`. One
+that deletes characters inside a text, trims a text before characters of its
+own that would complete a token, or writes a token's first characters itself
+before a text can put together a token the request only quoted. Writing a
+text as JSON (`tojson`), joining it to others, trimming it before a token or a
+line break of the template's own and testing it leave it as it is; a test for
+a tag in a text finds none, as in the model's own templates.
+
 ## Chat formats
 
 Each family's model frames its reasoning and lays out its tool calls in a
@@ -532,7 +756,9 @@ its target layout's; the tokens of `</think>`, of `<think>` where the model
 opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
 special token after which prompt tokenization reuses a cached prompt's tokens,
 `<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
-as the format has it. Grammars write reasoning and calls as the format lays
+as the format has it, and that it can keep its added tokens out of a request's
+text ([tokenizer and chat templates](#tokenizer-and-chat-templates)). Grammars
+write reasoning and calls as the format lays
 them out: Flint's optional think block may come before any constrained output,
 and its tags, which the grammar compiler takes as tokens rather than text, are
 written as their tokens. A model that opens its reasoning itself closes it

@@ -213,18 +213,18 @@ class RequestLifetimeTests(unittest.TestCase):
         self.addCleanup(release.set)
 
         class Constraint:
-            def masks(self, tokens):
+            def masks(self, tokens, _parents):
                 entered.set()
                 if not release.wait(2):
                     raise TimeoutError("test mask was not released")
-                return b"\xff" * (8 * (len(tokens) + 1))
+                return b"\xff" * (8 * (len(tokens) + 1)), ()
 
         job, cache, held = self.job()
         job.constraint = Constraint()
         backend.submit(job)
         call = backend.active[job.request_id].call
         process.send(wire.StartEvent(call.request_id, 0, 0))
-        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
+        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, (), ()))
         self.assertTrue(entered.wait(1))
         backend.cancel(job)
         process.send(

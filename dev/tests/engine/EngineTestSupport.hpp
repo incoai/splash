@@ -50,10 +50,8 @@ public:
     transcript.insert(transcript.end(), values.begin(), values.end());
   }
   void firstTokenParts(uint64_t id, const engine::TtftParts &parts) override { ttftParts[id] = parts; }
-  void maskRequested(uint64_t requestId,
-                     std::span<const uint32_t> simulation) override {
-    maskRequests.emplace_back(
-        requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
+  void maskRequested(const ModelMaskRequest &request) override {
+    maskRequests.emplace_back(request.requestId, request.simulationTokens);
   }
   void completed(uint64_t id, engine::EngineFinishReason reason, bool bounded, uint32_t prompt,
                  uint32_t completion, uint32_t deduplicated,

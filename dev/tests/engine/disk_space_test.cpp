@@ -152,7 +152,7 @@ void testActiveKvTakesTheRoom() {
   space.measure();
   require(budget->activeLimitBytes() == kQuota && budget->limitBytes() == kQuota,
           "a volume the tier does not follow did not leave both limits at the quota");
-  const std::shared_ptr<model::SlotFile::Slot> held = file->acquire();
+  const std::shared_ptr<model::SlotFile::Slot> held = file->acquire(kHostPageBytes);
   volume.set(localVolume(100 * kGiB));
   for (int write = 0; write < 2; ++write) {
     budget->reportFull();
@@ -236,7 +236,8 @@ void testMeasureOfRealFiles() {
           "a full volume stopped the files or kept the limit");
   measured.set(localVolume(100 * kGiB));
   space.measure();
-  std::vector<std::shared_ptr<model::SlotFile::Slot>> slots{file->acquire(), file->acquire()};
+  std::vector<std::shared_ptr<model::SlotFile::Slot>> slots{file->acquire(kHostPageBytes),
+                                                            file->acquire(kHostPageBytes)};
   const uint64_t ruled = budget->limitBytes();
   budget->reportFull();
   space.measure();
@@ -245,14 +246,14 @@ void testMeasureOfRealFiles() {
   budget->reportFull();
   space.measure();
   require(file->writable() && !budget->writesStopped() &&
-              budget->limitBytes() == 2 * kHostPageBytes && !file->acquire(),
+              budget->limitBytes() == 2 * kHostPageBytes && !file->acquire(kHostPageBytes),
           "a second write that found the volume full while it shows room did not keep the tier "
           "within what it held");
   measured.set(localVolume(500 * kGiB));
   space.measure();
   slots.pop_back();
-  slots.push_back(file->acquire());
-  require(budget->limitBytes() == 2 * kHostPageBytes && slots.back() && !file->acquire(),
+  slots.push_back(file->acquire(kHostPageBytes));
+  require(budget->limitBytes() == 2 * kHostPageBytes && slots.back() && !file->acquire(kHostPageBytes),
           "the tier did not replace within what it held, or grew past it");
   slots.pop_back();
   budget->reportFull();
@@ -268,7 +269,7 @@ void testMeasureOfRealFiles() {
   DiskSpace network(other, kSize, {shared}, reads(share));
   require(!network.followed() && other->limitBytes() == 5 * kGiB,
           "a network volume's free space set the limit");
-  const std::shared_ptr<model::SlotFile::Slot> held = shared->acquire();
+  const std::shared_ptr<model::SlotFile::Slot> held = shared->acquire(kHostPageBytes);
   other->reportFull();
   network.measure();
   require(other->limitBytes() == 5 * kGiB,
@@ -277,6 +278,38 @@ void testMeasureOfRealFiles() {
   network.measure();
   require(shared->writable() && other->limitBytes() == kHostPageBytes,
           "a full network volume did not keep the tier within what it held");
+}
+
+// What a tier's files hold on their volume, which every measure reads and the limit's rule counts
+// as the tier's, is what its slots count of the quota and their records: a quota filled with
+// payloads a quarter of a slot long holds four times as many as its slots, on no more blocks.
+void testFilesHoldWhatTheirSlotsCount() {
+  const test::TemporaryDirectory directory("splash-disk-space-held");
+  constexpr uint64_t quota = 8 * kMiB;
+  auto budget = std::make_shared<model::DiskBudget>(quota);
+  auto file = std::make_shared<model::SlotFile>(
+      kMiB, budget,
+      model::SlotFile::Persistence{directory.path() / "kv.slots", directory.path() / "kv.records", {}, 8});
+  file->finishAdoption();
+  DiskSpace space(budget, kSize, {file}, reads(localVolume(500 * kGiB)));
+  const std::vector<std::byte> payload(kMiB / 4, std::byte{1});
+  require(file->quotaBytesFor(payload.size()) == kMiB / 4, "a slot does not count its payload's host pages");
+  std::vector<std::shared_ptr<model::SlotFile::Slot>> slots;
+  for (auto slot = file->acquire(payload.size()); slot; slot = file->acquire(payload.size())) {
+    require(file->write(slot, {payload}, {})->wait(), "the tier could not write within its quota");
+    slots.push_back(std::move(slot));
+  }
+  require(file->synchronize({})->wait(), "the tier's file did not synchronize");
+  space.measure();
+  // The files hold what the slots count, and the records a header's block and a block of 32
+  // records; their blocks, which the tier counts, hold at least that, and for a while APFS's can
+  // hold more (test::dataBytes).
+  const uint64_t data =
+      test::dataBytes(directory.path() / "kv.slots") + test::dataBytes(directory.path() / "kv.records");
+  require(slots.size() == 32 && budget->usedBytes() == quota && data >= quota && data <= quota + kHostPageBytes &&
+              space.heldBytes() >= data,
+          "the tier's files hold other than what its slots count on the volume");
+  file->seal();
 }
 
 // Two other caches in a fresh root, a MiB of slots each, the first older.
@@ -355,7 +388,7 @@ void testOtherCachesGoAsTheTierGrows() {
     const std::vector<std::byte> payload(kMiB, std::byte{1});
     std::vector<std::shared_ptr<model::SlotFile::Slot>> slots;
     const auto grow = [&] {
-      slots.push_back(file->acquire());
+      slots.push_back(file->acquire(payload.size()));
       require(slots.back() && file->write(slots.back(), {payload}, {})->wait(),
               "the tier could not write within its limit");
       space.measure();
@@ -384,6 +417,7 @@ int main() {
     testSnapshotCostsAtMostAThird();
     testAutomaticStart();
     testMeasureOfRealFiles();
+    testFilesHoldWhatTheirSlotsCount();
     testOtherCachesGoFirst();
     testRemovedCachesStopCounting();
     testOtherCachesGoAsTheTierGrows();

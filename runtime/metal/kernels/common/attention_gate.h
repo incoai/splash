@@ -2,40 +2,43 @@
 
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/activation.h"
+#include "metal/kernels/common/gguf_sgmatrix.h"
 
-// The output of a full-attention layer at element `element` of a lane's rows
-// of every query head: the head's attention row, staged `stride` rows per KV
-// head ([KV head][row][query head in group][dimension]), times the sigmoid of
-// the head's gate in the packed row where the layer is Gated, and as it is
-// where it is not, which reads no packed row (`packed_qkv` may be null).
-// Lane `lane`'s rows start at packed row lane x lane_rows and its staging at
-// KV head lane x KHeads; a prefill chunk is lane 0.
-template <uint QHeads, uint KHeads, uint HeadDim, bool Gated>
-inline bfloat full_attention_output_value(device const bfloat *packed_qkv,
-                                          device const bfloat *attention,
-                                          uint lane, uint lane_rows, uint stride,
-                                          uint element) {
-  constexpr uint QStride = 2 * HeadDim;
-  constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
-  constexpr uint HeadsPerKV = QHeads / KHeads;
-  uint row = element / (QHeads * HeadDim);
-  uint remainder = element % (QHeads * HeadDim);
-  uint query_head = remainder / HeadDim;
-  uint dim = remainder % HeadDim;
-  float gate_scale = 1.0f;
+// The attention's output of one fused row of a reduce, as the layer's
+// out-projection reads it: element `dimension` of query head `query_head` of
+// the row, `value` (the reduce's, in bfloat) times the sigmoid of the head's
+// gate in its packed row `packed` where the layer is Gated (a projection row
+// holds each query head's queries, then its gate), and as it is where it is
+// not, which reads no packed row (`packed_qkv` may be null). Written, where
+// `writes`, at row `output` of `hidden` (QHeads x HeadDim elements a row)
+// and, with Table, of the out-projection's Table16 input and its sums too: a
+// thread of the first HeadDim / 2 a pair of the row's elements, whole
+// simdgroups a 64-element span, from `pairs`, which holds every thread's
+// element. `writes` is the threadgroup's, which every thread reaches.
+template <uint QHeads, uint KHeads, uint HeadDim, bool Gated, bool Table>
+inline void splash_attention_output_row(bfloat value, device const bfloat *packed_qkv, device bfloat *hidden,
+                                        device bfloat *table, device float *sums, ulong packed, ulong output,
+                                        uint query_head, uint dimension, bool writes, threadgroup bfloat *pairs) {
+  constexpr uint Width = QHeads * HeadDim;
+  static_assert(HeadDim % 64 == 0, "a head's elements fill whole simdgroups of pairs");
+  bfloat element = value;
   if constexpr (Gated) {
-    float gate = float(packed_qkv[(ulong(lane) * lane_rows + row) * PackedStride +
-                                  query_head * QStride + HeadDim + dim]);
-    gate_scale = splash_sigmoid(gate);
+    constexpr uint PackedStride = QHeads * 2 * HeadDim + 2 * KHeads * HeadDim;
+    if (writes) {
+      const float gate = float(packed_qkv[packed * PackedStride + query_head * 2 * HeadDim + HeadDim + dimension]);
+      element = bfloat(float(value) * splash_sigmoid(gate));
+    }
   }
-  uint kv_head = query_head / HeadsPerKV;
-  uint local_head = query_head % HeadsPerKV;
-  ulong attention_index =
-      (((ulong(lane) * KHeads + kv_head) * stride + row) * HeadsPerKV +
-       local_head) *
-          HeadDim +
-      dim;
-  if constexpr (!Gated)
-    return attention[attention_index];
-  return bfloat(float(attention[attention_index]) * gate_scale);
+  if (writes)
+    hidden[output * Width + query_head * HeadDim + dimension] = element;
+  if constexpr (Table) {
+    pairs[dimension] = element;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (writes && dimension < HeadDim / 2) {
+      const uint first = query_head * HeadDim + 2 * dimension;
+      gguf_sg::Table16::write(table + output / 8 * Width * 8,
+                              sums + output / 8 * gguf_sg::Table16::sums_per_tile(Width), Width, first / 64,
+                              output % 8, dimension % 32, pairs[2 * dimension], pairs[2 * dimension + 1]);
+    }
+  }
 }

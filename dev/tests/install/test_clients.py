@@ -1155,6 +1155,14 @@ class ClientTests(unittest.TestCase):
 
 
 class ClientLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        # A command that finds no ready server names the one that holds its
+        # port (launcher._port_holder), from the locks and records of a
+        # runtime directory of the test's: a server serving on this Mac while
+        # the tests run is not theirs.
+        runtime = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(launcher, "RUNTIME_DIR", runtime))
+
     @contextmanager
     def ready_server(self, client, context=102400, model=None, status=None):
         """Serve model from a ready server reporting status; yields the
