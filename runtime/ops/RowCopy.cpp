@@ -21,17 +21,21 @@ uint64_t regionBytes(RowRegion region, uint32_t rows, uint32_t width, FloatEleme
 
 void RowCopy::add(metal::CommandGraph &graph, metal::MetalBuffer source,
                   RowRegion from, metal::MetalBuffer destination, RowRegion to,
-                  uint32_t rows, uint32_t width, FloatElement sourceElement) {
+                  uint32_t rows, uint32_t width, FloatElement sourceElement,
+                  FloatElement destinationElement) {
+  constexpr FloatElement kF32 = FloatElement::Float32;
   if (!rows || !width || from.column + uint64_t{width} > from.stride ||
-      to.column + uint64_t{width} > to.stride)
+      to.column + uint64_t{width} > to.stride || (sourceElement == kF32 && destinationElement == kF32))
     throw std::invalid_argument("invalid row copy");
   requireBytes(source, regionBytes(from, rows, width, sourceElement), "row copy source");
-  requireBytes(destination, regionBytes(to, rows, width, FloatElement::BFloat16), "row copy destination");
+  requireBytes(destination, regionBytes(to, rows, width, destinationElement), "row copy destination");
   const RowCopyParams params{rows,        width,     from.row,
                              from.stride, from.column, to.row,
                              to.stride,   to.column};
   // One thread per value.
-  graph.add(sourceElement == FloatElement::Float32 ? "copy_rows_f32_bf16" : "copy_rows_bf16",
+  graph.add(sourceElement == kF32        ? "copy_rows_f32_bf16"
+            : destinationElement == kF32 ? "copy_rows_bf16_f32"
+                                         : "copy_rows_bf16",
             {std::move(source), std::move(destination)},
             params, {(uint64_t{rows} * width + kThreads - 1) / kThreads, 1, 1},
             {kThreads, 1, 1});

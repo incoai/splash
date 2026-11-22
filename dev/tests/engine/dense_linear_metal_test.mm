@@ -3,15 +3,17 @@
 // against fp64 references, as the vision tower runs them:
 //
 // - every epilogue (none, GELU tanh and erf into bf16, an fp32 residual
-//   updated in place) at row counts below, on and past the 64-row tile;
-//   the rows past a projection's rows, followed by NaN, are left as they
-//   were;
+//   updated in place, as it is or scaled per output, a LayerScale's) at row
+//   counts below, on and past the 64-row tile; the rows past a projection's
+//   rows, followed by NaN, are left as they were;
 // - every tile the rule picks, reached through devices of each GPU class
 //   and core count: the same bits on each, at every epilogue;
 // - a row's bits at any offset in its buffer and in a projection of any
 //   rows;
 // - each buffer at the extent the operators require, refused one element
-//   short.
+//   short;
+// - the LayerNorm into bf16 rows and into fp32 rows, its input's own among
+//   them.
 //
 //   dense-linear METALLIB
 #include "LinearNumerics.hpp"
@@ -45,6 +47,8 @@ using splash::metal::MetalBuffer;
 using splash::ops::DenseEpilogue;
 using splash::ops::DenseLinear;
 using splash::ops::DenseWeights;
+using splash::ops::elementBytes;
+using splash::ops::FloatElement;
 using splash::ops::KernelCalibration;
 using splash::ops::LayerNormWeights;
 using splash::ops::Normalization;
@@ -56,6 +60,9 @@ using splash::test::sharedBuffer;
 constexpr uint16_t kNan = 0x7FC0;
 
 std::mt19937 rng(17);
+
+constexpr DenseEpilogue kEpilogues[] = {DenseEpilogue::None, DenseEpilogue::GeluTanh, DenseEpilogue::GeluErf,
+                                        DenseEpilogue::Residual, DenseEpilogue::ScaledResidual};
 
 std::vector<float> randomBf16(size_t count, float scale) {
   std::uniform_real_distribution<float> uniform(-scale, scale);
@@ -94,6 +101,8 @@ const char *kernelSuffix(DenseEpilogue epilogue) {
     return "_gelu_erf";
   case DenseEpilogue::Residual:
     return "_residual";
+  case DenseEpilogue::ScaledResidual:
+    return "_scaled_residual";
   }
   return "";
 }
@@ -107,6 +116,8 @@ const char *epilogueName(DenseEpilogue epilogue) {
     return "gelu erf";
   case DenseEpilogue::Residual:
     return "residual";
+  case DenseEpilogue::ScaledResidual:
+    return "scaled residual";
   }
   return "";
 }
@@ -119,8 +130,8 @@ struct Projected final {
 
 // One projection of `rows` rows of `inputs` into `outputs`, its values drawn
 // from `seed`, against fp64 unless `exact` is false: an output may differ by
-// bf16 rounding of its magnitude (fp32 for the residual) plus fp32
-// accumulation over the inputs. The input holds whole row tiles, the rows
+// bf16 rounding of its magnitude (fp32 for the residuals, of the scaled sum
+// and the residual each) plus fp32 accumulation over the inputs. The input holds whole row tiles, the rows
 // past `rows` large finite values; NaN follows the output's rows, which must
 // survive.
 Projected testProjection(MetalBackend &backend, const DenseLinear &dense, uint32_t rows, uint32_t outputs,
@@ -133,11 +144,13 @@ Projected testProjection(MetalBackend &backend, const DenseLinear &dense, uint32
   std::fill(x.begin() + size_t(rows) * inputs, x.end(), 64.0F);
   const std::vector<float> w = randomBf16(size_t(outputs) * inputs, 0.1F), b = randomBf16(outputs, 0.5F);
   const std::vector<float> r = randomBf16(size_t(rows) * outputs, 1.0F);
-  const bool residual = epilogue == DenseEpilogue::Residual;
+  const bool scaled = epilogue == DenseEpilogue::ScaledResidual;
+  const bool residual = scaled || epilogue == DenseEpilogue::Residual;
+  const std::vector<float> scale = randomBf16(outputs, 0.3F);
   const size_t tail = size_t(64) * outputs;
   const MetalBuffer output = residual ? f32Buffer(backend, r, tail)
                                       : bf16Buffer(backend, std::vector<float>(size_t(rows) * outputs, 0.0F), tail);
-  const DenseWeights weights{bf16Buffer(backend, w), bf16Buffer(backend, b)};
+  const DenseWeights weights{bf16Buffer(backend, w), bf16Buffer(backend, b), bf16Buffer(backend, scale)};
   CommandGraph graph;
   dense.add(graph, weights, outputs, inputs, bf16Buffer(backend, x),
             backend.view(output, 0, size_t(rows) * outputs * (residual ? 4 : 2)), rows, epilogue);
@@ -152,11 +165,14 @@ Projected testProjection(MetalBackend &backend, const DenseLinear &dense, uint32
       }
       double expected = sum;
       if (epilogue == DenseEpilogue::GeluTanh || epilogue == DenseEpilogue::GeluErf) expected = gelu(epilogue, sum);
+      if (scaled) expected *= scale[n], magnitude *= std::fabs(scale[n]);
       if (residual) expected += r[size_t(m) * outputs + n];
       const size_t index = size_t(m) * outputs + n;
       const double got = residual ? static_cast<const float *>(output.contents())[index]
                                   : bf16ToFloat(static_cast<const uint16_t *>(output.contents())[index]);
-      const double bound = (residual ? 0x1p-22 : 0x1p-8) * std::fabs(expected) + inputs * 0x1p-24 * magnitude + 1e-6;
+      const double bound = (residual ? 0x1p-22 : 0x1p-8) * std::fabs(expected) +
+                           (scaled ? 0x1p-22 * std::fabs(r[size_t(m) * outputs + n]) : 0.0) +
+                           inputs * 0x1p-24 * magnitude + 1e-6;
       if (!(std::fabs(got - expected) <= bound))
         throw std::runtime_error(label + " [" + std::to_string(m) + "," + std::to_string(n) + "]: " +
                                  std::to_string(got) + " vs " + std::to_string(expected));
@@ -185,8 +201,7 @@ DeviceCapabilities deviceOf(uint32_t appleGpuFamily, uint32_t cores) {
 void testTiles(MetalBackend &backend) {
   constexpr uint32_t rows = 130, outputs = 256;
   const uint32_t inputs = KernelCalibration::of(deviceOf(11, 1)).denseTile.wideInputs;
-  for (const DenseEpilogue epilogue :
-       {DenseEpilogue::None, DenseEpilogue::GeluTanh, DenseEpilogue::GeluErf, DenseEpilogue::Residual}) {
+  for (const DenseEpilogue epilogue : kEpilogues) {
     std::set<std::string> ran;
     std::vector<uint8_t> first;
     for (const uint32_t family : {9U, 10U, 11U})
@@ -208,13 +223,12 @@ void testTiles(MetalBackend &backend) {
 void testOffsets(MetalBackend &backend, const DenseLinear &dense) {
   constexpr uint32_t rows = 150, outputs = 256, inputs = 384, shift = 7;
   const std::vector<float> w = randomBf16(size_t(outputs) * inputs, 0.1F), b = randomBf16(outputs, 0.5F);
-  const DenseWeights weights{bf16Buffer(backend, w), bf16Buffer(backend, b)};
+  const DenseWeights weights{bf16Buffer(backend, w), bf16Buffer(backend, b), bf16Buffer(backend, randomBf16(outputs, 0.3F))};
   const std::vector<float> x = randomBf16(size_t(DenseLinear::paddedRows(rows)) * inputs, 1.0F);
   std::vector<float> shifted = randomBf16(size_t(DenseLinear::paddedRows(rows + shift)) * inputs, 1.0F);
   std::copy_n(x.begin(), size_t(rows) * inputs, shifted.begin() + size_t(shift) * inputs);
-  for (const DenseEpilogue epilogue :
-       {DenseEpilogue::None, DenseEpilogue::GeluTanh, DenseEpilogue::GeluErf, DenseEpilogue::Residual}) {
-    const size_t element = epilogue == DenseEpilogue::Residual ? 4 : 2;
+  for (const DenseEpilogue epilogue : kEpilogues) {
+    const size_t element = epilogue == DenseEpilogue::Residual || epilogue == DenseEpilogue::ScaledResidual ? 4 : 2;
     const MetalBuffer alone = sharedBuffer(backend, size_t(rows) * outputs * element);
     const MetalBuffer packed = sharedBuffer(backend, size_t(rows + shift) * outputs * element);
     std::memset(alone.contents(), 0, alone.sizeBytes());
@@ -257,41 +271,74 @@ void testProjectionExtents(MetalBackend &backend, const DenseLinear &dense) {
     DenseLinear::requireWeights({weight, v}, outputs, inputs, "dense");
     dense.add(g, {weight, v}, outputs, inputs, input, output, rows);
   });
+  // A LayerScale's scales: those requireWeights takes, if any, and those the
+  // scaled residual reads.
+  const MetalBuffer scale = sharedBuffer(backend, size_t(outputs) * 2);
+  requireExtent(backend, scale, scale.sizeBytes(), 2, "dense scale", [&](CommandGraph &g, const MetalBuffer &v) {
+    DenseLinear::requireWeights({weight, bias, v}, outputs, inputs, "dense");
+    dense.add(g, {weight, bias, v}, outputs, inputs, input, output, rows, DenseEpilogue::ScaledResidual);
+  });
+  requireExtent(backend, scale, scale.sizeBytes(), 2, "dense scale", [&](CommandGraph &g, const MetalBuffer &v) {
+    dense.add(g, {weight, bias, v}, outputs, inputs, input, output, rows, DenseEpilogue::ScaledResidual);
+  });
+  splash::test::rejects(
+      [&] {
+        CommandGraph g;
+        dense.add(g, {weight, bias}, outputs, inputs, input, output, rows, DenseEpilogue::ScaledResidual);
+      },
+      "dense scale", "a scaled residual without scales was accepted");
   for (const auto [o, i] : {std::pair{192U, 384U}, std::pair{256U, 192U}, std::pair{0U, 384U}})
     splash::test::rejects([&] { DenseLinear::requireWeights({weight, bias}, o, i, "dense"); }, "not whole multiples",
                           "dense weights of " + std::to_string(o) + " x " + std::to_string(i) + " were accepted");
 }
 
-// LayerNorm with bias of fp32 rows into bf16, at a width that is not a
-// multiple of the 256 threads and at epsilons of 1e-5 and the tower's 1e-6, against
-// fp64 within bf16 rounding.
+// LayerNorm with bias of fp32 rows into bf16 rows, and into fp32 rows in
+// place (Inkling 2's tower's first, epsilon 1e-5) and into others, at a
+// width that is not a multiple of the 256 threads and at epsilons of 1e-5 and
+// Qwen's tower's 1e-6, against fp64 within bf16 rounding, or fp32's; the row
+// after the rows, NaN, stays.
 void testLayerNorm(MetalBackend &backend) {
-  for (const float epsilon : {1e-5F, 1e-6F}) {
-    constexpr uint32_t rows = 5, width = 300;
-    std::uniform_real_distribution<float> uniform(-2.0F, 2.0F);
-    std::vector<float> x(size_t(rows) * width);
-    for (float &value : x) value = uniform(rng);
-    const std::vector<float> weight = randomBf16(width, 1.0F), bias = randomBf16(width, 1.0F);
-    const MetalBuffer output = sharedBuffer(backend, size_t(rows) * width * 2);
-    CommandGraph graph;
-    Normalization::addLayer(graph, f32Buffer(backend, x), {bf16Buffer(backend, weight), bf16Buffer(backend, bias)},
-                            output, width, rows, epsilon);
-    run(backend, graph);
-    for (uint32_t r = 0; r < rows; ++r) {
-      double mean = 0.0, variance = 0.0;
-      for (uint32_t c = 0; c < width; ++c) mean += x[r * width + c];
-      mean /= width;
-      for (uint32_t c = 0; c < width; ++c) variance += (x[r * width + c] - mean) * (x[r * width + c] - mean);
-      variance /= width;
-      for (uint32_t c = 0; c < width; ++c) {
-        const double expected = (x[r * width + c] - mean) / std::sqrt(variance + epsilon) * weight[c] + bias[c];
-        const double got = bf16ToFloat(static_cast<const uint16_t *>(output.contents())[r * width + c]);
-        require(std::fabs(got - expected) <= 0x1p-8 * std::fabs(expected) + 1e-4,
-                "layer norm row " + std::to_string(r) + " column " + std::to_string(c) + ": " +
-                    std::to_string(got) + " vs " + std::to_string(expected));
+  for (const float epsilon : {1e-5F, 1e-6F})
+    for (const FloatElement element : {FloatElement::BFloat16, FloatElement::Float32})
+      for (const bool inPlace : {false, true}) {
+        if (inPlace && element != FloatElement::Float32) continue;
+        constexpr uint32_t rows = 5, width = 300;
+        std::uniform_real_distribution<float> uniform(-2.0F, 2.0F);
+        std::vector<float> x(size_t(rows) * width);
+        for (float &value : x) value = uniform(rng) + 0.5F;
+        const std::vector<float> weight = randomBf16(width, 1.0F), bias = randomBf16(width, 1.0F);
+        const bool wide = element == FloatElement::Float32;
+        const MetalBuffer input = f32Buffer(backend, x, width);
+        const MetalBuffer output = inPlace ? input
+                                   : wide  ? f32Buffer(backend, std::vector<float>(size_t(rows) * width), width)
+                                           : bf16Buffer(backend, std::vector<float>(size_t(rows) * width), width);
+        CommandGraph graph;
+        Normalization::addLayer(graph, backend.view(input, 0, size_t(rows) * width * 4),
+                                {bf16Buffer(backend, weight), bf16Buffer(backend, bias)},
+                                backend.view(output, 0, size_t(rows) * width * elementBytes(element)), width, rows,
+                                epsilon, element);
+        run(backend, graph);
+        const std::string label = std::string(wide ? inPlace ? "fp32 in place" : "fp32" : "bf16") + " layer norm";
+        for (uint32_t r = 0; r < rows; ++r) {
+          double mean = 0.0, variance = 0.0;
+          for (uint32_t c = 0; c < width; ++c) mean += x[r * width + c];
+          mean /= width;
+          for (uint32_t c = 0; c < width; ++c) variance += (x[r * width + c] - mean) * (x[r * width + c] - mean);
+          variance /= width;
+          for (uint32_t c = 0; c < width; ++c) {
+            const double expected = (x[r * width + c] - mean) / std::sqrt(variance + epsilon) * weight[c] + bias[c];
+            const double got = wide ? static_cast<const float *>(output.contents())[r * width + c]
+                                    : bf16ToFloat(static_cast<const uint16_t *>(output.contents())[r * width + c]);
+            require(std::fabs(got - expected) <= (wide ? 0x1p-20 : 0x1p-8) * std::fabs(expected) + 1e-4,
+                    label + " row " + std::to_string(r) + " column " + std::to_string(c) + ": " +
+                        std::to_string(got) + " vs " + std::to_string(expected));
+          }
+        }
+        const auto *tail = static_cast<const uint8_t *>(output.contents()) + size_t(rows) * width * elementBytes(element);
+        require(wide ? std::isnan(*reinterpret_cast<const float *>(tail))
+                     : *reinterpret_cast<const uint16_t *>(tail) == kNan,
+                label + ": a write reached past its rows");
       }
-    }
-  }
   constexpr uint32_t rows = 3, width = 260;
   const MetalBuffer input = sharedBuffer(backend, size_t(rows) * width * 4);
   const MetalBuffer weight = sharedBuffer(backend, size_t(width) * 2), bias = sharedBuffer(backend, size_t(width) * 2);
@@ -302,6 +349,9 @@ void testLayerNorm(MetalBackend &backend) {
   });
   requireExtent(backend, output, output.sizeBytes(), 2, "norm output", [&](CommandGraph &g, const MetalBuffer &v) {
     Normalization::addLayer(g, input, {weight, bias}, v, width, rows, 1e-5F);
+  });
+  requireExtent(backend, input, input.sizeBytes(), 4, "norm output", [&](CommandGraph &g, const MetalBuffer &v) {
+    Normalization::addLayer(g, input, {weight, bias}, v, width, rows, 1e-5F, FloatElement::Float32);
   });
   // The weights' contract (Normalization::requireLayer).
   requireExtent(backend, weight, weight.sizeBytes(), 2, "norm weight", [&](CommandGraph &g, const MetalBuffer &v) {
@@ -322,8 +372,7 @@ int main(int argc, char **argv) {
       require(argc == 2, "usage: dense-linear METALLIB");
       MetalBackend backend(argv[1]);
       const DenseLinear dense(backend.capabilities());
-      for (const DenseEpilogue epilogue :
-           {DenseEpilogue::None, DenseEpilogue::GeluTanh, DenseEpilogue::GeluErf, DenseEpilogue::Residual})
+      for (const DenseEpilogue epilogue : kEpilogues)
         for (const uint32_t rows : {1U, 5U, 63U, 64U, 65U, 130U}) {
           (void)testProjection(backend, dense, rows, 128, 128, epilogue);
           (void)testProjection(backend, dense, rows, 384, 512, epilogue);

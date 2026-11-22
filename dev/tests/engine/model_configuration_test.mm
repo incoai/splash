@@ -1284,12 +1284,12 @@ void testInkling(const std::filesystem::path &fixtures) {
   const test::TemporaryDirectory directory("splash-inkling-check");
   uint32_t checks = 0;
   const auto check = [&](std::string_view targetFormat, const std::string &configuration,
-                         const GgufHeaders &header) {
+                         const GgufHeaders &header, std::string_view visionFormat = "none") {
     const std::filesystem::path root = directory.path() / std::to_string(++checks);
     std::filesystem::create_directories(root / "target");
     test::writeFile(root / "config.json", configuration);
     test::writeFile(root / "target" / "model.gguf", test_gguf::file(header.keys.front(), header.tensors.front()));
-    return std::string(model::inspectSourceConfiguration(targetFormat, "none", root / "config.json",
+    return std::string(model::inspectSourceConfiguration(targetFormat, visionFormat, root / "config.json",
                                                          root / "target", std::nullopt));
   };
   const auto with = [](std::string text, std::string_view from, std::string_view to) {
@@ -1345,6 +1345,29 @@ void testInkling(const std::filesystem::path &fixtures) {
             refused.error, "an Inkling config with " + std::string(refused.to) + " was accepted");
   rejects([&] { static_cast<void>(check("gguf", with(derived, "[200006]", "[200007]"), headers)); },
           "text config eos_token_id mismatch", "an Inkling config of another stop token was accepted");
+  // With its vision tower: transformers' vision_config, as the release's
+  // config.json states it and the installer derives it from an inkling2v
+  // projector's header (install/gguf.py inkling_vision_config), of 20-pixel
+  // patches into the text width; and the derived one, with the projector's
+  // activation stated.
+  require(check("gguf", config, headers, "gguf") == "Inkling-2-Mini", "Inkling's vision config was refused");
+  const std::string stated = with(config, R"("layer_norm_eps": 1e-05)", R"("layer_norm_eps": 1e-05, "hidden_act": "gelu")");
+  require(check("gguf", stated, headers, "gguf") == "Inkling-2-Mini", "a vision config of the GELU was refused");
+  rejects([&] { static_cast<void>(check("gguf", with(config, R"("vision_config")", R"("unused")"), headers, "gguf")); },
+          "vision config must be an object", "an Inkling with a projector and no vision config was accepted");
+  for (const Refused &refused : std::initializer_list<Refused>{
+           {R"("model_type": "inkling2_vision")", R"("model_type": "qwen3_vl")", "vision config model_type mismatch"},
+           {R"("native_patch_size": 20)", R"("native_patch_size": 16)", "vision config native_patch_size mismatch"},
+           {R"("mlp_ratio": 4.0)", R"("mlp_ratio": 2.0)", "vision config mlp_ratio mismatch"},
+           {R"("posemb_grid_size": 32)", R"("posemb_grid_size": 48)", "vision config posemb_grid_size mismatch"},
+           {R"("text_hidden_size": 2304)", R"("text_hidden_size": 4608)", "vision config text_hidden_size mismatch"},
+           {R"("layer_norm_eps": 1e-05)", R"("layer_norm_eps": 1e-06)", "vision config layer_norm_eps mismatch"},
+           {R"("projector_bias": false)", R"("projector_bias": true)", "vision config projector_bias must be false"}})
+    rejects([&] { static_cast<void>(check("gguf", with(config, refused.from, refused.to), headers, "gguf")); },
+            refused.error, "an Inkling vision config with " + std::string(refused.to) + " was accepted");
+  rejects([&] { static_cast<void>(check("gguf", with(stated, R"("hidden_act": "gelu")", R"("hidden_act": "silu")"),
+                                        headers, "gguf")); },
+          "vision config hidden_act mismatch", "an Inkling vision config of another activation was accepted");
   // The header, as every start plans it.
   const GgufHeaders otherLoop = headers.with(test_gguf::uint32Key("inkling2_loop.loop.count", 2));
   rejects([&] { static_cast<void>(check("gguf", config, otherLoop)); }, "loop.count 2 (expected 3)",

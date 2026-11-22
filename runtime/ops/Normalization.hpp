@@ -43,10 +43,12 @@ public:
   // LayerNorm with bias of `rows` fp32 rows of `width`, a tower's residual
   // stream, into bf16 rows: (x - mean) / sqrt(variance + epsilon) * weight +
   // bias, the mean and variance fp32 over the row, of weights requireLayer
-  // took.
+  // took. Into fp32 rows instead with outputElement Float32, which may be the
+  // input's own (the LayerNorm that starts Inkling 2's tower's residual
+  // stream).
   static void addLayer(metal::CommandGraph &graph, const metal::MetalBuffer &input,
                        const LayerNormWeights &weights, const metal::MetalBuffer &output, uint32_t width,
-                       uint32_t rows, float epsilon);
+                       uint32_t rows, float epsilon, FloatElement outputElement = FloatElement::BFloat16);
   // Also writes the consumer's `layout` table into `scratch` when it is not
   // Plain, and throws when `scratch` cannot hold it; returns what the
   // scratch then describes.

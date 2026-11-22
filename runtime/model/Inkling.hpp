@@ -71,6 +71,8 @@ struct InklingLayout final : QwenHybridLayout {
   static constexpr std::string_view modelType = "inkling2_loop_text";
   static constexpr std::string_view contextKey = "model_max_length";
   static constexpr std::string_view ggufArchitecture = "inkling2_loop";
+  // Its vision tower, from an inkling2v mmproj (model/InklingVision.hpp).
+  static constexpr ops::VisionTower visionTower = ops::VisionTower::Inkling;
 
   // What its kernels compute, which its GGUFs state (InklingGguf): the L2
   // clip of queries and keys (16 sqrt(2)) and of relative values; the log

@@ -333,7 +333,7 @@ void testSharedPrefillDoesNotBlockUnrelatedWork() {
       auto value = request(id, std::vector<uint32_t>(193, images ? 7 : id));
       if (images) {
         value.images = {{0, 16, 8, 8, id, id}};
-        value.imagePixels.assign(value.images.front().pixelBytes(), 1);
+        value.imagePixels.assign(value.images.front().pixelBytes(splash::ops::kImagePatchPixels), 1);
       }
       engine.submit(std::move(value));
     }
@@ -1322,7 +1322,7 @@ void testImageSpansKeyPrefixIdentity() {
   auto withImage = [&](uint64_t id, uint64_t digest) {
     EngineRequest result = request(id, prompt);
     result.images = {{8, 16, 8, 8, digest, digest ^ 0xabcdULL}};
-    result.imagePixels.assign(result.images[0].pixelBytes(), 1);
+    result.imagePixels.assign(result.images[0].pixelBytes(splash::ops::kImagePatchPixels), 1);
     return result;
   };
 
@@ -1369,7 +1369,7 @@ void testSharedPrefillBoundaryStopsAtTheFirstDifferentImage() {
       EngineRequest result = request(id, std::vector<uint32_t>(289, 248056));
       result.images = images;
       for (const ImageSpan &image : images)
-        result.imagePixels.resize(result.imagePixels.size() + image.pixelBytes(), 1);
+        result.imagePixels.resize(result.imagePixels.size() + image.pixelBytes(splash::ops::kImagePatchPixels), 1);
       return result;
     };
     engine.submit(withImages(1, shape.producer));

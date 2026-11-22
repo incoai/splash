@@ -3,7 +3,9 @@
 // The image of a vision tower (MDFV0001, every tensor BF16), as
 // model/VisionLoader.cpp plans it from an MLX checkpoint or a GGUF mmproj, and
 // its writer. A BF16 tensor is copied; an F32 or F16 tensor is converted only
-// when every value is exactly a BF16, and loading fails otherwise.
+// when every value is exactly a BF16, and loading fails otherwise. A Q8_0
+// tensor (Inkling's mmproj) is the one a value of is rounded to the nearest
+// BF16 (roundBfloat16).
 
 #include "model/WeightSource.hpp"
 
@@ -21,14 +23,17 @@ struct Input {
 };
 
 // A section of rows x columns values, stored as storedRows x storedColumns
-// (padding stays zero), written from one source tensor, or from the two
-// temporal frames of a GGUF patch embedding.
+// (padding stays zero), written from one source tensor, from the two
+// temporal frames of a GGUF patch embedding, or, stacked, from several
+// tensors of rows / inputs rows each, one after another (Inkling's q, k and
+// v). A section without inputs is all zero (Inkling's absent biases).
 struct Section {
   std::string mlx, gguf; // the tensor's names in either source
   uint32_t rows, columns, storedRows, storedColumns;
   bool patch = false; // the patch embedding, whose rows the writer reorders
   uint64_t offset = 0;
   std::vector<Input> inputs{};
+  bool stacked = false;
 };
 
 // The header (magic, block count, file kind 0) in a 16 KiB block, then

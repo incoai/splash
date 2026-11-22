@@ -974,7 +974,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
       BackendInstrumentation::submittedCommands(backend);
   EngineRequest image = makeRequest(93, {1, 2}, 1);
   image.images = {{0, 1, 2, 2, 139, 431}};
-  image.imagePixels.resize(image.images.front().pixelBytes());
+  image.imagePixels.resize(image.images.front().pixelBytes(splash::ops::kImagePatchPixels));
   // At the budget the engine retries a denied start after each reclaim
   // step. A start is one admission, so a request whose lane does not fit is
   // refused before its encoder arena, sized for its image, or its image
@@ -982,9 +982,9 @@ void requireAtomicImageAdmission(model::Runtime &executor,
   {
     const ImageSpan &span = image.images.front();
     const uint64_t attemptBytes =
-        ops::Vision::scratchBytes(model.vision.tensors.layout,
-                                  span.gridHeight * span.gridWidth) +
-        span.pixelBytes() +
+        ops::ImageEncoder::scratchBytes(model.vision.tensors.layout,
+                                        span.gridHeight * span.gridWidth) +
+        span.pixelBytes(splash::ops::kImagePatchPixels) +
         uint64_t{span.grid().mergedTokens()} *
             model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t) +
         states.layout().laneBytes();
@@ -1115,7 +1115,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
     prompt[index] = 1 + index;
   EngineRequest request = makeRequest(95, prompt, 1);
   request.images = {{56, 16, 8, 8, 151, 433}};
-  request.imagePixels.resize(request.images.front().pixelBytes());
+  request.imagePixels.resize(request.images.front().pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index)
     request.imagePixels[index] = static_cast<uint8_t>(index * 7 + 3);
   const std::vector<uint32_t> pages = pageRange(120, 4);
@@ -1126,7 +1126,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
   const ImageSpan &span = request.images.front();
-  const uint64_t encoderBytes = ops::Vision::scratchBytes(
+  const uint64_t encoderBytes = ops::ImageEncoder::scratchBytes(
       model.vision.tensors.layout, span.gridHeight * span.gridWidth);
   // The encoder, its only image encoded, is a unit of a pool that costs only
   // its rebuild, which a start may take (model::PoolState::rebuildOnly), as
@@ -1190,7 +1190,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
             "mixed image admission changed preexisting buffers on failure");
   }
   const ImageSpan &miss = mixed.images.back();
-  const uint64_t missingImageBytes = miss.pixelBytes() +
+  const uint64_t missingImageBytes = miss.pixelBytes(splash::ops::kImagePatchPixels) +
       uint64_t{miss.grid().mergedTokens()} *
           model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t);
   require(executor.begin(mixed.modelView()).granted() &&
@@ -1225,7 +1225,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
     prompt[index] = 1 + index;
   EngineRequest request = makeRequest(98, prompt, 1);
   request.images = {{16, 16, 8, 8, 163, 443}};
-  request.imagePixels.resize(request.images.front().pixelBytes());
+  request.imagePixels.resize(request.images.front().pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index)
     request.imagePixels[index] = static_cast<uint8_t>(index * 11 + 5);
   require(executor.begin(request.modelView()).granted(),
@@ -1631,7 +1631,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
   // each request encodes the image itself.
   const auto withImage = [&](EngineRequest request) {
     request.images = {{chunk - 16, 64, 16, 16, request.id, 0}};
-    request.imagePixels.resize(request.images.front().pixelBytes());
+    request.imagePixels.resize(request.images.front().pixelBytes(splash::ops::kImagePatchPixels));
     for (size_t index = 0; index < request.imagePixels.size(); ++index)
       request.imagePixels[index] = static_cast<uint8_t>(index * 13 + 7);
     return request;
@@ -1849,7 +1849,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
     // each request encodes the image itself.
     if (image) {
       request.images = {{imageAt, 64, 16, 16, id, 0}};
-      request.imagePixels.resize(request.images.front().pixelBytes());
+      request.imagePixels.resize(request.images.front().pixelBytes(splash::ops::kImagePatchPixels));
       for (size_t index = 0; index < request.imagePixels.size(); ++index)
         request.imagePixels[index] = static_cast<uint8_t>(index * 13 + 7);
     }
@@ -3116,7 +3116,7 @@ EngineRequest imageRequest(uint64_t id, ImageSpan span) {
     prompt[index] = 1 + index;
   EngineRequest request = makeRequest(id, prompt, 1);
   request.images = {span};
-  request.imagePixels.resize(span.pixelBytes());
+  request.imagePixels.resize(span.pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index)
     request.imagePixels[index] = static_cast<uint8_t>(index * 13 + id);
   return request;
@@ -3311,7 +3311,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
     prompt[index] = 1 + index;
   EngineRequest request = makeRequest(114, prompt, 1);
   request.images = {{40, 16, 8, 8, 181, 463}};
-  request.imagePixels.resize(request.images.front().pixelBytes());
+  request.imagePixels.resize(request.images.front().pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index)
     request.imagePixels[index] = static_cast<uint8_t>(index * 5 + 1);
   const std::vector<uint32_t> pages = pageRange(120, 4);
@@ -3378,7 +3378,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const uint64_t laneBytes = states.layout().laneBytes();
   const auto imageBytes = [&](const ImageSpan &span) {
-    return span.pixelBytes() +
+    return span.pixelBytes(splash::ops::kImagePatchPixels) +
            uint64_t{span.grid().mergedTokens()} *
                model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t);
   };
@@ -3389,7 +3389,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   // idle and the rows stay with the request.
   EngineRequest cached = makeRequest(117, prompt, 1);
   cached.images = {{56, 16, 8, 8, 191, 467}};
-  cached.imagePixels.resize(cached.images.front().pixelBytes());
+  cached.imagePixels.resize(cached.images.front().pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < cached.imagePixels.size(); ++index)
     cached.imagePixels[index] = static_cast<uint8_t>(index * 3 + 2);
   const std::vector<uint32_t> pages = pageRange(120, 4);
@@ -3472,8 +3472,8 @@ void requirePoolReleaseTakesOneUnit(model::Runtime &executor,
     prompt[index] = 1 + index;
   EngineRequest request = makeRequest(120, prompt, 1);
   request.images = {{8, 16, 8, 8, 197, 487}, {32, 64, 16, 16, 199, 491}};
-  request.imagePixels.resize(request.images[0].pixelBytes() +
-                             request.images[1].pixelBytes());
+  request.imagePixels.resize(request.images[0].pixelBytes(splash::ops::kImagePatchPixels) +
+                             request.images[1].pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index)
     request.imagePixels[index] = static_cast<uint8_t>(index * 9 + 4);
   const StateAdmission admission = executor.begin(request.modelView());
@@ -3514,8 +3514,8 @@ void requireEncoderFitsItsImages(model::Runtime &executor,
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const auto scratchBytes = [&](const EngineRequest &request) {
     const ImageSpan &span = request.images.front();
-    return ops::Vision::scratchBytes(model.vision.tensors.layout,
-                                     span.gridHeight * span.gridWidth);
+    return ops::ImageEncoder::scratchBytes(model.vision.tensors.layout,
+                                           span.gridHeight * span.gridWidth);
   };
   const EngineRequest small = imageRequest(123, {16, 16, 8, 8, 223, 503});
   const EngineRequest smaller = imageRequest(124, {16, 4, 4, 4, 227, 509});
@@ -3574,7 +3574,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   // The image ends 8 rows past the page boundary at 64.
   EngineRequest request = makeRequest(121, prompt, 1);
   request.images = {{56, 16, 8, 8, 211, 499}};
-  request.imagePixels.resize(request.images.front().pixelBytes());
+  request.imagePixels.resize(request.images.front().pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index)
     request.imagePixels[index] = static_cast<uint8_t>(index * 17 + 6);
   const std::vector<uint32_t> pages = pageRange(120, 4);
@@ -3631,7 +3631,7 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
   // The image ends 8 rows past the page boundary at 64, inside the command.
   EngineRequest request = makeRequest(406, prompt, 1);
   request.images = {{56, 16, 8, 8, 241, 547}};
-  request.imagePixels.resize(request.images.front().pixelBytes());
+  request.imagePixels.resize(request.images.front().pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index)
     request.imagePixels[index] = static_cast<uint8_t>(index * 13 + 7);
   const std::vector<uint32_t> pages = pageRange(120, 4);

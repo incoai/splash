@@ -137,7 +137,7 @@ void testImagePromptsRunPrefillGroups() {
     auto value = request(1, std::vector<uint32_t>(8193, 7));
     if (images) {
       value.images = {{4000, 16, 8, 8, 1, 1}};
-      value.imagePixels.assign(value.images.front().pixelBytes(), 1);
+      value.imagePixels.assign(value.images.front().pixelBytes(splash::ops::kImagePatchPixels), 1);
     }
     engine.submit(std::move(value));
     runUntilIdle(engine);

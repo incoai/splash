@@ -104,10 +104,18 @@ ops::StridedRows InklingTarget::stateRows(const PrefillStep &step, uint32_t stat
   return {step.scratch.states.at(state), geometry_.hiddenSize};
 }
 
-// x = RMSNorm(E[token]) into the embedding's state, in fp32.
+// x = RMSNorm(E[token]) into the embedding's state, in fp32. An image's
+// rows take its embeddings as they are (spec 5: transformers scatters them
+// over the normed embeddings, llama.cpp skips the norm for embedding input).
 void InklingTarget::addPrefillBegin(PrefillStep &step) const {
-  ops::Normalization::addRmsRows(step.graph, step.buffers.hidden[0], kBf16, weights_.embeddingNorm,
-                                 step.scratch.states[kInklingEmbeddingState], kF32, geometry_.hiddenSize, step.rows);
+  const uint32_t hidden = geometry_.hiddenSize;
+  const metal::MetalBuffer &embedding = step.scratch.states[kInklingEmbeddingState];
+  ops::Normalization::addRmsRows(step.graph, step.buffers.hidden[0], kBf16, weights_.embeddingNorm, embedding, kF32,
+                                 hidden, step.rows);
+  for (const QwenTargetPrefillSequence &sequence : step.sequences)
+    for (const QwenTargetImageRows &image : sequence.imageRows)
+      ops::RowCopy::add(step.graph, step.buffers.hidden[0], {image.begin, hidden, 0}, embedding,
+                        {image.begin, hidden, 0}, image.rows, hidden, kBf16, kF32);
 }
 
 // The query, key and value inputs: layer 0's is the embedding's

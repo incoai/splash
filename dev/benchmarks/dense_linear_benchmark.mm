@@ -60,6 +60,7 @@ const char *suffix(DenseEpilogue epilogue) {
   case DenseEpilogue::GeluTanh: return "_gelu_tanh";
   case DenseEpilogue::GeluErf: return "_gelu_erf";
   case DenseEpilogue::Residual: return "_residual";
+  case DenseEpilogue::ScaledResidual: return "_scaled_residual";
   }
   return "";
 }

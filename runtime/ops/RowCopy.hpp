@@ -20,15 +20,17 @@ struct RowRegion final {
 // slot of the draft's captured target hidden rows, and an image's embedding
 // rows over its placeholder rows of a prefill chunk's hidden rows. A source
 // of fp32 rows (a target's fp32 residual stream, captured for its draft)
-// rounds each value to bf16.
+// rounds each value to bf16; a destination of fp32 rows (Inkling's fp32
+// embedding rows, which take an image's rows as they are) widens each.
 class RowCopy final {
 public:
   // Copies `rows` rows of `width` values from `source` at `from` to
-  // `destination` at `to`.
+  // `destination` at `to`; of fp32 rows to fp32 rows it copies none.
   static void add(metal::CommandGraph &graph, metal::MetalBuffer source,
                   RowRegion from, metal::MetalBuffer destination, RowRegion to,
                   uint32_t rows, uint32_t width,
-                  FloatElement sourceElement = FloatElement::BFloat16);
+                  FloatElement sourceElement = FloatElement::BFloat16,
+                  FloatElement destinationElement = FloatElement::BFloat16);
 };
 
 } // namespace splash::ops

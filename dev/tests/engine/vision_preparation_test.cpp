@@ -1,7 +1,8 @@
 // Writes the tiny vision source run_vision_preparation.py writes (depth 2,
-// width 8, 2x2 patches) and prints its image's SHA-256.
+// width 8, 2x2 patches; Inkling's of width 32) and prints its image's
+// SHA-256.
 //
-//   vision-preparation safetensors|gguf DIRECTORY EXPECTED
+//   vision-preparation safetensors|gguf|inkling DIRECTORY EXPECTED
 //   vision-preparation padding DIRECTORY
 //
 // EXPECTED is an independently serialized file the image and the size
@@ -61,9 +62,11 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (argc != 4)
-      throw std::runtime_error("usage: vision-preparation safetensors|gguf DIRECTORY EXPECTED | padding DIRECTORY");
+      throw std::runtime_error(
+          "usage: vision-preparation safetensors|gguf|inkling DIRECTORY EXPECTED | padding DIRECTORY");
     const std::string format = argv[1];
-    if (format != "safetensors" && format != "gguf") throw std::runtime_error("invalid vision-preparation arguments");
+    if (format != "safetensors" && format != "gguf" && format != "inkling")
+      throw std::runtime_error("invalid vision-preparation arguments");
     const auto source = format == "safetensors" ? model::VisionSource::Safetensors
                                         : model::VisionSource::Gguf;
     ops::VisionLayout layout;
@@ -71,6 +74,7 @@ int main(int argc, char **argv) {
     layout.hiddenSize = 8;
     layout.patchSize = 2;
     layout.patchDimension = 24;
+    layout.paddedPatchDimension = 24;
     layout.intermediateSize = 10;
     layout.paddedIntermediateSize = 16;
     layout.mergedHiddenSize = 32;
@@ -78,6 +82,23 @@ int main(int argc, char **argv) {
     layout.heads = 2;
     layout.headDimension = 4;
     layout.positionGridSide = 2;
+    // Inkling's tower of width 32, so its matrices' rows are whole Q8_0
+    // blocks: one frame of 2x2 patches (12 values, stored 16 wide).
+    if (format == "inkling")
+      layout = {.tower = ops::VisionTower::Inkling,
+                .depth = 2,
+                .hiddenSize = 32,
+                .patchDimension = 12,
+                .paddedPatchDimension = 16,
+                .intermediateSize = 64,
+                .paddedIntermediateSize = 64,
+                .mergedHiddenSize = 128,
+                .outputHiddenSize = 32,
+                .heads = 2,
+                .headDimension = 16,
+                .positionGridSide = 2,
+                .patchSize = 2,
+                .spatialMerge = 2};
     const model::ImagePlan image = model::VisionLoader(argv[2], source, layout).image();
     std::vector<uint8_t> bytes(image.bytes);
     image.write(bytes, {});

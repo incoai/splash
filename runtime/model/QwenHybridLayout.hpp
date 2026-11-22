@@ -7,6 +7,7 @@
 #include "ops/PagedKv.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/StopTokens.hpp"
+#include "ops/Vision.hpp"
 
 #include <array>
 #include <cmath>
@@ -326,6 +327,9 @@ struct QwenTargetDimensions {
 struct QwenHybridLayout : QwenTargetDimensions {
   static constexpr bool flatConfig = false;
   static constexpr std::string_view contextKey = "max_position_embeddings";
+  // The vision tower of the family's models, which an installation loads
+  // unless it serves text only.
+  static constexpr ops::VisionTower visionTower = ops::VisionTower::Qwen;
 
   // The family's name, as the installer pairs its draft (install/families.py).
   std::string_view family;

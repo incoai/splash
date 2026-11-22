@@ -21,12 +21,12 @@ void Normalization::requireLayer(const LayerNormWeights &weights, uint32_t width
 
 void Normalization::addLayer(metal::CommandGraph &graph, const metal::MetalBuffer &input,
                              const LayerNormWeights &weights, const metal::MetalBuffer &output, uint32_t width,
-                             uint32_t rows, float epsilon) {
+                             uint32_t rows, float epsilon, FloatElement outputElement) {
   // The weights are requireLayer's, which their owner checks once.
   requireBytes(input, uint64_t{rows} * width * 4, "norm input");
-  requireBytes(output, uint64_t{rows} * width * 2, "norm output");
-  graph.add("norm_layer", {input, weights.weight, weights.bias, output}, LayerNormParams{width, epsilon},
-            {rows, 1, 1});
+  requireBytes(output, uint64_t{rows} * width * elementBytes(outputElement), "norm output");
+  graph.add(outputElement == FloatElement::Float32 ? "norm_layer_f32" : "norm_layer",
+            {input, weights.weight, weights.bias, output}, LayerNormParams{width, epsilon}, {rows, 1, 1});
 }
 
 PreparedInput Normalization::addRms(metal::CommandGraph &graph,

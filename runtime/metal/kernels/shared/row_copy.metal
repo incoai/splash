@@ -27,3 +27,17 @@ kernel void copy_rows_f32_bf16(device const float *source [[buffer(0)]],
       bfloat(source[ulong(p.source_row + row) * p.source_stride + p.source_column +
                     column]);
 }
+
+// The same into rows of fp32 values, each widened.
+kernel void copy_rows_bf16_f32(device const bfloat *source [[buffer(0)]],
+                               device float *destination [[buffer(1)]],
+                               constant RowCopyParams &p [[buffer(2)]],
+                               uint index [[thread_position_in_grid]]) {
+  if (index >= p.rows * p.width)
+    return;
+  const uint row = index / p.width, column = index % p.width;
+  destination[ulong(p.destination_row + row) * p.destination_stride +
+              p.destination_column + column] =
+      float(source[ulong(p.source_row + row) * p.source_stride + p.source_column +
+                   column]);
+}

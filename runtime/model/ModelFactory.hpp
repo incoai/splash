@@ -6,7 +6,7 @@
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
-#include "QwenVision.hpp"
+#include "VisionLoader.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
@@ -59,7 +59,7 @@ struct LoadedModel final {
   std::shared_ptr<WeightImages> images;
   TargetWeights target;
   DFlashDraftWeights draft;
-  QwenVisionWeights vision;
+  VisionTowerWeights vision;
   std::string manifestFingerprintSha256;
 
   [[nodiscard]] const std::string &name() const noexcept {
@@ -172,8 +172,8 @@ void requireCompatibleModel(const LoadedModel &model);
                                                              const ModelDescriptor &descriptor);
 // The vision role written by `loader`; empty weights for a model without
 // vision (no loader).
-[[nodiscard]] QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                                  const VisionLoader *loader);
+[[nodiscard]] VisionTowerWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                                   const VisionLoader *loader);
 
 // Production loading is selected by the validated descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.

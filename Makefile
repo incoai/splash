@@ -264,6 +264,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
+	runtime/ops/InklingVision.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/KernelSelection.cpp \
@@ -336,6 +337,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Inkling.cpp \
 	runtime/model/InklingSteps.cpp \
 	runtime/model/InklingTarget.cpp \
+	runtime/model/InklingVision.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \

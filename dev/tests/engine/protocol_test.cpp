@@ -190,7 +190,7 @@ RequestFrame exampleImageRequest() {
   request.promptTokens = {7, 3, 9};
   request.imageSpans = {
       {1, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
-  request.imagePixels.resize(request.imageSpans[0].pixelBytes());
+  request.imagePixels.resize(request.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index) {
     request.imagePixels[index] = static_cast<uint8_t>(index * 7 + 1);
   }
@@ -424,7 +424,7 @@ void testScoreRequestAndDoneLogits() {
   RequestFrame withImage = request;
   withImage.imageSpans = {
       {0, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
-  withImage.imagePixels.resize(withImage.imageSpans[0].pixelBytes());
+  withImage.imagePixels.resize(withImage.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels));
   expectRequestIssue(test, withImage, IssueCode::InvalidCount);
 
   RequestFrame constrained = request;
@@ -626,7 +626,7 @@ void testImagePixelsMoveOutOfThePayload() {
   expected.imageSpans[0].gridWidth = 32;
   expected.imageSpans[0].tokens = 32 * 16;
   expected.promptTokens.assign(expected.imageSpans[0].tokens + 2, 7);
-  expected.imagePixels.resize(expected.imageSpans[0].pixelBytes());
+  expected.imagePixels.resize(expected.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < expected.imagePixels.size(); ++index)
     expected.imagePixels[index] = static_cast<uint8_t>(index * 13 + 5);
   CHECK(test, expected.imagePixels.size() >= 1024 * 1024);
@@ -793,7 +793,7 @@ void testPromptAndImageSpanRejections() {
   auto withSpan = [&](auto change) {
     RequestFrame result = image;
     change(result.imageSpans[0]);
-    result.imagePixels.resize(result.imageSpans[0].pixelBytes());
+    result.imagePixels.resize(result.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels));
     return result;
   };
   expectRequestIssue(test,
@@ -843,6 +843,20 @@ void testPromptAndImageSpanRejections() {
   ProtocolLimits oneImage;
   oneImage.maxImageSpans = 1;
   expectRequestIssue(test, twoImages, IssueCode::LimitExceeded, oneImage);
+  // A tower of 20-pixel patches (Inkling's) takes its grids' pixels in
+  // them: 16-pixel ones are a short payload, and its own decode whole.
+  ProtocolLimits inkling;
+  inkling.imagePatchPixels = 20;
+  expectRequestIssue(test, image, IssueCode::InvalidPayloadLength, inkling);
+  RequestFrame wide = image;
+  wide.imagePixels.resize(image.imageSpans[0].pixelBytes(20), 3);
+  CHECK(test, wide.imagePixels.size() == 40 * 40 * 3);
+  auto decoded = decodeClient(peer::serialize(wide), inkling);
+  CHECK(test, decoded && std::get<RequestFrame>(std::move(*decoded.value)) == wide);
+  expectRequestIssue(test, wide, IssueCode::InvalidPayloadLength);
+  ProtocolLimits none = inkling;
+  none.imagePatchPixels = 0;
+  CHECK(test, validateLimits(none).has_value());
 }
 
 // The sampling parameters are one block after the image span count:
