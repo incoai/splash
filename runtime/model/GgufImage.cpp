@@ -39,6 +39,14 @@ static_assert([] {
 // NVFP4's for llama.cpp's NVFP4, whose block_nvfp4 rows the writer builds
 // NVFP4's native rows from (TensorRows::ggufNvfp4RowBytes).
 uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVFP4 : gguf_format_of(type); }
+// The format whose native rows hold `tensor`: its type's (imageFormat), but
+// NVFP4's form of 64-element blocks for an NVFP4 tensor whose rows are not
+// whole 256-element ones (llama.cpp's NVFP4 blocks are 64 elements).
+uint32_t imageFormat(const GgufTensor &tensor) {
+  const uint32_t format = imageFormat(tensor.type);
+  return format == GGUF_FMT_NVFP4 && tensor.columns() % kQuantFormats[format].block_elements ? GGUF_FMT_NVFP464
+                                                                                             : format;
+}
 
 // A type of a format, BF16 and F16 among them: repacked into the planes
 // projections multiply, or rows as stored (storedRowBytes), which the
@@ -65,7 +73,7 @@ bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml
 // for llama.cpp's NVFP4 (Builder::tensorRows); 0 for a width that holds none.
 uint64_t storedRowBytes(const GgufTensor &tensor) {
   return floatType(tensor.type) ? tensor.columns() * sizeof(float)
-                                : quant_stored_row_bytes(imageFormat(tensor.type), tensor.columns());
+                                : quant_stored_row_bytes(imageFormat(tensor), tensor.columns());
 }
 
 // A MoE router, which the float projection runs in fp32 as stored (router):
@@ -175,7 +183,7 @@ public:
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != windows * columns)
       throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(tensor->type);
+    const uint32_t format = imageFormat(*tensor);
     Repack repack = image_.planes(format, windows * rows, columns, name);
     for (uint32_t window = 0; window < windows; ++window) {
       TensorRows source = tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], windows * columns), order);
@@ -209,7 +217,7 @@ public:
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(tensor->type);
+    const uint32_t format = imageFormat(*tensor);
     Repack repack = image_.expertPlanes(format, rows, columns, name);
     repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns)));
     image_.expertRepack(std::move(repack));
@@ -228,7 +236,7 @@ public:
     } else if (const GgufTensor *fused = find(fusedName, quantizedType)) {
       if (fused->rows() != 2 * experts * width || fused->columns() != hidden)
         throw GgufError("unexpected shape for " + fusedName);
-      const uint32_t format = imageFormat(fused->type);
+      const uint32_t format = imageFormat(*fused);
       const TensorRows rows = tensorRows(*fused, 2 * experts * width, ggufRowBytes(kQuantFormats[format], hidden));
       // Expert e's gate rows are rows 2e width.. of the fused tensor, its up rows the next width.
       for (const uint64_t up : {0, 1}) {
@@ -289,7 +297,7 @@ public:
       }
       return;
     }
-    const uint32_t format = imageFormat(beta->type);
+    const uint32_t format = imageFormat(*beta);
     const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], hidden);
     Repack repack = image_.planes(format, tiledRows(2ull * heads), hidden, alphaName);
     for (const GgufTensor *t : {beta, alpha}) repack.sources.push_back(tensorRows(*t, heads, rowBytes, grouped(0, 1)));
@@ -425,14 +433,14 @@ private:
       if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
       return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     }
-    const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
+    const QuantFormat &format = kQuantFormats[imageFormat(tensor)];
     const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
     const uint64_t sourceRowBytes =
         rowBytes / format.block_bytes * (format.block_elements / blocks.blockElements) * blocks.blockBytes;
     if (!count || rowBytes % format.block_bytes || count * sourceRowBytes != tensor.bytes)
       throw GgufError(tensor.name + "'s rows are not whole nvfp4 blocks of " + std::to_string(format.block_elements) +
                       " elements");
-    TensorRows rows{tensor.name, QUANT_NVFP4_TYPE, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
+    TensorRows rows{tensor.name, format.ggml_type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     rows.ggufNvfp4RowBytes = sourceRowBytes;
     const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
     const uint64_t values = stem.ends_with("_exps") ? geometry_.experts : 1;

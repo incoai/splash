@@ -203,7 +203,13 @@ without requantization, but for the Q8_0 of Flash-Next's BF16 or F16
 hyper-connection projections, quantizes the draft's BF16 projections
 ([Drafts](models.md#drafts)), and computes a safetensors target's GDN decay as
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
-exponential.
+exponential. llama.cpp's NVFP4 rows are rebuilt as NVFP4's native blocks of
+256 elements, or, for a tensor whose rows are not whole 256-element blocks
+(llama.cpp's are 64), as NVFP4's own form of 64-element blocks (`nvfp464`),
+which differs from the 256 form only in its meta unit (four scales and `g`,
+two groups wide): every tile reads both through the format list, as it reads
+every format, and the planner chooses the form by a tensor's width
+(`GgufImage.cpp` `imageFormat`).
 
 Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's

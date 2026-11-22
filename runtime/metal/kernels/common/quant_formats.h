@@ -485,6 +485,22 @@ struct FmtNVFP4 {
     return {float2(quant_e4m3_pair(quant_byte_pairs(pair).x)) * (128.0f * mt.g)};
   }
 };
+// NVFP4_64: NVFP4's codes and value in 64-element blocks (a row that is not whole 256-element ones); meta the 4
+// E4M3 scales of the unit's 16-groups (bytes 2j, 2j + 1 of group j), then g.
+struct FmtNVFP464 {
+  QUANT_FORMAT(GGUF_FMT_NVFP464, QuantCodebook, 0, 16, false);
+  struct Payload { uint4 a; }; typedef uint Chunk; struct Meta { uint sc; float g; }; typedef float Scale;
+  static half value(uint i) { return half(kFP4Values[i]); }
+  static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
+  static Meta loadMeta(device uchar *m) { Meta r; r.sc = *((device uint *)m); r.g = *((device float *)(m + 4)); return r; }
+  static Chunk chunk(Payload w, ushort c) { return w.a[c]; }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint *)(p0 + 4 * c)); }
+  static uint indices(Chunk q) { return q; }
+  static QuantCoef coef(Meta mt, ushort j) {
+    const uint pair = mt.sc >> (16u * (j & 1));   // the E4M3 scales of both 16-groups
+    return {float2(quant_e4m3_pair(quant_byte_pairs(pair).x)) * (128.0f * mt.g)};
+  }
+};
 // FP8: plane0 E4M3 values (bytes 8c..8c+7 = chunk c, as Q8_0's); meta the tensor's FP32 scale g. value = g * e4m3,
 // whose scale is 256 g.
 struct FmtFP8 {
@@ -579,7 +595,7 @@ QUANT_AFFINE_GROUPS(8)
   X(FmtAF3G128, af3g128) X(FmtAF4G32, af4g32) X(FmtAF4G64, af4g64) X(FmtAF4G128, af4g128) X(FmtAF5G32, af5g32)    \
   X(FmtAF5G64, af5g64) X(FmtAF5G128, af5g128) X(FmtAF6G32, af6g32) X(FmtAF6G64, af6g64) X(FmtAF6G128, af6g128)    \
   X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)            \
-  X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16) X(FmtQ20, q20)
+  X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16) X(FmtQ20, q20) X(FmtNVFP464, nvfp464)
 #define QUANT_FORMATS(X) QUANT_REGISTER_FORMATS(X) X(FmtF16, f16)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick

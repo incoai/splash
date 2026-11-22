@@ -288,10 +288,13 @@ void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t cou
 // reads 0x7F as 0 and ignores bit 7), the row's tensor scale, and the codes with
 // element e in the low nibble of byte e / 2 when e is even, else in its high
 // one (metal/abi/QuantFormat.h), where a block_nvfp4 holds element j of each
-// 16 in the low nibble of byte j and element j + 8 in its high one.
+// 16 in the low nibble of byte j and element j + 8 in its high one. Per 64
+// elements the same in NVFP4's form of 64-element blocks: its meta unit (the
+// E4M3 scales, then g) leads each native block, its codes follow.
 void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
                        uint8_t *to) {
-  const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
+  const QuantFormat &format = nativeFormat(rows);
+  const uint64_t gAt = format.meta_bytes - sizeof(float), codesAt = format.meta_bytes;
   const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
   const uint64_t perNative = format.block_elements / blocks.blockElements, nativeBlocks = span / format.block_bytes,
                  sourceSpan = nativeBlocks * perNative * blocks.blockBytes;
@@ -311,14 +314,14 @@ void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t co
           const uint8_t *codes = in + 4 + 8 * s;
           out[4 * q + s] = in[s] == 0x7F ? 0 : in[s] & 0x7F;
           // Elements 2 i and 2 i + 1: the low nibbles of bytes 2 i and 2 i + 1 for i < 4, else their high ones.
-          uint8_t *pairs = out + QUANT_NVFP4_CODES + 32 * q + 8 * s;
+          uint8_t *pairs = out + codesAt + 32 * q + 8 * s;
           for (uint64_t i = 0; i < 4; ++i) {
             pairs[i] = uint8_t((codes[2 * i] & 15) | (codes[2 * i + 1] & 15) << 4);
             pairs[4 + i] = uint8_t(codes[2 * i] >> 4 | (codes[2 * i + 1] & 0xF0));
           }
         }
       }
-      std::memcpy(out + QUANT_NVFP4_G, &g[row + b / nativeBlocks], 4);
+      std::memcpy(out + gAt, &g[row + b / nativeBlocks], 4);
     }
   }
 }

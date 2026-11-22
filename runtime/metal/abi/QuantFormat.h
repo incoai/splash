@@ -57,7 +57,10 @@
 // 16i..16i+15), g at QUANT_NVFP4_G, then from QUANT_NVFP4_CODES the codes as a
 // row packs them (element e in bits 4 (e % 2) of byte e / 2); FP8's g, then
 // from QUANT_FP8_VALUES the 256 E4M3 bytes. Their planes hold the codes as
-// MXFP4's indices and the values as Q8_0's.
+// MXFP4's indices and the values as Q8_0's. An NVFP4 tensor whose rows are not
+// whole 256-element blocks (llama.cpp's blocks are 64 elements) takes NVFP4's
+// form of 64-element blocks, NVFP4_64 (its 4 E4M3 scales, g at QUANT_NVFP464_G,
+// its codes from QUANT_NVFP464_CODES), whose meta unit spans two groups.
 //
 // BF16 and F16 hold 16-bit float values x with an FP32 scale g per 256
 // elements, as FP8 holds g: value = g * x. A GGUF tensor of either type has
@@ -121,7 +124,8 @@
 #define GGUF_FMT_BF16 41u
 #define GGUF_FMT_F16 42u
 #define GGUF_FMT_Q20 43u
-#define GGUF_FMT_COUNT 44u
+#define GGUF_FMT_NVFP464 44u
+#define GGUF_FMT_COUNT 45u
 
 // The tensor type an image descriptor names for an MLX affine format: no GGUF
 // type is of this form.
@@ -130,10 +134,13 @@
 // writes ("NVF4", "FP8E"): no GGUF type is either.
 #define QUANT_NVFP4_TYPE 0x4E564634u
 #define QUANT_FP8_TYPE 0x46503845u
+#define QUANT_NVFP464_TYPE 0x4E563634u
 // Byte offsets in NVFP4's native block (its scales at 0) and FP8's (its g at 0).
 #define QUANT_NVFP4_G 16u
 #define QUANT_NVFP4_CODES 20u
 #define QUANT_FP8_VALUES 4u
+#define QUANT_NVFP464_G 4u
+#define QUANT_NVFP464_CODES 8u
 
 struct QuantFormat {
   uint32_t ggml_type;      // GGUF tensor type, or a loader's (QUANT_AFFINE_TYPE, QUANT_NVFP4_TYPE, QUANT_FP8_TYPE)
@@ -185,7 +192,7 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {QUANT_AFFINE_TYPE(8, 32), 32, 36, 32, 0, 4, 1, "af8g32"},
     {QUANT_AFFINE_TYPE(8, 64), 64, 68, 32, 0, 4, 2, "af8g64"},
     {QUANT_AFFINE_TYPE(8, 128), 128, 132, 32, 0, 4, 4, "af8g128"},
-    // The loader's native blocks of 256 elements.
+    // The loader's native blocks of 256 elements (NVFP4_64's of 64, last).
     {QUANT_NVFP4_TYPE, 256, 148, 16, 0, 20, 8, "nvfp4"},   // meta: the 16 E4M3 scales, g
     {QUANT_FP8_TYPE, 256, 260, 32, 0, 4, 8, "fp8"},        // meta: g
     // Q5_K's planes with Q4_0's and Q4_1's meta.
@@ -195,6 +202,7 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {30, 256, 512, 64, 0, 4, 8, "bf16"},
     {1, 256, 512, 64, 0, 4, 8, "f16"},
     {42, 64, 18, 8, 0, 2, 2, "q20"},      // GGUF's block_q2_0, one d per 64 elements; meta: d
+    {QUANT_NVFP464_TYPE, 64, 40, 16, 0, 8, 2, "nvfp464"},   // meta: the 4 E4M3 scales, g
 };
 
 // The format that stores a GGUF tensor type (or a loader's);
@@ -221,9 +229,10 @@ inline constexpr bool quant_affine_format(uint32_t format) {
 }
 inline constexpr uint32_t quant_affine_bits(uint32_t format) { return (kQuantFormats[format].ggml_type >> 8) & 0xFF; }
 // Whether a format's native block is the loader's rather than a GGUF type's:
-// the MLX affine formats, NVFP4 and FP8.
+// the MLX affine formats, NVFP4 (of both block sizes) and FP8.
 inline constexpr bool quant_loader_format(uint32_t format) {
-  return quant_affine_format(format) || format == GGUF_FMT_NVFP4 || format == GGUF_FMT_FP8;
+  return quant_affine_format(format) || format == GGUF_FMT_NVFP4 || format == GGUF_FMT_NVFP464 ||
+         format == GGUF_FMT_FP8;
 }
 // Whether a format's values enter a bf16 matrix multiply exactly, as the
 // Apple9 register tile takes them (kernels/decode/linear_gguf_sgmatrix.metal):

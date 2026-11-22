@@ -185,9 +185,9 @@ static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, 
       for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
       break;
     }
-    case GGUF_FMT_NVFP4: {   // {E4M3 scales[16], g, codes[128]}
-      gguf_repack_nibbles(blk + QUANT_NVFP4_CODES, j, out0);
-      if (j == 0) for (uint i = 0; i < QUANT_NVFP4_CODES; ++i) meta[i] = blk[i];   // the scales and g
+    case GGUF_FMT_NVFP4: case GGUF_FMT_NVFP464: {   // {E4M3 scales[16] or [4], g, codes}: the meta unit, then codes
+      gguf_repack_nibbles(blk + f.meta_bytes, j, out0);
+      if (j == 0) for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];   // the scales and g
       break;
     }
     case GGUF_FMT_FP8: {   // {g, E4M3 values[256]}

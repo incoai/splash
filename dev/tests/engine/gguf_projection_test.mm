@@ -1901,6 +1901,11 @@ int main(int argc, char **argv) {
       }
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
         decodeTile(backend, linear, tile, false, 192, {Q80});
+      // Rows that are not whole 256-element blocks, in NVFP4's form of 64-element blocks: K 1152 (an expert down
+      // projection's), on the staged tile, its spread walk and the prefill tile (the register tile takes whole
+      // 256-input units of a format of several groups a meta unit).
+      for (const bool spread : {false, true}) decodeTile(backend, linear, LinearTile::GgufStaged, spread, 1152, {NVFP464});
+      prefill(backend, linear, 1152, {NVFP464});
       tokenGather(backend);
       stagedGather(backend);
       gatherExtents(backend);

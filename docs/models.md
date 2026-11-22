@@ -168,7 +168,9 @@ have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
-  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
+  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16; a tensor of a format of
+  256-value blocks (the K-quants, BF16, F16) whose rows are not whole blocks
+  of it, such as a BF16 expert tensor of 1152 inputs, is refused by name;
 - token embeddings: any of the linears' formats;
 - norms: F32, BF16 or F16, loaded as the F32 values they hold;
 - the MoE router: F32, BF16 or any of the linears' quantized formats (not
@@ -272,7 +274,12 @@ values as `.scale`) plays no part, as in Model Optimizer's targets; beside any
 other weight, or alone, it is refused. It loads as Model Optimizer's NVFP4 does
 ([Model Optimizer targets](#model-optimizer-targets)): four blocks make one
 256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
-(1 without one), at 4.625 bits per weight for the file's 4.5.
+(1 without one), at 4.625 bits per weight for the file's 4.5. A tensor whose
+rows are not whole 256-element blocks (llama.cpp writes any multiple of 64,
+an expert down projection of 1152 inputs among them) loads in NVFP4's form of
+64-element blocks instead (`nvfp464`): each block's four E4M3 scales and `g`
+make its meta unit, which spans two 32-input groups, at 5 bits per weight;
+every tile that takes the formats' list takes it.
 
 Q2_0 is GGUF tensor type 42, `block_q2_0`, as in the GSQ-RCO GGUFs:
 2-bit codes q worth d (q - 1) with one half d per 64 weights. Its planes are
