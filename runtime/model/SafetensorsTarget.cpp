@@ -45,7 +45,8 @@ SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, W
                                                  const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
                                                  ExpertStoreOptions experts)
     : TargetImages(backend, images, std::shared_ptr<std::vector<gguf::Image>>(planned, &planned->images),
-                   [planned] { planned->checkpoint.checkUnchanged(); }, geometry, std::move(table), experts),
+                   [planned] { planned->checkpoint.checkUnchanged(); }, geometry.layers, geometry.leadingDenseLayers,
+                   std::move(table), experts),
       planned_(std::move(planned)) {
   const safetensors::NormStorage norms = safetensors::normStorage(planned_->checkpoint, geometry);
   planned_->images = safetensors::planImages(planned_->checkpoint, geometry, norms, planOptions());

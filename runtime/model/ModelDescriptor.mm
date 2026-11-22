@@ -988,7 +988,7 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
       const OpenGguf headers(findTargetGgufs(*ggufHeaders), GgufContents::Headers);
       std::visit(
           [&](const auto &layout) {
-            static_cast<void>(gguf::planImages(headers.file(), layout.ggufArchitecture, layout));
+            static_cast<void>(ggufTargetPlan(layout).images(headers.file(), {}));
           },
           descriptor.target);
     }

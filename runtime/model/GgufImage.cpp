@@ -80,6 +80,9 @@ uint64_t storedRowBytes(const GgufTensor &tensor) {
 // a float projection's type, or a quantized one but F16, whose native rows it
 // decodes.
 bool routerType(uint32_t type) { return floatProjectionType(type) || (quantizedType(type) && type != ggml::kF16); }
+// A projection of fewer rows than a plane tile (smallProjection): a float
+// projection's type, or a quantized one.
+bool smallProjectionType(uint32_t type) { return floatProjectionType(type) || quantizedType(type); }
 // A tensor of F32 rows (floatRows): F32, or BF16 or Q8_0, which widen or
 // decode to it.
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
@@ -345,6 +348,21 @@ public:
       throw GgufError("expected an F32 or BF16 [" + std::to_string(rows) + ", " + std::to_string(columns) +
                       "] tensor: " + name);
     copiedRows(*tensor, storedRowBytes(*tensor));
+  }
+
+  // A projection [rows, columns] of fewer rows than a plane tile holds: F32
+  // or BF16 rows as stored, which the float projection runs in fp32 at any
+  // rows that are whole 8-column tiles of its kernels, or a quantized tensor
+  // repacked into whole plane tiles, its rows past `rows` zero.
+  void smallProjection(const std::string &name, uint64_t rows, uint64_t columns) {
+    const GgufTensor *tensor = find(name, smallProjectionType);
+    if (!tensor) return;
+    if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
+    if (floatProjectionType(tensor->type)) return copiedRows(*tensor, storedRowBytes(*tensor));
+    const uint32_t format = imageFormat(*tensor);
+    Repack repack = image_.planes(format, tiledRows(rows), columns, name);
+    repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns)));
+    image_.repack(std::move(repack));
   }
 
   // The MoE router [rows, columns] as stored, which the float projection runs
@@ -695,30 +713,55 @@ template <class Use> decltype(auto) withFamily(std::string_view architecture, Us
   return use(HybridGguf{});
 }
 
-// The images of a target from a GGUF of Family (planImages).
-template <class Family>
-std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options) {
+// The images of a target of `layerImages` layer images, each of which
+// `layer` plans, then the head's, which `head` begins before the head, and the
+// embedding's, then those `tables` adds (planImages, planTargetImages).
+template <class Layer, class Head, class Tables>
+std::vector<Image> targetImages(const GgufFile &file, const QwenTargetDimensions &g, uint32_t layerImages,
+                                PlanOptions options, const Layer &layer, const Head &head, const Tables &tables) {
   Problems problems;
   std::vector<Image> images;
-  for (uint32_t index = 0; index < g.layers; ++index) {
-    Builder layer(file, g, problems, "layer-" + std::to_string(index) + ".bin", index,
+  for (uint32_t index = 0; index < layerImages; ++index) {
+    Builder image(file, g, problems, "layer-" + std::to_string(index) + ".bin", index,
                   g.isFullAttentionLayer(index) ? 1u : 0u, options);
-    Family::layer(layer, g, index);
-    images.push_back(layer.finish());
+    layer(image, index);
+    images.push_back(image.finish());
   }
-  Builder head(file, g, problems, "head.bin", g.layers, 2);
-  Family::head(head, g);
-  head.quantized("output.weight", g.vocabularySize, g.hiddenSize);
-  images.push_back(head.finish());
+  Builder headImage(file, g, problems, "head.bin", layerImages, 2);
+  head(headImage);
+  headImage.quantized("output.weight", g.vocabularySize, g.hiddenSize);
+  images.push_back(headImage.finish());
   Builder embedding(file, g, problems, "embedding.bin", g.vocabularySize, g.hiddenSize);
   embedding.embeddingRows("token_embd.weight");
   images.push_back(embedding.finish());
-  Family::tables(file, g, options, problems, images);
+  tables(problems, images);
   const GgufMetadata &metadata = file.metadata();
-  problems.addUnread(file, g.layers,
+  problems.addUnread(file, layerImages,
                      metadata.unsignedValue(metadata.architecture() + ".nextn_predict_layers").value_or(0));
   if (!problems.empty()) throw GgufError("GGUF tensors this build cannot load: " + problems.text());
   return images;
+}
+
+// The images of a target from a GGUF of Family (planImages).
+template <class Family>
+std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options) {
+  return targetImages(
+      file, g, g.layers, options, [&](Builder &b, uint32_t index) { Family::layer(b, g, index); },
+      [&](Builder &b) { Family::head(b, g); },
+      [&](Problems &problems, std::vector<Image> &images) { Family::tables(file, g, options, problems, images); });
+}
+
+// Adds `section` to the image `b` plans (Section::Kind).
+void addSection(Builder &b, const QwenTargetDimensions &g, const Section &section) {
+  switch (section.kind) {
+  case Section::Kind::Norm: return b.floatNorm(section.name, section.rows);
+  case Section::Kind::Values: return b.floatValues(section.name, section.rows);
+  case Section::Kind::Quantized: return b.quantized(section.name, section.rows, section.columns);
+  case Section::Kind::FloatTensor: return b.floatTensor(section.name, section.rows, section.columns);
+  case Section::Kind::SmallProjection: return b.smallProjection(section.name, section.rows, section.columns);
+  case Section::Kind::Router: return b.router(section.name, section.rows, section.columns);
+  case Section::Kind::RoutedExperts: return b.routedExperts(section.name, section.rows, section.columns, g.hiddenSize);
+  }
 }
 
 // A rotated GGUF (GgufRotation) must name exactly what the loader rotates:
@@ -878,31 +921,10 @@ namespace {
 void requireMetadata(const GgufFile &file, std::string_view architecture, const QwenTargetDimensions &geometry) {
   const GgufMetadata &metadata = file.metadata();
   const std::string arch(architecture);
-  if (metadata.architecture() != arch)
-    throw GgufError("GGUF architecture is " + metadata.architecture() + ", but the model's target is " + arch);
-  std::string mismatched;
-  const auto expect = [&](const char *key, uint64_t value) {
-    const std::optional<uint64_t> found = metadata.unsignedValue(arch + "." + key);
-    if (found != value)
-      mismatched += (mismatched.empty() ? "" : ", ") + std::string(key) + " " +
-                    (found ? std::to_string(*found) : "missing") + " (expected " + std::to_string(value) + ")";
-  };
-  // A float equal to value up to its F32 rounding.
-  const auto expectFloat = [&](const char *key, double value) {
-    const std::optional<double> found = metadata.floatValue(arch + "." + key);
-    if (found && std::abs(*found - value) <= value * 1e-6) return;
-    std::ostringstream text;
-    text << (mismatched.empty() ? "" : ", ") << key << ' ';
-    if (found) text << *found;
-    else text << "missing";
-    text << " (expected " << value << ')';
-    mismatched += text.str();
-  };
-  // An array, named alone, that `matches` takes.
-  const auto expectArray = [&](const char *key, const auto &matches) {
-    const std::optional<std::span<const double>> values = file.numericArray(arch + "." + key);
-    if (!values || !matches(*values)) mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
-  };
+  MetadataCheck check(file, architecture);
+  const auto expect = [&](const char *key, uint64_t value) { check.expect(key, value); };
+  const auto expectFloat = [&](const char *key, double value) { check.expectFloat(key, value); };
+  const auto expectArray = [&](const char *key, const auto &matches) { check.expectArray(key, matches); };
   expect("block_count", geometry.layers + metadata.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
   expect("embedding_length", geometry.hiddenSize);
   expect("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);
@@ -917,7 +939,7 @@ void requireMetadata(const GgufFile &file, std::string_view architecture, const 
   expectFloat("rope.freq_base", geometry.rotaryTheta);
   expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
   if (const auto scaling = metadata.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
-    mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
+    check.mismatch("rope.scaling.type " + *scaling + " (expected none)");
   if (geometry.gdnLayerCount()) {
     expect("full_attention_interval", geometry.fullAttentionPeriod);
     expect("ssm.conv_kernel", kGdnConvolutionTaps);
@@ -936,10 +958,48 @@ void requireMetadata(const GgufFile &file, std::string_view architecture, const 
   } else {
     expect("feed_forward_length", geometry.intermediateSize);
   }
-  if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+  check.finish();
 }
 
 } // namespace
+
+MetadataCheck::MetadataCheck(const GgufFile &file, std::string_view architecture)
+    : file_(file), prefix_(std::string(architecture) + ".") {
+  const std::string found = file.metadata().architecture();
+  if (found != architecture)
+    throw GgufError("GGUF architecture is " + found + ", but the model's target is " + std::string(architecture));
+}
+
+void MetadataCheck::mismatch(const std::string &text) { mismatched_ += (mismatched_.empty() ? "" : ", ") + text; }
+
+void MetadataCheck::expect(std::string_view key, uint64_t value) {
+  const std::optional<uint64_t> found = file_.metadata().unsignedValue(prefix_ + std::string(key));
+  if (found != value)
+    mismatch(std::string(key) + " " + (found ? std::to_string(*found) : "missing") + " (expected " +
+             std::to_string(value) + ")");
+}
+
+// A float equal to value up to its F32 rounding.
+void MetadataCheck::expectFloat(std::string_view key, double value) {
+  const std::optional<double> found = file_.metadata().floatValue(prefix_ + std::string(key));
+  if (found && std::abs(*found - value) <= value * 1e-6) return;
+  std::ostringstream text;
+  text << key << ' ';
+  if (found) text << *found;
+  else text << "missing";
+  text << " (expected " << value << ')';
+  mismatch(text.str());
+}
+
+// An array, named alone, that `matches` takes.
+void MetadataCheck::expectArray(std::string_view key, const std::function<bool(std::span<const double>)> &matches) {
+  const std::optional<std::span<const double>> values = file_.numericArray(prefix_ + std::string(key));
+  if (!values || !matches(*values)) mismatch(std::string(key));
+}
+
+void MetadataCheck::finish() const {
+  if (!mismatched_.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched_);
+}
 
 std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                               const QwenTargetDimensions &geometry, PlanOptions options) {
@@ -948,6 +1008,17 @@ std::vector<Image> planImages(const GgufFile &file, std::string_view architectur
       architecture, [&](auto family) { return familyImages<decltype(family)>(file, geometry, options); });
   if (file.rotation()) requireRotation(file, geometry, images);
   return images;
+}
+
+std::vector<Image> planTargetImages(const GgufFile &file, const QwenTargetDimensions &geometry, uint32_t layerImages,
+                                    PlanOptions options, const std::function<std::vector<Section>(uint32_t)> &layer,
+                                    const std::vector<Section> &head) {
+  const auto add = [&](Builder &b, const std::vector<Section> &sections) {
+    for (const Section &section : sections) addSection(b, geometry, section);
+  };
+  return targetImages(
+      file, geometry, layerImages, options, [&](Builder &b, uint32_t index) { add(b, layer(index)); },
+      [&](Builder &b) { add(b, head); }, [](Problems &, std::vector<Image> &) {});
 }
 
 StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t columns) {

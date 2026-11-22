@@ -32,9 +32,11 @@ uint64_t loadedBytes(std::span<const gguf::Image> images) {
 // What a target of `layout` whose images `plan` plans for what streams
 // takes, while their sources are open: what loads while every part `streams`
 // lets stream does, and what each such part adds where it loads instead,
-// the routed experts' slot table with them.
+// the routed experts' slot table with them. Its images begin with
+// `layerImages` layer images, the first MoE layer's `firstMoeLayer`.
 template <class Layout, class Plan>
-StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::PlanOptions streams) {
+StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::PlanOptions streams,
+                                uint32_t layerImages, uint32_t firstMoeLayer) {
   streams.streamExperts = streams.streamExperts && layout.ffnKind == QwenFfnKind::SparseMoe;
   StreamableWeights result;
   std::vector<gguf::Image> streamed;
@@ -69,7 +71,7 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
                          residentExpertSlotsBytes(layout.experts);
     StreamedBlocks blocks;
     blocks.blocks = gguf::streamedExperts(
-        std::span(streamed).subspan(layout.leadingDenseLayers, layout.layers - layout.leadingDenseLayers));
+        std::span(streamed).subspan(firstMoeLayer, layerImages - firstMoeLayer));
     result.expertMinimumBytes = ExpertStore::minimumBytes(blocks, layout.moeBlockShape());
   }
   return result;
@@ -84,19 +86,17 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
         const std::filesystem::path directory = root / "target";
         if (descriptor.targetSource == TargetSource::Gguf) {
           const OpenGguf target(findTargetGgufs(directory));
+          const GgufTargetPlan plan = ggufTargetPlan(layout);
           return targetWeights(
-              layout,
-              [&](gguf::PlanOptions options) {
-                return gguf::planImages(target.file(), layout.ggufArchitecture, layout, options);
-              },
-              streams);
+              layout, [&](gguf::PlanOptions options) { return plan.images(target.file(), options); }, streams,
+              plan.layerImages, plan.firstMoeLayer);
         }
         const SafetensorsCheckpoint checkpoint(directory);
         const safetensors::NormStorage norms = safetensors::normStorage(checkpoint, layout);
         return targetWeights(
             layout,
             [&](gguf::PlanOptions options) { return safetensors::planImages(checkpoint, layout, norms, options); },
-            streams);
+            streams, layout.layers, layout.leadingDenseLayers);
       },
       descriptor.target);
   result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);

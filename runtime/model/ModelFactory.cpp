@@ -103,7 +103,7 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), ggufTargetPlan(layout), table,
                                   experts);
           return readTarget(backend, layout, std::ref(loader));
         }

@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -263,6 +264,59 @@ private:
 // model check from the installer's copy of its headers before any download.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                                             const QwenTargetDimensions &geometry, PlanOptions options = {});
+
+// A GGUF's metadata held to a target's values key by key under its
+// architecture's prefix, as planImages holds it: each mismatch, of a whole
+// number, of a float up to its F32 rounding, or of an array `matches` refuses,
+// is named, and finish() throws GgufError naming them all. Throws at once for
+// a GGUF of another architecture.
+class MetadataCheck final {
+public:
+  MetadataCheck(const GgufFile &file, std::string_view architecture);
+  void expect(std::string_view key, uint64_t value);
+  void expectFloat(std::string_view key, double value);
+  void expectArray(std::string_view key, const std::function<bool(std::span<const double>)> &matches);
+  // Names `text` among the mismatches.
+  void mismatch(const std::string &text);
+  void finish() const;
+
+private:
+  const GgufFile &file_;
+  std::string prefix_;
+  std::string mismatched_;
+};
+
+// One tensor of a GGUF and how its image holds it, for a family whose layer
+// and head images planTargetImages lays out from a list of them, as
+// planImages' families hold theirs: Norm, a vector of `rows` multipliers the
+// kernels read as F32 (as stored, or 16-bit floats widened); Values, `rows`
+// F32 values as stored; Quantized, a quantized tensor [rows, columns]
+// repacked into planes; FloatTensor, F32 or BF16 rows [rows, columns] as
+// stored; SmallProjection, a projection [rows, columns] of fewer rows than a
+// plane tile, its F32 or BF16 rows as stored or a quantized tensor repacked
+// with zero rows to a whole tile; Router, a MoE router [rows, columns] as
+// stored; RoutedExperts, the routed experts of the layer whose tensors' names
+// begin with `name`, `rows` experts `columns` wide over the geometry's
+// hiddenSize.
+struct Section final {
+  enum class Kind : uint8_t { Norm, Values, Quantized, FloatTensor, SmallProjection, Router, RoutedExperts };
+  Kind kind;
+  std::string name;
+  uint64_t rows = 0;
+  uint64_t columns = 0;
+};
+
+// The images of a target whose family lists its images' tensors: its
+// `layerImages` layer images, each of the sections `layer` lists for it, the
+// head's of `head`'s sections then output.weight, and the embedding's
+// (token_embd.weight), laid out as planImages lays out its families' (the
+// metadata is the family's to check: MetadataCheck). Throws GgufError naming
+// every missing tensor, every tensor of a type this build cannot load and
+// every tensor no section reads.
+[[nodiscard]] std::vector<Image> planTargetImages(const GgufFile &file, const QwenTargetDimensions &geometry,
+                                                  uint32_t layerImages, PlanOptions options,
+                                                  const std::function<std::vector<Section>(uint32_t)> &layer,
+                                                  const std::vector<Section> &head);
 
 // Where the GGUF holds the rows of the tensor `name`, a table of `columns`
 // values a row whose image copies its rows as stored (a family's

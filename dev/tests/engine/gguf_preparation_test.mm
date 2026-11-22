@@ -67,7 +67,11 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 // and the embedding's.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
                 const model::QwenTargetDimensions &geometry) {
-  model::GgufTargetLoader loader(backend, images, {path}, architecture(geometry), geometry);
+  const model::GgufTargetPlan plan{geometry.layers, geometry.leadingDenseLayers,
+                                   [&](const model::GgufFile &file, model::gguf::PlanOptions options) {
+                                     return model::gguf::planImages(file, architecture(geometry), geometry, options);
+                                   }};
+  model::GgufTargetLoader loader(backend, images, {path}, plan);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
   static_cast<void>(loader.embedding());
@@ -495,7 +499,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
   model::WeightImages images(backend, "fixture");
-  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout.ggufArchitecture, layout);
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), model::ggufTargetPlan(layout));
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
@@ -516,8 +520,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
     const uint64_t before = backend.memoryStats().allocatedBytes;
     model::WeightImages reserved(backend, "fixture");
     reserved.release();
-    model::GgufTargetLoader planned(backend, reserved, model::findTargetGgufs(target), layout.ggufArchitecture,
-                                    layout);
+    model::GgufTargetLoader planned(backend, reserved, model::findTargetGgufs(target), model::ggufTargetPlan(layout));
     const model::QwenTargetGeometry read =
         model::qwenTargetGeometry(model::loadQwen3_8Weights(backend, layout, planned), captured);
     check(backend.memoryStats().allocatedBytes == before && read.prefillProjections == geometry.prefillProjections &&
