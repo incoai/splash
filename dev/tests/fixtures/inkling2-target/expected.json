@@ -1,0 +1,24 @@
+{
+  "fixture_sha256": "a059340eaae92a68dedb9b64fcf0e35d5a9e36b0de9914b425955f2bcdce3743",
+  "reference": "dev/tools/inkling2_reference.py, fp32",
+  "applications": 24,
+  "rows": [
+    0,
+    1,
+    2,
+    3,
+    511,
+    512,
+    1022,
+    1023,
+    1024,
+    1099
+  ],
+  "hidden": 256,
+  "tokens": 314,
+  "layout": "fp32 [applications][rows][hidden] outputs, then fp32 [tokens] logits of the last row",
+  "regenerate": [
+    "build/engine-tests/inkling2-target build/splash.metallib --write-fixture DIR",
+    "python -m dev.tools.inkling2_target_fixture DIR dev/tests/fixtures/inkling2-target"
+  ]
+}

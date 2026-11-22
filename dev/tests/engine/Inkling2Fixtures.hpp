@@ -260,7 +260,8 @@ inline std::vector<test_gguf::Key> inkling2Metadata(const model::Inkling2LoopLay
 // applications: 4 stack planes and 2 of the pass before, as the model's), the
 // last layer of each block attending every key (2, 5, 8, 11); 16 experts of
 // 320, top 8, so that the gate and up of 256 inputs and the down of 320 take
-// the model's two NVFP4 forms; 320 vocabulary rows, 314 of them tokens.
+// the model's two NVFP4 forms; 320 vocabulary rows, 314 of them tokens, its
+// draft's mask token its last (the model's lies past them).
 inline model::Inkling2LoopLayout inkling2EngineLayout() {
   model::Inkling2LoopLayout g;
   g.weightLayers = 12;
@@ -273,6 +274,7 @@ inline model::Inkling2LoopLayout inkling2EngineLayout() {
   g.hiddenSize = 256;
   g.vocabularySize = 320;
   g.vocabularyTokens = 314;
+  g.maskToken = 313;
   g.slidingLayers = g.schedule().slidingApplications();
   g.unrotatedLayers = (uint64_t{1} << g.layers) - 1;
   g.experts = 16;
