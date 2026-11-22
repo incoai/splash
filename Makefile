@@ -270,6 +270,10 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/HyperConnection.cpp \
 	runtime/ops/NgramEmbedding.cpp \
+	runtime/ops/ShortConvolution.cpp \
+	runtime/ops/BlockResidualMix.cpp \
+	runtime/ops/MessageGate.cpp \
+	runtime/ops/LogitFinish.cpp \
 	runtime/ops/BlockIndexer.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
