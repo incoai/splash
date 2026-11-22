@@ -41,7 +41,6 @@ import weakref
 from dataclasses import dataclass
 
 from .. import request_fields
-from ..chat_format import THINK_END, THINK_START
 from ..chat_templates import render_chat_template, template_options
 from ..errors import (
     APIError,
@@ -195,9 +194,10 @@ def encode_prompt(
 ):
     """Render messages with chat_template without thinking, as a request
     with effort none renders, and verify single-token answer slots. A model
-    that opens its reasoning itself (chat_format.think_start_id), which
-    effort none leaves reasoning, gets an empty think block at the prompt's
-    end, after which it answers. The
+    that opens its reasoning itself (chat_format.think_start_ids), which
+    effort none may leave reasoning, gets an empty reasoning block at the
+    prompt's end, and one whose format frames its answer's text the frame's
+    opening (chat_format.text_frames), after which it answers. The
     prompt is the rendered text as every prompt is tokenized, each surrogate
     code point as U+FFFD: the one text its tokens, the slot checks and its
     digest read.
@@ -232,8 +232,10 @@ def encode_prompt(
             ),
         },
     )
-    if chat_format.think_start_id is not None:
-        rendered += THINK_START + THINK_END
+    if chat_format.think_start_ids:
+        rendered += chat_format.think_open + chat_format.think_close
+    if chat_format.text_frames:
+        rendered += chat_format.text_frames[0]
     head, tail = prompt_tokenizer.split(tokenizable(rendered))
     tail_ids = prompt_tokenizer.tokens(tail)
     ids = head + tail_ids

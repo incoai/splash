@@ -820,15 +820,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         output into blocks."""
         splitter = ReasoningSplitter(job.thinking, job.may_call_tools, job.chat_format)
         # A chat answer is parsed as it arrives whether it streams or not:
-        # its calls where tools may be called, and in any answer, a </think>
-        # the model writes after its reasoning ended is dropped. A text
-        # completion, without a chat template, is its text as written.
+        # its calls where tools may be called, and in any answer, a close of
+        # the reasoning the model writes after its reasoning ended is
+        # dropped. A text completion, without a chat template, is its text as
+        # written.
         projector = (
             StreamingToolCallProjector(
                 job.tool_policy,
                 job.public_id,
                 job.response_validator is not None,
                 job.chat_format.call_syntax,
+                job.chat_format.think_close,
             )
             if job.tool_policy is not None or job.reasoning is not None
             else None
@@ -1389,8 +1391,8 @@ def main():
         if args.reasoning_effort is not None and not (
             family.chat_format.reasoning_switch
         ):
-            # No effort reaches a model that opens its reasoning itself, so
-            # the server cannot set every request's.
+            # No effort reaches a model its format gives no reasoning switch,
+            # so the server cannot set every request's.
             raise OptionError(
                 f"--reasoning-effort cannot set how {args.model} reasons: a "
                 f"{family.name} model decides each turn whether to reason, "
@@ -1448,7 +1450,11 @@ def main():
         thinking_end = thinking_end_tokens(
             tokenizer, args.thinking_end_text, family.chat_format
         )
-        chat_templates = ChatTemplates(tokenizer, override=custom)
+        chat_templates = ChatTemplates(
+            tokenizer,
+            override=custom,
+            opens_own_message=family.chat_format.opens_own_message,
+        )
         print_status(f"Chat template · {chat_templates.describe()}")
         # Unset, a budget ends thinking as the template closes it, so that the
         # next request renders that close back as the tokens the reply ended

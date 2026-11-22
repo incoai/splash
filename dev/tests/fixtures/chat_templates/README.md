@@ -19,3 +19,8 @@ not templates distributed with the runtime.
   (revision `20468edfc38ab43d6914cc88b08cbecb05d0fc62`) holds byte for byte.
   The chat format tests (`dev/tests/server/test_chat_formats.py`) render it
   too.
+- `inkling2.jinja`: [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini/blob/b85c3cfa615fc413cc9af3379f491b963f3b586a/chat_template.jinja),
+  revision `b85c3cfa615fc413cc9af3379f491b963f3b586a`, which the `tokenizer.chat_template` of
+  `Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file` in
+  `unsloth/Inkling-2-Mini-GGUF` (revision
+  `ae9327c5fbc7333116ba32eee78bb5d2bbefae4f`) holds byte for byte.

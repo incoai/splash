@@ -1309,7 +1309,7 @@ class CallbackStreamerTests(unittest.TestCase):
         # is a token as any other; Flint's model opens it itself.
         for chat_format, think_start in (
             (QWEN, 248_068),
-            (FLINT, FLINT.think_start_id),
+            (FLINT, FLINT.think_start_ids[0]),
         ):
             texts = {
                 1: "a",
@@ -1340,8 +1340,8 @@ class CallbackStreamerTests(unittest.TestCase):
                     # not part of it.
                     start = int(
                         not thinking
-                        and chat_format.think_start_id is not None
-                        and token_ids[:1] == [chat_format.think_start_id]
+                        and bool(chat_format.think_start_ids)
+                        and token_ids[:1] == list(chat_format.think_start_ids)
                     )
                     splitter = ReasoningSplitter(thinking, tool_calls, chat_format)
                     parts = [

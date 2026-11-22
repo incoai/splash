@@ -764,20 +764,49 @@ format of the family its installation found, which the assembly records:
   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
   each tag a token; `<|end_of_text|>`, `<|user|>`, `<|observation|>` and
   `<|developer|>` stop.
+- Inkling 2's (`INKLING2`): the template appends no generation prompt, and the
+  model opens each of its messages itself, `<|message_model|>`, a content kind
+  and its text, closed by `<|end_message|>`: reasoning in
+  `<|content_thinking|>` blocks, which may come again after text, the answer in
+  `<|content_text|>` blocks (a `<|content_tool_error|>` or
+  `<|content_invoke_tool_text|>` block is the answer's too), every tag a
+  special token; calls are a JSON object in the model's message named for the
+  function (`INKLING2_JSON`),
+  `<|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}<|end_message|>`;
+  `<|content_model_end_sampling|>` stops.
 
 A format holds the model's vocabulary and the engine's stop tokens, which are
-its target layout's; the tokens of `</think>`, of `<think>` where the model
-opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
+its target layout's; the tags that open and close its reasoning (`<think>` and
+`</think>` for Qwen and Flint), with their tokens where the model opens its
+reasoning itself, and those that frame its answer's text where it has any;
+the call syntax, with the tags a call opens and closes with and the token of
+its opening, its arguments either tags around each argument or one JSON
+object; whether the model opens its own message; the special tokens decoding
+keeps in the text it reads (`visible_tags`: Inkling 2's tags, every other
+special token, its stop token among them, decoding to nothing); and the
 special token after which prompt tokenization reuses a cached prompt's tokens,
-`<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
-as the format has it, and that it can keep its added tokens out of a request's
-text ([tokenizer and chat templates](#tokenizer-and-chat-templates)). Grammars
-write reasoning and calls as the format lays
+`<|im_end|>`, `<|assistant|>` or `<|end_message|>`. Startup checks that the
+tokenizer encodes each as the format has it, and that it can keep its added
+tokens out of a request's text ([tokenizer and chat
+templates](#tokenizer-and-chat-templates)). Grammars write reasoning and calls
+as the format lays
 them out: Flint's optional think block may come before any constrained output,
 and its tags, which the grammar compiler takes as tokens rather than text, are
 written as their tokens. A model that opens its reasoning itself closes it
 before a call, so a `<tool_call>` inside its think block is reasoning, as
-Flint's own parser reads it.
+Flint's own parser reads it. A call of JSON arguments streams them as the
+model writes them, after the object's name, and its grammar writes them to
+the tool's schema as JSON; where the format frames the answer's text, a
+grammar's text and JSON answer are written in that frame.
+
+Inkling 2's template renders as shipped, and tells the model the request's
+effort in a system message before the first message that is not one
+(`Thinking effort level: 0.9` unless the request names one; none and
+`enable_thinking: false` render 0): `/v1/models` lists its efforts, and
+`--reasoning-effort` sets every request's. A thinking budget caps only
+reasoning the generation prompt opens, so it caps nothing here, as for Flint.
+Reasoning the model writes after text stays where it is in Messages and
+Responses, and joins the rest in Chat Completions' `reasoning_content`.
 
 Flint's template renders as shipped: its roles, the tools block it adds before
 the first message that is not a system message, each assistant turn's

@@ -34,7 +34,7 @@ from server import frontend as request_frontend
 from server import protocol as wire
 from server import runtime as engine_runtime
 from server import server as api
-from server.chat_format import FLINT, QWEN
+from server.chat_format import FLINT, INKLING2, QWEN
 from server.chat_templates import ChatTemplates
 from server.dialects import responses as responses_dialect
 from server.lru import LRUCache
@@ -47,10 +47,11 @@ FOREVER = math.inf
 # (QwenTargetDimensions::nativeContextTokens).
 NATIVE_CONTEXT = 262144
 # The vocabulary and stop tokens the engine of each chat format's targets
-# announces in Ready (runtime/model/Qwen3_8.hpp, Flint.hpp).
+# announces in Ready (runtime/model/Qwen3_8.hpp, Flint.hpp, Inkling2Loop.hpp).
 ENGINE_TOKENS = {
     QWEN: (248_320, (248_044, 248_046)),
     FLINT: (150_144, (150_001, 150_003, 150_005, 150_018)),
+    INKLING2: (201_024, (200_006,)),
 }
 
 

@@ -15,7 +15,7 @@ from . import images as image_input
 from . import protocol as wire
 from . import request_fields
 from .backend import Job, ReasoningRequest
-from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import REASONING_EFFORTS
 from .chat_messages import normalize_messages, template_messages
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
@@ -55,20 +55,21 @@ MIN_SAMPLING_TEMPERATURE = 0.01
 COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 
-def _generation_prompt(probed, rendered, tokens):
-    """Whether the generation prompt opens a think block, and how many of the
-    prompt's last tokens it is (zero where they differ from its tokens).
-    `probed` is its text and tokens, as the startup probe found them for the
-    request's template options, and the rendered prompt must end with that
-    text."""
+def _generation_prompt(probed, rendered, tokens, chat_format):
+    """Whether the generation prompt opens the chat format's reasoning, and
+    how many of the prompt's last tokens it is (zero where they differ from
+    its tokens). `probed` is its text and tokens, as the startup probe found
+    them for the request's template options, and the rendered prompt must end
+    with that text, which is empty only where the model opens its own message
+    (chat_format.opens_own_message)."""
     text, ids = probed
-    if not text or not rendered.endswith(text):
+    if not (text or chat_format.opens_own_message) or not rendered.endswith(text):
         raise APIError(
             400, "chat template must end with an assistant generation prefix"
         )
     count = len(ids)
     return (
-        text.rfind(THINK_START) > text.rfind(THINK_END),
+        text.rfind(chat_format.think_open) > text.rfind(chat_format.think_close),
         count if count < len(tokens) and tuple(tokens[-count:]) == ids else 0,
     )
 
@@ -773,7 +774,10 @@ class Frontend:
         thinking, generation_prompt_tokens = False, 0
         if add_generation_prompt:
             thinking, generation_prompt_tokens = _generation_prompt(
-                chat_template.generation_prompt(options), rendered, tokens
+                chat_template.generation_prompt(options),
+                rendered,
+                tokens,
+                self.chat_format,
             )
         head_tokens = _head_tokens(
             prompt.messages, prompt.tools, tokens, self.turn_openings
@@ -933,7 +937,8 @@ class Frontend:
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + chat_format.call_syntax.function_opening(name),
+                    chat_format.call_syntax.call_tag
+                    + chat_format.call_syntax.function_opening(name),
                     add_special_tokens=False,
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",
