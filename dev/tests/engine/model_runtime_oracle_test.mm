@@ -260,10 +260,10 @@ metal::AllocationAdmission governedFor(MemoryGovernor &governor, std::string nee
 }
 
 // The texts the checks run, in the target's tokenizer and chat format: the
-// Qwen families' (one tokenizer) or Flint's. Each family's chat prompts end
-// where its assistant reasons, in an open think block (Flint's model opens
-// one itself; the prompt opens it as Qwen's template does), and the
-// vocabulary sizes the constraint masks.
+// Qwen families' (one tokenizer), Flint's or Inkling 2's. Each family's chat
+// prompts end where its assistant reasons, in an open think block (Flint's
+// and Inkling 2's models open one themselves; the prompt opens it as Qwen's
+// template does), and the vocabulary sizes the constraint masks.
 struct OracleTokens final {
   uint32_t vocabulary = 0;
   // "List every prime number between 1 and 60, then check each one by trial
@@ -324,10 +324,45 @@ const OracleTokens kFlintTokens{
     // <|user|>...<|assistant|><think></think>
     .productionSeed = {150003, 3201, 29915, 497,  220,  16,   11,    3758, 1218, 1067,   299,    869,    5095,  1060, 358,
                        260,    618,  1507,  13,   27110, 2843, 361, 4495, 220,  905,    13,     150004, 150006, 150007}};
+// Inkling 2's template opens no assistant message: its model opens its own,
+// a thinking message <|message_model|><|content_thinking|> closed by
+// <|end_message|>, after the effort the template tells it (0.9, its default).
+const OracleTokens kInklingTokens{
+    .vocabulary = 201024,
+    // <|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>
+    // <|message_user|><|content_text|>...<|end_message|><|message_model|><|content_thinking|>
+    .thinkingPrompt = {200002, 200004, 34182,  279,    154554, 150628, 25,     220,    15,     13,
+                       24,     200010, 200000, 200004, 1738,   150710, 152200, 150107, 150134, 220,
+                       16,     149880, 220,    68273,  11,     150126, 150918, 150154, 150011, 149910,
+                       156703, 155775, 150463, 149941, 150893, 13,     200010, 200001, 200008},
+    .thinkEnd = 200010,
+    .thinkingEnds = {std::vector<uint32_t>{200010},
+                     std::vector<uint32_t>{51187, 279, 149876, 153534, 150038, 11, 149904, 149952, 149882, 150865,
+                                           149876, 150493, 150567, 149894, 149876, 154762, 152721, 150386, 13, 198,
+                                           200010}},
+    // <|message_system|><|content_text|>...<|end_message|>, the effort, and
+    // <|message_user|><|content_text|>Hello<|end_message|><|message_model|><|content_thinking|>
+    .samplingSeed = {200002, 200004, 34358,  279,    154554, 149884, 150076, 149882, 149924, 1327,   13,
+                     155958, 150634, 164966, 150225, 149876, 152103, 11,     161158, 150452, 163684, 11,
+                     150476, 189677, 174005, 11,     149880, 158321, 928,    150845, 1255,   11,     175568,
+                     11,     149880, 185382, 149881, 149876, 150400, 150893, 13,     200010, 200002, 200004,
+                     34182,  279,    154554, 150628, 25,     220,    15,     13,     24,     200010, 200000,
+                     200004, 32269,  200010, 200001, 200008},
+    // ...<|end_message|><|message_model|><|content_thinking|><|end_message|>
+    // <|message_model|><|content_text|>
+    .productionSeed = {200002, 200004, 34182,  279,    154554, 150628, 25,     220,    15,     13,     24,
+                       200010, 200000, 200004, 2635,   187399, 149920, 220,    16,     11,     152979, 150154,
+                       150107, 149880, 150114, 152692, 150231, 149894, 149878, 150046, 150264, 13,     188959,
+                       151319, 149941, 155939, 220,    68058,  13,     200010, 200001, 200008, 200010, 200001,
+                       200004}};
 // The target's texts (oracleTokens), which main chooses before any check
 // runs; the Qwen families' until then.
 const OracleTokens *targetTokens = &kQwenTokens;
+// The target head's rows past its tokens, which its logit finish sets to -inf
+// (QwenTargetDimensions::tokens; Inkling 2's 966).
+uint32_t targetPaddingRows = 0;
 [[nodiscard]] const OracleTokens &oracleTokens(const model::ModelDescriptor &descriptor) {
+  if (std::holds_alternative<model::Inkling2LoopLayout>(descriptor.target)) return kInklingTokens;
   return std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintTokens : kQwenTokens;
 }
 
@@ -451,13 +486,15 @@ std::vector<uint8_t> bytesOf(const metal::MetalBuffer &buffer) {
 // The state a decode step leaves a lane: its lengths, its GDN cell, which
 // holds the state before the step's rows, and the rows it retained, which wait
 // on its tape for the next step to fold in, and its draft rings' rows of the
-// positions they hold, each layer's keys then values.
+// positions they hold, each layer's keys then values; and whether its target
+// has GDN layers, whose rows wait so.
 struct CommittedState final {
   model::QwenLogicalLengths lengths;
   uint32_t pendingPath = 0;
   std::vector<uint8_t> cell;
   std::vector<uint8_t> retained;
   std::vector<std::vector<uint16_t>> rings;
+  bool gdn = false;
 };
 
 CommittedState committedState(const model::Runtime &executor, const model::QwenStateStorage &states,
@@ -465,7 +502,8 @@ CommittedState committedState(const model::Runtime &executor, const model::QwenS
   const auto &metadata = states.metadata(lane);
   // A cell of no bytes (a target without GDN layers') holds nothing.
   CommittedState state{metadata.lengths, metadata.pendingPath, bytesOf(states.current(lane).stateBase),
-                       model::RuntimeInstrumentation::pendingGdnRows(executor, metadata.requestId), {}};
+                       model::RuntimeInstrumentation::pendingGdnRows(executor, metadata.requestId), {},
+                       states.layout().target.layers != 0};
   // A ring's keys are [head][slot][dimension] and its values [head][dimension]
   // [slot]; position p is slot p % window.
   const auto layout = states.layout().draft;
@@ -491,14 +529,15 @@ CommittedState committedState(const model::Runtime &executor, const model::QwenS
 // bytes: the cells, the retained counts and the retained rows must match, so
 // that the next step of either lane folds the same state, and so must the
 // draft rings. The GDN kernel tests independently check the fold of each
-// retained count against FP64. A target without GDN layers retains no rows
-// (its cells hold nothing).
+// retained count against FP64. A target without GDN layers retains no rows:
+// its cells hold nothing, or an auxiliary state its commit writes after every
+// retained row (Inkling 2's convolutions').
 void requireSameCommittedState(const CommittedState &left, const CommittedState &right,
                                const std::string &label) {
   require(left.lengths == right.lengths && left.pendingPath && left.pendingPath == right.pendingPath,
           label + ": the logical state differs");
   require(left.cell == right.cell, label + ": the GDN cell differs");
-  require((!left.retained.empty() || left.cell.empty()) && left.retained == right.retained,
+  require(left.retained.empty() != left.gdn && left.retained == right.retained,
           label + ": the retained GDN rows differ");
   for (size_t ring = 0; ring < left.rings.size(); ++ring)
     require(ring < right.rings.size() && left.rings[ring] == right.rings[ring],
@@ -2495,9 +2534,11 @@ void requireCacheHitMatchesCold(model::Runtime &executor, std::span<const uint32
     return result;
   };
   const std::vector<double> p = logSoftmax(cold), q = logSoftmax(fromRam);
+  // A token of no probability (a padded head's rows past its tokens, -inf)
+  // adds nothing.
   double divergence = 0.0;
   for (size_t index = 0; index < p.size(); ++index)
-    divergence += std::exp(p[index]) * (p[index] - q[index]);
+    if (p[index] != -INFINITY) divergence += std::exp(p[index]) * (p[index] - q[index]);
   std::cout << "cache_hit_cold cached_states=" << (exact ? "exact" : "codes") << " cold_top=" << top(cold)
             << " hit_top=" << top(fromRam) << " kl=" << divergence
             << " disk_equal=" << (fromDisk == fromRam) << " exact_equal=" << (fromRam == cold) << '\n';
@@ -2603,11 +2644,13 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   require(decoded.size() == 2 && !decoded[0].failure.empty() &&
               decoded[0].outputTokens.empty(),
           "a decode from a non-finite state did not fail its lane alone");
-  // The poisoned state leaves every logit NaN, which the failure counts.
-  const std::string vocabulary = std::to_string(targetTokens->vocabulary);
+  // The poisoned state leaves every token's logit NaN, and a padded head's
+  // rows past its tokens -inf, which the failure counts.
+  const uint32_t padding = targetPaddingRows;
   require(decoded[0].failure == "target logits had no selectable token: " +
-                                    vocabulary + " NaN, 0 +inf and 0 -inf of " +
-                                    vocabulary,
+                                    std::to_string(targetTokens->vocabulary - padding) + " NaN, 0 +inf and " +
+                                    std::to_string(padding) + " -inf of " +
+                                    std::to_string(targetTokens->vocabulary),
           "the failed decode miscounted its logits: " + decoded[0].failure);
   require(decoded[1].failure.empty() && !decoded[1].outputTokens.empty() &&
               !decoded[1].finished && inVocabulary(decoded[1]),
@@ -6956,6 +6999,8 @@ int main(int argc, char **argv) {
     const std::filesystem::path modelRoot(argv[2]);
     const auto descriptor = model::servedFor(model::inspectModelRoot(modelRoot), maxContext);
     targetTokens = &oracleTokens(descriptor);
+    targetPaddingRows =
+        std::visit([](const auto &layout) { return layout.vocabularySize - layout.tokens(); }, descriptor.target);
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the
