@@ -18,7 +18,7 @@ GPU) with 48 GB.
 | `GET /v1/videos/{id}` | the video object |
 | `GET /v1/videos/{id}/content` | the mp4; `?variant=preview` the TAEH3 preview once decoded |
 | `GET /v1/videos` | a list (`limit` up to 100, `order`, `after`) |
-| `DELETE /v1/videos/{id}` | forgets the job, cancelling it at its next step |
+| `DELETE /v1/videos/{id}` | forgets the job, cancelling it at its next DiT block or decode clip |
 
 `POST` takes JSON, or the multipart form OpenAI's SDK sends: `prompt`,
 `model`, `seconds` (a whole number from `4` to `15`, `10` the default:
@@ -105,8 +105,8 @@ itself once `generate` has exited. Its flags are the `POST` fields
 `--reference FILE`, repeated in presentation order, the files of `references`
 (each one's kind from its leading bytes, else its extension); progress goes to
 stderr, `--preview` writes `clip.preview.mp4` once decoded, the mp4s replace
-files of their names, and Ctrl+C deletes the job, which cancels it at the next
-step. A request needs its
+files of their names, and Ctrl+C deletes the job, which cancels it at its next
+DiT block or decode clip. A request needs its
 variant's installation: references need
 `--model MiniMaxAI/MiniMax-H3:pika-ref2va-6`, which takes nothing else. The
 launcher refuses at once, with status 2, a command line no request can come
@@ -300,7 +300,7 @@ its int8 block weights stream from their files through a ring of 8 slots,
 each filled by a background batch of Splash's SSD readers ahead of the GPU
 (`model/WeightStream`). `VideoProgress` reports each phase's start and end
 and each denoising step, `VideoOutput` delivers the preview and then the
-clip; a `Cancel` stops the request at the next step or phase.
+clip; a `Cancel` stops the request at the next DiT block, VAE clip or phase.
 
 ### Video protocol
 

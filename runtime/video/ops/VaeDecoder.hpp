@@ -13,6 +13,7 @@
 #include "video/ops/Geometry.hpp"
 
 #include <array>
+#include <functional>
 
 namespace splash::video::ops {
 
@@ -34,6 +35,7 @@ struct DecodeStats {
   double wallS = 0, gpuS = 0;
   int64_t nonfinite = 0;
   double deviceMb = 0;
+  bool cancelled = false;  // decode stopped at a clip boundary; the frames are incomplete
 };
 
 class VaeDecoder {
@@ -42,8 +44,10 @@ public:
   VaeDecoder(metal::MetalBackend &backend, const device::Profile &profile, VaeDecoderWeights weights);
 
   // latents: de-normalised, time-padded fp32 [T][LH][LW][24]; frames: plan.outputFrames() x [H][W][3] uint8.
+  // cancelled is asked before each temporal clip is encoded; once it returns true the decode waits for the clip in
+  // flight and returns with stats.cancelled set.
   void decode(const float *latents, int32_t latentFrames, const VideoGeometry &geometry, const VaePlan &plan,
-              uint8_t *frames, DecodeStats &stats);
+              uint8_t *frames, DecodeStats &stats, const std::function<bool()> &cancelled);
 
 private:
   // A buffer of at least `bytes`, reallocated when smaller.

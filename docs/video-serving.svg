@@ -97,5 +97,5 @@
     <text x="1079" y="660" fill="#374151">H.264 + AAC</text>
     <text x="1079" y="677" fill="#374151">AVFoundation</text>
   </g>
-  <text x="60" y="715" font-size="12" fill="#6b7280">VideoProgress per phase and per denoising step · Cancel stops the request at the next step · the encoder's weights load for the request and are freed after it</text>
+  <text x="60" y="715" font-size="12" fill="#6b7280">VideoProgress per phase and per denoising step · Cancel stops the request at the next DiT block or VAE clip · the encoder's weights load for the request and are freed after it</text>
 </svg>

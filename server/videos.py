@@ -21,7 +21,7 @@ limits its VideoReady announces, which check requests while no engine runs,
 then one per job, which exits once its job has ended. A
 job's progress follows the engine's phases, its denoising step by step; its
 preview and mp4 stay in a store of bounded bytes, which evicts the oldest
-finished job first; DELETE cancels a job, a running one at its next step.
+finished job first; DELETE cancels a job, a running one at its next DiT block or decode clip.
 `splash generate` sends its clip to such a server, one it starts itself
 where none runs (install/launcher.py).
 """

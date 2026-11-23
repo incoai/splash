@@ -734,9 +734,9 @@ def _generate_on_server(args, served, request, port=None):
             raise LauncherError((job["error"] or {}).get("message", "the clip failed"))
         _write_whole(args.out, _call(port, f"/v1/videos/{job['id']}/content"))
     except StopSignal:
-        # The server cancels a running job at its next step.
+        # The server cancels a running job at its next DiT block or decode clip.
         if job is not None:
-            _status("Video · cancelling at the next step")
+            _status("Video · cancelling")
             with contextlib.suppress(OSError, LauncherError):
                 _call(port, f"/v1/videos/{job['id']}", method="DELETE")
         raise
@@ -1274,8 +1274,7 @@ def parse_args(argv=None):
         description="Write one clip of a prompt as an mp4, as a job of a splash\n"
         "serve of a video model on --port. With none there, install the video\n"
         "model as serve does, start a server of it on a free loopback port for\n"
-        "the clip, and stop it once the clip ends. Ctrl+C cancels the clip at\n"
-        "the next step.",
+        "the clip, and stop it once the clip ends. Ctrl+C cancels the clip.",
         epilog="Examples:\n"
         f"  # From the prompt alone: {H3.default_seconds} s at {H3.size}\n"
         f"  splash generate --model {H3.release} --out clip.mp4 \\\n"

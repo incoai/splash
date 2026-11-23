@@ -2574,7 +2574,7 @@ class GenerateOnServerTests(unittest.TestCase):
         with mock.patch.object(launcher.time, "sleep", side_effect=stop):
             status, stderr = self.generate()
         self.assertEqual(status, 143)
-        self.assertIn("cancelling at the next step", stderr)
+        self.assertIn("Video · cancelling", stderr)
         self.assertEqual(self.served.videos.list({})["data"], [])
         self.assertFalse((self.directory / "clip.mp4").exists())
 
@@ -2621,7 +2621,7 @@ class GenerateOnServerTests(unittest.TestCase):
         with mock.patch.object(launcher, "time", clock):
             status, stderr = self.own(step_seconds=0.5)
         self.assertEqual(status, 130)
-        self.assertIn("cancelling at the next step", stderr)
+        self.assertIn("Video · cancelling", stderr)
         ((_, _, _, app),) = self.spawned
         self.assertEqual(app.videos.list({})["data"], [])
         self.assertFalse((self.directory / "clip.mp4").exists())

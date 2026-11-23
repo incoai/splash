@@ -10,7 +10,7 @@
 // the DiT, streamed from SSD (DenoisingStage), the TAEH3 preview when asked (PreviewStage), the video VAE
 // (DecodingStage), the audio VAE when asked (AudioDecodingStage) and the mp4 writer (MuxStage). Each stage reports
 // VideoProgress, the denoising each step; the preview and the clip arrive as VideoOutputs. A Cancel stops the request
-// at the next step or stage boundary. The stages' log lines go to stderr.
+// at the next DiT block, VAE clip or stage boundary. The stages' log lines go to stderr.
 
 #include "metal/MetalBackend.hpp"
 #include "video/model/Adapter.hpp"

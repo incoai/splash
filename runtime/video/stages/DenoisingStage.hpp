@@ -25,6 +25,7 @@
 #include "video/pipeline/PipelineStage.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -72,9 +73,12 @@ public:
   Dit &operator=(const Dit &) = delete;
 
   // ada: bf16 [50][adaModalities][6][5376] and [finalSlots][2][5376] of one step (ops::SequenceLayout); latents
-  // fp32 [Nv][96] / [Na][32] (the target rows).
+  // fp32 [Nv][96] / [Na][32] (the target rows). cancelled, when given, is asked before each block is encoded; once it
+  // returns true the forward waits for the block in flight and throws Cancelled, so a Cancel stops the request within
+  // one block rather than one step. The weight stream is then mid-sequence: the Dit runs no forward after it.
   void forward(const uint16_t *adaBlocks, const uint16_t *adaFinal, const float *videoIn, const float *audioIn,
-               float *videoOut, float *audioOut, ForwardStats &stats);
+               float *videoOut, float *audioOut, ForwardStats &stats,
+               const std::function<bool()> &cancelled = {});
   // Blocks per forward: all 50, or the first ones only (the quick synthetic check of dev/tests runs 1).
   void setBlocks(int blocks) { blocks_ = blocks; }
   [[nodiscard]] const ops::SequenceLayout &layout() const { return layout_; }
