@@ -879,7 +879,7 @@ benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB) $(GGUF_PROJECTION_ARGS)
 
 # One MoE layer in GGUF formats, on the device's plans (ops/MoE.cpp);
-# GGUF_MOE_ARGS passes [35b|flash-next|flint] [rounds] [gate/up format]
+# GGUF_MOE_ARGS passes [35b|flash-next|flint|HxIxExK] [rounds] [gate/up format]
 # [down format] [shared format] (35b, q4k q5k q80 by default), or repack
 # [rounds] for the expert repack.
 benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)

@@ -1,13 +1,17 @@
 // GPU time of one sparse MoE layer in GGUF formats through ops::MoE, the numbers behind the MoE plans of ops/MoE.cpp,
 // at the 35B's shape (hidden 2048, 256 experts, top 8, intermediate 512), Qwen3.8-Flash-Next's (hidden 2560, 512
-// experts, top 10, intermediate 640) or Flint's (hidden 2048, 256 experts, top 6 by a sigmoid router, intermediate
-// 512, an ungated shared expert of two 512-wide slices), by default in the 35B UD-Q4_K_M's formats (Q4_K gate/up and
-// Q5_K down experts, a Q8_0 shared expert) with an F32 router:
-//   gguf-moe-benchmark <metallib> [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
-// - decode steps of one to four lanes of 8 rows on the device's plan, each row routed to top-k experts drawn at random
-//   from all of them (random) or, per lane of 8 rows, from a pool of three times top-k (pooled: the rows of a verify
-//   sharing their experts), with the share of the plan's expert tiles that run the column tile (an expert's only tile
-//   of GGUF_COLUMN_ROWS live rows or fewer);
+// experts, top 10, intermediate 640), Flint's (hidden 2048, 256 experts, top 6 by a sigmoid router, intermediate
+// 512, an ungated shared expert of two 512-wide slices) or HxIxExK's (hidden H, intermediate I, E experts, top K,
+// routed as the 35B's), by default in the 35B UD-Q4_K_M's formats (Q4_K gate/up and Q5_K down experts, a Q8_0
+// shared expert) with an F32 router:
+//   gguf-moe-benchmark <metallib> [35b|flash-next|flint|HxIxExK] [rounds] [gate/up format] [down format]
+//                      [shared format]
+// - decode steps of one lane of 1, 2 and 4 rows and of one to four lanes of 8 rows on the device's plan, each row
+//   routed to top-k experts drawn at random from all of them (random) or, per lane of 8 rows, from a pool of three
+//   times top-k (pooled: the rows of a verify sharing their experts), with the share of the plan's expert tiles that
+//   run the column tile (an expert's only tile of GGUF_COLUMN_ROWS live rows or fewer) and the GB/s at which the
+//   layer and its expert passes alone (replayed after it, its tiles grouped) stream its distinct experts' and shared
+//   slices' weights;
 // - prefill chunks of 64 to 2048 rows routed at random;
 // - every dispatch of the 2048-row chunk and of the 8- and 32-row steps replayed as its own command.
 //   gguf-moe-benchmark <metallib> tiles [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
@@ -239,12 +243,42 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
   for (const uint32_t rows : kPrefillRows)
     printf("  prefill chunk of %4u rows: %.4f\n", rows,
            time(layers(plans.moe(shape, routerFormat, rows, splash::ops::StepKind::Prefill), Routing::Random)));
-  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    printf("  decode %2u rows:", lanes * kLaneRows);
+  // The weights a layer streams: each distinct routed expert's three projections and the shared slices.
+  const double expertBytes = 2.0 * I * rowBytes(gateUpFormat, H) + double(H) * rowBytes(downFormat, I),
+               sharedBytes = shape.sharedSlices * (2.0 * I * rowBytes(sharedFormat, H) + double(H) * rowBytes(sharedFormat, I));
+  const auto streamedBytes = [&](const Layers &l, uint32_t rows) {
+    double sum = 0.0;
+    for (const MoeBuffers &b : l.buffers) {
+      const auto *selected = static_cast<const uint32_t *>(b.scratch.selectedExperts.contents());
+      std::vector<uint8_t> seen(E, 0);
+      uint32_t distinct = 0;
+      for (uint64_t route = 0; route < uint64_t{rows} * topK; ++route)
+        if (selected[route] < E && !seen[selected[route]]++) ++distinct;
+      sum += distinct * expertBytes + sharedBytes;
+    }
+    return sum / l.buffers.size();
+  };
+  // The expert passes of a command's layers alone, after the layers ran whole, which left their tiles grouped.
+  const auto passesTime = [&](const Layers &l) {
+    std::vector<splash::metal::ComputeDispatch> passes;
+    for (const splash::metal::ComputeDispatch &dispatch : l.graph.dispatches())
+      if (dispatch.pipelineName.rfind("moe_expert_", 0) == 0) passes.push_back(dispatch);
+    std::vector<double> samples;
+    for (uint32_t i = 0; i < rounds; ++i)
+      samples.push_back(backend.submitCommandAsync(passes).wait().gpuSeconds * 1e3 / l.buffers.size());
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2];
+  };
+  // Steps of one lane of 1, 2 and 4 rows, and of one to four lanes of 8 rows, each case with the GB/s its distinct
+  // experts and shared slices stream at, the whole layer's and its expert passes' alone.
+  for (const uint32_t rows : {1u, 2u, 4u, 8u, 16u, 24u, 32u}) {
+    printf("  decode %2u rows:", rows);
     for (const Routing routing : {Routing::Random, Routing::Pooled}) {
-      const Layers l = layers(plans.moe(shape, routerFormat, lanes * kLaneRows, splash::ops::StepKind::Decode), routing);
-      const double ms = time(l);
-      printf(" | %s %.4f (%2.0f%% column)", routing == Routing::Random ? "random" : "pooled", ms, columnShare(l));
+      const Layers l = layers(plans.moe(shape, routerFormat, rows, splash::ops::StepKind::Decode), routing);
+      const double ms = time(l), passes = passesTime(l), bytes = streamedBytes(l, rows);
+      printf(" | %s %.4f (%2.0f%% column, %3.0f GB/s; passes %.4f, %3.0f GB/s)",
+             routing == Routing::Random ? "random" : "pooled", ms, columnShare(l), bytes / (ms * 1e6), passes,
+             bytes / (passes * 1e6));
     }
     printf("\n");
   }
@@ -454,15 +488,18 @@ int main(int argc, const char *argv[]) {
     const Fmt gateUp = count > 4 ? fmtNamed(args[4]) : int8 ? mlx : Q4K,
               down = count > 5 ? fmtNamed(args[5]) : int8 ? mlx : Q5K,
               shared = count > 6 ? fmtNamed(args[6]) : int8 ? mlx : Q80;
-    if (count < 2 || count > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint") ||
+    // Or HxIxExK: hidden H, intermediate I, E experts, top K, routed as the 35B's (softmax, a gated shared slice).
+    uint32_t custom[4] = {};
+    const bool sized = std::sscanf(shapeName.c_str(), "%ux%ux%ux%u", &custom[0], &custom[1], &custom[2], &custom[3]) == 4;
+    if (count < 2 || count > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint" && !sized) ||
         gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles|int8] [35b|flash-next|flint] [rounds] [gate/up format] "
-                   "[down format] [shared format]\n";
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles|int8] [35b|flash-next|flint|HxIxExK] [rounds] "
+                   "[gate/up format] [down format] [shared format]\n";
       return 2;
     }
     const bool flashNext = shapeName == "flash-next", flint = shapeName == "flint";
-    const uint32_t H = flashNext ? 2560 : 2048, I = flashNext ? 640 : 512;
-    MoeShape shape{H, flashNext ? 512u : 256u, flashNext ? 10u : flint ? 6u : 8u, I};
+    const uint32_t H = sized ? custom[0] : flashNext ? 2560 : 2048, I = sized ? custom[1] : flashNext ? 640 : 512;
+    MoeShape shape{H, sized ? custom[2] : flashNext ? 512u : 256u, sized ? custom[3] : flashNext ? 10u : flint ? 6u : 8u, I};
     if (flint) {
       shape.router = splash::ops::MoeRouter::SigmoidNormalized;
       shape.sharedSlices = 2;

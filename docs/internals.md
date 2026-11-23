@@ -1168,10 +1168,11 @@ scratch holds (`int8 codes`, as a SwiGLU's up runs on its gate's); the formats `
 `float-f32`, and `float-<format>` for a quantized format's native rows (such as `float-af8g64`),
 time the float projection (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles
 instead, marking `selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B
-shape, or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
-device's plans; `GGUF_MOE_ARGS='repack'` times the repack of streamed experts into their slots
-(`moe_expert_load`, 1 to 32 jobs) and of tensors into an image (`gguf_repack`) in the streamed
-formats, each plane checked bytewise against the reference repack.
+shape, or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), or at
+any other (`'HxIxExK'`), on the device's plans, each decode step also as the GB/s its layer and its
+expert passes alone stream its distinct experts at; `GGUF_MOE_ARGS='repack'` times the repack of
+streamed experts into their slots (`moe_expert_load`, 1 to 32 jobs) and of tensors into an image
+(`gguf_repack`) in the streamed formats, each plane checked bytewise against the reference repack.
 
 Target attention runs once a layer for every sequence of a command, a decode step's lanes as a
 prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k projection
