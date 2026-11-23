@@ -31,9 +31,10 @@ ops::Projection readTaps(WeightFile &file, uint32_t rows, uint32_t inputs, std::
   return {static_cast<uint32_t>(gguf::tiledRows(rows)), inputs, ops::BlockWeights{{std::move(segment)}}};
 }
 
-// A tensor [rows, inputs] the float projection runs in fp32 (a layer's sinks,
-// a loop layer's gates) as its image holds it (gguf::Builder::floatTensor):
-// F32 or BF16 rows.
+// A tensor [rows, inputs] of float rows (a layer's sinks, which the float
+// projection runs in fp32, and a loop layer's gates, which the fused gate
+// kernels read) as its image holds it (gguf::Builder::floatTensor): F32 or
+// BF16 rows.
 ops::QuantizedSegment readFloatTensor(WeightFile &file, uint32_t rows, uint32_t inputs, std::string_view label) {
   ops::QuantizedSegment segment = readFloatSegment(file, label);
   if (segment.outputSize != rows || segment.inputSize != inputs)
@@ -65,8 +66,9 @@ ops::Projection readQueryProjection(WeightFile &file, const BlockTargetFormat &f
   return {layout.queryProjectionWidth(), hidden, std::move(weights)};
 }
 
-// A float projection [outputs, inputs] of F32 or BF16 rows as stored, run in
-// fp32 into fp32 (a loop layer's gates).
+// A float projection [outputs, inputs] of F32 or BF16 rows as stored, of fp32
+// outputs (a loop layer's gates, which the fused gate kernels read:
+// ops::MessageGate).
 ops::Projection readFloatProjection(WeightFile &file, uint32_t outputs, uint32_t inputs, std::string_view label) {
   ops::Projection projection(outputs, inputs, ops::BlockWeights{{readFloatTensor(file, outputs, inputs, label)}});
   projection.destination = ops::FloatOutput::Float32;

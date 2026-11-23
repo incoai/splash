@@ -2,7 +2,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/MessageGate.h"
 #include "metal/kernels/common/rms_inverse.h"
-#include "metal/kernels/common/row_sums.h"
 #include "metal/kernels/common/sgmatrix.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -10,65 +9,13 @@
 
 using namespace metal;
 
-// Message gates (metal/abi/MessageGate.h) over fp32 rows: a threadgroup of
-// kGateThreads threads a row, each thread the columns tid + kGateThreads i.
+// The fused message gates (metal/abi/MessageGate.h) over fp32 rows: a decode
+// step's of MESSAGE_GATE_THREADS threads a threadgroup, a prompt chunk's of
+// MESSAGE_GATE_TILE_THREADS (message_gate_rows below). Their reference path,
+// which rounds where they do, runs in the tests alone
+// (dev/tests/engine/message_gate_reference.h).
 constant constexpr uint kGateThreads = MESSAGE_GATE_THREADS;
 constant constexpr uint kGateSimdgroups = kGateThreads / 32;
-
-// A message gate's input to its down projection: the row and its message,
-// each RMS-normalized without weights, side by side in a bf16 row of
-// 2 hidden values (the source's down projection is a bf16 Linear).
-kernel void message_gate_prepare(device const float *x [[buffer(0)]], device const float *message [[buffer(1)]],
-                                 device bfloat *concat [[buffer(2)]], constant MessageGateParams &p [[buffer(3)]],
-                                 uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]],
-                                 uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float scratch[kGateSimdgroups * 2];
-  if (row >= p.rows) return;
-  device const float *xr = x + ulong(row) * p.x_stride + p.x_column;
-  device const float *mr = message + ulong(row) * p.message_stride + p.message_column;
-  float squares[2] = {0.0f, 0.0f};
-  for (uint d = tid; d < p.hidden; d += kGateThreads) {
-    squares[0] += xr[d] * xr[d];
-    squares[1] += mr[d] * mr[d];
-  }
-  threadgroup_row_sums<kGateSimdgroups>(squares, 2, scratch, lane, sg);
-  const float xs = rsqrt(squares[0] / p.hidden + kRmsEpsilon), ms = rsqrt(squares[1] / p.hidden + kRmsEpsilon);
-  device bfloat *out = concat + ulong(row) * 2 * p.hidden;
-  for (uint d = tid; d < p.hidden; d += kGateThreads) {
-    out[d] = bfloat(xr[d] * xs);
-    out[p.hidden + d] = bfloat(mr[d] * ms);
-  }
-}
-
-// The gated row, (1 - tanh(forget)) x + tanh(gain) message, in fp32 from the
-// forget and gain projections' fp32 rows [rows][hidden], through the
-// weighted RMS norm after it into bf16 rows.
-inline float message_gated(device const float *xr, device const float *mr, device const float *forget,
-                           device const float *gain, uint d) {
-  return (1.0f - precise::tanh(forget[d])) * xr[d] + precise::tanh(gain[d]) * mr[d];
-}
-kernel void message_gate_norm(device const float *x [[buffer(0)]], device const float *message [[buffer(1)]],
-                              device const float *forget [[buffer(2)]], device const float *gain [[buffer(3)]],
-                              device const float *norm [[buffer(4)]], device bfloat *output [[buffer(5)]],
-                              constant MessageGateParams &p [[buffer(6)]], uint row [[threadgroup_position_in_grid]],
-                              uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-                              uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float scratch[kGateSimdgroups];
-  if (row >= p.rows) return;
-  device const float *xr = x + ulong(row) * p.x_stride + p.x_column;
-  device const float *mr = message + ulong(row) * p.message_stride + p.message_column;
-  device const float *f = forget + ulong(row) * p.hidden, *g = gain + ulong(row) * p.hidden;
-  float squares[1] = {0.0f};
-  for (uint d = tid; d < p.hidden; d += kGateThreads) {
-    const float v = message_gated(xr, mr, f, g, d);
-    squares[0] += v * v;
-  }
-  threadgroup_row_sums<kGateSimdgroups>(squares, 1, scratch, lane, sg);
-  const float inverse = rsqrt(squares[0] / p.hidden + kRmsEpsilon);
-  for (uint d = tid; d < p.hidden; d += kGateThreads)
-    output[ulong(row) * p.hidden + d] = bfloat((message_gated(xr, mr, f, g, d) * inverse) * norm[d]);
-}
 
 // ---- The fused gates (metal/abi/MessageGate.h): a decode step's rows --------
 //
@@ -79,8 +26,8 @@ kernel void message_gate_norm(device const float *x [[buffer(0)]], device const 
 // contributing zeros; no thread keeps an array across a barrier (as
 // block_residual_mix.metal: an array indexed by a runtime bound and alive
 // across a barrier lost one simdgroup's values now and then under shader
-// validation). The sums are those of message_gate_prepare, the float
-// projections' and message_gate_norm's, in their order within a thread and
+// validation). The sums are those of message_gate_test_prepare, the float
+// projections' and message_gate_test_norm's, in their order within a thread and
 // over the simdgroups. A dispatch runs MessageGateFusedParams::gates gates
 // (grid z), gate g reading its weights, norm and output at slot g of their
 // kernel's MESSAGE_GATE_MAXIMUM_GATES bindings and its rows of the scratch
@@ -125,7 +72,7 @@ inline device const float *message_gate_row(device const float *x, device const 
 
 // Phase one: each row's and each message's inverse RMS, from quads: a
 // thread's quads tid + MESSAGE_GATE_THREADS i in order, each quad's squares
-// added in order (a sum of the same terms as message_gate_prepare's in
+// added in order (a sum of the same terms as message_gate_test_prepare's in
 // another order: it reads a value a thread at a time).
 __attribute__((noinline)) void message_gate_down_scales(device const float *x, device const float *message,
                                                         constant MessageGateFusedParams &p, uint g, uint first,
@@ -158,7 +105,7 @@ __attribute__((noinline)) void message_gate_down_scales(device const float *x, d
 
 // Phase two: the group's rank values k0 .. k0 + kDownOutputs - 1, each the
 // dot of the weights' row (`down`, [rank][2 hidden]) with the normalized
-// concatenation, rounded to bf16 as message_gate_prepare rounds it, the
+// concatenation, rounded to bf16 as message_gate_test_prepare rounds it, the
 // threads striding its quads; rounded to bf16 into `low` [rows][rank], the
 // gate's.
 template <typename Weight>
@@ -277,7 +224,7 @@ __attribute__((noinline)) void message_gate_apply_values(device const float *x, 
 
 // Phase two, by the slice that arrives last: each row's squares over the
 // slices in slice order, by a thread a row, then the group's rows through the
-// weighted RMS norm into bf16, as message_gate_norm writes each value, the
+// weighted RMS norm into bf16, as message_gate_test_norm writes each value, the
 // threads striding the rows' quads.
 __attribute__((noinline)) void message_gate_apply_norm(device coherent(device) float *values,
                                                        device coherent(device) float *partials,
@@ -350,11 +297,11 @@ kernel void message_gate_apply(device const float *x [[buffer(0)]], device const
 // threadgroup memory and, for the gated rows, the threadgroup's own rows of
 // device scratch: each row's and message's inverse RMS; the rank values, the
 // down projection of the normalized concatenation, each normalized value
-// rounded to bf16 as message_gate_prepare rounds it, each rank value rounded
+// rounded to bf16 as message_gate_test_prepare rounds it, each rank value rounded
 // to bf16 as the float projection writes it; forget, gain and the gated row in
 // fp32, a 64-value block of the rows after another, into the gated rows'
 // scratch, with each row's squares; and the gated rows through the weighted
-// RMS norm into bf16, as message_gate_norm writes each value. The products
+// RMS norm into bf16, as message_gate_test_norm writes each value. The products
 // run on simdgroup float 8x8 MMA with exact operands (bf16 values widened, the
 // weights as stored, BF16 ones widened, as shared/gguf_float.metal's), so a
 // sum differs from the float projections' only by its fp32 order. Simdgroup s

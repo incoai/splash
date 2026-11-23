@@ -476,7 +476,7 @@ static_assert([] {
 // [loopGateRank, 2 hiddenSize] of the unweighted norms of the input and of
 // the message side by side, forget and gain [hiddenSize, loopGateRank] of
 // that; F32 or BF16 rows as stored (a quantized gate's F32 values), which the
-// float projection runs in fp32 into fp32 (FloatOutput::Float32).
+// fused gate kernels read (ops::MessageGate).
 struct Inkling2LoopGateWeights final {
   ops::Projection down;
   ops::Projection forget;

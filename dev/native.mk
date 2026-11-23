@@ -11,7 +11,7 @@ TEST_METALFLAGS := $(filter-out -O3,$(PROD_METALFLAGS))
 # (PRODUCTION_FLAG_TOOLS).
 NATIVE_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	"$$(shasum -a 256 dev/native.mk)" | shasum -a 256 | cut -c1-16)
-# Test kernels build with METAL and METALLIB, and three with PROD_METALFLAGS
+# Test kernels build with METAL and METALLIB, and four with PROD_METALFLAGS
 # (above), so the production Metal configuration is part of theirs.
 TEST_CONFIG_DIGEST := $(shell printf '%s\0' $(NATIVE_CONFIG_DIGEST) \
 	$(METAL_CONFIG_DIGEST) $(call shell-quote,$(ENGINE_TEST_CXXFLAGS)) \
@@ -204,6 +204,10 @@ TEST_ATTENTION_STORE_AIR := $(ENGINE_TEST_BUILD)/attention-store-test.air
 # state codec's test checks beside the codec's own: in the production-and-test
 # library.
 TEST_STATE_CODEC_AIR := $(ENGINE_TEST_BUILD)/state-codec-test.air
+# The message gate's reference path (message_gate_test.metal), which
+# convolution-mix-kernels checks the fused gates against: in the
+# production-and-test library.
+TEST_MESSAGE_GATE_AIR := $(ENGINE_TEST_BUILD)/message-gate-test.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # Both Q8 tests share the attention kernels, the sparse ones included, and the
 # path commit, beside the tests' store.
@@ -336,7 +340,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TA
 	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
-	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) $(TEST_STATE_CODEC_AIR)
+	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) $(TEST_STATE_CODEC_AIR) \
+	$(TEST_MESSAGE_GATE_AIR)
 # Benchmarks and tools that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
@@ -511,7 +516,7 @@ $(TEST_KV_HISTORY_STREAM): dev/tests/engine/kv_history_stream_test.mm \
 $(TEST_QWEN4_KERNELS): dev/tests/engine/qwen4_kernels_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_CONVOLUTION_MIX_KERNELS): dev/tests/engine/convolution_mix_kernels_test.mm \
-		$(ENGINE_LIBRARY) $(LIB)
+		dev/tests/engine/message_gate_reference.h $(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_GDN_METAL_TEST): dev/tests/engine/gdn_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_STATE_CODEC_TEST): dev/tests/engine/state_codec_metal_test.mm \
@@ -639,11 +644,14 @@ $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
 # (gguf-dequant's AIR does not depend on -O3 with metal 32023, but that of
 # some kernels, moe_gguf's among them, does). The state codec's test kernel
 # stores codes as the decode kernels do, under the fast math that may drop a
-# NaN.
+# NaN. The message gate's reference kernels compile as the engine compiled
+# them while it ran them.
 $(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal
 $(TEST_GGUF_MOE_AIR): dev/tests/engine/gguf_moe_test.metal
 $(TEST_STATE_CODEC_AIR): dev/tests/engine/state_codec_test.metal
-$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_STATE_CODEC_AIR): $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+$(TEST_MESSAGE_GATE_AIR): dev/tests/engine/message_gate_test.metal dev/tests/engine/message_gate_reference.h
+$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_STATE_CODEC_AIR) $(TEST_MESSAGE_GATE_AIR): $(KERNEL_HEADERS) \
+		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
 # Test libraries, each linked from the AIRs it lists.
@@ -655,10 +663,11 @@ $(TEST_HOST_STEP_LIB): $(TEST_HOST_STEP_AIR)
 # The production kernels and test kernels in one library, for the kernel
 # tests that run test kernels between production dispatches:
 # metal_backend_test.metal's copies, gguf_moe_test.metal's gate and up
-# passes apart, and state_codec_test.metal's decode fold codes. It relinks
-# whenever the production library does.
+# passes apart, state_codec_test.metal's decode fold codes and
+# message_gate_test.metal's reference path. It relinks whenever the
+# production library does.
 $(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) \
-		$(TEST_STATE_CODEC_AIR) \
+		$(TEST_STATE_CODEC_AIR) $(TEST_MESSAGE_GATE_AIR) \
 		$(LIB)
 
 $(TEST_GGUF_DEQUANT_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_METAL_BACKEND_LIB) \
@@ -768,8 +777,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(TEST_QWEN4_KERNELS) $(LIB) bitwise
 	$(METAL_TEST_ENV) $(TEST_INKLING2_TARGET) $(LIB) dev/tests/fixtures/inkling2-target
 	$(TEST_INKLING2_TARGET) $(LIB) dev/tests/fixtures/inkling2-target bitwise
-	$(METAL_TEST_ENV) $(TEST_CONVOLUTION_MIX_KERNELS) $(LIB)
-	$(TEST_CONVOLUTION_MIX_KERNELS) $(LIB) bitwise
+	$(METAL_TEST_ENV) $(TEST_CONVOLUTION_MIX_KERNELS) $(TEST_PRODUCTION_LIB)
+	$(TEST_CONVOLUTION_MIX_KERNELS) $(TEST_PRODUCTION_LIB) bitwise
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_RELATIVE_ATTENTION) $(LIB)

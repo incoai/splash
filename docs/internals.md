@@ -238,7 +238,8 @@ or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](models.md#mlx-targets)) or a Model Optimizer or compressed-tensors
 target's in NVFP4 or FP8, and a GGUF's quantized alpha or beta beside one of
 another type and its quantized tensors of a float projection (Inkling 2's
-message gates and sink projections), which the GPU decodes as GGML does.
+message gates, which its fused gate kernels read as F32 rows, and its sink
+projections), which the GPU decodes as GGML does.
 In the second conversion, a
 Model Optimizer or compressed-tensors target's RMSNorm weight `w`, stored 1
 below the weight the norm multiplies by, loads as

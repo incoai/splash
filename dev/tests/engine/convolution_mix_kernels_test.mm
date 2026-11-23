@@ -1,7 +1,9 @@
 // The short convolution, block residual mix, message gate and logit finish
 // kernels (kernels/shared/short_convolution.metal, block_residual_mix.metal,
 // block_residual_mix_rows.metal, message_gate.metal, logit_finish.metal)
-// through their operators, against fp64 CPU references:
+// through their operators, against fp64 CPU references, in the
+// production-and-test library, which holds the message gate's reference path
+// (message_gate_test.metal):
 // - the convolution, static and dynamic taps, each output, over a prompt
 //   chunk's packed sequences from their states, the state after them, a chunk
 //   split in two carrying the state (the same bits as one chunk), states
@@ -23,9 +25,11 @@
 //   or fp32 current rows), plain and through its norms, of 5 rows (a
 //   threadgroup a row and query) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a
 //   threadgroup a row);
-// - the message gate through its norm;
+// - the message gate through its norm, its fused kernels' and its reference
+//   path's, and the paths against each other;
 // - the logit finish's softcap and padding rows.
 #include "ChainRows.hpp"
+#include "message_gate_reference.h"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/BlockResidualMix.hpp"
@@ -866,13 +870,45 @@ struct GateCase {
   }
 };
 
+// The paths a test call runs: the engine's fused kernels (ops::MessageGate),
+// or the reference path (message_gate_reference.h), whose kernels the
+// production-and-test library holds.
+enum class GatePath : uint8_t { Fused, Reference };
+
+// The reference path's gates of `rows` rows: a gate at a time, its rows' and
+// messages' norms and concatenation (message_gate_test_prepare) into
+// buffers.concat [rows][2 hidden] bf16, its down projection into buffers.low
+// [rows][rank] bf16 and its forget and gain projections into buffers.forget
+// and buffers.gain [rows][hidden] fp32 on the simdgroup float tile
+// (ops::addGgufFloat), and its gated rows' norm (message_gate_test_norm) into
+// its output.
+void addReferenceGates(CommandGraph &graph, const ops::MessageGateBuffers &buffers,
+                       std::span<const ops::MessageGateInput> gates, uint32_t hidden, uint32_t rows) {
+  const uint32_t rank = gates.front().weights.down.outputSize;
+  const ops::FloatTile tile = ops::FloatTile::Simdgroup;
+  for (const ops::MessageGateInput &gate : gates) {
+    const MessageGateReferenceParams p{rows, hidden, buffers.xStride, gate.xColumn, buffers.messageStride,
+                                       gate.messageColumn, rank};
+    graph.add("message_gate_test_prepare", {buffers.x, buffers.message, buffers.concat}, p, {rows, 1, 1},
+              {MESSAGE_GATE_REFERENCE_THREADS, 1, 1});
+    ops::addGgufFloat(graph, buffers.concat, gate.weights.down, buffers.low, rows, rank, 0,
+                      ops::FloatOutput::BFloat16, tile);
+    const std::array projections{ops::FloatProjection{&gate.weights.forget, buffers.forget, hidden, 0, tile},
+                                 ops::FloatProjection{&gate.weights.gain, buffers.gain, hidden, 0, tile}};
+    ops::addGgufFloat(graph, buffers.low, projections, rows, ops::FloatOutput::Float32);
+    graph.add("message_gate_test_norm",
+              {buffers.x, buffers.message, buffers.forget, buffers.gain, gate.norm.buffer, gate.output}, p,
+              {rows, 1, 1}, {MESSAGE_GATE_REFERENCE_THREADS, 1, 1});
+  }
+}
+
 // Runs rows [first, first + count) of the case's gates as one call on
-// `kernels`, into `outputs` (a buffer a gate, [rows][hidden] bf16), over
-// views of the shared rows; the counters stay zero.
+// `path`, into `outputs` (a buffer a gate, [rows][hidden] bf16), over views
+// of the shared rows; the counters stay zero.
 void runGates(MetalBackend &backend, const GateCase &c, const MetalBuffer &x, const MetalBuffer &message,
               std::span<const ops::MessageGateWeights> weights, std::span<const MetalBuffer> norms,
               std::span<const MetalBuffer> outputs, const MetalBuffer &counters, uint32_t first, uint32_t count,
-              ops::MessageGateKernels kernels = ops::MessageGateKernels::Fused) {
+              GatePath path = GatePath::Fused) {
   const uint32_t hidden = c.hidden, rank = c.rank;
   std::vector<ops::MessageGateInput> gates;
   for (uint32_t g = 0; g < c.gates; ++g)
@@ -889,30 +925,31 @@ void runGates(MetalBackend &backend, const GateCase &c, const MetalBuffer &x, co
       scratch(backend, size_t{count} * hidden * 4),
       counters};
   CommandGraph graph;
-  ops::MessageGate::add(graph, buffers, gates, hidden, count, ops::FloatTile::Simdgroup, kernels);
+  if (path == GatePath::Reference) addReferenceGates(graph, buffers, gates, hidden, count);
+  else ops::MessageGate::add(graph, buffers, gates, hidden, count);
   run(backend, graph);
 }
 
-// The kernels a call of `rows` rows on `kernels` runs.
-std::string gateKernels(uint32_t rows, ops::MessageGateKernels kernels) {
-  return kernels == ops::MessageGateKernels::FloatProjections ? "float projections"
-         : rows <= ops::MessageGate::kFusedRows               ? "fused"
-                                                              : "tiled";
+// The kernels a call of `rows` rows on `path` runs.
+std::string gateKernels(uint32_t rows, GatePath path) {
+  return path == GatePath::Reference              ? "float projections"
+         : rows <= ops::MessageGate::kFusedRows ? "fused"
+                                                : "tiled";
 }
 
 // Each gate of a call of one or three gates (a layer's FFN gate; its q, k and
 // v gates of x queries of their own or of one) against fp64 with the
 // source's bf16 roundings of the down projection's input and output: fused
 // (a decode step's rows: one group and a group and a part), tiled (more rows,
-// a prompt chunk's: whole tiles and a part of one) and through the float
-// projections, of F32 weights and of BF16, the counters back at zero. The
-// weights' values are the same in either format, and so is every product, so
-// the two formats' outputs are the same bits. Inkling-2-Mini's hidden and
-// rank, or others the tiled kernel takes: fewer 64-value steps, and a rank
-// short of its 64 columns, whose simdgroups past it read no down weights and
-// whose lanes past it no forget or gain weights.
+// a prompt chunk's: whole tiles and a part of one) and through the reference
+// path's float projections, of F32 weights and of BF16, the counters back at
+// zero. The weights' values are the same in either format, and so is every
+// product, so the two formats' outputs are the same bits. Inkling-2-Mini's
+// hidden and rank, or others the tiled kernel takes: fewer 64-value steps,
+// and a rank short of its 64 columns, whose simdgroups past it read no down
+// weights and whose lanes past it no forget or gain weights.
 void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX,
-              ops::MessageGateKernels kernels = ops::MessageGateKernels::Fused, uint32_t hidden = GateCase::kHidden,
+              GatePath path = GatePath::Fused, uint32_t hidden = GateCase::kHidden,
               uint32_t rank = GateCase::kRank) {
   std::mt19937 rng(31 + gates + (sharedX ? 7 : 0));
   const GateCase c(rng, rows, gates, sharedX, hidden, rank);
@@ -931,7 +968,7 @@ void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX
       weights.push_back(c.weights(backend, g, bfloat16));
       outputs.push_back(scratch(backend, size_t{rows} * hidden * 2));
     }
-    runGates(backend, c, x, message, weights, norms, outputs, counters, 0, rows, kernels);
+    runGates(backend, c, x, message, weights, norms, outputs, counters, 0, rows, path);
     for (uint32_t g = 0; g < gates; ++g) {
       got[bfloat16].push_back(download<uint16_t>(outputs[g], size_t{rows} * hidden));
       for (uint32_t r = 0; r < rows; ++r) {
@@ -948,16 +985,17 @@ void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX
                                 : ", hidden " + std::to_string(hidden) + " and rank " + std::to_string(rank);
   check(ok && got[0] == got[1] && std::all_of(zeros.begin(), zeros.end(), [](uint32_t value) { return value == 0; }),
         "message gates, " + std::to_string(gates) + " a call" + kind + ", of " + std::to_string(rows) + " rows (" +
-            gateKernels(rows, kernels) + shape +
+            gateKernels(rows, path) + shape +
             ") through their norms, x and the messages at columns of wider rows, F32 and BF16 weights alike");
 }
 
 // The gates' three paths on the same rows: a call of three gates of more rows
-// than MessageGate::kFusedRows through the float projections (a gate at a
-// time, the path of any weights), the same call on the tiled kernel (a
-// prompt chunk's fused gates: whole tiles and a part of one) and calls of at
-// most kFusedRows of those rows (a decode step's: the fused kernels), each
-// over views of the same buffers, row by row, each pair. Rounding points are
+// than MessageGate::kFusedRows through the reference path's float projections
+// (a gate at a time, the engine's path until the fused kernels took every
+// call), the same call on the tiled kernel (a prompt chunk's fused gates:
+// whole tiles and a part of one) and calls of at most kFusedRows of those
+// rows (a decode step's: the fused kernels), each over views of the same
+// buffers, row by row, each pair. Rounding points are
 // the same; what moves is the order of the sums: the rows' and messages'
 // squares (the fused kernels add a row's by quads), the rank values',
 // forget's, gain's and the norm's. Through them a normalized input's or a
@@ -992,7 +1030,7 @@ void gatePathsTest(MetalBackend &backend) {
                     counters = scratch(backend, ops::MessageGate::kCountersBytes);
   std::memset(counters.contents(), 0, counters.sizeBytes());
   runGates(backend, c, x, message, weights, norms, general, counters, 0, rows,
-           ops::MessageGateKernels::FloatProjections);
+           GatePath::Reference);
   runGates(backend, c, x, message, weights, norms, tiled, counters, 0, rows);
   for (uint32_t first = 0; first < rows; first += ops::MessageGate::kFusedRows)
     runGates(backend, c, x, message, weights, norms, fused, counters, first,
@@ -1032,6 +1070,37 @@ void gatePathsTest(MetalBackend &backend) {
   compare(general, fused, "the float projections' rows and the fused kernels'");
   compare(general, tiled, "the float projections' rows and the tiled kernel's");
   compare(tiled, fused, "the tiled kernel's rows and the fused kernels'");
+}
+
+// MessageGate::add refuses, saying why, the calls the fused kernels do not
+// take, which no Inkling-2-Mini checkpoint makes (its target checks a layer's
+// gates at load): gates of F32 and BF16 rows in one call, a rank short of a
+// run of 8, and a hidden short of a 64-value step.
+void gateRefusalTest(MetalBackend &backend) {
+  const auto refused = [&](uint32_t hidden, uint32_t rank, bool mixed, const std::string &why) {
+    std::mt19937 rng(41);
+    const GateCase c(rng, 13, 3, false, hidden, rank);
+    const MetalBuffer x = upload(backend, c.x), message = upload(backend, c.message),
+                      counters = scratch(backend, ops::MessageGate::kCountersBytes);
+    std::vector<ops::MessageGateWeights> weights;
+    std::vector<MetalBuffer> norms, outputs;
+    for (uint32_t g = 0; g < c.gates; ++g) {
+      weights.push_back(c.weights(backend, g, mixed && g > 0));
+      norms.push_back(upload(backend, c.norm[g]));
+      outputs.push_back(scratch(backend, size_t{c.rows} * hidden * 2));
+    }
+    try {
+      runGates(backend, c, x, message, weights, norms, outputs, counters, 0, c.rows);
+    } catch (const std::invalid_argument &error) {
+      return std::string(error.what()).find(why) != std::string::npos;
+    }
+    return false;
+  };
+  check(refused(GateCase::kHidden, GateCase::kRank, true, "all of one format") &&
+            refused(GateCase::kHidden, 4, false, "a rank of 8 to 64") &&
+            refused(96, GateCase::kRank, false, "whole 64-value steps"),
+        "message gates the fused kernels do not take refused, saying why: F32 and BF16 in one call, a rank of 4, a "
+        "hidden of 96");
 }
 
 // The finish of rows of logits: the softcap below `tokens`, -inf past it.
@@ -1098,7 +1167,7 @@ int main(int argc, const char *argv[]) {
       }
       for (const uint32_t rows : {13u, ops::MessageGate::kFusedRows + 1}) gateTest(backend, rows, 3, true);
       for (const uint32_t rows : {13u, ops::MessageGate::kFusedRows + 1})
-        gateTest(backend, rows, 3, false, ops::MessageGateKernels::FloatProjections);
+        gateTest(backend, rows, 3, false, GatePath::Reference);
       // The tiled kernel at other shapes: three 64-value steps a half at its
       // full rank and at ranks short of its 64 columns, its last tile of 1
       // row and of 31; and Inkling-2-Mini's hidden at rank 24, of 129 rows (of
@@ -1108,14 +1177,15 @@ int main(int argc, const char *argv[]) {
       // of 200 rows at rank 64 does on either path).
       for (const uint32_t rank : {64u, 8u, 24u, 56u})
         for (const uint32_t rows : {ops::MessageGate::kFusedRows + 1, ops::MessageGate::kFusedRows + 31}) {
-          gateTest(backend, rows, 1, true, ops::MessageGateKernels::Fused, 192, rank);
-          gateTest(backend, rows, 3, false, ops::MessageGateKernels::Fused, 192, rank);
+          gateTest(backend, rows, 1, true, GatePath::Fused, 192, rank);
+          gateTest(backend, rows, 3, false, GatePath::Fused, 192, rank);
         }
-      gateTest(backend, ops::MessageGate::kFusedRows + 1, 1, true, ops::MessageGateKernels::Fused, GateCase::kHidden,
+      gateTest(backend, ops::MessageGate::kFusedRows + 1, 1, true, GatePath::Fused, GateCase::kHidden,
                24);
-      gateTest(backend, ops::MessageGate::kFusedRows + 1, 3, false, ops::MessageGateKernels::Fused,
+      gateTest(backend, ops::MessageGate::kFusedRows + 1, 3, false, GatePath::Fused,
                GateCase::kHidden, 24);
       gatePathsTest(backend);
+      gateRefusalTest(backend);
       logitFinishTest(backend);
     } catch (const std::exception &error) {
       std::cerr << "convolution and mix kernel test error: " << error.what() << '\n';

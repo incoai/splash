@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -53,6 +54,23 @@ Inkling2LoopTarget::Inkling2LoopTarget(const Inkling2LoopWeights &weights, const
   // Its draft's captures and rows are those its producer trained it on: the
   // rows passed into its applications and its normed token rows.
   requireDraftRows(true, true);
+  // A loop layer's calls of message gates, its q, k and v gates and its FFN
+  // gate, take the fused kernels (ops::MessageGate), checked here rather than
+  // by a step's first call.
+  for (size_t index = 0; index < weights_.layers.size(); ++index) {
+    const Inkling2LoopLayerWeights &layer = weights_.layers[index];
+    if (!layer.messages) continue;
+    const std::array<ops::MessageGateWeights, 3> mixer{gateWeights(layer.messages->gates[0]),
+                                                       gateWeights(layer.messages->gates[1]),
+                                                       gateWeights(layer.messages->gates[2])};
+    const std::array<ops::MessageGateWeights, 1> ffn{gateWeights(layer.messages->gates[3])};
+    try {
+      ops::MessageGate::requireWeights(mixer, geometry_.hiddenSize);
+      ops::MessageGate::requireWeights(ffn, geometry_.hiddenSize);
+    } catch (const std::invalid_argument &error) {
+      throw std::invalid_argument("Inkling-2-Mini layer " + std::to_string(index) + ": " + error.what());
+    }
+  }
   for (const Inkling2LoopLayerWeights &layer : weights_.layers) keyValues_.push_back(keyValueProjection(layer));
 }
 
@@ -246,8 +264,7 @@ void Inkling2LoopTarget::addGates(const PrefillStep &step, uint32_t application,
                          .forget = s.gateForget,
                          .gain = s.gateGain,
                          .counters = s.gateCounters},
-                        std::span(inputs).first(gates.size()), hidden, step.rows,
-                        linear(step).ggufFloatTile(step.rows, hidden, inputs.front().weights.forget.formatId));
+                        std::span(inputs).first(gates.size()), hidden, step.rows);
 }
 
 // A prompt sequence's history through the command's reads of spilled K/V
