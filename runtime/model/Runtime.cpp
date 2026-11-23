@@ -779,12 +779,16 @@ struct Runtime::Impl {
     if (model.expertStore())
       mostStepRows = std::min(mostStepRows, ExpertStore::cycleRows());
     stepClasses = operators.decodeRowClasses(mostStepRows, moe);
-    // A target whose layers attend through relative attention (its layout's
-    // sharedAttention) picks those kernels by a chunk's rows too.
-    std::optional<kv::Layout> relativeAttention;
-    if (!std::visit([](const auto &layout) { return layout.sharedAttention; }, geometry.layout))
-      relativeAttention = geometry.target.kvLayout;
-    prefillClasses = operators.prefillRowClasses(moe, relativeAttention);
+    // A target whose layers attend through relative attention picks those
+    // kernels by a chunk's rows too, in each variant its layout states
+    // (QwenHybridLayout::relativeAttention), over its KV pages.
+    const std::vector<ops::RelativeAttentionVariant> relativeAttention = std::visit(
+        [](const auto &layout) {
+          const auto variants = layout.relativeAttention();
+          return std::vector<ops::RelativeAttentionVariant>(variants.begin(), variants.end());
+        },
+        geometry.layout);
+    prefillClasses = operators.prefillRowClasses(moe, relativeAttention, geometry.target.kvLayout);
     if (value.verifyRows == VerifyRows::Auto) {
       verifyBudget.emplace();
       if (model.expertStore()) {

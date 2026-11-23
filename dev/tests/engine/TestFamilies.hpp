@@ -93,7 +93,7 @@ template <class Family> [[nodiscard]] AttentionGeometry attentionGeometry(const 
   std::vector<AttentionGeometry> geometries;
   model::forEachFamily([&](const auto &family) {
     const AttentionGeometry geometry = attentionGeometry(family);
-    if (!family.sharedAttention || geometry.headDimension != SPLASH_KV_HEAD_DIMENSION) return;
+    if (!family.relativeAttention().empty() || geometry.headDimension != SPLASH_KV_HEAD_DIMENSION) return;
     if (std::find(geometries.begin(), geometries.end(), geometry) == geometries.end())
       geometries.push_back(geometry);
   });
@@ -121,7 +121,7 @@ template <class Runs> [[nodiscard]] std::vector<bool> normsOfFamilies(Runs runs)
 // layers attend through the shared attention.
 [[nodiscard]] inline std::vector<bool> familyNorms(const AttentionGeometry &geometry) {
   return normsOfFamilies(
-      [&](const auto &family) { return family.sharedAttention && attentionGeometry(family) == geometry; });
+      [&](const auto &family) { return family.relativeAttention().empty() && attentionGeometry(family) == geometry; });
 }
 
 } // namespace splash::test

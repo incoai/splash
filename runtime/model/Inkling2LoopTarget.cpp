@@ -44,7 +44,8 @@ Inkling2LoopTarget::Inkling2LoopTarget(const Inkling2LoopWeights &weights, const
                                        uint32_t prefillChunks)
     : QwenTarget(weights, geometry, backend, operators), weights_(weights), schedule_(weights.layout.schedule()),
       steps_(geometry_, schedule_.shape, backend, prefillChunks) {
-  static_assert(!Inkling2LoopLayout::sharedAttention, "the layout states the attention its target's layers run");
+  static_assert(!Inkling2LoopLayout{}.relativeAttention().empty(),
+                "the layout states the attention its target's layers run");
   // A step runs an application a layer, each with its KV layer, and the
   // weights hold a layer per weight layer; the relative attention stores
   // the KV layout's pages.
@@ -105,10 +106,10 @@ void Inkling2LoopTarget::planRelativeAttention(PrefillStep &step) const {
                                         operators_.calibration().attention, linear.int8Activations(), workspace,
                                         variant, step.decode ? ops::StepKind::Decode : ops::StepKind::Prefill);
   };
-  // The full layers scale their queries and relative states by their rows'
-  // positions; the sliding ones read their window.
-  step.fullAttention.emplace(plan({.windowTokens = 0, .positionScaled = true}));
-  step.slidingAttention.emplace(plan({.windowTokens = geometry_.kvLayout.windowTokens, .positionScaled = false}));
+  // The full layers' variant and the sliding layers', as its layout states
+  // them (Inkling2LoopLayout::relativeAttention).
+  step.fullAttention.emplace(plan(weights_.layout.fullAttention()));
+  step.slidingAttention.emplace(plan(weights_.layout.slidingAttention()));
 }
 
 metal::MetalBuffer Inkling2LoopTarget::rows(const PrefillStep &step, Inkling2LoopRows where) const {
@@ -349,8 +350,7 @@ void Inkling2LoopTarget::addAttention(PrefillStep &step, uint32_t application,
     const ops::RelativeAttentionStaging staging{b.fullQueries, s.relativeStates, s.rowSinks};
     ops::RelativeAttention::addProjection(step.graph, layerRows, weights, staging, step.kvLayers[kvLayer], pageTables,
                                           sequences, attentionRows, geometry_.kvLayout,
-                                          {.windowTokens = full ? 0 : geometry_.kvLayout.windowTokens,
-                                           .positionScaled = full});
+                                          full ? weights_.layout.fullAttention() : weights_.layout.slidingAttention());
     std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
     for (size_t index = 0; index < step.sequences.size(); ++index) {
       const QwenTargetPrefillSequence &sequence = step.sequences[index];

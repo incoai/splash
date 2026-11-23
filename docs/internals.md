@@ -815,8 +815,9 @@ every projection
   122B, on the 16-core 2048 on Inkling-2-Mini; a class of 2048 rows is the
   prefill of the most rows', which warms it, no chunk of its own repeating
   it), and the int8 passes where they run (from 192, 256 and 308 rows); and
-  the rows from which Inkling-2-Mini's relative attention after no history
-  runs a kernel no class before them and no chunk of the most rows runs:
+  the rows from which Inkling-2-Mini's relative attention after no history,
+  in each variant its layout states (a layout's `relativeAttention`), runs a
+  kernel no class before them and no chunk of the most rows runs:
   the direct kernel over bf16 queries, from 129 rows where INT8 pages take
   INT8 queries (Apple10 and Apple11), so that a fresh prompt of 129 to 224
   tokens creates none while it waits; the chunk of the most rows runs it

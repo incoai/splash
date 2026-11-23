@@ -273,9 +273,21 @@ struct Inkling2LoopLayout final : QwenHybridLayout {
   // too).
   static constexpr std::string_view modelType = "inkling2_loop_text";
   static constexpr std::string_view ggufArchitecture = "inkling2_loop";
-  // Its layers attend through its own operator (ops::RelativeAttention), not
-  // the shared attention.
-  static constexpr bool sharedAttention = false;
+  // Its layers attend through relative attention (ops::RelativeAttention),
+  // not the shared attention, in two variants: a full layer's over its whole
+  // history, its queries and relative states scaled by their rows' positions,
+  // and a sliding layer's over its window. Its target plans both a step
+  // (Inkling2LoopTarget::planRelativeAttention), and the start warms the
+  // kernels of both (QwenHybridLayout::relativeAttention).
+  [[nodiscard]] constexpr ops::RelativeAttentionVariant fullAttention() const noexcept {
+    return {.windowTokens = 0, .positionScaled = true};
+  }
+  [[nodiscard]] constexpr ops::RelativeAttentionVariant slidingAttention() const noexcept {
+    return {.windowTokens = kvLayout().windowTokens, .positionScaled = false};
+  }
+  [[nodiscard]] constexpr std::array<ops::RelativeAttentionVariant, 2> relativeAttention() const noexcept {
+    return {fullAttention(), slidingAttention()};
+  }
 
   // Its weight layers, and the loop: weight layers loopFirstLayer to
   // loopEndLayer - 1 run loopPasses times a token, with their weights shared;

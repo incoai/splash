@@ -6,6 +6,7 @@
 #include "ops/LogitFinish.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedKv.hpp"
+#include "ops/RelativeAttention.hpp"
 #include "ops/StopTokens.hpp"
 
 #include <array>
@@ -274,17 +275,24 @@ struct QwenTargetDimensions {
 // uses. The type states its config's model type and the architecture of its
 // GGUFs (modelType, ggufArchitecture), and, where its config.json holds the
 // text model's keys at its top level instead of in a text_config (a
-// multimodal Qwen checkpoint's), flatConfig; and whether its layers attend
-// through the shared attention (ops::PagedAttention), sharedAttention, false
-// for an architecture whose attention is an operator of its own: each
-// architecture's target is compiled against it, and the kernel tests take the
-// families' attention kernels from it.
+// multimodal Qwen checkpoint's), flatConfig; and the attention its layers
+// run, relativeAttention: the variants of relative attention
+// (ops::RelativeAttention) its layers attend in, each layer one of them, or
+// none where they attend through the shared attention (ops::PagedAttention).
+// Each architecture's target is compiled against it, the start warms each
+// variant's kernels (ops::ExecutionPlans::prefillRowClasses), and the kernel
+// tests take the families' attention kernels from it.
 struct QwenHybridLayout : QwenTargetDimensions {
   static constexpr bool flatConfig = false;
-  static constexpr bool sharedAttention = true;
 
   // The family's name, as the installer pairs its draft (install/families.py).
   std::string_view family;
+
+  // Its layers attend through the shared attention: no variant of relative
+  // attention.
+  [[nodiscard]] constexpr std::array<ops::RelativeAttentionVariant, 0> relativeAttention() const noexcept {
+    return {};
+  }
 
   // The KV pages, which also hold a QSA indexer's pooled keys; a QSA target's
   // attention reads the blocks its indexer selects, in the value order that

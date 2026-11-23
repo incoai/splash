@@ -51,9 +51,12 @@ Inkling 2's layout states the dimensions the shared runtime runs on as the
 layers a step runs, one per layer application (48: its 24 weight layers, the
 loop's twelve three times), and keeps its weight layers, its loop and the
 mapping of an application to its weight layer in its own members
-(`Inkling2LoopSchedule`); its layers attend through its own operator, not the
-shared attention (a layout type's `sharedAttention`), so the kernel tests'
-attention shapes leave it out. It is served up to Splash's serving ceiling,
+(`Inkling2LoopSchedule`); its layers attend through relative attention, not
+the shared attention, in the two variants its layout states, a full layer's
+and a sliding layer's (a layout's `relativeAttention`, none for a family of
+the shared attention): its target plans them, the start warms their kernels
+and the kernel tests take them from it, and the tests' shared-attention
+shapes leave it out. It is served up to Splash's serving ceiling,
 1,010,000 tokens, below its own window of 1,048,576. It loads from a GGUF or
 from its release's checkpoint or an MLX conversion of it ([Inkling 2's
 checkpoints](#inkling-2s-checkpoints)); its configuration, under

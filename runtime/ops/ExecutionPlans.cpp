@@ -21,16 +21,16 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations
 namespace {
 
 // The kernels the relative attention of a prompt chunk of `rows` rows after
-// no history runs over `layout`'s pages, of each layer variant
-// (Inkling2LoopTarget::planRelativeAttention): each dispatch's direct
-// kernel, or its split and reduce.
-std::set<std::string> relativeKernels(const ExecutionPlans &plans, kv::Layout layout, uint32_t rows) {
+// no history runs over `layout`'s pages, in each of `variants` (a target's
+// layout's, model::QwenHybridLayout::relativeAttention): each dispatch's
+// direct kernel, or its split and reduce; none without variants.
+std::set<std::string> relativeKernels(const ExecutionPlans &plans, std::span<const RelativeAttentionVariant> variants,
+                                      kv::Layout layout, uint32_t rows) {
+  std::set<std::string> kernels;
+  if (variants.empty()) return kernels;
   const uint32_t pages = (rows + kv::kPageTokens - 1) / kv::kPageTokens;
   const std::array sequence{PagedAttention::chunkParams(0, rows, pages * kv::kPageTokens, pages)};
-  std::set<std::string> kernels;
-  for (const RelativeAttentionVariant variant :
-       {RelativeAttentionVariant{.windowTokens = 0, .positionScaled = true},
-        RelativeAttentionVariant{.windowTokens = layout.windowTokens, .positionScaled = false}}) {
+  for (const RelativeAttentionVariant &variant : variants) {
     const RelativeAttentionPlan plan =
         RelativeAttention::plan(sequence, layout, plans.calibration().attention, plans.linear().int8Activations(),
                                 RelativeAttention::sequenceWorkspace(layout), variant);
@@ -77,13 +77,13 @@ std::set<std::string> relativeKernels(const ExecutionPlans &plans, kv::Layout la
 // sides. A class no warmup ran created its kernels while its request waited:
 // 19 s for the 27B's cold 17-row chunk on a 16-core Apple9 plan.
 std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<MoeShape, uint32_t>> moe,
-                                                        std::optional<kv::Layout> relativeAttention) const {
+                                                        std::span<const RelativeAttentionVariant> relativeAttention,
+                                                        kv::Layout kvLayout) const {
   std::vector<uint32_t> first;
   std::tuple<LinearTile, uint32_t, MoeExpertTile, bool> last{};
   // The relative attention's kernels warmup's chunks run after no history:
   // the most rows' and those of the classes so far.
-  std::set<std::string> warmed;
-  if (relativeAttention) warmed = relativeKernels(*this, *relativeAttention, SPLASH_PREFILL_TOKEN_BUDGET);
+  std::set<std::string> warmed = relativeKernels(*this, relativeAttention, kvLayout, SPLASH_PREFILL_TOKEN_BUDGET);
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
     const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
     const LinearTile tile = plan.configuration().tile;
@@ -93,8 +93,7 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<
     if (moe)
       config = selectMoe(calibration(), linear_.int8Activations(), StepKind::Prefill, moe->first, moe->second, rows);
     const std::tuple key{tile, named ? plan.storageRows() : 0, config.expertTile, config.int8Passes};
-    const std::set<std::string> kernels =
-        relativeAttention ? relativeKernels(*this, *relativeAttention, rows) : std::set<std::string>();
+    const std::set<std::string> kernels = relativeKernels(*this, relativeAttention, kvLayout, rows);
     if (first.empty() || key != last || !std::ranges::includes(warmed, kernels)) {
       first.push_back(rows);
       warmed.insert(kernels.begin(), kernels.end());

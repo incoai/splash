@@ -717,20 +717,21 @@ RelativeAttentionPlan relativeStepPlan(const ExecutionPlans &plans, std::span<co
 }
 
 // Whether a family's layers attend through relative attention, and the
-// windows they attend: the whole history's and, with a window, its layout's.
+// variants they attend in, as its layout states them
+// (QwenHybridLayout::relativeAttention).
 template <class Family> bool relativeAttention(const Family &family) {
-  return !family.sharedAttention && RelativeAttention::stores(family.kvLayout());
+  return !family.relativeAttention().empty() && RelativeAttention::stores(family.kvLayout());
 }
-template <class Family> std::vector<uint32_t> relativeWindows(const Family &family) {
-  const kv::Layout base = family.kvLayout();
-  return base.windowTokens ? std::vector<uint32_t>{0, base.windowTokens} : std::vector<uint32_t>{0};
+template <class Family> std::vector<RelativeAttentionVariant> relativeVariants(const Family &family) {
+  const auto variants = family.relativeAttention();
+  return std::vector<RelativeAttentionVariant>(variants.begin(), variants.end());
 }
 
 // The variants a family's attention layers run (QwenTargetGeometry::attentionVariant):
-// none for a family whose layers attend through an operator of its own.
+// none for a family whose layers attend through relative attention.
 template <class Family> std::vector<AttentionVariant> attentionVariants(const Family &family) {
   std::vector<AttentionVariant> variants;
-  if (!family.sharedAttention) return variants;
+  if (!family.relativeAttention().empty()) return variants;
   const kv::Layout base = family.kvLayout();
   for (uint32_t a = 0; a < base.attentionLayers; ++a) {
     const AttentionVariant v{.rotated = a >= 64 || !(family.unrotatedLayers >> a & 1),
@@ -749,7 +750,7 @@ std::vector<uint32_t> verifyHistories(uint32_t lanes, uint32_t history) {
 
 void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlans &plans, Pipelines *library) {
   model::forEachFamily([&](const auto &family) {
-    if (!family.sharedAttention) return;
+    if (!family.relativeAttention().empty()) return;
     const std::string f(family.family);
     const std::vector<AttentionVariant> variants = attentionVariants(family);
     const kv::Layout base = family.kvLayout();
@@ -806,10 +807,10 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
 // layers attend through it, in the groups attentionPlans fills for the shared
 // attention's families, at the same rows, histories and lanes: a prompt
 // chunk's plans and a decode step's single pass, of lanes of the narrow cap
-// and of a verify block's rows, of each window it attends (the whole
-// history's position-scaled, as its layers attend it), in INT8 and BF16
-// pages, its workspaces, and with a library its pipelines, its layers'
-// prepare, plain and position-scaled, and its pages' path commit.
+// and of a verify block's rows, in each variant its layers attend in (named
+// by its window), in INT8 and BF16 pages, its workspaces, and with a library
+// its pipelines, its layers' prepare, plain and position-scaled, and its
+// pages' path commit.
 void relativeAttentionPlans(Golden &golden, const std::string &name, const ExecutionPlans &plans,
                             Pipelines *library) {
   model::forEachFamily([&](const auto &family) {
@@ -823,8 +824,8 @@ void relativeAttentionPlans(Golden &golden, const std::string &name, const Execu
       kv::Layout layout = family.kvLayout();
       layout.format = format;
       const std::string fmt = format == kv::Format::Int8 ? "int8" : "bf16";
-      for (const uint32_t window : relativeWindows(family)) {
-        const RelativeAttentionVariant v{.windowTokens = window, .positionScaled = !window};
+      for (const RelativeAttentionVariant &v : relativeVariants(family)) {
+        const uint32_t window = v.windowTokens;
         const std::string variant = fmt + " relative window " + std::to_string(window);
         const auto planned = [&](const std::string &line, const auto &plan) {
           return line + ": " + attempt([&] {
@@ -1169,13 +1170,15 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
       for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
         kv::Layout layout = family.kvLayout();
         layout.format = format;
-        const std::vector<uint32_t> chunks = warmed(plans.prefillRowClasses(std::nullopt, layout));
-        for (const uint32_t window : relativeWindows(family)) {
+        const std::vector<RelativeAttentionVariant> variants = relativeVariants(family);
+        const std::vector<uint32_t> chunks = warmed(plans.prefillRowClasses(std::nullopt, variants, layout));
+        for (const RelativeAttentionVariant &variant : variants) {
+          const uint32_t window = variant.windowTokens;
           std::map<std::pair<uint32_t, uint32_t>, std::pair<std::string, std::string>> kernels;
           const auto planned = [&](uint32_t rows, uint32_t history) -> const std::pair<std::string, std::string> & {
             const auto [at, added] = kernels.try_emplace({rows, history});
             if (added) {
-              const RelativeAttentionPlan plan = relativeChunkPlan(plans, rows, history, layout, {window});
+              const RelativeAttentionPlan plan = relativeChunkPlan(plans, rows, history, layout, variant);
               for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches())
                 at->second = plan.direct(dispatch) ? std::pair{std::string(), plan.directPipeline()}
                                                    : std::pair{plan.splitPipeline(), plan.reducePipeline()};

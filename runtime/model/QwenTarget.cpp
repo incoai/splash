@@ -495,7 +495,7 @@ public:
   Qwen3_5Target(const QwenTargetWeights<Layout, Layer> &weights, const QwenTargetGeometry &geometry,
                 metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
       : QwenTarget(weights, geometry, backend, operators), weights_(weights) {
-    static_assert(Layout::sharedAttention, "the layout states the attention its target's layers run");
+    static_assert(Layout{}.relativeAttention().empty(), "the layout states the attention its target's layers run");
     requireLayers(std::span<const Layer>(weights.layers));
     requireSharedAttention();
     // Its layers' outputs, which their loop captures, and its stored token
