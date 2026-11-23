@@ -1495,6 +1495,200 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
           "finite");
 }
 
+// ---------------------------------------------------------------- int8 prefill edges
+// Q8_0 on the int8 prefill tile at the edges of the int8-activation rule and of Q8_0's blocks, each class of rows (or
+// of weight columns) on its own against the fp64 products and the bf16 tile, by prefillInt8's two bounds: rows of
+// zeros, of every third 64-input group zero, of one value repeated, of one input a group, of groups 10^-4..10^3 apart,
+// of magnitudes 1e36, 1e20, 1e-20 and 1e-30 (above the rule's 2^-100), of rint ties and of +-m extremes; rows below
+// 2^-100 (5e-31) and of zeros code as zeros, so their outputs are exactly 0. Weights whose d are subnormal halves (a
+// block of largest magnitude under 127 * 2^-14 that quantize_row_q8_0_ref rounds) or zero, and blocks of the codes
+// -128 and 127 under inputs of one value, at K 1024 and at K 25600 (Qwen3-32B's down projection), where each
+// 32-group's int32 sum reaches 520192. The planner keeps a unit of Q8_0 beside Q4_K on the bf16 tile, and puts Q8_0
+// alone or beside a float segment on the int8 tile past 64 rows.
+void prefillInt8Edges(MetalBackend &backend, const Linear &linear) {
+  if (!linear.calibration().projection.prefillInt8) {
+    section("int8 prefill edges: skipped, the family does not run it");
+    return;
+  }
+  constexpr LinearConfig kTile{.tile = LinearTile::GgufPrefill}, kInt8{.tile = LinearTile::GgufPrefillInt8};
+  constexpr double kBound = 1e-2, kRoundedBound = 1.25;
+  double worstAdded = 0, worstTotal = 0, worstRounded = 0;
+  uint32_t silentOutputs = 0, classes = 0;
+  // Q8_0 weights of random blocks, each block {fp16 d, 32 int8 codes} then rewritten by edit(row, block, bytes).
+  const auto q80 = [&](uint32_t N, uint32_t K, const std::function<void(uint32_t, uint32_t, uint8_t *)> &edit) {
+    Tensor t{Q80, N, K, makeNative(Q80, N, K, rng), {}};
+    const uint32_t blocks = K / 32, bytes = kQuantFormats[Q80].block_bytes;
+    for (uint32_t n = 0; n < N; ++n)
+      for (uint32_t b = 0; b < blocks; ++b) edit(n, b, t.native.data() + (uint64_t{n} * blocks + b) * bytes);
+    const Packed planes = repack(Q80, t.native, N, K, nullptr);
+    t.segment = QuantizedSegment::planes(Q80, N, K, upload(backend, planes.w0), MetalBuffer{},
+                                         upload(backend, planes.meta));
+    return t;
+  };
+  // Runs `rows` rows of x (rows of K) through t on both tiles, plain, and checks each class of outputs (`kind` of a
+  // row and column; -1: inputs that code as zeros, whose outputs must be exactly 0): its relative RMS error from the
+  // exact products, and that over the bf16 tile's, within kBound (but class `rounding`, whose inputs the rule rounds
+  // by half a code each by design), and its error from the products of the rounded inputs within kRoundedBound of the
+  // bf16 tile's.
+  const auto check = [&](const Tensor &t, std::vector<float> x, uint32_t rows, const std::string &what,
+                         const std::function<int(uint32_t, uint32_t)> &kind, int kinds, int rounding) {
+    const uint32_t N = t.N, K = t.K;
+    const Projection p = projection({&t}, N);
+    const LinearWorkload w{{N, K}, rows, LinearEpilogue::None};
+    const LinearPlan plan = Linear::plan(w, kInt8, FloatOutput::BFloat16);
+    const uint32_t storage = plan.storageRows();
+    x.resize(uint64_t{storage} * K, 0.f);
+    for (float &v : x) v = bf16ToFloat(floatToBf16(v));
+    const std::vector<uint16_t> aux = storageRows(activations(Inputs::Dense, storage, N), N, storage, storage);
+    std::vector<float> rounded = x;
+    for (uint64_t at = 0; at < uint64_t{rows} * K; at += GGUF_PREFILL_INT8_GROUP) {
+      float most = 0;
+      for (uint32_t k = 0; k < GGUF_PREFILL_INT8_GROUP; ++k) most = std::max(most, std::fabs(x[at + k]));
+      const test::Int8Block block = test::int8Block(most);
+      for (uint32_t k = 0; k < GGUF_PREFILL_INT8_GROUP; ++k)
+        rounded[at + k] = float(test::int8Code(x[at + k], block)) * block.scale;
+    }
+    const std::vector<Dot> dots = products({&t}, N, x, rows), roundedDots = products({&t}, N, rounded, rows);
+    const Outcome out =
+        run(backend, linear, plan, p, nullptr, storageRows(x, K, rows, storage), aux, kPoisonNaN, N, what);
+    const Outcome base = run(backend, linear, Linear::plan(w, kTile, FloatOutput::BFloat16), p, nullptr,
+                             storageRows(x, K, rows, storage), aux, kPoisonNaN, N, what + " bf16 tile");
+    if (std::none_of(out.pipelines.begin(), out.pipelines.end(),
+                     [](const std::string &s) { return s.starts_with("gguf_prefill_int8_q80_"); }))
+      fail(what + ": did not run the Q8_0 int8 tile");
+    std::vector<double> err2(kinds), base2(kinds), ref2(kinds), rounded2(kinds);
+    std::vector<uint64_t> nonfinite(kinds);
+    for (uint32_t r = 0; r < rows; ++r)
+      for (uint32_t c = 0; c < N; ++c) {
+        const uint64_t i = uint64_t{r} * N + c;
+        const double got = bf16ToFloat(out.output[i]), tile = bf16ToFloat(base.output[i]), want = dots[i].value;
+        const int k = kind(r, c);
+        if (k < 0) {
+          ++silentOutputs;
+          if (got != 0 || std::fabs(tile) > 1e-25)
+            fail(what + ": row " + std::to_string(r) + " column " + std::to_string(c) + " of inputs coded as zeros: " +
+                 digits(got) + " (bf16 tile " + digits(tile) + ")");
+          continue;
+        }
+        if (!std::isfinite(got)) {
+          ++nonfinite[k];
+          continue;
+        }
+        err2[k] += (got - want) * (got - want);
+        rounded2[k] += (got - roundedDots[i].value) * (got - roundedDots[i].value);
+        base2[k] += (tile - want) * (tile - want);
+        ref2[k] += want * want;
+      }
+    for (int k = 0; k < kinds; ++k) {
+      if (ref2[k] == 0 && err2[k] == 0 && !nonfinite[k]) continue;
+      ++classes;
+      const std::string label = what + " class " + std::to_string(k);
+      const double total = std::sqrt(err2[k] / std::max(ref2[k], 1e-300)),
+                   added = std::sqrt(std::max(err2[k] - base2[k], 0.0) / std::max(ref2[k], 1e-300)),
+                   fromRounded = base2[k] > 0 ? std::sqrt(rounded2[k] / base2[k]) : (rounded2[k] > 0 ? INFINITY : 0);
+      worstRounded = std::max(worstRounded, fromRounded);
+      if (nonfinite[k]) fail(label + ": " + std::to_string(nonfinite[k]) + " non-finite outputs");
+      if (k != rounding) {
+        worstAdded = std::max(worstAdded, added);
+        worstTotal = std::max(worstTotal, total);
+        if (total > kBound) fail(label + ": relative RMS error " + digits(total) + " from the exact products");
+        if (added > kBound) fail(label + ": adds relative RMS error " + digits(added));
+      }
+      if (fromRounded > kRoundedBound)
+        fail(label + ": differs from the products of its inputs rounded per row and group by " + digits(fromRounded) +
+             "x the bf16 tile's error");
+    }
+  };
+  std::uniform_real_distribution<float> unit(-1.f, 1.f);
+  // Rows of the int8 rule's edges over random Q8_0 weights, K 1024 (16 groups), 136 rows.
+  {
+    constexpr uint32_t N = 256, K = 1024, kRows = 136, kPatterns = 14;
+    const Tensor t = q80(N, K, [](uint32_t, uint32_t, uint8_t *) {});
+    const auto silentRow = [](uint32_t r) { return r % kPatterns == 0 || r % kPatterns == 9; };
+    std::vector<float> x(uint64_t{kRows} * K, 0.f);
+    const float ties[] = {0.5f, -0.5f, 1.5f, -1.5f, 2.5f, -2.5f, 3.5f, -3.5f, 10.5f, -10.5f, 63.5f, -63.5f};
+    for (uint32_t r = 0; r < kRows; ++r)
+      for (uint32_t k = 0; k < K; ++k) {
+        const uint32_t g = k / GGUF_PREFILL_INT8_GROUP, j = k % GGUF_PREFILL_INT8_GROUP;
+        float &v = x[uint64_t{r} * K + k];
+        switch (r % kPatterns) {
+          case 0: v = 0; break;                                              // zeros
+          case 1: v = g % 3 == 0 ? 0.f : unit(rng); break;                   // groups of zeros
+          case 2: v = 0.37f; break;                                          // one value
+          case 3: v = -2.5f; break;
+          case 4: v = j == (r * 7 + g * 13) % 64 ? (g % 2 ? -1.5f : 1.5f) : 0.f; break;  // one input a group
+          case 5: v = unit(rng) * std::pow(10.f, float(int(g % 8) - 4)); break;          // groups 1e-4..1e3
+          case 6: v = unit(rng) * 1e36f; break;
+          case 7: v = unit(rng) * 1e20f; break;
+          case 8: v = unit(rng) * 1e-30f; break;                             // above 2^-100
+          case 9: v = unit(rng) * 5e-31f; break;                             // below 2^-100: zeros
+          case 10: v = j == 0 ? 127.f : ties[(j + r) % std::size(ties)]; break;          // codes at rint ties
+          case 11: v = j == 5 ? 3.f : j == 40 ? -3.f : unit(rng) * 3.f; break;           // +-m: codes +-127
+          case 12: v = j % 2 ? 1.f : -1.f; break;                            // alternating +-1
+          case 13: v = unit(rng) * 1e-3f; break;
+        }
+      }
+    check(t, x, kRows, "q80 int8 rule edges K 1024", [&](uint32_t r, uint32_t) {
+      return silentRow(r) ? -1 : int(r % kPatterns);
+    }, kPatterns, 10);
+  }
+  // Weights: subnormal d, zero d and saturated codes (all -128 or all 127 in a block), at K 1024 and 25600, under dense
+  // rows and rows of one value (codes 127).
+  for (const uint32_t K : {1024u, 25600u}) {
+    constexpr uint32_t N = 256, kRows = 168;
+    std::uniform_real_distribution<float> subnormal(1e-7f, 6e-5f);
+    const Tensor t = q80(N, K, [&](uint32_t n, uint32_t b, uint8_t *block) {
+      uint16_t d;
+      std::memcpy(&d, block, 2);
+      switch (n % 4) {
+        case 1: d = f2h(subnormal(rng)); break;
+        case 2: if (b % 3 == 0) d = 0; break;
+        case 3: {
+          d = f2h(0.004f);
+          std::memset(block + 2, b % 2 ? 0x7F : 0x80, 32);
+          break;
+        }
+        default: break;
+      }
+      std::memcpy(block, &d, 2);
+    });
+    std::vector<float> x(uint64_t{kRows} * K);
+    for (uint32_t r = 0; r < kRows; ++r)
+      for (uint32_t k = 0; k < K; ++k) x[uint64_t{r} * K + k] = r % 2 ? 1.f : unit(rng);
+    check(t, x, kRows, "q80 weight edges K " + std::to_string(K),
+          [](uint32_t r, uint32_t c) { return int(c % 4) * 2 + int(r % 2); }, 8, -1);
+  }
+  // The planner: Q8_0 beside Q4_K stays on the bf16 tile; Q8_0 alone, and beside F32 rows, takes the int8 tile past 64
+  // rows (the staged tile at 64).
+  {
+    constexpr uint32_t K = 1024;
+    const Tensor a = tensor(backend, Q80, 256, K), b = tensor(backend, Q4K, 256, K);
+    std::vector<float> values(uint64_t{64} * K, 0.25f);
+    std::vector<uint8_t> bytes(values.size() * 4);
+    std::memcpy(bytes.data(), values.data(), bytes.size());
+    QuantizedSegment floats = QuantizedSegment::floats(64, K, upload(backend, bytes));
+    floats.columnOffset = 256;
+    BlockWeights withFloats;
+    withFloats.segments = {a.segment, floats};
+    const Projection alone = projection({&a}, 256), mixed = projection({&a, &b}, 512),
+                     besideFloats(320, K, std::move(withFloats));
+    const auto tileOf = [&](const Projection &p, uint32_t rows) { return linear.plan(p, rows).configuration().tile; };
+    if (tileOf(alone, 168) != LinearTile::GgufPrefillInt8 || tileOf(alone, 65) != LinearTile::GgufPrefillInt8)
+      fail("planner: Q8_0 alone past 64 rows is not on the int8 tile");
+    if (tileOf(alone, 64) == LinearTile::GgufPrefillInt8) fail("planner: Q8_0 at 64 rows is on the int8 tile");
+    if (tileOf(mixed, 168) == LinearTile::GgufPrefillInt8) fail("planner: Q8_0 beside Q4_K is on the int8 tile");
+    if (tileOf(besideFloats, 168) != LinearTile::GgufPrefillInt8)
+      fail("planner: Q8_0 beside F32 rows is not on the int8 tile");
+  }
+  section("int8 prefill edges: q80 rows of zeros, zero groups, one value, one input a group, groups 1e-4..1e3, "
+          "1e36, 1e20, 1e-20, 1e-30, 5e-31 (coded as zeros), rint ties, +-m and +-1; weights of subnormal and zero d "
+          "and saturated codes at K 1024 and 25600: " + std::to_string(classes) + " classes, worst relative RMS " +
+          digits(worstTotal) + " (added " + digits(worstAdded) + "), worst error from the rounded inputs " +
+          digits(worstRounded) +
+          "x the bf16 tile's, " + std::to_string(silentOutputs) + " outputs of inputs coded as zeros exactly 0; "
+          "planner: q80+q4k bf16 tile, q80 and q80+f32 int8 tile");
+}
+
 // ---------------------------------------------------------------- leading inputs
 // A view of the leading inputs of a projection's rows (Projection::leadingInputs), as the ANE FFN split runs down's GPU
 // share: its residual prefill (gguf_prefill_<format>_r_leading_inputs) equals bit for bit the residual prefill of
@@ -1907,6 +2101,7 @@ int main(int argc, char **argv) {
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
       decodeInt8(backend, linear);
       prefillInt8(backend, linear);
+      prefillInt8Edges(backend, linear);
       leadingInputs(backend, linear);
       rowViews(backend, linear);
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
