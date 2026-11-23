@@ -108,10 +108,12 @@ class ReasoningRequest:
     renders over the others, None when unset, when the server's effort
     replaced it or when the template does not read it."""
 
-    sent: str | None
-    effort: str | None
+    # An effort is a name, or a level where the format reads numbers
+    # (ChatFormat.effort_levels).
+    sent: str | float | None
+    effort: str | float | None
     enable_thinking: bool | None
-    template: str | None = None
+    template: str | float | None = None
 
 
 @dataclass
@@ -297,10 +299,22 @@ class CallbackStreamer:
         the start of the output where the generation prompt opened the
         reasoning (thinking), or after the model's own opening of it
         (chat_format.think_start_id), to its close or, where a call may follow
-        and a call's opening ends the reasoning, a call's opening; none for
-        a request without a chat format."""
+        and a call's opening ends the reasoning, a call's opening; the tokens
+        of every reasoning block where the format frames its blocks
+        (output.FrameSplitter); none for a request without a chat format."""
         if chat_format is None:
             return 0
+        if (frames := chat_format.frames) is not None:
+            # Each reasoning block's tokens, between its content token and
+            # its close (output.FrameSplitter).
+            count, inside = 0, False
+            for token in self.token_ids:
+                if inside:
+                    inside = token != frames.close_id
+                    count += inside
+                else:
+                    inside = token == frames.reasoning_id
+            return count
         if thinking:
             start = 0
         elif chat_format.think_start_id is not None and self.token_ids[:1] == [

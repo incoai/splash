@@ -798,8 +798,9 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
 // splits and lie within fp64 with them; chunks of 33-64 rows run the 48- and 64-row tiles, alike, and also at eight
 // partitions, which the split law takes for some shapes, where K takes them, and chunks of 65-128 rows the tiles' two
 // row groups of 48 or 64 rows (65 and 97 rows with a padded second group), alike. Every chunk's last 1 and 4 rows, on its
-// tile and splits at their own height, equal its rows bitwise. Each of `formats` ([1024, K]) at each epilogue, and a
-// fused projection at its segments' column offsets.
+// tile and splits at their own height, equal its rows bitwise. A plain chunk's fp32 outputs on the 128-row tiles round
+// to its bf16 outputs. Each of `formats` ([1024, K]) at each epilogue, and a fused projection at its segments' column
+// offsets.
 void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std::vector<Fmt> &formats) {
   constexpr uint32_t kChunks[] = {168, 136}, kSimdgroupRows = 32;
   // The split chunks' partitions: the most up to four that take whole 32-input groups.
@@ -845,6 +846,9 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
       const Outcome whole =
           run(backend, linear, tiles, p, nullptr, storageRows(x, K, chunk, storage), aux, kPoisonNaN, covered, name);
       checkValues(whole, within(dots, true), {}, aux, w, chunk, covered, name);
+      if (epilogue == LinearEpilogue::None)
+        floatOutput(backend, linear, Linear::plan(w, kTiles, FloatOutput::Float32), p,
+                    storageRows(x, K, chunk, storage), whole, within(dots, true), covered, name);
       lastRows(tiles, whole, name);
       const uint32_t written = (chunk + kSimdgroupRows - 1) / kSimdgroupRows * kSimdgroupRows;
       if (!std::all_of(whole.output.begin() + uint64_t{written} * columns, whole.output.end(),

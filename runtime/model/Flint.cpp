@@ -15,8 +15,8 @@ FlintWeights loadFlintWeights(metal::MetalBackend &backend, FlintLayout layout, 
       backend, layout, files, [&](auto &loader, const BlockTargetFormat &format, const MoeExperts &experts) {
         FlintWeights result;
         result.layout = layout;
-        result.layers.reserve(layout.layers);
-        for (uint32_t index = 0; index < layout.layers; ++index) {
+        result.layers.reserve(layout.weightLayers());
+        for (uint32_t index = 0; index < layout.weightLayers(); ++index) {
           WeightFile file = loader.layer(index);
           FlintLayerWeights &layer = result.layers.emplace_back();
           layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");

@@ -1,5 +1,6 @@
 #include "model/ModelSizing.hpp"
 
+#include "model/DSparkDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
@@ -69,7 +70,7 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
                          residentExpertSlotsBytes(layout.experts);
     StreamedBlocks blocks;
     blocks.blocks = gguf::streamedExperts(
-        std::span(streamed).subspan(layout.leadingDenseLayers, layout.layers - layout.leadingDenseLayers));
+        std::span(streamed).subspan(layout.leadingDenseLayers, layout.weightLayers() - layout.leadingDenseLayers));
     result.expertMinimumBytes = ExpertStore::minimumBytes(blocks, layout.moeBlockShape());
   }
   return result;
@@ -99,7 +100,9 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
             streams);
       },
       descriptor.target);
-  result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
+  if (descriptor.draft.present())
+    result.loadedBytes += descriptor.draft.kind == DraftKind::DSpark ? dsparkDraftBytes(root / "draft", descriptor.draft)
+                                                                     : draftImageBytes(root / "draft", descriptor.draft);
   if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
   return result;
 }

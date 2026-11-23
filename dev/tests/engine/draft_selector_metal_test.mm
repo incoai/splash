@@ -895,6 +895,69 @@ void forcedChain(MetalBackend &backend) {
   }
 }
 
+// Without a draft the host writes each lane's tree (writeChain): the tree
+// the selector grows of the lane's host chain alone, at no children and the
+// same rate for every agreement, row for row (tokens, rows, draft
+// probabilities, estimates, caps, draws and sizes; its next positions'
+// probabilities aside, which only drawn children read), whose rows the
+// layout then places alike: of lanes of a chain longer than the depth cuts,
+// one the depth cuts and none.
+void hostChainIsTheSelectors(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr uint32_t lanes = 3;
+  Random random(0x686f7374);
+  const std::array patterns{Pattern::Peaked};
+  const Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.1F);
+  const DraftSelector selector(vocabulary);
+  const std::array<uint32_t, 5> chain{17, 940, 3, 3, 512};
+  const std::array<float, 5> rates{0.9F, 0.75F, 0.5F, 1.0F, 0.25F};
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    std::copy(chain.begin(), chain.end(), f.chainTokens(lane));
+    for (uint32_t d = 0; d < chain.size(); ++d)
+      std::fill_n(f.chainRates(lane) + d * kAgreements, kAgreements, rates[d]);
+  }
+  const std::array trees{DraftTreeLane{5, kBlock - 1, 5, 0}, DraftTreeLane{9, 2, 5, 0}, DraftTreeLane{11, 4, 0, 0}};
+  run(backend, selector, f, trees);
+  const auto copy = [](const MetalBuffer &buffer) {
+    const auto *bytes = static_cast<const uint8_t *>(buffer.contents());
+    return std::vector<uint8_t>(bytes, bytes + buffer.sizeBytes());
+  };
+  const std::array kept{copy(f.buffers.treeTokens), copy(f.buffers.trees),     copy(f.buffers.treeScores),
+                        copy(f.buffers.treeCaps),   copy(f.buffers.treeDraws), copy(f.buffers.treeSizes)};
+  const std::array written{f.buffers.treeTokens, f.buffers.trees,     f.buffers.treeScores,
+                           f.buffers.treeCaps,   f.buffers.treeDraws, f.buffers.treeSizes};
+  const auto layout = [&] {
+    std::fill_n(static_cast<uint32_t *>(f.buffers.inputTokens.contents()), lanes * kBlock, 0xBADu);
+    CommandGraph graph;
+    DraftSelector::addVerifyRows(graph, f.buffers, {lanes, lanes * kBlock, kBlock});
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    return std::array{copy(f.buffers.inputTokens), copy(f.buffers.treeRows), copy(f.buffers.laneRows),
+                      copy(f.buffers.verifySources)};
+  };
+  const auto selectors = layout();
+  // Only the rows each lane's tree holds are its: the rest are poisoned.
+  for (const MetalBuffer &buffer : written)
+    std::memset(buffer.contents(), 0x5A, buffer.sizeBytes());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const uint32_t made = std::min(trees[lane].chain, trees[lane].depth);
+    DraftSelector::writeChain(f.buffers, lane, trees[lane].anchor, std::span(chain).first(made),
+                              std::span(rates).first(made));
+    for (uint32_t index = 0; index < written.size(); ++index) {
+      // Each buffer's bytes of the lane's rows (its size: the lane's word).
+      const uint64_t rowBytes = written[index].sizeBytes() / (index == 5 ? lanes : lanes * kBlock);
+      const uint64_t begin = index == 5 ? lane * rowBytes : lane * kBlock * rowBytes;
+      const uint64_t end = begin + (index == 5 ? rowBytes : (made + 1) * rowBytes);
+      const auto *host = static_cast<const uint8_t *>(written[index].contents());
+      require(std::equal(host + begin, host + end, kept[index].begin() + begin),
+              "lane " + std::to_string(lane) + "'s host chain tree differs from the selector's in buffer " +
+                  std::to_string(index));
+    }
+  }
+  require(layout() == selectors, "a host chain tree's verify rows differ from the selector's tree's");
+  rejects([&] { DraftSelector::writeChain(f.buffers, 0, 5, chain, std::span(rates).first(4)); },
+          "invalid host chain tree", "a chain of other rates than tokens was written");
+}
+
 // A host chain that copies the draft's likeliest path, at rates above the
 // draft's first step's estimate, makes its first row before the draft's
 // likeliest first step joins it, and the draft's later steps join its other
@@ -1510,6 +1573,7 @@ int main(int argc, char **argv) {
     nonFiniteRowDrawsNothing(backend);
     lowTemperatureDraws(backend);
     forcedChain(backend);
+    hostChainIsTheSelectors(backend);
     chainRowsTheDraftJoins(backend);
     siblingsShareTheirParent(backend);
     chainCountsAgainstItsSiblings(backend);

@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import fcntl
 import io
 import json
@@ -27,7 +28,7 @@ from dev.tests.installer_fixtures import (
     write_gguf,
     write_target,
 )
-from install import assembly, hub, local, models, upstream
+from install import assembly, families, hub, local, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -235,6 +236,17 @@ class LocalModelTest(unittest.TestCase):
             models.ModelError, f"the Hub cache has no snapshot of {missing}; {remedy}"
         ):
             self.prepare(target)
+
+    def test_a_family_released_without_a_draft_is_prepared_without_one(self):
+        target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
+        undrafted = dataclasses.replace(MOE, draft_repo=None)
+        with mock.patch.object(families, "FAMILIES", (DENSE, undrafted)):
+            prepared = self.prepare(target)
+            record = assembly.verify(prepared)
+        self.assertIsNone(record["sources"]["draft"])
+        self.assertFalse((prepared / "draft").exists())
+        self.assertFalse(any(name.startswith("draft/") for name in record["files"]))
+        self.assertEqual(pins(self.cache), [])
 
     def test_an_mlx_target_serves_images_with_its_own_tower(self):
         shards = {

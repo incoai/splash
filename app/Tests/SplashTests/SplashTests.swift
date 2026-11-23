@@ -213,8 +213,8 @@ struct ServeSettingsTests {
         #expect(Self.flint.takes("--max-context", "262144") && !Self.flint.takes("--max-context", "1000000"))
         #expect(Self.flint.refusal("--max-context", "1000000") == "The model picked serves at most 256K tokens; it starts on Auto.")
         #expect(Self.moe.refusal("--max-context", "1000000") == nil && Self.flint.refusal("--max-memory", "1000000G") == nil)
-        #expect(ContextLength.parse("1010000") == 1_010_000)
-        #expect(ContextLength.parse("5M") == nil && ContextLength.parse("1010001") == nil)
+        #expect(ContextLength.parse("1010000") == 1_010_000 && ContextLength.parse("1024K") == 1_048_576)
+        #expect(ContextLength.parse("5M") == nil && ContextLength.parse("1048577") == nil)
     }
 
     /// The app takes the context lengths `splash serve` takes: its ceiling is the server's
@@ -306,8 +306,8 @@ struct ServeSettingsTests {
             == "Sampling defaults: temperature must be a number in [0, 2]")
         #expect(problem(failure("configuration", message: "argument --sampling-default: top_k must be 0 or -1 (disabled) or a positive integer"))
             == "Sampling defaults: top_k must be 0 or -1 (disabled) or a positive integer")
-        #expect(problem(failure("configuration", message: "argument --max-context: must be 'auto' or a token count up to 1010000"))
-            == "Context length: must be 'auto' or a token count up to 1010000")
+        #expect(problem(failure("configuration", message: "argument --max-context: must be 'auto' or a token count up to 1048576"))
+            == "Context length: must be 'auto' or a token count up to 1048576")
         // One of no launch option stays in the launcher's words.
         #expect(problem(failure("configuration", message: "argument --no-such-option: x")) == "argument --no-such-option: x")
         // The rest in the engine's words, as its refusal of a MAX_CONTEXT past the model's.

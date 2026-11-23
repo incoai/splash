@@ -83,6 +83,30 @@ inline TargetRow selected_row(device const float *logits,
           0.0f};
 }
 
+// A head's logits made final in place (LogitCapParams, ops::addLogitCap),
+// before every policy, acceptance and readout reads them: a token from the
+// valid vocabulary on takes -inf, which no policy selects and a softmax
+// weighs at nothing (shard_mass), and every other token's logit is softcapped
+// where softcap is non-zero. tanh is the precise one, so a capped logit keeps
+// the relative precision of a small one. Thread t of a threadgroup takes the
+// group's tokens t, t + LOGIT_CAP_THREADS, ..., in turn.
+kernel void head_logit_cap(device float *logits [[buffer(0)]],
+                           constant LogitCapParams &params [[buffer(1)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           uint thread_index [[thread_index_in_threadgroup]]) {
+  if (group.y >= params.rows)
+    return;
+  device float *row = logits + ulong(group.y) * params.vocabulary;
+  for (uint token = group.x * LOGIT_CAP_TOKENS + thread_index;
+       token < min(params.vocabulary, (group.x + 1) * LOGIT_CAP_TOKENS);
+       token += LOGIT_CAP_THREADS) {
+    if (token >= params.valid_vocabulary)
+      row[token] = -INFINITY;
+    else if (params.softcap != 0.0f)
+      row[token] = params.softcap * precise::tanh(row[token] / params.softcap);
+  }
+}
+
 // Each lane's lane rows and tree row for the selection of its first token
 // after its prompt (SampleFirstRowsParams), one group a lane: its one row of
 // the logits, a tree's root, which the selection's kernels read as a decode
@@ -1566,8 +1590,13 @@ inline void tree_expand(threadgroup TreeLattice &lattice,
     rows.next[row][i] = weight;
     mass += weight;
   }
+  // A recurrent chain's row off its chain has no distribution, nor children
+  // (DraftTreeParams::markov).
+  if (!(mass > 0.0f))
+    return;
   for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
     rows.next[row][i] /= mass;
+  const bool chained = (params.markov >> lane & 1u) != 0;
   float keys[SPLASH_DRAFT_CANDIDATES];
   for (uint i = 0; temperature > 0.0f && i < SPLASH_DRAFT_CANDIDATES; ++i)
     keys[i] = rows.next[row][i] > 0.0f
@@ -1580,6 +1609,9 @@ inline void tree_expand(threadgroup TreeLattice &lattice,
     if (temperature == 0.0f) {
       const uint likeliest = lattice.likeliest[position][predecessor][child];
       drawn = q[likeliest] > 0.0f ? likeliest : drawn;
+    } else if (chained && child == 0) {
+      // The token the chain drew from these probabilities.
+      drawn = q[0] > 0.0f ? 0 : drawn;
     } else {
       for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
         if (!(taken & (1u << i)) && keys[i] > -INFINITY &&
@@ -1656,8 +1688,15 @@ kernel void draft_select_tree(
     const uint position = thread_index / Candidates;
     const uint predecessor = thread_index % Candidates;
     lattice.ids[position][predecessor] = candidates[origin + thread_index];
-    // Position 0 follows the anchor alone.
-    if (position > 0 || predecessor == 0) {
+    const bool chained = (params.markov >> lane & 1u) != 0;
+    if (chained && predecessor > 0) {
+      // A recurrent chain follows its own token, candidate 0, alone.
+      for (uint i = 0; i < Candidates; ++i)
+        lattice.probability[position][predecessor][i] = 0.0f;
+      for (uint child = 0; child < kTreeChildren; ++child)
+        lattice.likeliest[position][predecessor][child] = uchar(child);
+    } else if (position > 0 || predecessor == 0) {
+      // Position 0 follows the anchor alone.
       device const float *edges =
           partial_values +
           ulong(params.lanes) * Positions * Shards * Candidates +
@@ -1665,7 +1704,7 @@ kernel void draft_select_tree(
               Candidates;
       float score[Candidates];
       for (uint i = 0; i < Candidates; ++i)
-        score[i] = unary[origin + position * Candidates + i] + edges[i];
+        score[i] = unary[origin + position * Candidates + i] + (chained ? 0.0f : edges[i]);
       float best = score[0];
       for (uint i = 1; i < Candidates; ++i)
         best = max(best, score[i]);

@@ -22,9 +22,10 @@ from .protocol import MAX_THINKING_END_TOKENS, SAMPLING_FIELDS
 
 # The most context --max-context takes: the most any family serves
 # (QwenTargetDimensions::maximumContextTokens(), as the engine's families
-# command reports it), YaRN's window of the Qwen targets. The engine refuses
-# more than the model's own.
-MAX_YARN_CONTEXT_TOKENS = 1010000
+# command reports it), Inkling 2's native window of 1M (1,048,576) tokens, past
+# YaRN's 1010000 of the Qwen targets. The engine refuses more than the model's
+# own.
+MAX_YARN_CONTEXT_TOKENS = 1048576
 # The suffixes of a --max-context: K, 1024 tokens, and M, a million.
 _CONTEXT_UNITS = {"K": 1024, "M": 1000000}
 DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
@@ -110,7 +111,7 @@ def parse_max_context(value):
         tokens = 0
     if not 1 <= tokens <= MAX_YARN_CONTEXT_TOKENS:
         raise argparse.ArgumentTypeError(
-            "must be 'auto' or a token count up to 1010000, such as 100K or 1M "
+            "must be 'auto' or a token count up to 1048576, such as 100K or 1M "
             "(K = 1024 tokens, M = 1000000 tokens)"
         )
     return tokens
@@ -453,8 +454,8 @@ class ServeOption:
     # What a model's family must have for the option to act on it, one of
     # the facts install/families.py reports: a fact of its layout, as the
     # engine gives it (experts, recurrent_state, ple_table, sparse_kv,
-    # dense_ffn), or of its release (vision, reasoning_switch). None: every
-    # model.
+    # dense_ffn), or of its release (vision, reasoning_switch,
+    # reasoning_effort). None: every model.
     needs: str | None = None
 
     @property
@@ -542,7 +543,7 @@ SERVE_OPTIONS = (
             default=None,
             metavar="TOKENS",
             help="context token limit, e.g. 100K or 1M (K = 1024 tokens, M = "
-            "1000000 tokens), up to the model's limit, at most 1010000; past its "
+            "1000000 tokens), up to the model's limit, at most 1048576; past its "
             "native window a model with YaRN turns it on, which is static and "
             "changes answers at every length, so pass more than the native "
             "window only when a request needs it (default: auto, the native "
@@ -752,7 +753,7 @@ SERVE_OPTIONS = (
             "SPLASH_REASONING_EFFORT, else each request's own)",
         ),
         environment="SPLASH_REASONING_EFFORT",
-        needs="reasoning_switch",
+        needs="reasoning_effort",
     ),
     ServeOption(
         "--default-reasoning-effort",
@@ -766,7 +767,7 @@ SERVE_OPTIONS = (
             "SPLASH_DEFAULT_REASONING_EFFORT, else the model template's)",
         ),
         environment="SPLASH_DEFAULT_REASONING_EFFORT",
-        needs="reasoning_switch",
+        needs="reasoning_effort",
     ),
     ServeOption(
         "--thinking-token-budget",

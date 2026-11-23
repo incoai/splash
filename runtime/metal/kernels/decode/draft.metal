@@ -42,19 +42,23 @@ inline void draft_conv_phase(device const bfloat *input,
   output[element] = bfloat(value);
 }
 
+// The rows hold `query_heads` query heads (DraftPrepareParams); the grouped
+// queries all SPLASH_DRAFT_QUERY_HEADS, KV head g's from head g * Group on,
+// of which those past the draft's own heads of g are zero rows.
 inline void draft_qkv_prepare_phase(
     device const bfloat *proposal_qkv, device bfloat *queries,
     device const bfloat *q_norm, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
     device bfloat *query_keys, device bfloat *query_values,
     threadgroup float *reductions, threadgroup bfloat *head, uint group,
-    uint thread_index, uint lane, uint simd_group) {
+    uint thread_index, uint lane, uint simd_group, uint PackedWidth,
+    uint query_heads) {
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS,
                  QHeads = SPLASH_DRAFT_QUERY_HEADS,
                  KVHeads = SPLASH_DRAFT_KV_HEADS,
                  HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
-  constexpr uint QWidth = SPLASH_DRAFT_ATTENTION_WIDTH, KWidth = KVHeads * HeadDim;
-  constexpr uint PackedWidth = SPLASH_DRAFT_QKV_WIDTH;
+  constexpr uint KWidth = KVHeads * HeadDim, Group = QHeads / KVHeads;
+  const uint QWidth = query_heads * HeadDim, own = query_heads / KVHeads;
   constexpr uint QueryTasks = Rows * QHeads;
   constexpr uint Tasks = QueryTasks + Rows * KVHeads;
 
@@ -77,15 +81,20 @@ inline void draft_qkv_prepare_phase(
     uint heads = query ? QHeads : KVHeads;
     uint row = local_task / heads;
     uint attention_head = local_task % heads;
+    // A grouped query head past its KV head's own is a zero row.
+    const bool padding = query && attention_head % Group >= own;
+    const uint source_head =
+        query ? attention_head / Group * own + attention_head % Group
+              : attention_head;
     device const bfloat *source =
-        query ? proposal_qkv + row * PackedWidth + attention_head * HeadDim
+        query ? proposal_qkv + row * PackedWidth + source_head * HeadDim
               : proposal_qkv + row * PackedWidth + QWidth +
                     attention_head * HeadDim;
     device const bfloat *weight = query ? q_norm : k_norm;
     device bfloat *destination = (query ? queries : query_keys) +
                                  (attention_head * Rows + row) * HeadDim;
 
-    float value = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
+    float value = thread_index < HeadDim && !padding ? float(source[thread_index]) : 0.0f;
     const float inverse = rms_inverse_of_sums(value * value, HeadDim,
                                               reductions, thread_index, lane,
                                               simd_group);
@@ -187,6 +196,7 @@ inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
     device float *partial, uint value_stride, uint cache_length, uint split,
+    uint window, bool row_uniform,
     threadgroup float *score_storage, threadgroup float *row_max,
     threadgroup float *row_sum, threadgroup float *previous_scale,
     uint thread_index, uint lane, uint simd_group) {
@@ -194,8 +204,9 @@ inline void draft_attention_split_phase(
                    D = SPLASH_DRAFT_HEAD_DIMENSION, TileK = 64;
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW,
                  Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
-  uint common_start =
-      cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
+  // The earliest key any row sees: the first row's window's
+  // (DraftAttentionBatchParams), which the ring holds (window < Window).
+  uint common_start = cache_length >= window ? cache_length - window : 0;
   uint old_count = cache_length - common_start;
   uint physical_start = common_start % Window;
   // Live tiles: [0, wrapped) when the window wraps, then [resume, tail_end);
@@ -265,7 +276,8 @@ inline void draft_attention_split_phase(
       uint proposal_row = matrix_row % Rows;
       uint query_position = cache_length + proposal_row;
       uint row_start =
-          query_position >= Window - 1 ? query_position - (Window - 1) : 0;
+          row_uniform ? common_start
+                      : (query_position >= window ? query_position - window : 0);
       uint hidden_prefix = row_start - common_start;
       float local_scores[4];
       float tile_max = -INFINITY;
@@ -438,14 +450,17 @@ inline void draft_attention_split_phase(
 // take the place of the grouped query rows the splits have read.
 inline void draft_attention_reduce_phase(device const float *partials,
                                          device bfloat *output, uint kv_head,
-                                         uint thread_index) {
+                                         uint query_heads, uint thread_index) {
   constexpr uint M = SPLASH_DRAFT_ATTENTION_ROWS, D = SPLASH_DRAFT_HEAD_DIMENSION,
-                 Rows = SPLASH_DRAFT_QUERY_ROWS,
-                 QHeads = SPLASH_DRAFT_QUERY_HEADS, Stride = M * D + 2 * M,
+                 Rows = SPLASH_DRAFT_QUERY_ROWS, Stride = M * D + 2 * M,
                  Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
   constexpr uint Chunk = D / 8;
   uint row = thread_index / 8;
   uint dim = (thread_index % 8) * Chunk;
+  // A grouped head past the KV head's own has no output row.
+  const uint own = query_heads / SPLASH_DRAFT_KV_HEADS;
+  if (row / Rows >= own)
+    return;
   float maximum = -INFINITY;
   for (uint split = 0; split < Splits; ++split)
     maximum = max(maximum, partials[split * Stride + M * D + row]);
@@ -466,9 +481,9 @@ inline void draft_attention_reduce_phase(device const float *partials,
       accumulated[i] += scale * partial[row * D + dim + i];
   }
   uint proposal_row = row % Rows;
-  uint query_head = kv_head * (M / Rows) + row / Rows;
+  uint query_head = kv_head * own + row / Rows;
   device bfloat *destination =
-      output + (proposal_row * QHeads + query_head) * D + dim;
+      output + (proposal_row * query_heads + query_head) * D + dim;
   for (uint i = 0; i < Chunk; ++i)
     destination[i] = bfloat(accumulated[i] / total);
 }
@@ -500,12 +515,13 @@ kernel void draft_attention_qkv(
     device const float *rope_sin [[buffer(5)]],
     device bfloat *query_keys [[buffer(6)]],
     device bfloat *query_values [[buffer(7)]],
+    constant DraftPrepareParams &params [[buffer(8)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr ulong Packed = SPLASH_DRAFT_QKV_WIDTH;
+  const ulong Packed = params.packed_width;
   constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
   constexpr ulong KVHeads = SPLASH_DRAFT_KV_HEADS;
   constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
@@ -521,7 +537,8 @@ kernel void draft_attention_qkv(
       rope_cos + batch * RopeStride, rope_sin + batch * RopeStride,
       query_keys + batch * KVHeads * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows, reductions, head,
-      group.x, thread_index, lane, simd_group);
+      group.x, thread_index, lane, simd_group, params.packed_width,
+      params.query_heads);
 }
 
 // Grid {kv heads, lanes, splits}: every split streams its share of the live
@@ -566,6 +583,7 @@ kernel void draft_attention_bf16_split(
       query_values + batch * KVHeads * HeadDim * Rows +
           group.x * Rows * HeadDim,
       partials, params.value_stride, params.cache_length[batch], group.z,
+      params.window, params.row_uniform != 0,
       workspace, workspace + AttentionM * AttentionN,
       workspace + AttentionM * AttentionN + AttentionM,
       workspace + AttentionM * AttentionN + 2 * AttentionM, thread_index,
@@ -588,6 +606,7 @@ kernel void draft_attention_bf16_reduce(
                                              params.lanes * Rows * Attention) +
       (batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS *
           PartialFloats;
-  draft_attention_reduce_phase(partials, queries + batch * Rows * Attention,
-                               group.x, thread_index);
+  draft_attention_reduce_phase(partials,
+                               queries + batch * Rows * params.query_heads * HeadDim,
+                               group.x, params.query_heads, thread_index);
 }

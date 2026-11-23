@@ -82,6 +82,30 @@ struct SamplingPolicy final {
   [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F && minP < 1.0F && topK != 1; }
 };
 
+// What a target's head makes of its logits before any policy, acceptance
+// or readout reads them (model::QwenTargetDimensions::logitCap): a
+// non-zero softcap makes each logit softcap * tanh(logit / softcap), and a
+// non-zero validVocabulary below the head's vocabulary makes the logits of
+// the tokens from it on -inf, which no policy selects (the rows that pad a
+// vocabulary to whole tiles), nor a readout counts. The default does nothing.
+struct LogitCap final {
+  float softcap = 0.0F;
+  uint32_t validVocabulary = 0;
+
+  [[nodiscard]] constexpr bool active(uint32_t vocabulary) const noexcept {
+    return softcap != 0.0F || (validVocabulary && validVocabulary < vocabulary);
+  }
+  bool operator==(const LogitCap &) const = default;
+};
+
+// The logit cap of `rows` rows of fp32 `logits` of `vocabulary` tokens each,
+// in place, right after the head that wrote them: nothing for a cap that
+// does nothing (LogitCap::active). Throws for a negative or non-finite
+// softcap, a valid vocabulary past the vocabulary, or logits that do not hold
+// the rows.
+void addLogitCap(metal::CommandGraph &graph, const metal::MetalBuffer &logits, uint32_t rows, uint32_t vocabulary,
+                 LogitCap cap);
+
 // The penalty words of every state lane, one row of vocabulary words each,
 // and the row each lane of a dispatch reads. Dispatch lanes follow the batch
 // plan, not state lanes, so a lane never binds a row by its own index.

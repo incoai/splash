@@ -120,8 +120,9 @@ std::array<uint64_t, prefillTensorCount> prefillTensorBytes(const RuntimeGeometr
       bytesFor<float>(geometry.draftRotaryPairs()));
   put(PrefillTensor::ContextProjected,
       bytesFor<uint16_t>(uint64_t{rows} * geometry.draft.hiddenSize));
+  // A row's context rows: a DSpark draft's one a layer.
   put(PrefillTensor::ContextHidden,
-      bytesFor<uint16_t>(uint64_t{rows} * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{rows} * geometry.draft.stateLayout().contextWidth));
   put(PrefillTensor::ContextKv,
       bytesFor<uint16_t>(uint64_t{rows} *
                          geometry.draft.contextKvSize()));
@@ -133,15 +134,17 @@ std::array<uint64_t, prefillTensorCount> prefillTensorBytes(const RuntimeGeometr
                       geometry.draftRotaryPairs()));
   // The split partials and counters, the rotated rows, the register tile's
   // tables of the plans of up to 32 rows and the int8 tile's codes and scales
-  // of a full chunk: the target's, and the draft's context projections' on
+  // of a full chunk: the target's, and any draft's context projections' on
   // the draft's plans.
   ops::LinearScratchSize linear;
   for (const auto &projection : geometry.target.prefillProjections)
     linear.include(operators.linear().scratchSize(projection, rows));
   const auto &draft = geometry.draft;
-  for (const ops::ProjectionShape projection :
-       {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
-    linear.include(operators.draftLinear().scratchSize(projection, rows));
+  if (draft.present())
+    linear.include(operators.draftLinear().scratchSize({draft.contextKvSize(), draft.hiddenSize}, rows));
+  // A DFlash2 draft's context projection; a DSpark draft mixes its features.
+  if (draft.present() && draft.kind == DraftKind::DFlash2)
+    linear.include(operators.draftLinear().scratchSize({draft.hiddenSize, draft.targetHiddenSize()}, rows));
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
   put(PrefillTensor::LinearTable, linear.input);
@@ -192,8 +195,12 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
-  const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+  // A model without a draft has no draft tensors: its draft's dimensions
+  // size them to nothing, and its attention none. Its selector's trees and
+  // host chains stay, which a cycle's rows are laid out from.
+  const auto draftWorkspace = geometry.draft.present()
+                                  ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                                  : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -208,7 +215,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::ContextProjected,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
   put(DecodeTensor::ContextHidden,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(r * geometry.draft.stateLayout().contextWidth));
   put(DecodeTensor::ContextKv,
       bytesFor<uint16_t>(r * geometry.draft.contextKvSize()));
   put(DecodeTensor::CapturedTargetHidden,
@@ -303,12 +310,12 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 
 namespace {
 
-// A draft projection of `outputSize` by `inputSize` as its checkpoint stores
-// it: af4g64 planes (DraftCheckpoint).
-ops::ProjectionShape draftShape(uint32_t outputSize, uint32_t inputSize) {
+// A draft projection of `outputSize` by `inputSize` as its weights load:
+// planes of the draft's projection format (DFlashDraftLayout::
+// projectionFormat).
+ops::ProjectionShape draftShape(uint32_t format, uint32_t outputSize, uint32_t inputSize) {
   return ops::Projection(outputSize, inputSize,
-                         ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_AF4G64, outputSize, inputSize, {},
-                                                                          {}, {})}})
+                         ops::BlockWeights{{ops::QuantizedSegment::planes(format, outputSize, inputSize, {}, {}, {})}})
       .shape();
 }
 
@@ -319,11 +326,23 @@ uint32_t draftStepLanes(const RuntimeGeometry &geometry, const ops::ExecutionPla
   const auto &t = geometry.target;
   const uint32_t rows = lanes * kDraftRows;
   uint32_t storage = rows;
-  for (const auto &[output, input] : {std::pair{d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize},
-                                      {d.hiddenSize, d.attentionSize}, {d.intermediateSize, d.hiddenSize},
-                                      {d.hiddenSize, d.intermediateSize}, {d.selectorRank, d.hiddenSize},
-                                      {d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}})
-    storage = std::max(storage, operators.draftLinear().storageRows(rows, draftShape(output, input)));
+  // A model without a draft binds its vocabulary head's rows alone. Every
+  // draft's block runs its attention, FFN and context projections; a
+  // DFlash2 draft's also its convolutions, selector and context projection.
+  if (d.present()) {
+    std::vector<std::pair<uint32_t, uint32_t>> shapes{{d.qkvSize, d.hiddenSize},
+                                                      {d.hiddenSize, d.attentionSize},
+                                                      {d.intermediateSize, d.hiddenSize},
+                                                      {d.hiddenSize, d.intermediateSize},
+                                                      {d.contextKvSize(), d.hiddenSize}};
+    if (d.kind == DraftKind::DFlash2)
+      shapes.insert(shapes.end(), {{d.dynamicSize, d.hiddenSize},
+                                   {d.selectorRank, d.hiddenSize},
+                                   {d.hiddenSize, d.targetHiddenSize()}});
+    for (const auto &[output, input] : shapes)
+      storage =
+          std::max(storage, operators.draftLinear().storageRows(rows, draftShape(d.projectionFormat, output, input)));
+  }
   // The target's vocabulary head and the draft's view of its subset's rows,
   // as the target's weights give them (QwenTargetGeometry::finish).
   for (const ops::ProjectionShape &shape : t.decodeProjections)
@@ -360,14 +379,21 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   // the draft among them, and the draft's context projections.
   for (const auto &p : geometry.target.decodeProjections)
     result.include(operators.decodeLinear().scratchSize(p, geometry.target.stepRows()));
+  if (!d.present())
+    return result;
+  result.include(
+      operators.draftDecodeLinear().scratchSize({d.contextKvSize(), d.hiddenSize}, geometry.target.stepRows()));
+  // The draft's own block, kDraftRows a lane; a DFlash2 draft's context
+  // projection, convolutions and selector besides.
+  for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.qkvSize, d.hiddenSize},
+       {d.hiddenSize, d.attentionSize}, {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize}})
+    result.include(operators.draftLinear().scratchSize(shape, geometry.target.lanes * kDraftRows));
+  if (d.kind == DraftKind::DSpark)
+    return result;
+  result.include(
+      operators.draftDecodeLinear().scratchSize({d.hiddenSize, d.targetHiddenSize()}, geometry.target.stepRows()));
   for (const ops::ProjectionShape shape :
-       {ops::ProjectionShape{d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}})
-    result.include(operators.draftDecodeLinear().scratchSize(shape, geometry.target.stepRows()));
-  // The draft's own block, kDraftRows a lane.
-  for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
-       {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
-       {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-       {d.selectorRank, d.hiddenSize}})
+       {ops::ProjectionShape{d.dynamicSize, d.hiddenSize}, {d.selectorRank, d.hiddenSize}})
     result.include(operators.draftLinear().scratchSize(shape, geometry.target.lanes * kDraftRows));
   return result;
 }

@@ -53,4 +53,16 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
   return {};
 }
 
+void Normalization::addRmsRows(metal::CommandGraph &graph, metal::MetalBuffer input, FloatElement inputElement,
+                               const NormWeights &weight, metal::MetalBuffer output, FloatElement outputElement,
+                               uint32_t width, uint32_t rows) {
+  if (inputElement == outputElement || !width || !rows)
+    throw std::invalid_argument("an RMS norm of rows goes between fp32 and bf16 rows");
+  requireBytes(input, uint64_t{rows} * width * elementBytes(inputElement), "norm input");
+  requireBytes(output, uint64_t{rows} * width * elementBytes(outputElement), "norm output");
+  graph.add(normKernel(std::string("norm_rms_rows_") + elementToken(inputElement) + "_" + elementToken(outputElement),
+                       weight, width),
+            {std::move(input), weight.buffer, std::move(output)}, width, {rows, 1, 1});
+}
+
 } // namespace splash::ops

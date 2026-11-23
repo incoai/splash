@@ -133,7 +133,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     shape.int8Experts = moeInt8Experts;
     return shape;
   }
-  // The layers whose output rows the DFlash2 draft reads, ascending.
+  // The layers whose output rows the draft reads, ascending; `layers`, the
+  // last, names the final normed rows of a target that captures them
+  // (finalNormCapture).
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   // The target's KV layout in the format the runtime stores KV in, and its
@@ -192,10 +194,11 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   }
   // The layout itself was checked by requireQwenLayout when the target
   // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
-  // of its layers, ascending. A target without GDN layers has no GDN shape.
-  // The projection lists hold every projection the weights dispatch, which
-  // each have sizes; a target with dense FFNs, a MoE target's leading layers
-  // too, holds their gate and up projections.
+  // of its layers, ascending, and a target without a draft none. A target
+  // without GDN layers has no GDN shape. The projection lists hold every
+  // projection the weights dispatch, which each have sizes; a target with
+  // dense FFNs, a MoE target's leading layers too, holds their gate and up
+  // projections.
   [[nodiscard]] bool valid() const noexcept {
     const auto sized = [](const std::vector<ops::ProjectionShape> &shapes) {
       return !shapes.empty() && std::all_of(shapes.begin(), shapes.end(), [](const auto &shape) {
@@ -203,9 +206,11 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       });
     };
     const auto captured = [&] {
-      if (!captureLayerCount || captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
+      if (!captureLayerCount) return true;
+      if (captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
       const auto ids = captureLayers();
-      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
+      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() &&
+             ids.back() < layers + finalNormCapture;
     };
     const bool dense = intermediateSize && sized(gateUpProjections);
     return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
@@ -480,6 +485,10 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
+  // The norm of its token embedding rows, which its first layer reads (a
+  // DSpark draft's anchor row takes it): none for a target that reads the
+  // rows as they are.
+  [[nodiscard]] virtual const ops::NormWeights *embeddingNorm() const noexcept { return nullptr; }
   // A prefill command of one or more chunks (a prefill group), run layer by
   // layer: a layer of each chunk in turn, then the next layer, so that a
   // layer whose experts stream loads the union of the chunks' experts once.
@@ -700,6 +709,13 @@ protected:
   // the input projection's plan's (a table its producer wrote, or plain).
   void addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
                        BlockOutput output) const;
+  // Where each of a step's sequences reads attention layer `layer`'s
+  // history, after the layer's projection stored the step's K/V: a decode
+  // lane its pages, or through its lists of `blocks` (one per sequence, when
+  // given), located where it reads spilled K/V; a prompt sequence its pages,
+  // or the staging the step's reads of spilled K/V fill.
+  [[nodiscard]] std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth>
+  attentionHistories(PrefillStep &step, uint32_t layer, std::span<const ops::AttentionBlocks> blocks = {}) const;
   void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
                        BlockOutput output, std::span<const ops::AttentionBlocks> blocks = {}) const;
   // The FFNs of a layer whose residual is one row of hiddenSize values: each
@@ -728,7 +744,8 @@ protected:
   // again: on a 12-core M6 the 27B's Q6_K head took 19.1 ms at 128 rows in
   // two passes against 27.0 on the staged tile's two row groups, which took
   // 13.9 against 17.5 at 96 rows (level or faster on a 20-core M5 Pro and an
-  // M4).
+  // M4). Its logits are then capped as the family's layout states
+  // (ops::addLogitCap).
   [[nodiscard]] ops::LinearInput headInput(const ops::Linear &linear, uint32_t rows) const;
   void addHead(metal::CommandGraph &graph, const ops::Linear &linear, metal::MetalBuffer input,
                metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch,

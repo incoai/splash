@@ -1026,8 +1026,7 @@ class ServerMainTests(unittest.TestCase):
         served = models / ".resolved/assembly"
         served.mkdir(parents=True)
         (served / "model.json").write_text("{}")
-        (served / "draft").mkdir()
-        (served / "draft/config.json").write_text('{"vocab_size": 248320}')
+        (served / "config.json").write_text('{"text_config": {"vocab_size": 248320}}')
         link = models / "owner/model"
         link.parent.mkdir()
         link.symlink_to(served, target_is_directory=True)
@@ -1215,13 +1214,17 @@ class CustomTemplateStartupTests(unittest.TestCase):
         data = b"{% for m in messages %}{{ m.content }}{% endfor %}\n"
         path = self.template("custom template.jinja", data)
         templates, tokenizer, _, status = self.start(main_args(chat_template_file=path))
+        # A Qwen model's template must end with a generation prompt; only a
+        # model that opens its turn itself takes a template without one.
         templates.assert_called_once_with(
-            tokenizer.return_value, override=data.decode()
+            tokenizer.return_value, override=data.decode(), opens_turn=False
         )
         self.assertEqual(self.file_lines(status), [f"Chat template file · {path}"])
         # Without one, the tokenizer's templates, and no line.
         templates, tokenizer, _, status = self.start(main_args())
-        templates.assert_called_once_with(tokenizer.return_value, override=None)
+        templates.assert_called_once_with(
+            tokenizer.return_value, override=None, opens_turn=False
+        )
         self.assertEqual(self.file_lines(status), [])
 
     def test_a_template_file_it_cannot_use_stops_startup_first(self):

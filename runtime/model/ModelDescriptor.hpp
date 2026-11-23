@@ -2,6 +2,7 @@
 
 #include "DFlashDraft.hpp"
 #include "Flint.hpp"
+#include "Inkling.hpp"
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -20,14 +21,14 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout, InklingLayout>;
 
 // The families Splash serves, values of the layout types TargetLayout holds,
 // one type for each architecture's code. A family of an architecture is one
 // more value here. Refusals name them in this order, and a config's model type
 // finds its family among those of its type in it (describeSourceModel).
 inline constexpr std::tuple kFamilies{Qwen3_8Layout{}, Qwen3_6MoeLayout{}, kQwen3_5_122BLayout, Qwen4ExpLayout{},
-                                      FlintLayout{}};
+                                      FlintLayout{}, InklingLayout{}};
 static_assert(std::apply([](const auto &...family) { return ((family.attentionNormMean > 0.0F) && ...); },
                          kFamilies),
               "every family states its attentionNormMean, by which its safetensors checkpoints' norm storage is told");
@@ -126,8 +127,9 @@ struct FamilyFacts final {
 // headers as the installer read them (its one file's, or each split part's
 // under the part's name), from which it plans the target as every start
 // plans the GGUF (gguf::planImages); and draft, once chosen, the DFlash2
-// draft's config.json. The installer runs it before any weight download
-// (the engine's model-check command).
+// draft's config.json or the directory of a DSpark draft's GGUF headers. The
+// installer runs it before any weight download (the engine's model-check
+// command).
 [[nodiscard]] std::string_view
 inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                            const std::filesystem::path &config,

@@ -1,4 +1,5 @@
 #include "ModelFactory.hpp"
+#include "model/DSparkDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
@@ -12,6 +13,7 @@
 
 #include <array>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -24,8 +26,8 @@ void requireCompatibleModel(const LoadedModel &model) {
       !std::visit(
           [&](const auto &target) {
             return model.descriptor.target == TargetLayout{target.layout} &&
-                   target.layout.vocabularySize ==
-                       model.draft.layout.vocabularySize;
+                   (!model.draft.layout.present() ||
+                    target.layout.vocabularySize == model.draft.layout.vocabularySize);
           },
           model.target)) {
     throw std::invalid_argument(
@@ -65,6 +67,10 @@ TargetWeights readTarget(metal::MetalBackend &backend, const FlintLayout &layout
   return loadFlintWeights(backend, layout, files);
 }
 
+TargetWeights readTarget(metal::MetalBackend &backend, const InklingLayout &layout, const QwenTargetFiles &files) {
+  return loadInklingWeights(backend, layout, files);
+}
+
 } // namespace
 
 SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
@@ -72,6 +78,8 @@ SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
 SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &) { return {}; }
 
 SparseRowStoreOptions streamedTableRows(const FlintLayout &) { return {}; }
+
+SparseRowStoreOptions streamedTableRows(const InklingLayout &) { return {}; }
 
 StreamedParts StreamedParts::loaded(const LoadedModel &model, bool kv) noexcept {
   const SparseRowStore *table = model.streamedTable();
@@ -139,11 +147,16 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   result.images = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
   WeightImages &images = *result.images;
   // Every source's metadata is checked before the first image is written:
-  // the vision tower's and the draft's here, the target's by its loader.
+  // the vision tower's and any draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  const DFlashDraftLayout &layout = result.descriptor.draft;
+  const bool dspark = layout.kind == DraftKind::DSpark;
+  std::optional<DraftCheckpointLoader> draft;
+  if (layout.present() && !dspark) draft.emplace(backend, images, root / "draft", layout);
   result.target = loadTarget(backend, images, root, result.descriptor, options);
-  result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
+  if (draft) result.draft = loadDFlashDraftWeights(backend, *draft, layout);
+  // A DSpark draft's GGUF is planned and checked as it loads.
+  if (layout.present() && dspark) result.draft = loadDSparkDraftWeights(backend, images, root / "draft", layout);
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),

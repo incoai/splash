@@ -43,7 +43,13 @@ uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
 //   without RoPE (NoPE) as well, for an AttentionVariant that is not rotated;
 // - windowTokens: a split and reduce over a window of that many keys before
 //   each row as well as over the whole history, for an AttentionVariant of
-//   that window; 0 without.
+//   that window; 0 without;
+// - relative: a relative geometry's (metal/abi/PagedAttention.h,
+//   RelativeProjection), without RoPE (no rotaryPairs) and gated: a prepare
+//   of query side rows and convolved keys and values, unscaled and
+//   positionScaled, in place of the q/k norms; splits that bias their scores
+//   by distance; and a reduce that adds its rows' own sinks and gates them,
+//   both from their query side rows (Inkling 2's).
 // Its q/k norm kernels take the norm types its families store (normKernel):
 // F32 and bf16, or F32 alone for the geometries of families whose norms load
 // as F32 from GGUFs and MLX images alike (Qwen3.8-Flash-Next's, Flint's:
@@ -58,15 +64,20 @@ struct CompiledAttention final {
   uint32_t rotaryPairs;
   bool unrotated;
   uint32_t windowTokens;
+  bool relative;
   std::string_view suffix;
   std::string_view commitSuffix;
 };
 constexpr std::array kCompiledAttention{
-    CompiledAttention{24, 4, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "", ""},
-    CompiledAttention{16, 2, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "_kv2_g8", "_kv2_g8"},
-    CompiledAttention{32, 2, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "_kv2_g16", "_kv2_g8"},
-    CompiledAttention{24, 2, 256, kv::Reads::SelectedBlocks, true, false, 32, false, 0, "_kv2_g12", "_kv2_vt"},
-    CompiledAttention{32, 4, 128, kv::Reads::EveryPage, false, true, 64, true, 512, "_kv4_g8_d128", "_kv4_d128"},
+    CompiledAttention{24, 4, 256, kv::Reads::EveryPage, true, false, 32, false, 0, false, "", ""},
+    CompiledAttention{16, 2, 256, kv::Reads::EveryPage, true, false, 32, false, 0, false, "_kv2_g8", "_kv2_g8"},
+    CompiledAttention{32, 2, 256, kv::Reads::EveryPage, true, false, 32, false, 0, false, "_kv2_g16", "_kv2_g8"},
+    CompiledAttention{24, 2, 256, kv::Reads::SelectedBlocks, true, false, 32, false, 0, false, "_kv2_g12",
+                      "_kv2_vt"},
+    CompiledAttention{32, 4, 128, kv::Reads::EveryPage, false, true, 64, true, 512, false, "_kv4_g8_d128",
+                      "_kv4_d128"},
+    CompiledAttention{24, 8, 128, kv::Reads::EveryPage, true, false, 0, true, 1023, true, "_kv8_g3_d128",
+                      "_kv8_d128"},
 };
 
 // Whether a compiled geometry's pages are a layout's: its KV heads, head
@@ -86,21 +97,26 @@ std::string_view commitSuffix(kv::Layout layout) {
 }
 
 // The compiled geometry of `queryHeads` over a layout's KV heads that reads
-// its pages as it does, so the kernels need no geometry branches, which must
-// compile a layer's variant.
-const CompiledAttention &compiledAttention(uint32_t queryHeads, kv::Layout layout,
-                                           AttentionVariant variant = {}) {
+// its pages as it does, so the kernels need no geometry branches.
+const CompiledAttention &compiledAttention(uint32_t queryHeads, kv::Layout layout) {
   static_cast<void>(commitSuffix(layout));
-  for (const CompiledAttention &compiled : kCompiledAttention) {
-    if (compiled.queryHeads != queryHeads || compiled.reads != layout.reads || !storesLayout(compiled, layout))
-      continue;
-    if ((!variant.rotated && !compiled.unrotated) ||
-        (variant.windowTokens && variant.windowTokens != compiled.windowTokens))
-      throw std::invalid_argument("no attention kernel for the layer's variant");
-    return compiled;
-  }
+  for (const CompiledAttention &compiled : kCompiledAttention)
+    if (compiled.queryHeads == queryHeads && compiled.reads == layout.reads && storesLayout(compiled, layout))
+      return compiled;
   throw std::invalid_argument(selectsBlocks(layout) ? "no sparse attention kernel for layout"
                                                     : "no paged-attention kernel for layout");
+}
+
+// The compiled geometry, which must compile a layer's variant: its rotation
+// (RoPE where the geometry has pairs), its window and its position scale (a
+// relative geometry's).
+const CompiledAttention &compiledAttention(uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) {
+  const CompiledAttention &compiled = compiledAttention(queryHeads, layout);
+  if ((!variant.rotated && !compiled.unrotated) || (variant.rotated && !compiled.rotaryPairs) ||
+      (variant.windowTokens && variant.windowTokens != compiled.windowTokens) ||
+      (variant.positionScaled && !compiled.relative))
+    throw std::invalid_argument("no attention kernel for the layer's variant");
+  return compiled;
 }
 
 // The attention kernel `name` with a suffix.
@@ -258,13 +274,23 @@ void requireQueries(const metal::MetalBuffer &queries, const CommandRows &rows, 
 }
 
 // A packed projection row: every query head's q and, gated, its gate, then
-// the K and V heads. The gates read each row's query heads only.
+// the K and V heads. The gates read each row's query heads only; a relative
+// geometry's, every row's query side row up to its sinks.
 uint64_t packedWidth(const CompiledAttention &compiled) {
   return (uint64_t{compiled.queryHeads} * (compiled.gated ? 2 : 1) + uint64_t{compiled.kvHeads} * 2) *
          compiled.headDimension;
 }
 uint64_t gateBytes(uint64_t rows, const CompiledAttention &compiled) {
+  if (compiled.relative)
+    return rowBytes(rows, relativeQuerySideWidth(compiled.queryHeads, compiled.headDimension),
+                    SPLASH_RELATIVE_SINKS(compiled.queryHeads, compiled.headDimension) + compiled.queryHeads,
+                    sizeof(float));
   return rowBytes(rows, packedWidth(compiled), uint64_t{compiled.queryHeads} * 2 * compiled.headDimension, 2);
+}
+
+// A relative geometry's rows' relative states, of every query head.
+uint64_t relativeStateBytes(uint64_t rows, uint32_t queryHeads) {
+  return rows * queryHeads * kRelativeWidth * sizeof(float);
 }
 
 // The q/k projection's bindings: the packed rows and norms, a rotated
@@ -359,7 +385,7 @@ AttentionPlan PagedAttention::plan(std::span<const kv::ChunkedPrefillParams> seq
   const uint64_t slots = std::min(capacity.partialsBytes / slot.partialsBytes,
                                   capacity.statisticsBytes / slot.statisticsBytes);
   const bool sparse = selectsBlocks(layout);
-  AttentionPlan plan(layout, queryHeads, sparse, kernel.sinks,
+  AttentionPlan plan(layout, queryHeads, sparse, kernel.sinks, kernel.relative,
                      static_cast<uint32_t>(std::min<uint64_t>(slots, std::numeric_limits<uint32_t>::max())));
   uint64_t splitReads = 0;
   for (const kv::ChunkedPrefillParams &chunk : sequences) {
@@ -422,9 +448,10 @@ AttentionWorkspace PagedAttention::workspace(uint32_t slots, uint32_t queryHeads
   return attentionWorkspace(slots * slotRows(queryHeads), layout.headDimension);
 }
 
-bool PagedAttention::compiles(uint32_t queryHeads, kv::Layout layout, bool gated, uint32_t rotaryPairs) {
+bool PagedAttention::compiles(uint32_t queryHeads, kv::Layout layout, bool gated, uint32_t rotaryPairs,
+                              bool relative) {
   const CompiledAttention &compiled = compiledAttention(queryHeads, layout);
-  return compiled.gated == gated && compiled.rotaryPairs == rotaryPairs;
+  return compiled.gated == gated && compiled.rotaryPairs == rotaryPairs && compiled.relative == relative;
 }
 
 kv::ChunkedPrefillParams PagedAttention::chunkParams(uint64_t logicalPosition, uint32_t chunkTokens,
@@ -447,6 +474,7 @@ void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffe
                                    std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
                                    uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
+  if (kernel.relative) throw std::invalid_argument("a relative geometry's rows take its relative projection");
   const CommandRows command = commandRows(sequences, layout);
   if (pageTables.size() != sequences.size())
     throw std::invalid_argument("a q/k projection takes a page table per sequence");
@@ -465,12 +493,52 @@ void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffe
             rowGroups(queryHeads + layout.kvHeads, command, sequences.size()), {layout.headDimension, 1, 1});
 }
 
+void PagedAttention::addRelativeProjection(metal::CommandGraph &graph, const RelativeProjection &inputs,
+                                           metal::MetalBuffer queries, metal::MetalBuffer states,
+                                           SplashKvLayer layer, std::span<const metal::MetalBuffer> pageTables,
+                                           std::span<const kv::ChunkedPrefillParams> sequences,
+                                           const AttentionRows &rows, uint32_t queryHeads, kv::Layout layout,
+                                           AttentionVariant variant) {
+  const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
+  if (!kernel.relative || variant.rotated)
+    throw std::invalid_argument("a relative projection takes an unrotated relative geometry");
+  const CommandRows command = commandRows(sequences, layout);
+  if (pageTables.size() != sequences.size())
+    throw std::invalid_argument("a q/k projection takes a page table per sequence");
+  requireRows(rows, command, sequences.size());
+  const uint64_t keyWidth = uint64_t{layout.kvHeads} * layout.headDimension;
+  requireBytes(inputs.querySide,
+               uint64_t{rows.rows} * relativeQuerySideWidth(queryHeads, layout.headDimension) * sizeof(float),
+               "attention query side");
+  requireBytes(inputs.keys, uint64_t{rows.rows} * keyWidth * sizeof(float), "attention keys");
+  requireBytes(inputs.values, uint64_t{rows.rows} * keyWidth * sizeof(float), "attention values");
+  requireBytes(inputs.queryScale, uint64_t{queryHeads} * layout.headDimension * sizeof(float),
+               "attention query scale");
+  requireBytes(inputs.relativeScale, uint64_t{queryHeads} * kRelativeWidth * sizeof(float),
+               "attention relative scale");
+  requireBytes(states, relativeStateBytes(rows.rows, queryHeads), "attention relative states");
+  requireQueries(queries, command, queryHeads / layout.kvHeads, layout, command.last.chunk_tokens);
+  for (size_t s = 0; s < sequences.size(); ++s) requirePageTable(pageTables[s], sequences[s]);
+  std::vector<metal::MetalBuffer> bindings{inputs.querySide,    inputs.keys,        inputs.values,    inputs.queryScale,
+                                           inputs.relativeScale, std::move(queries), std::move(states)};
+  const auto tables = laneBindings(pageTables);
+  bindings.insert(bindings.end(), tables.begin(), tables.end());
+  // Without tree rows the prepare binds another buffer of the dispatch for
+  // them, of which it reads nothing.
+  bindings.insert(bindings.end(), {rows.tree ? rows.tree : inputs.querySide, rows.layout});
+  graph.add(kernelName(kernelFormat(layout) + "_qkv", std::string(kernel.suffix) +
+                                                          (variant.positionScaled ? "_scaled" : "")),
+            std::move(bindings), everyRow(sequences, command, rows, layer),
+            rowGroups(queryHeads + layout.kvHeads, command, sequences.size()), {layout.headDimension, 1, 1});
+}
+
 PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPlan &plan,
                                            metal::MetalBuffer queries, const metal::MetalBuffer &partials,
                                            const metal::MetalBuffer &statistics,
                                            std::span<const kv::ChunkedPrefillParams> sequences,
                                            std::span<const AttentionHistory> histories, const AttentionRows &rows,
-                                           const AttentionOutputRows &output, metal::MetalBuffer sinks) {
+                                           const AttentionOutputRows &output, metal::MetalBuffer sinks,
+                                           const RelativeBias &relative) {
   const CommandRows command = commandRows(sequences, plan.layout);
   const std::span<const AttentionPlan::Sequence> planned = plan.sequences();
   if (planned.size() != sequences.size() || histories.size() != sequences.size())
@@ -517,6 +585,13 @@ PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const Att
   requireBytes(partials, workspace.partialsBytes, "attention partials");
   requireBytes(statistics, workspace.statisticsBytes, "attention statistics");
   requireSinks(sinks, plan.sinks, plan.queryHeads);
+  if (plan.relative) {
+    requireBytes(relative.states, relativeStateBytes(rows.rows, plan.queryHeads), "attention relative states");
+    requireBytes(relative.table, uint64_t{kRelativeExtent} * kRelativeWidth * sizeof(float),
+                 "attention relative table");
+  } else if (relative.states || relative.table) {
+    throw std::invalid_argument("the attention kernels take no relative bias");
+  }
   // A dispatch's sequences read one layer, which SplashAttentionParams::kv
   // places in their pages' extents: where a planned dispatch's sequences read
   // two placements (a spilled history staged apart from the pool), each run of
@@ -569,6 +644,7 @@ PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const Att
     // Without tree rows a split binds another buffer of the dispatch for
     // them, of which it reads nothing.
     split.insert(split.end(), {rows.tree ? rows.tree : partials, rows.layout});
+    if (plan.relative) split.insert(split.end(), {relative.states, relative.table});
     std::vector<metal::MetalBuffer> reduce{partials, statistics, gates, output.hidden, tableInput, tableSums,
                                            rows.layout};
     if (plan.sparse) {

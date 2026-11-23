@@ -1,5 +1,6 @@
 // The GGUF image planner on the small dense and MoE targets, a rotated dense
-// one and a small Flash-Next one: where each tensor goes and in which row
+// one, a small Flash-Next one, Flint's and Inkling's: where each tensor goes
+// and in which row
 // order, which F32 tensors it narrows to bf16, which float projections it
 // quantizes to Q8_0, where a streamed table's rows are, which part of a split
 // GGUF each tensor is read from, and the sources it refuses.
@@ -1026,6 +1027,176 @@ void checkFlint(const std::filesystem::path &directory) {
   }
 }
 
+// Inkling's GGUF (inkling2_loop) plans an image of each weight layer, which
+// the loop's passes share, as llama.cpp writes them: its sides stacked as
+// InklingSides lays them out (the queries, gate, relative values and sinks
+// padded to a tile; a global layer's keys and values with their dynamic
+// taps), a segment per run of tensors of one type; its F32 tensors as
+// stored; its MoE of no shared expert and its router's bias; the loop's
+// message queries and gates on the loop's weight layers alone. Its metadata
+// names each mismatch, its per-layer head counts and window and its loop
+// among them, and its tensors a loop gate missing or past the loop; a side's
+// F32 tensors are quantized into its Q8_0 run.
+void checkInkling(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = inklingGeometry();
+  const model::InklingSides sides = model::InklingSides::of(g);
+  std::vector<Tensor> tensors = targetTensors(g, inklingTypes());
+  randomize(tensors, 1200);
+  const auto path = directory / "inkling.gguf";
+  const auto planned = [&](const std::vector<test_gguf::Key> &keys, const std::vector<Tensor> &written,
+                           model::gguf::PlanOptions options = {}) {
+    splash::test::writeFile(path, test_gguf::file(keys, written));
+    return plan(path, g, options);
+  };
+  const Plan inkling = planned(metadata(g), tensors);
+  check(!inkling.error && g.weightLayers() == 4 && inkling.images.size() == g.weightLayers() + 2,
+        "planner plans the Inkling target, an image of each weight layer" +
+            (inkling.error ? ": " + *inkling.error : ""));
+  if (inkling.error) return;
+  // A repack of `rows` rows whose sources are the named tensors' rows in order.
+  const auto stackedOf = [](const model::gguf::Repack *repack, uint64_t rows,
+                            std::vector<std::pair<std::string, uint64_t>> sources) {
+    if (!repack || repack->rows != rows || repack->sources.size() != sources.size()) return false;
+    for (size_t index = 0; index < sources.size(); ++index)
+      if (repack->sources[index].name != sources[index].first || repack->sources[index].rows != sources[index].second)
+        return false;
+    return true;
+  };
+  const uint64_t hidden = g.hiddenSize, kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+  for (uint32_t layer = 0; layer < g.weightLayers(); ++layer) {
+    const model::gguf::Image &image = inkling.images[layer];
+    const std::string p = "blk." + std::to_string(layer) + ".", at = " of weight layer " + std::to_string(layer);
+    const bool global = layer >= 2, core = layer == 1 || layer == 2;
+    check(model::inklingGlobalLayer(g, layer) == global, "weight layer " + std::to_string(layer) + "'s window");
+    check(stackedOf(repackOf(image, p + "attn_q.weight"), sides.query,
+                    {{p + "attn_q.weight", g.attentionWidth},
+                     {p + "attn_gate.weight", g.attentionWidth},
+                     {p + "attn_rel.weight", 4 * g.relativeDimension},
+                     {p + "attn_sink_proj.weight", 4}}) &&
+              sides.query == 1152,
+          "planner stacks the query side" + at + ", padded to a tile");
+    for (const char *side : {"k", "v"}) {
+      std::vector<std::pair<std::string, uint64_t>> rows{{p + "attn_" + side + ".weight", kvRows}};
+      if (global) rows.push_back({p + "attn_" + side + "_conv_proj.weight", g.attentionKvHeads * 4});
+      check(stackedOf(repackOf(image, p + "attn_" + side + ".weight"), global ? 320 : 256, rows),
+            std::string("planner stacks the ") + side + " side" + at + (global ? " with its dynamic taps" : ""));
+    }
+    std::vector<std::string> stored{"attn_q_clip.weight",    "attn_rel_clip.weight", "attn_rel_bias.weight",
+                                    "attn_k_conv.weight",    "attn_v_conv.weight",   "attn_post_conv.weight",
+                                    "ffn_res_query.weight",  "ffn_norm.weight",      "ffn_post_conv.weight"};
+    if (layer) stored.push_back("attn_res_query.weight");
+    if (core) stored.push_back("loop_msg_query.weight");
+    for (const std::string &name :
+         global ? std::vector<std::string>{"attn_q_inp_norm.weight", "attn_k_inp_norm.weight", "attn_v_inp_norm.weight"}
+                : std::vector<std::string>{"attn_norm.weight"})
+      stored.push_back(name);
+    for (const std::string &name : stored)
+      check(asStored(copyOf(image, p + name), tensorNamed(tensors, p + name).data),
+            "planner copies the F32 tensor as stored: " + p + name);
+    check(!copyOf(image, p + "attn_res_query.weight") == !layer,
+          "planner reads the depth-attention queries of every weight layer's inputs but 0's" + at);
+    check(asStored(copyOf(image, p + "exp_probs_b.bias"), tensorNamed(tensors, p + "exp_probs_b.bias").data) &&
+              asStored(copyOf(image, p + "ffn_gate_inp.weight"), tensorNamed(tensors, p + "ffn_gate_inp.weight").data),
+          "planner copies the router and its selection bias" + at);
+    const auto *down = copyOf(image, p + "loop_q_ctrl_down.weight");
+    check(bool(down) == core && (!down || (down->source.rows == 64 && asStored(down, tensorNamed(tensors, p +
+              "loop_q_ctrl_down.weight").data))),
+          "planner copies the loop's float gates on the loop's weight layers alone" + at);
+    const auto *gateUp = repackOf(image, p + "ffn_gate_up_exps.weight");
+    check(gateUp && gateUp->rows == g.experts * g.expertIntermediateSize && image.repacks.size() == 7,
+          "planner plans the routed experts and no shared expert" + at);
+  }
+  for (const char *name : {"output_res_query.weight", "output_norm.weight", "token_embd_norm.weight"})
+    check(asStored(copyOf(inkling.images[g.weightLayers()], name), tensorNamed(tensors, name).data),
+          std::string("planner copies the head's F32 tensor as stored: ") + name);
+  const Plan streamed = planned(metadata(g), tensors, {.streamExperts = true});
+  check(!streamed.error && streamsExperts(inkling, streamed) &&
+            model::gguf::streamedExperts(std::span(streamed.images).first(g.weightLayers())).size() ==
+                g.weightLayers(),
+        "planner streams each weight layer's experts once, which its passes share");
+
+  // Tensors of several types: a run of one type a segment, the last padded.
+  std::vector<Tensor> mixed = tensors;
+  for (const std::string name : {"blk.2.attn_sink_proj.weight", "blk.2.attn_k_conv_proj.weight"}) {
+    Tensor &tensor = tensorNamed(mixed, name);
+    tensor.type = model::ggml::kBF16;
+    uint64_t rows = 1;
+    for (size_t i = 1; i < tensor.dims.size(); ++i) rows *= tensor.dims[i];
+    tensor.data = test_gguf::Bytes(2 * tensor.dims[0] * rows);
+  }
+  const Plan runs = planned(metadata(g), mixed);
+  check(!runs.error &&
+            stackedOf(repackOf(runs.images[2], "blk.2.attn_q.weight"), 1088,
+                      {{"blk.2.attn_q.weight", 512}, {"blk.2.attn_gate.weight", 512}, {"blk.2.attn_rel.weight", 64}}) &&
+            stackedOf(repackOf(runs.images[2], "blk.2.attn_sink_proj.weight"), 64,
+                      {{"blk.2.attn_sink_proj.weight", 4}}) &&
+            stackedOf(repackOf(runs.images[2], "blk.2.attn_k.weight"), 256, {{"blk.2.attn_k.weight", 256}}) &&
+            stackedOf(repackOf(runs.images[2], "blk.2.attn_k_conv_proj.weight"), 64,
+                      {{"blk.2.attn_k_conv_proj.weight", 8}}) &&
+            repackOf(runs.images[2], "blk.2.attn_sink_proj.weight")->format == GGUF_FMT_BF16,
+        "planner stacks a side of two types as a segment of each" + (runs.error ? ": " + *runs.error : ""));
+
+  const auto withKey = [&](const test_gguf::Key &replacement) {
+    std::vector<test_gguf::Key> keys = metadata(g);
+    for (test_gguf::Key &key : keys)
+      if (key.name == replacement.name) key = replacement;
+    return keys;
+  };
+  check(names(planned(withKey(test_gguf::uint32Key("inkling2_loop.loop.count", 3)), tensors),
+              {"does not match the target: loop.count 3 (expected 2)"}),
+        "planner names another loop");
+  check(names(planned(withKey(test_gguf::uint32Key("inkling2_loop.block_count", 6)), tensors),
+              {"block_count 6 (expected 4)"}),
+        "planner counts the weight layers, not the layers");
+  check(names(planned(withKey(test_gguf::boolArrayKey("inkling2_loop.attention.sliding_window_pattern",
+                                                      {true, false, false, false})),
+                      tensors),
+              {"attention.sliding_window_pattern"}),
+        "planner names a window of other weight layers");
+  check(names(planned(withKey(test_gguf::int32ArrayKey("inkling2_loop.attention.head_count_kv", {2, 2, 4, 2})),
+                      tensors),
+              {"attention.head_count_kv"}),
+        "planner names a weight layer of other KV heads");
+  check(names(planned(withKey(test_gguf::float32Key("inkling2_loop.attention.qk_clip", 16.0F)), tensors),
+              {"attention.qk_clip 16 (expected 22.6274)"}),
+        "planner names another clip");
+  check(names(planned(withKey(test_gguf::uint32Key("inkling2_loop.rope.dimension_count", 128)), tensors),
+              {"rope.dimension_count 128 (expected 0)"}),
+        "planner refuses a RoPE");
+  // bartowski's GGUFs keep the sinks' and the dynamic taps' projections F32:
+  // they join the side's Q8_0 run as the Q8_0 rows their values quantize to.
+  std::vector<Tensor> floatSides = tensors;
+  for (const std::string name : {"blk.2.attn_sink_proj.weight", "blk.2.attn_k_conv_proj.weight"}) {
+    Tensor &tensor = tensorNamed(floatSides, name);
+    uint64_t rows = 1;
+    for (size_t i = 1; i < tensor.dims.size(); ++i) rows *= tensor.dims[i];
+    tensor.type = model::ggml::kF32;
+    tensor.data = floatValues(tensor.dims[0] * rows, 1201);
+  }
+  const Plan floats = planned(metadata(g), floatSides);
+  const auto *floatQuery = floats.error ? nullptr : repackOf(floats.images[2], "blk.2.attn_q.weight");
+  const auto *floatKeys = floats.error ? nullptr : repackOf(floats.images[2], "blk.2.attn_k.weight");
+  check(stackedOf(floatQuery, sides.query,
+                  {{"blk.2.attn_q.weight", g.attentionWidth},
+                   {"blk.2.attn_gate.weight", g.attentionWidth},
+                   {"blk.2.attn_rel.weight", 4 * g.relativeDimension},
+                   {"blk.2.attn_sink_proj.weight", 4}}) &&
+            stackedOf(floatKeys, 320, {{"blk.2.attn_k.weight", 256}, {"blk.2.attn_k_conv_proj.weight", 8}}) &&
+            floatQuery->format == GGUF_FMT_Q80 && floatQuery->sources[3].type == model::ggml::kQ8_0 &&
+            floatQuery->sources[3].ggufFloatType == model::ggml::kF32 &&
+            floatQuery->sources[3].ggufFloatRowBytes == hidden * sizeof(float) &&
+            floatKeys->sources[1].ggufFloatType == model::ggml::kF32,
+        "planner quantizes a side's F32 tensors into its Q8_0 run" + (floats.error ? ": " + *floats.error : ""));
+  std::vector<Tensor> gateless = tensors;
+  std::erase_if(gateless, [](const Tensor &tensor) { return tensor.name == "blk.2.loop_k_ctrl_gain.weight"; });
+  check(names(planned(metadata(g), gateless), {"loop_k_ctrl_gain.weight (missing) in 1 layer"}),
+        "planner names a missing loop gate");
+  std::vector<Tensor> pastLoop = tensors;
+  pastLoop.push_back({"blk.3.loop_msg_query.weight", {hidden, 4}, model::ggml::kF32, floatValues(hidden * 4, 1202)});
+  check(names(planned(metadata(g), pastLoop), {"loop_msg_query.weight (unused) in 1 layer"}),
+        "planner refuses a loop tensor past the loop");
+}
+
 // llama.cpp NVFP4 weights each beside an F32 .scale and the .input_scale of
 // NVIDIA's W4A4 activations, of one value or one per expert of an experts
 // tensor: the planner reads the .input_scale, which a weights-only decode
@@ -1105,6 +1276,7 @@ int main() {
     guarded("planner on Flash-Next's PLE table", [&] { checkPleTable(directory.path()); });
     guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
     guarded("planner on Flint", [&] { checkFlint(directory.path()); });
+    guarded("planner on Inkling", [&] { checkInkling(directory.path()); });
     guarded("planner on NVFP4 activation scales", [&] { checkNvfp4InputScale(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;

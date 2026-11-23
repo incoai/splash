@@ -141,6 +141,26 @@ public:
   // holds.
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
            DraftVocabulary vocabulary, std::span<const DraftTreeLane> lanes) const;
+  // In add's place for a draft whose proposals are a chain of a recurrent
+  // head (a DSpark draft's, ops::DSpark::addMarkov), which wrote each lane's
+  // candidates (buffers.candidates) and their logits (buffers.unary) at each
+  // position along its chain, the chain's token first: each lane's tree of
+  // its chain, its rows' other candidates beside it and its host chain
+  // (DraftTreeParams::markov). The codebooks, logits and partials are
+  // unread.
+  void addChain(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
+                std::span<const DraftTreeLane> lanes) const;
+  // In add's place for a model without a draft, on the host: lane `lane`'s
+  // tree as add grows it of its host chain alone (a lane of no children,
+  // whose chain token agrees with no draft): its anchor and `chain`'s
+  // tokens, each the child of the one before it, of no draft probability
+  // (-1) and estimated at the product of `rates`, each token's rate, up to
+  // it, each row of cap 1 and drawing no children, so that a sampled verify
+  // row draws from the target's whole distribution. Its next positions'
+  // probabilities, which no row of no children reads, are left as they are.
+  // The trees' buffers are CPU-visible.
+  static void writeChain(const DraftSelectorBuffers &buffers, uint32_t lane, uint32_t anchor,
+                         std::span<const uint32_t> chain, std::span<const float> rates);
   // After add: the rows of a decode step of `step.lanes` lanes
   // (VerifyRowsParams), the trees' best rows that the step's rows and its
   // lane cap hold, none past an anchor estimated below `floor`, each lane's

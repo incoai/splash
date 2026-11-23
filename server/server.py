@@ -67,8 +67,8 @@ from .latency import RequestLatency
 from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
 from .output import (
-    ReasoningSplitter,
-    StreamingToolCallProjector,
+    reasoning_splitter,
+    tool_call_projector,
     validate_response_content,
 )
 from .protocol import MAX_IMAGE_SPANS
@@ -818,17 +818,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         start, each piece of output, the idle waits and prompt progress:
         streams send them, and complete Messages and Responses gather the
         output into blocks."""
-        splitter = ReasoningSplitter(job.thinking, job.may_call_tools, job.chat_format)
+        splitter = reasoning_splitter(job.thinking, job.may_call_tools, job.chat_format)
         # A chat answer is parsed as it arrives whether it streams or not:
         # its calls where tools may be called, and in any answer, a </think>
         # the model writes after its reasoning ended is dropped. A text
         # completion, without a chat template, is its text as written.
         projector = (
-            StreamingToolCallProjector(
+            tool_call_projector(
                 job.tool_policy,
                 job.public_id,
                 job.response_validator is not None,
-                job.chat_format.call_syntax,
+                job.chat_format,
             )
             if job.tool_policy is not None or job.reasoning is not None
             else None
@@ -1387,10 +1387,11 @@ def main():
         # Its vocabulary, which the grammars' table covers (ConstraintFactory).
         vocabulary = assembly.vocabulary(model_root)
         if args.reasoning_effort is not None and not (
-            family.chat_format.reasoning_switch
+            family.chat_format.reasoning_effort
         ):
-            # No effort reaches a model that opens its reasoning itself, so
-            # the server cannot set every request's.
+            # No effort reaches a model that opens its reasoning itself
+            # unless its template renders it as a level, so the server
+            # cannot set every request's.
             raise OptionError(
                 f"--reasoning-effort cannot set how {args.model} reasons: a "
                 f"{family.name} model decides each turn whether to reason, "
@@ -1448,7 +1449,9 @@ def main():
         thinking_end = thinking_end_tokens(
             tokenizer, args.thinking_end_text, family.chat_format
         )
-        chat_templates = ChatTemplates(tokenizer, override=custom)
+        chat_templates = ChatTemplates(
+            tokenizer, override=custom, opens_turn=family.chat_format.opens_turn
+        )
         print_status(f"Chat template · {chat_templates.describe()}")
         # Unset, a budget ends thinking as the template closes it, so that the
         # next request renders that close back as the tokens the reply ended
@@ -1459,8 +1462,8 @@ def main():
                 tokenizer, chat_templates.select(None).thinking_end, family.chat_format
             )
         # The grammars' table, built while the engine loads (0.82 s on a
-        # 32-core M5 Max): its vocabulary is the draft's, which the engine
-        # holds to its target's as it loads, and its stop tokens those
+        # 32-core M5 Max): its vocabulary is the target's, which the engine
+        # holds a draft's to as it loads, and its stop tokens those
         # check_capabilities holds to the Ready's.
         grammar_table = ConstraintFactory.table(
             tokenizer, family.chat_format, vocabulary

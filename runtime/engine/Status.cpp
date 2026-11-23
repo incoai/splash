@@ -812,8 +812,8 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
           .field("resets", executorTelemetry.draftStateResets);
     });
     // The rows decode cycles verify (--verify-rows): auto where the verify
-    // budget chooses them, all where they are every row of a draft's block a
-    // lane up to each lane's retention limit.
+    // budget chooses them, all where they are every row a lane holds up to
+    // its retention limit: a draft's block, or without a draft its host chain.
     w.field("verify_rows", executorTelemetry.verifyBudget ? "auto" : "all");
     w.key("model_timing");
     writeModelTiming(w, executorTelemetry);

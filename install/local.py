@@ -59,7 +59,8 @@ def prepare_local_model(
     weights) trained for the target's family. Without one, the draft
     released for the family is taken from the Hugging Face cache
     (HF_HUB_CACHE), at the commit last recorded there for its default
-    branch, as `hf download REPO` and `splash serve` record it.
+    branch, as `hf download REPO` and `splash serve` record it; a family
+    released without a draft is prepared without one.
     mmproj: a GGUF target's vision projector, a GGUF file, with which it
     serves images; a GGUF target serves text only without one, as one of a
     family without a vision tower (Flint) always does. An MLX target's
@@ -125,7 +126,7 @@ def _prepare(target, draft, mmproj, language_only, models_root):
     with tempfile.TemporaryDirectory(prefix="splash-target-") as scratch:
         source, inspected = _inspect(target, mmproj, language_only, Path(scratch))
         repo = _draft(inspected.family, draft)
-        files = upstream.draft_files(repo, inspected)
+        files = upstream.draft_files(repo, inspected) if repo else {}
     files |= {path: source.paths[name] for path, name in inspected.files.items()}
     record = upstream.assembly_record(str(target), inspected, source, repo)
     return upstream.publish(models_root, link, record, files)
@@ -255,9 +256,12 @@ def _draft(family, draft):
     """The draft's files: the directory draft, or else, without one, the
     draft released for family at the commit the Hugging Face cache records
     for its default branch, with no request to the Hub
-    (hub.Repository.resolve)."""
+    (hub.Repository.resolve); None for a family released without a draft,
+    whose model is prepared without one."""
     if draft:
         return hub.Repository.local_directory(draft)
+    if not family.draft_repo:
+        return None
     try:
         return hub.Repository.resolve(
             family.draft_repo,

@@ -162,7 +162,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](models.md#local-model-files). |
 | `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place. See [drafts](models.md#drafts). |
+| `--draft-model` | The family's released draft: its DFlash2 draft, or Inkling 2 Mini's DSpark draft | A compatible repository or local directory in its place; `none` serves the model without a draft, each decode cycle verifying its anchor and any host chain (prompt lookup, grammar-forced tokens). See [drafts](models.md#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -412,8 +412,10 @@ as Qwen describes for them: the factor is the context over the native window,
 so that the stretched window is the context asked for, such as 2 for
 `--max-context 512K` and about 3.81 for `1M`. Flint's full layers have no RoPE
 to stretch, so its native window is its most, and a longer `--max-context`
-stops its startup. Without `--max-context`, or at 256K or less, YaRN stays off, so
-answers and the persistent cache are the native window's. The budget must
+stops its startup; Inkling 2 Mini has no RoPE either, and its native window,
+1,048,576 tokens, is the most `--max-context` takes. Without `--max-context`,
+or at 256K or less, YaRN stays off, so answers and the persistent cache are
+the native window's. The budget must
 hold the context: about a million tokens of the 27B's int8 KV on a 64 GB Mac,
 more of the 35B's, whose KV per token is a third of the 27B's; where it does
 not, startup stops with the most it holds, which a `--max-context` of that
@@ -1236,6 +1238,13 @@ decides each turn whether to reason. Both reach its template and change
 nothing; a reply whose output opens with `<think>` returns that block as its
 reasoning, and any other reply is all answer
 ([chat formats](models.md#chat-formats)).
+
+Inkling 2's model, too, opens its reasoning itself, and no effort turns it
+off, but its template renders the effort as a level the model reads, a
+`Thinking effort level` system block (`none` 0, `minimal` 0.1, `low` 0.2,
+`medium` 0.7, `high` 0.9, `xhigh` and `max` 0.99; 0.9 without an effort), so
+both options set it, and a request may send a number from 0 to 0.99 as its
+`reasoning_effort` too.
 
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none

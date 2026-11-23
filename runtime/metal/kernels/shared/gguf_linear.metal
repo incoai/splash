@@ -3,8 +3,8 @@
 // matching llama.cpp Metal dequantize.h / mul_mm.metal (MIT notice in THIRD_PARTY_NOTICES). Keep activations BF16.
 // Weight planes and meta in the MDGG0001 layout (metal/abi/QuantFormat.h), decoded by kernels/common/quant_formats.h.
 // Activations bf16 [rows][K]; weights staged as fp16 in threadgroup memory; fp32 accumulation; bf16 output (fp32 from
-// the _a_f32 instances, the logits). Rotated PQ2_0 decode also runs in int8 activations (gguf_decode_int8_*, below):
-// int8 codes, int32 accumulation per 128-input block.
+// the _a_f32 instances: the logits, and rows a kernel after the projection reads in fp32). Rotated PQ2_0 decode also
+// runs in int8 activations (gguf_decode_int8_*, below): int8 codes, int32 accumulation per 128-input block.
 // Keep the source order of float operations, which Metal's default fast math lets the compiler reassociate. Set
 // before the includes, so it also holds for the shared format and reduction code compiled here.
 #pragma clang fp reassociate(off)
@@ -75,8 +75,9 @@ inline void gguf_store_gate_up(thread Acc &gate, thread Acc &up, uint splits, ui
 // not a multiple of the tile) skip their matmuls and stores, so a chunk costs its rows rounded up to RowsPerSG rather
 // than to the tile (a 33-row chunk: 1.7x faster than a 128-row tile). Full tiles run this loop too; a branch-free copy
 // for them is no faster.
-template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
-inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
+template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone,
+          class Out = bfloat>
+inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device Out *output,
                     uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
                     uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr) {
   const bool owns_rows = simd_group * RowsPerSG < rows;   // uniform per simdgroup
@@ -92,7 +93,7 @@ inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uch
     if (!acc.is_valid_element(i)) continue;
     auto index = acc.get_multidimensional_index(i);
     const ulong o = (ulong(simd_group) * RowsPerSG + index[1]) * out_stride + out_offset + output_origin + index[0];
-    output[o] = gguf_epilogue<Ep>(acc[i], aux, o);
+    output[o] = gguf_epilogue<Ep, Out>(acc[i], aux, o);
   }
 }
 
@@ -284,18 +285,20 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
   quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_PREFILL_THREADS);                                      \
   threadgroup half stage[kPrefillStages]
 // The plain kernel takes up to three segments of its format (GgufPrefillSegmentsParams), so the segments of a fused
-// projection that share a format run as one dispatch, grid.y over their column tiles in segment order.
-#define GGUF_PREFILL(F, f)                                                                                         \
-  kernel void gguf_prefill_##f##_a(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                            \
-                                   device bfloat *output [[buffer(10)]],                                          \
-                                   constant GgufPrefillSegmentsParams &p [[buffer(11)]], GGUF_PREFILL_THREAD) {    \
+// projection that share a format run as one dispatch, grid.y over their column tiles in segment order. Its output is
+// bf16 (a), or fp32 (a_f32: a projection whose rows a kernel after it reads in fp32, Inkling's attention sides,
+// ops::Projection::destination).
+#define GGUF_PREFILL(F, f, a, Out)                                                                                 \
+  kernel void gguf_prefill_##f##_##a(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                          \
+                                     device Out *output [[buffer(10)]],                                           \
+                                     constant GgufPrefillSegmentsParams &p [[buffer(11)]], GGUF_PREFILL_THREAD) {  \
     GGUF_PREFILL_TABLES(F);                                                                                        \
     GGUF_SEGMENT_OF(group.y, p.cols);                                                                              \
     const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
-    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>(input + ulong(first) * p.input_size, w0, w1, meta,                        \
-                                         output + ulong(first) * p.out_stride, p.input_size,                       \
-                                         local * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,        \
-                                         p.out_stride, p.offset[s]);                                               \
+    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, \
+                      EpNone, Out>(input + ulong(first) * p.input_size, w0, w1, meta,                              \
+                                   output + ulong(first) * p.out_stride, p.input_size, local * GGUF_TILE_COLUMNS,  \
+                                   rows, stage, tl, simd_lane, simd_group, p.out_stride, p.offset[s]);             \
   }
 #define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep)                                                                        \
   kernel void gguf_prefill_##f##_##ep(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],                    \
@@ -307,8 +310,9 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
                                              group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,  \
                                              p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);       \
   }
-#define GGUF_PREFILL_FORMAT(F, f) \
-  GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)
+#define GGUF_PREFILL_FORMAT(F, f)                                                                                  \
+  GGUF_PREFILL(F, f, a, bfloat) GGUF_PREFILL(F, f, a_f32, float) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual)       \
+  GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
 #undef GGUF_PREFILL_FORMAT
 

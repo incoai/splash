@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
     __package__ = "install"
 
 from server import serve_options
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, INKLING, QWEN, ChatFormat
 
 from . import models
 
@@ -46,6 +46,12 @@ QWEN_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
 # What Flint's GGUF release states (general.sampling.temp, top_p, top_k),
 # which are Qwen's numbers.
 FLINT_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
+# What Inkling 2's release states: generation_config.json's temperature 1.0,
+# and no truncation. It states no top_k, which transformers' generate reads
+# as its default 50, and ggml-org's GGUFs state so (general.sampling.top_k);
+# vLLM and SGLang, which the release names, read none as off, and so do
+# Unsloth's GGUFs and recommendation (top_k 0, top_p 1.0).
+INKLING_SAMPLING = SamplingDefaults(temperature=1.0, top_p=1.0, top_k=0)
 
 
 @dataclass(frozen=True)
@@ -53,10 +59,13 @@ class ModelFamily:
     # The family's name, as the engine names it (each target layout's family,
     # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp and Flint.hpp).
     name: str
-    # The repository of the DFlash2 draft released for the family, as its
-    # release publishes it (config.json and BF16 safetensors). Installations
-    # follow its default branch as they follow the target's.
-    draft_repo: str
+    # The repository of the draft released for the family, as its release
+    # publishes it: a DFlash2 checkpoint (config.json and BF16 safetensors),
+    # or a DSpark draft's GGUF (upstream.dspark_gguf). Installations follow
+    # its default branch as they follow the target's. None for a family
+    # released without one: its models serve without a draft, as
+    # --draft-model none installs them, unless --draft-model names one.
+    draft_repo: str | None
     # How the family's model reasons and calls tools, and the tokens it
     # shares with the engine (server/chat_format.py).
     chat_format: ChatFormat
@@ -66,6 +75,11 @@ class ModelFamily:
     # loads from the target repository unless --language-only. The models of
     # a family without one serve text only, whatever their repository holds.
     vision: bool = True
+    # Whether the family's models serve without a draft (--draft-model none).
+    # Flint's do not: its target keeps no recurrent or auxiliary state, so
+    # without a draft a cached state would be empty, which the SSD cache's
+    # state slots cannot hold (ModelDescriptor.mm inspectModelRoot).
+    draftless: bool = True
 
 
 FAMILIES = (
@@ -84,8 +98,25 @@ FAMILIES = (
         QWEN,
         QWEN_SAMPLING,
     ),
-    # It has no vision tower.
-    ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
+    # It has no vision tower, and serves only with a draft.
+    ModelFamily(
+        "Flint",
+        "incoai/Flint-DFlash2",
+        FLINT,
+        FLINT_SAMPLING,
+        vision=False,
+        draftless=False,
+    ),
+    # Its DSpark draft is the GGUF Unsloth publishes beside its own
+    # quantizations, and it serves text only: its vision tower's projector
+    # (inkling2v) is none Splash loads yet.
+    ModelFamily(
+        "Inkling-2-Mini",
+        "unsloth/Inkling-2-Mini-GGUF",
+        INKLING,
+        INKLING_SAMPLING,
+        vision=False,
+    ),
 )
 
 
@@ -103,8 +134,9 @@ LAUNCHER_NEEDS = {"--language-only": "vision"}
 def option_report(engine_facts):
     """What each family, by name, makes of the options of `splash serve`,
     from its facts: engine_facts, each family's facts of its layout by name,
-    as the engine's families command gives them, and its own vision tower
-    and reasoning switch. Each family's report holds the flags of the
+    as the engine's families command gives them, and its own vision tower,
+    reasoning switch and whether a request's reasoning effort reaches its
+    model. Each family's report holds the flags of the
     options that need a fact it lacks (ServeOption.needs, LAUNCHER_NEEDS),
     which act on none of its models, and the context its models serve:
     their native window, and the most past it, with YaRN."""
@@ -119,6 +151,7 @@ def option_report(engine_facts):
         facts = engine | {
             "vision": family.vision,
             "reasoning_switch": family.chat_format.reasoning_switch,
+            "reasoning_effort": family.chat_format.reasoning_effort,
         }
         report[family.name] = {
             "unusable": [flag for flag, fact in needs.items() if not facts[fact]],

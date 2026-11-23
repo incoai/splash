@@ -15,7 +15,7 @@ from . import images as image_input
 from . import protocol as wire
 from . import request_fields
 from .backend import Job, ReasoningRequest
-from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START
 from .chat_messages import normalize_messages, template_messages
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
@@ -55,13 +55,17 @@ MIN_SAMPLING_TEMPERATURE = 0.01
 COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 
-def _generation_prompt(probed, rendered, tokens):
+def _generation_prompt(probed, rendered, tokens, opens_turn=False):
     """Whether the generation prompt opens a think block, and how many of the
     prompt's last tokens it is (zero where they differ from its tokens).
     `probed` is its text and tokens, as the startup probe found them for the
     request's template options, and the rendered prompt must end with that
-    text."""
+    text. A template whose model opens its turn itself (opens_turn,
+    ChatFormat.opens_turn) has none: its prompt ends with its last message,
+    which no thinking follows, and the reusable state is all of it."""
     text, ids = probed
+    if not text and opens_turn:
+        return False, 0
     if not text or not rendered.endswith(text):
         raise APIError(
             400, "chat template must end with an assistant generation prefix"
@@ -287,9 +291,12 @@ class Frontend:
         """What /v1/models reports of reasoning: the default template's
         (ChatTemplate.reasoning), with the server's default effort in place of
         the template's own, named by the listed effort it renders like; no
-        efforts where a request's effort decides nothing (reasoning_switch),
-        so that a client offers none."""
-        if not self.reasoning_switch:
+        efforts where a request's effort decides nothing, as it reaches no
+        model that opens its reasoning itself unless the template renders it
+        as a level (ChatFormat.reasoning_effort) and nothing reaches the
+        model where the server sets every request's, so that a client offers
+        none."""
+        if not self.chat_format.reasoning_effort or self.reasoning_effort is not None:
             return {"thinks": None, "efforts": [], "default": None}
         template = self.chat_templates.select(None)
         reasoning = dict(template.reasoning)
@@ -622,9 +629,10 @@ class Frontend:
         reasoning_effort = body.get("reasoning_effort")
         if reasoning_effort is None:
             reasoning_effort = self.default_reasoning_effort
-        if reasoning_effort is not None and (
-            not isinstance(reasoning_effort, str)
-            or reasoning_effort not in REASONING_EFFORTS
+        # A named effort, or a level where the template reads one
+        # (ChatFormat.effort_levels), which it renders as it is.
+        if reasoning_effort is not None and not self.chat_format.accepts_effort(
+            reasoning_effort
         ):
             raise APIError(400, "invalid reasoning_effort")
         preserve_thinking = body.get("preserve_thinking")
@@ -653,7 +661,11 @@ class Frontend:
             reasoning_effort, enable_thinking = self.reasoning_effort, None
             template_kwargs.pop("reasoning_effort", None)
         template_effort = template_kwargs.get("reasoning_effort")
-        messages = normalize_messages(body.get("messages"), vision=self.vision)
+        messages = normalize_messages(
+            body.get("messages"),
+            vision=self.vision,
+            text_parts=self.chat_format.frames is not None,
+        )
         tools, tool_policy = normalize_tools(
             body.get("tools"),
             body.get("tool_choice"),
@@ -680,7 +692,7 @@ class Frontend:
             template_kwargs,
             body.get("reasoning_effort"),
             template_effort
-            if template_effort in REASONING_EFFORTS
+            if self.chat_format.accepts_effort(template_effort)
             and self.chat_templates.select(tools).reads_effort
             else None,
         )
@@ -773,7 +785,10 @@ class Frontend:
         thinking, generation_prompt_tokens = False, 0
         if add_generation_prompt:
             thinking, generation_prompt_tokens = _generation_prompt(
-                chat_template.generation_prompt(options), rendered, tokens
+                chat_template.generation_prompt(options),
+                rendered,
+                tokens,
+                self.chat_format.opens_turn,
             )
         head_tokens = _head_tokens(
             prompt.messages, prompt.tools, tokens, self.turn_openings
@@ -933,8 +948,7 @@ class Frontend:
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + chat_format.call_syntax.function_opening(name),
-                    add_special_tokens=False,
+                    chat_format.call_opening(name), add_special_tokens=False
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",
             )

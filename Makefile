@@ -260,6 +260,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/DenseLinear.cpp \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/DraftSelector.cpp \
+	runtime/ops/DSpark.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
@@ -271,6 +272,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/HyperConnection.cpp \
 	runtime/ops/NgramEmbedding.cpp \
 	runtime/ops/BlockIndexer.cpp \
+	runtime/ops/ShortConvolution.cpp \
+	runtime/ops/BlockResidual.cpp \
+	runtime/ops/LoopControl.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
 	runtime/ops/KvSlotFormat.cpp \
@@ -329,12 +333,16 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen4Steps.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/Flint.cpp \
+	runtime/model/Inkling.cpp \
+	runtime/model/InklingSteps.cpp \
+	runtime/model/InklingTarget.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
+	runtime/model/DSparkDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/ModelSizing.cpp \
 	runtime/model/SlotFile.cpp \

@@ -714,6 +714,13 @@ class ArchitectureTests(unittest.TestCase):
             ),
             {"gemma", "opal", "dflash"},
         )
+        # A family released without a draft goes by its name's words alone.
+        self.assertEqual(
+            check_architecture.family_words(
+                [("Inkling-2-Mini", None)], ("model/InklingTarget.hpp",)
+            ),
+            {"inkling"},
+        )
 
     def test_engine_policy_names_no_model_mechanism(self):
         name = "runtime/engine/Engine.cpp"

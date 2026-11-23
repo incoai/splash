@@ -43,6 +43,18 @@ UNUSABLE = {
         "--thinking-token-budget",
         "--thinking-end-text",
     },
+    "Inkling-2-Mini": {
+        "--language-only",
+        "--state-format",
+        "--cached-states",
+        "--ple-memory",
+        "--sparse-kv-memory",
+        "--disable-ane",
+        "--recalibrate-ane",
+        "--max-image-pixels",
+        "--thinking-token-budget",
+        "--thinking-end-text",
+    },
 }
 
 
@@ -56,14 +68,18 @@ class OptionReportTests(unittest.TestCase):
             {name: set(family["unusable"]) for name, family in report.items()},
             UNUSABLE,
         )
-        # Flint serves its native window alone; YaRN stretches the others'.
+        # Flint and Inkling serve their native windows alone; YaRN stretches
+        # the others'.
         self.assertEqual(
             {
                 name: (family["context_tokens"], family["max_context_tokens"])
                 for name, family in report.items()
             },
             {
-                name: (262144, 262144 if name == "Flint" else 1010000)
+                name: {
+                    "Flint": (262144, 262144),
+                    "Inkling-2-Mini": (1048576, 1048576),
+                }.get(name, (262144, 1010000))
                 for name in UNUSABLE
             },
         )

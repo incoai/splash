@@ -1,12 +1,13 @@
 // gguf-moe's two-pass reference (gguf_moe_test.mm): the gate and up passes that the production gate/up pass
 // (moe_expert_gguf_m<rows>_gate_up[_mixed]) runs in one, apart, each on the expert tile of the production down pass
 // (kernels/common/moe_gguf_expert_tile.h), built with the production flags: the gate pass writes bf16(gate), and the
-// up pass bf16(bf16(up) * silu(gate)) (gguf_epilogue<EpUpWithGate>) with the gate from `aux`. The production gate/up
-// pass's intermediate is bitwise theirs.
+// up pass bf16(bf16(up) * silu(gate)) (gguf_epilogue<EpUpWithGate>), or SiTU's bf16 of the two (moe_activation), with
+// the gate from `aux`. The production gate/up pass's intermediate is bitwise theirs. An instance of no shared expert
+// (_s0) never reads the shared planes it binds.
 #pragma clang fp reassociate(off)
 #include "metal/kernels/common/moe_gguf_expert_tile.h"
 
-template <ushort Rows, uint Shared, bool Up>
+template <ushort Rows, uint Shared, bool Up, MoeActivation Activation = MoeActivation::SwiGlu>
 kernel void gguf_moe_test_pass(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
                                device const uint *tile_count [[buffer(2)]], device uchar *sw0 [[buffer(3)]],
                                device uchar *sw1 [[buffer(4)]], device uchar *smeta [[buffer(5)]],
@@ -18,7 +19,11 @@ kernel void gguf_moe_test_pass(device bfloat *input [[buffer(0)]], device const 
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
   moe_gguf_expert_tile<Rows, Shared, Up ? 1 : 0>(input, tiles, tile_count, sw0, sw1, smeta, slots, p, chunks, group,
                                                  simd_lane, simd_group, stage, tl, [&](ulong o, float v) {
-                                                   if constexpr (Up) output[o] = gguf_epilogue<EpUpWithGate>(v, aux, o);
+                                                   if constexpr (Up && Activation == MoeActivation::SwiGlu)
+                                                     output[o] = gguf_epilogue<EpUpWithGate>(v, aux, o);
+                                                   else if constexpr (Up)
+                                                     output[o] = bfloat(moe_activation<Activation>(float(aux[o]),
+                                                                                                   float(bfloat(v))));
                                                    else output[o] = bfloat(v);
                                                  });
 }
@@ -33,3 +38,11 @@ template [[host_name("gguf_moe_test_m8_gate_s2")]] kernel GgufMoeTestPass gguf_m
 template [[host_name("gguf_moe_test_m8_up_s2")]] kernel GgufMoeTestPass gguf_moe_test_pass<8, 2, true>;
 template [[host_name("gguf_moe_test_m32_gate_s2")]] kernel GgufMoeTestPass gguf_moe_test_pass<32, 2, false>;
 template [[host_name("gguf_moe_test_m32_up_s2")]] kernel GgufMoeTestPass gguf_moe_test_pass<32, 2, true>;
+template [[host_name("gguf_moe_test_m8_gate_s0_situ")]] kernel GgufMoeTestPass
+    gguf_moe_test_pass<8, 0, false, MoeActivation::Situ>;
+template [[host_name("gguf_moe_test_m8_up_s0_situ")]] kernel GgufMoeTestPass
+    gguf_moe_test_pass<8, 0, true, MoeActivation::Situ>;
+template [[host_name("gguf_moe_test_m32_gate_s0_situ")]] kernel GgufMoeTestPass
+    gguf_moe_test_pass<32, 0, false, MoeActivation::Situ>;
+template [[host_name("gguf_moe_test_m32_up_s0_situ")]] kernel GgufMoeTestPass
+    gguf_moe_test_pass<32, 0, true, MoeActivation::Situ>;

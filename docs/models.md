@@ -29,8 +29,8 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
-`runtime/model/`) is an architecture, whose code its families share, and each
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp`, `Inkling.hpp`
+in `runtime/model/`) is an architecture, whose code its families share, and each
 family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
 another size of an architecture is one more value there, built by the
 constructor from a `QwenHybridLayout` its layout type gains with its second
@@ -204,6 +204,34 @@ token, one of them its EOS; the engine's check holds each to the family's,
 and the header's layer patterns to them. The token table must be of a format:
 RecursiveSI's int4 GGUF, whose table is F32, is refused before its download.
 
+Inkling 2 Mini's GGUFs (`inkling2_loop`, as llama.cpp writes them, such as
+`ggml-org/Inkling-2-Mini-GGUF`'s Q8_0, 27.8 GB, and IQ4_NL, 17.6 GB) hold 24
+weight layers, whose layers 6 to 17 run three times in a row: a row runs
+through 48 layers (`QwenTargetDimensions::weightLayers` and `weightLayer`),
+each with its K/V and its short convolutions' history of its own, and the
+images and MoE blocks are the weight layers', which the passes share. Its
+attention has no RoPE: 24 query heads over 8 KV heads of 128 with an
+additive bias of each row's 16 relative values against a bank of 1,024 key
+distances, a sink logit per row and head, L2-clipped queries and keys,
+RMS-normed values and a sigmoid output gate; every sixth layer attends every
+key, its queries scaled by `1 + 0.1 ln((p + 1) / 8192)` past 8,191 tokens, the
+others a window of the 1,024 keys that end at a row (`ops::PagedAttention`'s
+relative geometry). Causal short convolutions of 4 taps run on its keys and
+values, its attention output and its MoE output (`ops::ShortConvolution`),
+its residual is a depth attention over the outputs of its blocks of 6 layers
+(`ops::BlockResidual`), the loop's later passes gate each core layer's inputs
+with messages of the pass before (`ops::LoopControl`), its MoE routes 8 of 128
+SiTU experts by sigmoid plus a selection bias with no shared expert, and its
+head softcaps its logits at 30, its 966 padding rows past its 200,058 tokens
+at -inf. Its derived configuration is transformers' `text_config` in its own
+keys (`gguf.inkling_text_config`), held key by key to the family's, and the
+header's loop, window pattern, clips, softcaps and head counts (stated per
+weight layer) to them. It loads from a GGUF only, text only: its vision
+projector (`inkling2v`) is not loaded. Unsloth's `inkling2` files (its own
+looped layout) are refused before their download, and its UD-Q8_K_XL's
+NVFP4 down projections, whose 1,152 inputs hold no whole 256-input meta unit,
+cannot be planned.
+
 A split GGUF is the parts of one name, `NAME-0000K-of-0000N.gguf`: every part
 from 1 to N must be present, at the root or in its folder, and a folder that
 mixes the parts of several names is refused (`upstream.split_order`, and
@@ -303,7 +331,8 @@ inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
 
 ## Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
+A model decodes with a DFlash2 draft unless it is installed without one
+(below). Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
@@ -314,7 +343,36 @@ holds them. A checkpoint is installed only when the engine accepts its
 configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads.
 
-A draft's `config.json` states its layers, intermediate size, rotary base and
+Inkling 2 Mini's draft is a DSpark draft, which a draft repository without a
+`config.json` supplies as a GGUF at its root: `unsloth/Inkling-2-Mini-GGUF`'s
+`dspark-Inkling-2-Mini-Q8_0.gguf` (0.40 GB; `upstream.dspark_gguf` takes a
+repository's Q8_0 one where it holds several), whose header the engine checks
+with the target's before the download (`readDSparkHeader`, `dsparkLayout`). A
+DSpark draft (`model/DSparkDraft.hpp`) runs a block of 8 rows, the anchor's
+token embedding normed as the target's and 7 mask rows, through 3 layers of
+24 query heads over 8 KV heads of 128 that attend non-causally within the
+block and to its context in rings: layers 0 and 2 the 1,024 positions before
+the anchor, layer 1 its ring's 2,047. Each layer's context row mixes four of
+the target's rows (the outputs of its layers 4, 22 and 40 and its final
+normed row, which `InklingTarget` captures) by its own softmax weights and
+norm. Its rows' base logits are the target's head's; a Markov head over a
+rank-256 state then corrects each position's logits over the whole
+vocabulary from the token the position before chose and the lane's f_rnn
+row, a mix of its last retained row kept beside its rings, its output
+projection folded into the head once at start (`DraftModel::addSetup`). A
+greedy lane's chain takes each position's most likely token; a sampled lane
+draws it from the position's 16 candidates at its temperature, and the target
+accepts its rows with min(1, p/q), so outputs keep the target's distribution.
+Its chain and the lane's host chain grow one tree (`DraftSelector::addChain`).
+Measured on an M3 Ultra (IQ4_NL target, 22G, one greedy lane), it decodes 1.6
+to 1.9 times as many tokens a second as Inkling without a draft on code (89 and
+100 against 55 and 53) and 1.4 times on JSON, about as many on English prose
+(1.07 times) and fewer on Czech prose (0.83 times), whose draft rows the target
+accepts less often (1.4 tokens a cycle, against 2.0 to 3.6 on the others), so
+`--draft-model none` decodes such text faster. At 22G the automatic context is
+195,601 tokens with the draft and 232,465 without it.
+
+A DFlash2 draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
@@ -540,6 +598,35 @@ Qwen3.6-35B-A3B UD-Q4_K_M. Flint's vocabulary mixes its scripts through all
 its tokens (its first 98,304 hold 98.1% of English text's tokens and 88.5% of
 Russian text's), so its drafts propose from all of them.
 
+`--draft-model none` installs the target alone: the installer asks the Hub for
+no draft, downloads none and links no `draft/`, and the installation's
+`model.json` records its draft source as `null`, so it is an installation of
+its own beside the drafted one ([Model cache](server.md#model-cache)). A
+family released without a draft (its `families.FAMILIES` draft repository is
+`None`) installs so by default, from the Hub or from local files. The engine
+then loads no draft weights and allocates neither the draft's rings, its
+context windows, its decode rows nor its scratch (`DFlashDraftLayout{}`,
+whose `present()` is false), and the memory they took goes to the KV cache.
+Every decode cycle verifies each lane's anchor and its host chain: the
+tokens its grammar forces or its thinking end, or else its prompt-lookup
+chain, which the host lays out as the lane's tree, a chain whose rows the
+target verifies in one forward and whose acceptance keeps the path its
+selections follow, as with a draft. The chain's tokens are estimated by
+`model::LookupAcceptance` with no agreement with a draft, its counts refined
+by the cycles' outcomes under `--verify-rows auto` as with a draft, and that
+mode's measured step costs choose how many of a chain's rows a cycle
+verifies; under `--verify-rows all` it verifies all of them. A lane with no
+chain verifies its anchor alone, one row. No row is a draft's, so a sampled
+row draws from the target's whole distribution and keeps a chain token only
+where its draw is that token: outputs are the target's, greedy and sampled.
+Without a draft a model needs no mask token. Its cached states are the
+target's cells alone, so a family whose target keeps no recurrent or
+auxiliary state (Flint) serves only with its draft: its states would be
+empty, which the SSD cache's state slots cannot hold, and the installer
+refuses it before any download (`families.FAMILIES`), as the engine does.
+[Local model files](#local-model-files) of a family with a draft are always
+prepared with one: `--draft-model none` cannot be used with `--model-dir`.
+
 ## Vision
 
 Vision comes from the target repository: MLX's `vision_tower.*` tensors (or
@@ -599,8 +686,12 @@ ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
 come from that file; the supported profiles supply the pre-tokenization
 algorithms: `gpt2/qwen35` NFC and Qwen's split, `gpt2/flint` Flint's three
 splits (digits in runs of up to three, runs of Han and kana, then o200k's
-pattern) without a normalizer, each before byte-level BPE, as the release's
-own tokenizer.json has them. Unknown profiles, malformed metadata
+pattern) without a normalizer, and `gpt2/inkling2` o200k's pattern without a
+normalizer, whose BPE takes a split that is a token of its own whole
+(`ignore_merges`, as its tokenizer.json and tiktoken do; llama.cpp merges it,
+which tokenizes 337 of its 199,998 entries, ` Hours` among them,
+differently), each before byte-level BPE, as the release's own tokenizer.json
+has them. Unknown profiles, malformed metadata
 and automatic BOS/EOS insertion are rejected, with no cross-repository
 fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
 Model geometry is translated from the same metadata, subtracting any declared
@@ -757,6 +848,19 @@ format of the family its installation found, which the assembly records:
   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
   each tag a token; `<|end_of_text|>`, `<|user|>`, `<|observation|>` and
   `<|developer|>` stop.
+- Inkling 2's (`INKLING`): the model frames each part of its turn as a block
+  of its own (`MessageFrames`), `<|message_model|>` then
+  `<|content_thinking|>` (reasoning) or `<|content_text|>` (text) and the
+  block's text, or the function's name, `<|content_invoke_tool_json|>` and
+  `{"name":NAME,"args":{...}}` (`JsonCallSyntax`), each block closed by
+  `<|end_message|>`; `<|content_model_end_sampling|>` alone stops. The template
+  has no generation prompt: a prompt ends after its last block and the model
+  writes `<|message_model|>` itself. It renders the reasoning effort as a
+  `Thinking effort level` system block before the first message that is not a
+  system message (none 0, minimal 0.1, low 0.2, medium 0.7, high 0.9, xhigh
+  and max 0.99, default 0.9), which steers the reasoning the model opens
+  itself but never turns it off; a request may also send a number from 0 to
+  0.99 (`effort_levels`).
 
 A format holds the model's vocabulary and the engine's stop tokens, which are
 its target layout's; the tokens of `</think>`, of `<think>` where the model
@@ -771,6 +875,19 @@ and its tags, which the grammar compiler takes as tokens rather than text, are
 written as their tokens. A model that opens its reasoning itself closes it
 before a call, so a `<tool_call>` inside its think block is reasoning, as
 Flint's own parser reads it.
+
+Inkling's output is read block by block (`output.FrameSplitter`): reasoning
+blocks are reasoning, text blocks content, joined in order, and each call's
+JSON object streams its arguments as it is read, written compactly
+(`output.JsonCallProjector`), so that a closed call's arguments are valid JSON
+however the model wrote them. Its frames are control tokens in its GGUFs and
+special in its tokenizer.json, so the derived tokenizer adds the ones the
+server reads as tokens that are not special (`ChatFormat.decoded_tags`), which
+decoding keeps. Grammars write its blocks and calls as frames of their tokens:
+optional reasoning blocks, then text blocks and calls, or a response schema's
+JSON in a text block. A user's or tool's text parts render as blocks of their
+own, as its template renders them. Scoring reads its slots after
+`<|message_model|><|content_text|>`, its template's turn without reasoning.
 
 Flint's template renders as shipped: its roles, the tools block it adds before
 the first message that is not a system message, each assistant turn's

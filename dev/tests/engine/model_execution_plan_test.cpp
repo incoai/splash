@@ -37,7 +37,8 @@ model::DFlashDraftLayout draftOf() {
 }
 
 // A target of Weights' architecture at the sizes of `family`, its first
-// family's by default, its projections in `format`, paired with `draft`.
+// family's by default, its projections in `format`, paired with `draft` --
+// an empty layout installs no draft (--draft-model none).
 template <class Weights>
 model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
                                const model::DFlashDraftLayout &draft = draftOf<Weights>(),
@@ -242,13 +243,16 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
                                                      model::StreamedParts::loaded(loaded), runtimeLanes);
   const auto &d = geometry.draft;
   const auto &target = geometry.target;
-  // Each matrix with the rows a lane gives it.
-  std::vector<std::pair<ops::LinearMatrix, uint32_t>> matrices{
-      {{d.dynamicSize, d.hiddenSize}, model::kDraftRows},       {{d.qkvSize, d.hiddenSize}, model::kDraftRows},
-      {{d.hiddenSize, d.attentionSize}, model::kDraftRows},     {{d.intermediateSize, d.hiddenSize}, model::kDraftRows},
-      {{d.hiddenSize, d.intermediateSize}, model::kDraftRows},  {{d.selectorRank, d.hiddenSize}, model::kDraftRows},
-      {{d.contextKvSize(), d.hiddenSize}, model::kDecodeRows}, {{d.hiddenSize, d.targetHiddenSize()}, model::kDecodeRows},
-      {{target.draftVocabulary.columns(target.vocabularySize), target.hiddenSize}, model::kDraftRows}};
+  // Each matrix with the rows a lane gives it: the draft's, when the model
+  // has one, its head over its subset of the vocabulary among them.
+  std::vector<std::pair<ops::LinearMatrix, uint32_t>> matrices;
+  if (d.present())
+    matrices = {
+        {{d.dynamicSize, d.hiddenSize}, model::kDraftRows},       {{d.qkvSize, d.hiddenSize}, model::kDraftRows},
+        {{d.hiddenSize, d.attentionSize}, model::kDraftRows},     {{d.intermediateSize, d.hiddenSize}, model::kDraftRows},
+        {{d.hiddenSize, d.intermediateSize}, model::kDraftRows},  {{d.selectorRank, d.hiddenSize}, model::kDraftRows},
+        {{d.contextKvSize(), d.hiddenSize}, model::kDecodeRows}, {{d.hiddenSize, d.targetHiddenSize()}, model::kDecodeRows},
+        {{target.draftVocabulary.columns(target.vocabularySize), target.hiddenSize}, model::kDraftRows}};
   for (const auto &p : target.decodeProjections)
     matrices.push_back({{p.outputSize, p.inputSize}, model::kDecodeRows});
   for (uint32_t family : {9U, 10U, 11U})
@@ -500,6 +504,43 @@ void checkIndexTables() {
           "a lane's index table is not its block index's alone");
 }
 
+// A model without a draft has a geometry without one: it captures no target
+// layer, and its decode arena holds none of a draft's rows, its context's
+// nor its RoPE, nor its gate and linear scratch, while the trees and host
+// chains its cycles lay their rows out from, and the rows the target
+// verifies, stay as they are with a draft.
+template <class Weights>
+void checkWithoutDraft() {
+  const auto drafted = model::RuntimeGeometry::from(loadedModel<Weights>(), kv::Format::Int8,
+                                                    ops::GdnStateFormat::Float32);
+  const auto undrafted = model::RuntimeGeometry::from(loadedModel<Weights>({}, model::DFlashDraftLayout{}), kv::Format::Int8,
+                                                      ops::GdnStateFormat::Float32);
+  require(undrafted.draft == model::DFlashDraftLayout{} && !undrafted.target.captureLayerCount &&
+              drafted.target.captureLayerCount,
+          "a geometry without a draft captured target layers");
+  for (const auto tensor : {model::DecodeTensor::DraftHidden0, model::DecodeTensor::DraftProposalQkv,
+                            model::DecodeTensor::DraftFinalHidden, model::DecodeTensor::DraftRopeCos,
+                            model::DecodeTensor::DraftQueryKeys, model::DecodeTensor::ContextKv,
+                            model::DecodeTensor::CapturedTargetHidden, model::DecodeTensor::SelectorHidden})
+    require(decodeBytes(drafted, tensor) && !decodeBytes(undrafted, tensor),
+            "a decode arena without a draft holds a draft's rows");
+  for (const auto tensor : {model::DecodeTensor::InputTokens, model::DecodeTensor::TreeRows,
+                            model::DecodeTensor::VerifySources, model::DecodeTensor::Candidates,
+                            model::DecodeTensor::ChainTokens, model::DecodeTensor::ChainRates,
+                            model::DecodeTensor::DraftTreeTokens, model::DecodeTensor::DraftTrees,
+                            model::DecodeTensor::DraftTreeScores, model::DecodeTensor::DraftTreeDraws,
+                            model::DecodeTensor::DraftTreeCaps, model::DecodeTensor::DraftTreeSizes})
+    require(decodeBytes(undrafted, tensor) && decodeBytes(undrafted, tensor) == decodeBytes(drafted, tensor),
+            "a decode arena without a draft lays out or verifies otherwise");
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+  require(model::decodeArenaBytes(undrafted, plans) < model::decodeArenaBytes(drafted, plans) &&
+              model::plannedPrefillBytes(undrafted, plans) < model::plannedPrefillBytes(drafted, plans),
+          "the arenas of a model without a draft are not smaller than with one");
+}
+
 // A runtime whose K/V spills (one given the readers of spilled K/V,
 // model::RuntimeContext) runs its prefill commands as groups, which read an
 // attention layer's spilled history once each, and its decode arena holds
@@ -695,6 +736,57 @@ void checkDraftVocabulary() {
           "a subset whose parts cross was accepted");
 }
 
+// A MoE layout's blocks are of a compiled routing (ops::MoeShape::valid):
+// Qwen3.6-35B-A3B's experts without a shared expert pass with Inkling's
+// routing (a biased sigmoid router scaling by 8, SiTU experts) and are refused
+// with a softmax router or SwiGLU experts, which no compiled routing pairs
+// with no shared expert, and with a route scale of 0.
+void checkMoeRouting() {
+  auto inkling = model::Qwen3_6MoeLayout{};
+  inkling.moeRouter = ops::MoeRouter::SigmoidBiased;
+  inkling.sharedExpertSlices = 0;
+  inkling.sharedExpertGate = false;
+  inkling.routeScale = 8.0F;
+  inkling.moeActivation = ops::MoeActivation::Situ;
+  model::requireQwenLayout(inkling);
+  for (const auto &[change, what] :
+       std::initializer_list<std::pair<void (*)(model::Qwen3_6MoeLayout &), const char *>>{
+           {[](model::Qwen3_6MoeLayout &l) { l.moeRouter = ops::MoeRouter::Softmax; }, "a softmax router"},
+           {[](model::Qwen3_6MoeLayout &l) { l.moeActivation = ops::MoeActivation::SwiGlu; }, "SwiGLU experts"},
+           {[](model::Qwen3_6MoeLayout &l) { l.routeScale = 0.0F; }, "a route scale of 0"}}) {
+    auto changed = inkling;
+    change(changed);
+    rejects([&] { model::requireQwenLayout(changed); }, "Qwen target layout is inconsistent",
+            std::string("a MoE layout without a shared expert was accepted with ") + what);
+  }
+}
+
+// A head's logit cap (logitCap) is its family's: a layout that sets none
+// caps nothing and selects from its whole vocabulary; Inkling's softcap and
+// valid vocabulary pass, and a negative softcap or a valid vocabulary past
+// the head's are refused.
+void checkLogitCap() {
+  const model::Qwen3_6MoeLayout shipped;
+  require(!shipped.logitCap().active(shipped.vocabularySize) &&
+              shipped.selectableVocabularySize() == shipped.vocabularySize,
+          "a layout that sets no logit cap caps its logits");
+  auto capped = shipped;
+  capped.logitSoftcap = 30.0F;
+  capped.validVocabularySize = shipped.vocabularySize - 966;
+  model::requireQwenLayout(capped);
+  require(capped.logitCap() == ops::LogitCap{30.0F, shipped.vocabularySize - 966} &&
+              capped.selectableVocabularySize() == shipped.vocabularySize - 966,
+          "a layout's logit cap is not its softcap and valid vocabulary");
+  auto negative = capped;
+  negative.logitSoftcap = -30.0F;
+  rejects([&] { model::requireQwenLayout(negative); }, "Qwen target layout is inconsistent",
+          "a negative logit softcap was accepted");
+  auto past = capped;
+  past.validVocabularySize = shipped.vocabularySize + 64;
+  rejects([&] { model::requireQwenLayout(past); }, "Qwen target layout is inconsistent",
+          "a valid vocabulary past the head's was accepted");
+}
+
 } // namespace
 
 // A prefill chunk's attention plan follows the history its chunk committed:
@@ -725,6 +817,8 @@ int main() {
     checkCaptureLayers();
     checkGdnWidths();
     checkDraftVocabulary();
+    checkMoeRouting();
+    checkLogitCap();
     checkGateUpLayers();
     checkYarnGeometry();
     checkIndexTables();
@@ -732,9 +826,13 @@ int main() {
     checkArenasWithoutGdnLayers();
     checkDenseHalves();
     checkPrefillInt8Scratch();
+    checkWithoutDraft<model::Qwen3_8Weights>();
+    checkWithoutDraft<model::Qwen3_6MoeWeights>();
+    checkWithoutDraft<model::Qwen4ExpWeights>();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    checkLaneScratch(loadedModel<model::Qwen3_8Weights>({}, model::DFlashDraftLayout{}));
     checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {450'576'384, 434'864'128},
                               {749'715'456, 733'609'984});
     checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {279'281'664, 273'874'944},
@@ -743,13 +841,14 @@ int main() {
                               {409'796'608, 403'963'904}, {1'124'614'144, 1'118'781'440});
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>({}, model::DFlashDraftLayout{}));
     checkDecodeStepRows(loadedModel<model::Qwen3_8Weights>());
     checkDecodeStepRows(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>());
     checkMoeInt8Passes(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkDecodeStepMoe(loadedModel<model::Qwen4ExpWeights>());
-    std::cout << "model execution plans: PASS (three paired geometries)\n";
+    std::cout << "model execution plans: PASS (three paired geometries, three without a draft)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

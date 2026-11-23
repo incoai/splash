@@ -1020,9 +1020,44 @@ def _reasoning(thinking, chat_format):
     return "", None
 
 
+def _frame_rules(chat_format, response_schema=None):
+    """The rules of the blocks a framed format's model writes
+    (ChatFormat.frames): a reasoning block, a text block and, with a
+    response schema, the answer, a text block holding its JSON. Each frame
+    is its token, as the template writes it, and a block's text is TEXT,
+    which spells neither its close nor a call's opening, so that it reads
+    back as written."""
+    frames = chat_format.frames
+    header, close = f"<[{frames.header_id}]>", f"<[{frames.close_id}]>"
+    rules = [
+        f"think: {header} <[{frames.reasoning_id}]> TEXT {close}",
+        f"text: {header} <[{frames.text_id}]> TEXT {close}",
+        _text_rule(frames.close, frames.header),
+    ]
+    if response_schema is not None:
+        rules.append(
+            f"answer: {header} <[{frames.text_id}]> %json "
+            + json.dumps(
+                _grammar_compatible_schema(response_schema), separators=(",", ":")
+            )
+            + f" {close}"
+        )
+    return rules
+
+
+def _framed_json_grammar(schema, chat_format):
+    """json_grammar for a format whose model frames its blocks: any
+    reasoning blocks, then the JSON in a text block, as the model's own
+    reader takes a response format's answer."""
+    rules = ["%llguidance {}", "start: think* answer"]
+    return "\n".join(rules + _frame_rules(chat_format, schema)) + "\n"
+
+
 def json_grammar(schema, thinking, *, chat_format):
     """The output grammar of a request with a response schema and no tools:
     the reasoning chat_format lets come first (_reasoning), then the JSON."""
+    if chat_format.frames is not None:
+        return _framed_json_grammar(schema, chat_format)
     think, think_rule = _reasoning(thinking, chat_format)
     grammar = [
         "%llguidance {}",
@@ -1183,6 +1218,72 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
     return offered, policy
 
 
+def _json_arguments(schema):
+    """The arguments of a call laid out as JSON: a strict tool's generated to
+    its schema made strict (_strict_schema), as an object; any other's an
+    object."""
+    if schema is None or schema is True:
+        schema = {}
+    elif schema is not False:
+        schema = _strict_schema(_json_type_names(schema))
+    if isinstance(schema, dict) and "type" not in schema:
+        schema = {**schema, "type": "object"}
+    return "%json " + json.dumps(
+        _grammar_compatible_schema(schema), separators=(",", ":")
+    )
+
+
+def _framed_tool_grammar(policy, response_schema, chat_format):
+    """tool_grammar for a format whose model frames its blocks and lays a
+    call out as JSON in a frame of its own (Inkling's): each call is the
+    frame's header, the tool's name, the name's close, then the object of
+    the name and its arguments, as the template writes it, and the close.
+    Reasoning blocks may come first. A required choice then makes its
+    calls, one where calls are not parallel, as a named one makes its one
+    call; an auto choice may write text blocks, with reasoning between,
+    before its calls; beside an auto choice a response schema's answer
+    stands instead of the calls; tool_choice none writes no call. Calls are
+    the turn's last blocks, as the model's own reader takes them."""
+    syntax = chat_format.call_syntax
+    frames = chat_format.frames
+    calls = []
+    for index, name in enumerate(policy.schemas):
+        schema = policy.schemas[name] if name in policy.strict else None
+        opening = syntax.function_opening(name)[len(name) + len(syntax.name_close) :]
+        calls += [
+            f"call_{index}: <[{frames.header_id}]> {json.dumps(name)} "
+            f"<[{syntax.name_close_id}]> {json.dumps(opening)} arguments_{index} "
+            f'"}}" <[{frames.close_id}]>',
+            f"arguments_{index}: {_json_arguments(schema)}",
+        ]
+    call = (
+        "(" + " | ".join(f"call_{index}" for index in range(len(policy.schemas))) + ")"
+    )
+    repeat = "*" if policy.parallel else "?"
+    if not policy.schemas:
+        body = "(think | text)*" if response_schema is None else "think* answer"
+    elif policy.required:
+        body = f"think* {call}" + (f" {call}*" if policy.parallel else "")
+    elif response_schema is not None:
+        body = f"think* (({call}{'+' if policy.parallel else ''}) | answer)"
+    else:
+        body = f"(think | text)* {call}{repeat}"
+    grammar = [
+        "%llguidance {}",
+        f"start: {body}",
+        *_frame_rules(chat_format, response_schema),
+        *calls,
+    ]
+    return json.dumps(
+        {
+            "grammars": [
+                {"name": "tool_output", "lark_grammar": "\n".join(grammar) + "\n"}
+            ]
+        },
+        separators=(",", ":"),
+    )
+
+
 def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
     """The output grammar of a request whose tool calls are constrained, or
     whose tools stand beside a response schema: after the reasoning
@@ -1194,6 +1295,8 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
     text and further calls, and a single call by whitespace only. Beside an
     auto choice, a response schema admits its JSON answer instead of the
     calls."""
+    if chat_format.frames is not None:
+        return _framed_tool_grammar(policy, response_schema, chat_format)
     syntax = chat_format.call_syntax
     strict_arguments = {
         name: _argument_grammar(policy.argument_schemas[name], syntax)

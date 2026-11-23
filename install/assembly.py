@@ -25,7 +25,9 @@ The paths an assembly links, and what reads each:
                          the DFlash2 checkpoint (ModelDescriptor.mm,
                          DraftCheckpoint.cpp), with the mask token's
                          embedding, draft/mask_embedding.safetensors, when
-                         the release ships one
+                         the release ships one; none for an installation
+                         without a draft, whose record's draft source is
+                         null
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
@@ -186,14 +188,15 @@ def _well_formed(record):
         and isinstance(sources, dict)
         and set(sources) == {"target", "draft"}
         and all(
-            isinstance(source, dict)
+            (role == "draft" and source is None)
+            or isinstance(source, dict)
             and set(source) == {"repo", "revision"}
             and isinstance(source["repo"], str)
             and (
                 source["revision"] is None
                 or models.is_hex_digest(source["revision"], 40)
             )
-            for source in sources.values()
+            for role, source in sources.items()
         )
         and isinstance(files, dict)
         and all(
@@ -210,6 +213,11 @@ def _well_formed(record):
             )
             for name, entry in files.items()
         )
+        # An installation without a draft links none.
+        and (
+            sources["draft"] is not None
+            or not any(name.startswith("draft/") for name in files)
+        )
     )
 
 
@@ -224,7 +232,7 @@ def _snapshots(record):
             source["revision"],
         )
         for source in record["sources"].values()
-        if source["revision"] is not None
+        if source is not None and source["revision"] is not None
     }
     snapshots = {}
     for entry in record["files"].values():
@@ -276,12 +284,15 @@ def family(path: Path):
 
 
 def vocabulary(path: Path) -> int:
-    """The vocabulary the assembly path names serves: its DFlash2 draft's
-    (draft/config.json), which the engine refuses unless it is its target's
-    (ModelDescriptor.mm readDraftLayout)."""
-    size = models.read_json(Path(path) / "draft/config.json").get("vocab_size")
+    """The vocabulary the assembly path names serves: its target's, of its
+    config.json's text model (text_config, or a flat config's own), which
+    the engine holds a draft's to as it loads (ModelDescriptor.mm), and
+    which an assembly without a draft holds as well."""
+    config = models.read_json(Path(path) / "config.json")
+    text = config.get("text_config", config)
+    size = text.get("vocab_size") if isinstance(text, dict) else None
     if type(size) is not int or size <= 0:
-        raise models.ModelError(f"{path}/draft/config.json names no vocabulary size")
+        raise models.ModelError(f"{path}/config.json names no vocabulary size")
     return size
 
 

@@ -28,9 +28,13 @@ DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
 FLINT = families.named("Flint")
+INKLING = families.named("Inkling-2-Mini")
 # The families whose config.json fixture is the one the installer derives
-# from their GGUF; an MLX config.json of one is mlx-config.json.
-GGUF_CONFIGS = (FLASH_NEXT, FLINT)
+# from their GGUF; an MLX config.json of one is mlx-config.json. Of them,
+# the families no MLX checkpoint serves, whose targets the engine loads from
+# a GGUF only.
+GGUF_CONFIGS = (FLASH_NEXT, FLINT, INKLING)
+GGUF_ONLY = (INKLING,)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # An MLX config.json (of a GGUF_CONFIGS family, the one the installer derives
 # from its GGUF, beside its MLX mlx-config.json), a DFlash2 draft config and,
@@ -75,7 +79,11 @@ def mlx_target(root, family, *, changes=None):
 
 def draft_dir(root, family, **changes):
     """A DFlash2 release of family's draft: its config.json, with changes
-    (dotted keys), and weights."""
+    (dotted keys), and weights; or, for a family whose draft is a DSpark
+    GGUF (Inkling 2's), that GGUF's header (dspark_dir)."""
+    if (CONFIGS / family.name.lower() / "draft" / "dspark-metadata.json").exists():
+        assert not changes
+        return dspark_dir(root, family)
     root.mkdir(parents=True, exist_ok=True)
     draft = family_config(family, "draft/config.json")
     for key, value in changes.items():
@@ -86,6 +94,26 @@ def draft_dir(root, family, **changes):
         node[name] = value
     (root / "config.json").write_text(json.dumps(draft))
     (root / "model.safetensors").write_bytes(b"draft")
+    return root
+
+
+def dspark_dir(root, family):
+    """A DSpark release of family's draft: its GGUF's header without data,
+    as Unsloth's dspark-Inkling-2-Mini-Q8_0.gguf states it (but its
+    tokenizer, which the draft reads none of): the fixture's
+    draft/dspark-metadata.json and draft/dspark-tensors.json."""
+    root.mkdir(parents=True, exist_ok=True)
+    tensors = [
+        (name, extents, GGML[kind])
+        for name, (kind, extents) in family_config(
+            family, "draft/dspark-tensors.json"
+        ).items()
+    ]
+    write_target(
+        root / f"dspark-{family.name}-Q8_0.gguf",
+        family_config(family, "draft/dspark-metadata.json"),
+        tensors,
+    )
     return root
 
 
@@ -328,11 +356,14 @@ class FakeHub:
 
 def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
     """A FakeHub publishing MODEL at commit on main and the DFlash2 draft
-    released for each family at DRAFT_COMMIT on main."""
+    released for each family that has one at DRAFT_COMMIT on main."""
     fake = FakeHub(test, cache)
     fake.publish(MODEL, commit, lambda p: mlx_target(p, target))
     for family in families.FAMILIES:
-        fake.publish(family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
+        if family.draft_repo is not None:
+            fake.publish(
+                family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family)
+            )
     return fake
 
 

@@ -3,6 +3,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/MoE.h"
 #include "metal/abi/QuantFormat.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/moe_expert_chunk.h"
 
 // A grouped expert tile of at most tile_rows rows (kernels/shared/moe.metal)
@@ -42,6 +43,17 @@ inline void moe_live_rows(uint rows, Run run) {
       return run(integral_constant<ushort, 16>{});
   }
   run(integral_constant<ushort, Max>{});
+}
+
+// The experts' activation (ops::MoeActivation) of a row's gate and up
+// products, each bf16 of its sum, which the gate/up pass rounds to its bf16
+// intermediate: SwiGLU's up silu(gate), as gguf_epilogue<EpUpWithGate>
+// computes it, or SiTU's (splash_situ).
+enum class MoeActivation : uint { SwiGlu, Situ };
+template <MoeActivation Activation> inline float moe_activation(float gate, float up) {
+  if constexpr (Activation == MoeActivation::Situ)
+    return splash_situ(gate, up);
+  return up * splash_silu(gate);
 }
 
 // The shared slice that `id` names when the shared expert's slices take the

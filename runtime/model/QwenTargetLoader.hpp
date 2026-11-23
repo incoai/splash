@@ -12,6 +12,7 @@
 #include "ops/Normalization.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -80,8 +81,9 @@ struct MoeExperts final {
 
 // A MoE block of `target`'s sections in image order: its router, its routed
 // experts' gate, up and down (none when they stream), its shared expert's
-// gate, up and down and, where the target's has one, its scalar gate. Block
-// `block` of the store when its experts stream.
+// gate, up and down (none without one) and, where the target's has them, its
+// scalar gate and its router's selection bias. Block `block` of the store
+// when its experts stream.
 [[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, const QwenTargetDimensions &target,
                                                 const MoeExperts &experts, uint32_t block);
 
@@ -109,7 +111,7 @@ void readQwenTargetHead(Weights &result, const Layout &layout, Files &&files, co
 }
 
 // Reads a target through the files of its images, written from an upstream
-// source, in their format: per layer the input norm, mixer,
+// source, in their format: per weight layer the input norm, mixer,
 // post-attention norm and the architecture's FFN through readFfn (called
 // with the file, the layer's weights, the format and the layer's index),
 // then the head and the token embedding. Weights is the architecture's
@@ -119,9 +121,9 @@ template <class Weights, class Layout, class Files, class ReadFfn>
 readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetFormat &format, ReadFfn readFfn) {
   Weights result;
   result.layout = layout;
-  result.layers.reserve(layout.layers);
+  result.layers.reserve(layout.weightLayers());
 
-  for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
+  for (uint32_t layerIndex = 0; layerIndex < layout.weightLayers(); ++layerIndex) {
     const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
     WeightFile file = files.layer(layerIndex);
     auto &layer = result.layers.emplace_back();
@@ -139,35 +141,54 @@ readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetForm
 // Throws unless every dimension of a family's layout is set and the
 // dimensions agree with each other: the GDN's where it has GDN layers (and
 // none without), the packed attention rows of every query head's queries and,
-// gated, gates (attentionGate), a MoE target's leading dense layers
-// (intermediateSize wide) before at least one MoE layer, the sliding and
-// unrotated layers among the attention layers, and its drafts' subset of the
-// vocabulary (draftVocabulary) in it, whole QUANT_TILE_ROWS tiles of its
-// head's rows (DFlashDraft's view of them): a subset past the vocabulary
-// would wrap its logits width. The image planners hold each tensor to whole
-// plane tiles.
+// gated, gates (attentionGate), RoPE's pairs and base, or neither for a
+// target of no RoPE, whose every attention layer is then unrotated, a MoE
+// target's leading dense layers (intermediateSize wide) before at least one
+// MoE weight layer and blocks of a compiled routing (ops::MoeShape::valid; a
+// shared expert of no slices is none), a loop of weight layers among them,
+// run at least twice, the sliding and unrotated layers among the attention
+// layers, its drafts' subset of the vocabulary (draftVocabulary) in it, whole
+// QUANT_TILE_ROWS tiles of its head's rows (DFlashDraft's view of them): a
+// subset past the vocabulary would wrap its logits width, and its logit cap
+// (logitCap) a finite softcap of zero or more and a valid vocabulary inside
+// the head's. The image planners hold each tensor to whole plane tiles.
 template <class Layout> void requireQwenLayout(const Layout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
   const auto nonzero = [](auto... dimensions) { return ((dimensions != 0) || ...); };
   const bool dense = layout.ffnKind == QwenFfnKind::Dense;
   const uint32_t ffnWidth = dense ? layout.intermediateSize : layout.expertIntermediateSize;
   const bool ffnZero = dense ? zero(ffnWidth)
-                             : zero(layout.experts, layout.expertsPerToken, ffnWidth, layout.sharedExpertSlices) ||
+                             : zero(layout.experts, layout.expertsPerToken, ffnWidth) ||
                                    (layout.leadingDenseLayers && zero(layout.intermediateSize));
   const bool routingInconsistent =
-      !dense && (layout.expertsPerToken > layout.experts || layout.leadingDenseLayers >= layout.layers);
+      !dense && (layout.expertsPerToken > layout.experts || layout.leadingDenseLayers >= layout.weightLayers() ||
+                 !layout.moeBlockShape().valid());
+  const bool logitCapInvalid = !(layout.logitSoftcap >= 0.0F && std::isfinite(layout.logitSoftcap)) ||
+                               layout.validVocabularySize > layout.vocabularySize;
   const bool gdn = layout.gdnLayerCount() != 0;
   const bool gdnZero = zero(layout.packedGdnWidth, layout.convolutionDimension, layout.gdnKeyHeads,
                             layout.gdnValueHeads, layout.gdnHeadDimension);
-  if (ffnZero || !(layout.rotaryTheta > 0.0F) || (gdn && gdnZero) ||
+  const bool rotary = layout.rotaryPairs != 0;
+  if (ffnZero || (rotary ? !(layout.rotaryTheta > 0.0F) : layout.rotaryTheta != 0.0F) || (gdn && gdnZero) ||
       zero(layout.nativeContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
            layout.packedFullWidth, layout.attentionWidth, layout.attentionQueryHeads, layout.attentionKvHeads,
-           layout.attentionHeadDimension, layout.rotaryPairs, layout.fullAttentionPeriod))
+           layout.attentionHeadDimension, layout.fullAttentionPeriod))
     throw WeightStoreError("Qwen target layout contains a zero dimension");
   const uint32_t kvWidth = 2 * layout.attentionKvHeads * layout.attentionHeadDimension;
   const auto attentionMask = [&](uint64_t mask) {
     return layout.attentionLayerCount() >= 64 || !(mask >> layout.attentionLayerCount());
   };
+  // A target of no RoPE names every attention layer unrotated.
+  const uint64_t attentionLayers =
+      layout.attentionLayerCount() >= 64 ? ~uint64_t{0} : (uint64_t{1} << layout.attentionLayerCount()) - 1;
+  const bool unrotatedInconsistent = !rotary && layout.unrotatedLayers != attentionLayers;
+  // The loop's weight layers lie among the target's, and it runs them at
+  // least twice; a target without a loop names none.
+  const bool loopInconsistent =
+      layout.loopPasses ? layout.loopPasses < 2 || layout.loopStart >= layout.loopEnd ||
+                              uint64_t{layout.loopPasses - 1} * (layout.loopEnd - layout.loopStart) >= layout.layers ||
+                              layout.loopEnd > layout.weightLayers()
+                        : nonzero(layout.loopStart, layout.loopEnd);
   const ops::DraftVocabulary &subset = layout.draftVocabulary;
   const bool draftRowsOutside =
       subset != ops::DraftVocabulary{} &&
@@ -175,7 +196,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
        std::ranges::any_of(subset.rows(layout.vocabularySize), [](ops::Projection::RowRange range) {
          return range.first % QUANT_TILE_ROWS || range.count % QUANT_TILE_ROWS;
        }));
-  if (routingInconsistent ||
+  if (routingInconsistent || unrotatedInconsistent || loopInconsistent ||
       (gdn ? layout.gdnValueHeads % layout.gdnKeyHeads ||
                  layout.convolutionDimension !=
                      (2 * layout.gdnKeyHeads + layout.gdnValueHeads) * layout.gdnHeadDimension ||
@@ -186,7 +207,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
       layout.attentionWidth != layout.attentionQueryHeads * layout.attentionHeadDimension ||
       layout.packedFullWidth != (layout.attentionGate ? 2 : 1) * layout.attentionWidth + kvWidth ||
       !attentionMask(layout.unrotatedLayers) || !layout.kvLayout().valid() || !layout.gdnStateLayout().valid() ||
-      draftRowsOutside)
+      draftRowsOutside || logitCapInvalid)
     throw WeightStoreError("Qwen target layout is inconsistent");
 }
 

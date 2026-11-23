@@ -403,7 +403,8 @@ MoeConfig selectMoe(const KernelCalibration &calibration, Int8Activations int8Ac
   MoeConfig config;
   config.expertTile = routes > shape.experts ? MoeExpertTile::M32 : MoeExpertTile::M8;
   config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, routerFormat);
-  config.int8Passes = shape.int8Experts && int8PrefillPaths(calibration, int8Activations, step) &&
+  config.int8Passes = shape.int8Experts && shape.activation == MoeActivation::SwiGlu && shape.sharedSlices &&
+                      int8PrefillPaths(calibration, int8Activations, step) &&
                       rows > kMaximumDecodeTileRows && routes >= uint64_t{kInt8PassRoutesPerExpert} * shape.experts;
   return config;
 }

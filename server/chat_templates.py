@@ -224,10 +224,11 @@ class ChatTemplates:
     """The tokenizer's templates, or a custom one in their place, probed and
     chosen once at startup."""
 
-    def __init__(self, tokenizer, *, override=None):
+    def __init__(self, tokenizer, *, override=None, opens_turn=False):
         """override, a custom template's source (read_template_file), is the
         one template every request renders with, in place of all the
-        tokenizer defines."""
+        tokenizer defines. It needs a generation prompt unless the model
+        opens its turn itself (opens_turn, ChatFormat.opens_turn)."""
         if override is not None:
             named = {None: override}
         else:
@@ -245,7 +246,7 @@ class ChatTemplates:
             if source not in prepared:
                 prepared[source] = _prepare(render, encode, source)
         self.templates = {name: prepared[source] for name, source in named.items()}
-        if override is not None:
+        if override is not None and not opens_turn:
             _require_generation_prompt(render, self.templates[None])
 
     def select(self, tools):

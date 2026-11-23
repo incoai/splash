@@ -24,6 +24,7 @@ from dev.tests.installer_fixtures import (
     DRAFT_COMMIT,
     FLINT,
     GGUF_CONFIGS,
+    GGUF_ONLY,
     MODEL,
     MOE,
     PROCESSOR,
@@ -31,6 +32,7 @@ from dev.tests.installer_fixtures import (
     blob_bytes,
     cached_snapshot,
     draft_dir,
+    dspark_dir,
     fake_hub,
     family_config,
     fixture,
@@ -72,7 +74,8 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft_repo for family in families.FAMILIES]
+        # A family released without a draft names none.
+        repos = [family.draft_repo for family in families.FAMILIES if family.draft_repo]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
@@ -82,6 +85,8 @@ class UpstreamTest(unittest.TestCase):
         # The engine's check (its model-check command), with and without the
         # draft, of each family an MLX checkpoint serves.
         for family in families.FAMILIES:
+            if family in GGUF_ONLY:
+                continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
             vision = "safetensors" if family.vision else "none"
@@ -91,11 +96,11 @@ class UpstreamTest(unittest.TestCase):
                     family,
                 )
 
-        # Qwen3.8-Flash-Next and Flint load from a GGUF too: the config the
-        # installer derives from it and its header name the family, with and
-        # without its draft (Flint's flat config, its release's keys, and a
-        # test draft naming one of its reserved tokens as its mask), and
-        # another family's draft is refused.
+        # Qwen3.8-Flash-Next, Flint and Inkling 2 load from a GGUF too: the
+        # config the installer derives from it and its header name the
+        # family, with and without its draft (Flint's flat config, its
+        # release's keys, and a test draft naming one of its reserved tokens
+        # as its mask), and another family's draft is refused.
         def headers(family):
             directory = self.root / family.name / "target"
             directory.mkdir(parents=True, exist_ok=True)
@@ -107,7 +112,16 @@ class UpstreamTest(unittest.TestCase):
         for family in GGUF_CONFIGS:
             configs = CONFIGS / family.name.lower()
             gguf_check = headers(family)
-            for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
+            # A DFlash2 draft is checked by its config.json, a DSpark draft
+            # (Inkling 2's) by its GGUF's header.
+            drafts = [{}]
+            if (configs / "draft" / "config.json").exists():
+                drafts.append({"draft": configs / "draft" / "config.json"})
+            else:
+                drafts.append(
+                    {"draft": dspark_dir(self.root / family.name / "draft", family)}
+                )
+            for arguments in drafts:
                 self.assertIs(
                     upstream.check_model(
                         "gguf",
@@ -901,6 +915,59 @@ class UpstreamTest(unittest.TestCase):
         (snapshot / "tokenizer.json").write_text("changed size")
         with self.assertRaises(models.ModelError):
             assembly.verify(chosen.link)
+
+    def test_a_selection_without_a_draft_asks_for_and_links_none(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root, draft_model=models.NO_DRAFT)
+        output, _ = self.prepare(chosen)
+        self.assertIn("; draft none;", output)
+        # The draft's repository is neither asked for nor downloaded.
+        self.assertEqual(fake.requests, [(MODEL, None)])
+        self.assertTrue(fake.downloads)
+        self.assertTrue(all(name.startswith(MODEL + "/") for name in fake.downloads))
+        record = assembly.verify(chosen.link)
+        self.assertEqual(
+            record["sources"],
+            {"target": {"repo": MODEL, "revision": "a" * 40}, "draft": None},
+        )
+        self.assertFalse((chosen.link / "draft").exists())
+        self.assertFalse(any(name.startswith("draft/") for name in record["files"]))
+        self.assertEqual(pins(self.cache), ["a" * 40])
+        # It is an installation of its own, beside the family draft's.
+        self.assertNotEqual(chosen.link, selection(self.root).link)
+        fake.requests.clear(), fake.downloads.clear()
+        output, _ = self.prepare(chosen)
+        self.assertIn("is already installed", output)
+        self.assertEqual((fake.requests, fake.downloads), ([(MODEL, None)], []))
+        # A family that serves only with a draft (Flint) is refused before
+        # anything downloads.
+        with mock.patch.object(
+            families, "FAMILIES", (dataclasses.replace(DENSE, draftless=False), MOE)
+        ):
+            shutil.rmtree(chosen.models_root)
+            fake.downloads.clear()
+            with self.assertRaisesRegex(
+                models.ModelError, "serves only with a DFlash2 draft"
+            ):
+                self.prepare(chosen)
+            self.assertEqual(fake.downloads, [])
+
+    def test_a_family_released_without_a_draft_installs_without_one(self):
+        fake = fake_hub(self, self.cache)
+        undrafted = dataclasses.replace(DENSE, draft_repo=None)
+        with mock.patch.object(families, "FAMILIES", (undrafted, MOE)):
+            chosen = selection(self.root)
+            output, _ = self.prepare(chosen)
+            self.assertIn("; draft none;", output)
+            self.assertEqual(fake.requests, [(MODEL, None)])
+            record = assembly.verify(chosen.link)
+            self.assertIsNone(record["sources"]["draft"])
+            self.assertFalse((chosen.link / "draft").exists())
+            # Its start asks the Hub for no draft either.
+            fake.requests.clear(), fake.downloads.clear()
+            output, _ = self.prepare(chosen)
+            self.assertIn("is already installed", output)
+            self.assertEqual((fake.requests, fake.downloads), ([(MODEL, None)], []))
 
     def test_mlx_vision_links_only_the_shards_holding_the_tower(self):
         shards = {
@@ -1953,21 +2020,33 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(self.remove(first), 0)
         self.assertEqual(blob_bytes(self.cache, MODEL), size)
 
-    def test_an_installations_vocabulary_is_its_drafts(self):
+    def test_an_installations_vocabulary_is_its_targets(self):
         """The server builds its grammars' table of it before the engine is
-        Ready (server.main)."""
+        Ready (server.main), with a draft or without one."""
         fake_hub(self, self.cache)
-        chosen = selection(self.root)
-        self.prepare(chosen)
-        self.assertEqual(
-            assembly.vocabulary(chosen.link),
-            family_config(DENSE, "draft/config.json")["vocab_size"],
-        )
+        size = family_config(DENSE)["text_config"]["vocab_size"]
+        # The engine holds a DFlash2 draft's to it.
+        self.assertEqual(family_config(DENSE, "draft/config.json")["vocab_size"], size)
+        for draft_model in (None, models.NO_DRAFT):
+            with self.subTest(draft_model=draft_model):
+                chosen = selection(self.root, draft_model=draft_model)
+                self.prepare(chosen)
+                self.assertEqual(assembly.vocabulary(chosen.link), size)
         broken = self.root / "broken"
-        (broken / "draft").mkdir(parents=True)
-        for config in ("{", "{}", '{"vocab_size": "248320"}', '{"vocab_size": 0}'):
+        broken.mkdir()
+        # A flat config (Flint's) holds its text model's keys itself.
+        (broken / "config.json").write_text('{"vocab_size": 248320}')
+        self.assertEqual(assembly.vocabulary(broken), 248320)
+        for config in (
+            "{",
+            "{}",
+            '{"text_config": {}}',
+            '{"text_config": []}',
+            '{"text_config": {"vocab_size": "248320"}}',
+            '{"vocab_size": 0}',
+        ):
             with self.subTest(config=config):
-                (broken / "draft/config.json").write_text(config)
+                (broken / "config.json").write_text(config)
                 with self.assertRaises(models.ModelError):
                     assembly.vocabulary(broken)
 

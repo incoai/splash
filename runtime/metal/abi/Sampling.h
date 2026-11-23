@@ -117,6 +117,25 @@ struct TargetVocabularyRange {
 static_assert(sizeof(TargetVocabularyRange) == 8,
               "Target vocabulary ranges are 8 bytes on both sides");
 
+// A head's logits made final before any policy reads them
+// (ops::addLogitCap): `rows` rows of `vocabulary` fp32 logits, each of a
+// token below valid_vocabulary softcap * tanh(logit / softcap) unless
+// softcap is 0, which leaves it, each from valid_vocabulary on -inf. The
+// threadgroups of a row (LOGIT_CAP_TOKENS tokens each, LOGIT_CAP_THREADS
+// threads) are the grid's x, its rows its y.
+struct LogitCapParams {
+  uint32_t rows;
+  uint32_t vocabulary;
+  uint32_t valid_vocabulary;
+  float softcap;
+};
+
+static_assert(sizeof(LogitCapParams) == 16,
+              "Logit cap parameters are 16 bytes on both sides");
+
+#define LOGIT_CAP_THREADS 256u
+#define LOGIT_CAP_TOKENS (4u * LOGIT_CAP_THREADS)
+
 // A penalized request's word for each vocabulary token, in its state lane's
 // row of the penalty table (ops::Sampling::rebuildPenaltyWords): the
 // prompt bit marks a prompt token, and the count is how often the target
@@ -249,9 +268,17 @@ struct DraftTreeParams {
   float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
+  // Bit l: lane l's draft is a chain of a recurrent head (a DSpark draft's,
+  // DraftSelector::addChain), whose distribution at each position follows
+  // its chain's token before it alone. Its candidates at each position hold
+  // the token its chain took first and its probabilities are the softmax of
+  // their unary scores alone; only that candidate's row has children, a
+  // greedy lane's its most likely candidates, a sampled lane's that token
+  // first, then its draws without replacement of the others.
+  uint32_t markov;
 };
 
-static_assert(sizeof(DraftTreeParams) == 4 + (32 + 4 * SPLASH_DRAFT_PROPOSAL_TOKENS) * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(DraftTreeParams) == 8 + (32 + 4 * SPLASH_DRAFT_PROPOSAL_TOKENS) * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Draft tree parameters are the same size on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): the `rows` rows of its

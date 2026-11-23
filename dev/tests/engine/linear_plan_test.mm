@@ -82,10 +82,11 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
   return blockProjection(n, k, std::vector<uint32_t>(segments, format));
 }
 
-// fp32 destinations (the logits): the plan of a projection with an fp32
-// destination keeps the configuration, input table and scratch of its bf16
-// plan on every family and core count, and only plain plans on the decode
-// tiles take one. ggufProjectionMatrix checks the fp32 kernel it encodes.
+// fp32 destinations (the logits, Inkling's attention sides): the plan of a
+// projection with an fp32 destination keeps the configuration, input table
+// and scratch of its bf16 plan on every family and core count, and only plain
+// plans on the decode tiles and the prefill tile take one.
+// ggufProjectionMatrix checks the fp32 kernel it encodes.
 void floatOutputPlans() {
   const auto fp32 = [](Projection p) {
     p.destination = FloatOutput::Float32;
@@ -97,8 +98,8 @@ void floatOutputPlans() {
       for (const uint32_t n : {256U, 5120U, 16640U, 248320U})
         for (const uint32_t k : {2048U, 5120U}) {
           const Projection p = blockProjection(n, k, 1);
-          for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-            const LinearWorkload w{{n, k}, lanes * 8, LinearEpilogue::None};
+          for (const uint32_t rows : {8U, 16U, 24U, 32U, 2048U}) {
+            const LinearWorkload w{{n, k}, rows, LinearEpilogue::None};
             const LinearPlan bf16 = linear.plan(w, p), head = linear.plan(w, fp32(p));
             if (head.configuration() != bf16.configuration() || head.destination() != FloatOutput::Float32 ||
                 head.input() != bf16.input() || head.storageRows() != bf16.storageRows() ||
@@ -110,15 +111,22 @@ void floatOutputPlans() {
   std::vector<LinearWorkload> others{{{5120, 2048}, 8, LinearEpilogue::Residual},
                                      {{5120, 2048}, 8, LinearEpilogue::GateUp},
                                      {{5120, 2048}, 8, LinearEpilogue::UpWithGate}};
-  for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+  for (const auto epilogue : {LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
     others.push_back({{5120, 2048}, 2048, epilogue});
   const Linear linear = gpu(10, 20);
   const Projection p = blockProjection(5120, 2048, 1);
   for (const LinearWorkload &w : others) {
     (void)linear.plan(w, p);
-    rejects([&] { (void)linear.plan(w, fp32(p)); }, "an fp32 destination takes a plain projection on the decode tiles",
-            "an fp32 plan of other than a plain projection on the decode tiles was accepted");
+    rejects([&] { (void)linear.plan(w, fp32(p)); },
+            "an fp32 destination takes a plain projection on the decode or prefill tiles",
+            "an fp32 plan of other than a plain projection was accepted");
   }
+  // The int8 prefill tile has no fp32 instance.
+  rejects([&] {
+    (void)Linear::plan({{5120, 2048}, 2048, LinearEpilogue::None}, {.tile = LinearTile::GgufPrefillInt8},
+                       FloatOutput::Float32);
+  }, "an fp32 destination takes a plain projection on the decode or prefill tiles",
+          "an fp32 plan on the int8 prefill tile was accepted");
 }
 
 // Every Apple9 GPU runs plans of up to 32 rows on the register tile (which

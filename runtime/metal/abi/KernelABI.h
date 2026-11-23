@@ -4,6 +4,7 @@
 // shared parameter layouts use fixed-width scalars and explicit padding.
 
 #include "metal/abi/AneFfn.h"
+#include "metal/abi/DSpark.h"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/Embedding.h"
 #include "metal/abi/ExecutionGeometry.h"

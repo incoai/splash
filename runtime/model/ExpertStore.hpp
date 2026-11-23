@@ -179,8 +179,8 @@ public:
   // Block `block`'s routed segments (the format and size of its size's
   // slots), chunks and slot table, which `weights` reads them through, and,
   // when its experts stream, the store, which loads them; the store keeps the
-  // block's router and shared-expert gate, set before, which predict its
-  // routes.
+  // block's router, shared-expert gate and selection bias, set before, which
+  // predict its routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
   void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
                const std::function<void()> &beside = {}) const override;

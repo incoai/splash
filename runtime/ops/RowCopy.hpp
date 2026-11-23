@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "ops/FloatRows.hpp"
 
 #include <cstdint>
 
@@ -17,14 +18,17 @@ struct RowRegion final {
 // Copies rows of bf16 values between two row regions: a finished prompt's
 // last prefill row into the head's input, a capture layer's output into its
 // slot of the draft's captured target hidden rows, and an image's embedding
-// rows over its placeholder rows of a prefill chunk's hidden rows.
+// rows over its placeholder rows of a prefill chunk's hidden rows. A source
+// of fp32 rows (a target's fp32 residual stream, captured for its draft)
+// rounds each value to bf16.
 class RowCopy final {
 public:
   // Copies `rows` rows of `width` values from `source` at `from` to
   // `destination` at `to`.
   static void add(metal::CommandGraph &graph, metal::MetalBuffer source,
                   RowRegion from, metal::MetalBuffer destination, RowRegion to,
-                  uint32_t rows, uint32_t width);
+                  uint32_t rows, uint32_t width,
+                  FloatElement sourceElement = FloatElement::BFloat16);
 };
 
 } // namespace splash::ops

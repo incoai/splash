@@ -29,7 +29,9 @@ using namespace mpp::tensor_ops;
 // keys p - Window to p (Window + 1 with its own; a sliding-window layer's),
 // and a reduce given a layer's learned sinks adds one per query head
 // (splash_attention_combine_splits). Window 0 and no sinks is plain causal
-// attention over the whole history.
+// attention over the whole history. A relative geometry's split adds each
+// score's relative bias (metal/abi/PagedAttention.h, SplashRelativeRow), and
+// its reduce each row's own sink.
 //
 // Every attention dispatch's tiles share this device-operand page loop.
 constant uint SplashAttentionMaximumSplits = SPLASH_ATTENTION_MAXIMUM_SPLITS;
@@ -180,6 +182,60 @@ inline SplashAttentionWholePages splash_attention_whole_pages(uint first_positio
 // its own row's query scale.
 constant uint SplashAttentionLanesPerRow = 4;
 
+// A relative geometry's tile (metal/abi/PagedAttention.h) reads the relative
+// states of its rows from `states`, its first row's of its KV head's first
+// query head, a row's QHeads x SPLASH_RELATIVE_WIDTH floats after the one
+// before it, and the layer's table of SPLASH_RELATIVE_EXTENT rows; another
+// geometry's tile reads neither (SplashUnbiasedTile).
+struct SplashUnbiasedTile {};
+struct SplashRelativeTile {
+  device const float *states;
+  device const float4 *table;
+};
+
+// A softmax lane's row's relative state, held in registers through the page
+// loop, and the table its bias reads; empty without a relative bias.
+template <bool Biased> struct SplashRelativeRow {};
+template <> struct SplashRelativeRow<true> {
+  float4 state[SPLASH_RELATIVE_WIDTH / 4];
+  device const float4 *table;
+
+  // The bias of a key `distance` positions before the row, which the table
+  // holds.
+  float bias(uint distance) const {
+    device const float4 *row = table + ulong(distance) * (SPLASH_RELATIVE_WIDTH / 4);
+    float sum = 0.0f;
+#pragma unroll
+    for (uint part = 0; part < SPLASH_RELATIVE_WIDTH / 4; ++part)
+      sum += dot(state[part], row[part]);
+    return sum;
+  }
+};
+
+// A tile's relative states and table as its softmax lanes hold them: each
+// lane its fused row's state, a row past the tile's active rows its last
+// active row's. Threads past the lanes hold none.
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, class Relative>
+inline SplashRelativeRow<!is_same<Relative, SplashUnbiasedTile>::value>
+splash_relative_row(Relative relative, uint active_rows, uint thread_index) {
+  SplashRelativeRow<!is_same<Relative, SplashUnbiasedTile>::value> row{};
+  if constexpr (!is_same<Relative, SplashUnbiasedTile>::value) {
+    constexpr uint Width = SPLASH_RELATIVE_WIDTH;
+    row.table = relative.table;
+    if (thread_index < SplashAttentionLanesPerRow * RowsPerTile * QueryHeadsPerKVHead) {
+      const uint fused_row = thread_index / SplashAttentionLanesPerRow;
+      const uint query_row = min(fused_row / QueryHeadsPerKVHead, active_rows - 1);
+      device const float4 *state = reinterpret_cast<device const float4 *>(
+          relative.states +
+          (ulong(query_row) * KVHeads * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead) * Width);
+#pragma unroll
+      for (uint part = 0; part < Width / 4; ++part)
+        row.state[part] = state[part];
+    }
+  }
+  return row;
+}
+
 // One Page32 block of one tile: key-scaled scores (fp32, or the int32
 // products of INT8 queries) times score_scale, the row's, become value-scaled
 // bf16 probabilities and the row statistics advance. Four lanes own one
@@ -201,7 +257,14 @@ constant uint SplashAttentionLanesPerRow = 4;
 // holds rows of the block tests them.
 // Masked false is a page every row of the tile sees wholly
 // (splash_attention_whole_pages): its tokens are all seen, untested.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Window, bool Quantized, bool Masked, typename Score>
+// With a relative bias (Biased) each key the row sees adds its bias by its
+// distance back from the row (SplashRelativeRow) to its scaled score: a
+// history key's from the row's position, a block row's (an ancestor) from
+// its depth, the ancestors below it on the row's path. A page `biased` holds
+// some key within the table's extent of some row; another adds nothing, and
+// a window within the extent needs no test.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Window, bool Quantized, bool Masked, typename Score,
+          bool Biased = false>
 inline void splash_attention_page_softmax(
     threadgroup const Score *scores, float score_scale, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -210,7 +273,7 @@ inline void splash_attention_page_softmax(
     uint token_start,
     uint visible_tokens, uint committed_tokens, uint active_rows,
     bool tree, uint anchor, uint ancestors, uint depth,
-    uint thread_index) {
+    uint thread_index, SplashRelativeRow<Biased> relative = {}, bool biased = false) {
   constexpr uint N = SplashKvPageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
@@ -266,6 +329,22 @@ inline void splash_attention_page_softmax(
     high *= score_scale;
     score[0] = low.x, score[1] = low.y, score[2] = low.z, score[3] = low.w;
     score[4] = high.x, score[5] = high.y, score[6] = high.z, score[7] = high.w;
+  }
+  if constexpr (Biased) {
+    constexpr bool Within = Window != 0 && Window < SPLASH_RELATIVE_EXTENT;
+    if (Within || biased) {
+      const uint position =
+          tree ? anchor + depth : committed_tokens + min(fused_row / QueryHeadsPerKVHead, active_rows - 1);
+#pragma unroll
+      for (uint j = 0; j < TokensPerLane; ++j) {
+        const uint slot = token_start + column + j;
+        const uint distance = tree && slot >= anchor
+                                  ? depth - popcount(ancestors & ((1u << min(slot - anchor, 31u)) - 1u))
+                                  : position - slot;
+        if (seen[j] && (Within || distance < SPLASH_RELATIVE_EXTENT))
+          score[j] += relative.bias(distance);
+      }
+    }
   }
   float local_max = -INFINITY;
 #pragma unroll
@@ -368,8 +447,11 @@ inline float splash_attention_query_codes(device const bfloat *queries, device i
 // A tree's tile (SplashAttentionTree) masks each row to its path's rows of
 // the block; its K/V, the store's, sit at the slots of their rows before
 // any tile runs, so a row of a later tile reads its ancestors' from them.
+// A relative geometry's tile (SplashRelativeTile) biases its rows' scores
+// (splash_attention_page_softmax); a page whose every key is past the
+// table's extent from the tile's first row (or a tree's anchor) adds none.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          uint Window, typename CacheElement, bool Int8Queries>
+          uint Window, typename CacheElement, bool Int8Queries, class Relative = SplashUnbiasedTile>
 inline void splash_paged_attention_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -377,7 +459,8 @@ inline void splash_paged_attention_tile(
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
-    SplashAttentionTree tree, uint thread_index) {
+    SplashAttentionTree tree, uint thread_index, Relative relative = {}) {
+  constexpr bool Biased = !is_same<Relative, SplashUnbiasedTile>::value;
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr ushort N = SplashKvPageTokens;
@@ -417,6 +500,8 @@ inline void splash_paged_attention_tile(
     ancestors = place.ancestors;
     depth = place.depth;
   }
+  const SplashRelativeRow<Biased> relative_row =
+      splash_relative_row<KVHeads, QueryHeadsPerKVHead, RowsPerTile>(relative, active_rows, thread_index);
   // The query codes are device writes the whole threadgroup reads.
   threadgroup_barrier(Int8Queries ? mem_flags::mem_threadgroup | mem_flags::mem_device
                                   : mem_flags::mem_threadgroup);
@@ -476,18 +561,22 @@ inline void splash_paged_attention_tile(
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    const bool biased =
+        Biased && token_start + N - 1 + SPLASH_RELATIVE_EXTENT > (in_tree ? tree.anchor : committed_tokens);
     if (page >= whole.begin && page < whole.end)
-      splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Window, Quantized, false>(
+      splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Window, Quantized, false, Score, Biased>(
           page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale, rescale,
           reinterpret_cast<device const float4 *>(key_scales),
           reinterpret_cast<device const float4 *>(value_scales), token_start,
-          visible_tokens, committed_tokens, active_rows, in_tree, tree.anchor, ancestors, depth, thread_index);
+          visible_tokens, committed_tokens, active_rows, in_tree, tree.anchor, ancestors, depth, thread_index,
+          relative_row, biased);
     else
-      splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Window, Quantized, true>(
+      splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Window, Quantized, true, Score, Biased>(
           page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale, rescale,
           reinterpret_cast<device const float4 *>(key_scales),
           reinterpret_cast<device const float4 *>(value_scales), token_start,
-          visible_tokens, committed_tokens, active_rows, in_tree, tree.anchor, ancestors, depth, thread_index);
+          visible_tokens, committed_tokens, active_rows, in_tree, tree.anchor, ancestors, depth, thread_index,
+          relative_row, biased);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
@@ -520,6 +609,10 @@ inline float splash_row_sink(uint fused_row, device const float *group_sinks) {
   return group_sinks[fused_row % QueryHeadsPerKVHead];
 }
 
+// A row's own sink (a relative geometry's, read from its query side row by
+// its reduce), or a logit below every score for a row it holds none of.
+template <uint QueryHeadsPerKVHead> inline float splash_row_sink(uint, float row_sink) { return row_sink; }
+
 // Partials are [slot][fused row][dimension]; statistics are
 // [slot][fused row]{max, sum}. The callers lay a sequence's slots out from its
 // first_slot as [tile][KV head][part][split], a sparse tile being one part.
@@ -532,10 +625,10 @@ inline float splash_row_sink(uint fused_row, device const float *group_sinks) {
 // row past the tile's active rows is zero. A threadgroup owns one fused row,
 // so it returns uniformly.
 // A layer's learned sinks come as group_sinks, a logit per query head of the
-// tile's KV head (its GQA group), and none without: the row's query head's
-// sink is one more key, with no value, of the softmax (the scores' scale
-// already applied), so it enters the maximum and, after the splits in their
-// order, the denominator.
+// tile's KV head (its GQA group), a relative geometry's as the row's own
+// logit, and none without: the row's query head's sink is one more key, with
+// no value, of the softmax (the scores' scale already applied), so it enters
+// the maximum and, after the splits in their order, the denominator.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, class... GroupSinks>
 inline bfloat splash_attention_combine_splits(
     device const float *partials, device const float *statistics, uint active_rows, uint written,

@@ -516,9 +516,13 @@ syntax ([chat formats](models.md#chat-formats)). In Qwen's XML a call opens at
 `\n</parameter>\n` where the next parameter, `</function>` or `</tool_call>`
 follows; in Flint's GLM tags a call opens at `<tool_call>`, the function's name
 follows it up to the first tag, and a value ends at `</arg_value>` where the
-next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
-other order, as a file an agent writes may. Tags written otherwise are text.
-Besides:
+next `<arg_key>` or `</tool_call>` follows; in Inkling's JSON frames a call
+opens at `<|message_model|>`, the function's name follows it up to
+`<|content_invoke_tool_json|>`, and the call's object runs to
+`<|end_message|>`: its `args` stream as they are read, written compactly and
+closed as valid JSON however the output ends, and its `name` names a call
+whose frame names none. A value may hold the tags in any other order, as a
+file an agent writes may. Tags written otherwise are text. Besides:
 
 - names lose the space around them; an opening that names no function, or a
   name too long to be one, opens no call and reads as the text the model
@@ -701,7 +705,9 @@ assistant prompt boundary. Prompts render without thinking, as effort `none`
 renders them. A model that opens its reasoning itself (Flint), which no effort
 turns off, would open it where the generation prompt ends: its prompt ends with
 an empty think block, `<think></think>`, and the answer slots are read after it,
-where its answer starts. Besides the row it takes `model`, `timeout`,
+where its answer starts; Inkling's ends with its turn's text block opened,
+`<|message_model|><|content_text|>`, as its template renders a turn without
+reasoning. Besides the row it takes `model`, `timeout`,
 `priority` and `cache_salt` as the generation APIs do ([request
 fields](#request-fields)); other generation controls return errors rather than
 silently changing the scoring protocol. A row's text is text to the model, as a
@@ -723,9 +729,10 @@ share the scheduler. Disconnects and timeouts cancel the current question.
 
 Preparation renders each prompt once, then enforces the context limit and the
 batch token budget before the per-slot boundary checks. A label can change only
-the tokens after the prompt's last message boundary (`<|im_end|>`, or Flint's
-`<|assistant|>`), which the tokenizer encodes on its own, so each check encodes
-that end with the option appended rather than the whole prompt. The checks
+the tokens after the prompt's last message boundary (`<|im_end|>`, Flint's
+`<|assistant|>` or Inkling's `<|end_message|>`), which the tokenizer encodes on
+its own, so each check encodes that end with the option appended rather than
+the whole prompt. The checks
 observe the request deadline and stop when the client disconnects.
 Prompts that exceed the context limit are rejected, not truncated.
 
@@ -766,7 +773,7 @@ fields; additional fields may be added:
 | `memory_plan.budget.host_held_back_bytes` | The expert store's chunks above its floor, which it started without and the memory ledger grows into as the host allows ([memory and context](server.md#memory-and-context)): no memory at the start, but among the fixed bytes, so that the context and the KV the plan holds are the limit's |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](internals.md#neural-engine-prefill): `split` while it serves, over commands of `minimum_rows` rows or more, at most `share` of the FFN's channels (where commands of two steps take a larger share than those of one, `reason` gives both); `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
-| `verify_rows` | The rows decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where each cycle's step is the one of the most expected accepted tokens per measured cost, with what its cycles show a long history adds to it, every row of which its lanes' trees fill is verified, or, where the target's experts stream, each cycle verifies the rows whose chance of a token is worth their time by its cycles' cost line (the default), `all` where each verifies every row of a draft's block a lane, whatever output the lane has left (`--verify-rows all`) |
+| `verify_rows` | The rows decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where each cycle's step is the one of the most expected accepted tokens per measured cost, with what its cycles show a long history adds to it, every row of which its lanes' trees fill is verified, or, where the target's experts stream, each cycle verifies the rows whose chance of a token is worth their time by its cycles' cost line (the default), `all` where each verifies every row of a draft's block a lane, whatever output the lane has left (`--verify-rows all`). A model installed without a draft (`--draft-model none`) has no draft's block: a lane's rows are its anchor and its host chain, of which `auto` verifies those its step's costs choose and `all` every one, and `memory_plan`'s `draft_weights_bytes` is 0 |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
@@ -787,7 +794,7 @@ fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
-| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn, and under `--reasoning-effort`, where the server sets every request's effort |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn, for Inkling 2, whose model opens its reasoning itself at the level its effort sets (`/v1/models` lists its efforts, and `--reasoning-effort` and `--default-reasoning-effort` set them), and under `--reasoning-effort`, where the server sets every request's effort |
 | `reasoning_effort` | The effort `--reasoning-effort` gives every request, whatever it asks; `null` without the option |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row, and the server is exiting ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |

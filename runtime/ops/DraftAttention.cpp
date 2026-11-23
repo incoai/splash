@@ -34,9 +34,10 @@ uint32_t phaseGroups(uint64_t elements, uint32_t tasks = 0) {
       std::max<uint64_t>((elements + kThreads - 1) / kThreads, tasks));
 }
 
-// The grouped query rows alone, without the split partials behind them.
+// The grouped query rows alone, without the split partials behind them:
+// every compiled query head's, a draft of fewer heads' zero rows among them.
 uint64_t queryRowsBytes(const DraftAttentionPlan &plan) {
-  return uint64_t{plan.lanes()} * kRows * plan.shape().attentionSize * 2;
+  return uint64_t{plan.lanes()} * kRows * SPLASH_DRAFT_ATTENTION_WIDTH * 2;
 }
 
 // One lane's keys, or values, of one layer: the kernels place a position in
@@ -79,8 +80,12 @@ void requireLanes(uint32_t lanes) {
 }
 
 // The draft attention the kernels are built for (metal/abi/DraftAttention.h),
-// over a hidden state of any whole number of convolution groups.
+// over a hidden state of any whole number of convolution groups: a DFlash2
+// draft's, or a DSpark draft's of three query heads of each KV head's four
+// and no convolutions, whose q/k/v rows hold its own heads.
 void requireCompiledShape(DraftAttentionShape shape) {
+  constexpr uint32_t kv = 2 * SPLASH_DRAFT_KV_HEADS * SPLASH_DRAFT_HEAD_DIMENSION;
+  constexpr uint32_t dsparkHeads = 3 * SPLASH_DRAFT_KV_HEADS;
   const DraftAttentionShape compiled{shape.hiddenSize,
                                      draft_dynamic_width(shape.hiddenSize),
                                      SPLASH_DRAFT_QKV_WIDTH,
@@ -88,7 +93,15 @@ void requireCompiledShape(DraftAttentionShape shape) {
                                      SPLASH_DRAFT_QUERY_HEADS,
                                      SPLASH_DRAFT_KV_HEADS,
                                      SPLASH_DRAFT_HEAD_DIMENSION};
-  if (!shape.hiddenSize || shape.hiddenSize % SPLASH_DRAFT_CONVOLUTION_GROUP || shape != compiled)
+  const DraftAttentionShape dspark{shape.hiddenSize,
+                                   0,
+                                   dsparkHeads * SPLASH_DRAFT_HEAD_DIMENSION + kv,
+                                   dsparkHeads * SPLASH_DRAFT_HEAD_DIMENSION,
+                                   dsparkHeads,
+                                   SPLASH_DRAFT_KV_HEADS,
+                                   SPLASH_DRAFT_HEAD_DIMENSION};
+  if (!shape.hiddenSize || shape.hiddenSize % SPLASH_DRAFT_CONVOLUTION_GROUP ||
+      (shape != compiled && shape != dspark))
     throw std::invalid_argument("unsupported compiled draft attention shape");
 }
 
@@ -100,7 +113,7 @@ DraftAttentionWorkspace DraftAttentionPlan::workspace() const noexcept {
   const uint64_t partialBytes =
       uint64_t{lanes_} * shape_.kvHeads * kSplits * kPartialBytes;
   return {rows * shape_.hiddenSize * 2, rows * shape_.qkvSize * 2,
-          rows * shape_.attentionSize * 2 + partialBytes, kvBytes, kvBytes};
+          rows * SPLASH_DRAFT_ATTENTION_WIDTH * 2 + partialBytes, kvBytes, kvBytes};
 }
 
 DraftAttentionPlan DraftAttention::plan(DraftAttentionShape shape,
@@ -148,10 +161,10 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
   // The prepare kernel copies one element of the value rows per thread and
-  // normalizes one (row, head) per group.
+  // normalizes one (row, head) per group, of every grouped query head.
   const uint32_t groups = phaseGroups(
       uint64_t{kRows} * shape.kvHeads * shape.headDimension,
-      kRows * (shape.queryHeads + shape.kvHeads));
+      kRows * (SPLASH_DRAFT_QUERY_HEADS + shape.kvHeads));
   const uint32_t lanes = plan.lanes();
   requireBytes(buffers.qkv, workspace.qkvBytes, "draft q/k/v");
   requireBytes(buffers.groupedQueries, queryRowsBytes(plan), "draft grouped queries");
@@ -162,17 +175,19 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   const uint64_t ropeBytes = (uint64_t{lanes - 1} * kRopeRows + kRows) * SPLASH_DRAFT_ROPE_PAIRS * 4;
   requireBytes(buffers.ropeCos, ropeBytes, "draft RoPE cosine");
   requireBytes(buffers.ropeSin, ropeBytes, "draft RoPE sine");
+  const DraftPrepareParams params{shape.qkvSize, shape.queryHeads};
   graph.add("draft_attention_qkv",
             {std::move(buffers.qkv), std::move(buffers.groupedQueries),
              std::move(buffers.queryNorm), std::move(buffers.keyNorm),
              std::move(buffers.ropeCos), std::move(buffers.ropeSin),
              std::move(buffers.queryKeys), std::move(buffers.queryValues)},
-            {groups, lanes, 1});
+            params, {groups, lanes, 1});
 }
 
 void DraftAttention::addDecode(
     metal::CommandGraph &graph, DraftDecodeAttentionBuffers buffers,
-    std::span<const uint32_t> cacheLengths, const DraftAttentionPlan &plan) {
+    std::span<const uint32_t> cacheLengths, const DraftAttentionPlan &plan,
+    DraftAttentionWindow window) {
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
   const uint32_t lanes = plan.lanes();
@@ -189,7 +204,9 @@ void DraftAttention::addDecode(
     requireBytes(buffers.persistentKeys[lane], ringBytes(shape), "draft key ring");
     requireBytes(buffers.persistentValues[lane], ringBytes(shape), "draft value ring");
   }
-  DraftAttentionBatchParams params{kWindow, lanes, {}};
+  if (!window.keys || window.keys >= kWindow)
+    throw std::invalid_argument("a draft attention window lies inside its ring");
+  DraftAttentionBatchParams params{kWindow, lanes, window.keys, window.rowUniform, shape.queryHeads, {}};
   std::copy(cacheLengths.begin(), cacheLengths.end(),
             std::begin(params.cache_length));
   std::vector<metal::MetalBuffer> bindings{buffers.groupedQueries};

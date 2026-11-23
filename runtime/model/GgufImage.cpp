@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
 #include "model/GgufImageLayout.hpp"
+#include "model/Inkling.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
@@ -195,13 +196,64 @@ public:
     problems_.read(*tensor);
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
     Repack repack = image_.planes(GGUF_FMT_Q80, rows, columns, name);
-    TensorRows source = tensorRows(*tensor, rows, tensor->bytes / rows);
+    repack.sources.push_back(q8_0Rows(*tensor, rows, columns));
+    image_.repack(std::move(repack));
+  }
+
+  // Rows [0, count) of a tensor of F32, BF16 or F16 values as the Q8_0 rows
+  // the writer quantizes them to (TensorRows::ggufFloatRowBytes).
+  TensorRows q8_0Rows(const GgufTensor &tensor, uint64_t count, uint64_t columns) const {
+    TensorRows source = tensorRows(tensor, count, tensor.bytes / count);
     source.ggufFloatType = source.type;
     source.ggufFloatRowBytes = source.rowBytes;
     source.type = ggml::kQ8_0;
     source.rowBytes = ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], columns);
-    repack.sources.push_back(std::move(source));
-    image_.repack(std::move(repack));
+    return source;
+  }
+
+  // Tensors [N_i, K] stacked into one projection [rows, K], their rows in
+  // order and zero rows from their last to `rows` (Inkling's sides,
+  // model/Inkling.hpp InklingSides), as the loader reads a fused projection:
+  // a segment of each run of tensors of one type, repacked in its format at
+  // the run's first row, each whole plane tiles. A run but the last must end
+  // on a tile, the last takes the zero rows; tensors of one type share a
+  // segment, which a projection runs in one dispatch. An F32 tensor (a small
+  // projection some quantizers keep unquantized, as bartowski's Inkling
+  // GGUFs keep the sinks' and the dynamic taps') is one of Q8_0, the rows
+  // its values quantize to (q8_0Rows), as other GGUFs store it.
+  void stacked(std::span<const std::pair<std::string, uint64_t>> parts, uint64_t rows, uint64_t columns) {
+    const auto stackedType = [](uint32_t type) { return floatType(type) ? ggml::kQ8_0 : type; };
+    std::vector<const GgufTensor *> tensors;
+    uint64_t partRows = 0;
+    for (const auto &[name, count] : parts) {
+      const GgufTensor *tensor = find(name, [](uint32_t type) { return quantizedType(type) || floatType(type); });
+      if (tensor && (tensor->rows() != count || tensor->columns() != columns))
+        throw GgufError("unexpected shape for " + name);
+      tensors.push_back(tensor);
+      partRows += count;
+    }
+    if (std::ranges::find(tensors, nullptr) != tensors.end()) return;
+    if (tiledRows(partRows) != rows) throw GgufError("stacked tensors do not fill whole tiles: " + parts[0].first);
+    uint64_t first = 0;
+    for (size_t run = 0; run < tensors.size();) {
+      size_t end = run;
+      uint64_t runRows = 0;
+      const uint32_t type = stackedType(tensors[run]->type);
+      while (end < tensors.size() && stackedType(tensors[end]->type) == type) runRows += parts[end++].second;
+      const uint64_t segmentRows = end == tensors.size() ? rows - first : runRows;
+      if (segmentRows % QUANT_TILE_ROWS)
+        throw GgufError("a run of stacked tensors of one type does not end on a tile: " + tensors[end - 1]->name);
+      const uint32_t format = imageFormat(type);
+      Repack repack = image_.planes(format, segmentRows, columns, tensors[run]->name);
+      for (size_t part = run; part < end; ++part)
+        repack.sources.push_back(
+            floatType(tensors[part]->type)
+                ? q8_0Rows(*tensors[part], parts[part].second, columns)
+                : tensorRows(*tensors[part], parts[part].second, ggufRowBytes(kQuantFormats[format], columns)));
+      image_.repack(std::move(repack));
+      first += segmentRows;
+      run = end;
+    }
   }
 
   // One routed experts' tensor [experts * N, K] (routedExperts).
@@ -495,17 +547,19 @@ void mixerImage(Builder &b, const QwenTargetDimensions &g, const std::string &p,
   }
 }
 
-// Layer `index`'s dense FFN or sparse MoE, which every family's layers hold:
-// a MoE layer's router, routed experts and shared expert of its slices
-// (QwenTargetDimensions::sharedExpertSlices) and, where its blocks have one,
-// the shared expert's scalar gate; a dense layer's SwiGLU.
+// Weight layer `index`'s dense FFN or sparse MoE, which every family's layers
+// hold: a MoE layer's router, routed experts and shared expert of its slices
+// (QwenTargetDimensions::sharedExpertSlices), none for 0, and, where its
+// blocks have them, the shared expert's scalar gate and a biased router's F32
+// selection bias (ops::MoeRouter::SigmoidBiased); a dense layer's SwiGLU.
 void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p, uint32_t index) {
   if (g.isMoeLayer(index)) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.router(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
     b.routedExperts(p, routed, width, g.hiddenSize);
-    b.sharedExpert(p, g.sharedExpertSlices, width, g.hiddenSize);
+    if (g.sharedExpertSlices) b.sharedExpert(p, g.sharedExpertSlices, width, g.hiddenSize);
     if (g.sharedExpertGate) b.floatRows(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize, true);
+    if (g.moeRouter == ops::MoeRouter::SigmoidBiased) b.floatRows(p + "exp_probs_b.bias", 1, routed, true);
   } else {
     b.quantized(p + "ffn_gate.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
@@ -675,30 +729,135 @@ struct FlintGguf final {
                      std::vector<Image> &) {}
 };
 
+// Inkling 2 Mini's GGUFs (inkling2_loop, as llama.cpp converts them): a
+// weight layer's tensors once, which its layers share (model/Inkling.hpp),
+// every weight layer's attention without RoPE, of a relative-position bias,
+// sink projection and output gate; those that sliding_window_pattern names
+// over a sliding window from one input, every sixth over every key from
+// separate query, key and value inputs, whose keys and values take dynamic
+// convolution taps; short convolutions and depth-attention queries; a MoE
+// of no shared expert whose router selects with a bias; and, on the loop's
+// weight layers, its message queries and gates. Its head adds the head's
+// depth-attention query and the embedding's norm; its scalars and per-layer
+// head counts hold the attention's, the convolutions', the depth
+// attention's and the loop's values.
+struct InklingGguf final {
+  static constexpr std::string_view architecture = InklingLayout::ggufArchitecture;
+
+  template <class Expect, class ExpectFloat, class ExpectArray>
+  static void metadata(const Expect &expect, const ExpectFloat &expectFloat, const ExpectArray &expectArray,
+                       const QwenTargetDimensions &g) {
+    expect("vocab_size", g.vocabularySize);
+    expect("attention.key_length_swa", g.attentionHeadDimension);
+    expect("attention.value_length_swa", g.attentionHeadDimension);
+    expect("attention.sliding_window", g.slidingWindow);
+    expect("attention.relative_length", g.relativeDimension);
+    expect("attention.relative_extent", g.relativeExtent);
+    expect("attention.log_scale_floor", InklingLayout::logScaleFloor);
+    expectFloat("attention.qk_clip", InklingLayout::queryKeyClip);
+    expectFloat("attention.relative_clip", InklingLayout::relativeClip);
+    expectFloat("attention.log_scale_alpha", InklingLayout::logScaleAlpha);
+    expect("shortconv.l_cache", g.shortConvolutionTaps);
+    expect("attn_res.block_size", InklingLayout::residualBlockLayers);
+    expect("loop.start", g.loopStart);
+    expect("loop.end", g.loopEnd);
+    expect("loop.count", g.loopPasses);
+    expect("loop.gate_rank", InklingLayout::loopGateRank);
+    expect("loop.varying", 0);
+    // A weight layer's window, as each layer that runs it attends.
+    expectArray("attention.sliding_window_pattern", [&g](std::span<const double> values) {
+      bool matches = values.size() == g.weightLayers();
+      for (uint32_t layer = 0; matches && layer < g.weightLayers(); ++layer)
+        matches = values[layer] == double(!inklingGlobalLayer(g, layer));
+      return matches;
+    });
+  }
+
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const std::string p = prefix(index);
+    const bool global = inklingGlobalLayer(g, index);
+    const InklingSides sides = InklingSides::of(g);
+    const uint64_t hidden = g.hiddenSize, heads = g.attentionQueryHeads, taps = g.shortConvolutionTaps;
+    const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+    // The attention's inputs: weight layer 0's is the embedding.
+    if (index) b.floatValues(p + "attn_res_query.weight", (global ? 3 : 1) * hidden);
+    if (global) {
+      for (const char *input : {"q", "k", "v"}) b.floatNorm(p + "attn_" + input + "_inp_norm.weight", hidden);
+    } else {
+      b.floatNorm(p + "attn_norm.weight", hidden);
+    }
+    const std::pair<std::string, uint64_t> query[]{{p + "attn_q.weight", g.attentionWidth},
+                                                   {p + "attn_gate.weight", g.attentionWidth},
+                                                   {p + "attn_rel.weight", heads * g.relativeDimension},
+                                                   {p + "attn_sink_proj.weight", heads}};
+    b.stacked(query, sides.query, hidden);
+    for (const char *side : {"k", "v"}) {
+      const std::string stem = p + "attn_" + side;
+      const std::pair<std::string, uint64_t> rows[]{{stem + ".weight", kvRows},
+                                                    {stem + "_conv_proj.weight", g.attentionKvHeads * taps}};
+      b.stacked(std::span(rows).first(global ? 2 : 1), sides.keyRows(global), hidden);
+    }
+    b.floatValues(p + "attn_q_clip.weight", heads * g.attentionHeadDimension);
+    b.floatValues(p + "attn_rel_clip.weight", heads * g.relativeDimension);
+    b.floatValues(p + "attn_rel_bias.weight", uint64_t{g.relativeExtent} * g.relativeDimension);
+    b.floatValues(p + "attn_k_conv.weight", kvRows * taps);
+    b.floatValues(p + "attn_v_conv.weight", kvRows * taps);
+    b.quantized(p + "attn_output.weight", hidden, g.attentionWidth);
+    b.floatValues(p + "attn_post_conv.weight", hidden * taps);
+    // The FFN: its input's query and norm, the MoE and its router's
+    // selection bias, a float tensor of one row, then its output's
+    // convolution.
+    b.floatValues(p + "ffn_res_query.weight", hidden);
+    b.floatNorm(p + "ffn_norm.weight", hidden);
+    ffnImage(b, g, p, index);
+    b.floatValues(p + "ffn_post_conv.weight", hidden * taps);
+    if (index < g.loopStart || index >= g.loopEnd) return;
+    // The loop's: its messages' queries, then the gates of its query, key,
+    // value and FFN inputs.
+    b.floatValues(p + "loop_msg_query.weight", InklingLayout::loopMessages * hidden);
+    for (const char *stream : {"q", "k", "v", "ffn"}) {
+      const std::string gate = p + "loop_" + stream + "_ctrl_";
+      b.floatTensor(gate + "down.weight", InklingLayout::loopGateRank, 2 * hidden);
+      b.floatTensor(gate + "gain.weight", hidden, InklingLayout::loopGateRank);
+      b.floatTensor(gate + "forget.weight", hidden, InklingLayout::loopGateRank);
+    }
+  }
+
+  static void head(Builder &b, const QwenTargetDimensions &g) {
+    b.floatValues("output_res_query.weight", g.hiddenSize);
+    b.floatNorm("output_norm.weight", g.hiddenSize);
+    b.floatNorm("token_embd_norm.weight", g.hiddenSize);
+  }
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, Problems &,
+                     std::vector<Image> &) {}
+};
+
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
-// (Qwen4ExpGguf), Flint's (FlintGguf) or the Qwen3.5 hybrid's (HybridGguf).
-// Another architecture is refused, so a layout without a family here fails
-// by name rather than planning as the hybrid.
+// (Qwen4ExpGguf), Flint's (FlintGguf), Inkling 2 Mini's (InklingGguf) or the
+// Qwen3.5 hybrid's (HybridGguf). Another architecture is refused, so a layout
+// without a family here fails by name rather than planning as the hybrid.
 template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
   if (architecture == FlintGguf::architecture) return use(FlintGguf{});
+  if (architecture == InklingGguf::architecture) return use(InklingGguf{});
   if (std::ranges::find(HybridGguf::architectures, architecture) == HybridGguf::architectures.end())
     throw GgufError("no GGUF family plans architecture " + std::string(architecture));
   return use(HybridGguf{});
 }
 
-// The images of a target from a GGUF of Family (planImages).
+// The images of a target from a GGUF of Family (planImages): one of each
+// weight layer, whose layers share it.
 template <class Family>
 std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options) {
   Problems problems;
   std::vector<Image> images;
-  for (uint32_t index = 0; index < g.layers; ++index) {
+  for (uint32_t index = 0; index < g.weightLayers(); ++index) {
     Builder layer(file, g, problems, "layer-" + std::to_string(index) + ".bin", index,
-                  g.isFullAttentionLayer(index) ? 1u : 0u, options);
+                  g.isFullAttentionLayer(g.firstLayer(index)) ? 1u : 0u, options);
     Family::layer(layer, g, index);
     images.push_back(layer.finish());
   }
-  Builder head(file, g, problems, "head.bin", g.layers, 2);
+  Builder head(file, g, problems, "head.bin", g.weightLayers(), 2);
   Family::head(head, g);
   head.quantized("output.weight", g.vocabularySize, g.hiddenSize);
   images.push_back(head.finish());
@@ -707,7 +866,7 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
   images.push_back(embedding.finish());
   Family::tables(file, g, options, problems, images);
   const GgufMetadata &metadata = file.metadata();
-  problems.addUnread(file, g.layers,
+  problems.addUnread(file, g.weightLayers(),
                      metadata.unsignedValue(metadata.architecture() + ".nextn_predict_layers").value_or(0));
   if (!problems.empty()) throw GgufError("GGUF tensors this build cannot load: " + problems.text());
   return images;
@@ -895,18 +1054,29 @@ void requireMetadata(const GgufFile &file, std::string_view architecture, const 
     const std::optional<std::span<const double>> values = file.numericArray(arch + "." + key);
     if (!values || !matches(*values)) mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
   };
-  expect("block_count", geometry.layers + metadata.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
+  // A count a GGUF states once, or for each weight layer (inkling2_loop's
+  // head counts), every layer's the same.
+  const auto expectEach = [&](const char *key, uint64_t value) {
+    if (!file.numericArray(arch + "." + key)) return expect(key, value);
+    expectArray(key, [&](std::span<const double> values) {
+      return values.size() == geometry.weightLayers() &&
+             std::ranges::all_of(values, [&](double each) { return each == double(value); });
+    });
+  };
+  expect("block_count",
+         geometry.weightLayers() + metadata.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
   expect("embedding_length", geometry.hiddenSize);
-  expect("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);
-  expect("attention.head_count_kv", geometry.attentionKvHeads);
+  expectEach("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);
+  expectEach("attention.head_count_kv", geometry.attentionKvHeads);
   expect("attention.key_length", geometry.attentionHeadDimension);
   expect("attention.value_length", geometry.attentionHeadDimension);
   // A GGUF whose RoPE rotates whole heads (Flint's) need not state the
-  // rotated dimensions, but one that does states the target's.
+  // rotated dimensions, but one that does states the target's; one of no
+  // RoPE (Inkling's) states none rotated, and no base.
   if (2 * geometry.rotaryPairs != geometry.attentionHeadDimension ||
       metadata.unsignedValue(arch + ".rope.dimension_count"))
     expect("rope.dimension_count", 2ull * geometry.rotaryPairs);
-  expectFloat("rope.freq_base", geometry.rotaryTheta);
+  if (geometry.rotaryPairs) expectFloat("rope.freq_base", geometry.rotaryTheta);
   expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
   if (const auto scaling = metadata.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
     mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
@@ -923,11 +1093,23 @@ void requireMetadata(const GgufFile &file, std::string_view architecture, const 
     expect("expert_count", geometry.experts);
     expect("expert_used_count", geometry.expertsPerToken);
     expect("expert_feed_forward_length", geometry.expertIntermediateSize);
-    expect("expert_shared_feed_forward_length",
-           uint64_t{geometry.sharedExpertSlices} * geometry.expertIntermediateSize);
+    // A block without a shared expert states none; a scaled router its
+    // scale; SiTU experts the softcaps the kernels hold (ops::MoeActivation).
+    if (geometry.sharedExpertSlices)
+      expect("expert_shared_feed_forward_length",
+             uint64_t{geometry.sharedExpertSlices} * geometry.expertIntermediateSize);
+    if (geometry.routeScale != 1.0F) expectFloat("expert_weights_scale", geometry.routeScale);
+    if (geometry.moeActivation == ops::MoeActivation::Situ) {
+      expectFloat("activation.situ_beta", 4.0);
+      expectFloat("activation.situ_linear_beta", 25.0);
+    }
   } else {
     expect("feed_forward_length", geometry.intermediateSize);
   }
+  // The head's softcap and the vocabulary its padding rows follow
+  // (QwenTargetDimensions::logitCap), where the target has them.
+  if (geometry.logitSoftcap != 0.0F) expectFloat("final_logit_softcapping", geometry.logitSoftcap);
+  if (geometry.validVocabularySize) expect("vocab_size_unpadded", geometry.validVocabularySize);
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 

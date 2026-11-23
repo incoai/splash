@@ -89,3 +89,97 @@ inline void full_qkv_storage_phase(
   splash_store_kv_slot<KHeads, HeadDim, CacheElement, ValuesTokenMajor>(
       page, sequence, params.kv, maxima, head_index, sequence_row, result, value, thread_index, lane, simd_group);
 }
+
+// A relative geometry's rows (metal/abi/PagedAttention.h): a threadgroup of
+// HeadDim threads per (head, row, sequence), as full_qkv_storage_phase's. A
+// query head's group reads its queries and relative state from the row's
+// query side row (F32, SPLASH_RELATIVE_QUERY_SIDE floats), scales each by the
+// layer's F32 scales (query_scale [QHeads][HeadDim], relative_scale [QHeads]
+// [SPLASH_RELATIVE_WIDTH]) and clips them, and on a PositionScaled layer
+// multiplies both by tau of the row's position (the sequence's committed
+// tokens plus its row, or for a tree row plus its depth): its queries staged
+// as full_qkv_storage_phase stages them, its relative state at its packed row
+// of `relative` ([row][QHeads][SPLASH_RELATIVE_WIDTH], F32). A K head's group
+// clips its key from `keys` and normalizes its value from `values` (each
+// [row][KHeads x HeadDim], F32) by its RMS without a gamma, and stores both
+// in the row's page slot. Each norm adds its squares per simdgroup and then
+// the simdgroups' in order.
+inline float relative_tau(uint position) {
+  return 1.0f + SPLASH_RELATIVE_LOG_SCALE_ALPHA *
+                    precise::log(max(1.0f, float(position + 1) / SPLASH_RELATIVE_LOG_SCALE_FLOOR));
+}
+
+inline float relative_clip_factor(float squares, float threshold) {
+  return min(1.0f, threshold / (precise::sqrt(squares) + SPLASH_RELATIVE_CLIP_EPSILON));
+}
+
+// Both sums of the threadgroup's HeadDim threads, each thread's own pair
+// added per simdgroup and then over the simdgroups in their order.
+template <uint HeadDim>
+inline float2 relative_head_sums(float2 own, threadgroup float2 *partials, uint lane, uint simd_group) {
+#pragma clang fp reassociate(off)
+  const float2 sum = float2(simd_sum(own.x), simd_sum(own.y));
+  if (lane == 0)
+    partials[simd_group] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float2 total = 0.0f;
+  for (uint group = 0; group < HeadDim / 32; ++group)
+    total += partials[group];
+  return total;
+}
+
+template <uint QHeads, uint KHeads, uint HeadDim, bool PositionScaled, typename CacheElement>
+inline void relative_qkv_storage_phase(
+    device const float *query_side, device const float *keys, device const float *values,
+    device const float *query_scale, device const float *relative_scale, device bfloat *queries,
+    device float *relative, device const SplashKvPage *page_table, device const SplashTreeRow *tree,
+    device const SplashLaneRows *layout, constant SplashAttentionParams &params, threadgroup float2 *partials,
+    threadgroup float *maxima, uint3 group, uint thread_index, uint lane, uint simd_group) {
+  static_assert(QHeads % KHeads == 0 && HeadDim % 32 == 0 && SPLASH_RELATIVE_WIDTH <= 32,
+                "a relative state's dimensions are the first simdgroup's lanes");
+  constexpr uint Group = QHeads / KHeads, Width = SPLASH_RELATIVE_WIDTH;
+  constexpr uint SideStride = SPLASH_RELATIVE_QUERY_SIDE(QHeads, HeadDim), KWidth = KHeads * HeadDim;
+  const uint sequence_row = group.y;
+  constant SplashAttentionSequence &sequence = params.sequence[group.z];
+  const bool query = group.x < QHeads;
+  const bool stores =
+      !query && splash_attention_rows_valid(params, sequence) && sequence_row < sequence.row_bound;
+  const SplashKvPage page = stores ? splash_store_page(page_table, sequence, sequence_row) : SPLASH_KV_PAGE_ABSENT;
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, group.z);
+  if (sequence_row >= rows.rows || (!query && !stores))
+    return;
+  const uint head = query ? group.x : group.x - QHeads;
+  const ulong packed = ulong(rows.first) + sequence_row;
+  if (query) {
+    device const float *side = query_side + packed * SideStride;
+    const float element = query_scale[head * HeadDim + thread_index] * side[head * HeadDim + thread_index];
+    const bool state = thread_index < Width;
+    const float coordinate =
+        state ? relative_scale[head * Width + thread_index] *
+                    side[SPLASH_RELATIVE_STATES(QHeads, HeadDim) + head * Width + thread_index]
+              : 0.0f;
+    const float2 squares =
+        relative_head_sums<HeadDim>(float2(element * element, coordinate * coordinate), partials, lane, simd_group);
+    float tau = 1.0f;
+    if constexpr (PositionScaled)
+      tau = relative_tau(sequence.committed_tokens + (params.trees ? uint(tree[packed].depth) : sequence_row));
+    const float scaled = element * relative_clip_factor(squares.x, SPLASH_RELATIVE_QK_CLIP) * tau;
+    const uint kv_head = head / Group, local_head = head % Group;
+    queries[((ulong(sequence.stage_row) + ulong(kv_head) * sequence.chunk_stride + sequence_row) * Group +
+             local_head) *
+                HeadDim +
+            thread_index] = bfloat(scaled);
+    if (state)
+      relative[(packed * QHeads + head) * Width + thread_index] =
+          coordinate * relative_clip_factor(squares.y, SPLASH_RELATIVE_STATE_CLIP) * tau;
+    return;
+  }
+  const float key = keys[packed * KWidth + head * HeadDim + thread_index];
+  const float value = values[packed * KWidth + head * HeadDim + thread_index];
+  const float2 squares = relative_head_sums<HeadDim>(float2(key * key, value * value), partials, lane, simd_group);
+  const float clipped = key * relative_clip_factor(squares.x, SPLASH_RELATIVE_QK_CLIP);
+  const float normalized = value * rsqrt(squares.y / HeadDim + kRmsEpsilon);
+  splash_store_kv_slot<KHeads, HeadDim, CacheElement, false>(page, sequence, params.kv, maxima, head, sequence_row,
+                                                             bfloat(clipped), bfloat(normalized), thread_index, lane,
+                                                             simd_group);
+}

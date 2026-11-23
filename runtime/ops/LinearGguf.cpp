@@ -388,7 +388,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
 // over 128-row tiles: a plain projection in one
 // dispatch per format, over the column tiles of its segments of that format
 // (a fused projection's segments otherwise run as small grids of their own),
-// a projection with an epilogue in one dispatch per segment. Rows past the
+// into bf16 or fp32 rows (the plan's destination), a projection with an
+// epilogue in one dispatch per segment, into bf16 rows. Rows past the
 // chunk's stay inside the budget-sized prefill buffers, and the simdgroups of
 // a tile that only hold them skip their matmuls.
 void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
@@ -421,8 +422,8 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
         bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
       }
       bindings.push_back(b.output);
-      graph.add(prefillKernel(group.front()->name(), epilogue), std::move(bindings), params,
-                {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
+      graph.add(kernelInstance(prefillKernel(group.front()->name(), epilogue), plan.destination()),
+                std::move(bindings), params, {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
     }
     return;
   }

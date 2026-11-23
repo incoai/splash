@@ -33,3 +33,12 @@ inline float splash_erf(float x) {
 inline float splash_gelu_erf(float x) {
   return 0.5f * x * (1.0f + splash_erf(x * 0.7071067811865476f));
 }
+
+// Inkling's SiTU of a gate g and an up u: the gate softcapped at 4 times the
+// sigmoid of the raw gate, times the up softcapped at 25, 4 tanh(g / 4)
+// sigmoid(g) 25 tanh(u / 25). tanh is the precise one: fast math's loses
+// the relative precision of a small argument, where the product is nearly
+// g sigmoid(g) u.
+inline float splash_situ(float gate, float up) {
+  return 4.0f * precise::tanh(0.25f * gate) * splash_sigmoid(gate) * (25.0f * precise::tanh(up * 0.04f));
+}

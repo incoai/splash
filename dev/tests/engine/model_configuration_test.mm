@@ -14,7 +14,9 @@
 #include "TestDrafts.hpp"
 #include "TestFiles.hpp"
 #include "TestModel.hpp"
+#include "model/InklingSteps.hpp"
 #include "model/ModelDescriptor.hpp"
+#include "model/QwenTargetLoader.hpp"
 #include "model/RopeScaling.hpp"
 #include "model/WeightStore.hpp"
 
@@ -30,6 +32,7 @@
 #include <string>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 namespace {
 
@@ -82,13 +85,16 @@ constexpr std::string_view kLargeMoeGgufConfig =
     R"("max_position_embeddings":262144,"num_attention_heads":32,"num_key_value_heads":2,)"
     R"("head_dim":256,"num_experts":256,"num_hidden_layers":48,"vocab_size":248320}})";
 
-// The descriptor inspection makes of model's assembly.
-model::ModelDescriptor inspect(const SourceModel &model) {
+// The descriptor inspection makes of model's assembly, whose root holds the
+// draft's config unless `draft` is false.
+model::ModelDescriptor inspect(const SourceModel &model, bool draft = true) {
   const test::TemporaryDirectory root("splash-source-model");
-  std::filesystem::create_directory(root.path() / "draft");
   test::writeFile(root.path() / "model.json", model.record);
   test::writeFile(root.path() / "config.json", model.config);
-  test::writeFile(root.path() / "draft" / "config.json", model.draft);
+  if (draft) {
+    std::filesystem::create_directory(root.path() / "draft");
+    test::writeFile(root.path() / "draft" / "config.json", model.draft);
+  }
   return model::inspectModelRoot(root.path());
 }
 
@@ -227,11 +233,64 @@ void testSources() {
   require(!described(model::TargetSource{}, model::VisionSource::None).valid() &&
               !described(model::TargetSource::Safetensors, model::VisionSource{}).valid(),
           "a descriptor without a source was valid");
+  // A model installed without a draft has the zero draft layout, and no
+  // draft state; a layout of no layers that states anything else is none.
+  const model::ModelDescriptor undrafted =
+      described(model::TargetSource::Safetensors, model::VisionSource::None, {});
+  require(undrafted.valid() && !undrafted.draft.present() && undrafted.stateLayout.draft == model::DraftStateLayout{} &&
+              undrafted.stateLayout.laneBytes() < described(model::TargetSource::Safetensors, model::VisionSource::None)
+                                                      .stateLayout.laneBytes(),
+          "a descriptor without a draft was not valid, or held draft state");
+  // Without a draft no mask token is read: a family whose drafts choose
+  // theirs (Flint's) has none to name, and its descriptor stays valid.
+  require(model::makeModelDescriptor("sources", model::FlintLayout{}, {},
+                                     {.outputHiddenSize = model::FlintLayout{}.hiddenSize},
+                                     model::TargetSource::Gguf, model::VisionSource::None)
+              .valid(),
+          "a descriptor without a draft needed a mask token");
+  model::DFlashDraftLayout layerless = test::qwen3_8Draft();
+  layerless.layers = 0;
+  require(!described(model::TargetSource::Safetensors, model::VisionSource::None, layerless).valid(),
+          "a draft of no layers was valid");
   constexpr std::array<uint32_t, 2> pastLastLayer{5, 64};
   require(!described(model::TargetSource::Safetensors, model::VisionSource::None,
                      model::draftLayout(5120, 248320, 5, 17408, 1e7F, pastLastLayer))
                .valid(),
           "a descriptor whose draft reads past the target's last layer was valid");
+}
+
+// A record whose draft source is null (--draft-model none) names a model
+// without a draft, whose root holds no draft/; a root that disagrees with its
+// record is refused either way.
+void testWithoutDraft(const std::filesystem::path &fixtures) {
+  const SourceModel drafted =
+      mlxModel(fixtures, "qwen3.8-27b")
+          .with(&SourceModel::record, R"("vision_format":"none")",
+                R"("vision_format":"none","sources":{"target":{"repo":"community/fine-tune","revision":null},)"
+                R"("draft":{"repo":"incoai/Qwen3.8-27B-DFlash2","revision":null}})");
+  const SourceModel undrafted =
+      drafted.with(&SourceModel::record, R"("draft":{"repo":"incoai/Qwen3.8-27B-DFlash2","revision":null})",
+                   R"("draft":null)");
+  const model::ModelDescriptor descriptor = inspect(undrafted, false);
+  require(descriptor.valid() && descriptor.draft == model::DFlashDraftLayout{} &&
+              std::holds_alternative<model::Qwen3_8Layout>(descriptor.target),
+          "a record without a draft did not make a descriptor without one");
+  require(inspect(drafted).draft == test::qwen3_8Draft(), "a record naming its draft lost it");
+  rejects([&] { static_cast<void>(inspect(undrafted)); }, "the model's root holds a draft/ its record does not name",
+          "a draft/ the record does not name was loaded");
+  rejects([&] { static_cast<void>(inspect(drafted, false)); },
+          "the model's root holds no draft/ for its DFlash2 draft", "a record's draft was not required");
+  // Flint's target keeps no recurrent or auxiliary state: without a draft a
+  // cached state would hold nothing, which the SSD cache's state slots
+  // cannot store.
+  const SourceModel flint =
+      mlxModel(fixtures, "flint")
+          .with(&SourceModel::record, R"("mlx-affine")", R"("gguf")")
+          .with(&SourceModel::record, R"("vision_format":"none")",
+                R"("vision_format":"none","sources":{"target":{"repo":"community/fine-tune","revision":null},)"
+                R"("draft":null})");
+  rejects([&] { static_cast<void>(inspect(flint, false)); }, "Flint serves only with a DFlash2 draft",
+          "a Flint without a draft was accepted");
 }
 
 // Each config is checked where the descriptor is made, once, and each number
@@ -1054,11 +1113,310 @@ void testFlint(const std::filesystem::path &fixtures) {
           "a Flint config under text_config was accepted");
 }
 
+// The header of a real GGUF of a family as its fixtures hold it, without
+// data: its architecture's keys (gguf-metadata.json), each typed as the JSON
+// value reads (a whole number a uint32, another number an F32, booleans and
+// their arrays, integer arrays as int32), and its tensor table
+// (gguf-tensors.json: name, ggml type, extents innermost first).
+GgufHeaders fixtureHeaders(const std::filesystem::path &family, const char *metadataFile = "gguf-metadata.json",
+                           const char *tensorsFile = "gguf-tensors.json") {
+  const auto object = [&](const char *name) {
+    NSData *data = [NSData dataWithContentsOfFile:@((family / name).c_str())];
+    NSDictionary *value = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    require([value isKindOfClass:NSDictionary.class], "unreadable fixture " + (family / name).string());
+    return value;
+  };
+  const auto boolean = [](id value) {
+    return [value isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID();
+  };
+  std::vector<test_gguf::Key> keys;
+  NSDictionary *metadata = object(metadataFile);
+  for (NSString *key in [metadata.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+    const std::string name = key.UTF8String;
+    id value = metadata[key];
+    if ([value isKindOfClass:NSString.class]) {
+      keys.push_back(test_gguf::stringKey(name, [value UTF8String]));
+    } else if ([value isKindOfClass:NSArray.class] && boolean([value firstObject])) {
+      std::vector<bool> values;
+      for (NSNumber *each in value) values.push_back(each.boolValue);
+      keys.push_back(test_gguf::boolArrayKey(name, values));
+    } else if ([value isKindOfClass:NSArray.class]) {
+      std::vector<int32_t> values;
+      for (NSNumber *each in value) values.push_back(each.intValue);
+      keys.push_back(test_gguf::int32ArrayKey(name, values));
+    } else if (boolean(value)) {
+      keys.push_back(test_gguf::boolKey(name, [value boolValue]));
+    } else if (CFNumberIsFloatType((__bridge CFNumberRef)value)) {
+      keys.push_back(test_gguf::float32Key(name, [value floatValue]));
+    } else {
+      keys.push_back(test_gguf::uint32Key(name, [value unsignedIntValue]));
+    }
+  }
+  std::vector<test_gguf::Tensor> tensors;
+  NSDictionary *table = object(tensorsFile);
+  for (NSString *name in table) {
+    NSArray *entry = table[name];
+    const std::string type = [entry[0] UTF8String];
+    const auto found =
+        std::ranges::find_if(model::kGgmlTypes, [&](const auto &each) { return each.second.name == type; });
+    require(found != std::ranges::end(model::kGgmlTypes), "unknown ggml type " + type);
+    std::vector<uint64_t> dims;
+    for (NSNumber *extent in entry[1]) dims.push_back(extent.unsignedLongLongValue);
+    tensors.push_back({name.UTF8String, std::move(dims), found->first, {}});
+  }
+  return {{std::move(keys)}, {std::move(tensors)}};
+}
+
+// Inkling 2 Mini: 24 weight layers whose loop runs 6 to 17 three times, so 48
+// layers in run order (prelude 0-5, passes 6-17, 18-29 and 30-41, coda
+// 42-47), each with its K/V and convolution state; its global layers every
+// sixth (5, 11, ..., 47), the others over a window of the 1,023 keys before a
+// row; no RoPE, MoE blocks of no shared expert. Its configuration is
+// transformers' text_config, which the installer derives from its GGUF in
+// those names (a float32 header value as its shortest decimal), whose sizes
+// are its weight layers' and its window model_max_length; the installer's
+// check plans the real ggml-org Q8_0 file's header from it. Each key its
+// values make is held to them by name. It loads from a GGUF only.
+// Where Inkling's layers read and write their residual's states
+// (model::inklingLayerStates), against the model's forward (transformers'
+// Inkling2LoopModel.forward) run on names: each layer's output a value
+// of its own, the blocks a list each block's first layer pushes its input to,
+// every pass of the loop restarting from the prelude's output and its blocks
+// with messages from the blocks and output of the pass before. Every state a
+// layer reads holds the value the model reads there, its output's state took
+// no value read later, and the head reads every block and the last output.
+void testInklingStates(const model::InklingLayout &layout) {
+  std::array<std::string, model::kInklingStates> slots;
+  slots[model::kInklingEmbeddingState] = "x";
+  std::vector<std::string> blocks, preludeBlocks;
+  std::string h = "x", prelude, bankBlock, bankOutput;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const uint32_t weight = layout.weightLayer(layer), pass = layout.loopPass(layer);
+    const std::string where = "Inkling layer " + std::to_string(layer);
+    if (weight == layout.loopStart && pass) {
+      bankBlock = blocks.at(preludeBlocks.size() + 1);
+      bankOutput = h;
+      blocks = preludeBlocks;
+      h = prelude;
+    }
+    const model::InklingLayerStates states = model::inklingLayerStates(layout, layer);
+    const auto read = [&](uint32_t state, const std::string &value, const std::string &what) {
+      require(state < slots.size() && slots[state] == value, where + " reads another " + what);
+    };
+    read(states.input, h, "input");
+    require(layer == 0 || states.attentionBlocks == blocks.size(), where + "'s attention mixes other blocks");
+    for (uint32_t block = 0; block < states.attentionBlocks; ++block)
+      read(states.blocks[block], blocks[block], "attention block");
+    const bool starts = weight % model::InklingLayout::residualBlockLayers == 0;
+    require(states.startsBlock() == starts, where + " starts a block wrongly");
+    if (starts) blocks.push_back(h);
+    require(states.ffnBlocks == blocks.size(), where + "'s FFN mixes other blocks");
+    for (uint32_t block = 0; block < states.ffnBlocks; ++block) read(states.blocks[block], blocks[block], "FFN block");
+    require(states.messages == (pass != 0), where + "'s messages are another pass's");
+    if (states.messages) {
+      read(states.bank[0], bankBlock, "message block");
+      read(states.bank[1], bankOutput, "message output");
+    }
+    h = slots[states.output] = "out" + std::to_string(layer);
+    if (layer + 1 == layout.loopStart) {
+      prelude = h;
+      preludeBlocks = blocks;
+    }
+  }
+  blocks.push_back(h);
+  require(model::kInklingFinalStates.size() == blocks.size(), "Inkling's head mixes other states");
+  for (uint32_t state = 0; state < blocks.size(); ++state)
+    require(slots[model::kInklingFinalStates[state]] == blocks[state], "Inkling's head mixes another state");
+  rejects([&] { static_cast<void>(model::inklingLayerStates(layout, layout.layers)); }, "not a layer of Inkling's loop",
+          "a layer past Inkling's was given states");
+}
+
+void testInkling(const std::filesystem::path &fixtures) {
+  const model::InklingLayout layout;
+  require(layout.weightLayers() == 24 && layout.layers == 48, "Inkling's layers are not its loop's");
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const uint32_t weight = layer < 6 ? layer : layer < 42 ? 6 + (layer - 6) % 12 : layer - 24;
+    const uint32_t pass = layer >= 6 && layer < 42 ? (layer - 6) / 12 : 0;
+    require(layout.weightLayer(layer) == weight && layout.loopPass(layer) == pass,
+            "layer " + std::to_string(layer) + " runs another weight layer or pass");
+    require(layout.kvLayout().windowed(layer) == (layer % 6 != 5),
+            "layer " + std::to_string(layer) + "'s window is not its weight layer's");
+    if (layer == layout.firstLayer(weight))
+      require(weight < 18 ? layer == weight : layer == weight + 24, "a weight layer's first layer is another");
+  }
+  const model::Qwen3_8Layout dense;
+  require(dense.weightLayers() == dense.layers && dense.weightLayer(40) == 40 && dense.firstLayer(40) == 40,
+          "a target without a loop runs its weight layers once");
+  testInklingStates(layout);
+  const kv::Layout kv = layout.kvLayout();
+  require(kv.valid() && kv.attentionLayers == 48 && kv.kvHeads == 8 && kv.headDimension == 128 &&
+              kv.windowTokens == 1023 && kv.windowedLayers == 0x7df7df7df7df,
+          "Inkling's KV layout is not its 48 layers'");
+  // A state cell keeps the convolutions' last three inputs of every layer:
+  // keys and values of 1,024 channels, attention and FFN outputs of 2,304,
+  // in bf16.
+  const model::GdnStateLayout state = layout.gdnStateLayout();
+  require(state.valid() && !state.layers && state.auxiliaryBytes == 48ull * 3 * (1024 + 1024 + 2304 + 2304) * 2 &&
+              state.auxiliaryBytes == 1'916'928,
+          "Inkling's state cell is not its convolutions' history");
+  // Its layout is whole: no RoPE, so every attention layer unrotated, and a
+  // loop of its weight layers run at least twice.
+  model::requireQwenLayout(layout);
+  model::InklingLayout rotated = layout;
+  rotated.unrotatedLayers &= ~uint64_t{1};
+  model::InklingLayout based = layout;
+  based.rotaryTheta = 1e4F;
+  model::InklingLayout once = layout;
+  once.loopPasses = 1;
+  once.layers = 24;
+  model::InklingLayout past = layout;
+  past.loopEnd = 25;
+  for (const auto &[inconsistent, what] : {std::pair{rotated, "a layer rotated without RoPE"},
+                                           {based, "a RoPE base without RoPE"},
+                                           {once, "a loop run once"},
+                                           {past, "a loop past the weight layers"}})
+    rejects([&] { model::requireQwenLayout(inconsistent); }, "Qwen target layout",
+            std::string("a layout of ") + what + " was accepted");
+
+  const std::filesystem::path family = fixtures / "inkling-2-mini";
+  const std::string config = text(family / "config.json");
+  const GgufHeaders headers = fixtureHeaders(family);
+  const test::TemporaryDirectory directory("splash-inkling-check");
+  uint32_t checks = 0;
+  const auto check = [&](std::string_view targetFormat, const std::string &configuration,
+                         const GgufHeaders &header) {
+    const std::filesystem::path root = directory.path() / std::to_string(++checks);
+    std::filesystem::create_directories(root / "target");
+    test::writeFile(root / "config.json", configuration);
+    test::writeFile(root / "target" / "model.gguf", test_gguf::file(header.keys.front(), header.tensors.front()));
+    return std::string(model::inspectSourceConfiguration(targetFormat, "none", root / "config.json",
+                                                         root / "target", std::nullopt));
+  };
+  const auto with = [](std::string text, std::string_view from, std::string_view to) {
+    const size_t at = text.find(from);
+    require(at != std::string::npos, "the config has no " + std::string(from));
+    return text.replace(at, from.size(), to);
+  };
+  require(check("gguf", config, headers) == "Inkling-2-Mini",
+          "transformers' Inkling config and the release's GGUF header were not found to be Inkling-2-Mini");
+  // The installer's spelling of its float32 values, its stop token in the
+  // text config and the sliding layers' attention sizes.
+  const std::string derived =
+      with(with(config, R"("qk_l2_clip_threshold": 22.627416997969522)", R"("qk_l2_clip_threshold": 22.627417)"),
+           R"("model_type": "inkling2_loop_text",)",
+           R"("model_type": "inkling2_loop_text", "eos_token_id": [200006], "max_position_embeddings": 1048576,)");
+  require(check("gguf", derived, headers) == "Inkling-2-Mini", "the installer's derived Inkling config was refused");
+  rejects([&] { static_cast<void>(check("mlx-affine", config, headers)); }, "Inkling-2-Mini loads from a GGUF only",
+          "an MLX Inkling was accepted");
+  rejects(
+      [&] {
+        static_cast<void>(
+            check("gguf", with(config, R"("num_hidden_layers": 24)", R"("num_hidden_layers": 48)"), headers));
+      },
+          "no supported model has this architecture (text config num_hidden_layers: GGUF 48, Inkling-2-Mini 24)",
+          "an Inkling config counting its layers' passes was accepted");
+  struct Refused final {
+    std::string_view from, to, error;
+  };
+  for (const Refused &refused : std::initializer_list<Refused>{
+           {R"("d_rel": 16)", R"("d_rel": 32)", "text config d_rel mismatch"},
+           {R"("rel_extent": 1024)", R"("rel_extent": 512)", "text config rel_extent mismatch"},
+           {R"("sliding_window_size": 1024)", R"("sliding_window_size": 4096)",
+            "text config sliding_window_size mismatch"},
+           {"\n      21,\n      22\n    ]", "\n      21,\n      23\n    ]", "text config local_layer_ids mismatch"},
+           {R"("sconv_kernel_size": 4)", R"("sconv_kernel_size": 3)", "text config sconv_kernel_size mismatch"},
+           {R"("n_layers_per_attn_res_block": 6)", R"("n_layers_per_attn_res_block": 8)",
+            "text config n_layers_per_attn_res_block mismatch"},
+           {R"("n_shared_experts": 0)", R"("n_shared_experts": 1)", "text config n_shared_experts mismatch"},
+           {R"("intermediate_size": 1152)", R"("intermediate_size": 1024)", "text config intermediate_size mismatch"},
+           {R"("route_scale": 8.0)", R"("route_scale": 2.5)", "text config route_scale mismatch"},
+           {R"("final_logit_softcapping": 30.0)", R"("final_logit_softcapping": 50.0)",
+            "text config final_logit_softcapping mismatch"},
+           {R"("unpadded_vocab_size": 200058)", R"("unpadded_vocab_size": 201024)",
+            "text config unpadded_vocab_size mismatch"},
+           {R"("num_passes": 3)", R"("num_passes": 2)", "text config loop_config num_passes mismatch"},
+           {R"("core_end": 18)", R"("core_end": 12)", "text config loop_config core_end mismatch"},
+           {R"("qk_l2_clip_threshold": 22.627416997969522)", R"("qk_l2_clip_threshold": 16.0)",
+            "text config qk_l2_clip_threshold mismatch"},
+           {R"("mlp_up_softcap": 25.0)", R"("mlp_up_softcap": 20.0)", "text config mlp_up_softcap mismatch"},
+           {R"("use_gate_bias": true)", R"("use_gate_bias": false)", "text config use_gate_bias must be true"},
+           {R"("is_varloop": false)", R"("is_varloop": true)", "text config loop_config is_varloop must be false"}})
+    rejects([&] { static_cast<void>(check("gguf", with(config, refused.from, refused.to), headers)); },
+            refused.error, "an Inkling config with " + std::string(refused.to) + " was accepted");
+  rejects([&] { static_cast<void>(check("gguf", with(derived, "[200006]", "[200007]"), headers)); },
+          "text config eos_token_id mismatch", "an Inkling config of another stop token was accepted");
+  // The header, as every start plans it.
+  const GgufHeaders otherLoop = headers.with(test_gguf::uint32Key("inkling2_loop.loop.count", 2));
+  rejects([&] { static_cast<void>(check("gguf", config, otherLoop)); }, "loop.count 2 (expected 3)",
+          "an Inkling GGUF of another loop was accepted");
+  const GgufHeaders tapless = headers.changed(
+      [](const test_gguf::Tensor &tensor) { return tensor.name != "blk.11.attn_v_conv_proj.weight"; });
+  rejects([&] { static_cast<void>(check("gguf", config, tapless)); }, "attn_v_conv_proj.weight (missing) in 1 layer",
+          "an Inkling GGUF without a global layer's value taps was accepted");
+
+  // Its DSpark draft, by its GGUF's header (Unsloth's, but its tokenizer),
+  // as the installer checks it before any download: its layout reads the
+  // outputs of the layers before the visits it names and the final norm.
+  const GgufHeaders dspark = fixtureHeaders(family / "draft", "dspark-metadata.json", "dspark-tensors.json");
+  const auto drafted = [&](const GgufHeaders &draft) {
+    const std::filesystem::path root = directory.path() / std::to_string(++checks);
+    std::filesystem::create_directories(root / "target");
+    std::filesystem::create_directories(root / "draft");
+    test::writeFile(root / "config.json", config);
+    test::writeFile(root / "target" / "model.gguf", test_gguf::file(headers.keys.front(), headers.tensors.front()));
+    test::writeFile(root / "draft" / "dspark.gguf", test_gguf::file(draft.keys.front(), draft.tensors.front()));
+    return std::string(
+        model::inspectSourceConfiguration("gguf", "none", root / "config.json", root / "target", root / "draft"));
+  };
+  require(drafted(dspark) == "Inkling-2-Mini", "Inkling's DSpark draft was refused");
+  struct DraftRefused final {
+    test_gguf::Key key;
+    std::string_view error;
+  };
+  for (const DraftRefused &refused : std::initializer_list<DraftRefused>{
+           {test_gguf::uint32Key("dflash.attention.head_count", 32), "dflash.attention.head_count 24"},
+           {test_gguf::uint32Key("dflash.vocab_size", 248320), "hidden size and vocabulary are not its target's"},
+           {test_gguf::uint32Key("dflash.dspark.markov_rank", 128), "a Markov rank of 256"},
+           {test_gguf::int32ArrayKey("dflash.target_layers", {5, 23, 41, 47}), "the last the target's final norm"},
+           {test_gguf::uint32Key("dflash.attention.sliding_window", 4096), "window lies inside its rings"},
+           {test_gguf::boolKey("dflash.attention.causal", true), "dflash.attention.causal 0"}})
+    rejects([&] { static_cast<void>(drafted(dspark.with(refused.key))); }, refused.error,
+            "a DSpark draft of another " + refused.key.name + " was accepted");
+  const GgufHeaders headless =
+      dspark.changed([](const test_gguf::Tensor &tensor) { return tensor.name != "joint_proj.weight"; });
+  rejects([&] { static_cast<void>(drafted(headless)); }, "joint_proj.weight",
+          "a DSpark draft without its Markov head was accepted");
+  model::DSparkHeader header;
+  header.hiddenSize = layout.hiddenSize;
+  header.vocabularySize = layout.vocabularySize;
+  header.layers = 3;
+  header.intermediateSize = 9216;
+  header.rotaryTheta = 1e6F;
+  header.targetFeatures = {5, 23, 41, 48};
+  header.slidingLayers = 0b101;
+  header.slidingWindow = 1024;
+  header.markovRank = 256;
+  header.proposedVocabulary = 200058;
+  header.logitCap = 30.0F;
+  header.projectionFormat = GGUF_FMT_Q80;
+  const model::DFlashDraftLayout draft = model::dsparkLayout(layout.hiddenSize, layout.vocabularySize, layout.layers,
+                                                             header);
+  require(draft.kind == model::DraftKind::DSpark && draft.targetLayerIds().size() == 4 &&
+              draft.targetLayers[0] == 4 && draft.targetLayers[1] == 22 && draft.targetLayers[2] == 40 &&
+              draft.targetLayers[3] == 48 && draft.targetHiddenSize() == 4 * 2304 && draft.qkvSize == 5120 &&
+              draft.attentionSize == 3072 && draft.contextKvSize() == 2048 && draft.projectionFormat == GGUF_FMT_Q80,
+          "Inkling's DSpark layout does not read its taps or attend with its heads");
+  const model::DraftStateLayout lane = draft.stateLayout();
+  require(lane.contextWidth == 3 * 2304 && lane.auxiliaryBytes == 2304 * 2 && lane.valid(),
+          "a DSpark lane does not keep its layers' context rows and its f_rnn row");
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
     testFamilies(argv[1]);
     testSources();
+    testWithoutDraft(argv[1]);
     testOneRulePerValue(argv[1]);
     testQuantization(argv[1]);
     testVisionConfig(argv[1]);
@@ -1066,8 +1424,9 @@ int main(int argc, char **argv) {
     testConfigurationCheck(argv[1]);
     testYarn(argv[1]);
     testFlint(argv[1]);
-    std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
-                 "experts, the installer's check, YaRN, Flint PASS\n";
+    testInkling(argv[1]);
+    std::cout << "model configuration: every family, sources, without a draft, one rule per value, quantization, vision, "
+                 "pruned experts, the installer's check, YaRN, Flint, Inkling PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

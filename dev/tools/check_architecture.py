@@ -108,6 +108,9 @@ ENGINE_MODEL_BOUNDARY = frozenset(
 CONCRETE_MODEL_HEADERS = (
     "model/DFlashDraft.hpp",
     "model/Flint.hpp",
+    "model/Inkling.hpp",
+    "model/InklingSteps.hpp",
+    "model/InklingTarget.hpp",
     "model/ModelFactory.hpp",
     "model/Qwen3_6Moe.hpp",
     "model/Qwen3_8.hpp",
@@ -486,9 +489,10 @@ def identifier_parts(identifier: str) -> list[str]:
     return [part.lower() for part in IDENTIFIER_PART.findall(identifier)]
 
 
-def family_names(path: Path) -> list[tuple[str, str]]:
+def family_names(path: Path) -> list[tuple[str, str | None]]:
     """The name and the draft's repository of each family the installer
-    serves (FAMILIES in install/families.py)."""
+    serves (FAMILIES in install/families.py), None for a family released
+    without a draft."""
     families = next(
         node.value
         for node in ast.parse(path.read_text()).body
@@ -499,7 +503,7 @@ def family_names(path: Path) -> list[tuple[str, str]]:
 
 
 def family_words(
-    families: list[tuple[str, str]], headers: tuple[str, ...]
+    families: list[tuple[str, str | None]], headers: tuple[str, ...]
 ) -> frozenset[str]:
     """The words a family goes by: the first word of a family's name and of
     its draft's repository after the owner, the model's brand (Qwen, Ornith,
@@ -516,7 +520,7 @@ def family_words(
     return frozenset(
         part
         for family, repository in families
-        for name in (words(family), words(repository.rpartition("/")[2]))
+        for name in (words(family), words((repository or "").rpartition("/")[2]))
         for part in name
         if part == name[0] or part in header_words
     )

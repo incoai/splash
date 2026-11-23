@@ -1965,6 +1965,14 @@ void ropeExtents(metal::MetalBackend &backend) {
                        [&](metal::CommandGraph &graph, const std::vector<metal::MetalBuffer> &b) {
                          ops::RoPE::addDraftRangeTables(graph, b[0], b[1], b[2], rows.draft_rows, 6130, 2048);
                        });
+  // A target without RoPE (Inkling 2's) has no table: its rows encode
+  // nothing, and a step's tree rows neither.
+  metal::CommandGraph none;
+  const metal::MetalBuffer empty;
+  ops::RoPE::addTables(none, empty, empty, empty, empty, empty, empty, empty, empty, {rows.target_rows, 0, 1.0F}, 2048,
+                       0);
+  ops::RoPE::addTreeTables(none, empty, empty, {}, empty, empty, empty, {1, 1, 16}, 1.0F, 0);
+  require(none.empty(), "a target without RoPE encoded tables");
 }
 
 // The draft rows of a range of consecutive positions come out bit for bit as

@@ -65,9 +65,11 @@ def _require_vision(modality, vision):
         raise APIError(400, f"{modality} input is not supported: {VISION_UNAVAILABLE}")
 
 
-def _user_content(content, vision):
+def _user_content(content, vision, text_parts=False):
     """Text for plain user content; a canonical parts list when it carries
-    images or PDFs, so the chat template places each where the author put it.
+    images or PDFs, so the chat template places each where the author put it,
+    or, with text_parts, more than one text part, which a template that
+    frames each part as a block of its own renders apart (Inkling's).
 
     The one place media is accepted or rejected: every API shape converts its
     image and PDF parts to image_url and file parts that reach this point
@@ -95,7 +97,7 @@ def _user_content(content, vision):
             raise APIError(400, f"{kind} content is not supported")
         else:
             raise APIError(400, "unsupported message content part")
-    return media_content(parts)
+    return parts if text_parts and len(parts) > 1 else media_content(parts)
 
 
 def _call_arguments(arguments):
@@ -115,9 +117,11 @@ def _call_arguments(arguments):
     return arguments if isinstance(arguments, dict) else json_codec.dumps(arguments)
 
 
-def normalize_messages(messages, *, vision):
+def normalize_messages(messages, *, vision, text_parts=False):
     """`messages` checked and in canonical form, each PDF a file part of its
-    checked data, not yet rendered."""
+    checked data, not yet rendered. text_parts keeps a user's or a tool's
+    text parts apart, for a template that frames each part as a block of its
+    own (ChatFormat.frames); otherwise they are one text."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
     normalized = []
@@ -143,7 +147,7 @@ def normalize_messages(messages, *, vision):
         content = message.get("content")
         item = {
             "role": role,
-            "content": _user_content(content, vision)
+            "content": _user_content(content, vision, text_parts)
             if role in ("user", "tool")
             else _text_content(content),
         }

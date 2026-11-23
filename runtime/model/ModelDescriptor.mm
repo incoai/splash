@@ -1,4 +1,5 @@
 #include "ModelDescriptor.hpp"
+#include "DSparkDraft.hpp"
 #include "GgufImage.hpp"
 #include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
@@ -179,22 +180,25 @@ void requireBooleans(NSDictionary *object, std::string_view where,
   }
 }
 
-// Each layer's type in a layer_types array: linear_attention for a GDN
-// layer; for an attention layer, sliding_attention where a window bounds it
-// (kv::Layout::windowed), else full_attention.
+// Each weight layer's type in a layer_types array, as the layers that run it
+// attend: linear_attention for a GDN layer; for an attention layer,
+// sliding_attention where a window bounds it (kv::Layout::windowed), else
+// full_attention.
 void requireLayerTypes(NSArray *types, const QwenHybridLayout &target,
                        std::string_view source, std::string_view label) {
-  if (types.count != target.layers)
+  if (types.count != target.weightLayers())
     throw std::invalid_argument(std::string(label) + " count mismatch: " + std::string(source) +
                                 " " + std::to_string(types.count) + ", runtime " +
-                                std::to_string(target.layers));
+                                std::to_string(target.weightLayers()));
   for (uint32_t layer = 0, attention = 0; layer < target.layers; ++layer) {
-    NSString *expected = !target.isFullAttentionLayer(layer)       ? @"linear_attention"
-                         : target.kvLayout().windowed(attention++) ? @"sliding_attention"
-                                                                   : @"full_attention";
-    if (![types[layer] isEqual:expected])
+    const bool full = target.isFullAttentionLayer(layer);
+    const bool windowed = full && target.kvLayout().windowed(attention++);
+    const uint32_t weightLayer = target.weightLayer(layer);
+    if (target.firstLayer(weightLayer) != layer) continue;
+    NSString *expected = !full ? @"linear_attention" : windowed ? @"sliding_attention" : @"full_attention";
+    if (![types[weightLayer] isEqual:expected])
       throw std::invalid_argument(std::string(label) + " " +
-                                  std::to_string(layer) + " must be " +
+                                  std::to_string(weightLayer) + " must be " +
                                   expected.UTF8String);
   }
 }
@@ -230,18 +234,21 @@ std::invalid_argument unsupportedModel(const std::string &difference) {
 
 // How a text configuration differs from a family in the sizes every one
 // holds, which tell the family's target from other models of its
-// architecture: the first that differs, after `matched` that agree.
+// architecture: the first that differs, after `matched` that agree. Its
+// layers are its weight layers, and its native window is at the layout's
+// contextKey.
 struct SizeDifference final {
   size_t matched;
   std::string difference;
 };
-std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
-                                             TargetSource source) {
+template <class Layout>
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const Layout &target, TargetSource source) {
+  const std::string contextKey(Layout::contextKey);
   const std::initializer_list<ExpectedNumber> sizes{
       {"hidden_size", target.hiddenSize},
-      {"num_hidden_layers", target.layers},
+      {"num_hidden_layers", target.weightLayers()},
       {"vocab_size", target.vocabularySize},
-      {"max_position_embeddings", target.nativeContextTokens},
+      {contextKey.c_str(), target.nativeContextTokens},
       {"num_attention_heads", target.attentionQueryHeads},
       {"num_key_value_heads", target.attentionKvHeads},
       {"head_dim", target.attentionHeadDimension}};
@@ -406,6 +413,81 @@ void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSou
   if (text[@"hidden_act"])
     requireEqual(requireString(text, @"hidden_act", "text config hidden_act"), "silu", name, "text config hidden_act");
   for (const char *key : {"attention_bias", "tie_word_embeddings"})
+    if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
+}
+
+// A number that rounds to the F32 value expected, as a GGUF's F32 metadata
+// holds it: a config derived from a GGUF writes the shortest decimal of that
+// F32 (22.627417 for qk_clip), transformers' its double (22.627416997969522).
+void requireFloat32(id value, float expected, std::string_view source, std::string_view label) {
+  NSNumber *number = requireNumber(value, label);
+  if (static_cast<float>(number.doubleValue) != expected)
+    throw std::invalid_argument(std::string(label) + " mismatch: " + std::string(source) + " " +
+                                number.description.UTF8String + ", runtime " + @(expected).description.UTF8String);
+}
+
+// Inkling 2 Mini's text configuration, config.json's text_config in
+// transformers' names (the installer derives it from a GGUF's metadata in
+// them): the sizes every family's holds (sizeDifference, of its 24 weight
+// layers and its window at model_max_length), then the rest as the layout's
+// values make them: its relative-position bias, window and sliding layers
+// (local_layer_ids), short convolution, depth-attention block, loop, MoE
+// (no shared expert), routing scale, logit softcap and the tokens of its
+// vocabulary. Where a config states them too (transformers' does), its
+// stop tokens, epsilon, clips, log position scale, SiTU softcaps, router
+// bias, the sliding layers' attention sizes and a fixed loop. Its weights
+// load from a GGUF only: no safetensors checkpoint of it is released, and
+// its attention holds no q or k norm to tell one's storage by
+// (safetensors::normStorage).
+void validateTextConfig(NSDictionary *text, const InklingLayout &target, TargetSource source) {
+  if (source != TargetSource::Gguf) throw std::invalid_argument(std::string(target.family) + " loads from a GGUF only");
+  const std::string_view name = sourceName(source);
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  requireNumbers(text, name, "text config",
+                 {{"d_rel", target.relativeDimension},
+                  {"rel_extent", target.relativeExtent},
+                  {"sliding_window_size", target.slidingWindow},
+                  {"sconv_kernel_size", target.shortConvolutionTaps},
+                  {"n_layers_per_attn_res_block", InklingLayout::residualBlockLayers},
+                  {"n_routed_experts", target.experts},
+                  {"num_experts_per_tok", target.expertsPerToken},
+                  {"intermediate_size", target.expertIntermediateSize},
+                  {"n_shared_experts", target.sharedExpertSlices},
+                  {"unpadded_vocab_size", InklingLayout::tokenVocabulary}});
+  requireFloat32(text[@"route_scale"], InklingLayout::expertWeightsScale, name, "text config route_scale");
+  requireFloat32(text[@"final_logit_softcapping"], InklingLayout::finalLogitSoftcap, name,
+                 "text config final_logit_softcapping");
+  std::vector<uint32_t> sliding;
+  for (uint32_t layer = 0; layer < target.weightLayers(); ++layer)
+    if (!inklingGlobalLayer(target, layer)) sliding.push_back(layer);
+  requireWholes(requireArray(text, @"local_layer_ids", "text config local_layer_ids"), sliding, name,
+                "text config local_layer_ids");
+  NSDictionary *loop = requireObject(text, @"loop_config", "text config loop_config");
+  requireNumbers(loop, name, "text config loop_config",
+                 {{"core_start", target.loopStart}, {"core_end", target.loopEnd}, {"num_passes", target.loopPasses}});
+  if (loop[@"gate_rank"])
+    requireNumbers(loop, name, "text config loop_config", {{"gate_rank", InklingLayout::loopGateRank}});
+  if (loop[@"is_varloop"]) requireBooleans(loop, "text config loop_config", {{"is_varloop", false}});
+  if (text[@"eos_token_id"])
+    requireWholes(requireArray(text, @"eos_token_id", "text config eos_token_id"), target.stopTokens.tokens(), name,
+                  "text config eos_token_id");
+  for (const auto &[key, value] : std::initializer_list<std::pair<const char *, uint32_t>>{
+           {"swa_head_dim", target.attentionHeadDimension},
+           {"swa_num_attention_heads", target.attentionQueryHeads},
+           {"swa_num_key_value_heads", target.attentionKvHeads},
+           {"log_scaling_n_floor", InklingLayout::logScaleFloor}})
+    if (text[@(key)]) requireNumbers(text, name, "text config", {{key, value}});
+  for (const auto &[key, value] : std::initializer_list<std::pair<const char *, float>>{
+           {"rms_norm_eps", static_cast<float>(SPLASH_RMS_EPSILON)},
+           {"qk_l2_clip_threshold", InklingLayout::queryKeyClip},
+           {"rel_l2_clip_threshold", InklingLayout::relativeClip},
+           {"log_scaling_alpha", InklingLayout::logScaleAlpha},
+           {"mlp_gate_softcap", InklingLayout::gateSoftcap},
+           {"mlp_up_softcap", InklingLayout::upSoftcap}})
+    if (text[@(key)]) requireFloat32(text[@(key)], value, name, std::string("text config ") + key);
+  for (const char *key : {"use_gate_bias", "use_value_norm_no_gamma", "attn_res_normalize_values"})
+    if (text[@(key)]) requireBooleans(text, "text config", {{key, true}});
+  for (const char *key : {"q_bias", "o_bias"})
     if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
 }
 
@@ -766,6 +848,20 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   return layout;
 }
 
+// A DSpark draft's GGUF header: the draft's layout over a target that
+// captures its final normed rows for it (finalNormCapture), of its hidden
+// size and vocabulary, whose tokens the draft proposes and whose logits'
+// cap it takes.
+DFlashDraftLayout readDSparkLayout(const DSparkHeader &header, const QwenTargetDimensions &target) {
+  if (!target.finalNormCapture) throw std::invalid_argument("this model's target reads no DSpark draft");
+  if (header.hiddenSize != target.hiddenSize || header.vocabularySize != target.vocabularySize)
+    throw std::invalid_argument("the DSpark draft's hidden size and vocabulary are not its target's");
+  if ((target.validVocabularySize && header.proposedVocabulary != target.validVocabularySize) ||
+      (target.logitSoftcap && header.logitCap != target.logitSoftcap))
+    throw std::invalid_argument("the DSpark draft's tokens and logit cap are not its target's");
+  return dsparkLayout(target.hiddenSize, target.vocabularySize, target.layers, header);
+}
+
 // The vision tower's config, config.json's vision_config, which the
 // installer derives from a GGUF's mmproj too: the tower the layout describes,
 // over RGB patches of two frames, without deepstack layers.
@@ -796,7 +892,7 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
 // states (ggufRoutedExperts).
 ModelDescriptor describeSourceModel(std::string name, std::string_view targetFormat,
                                     std::string_view visionFormat, NSDictionary *config,
-                                    NSDictionary *draft) {
+                                    NSDictionary *draft, const std::optional<DSparkHeader> &dspark = std::nullopt) {
   // A family whose config is flat (flatConfig) holds its text model's keys
   // in the config itself, which then names its model type.
   bool flat = false;
@@ -828,9 +924,9 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
   else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
-  // Without a draft config the descriptor names the family but has no draft
-  // (inspectSourceConfiguration), and is not valid; a model root always
-  // holds its draft's.
+  // Without a draft config the descriptor has no draft: the model of a root
+  // installed without one (--draft-model none), or a target checked before
+  // its draft is chosen (inspectSourceConfiguration).
   DFlashDraftLayout dflashLayout;
   std::visit([&](auto &layout) {
     validateTextConfig(text, layout, targetSource);
@@ -839,6 +935,7 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
       layout.experts = ggufRoutedExperts(text, layout);
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
+    else if (dspark) dflashLayout = readDSparkLayout(*dspark, layout);
   }, *target);
   ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
                                                {.outputHiddenSize = std::visit(
@@ -893,7 +990,7 @@ bool ModelDescriptor::valid() const noexcept {
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
-      vision.outputHiddenSize != draft.hiddenSize) {
+      (!draft.present() && draft != DFlashDraftLayout{})) {
     return false;
   }
   return std::visit(
@@ -908,11 +1005,15 @@ bool ModelDescriptor::valid() const noexcept {
                  capabilities.maximumContextTokens <= layout.yarnContextTokens)) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
-               layout.hiddenSize == draft.hiddenSize &&
-               draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
-               // A family whose drafts choose the mask token holds its draft's.
-               (!layout.draftChoosesMaskToken() ||
+               vision.outputHiddenSize == layout.hiddenSize &&
+               (!draft.present() ||
+                (layout.hiddenSize == draft.hiddenSize && draft.targetLayerCount &&
+                 draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
+                 draft.targetLayers[draft.targetLayerCount - 1] <
+                     layout.layers + (draft.kind == DraftKind::DSpark && layout.finalNormCapture))) &&
+               // A family whose drafts choose the mask token holds its draft's;
+               // a model without a draft reads no mask token.
+               (!layout.draftChoosesMaskToken() || !draft.present() ||
                 (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
                layout.kvLayout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
@@ -963,12 +1064,27 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // Every family decodes with its DFlash2 draft, in draft/.
-    if (!std::filesystem::exists(root / "draft"))
-      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
-    NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
-    ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    // A model decodes with its DFlash2 draft, in draft/, unless its record
+    // names no draft source (--draft-model none) and its root holds none.
+    NSDictionary *sources = record[@"sources"];
+    const bool drafted =
+        ![sources isKindOfClass:[NSDictionary class]] || sources[@"draft"] != [NSNull null];
+    if (drafted != std::filesystem::exists(root / "draft"))
+      throw std::invalid_argument(drafted ? "the model's root holds no draft/ for its DFlash2 draft"
+                                          : "the model's root holds a draft/ its record does not name");
+    // A DFlash2 draft's config.json, or a DSpark draft's GGUF.
+    const bool dflash = drafted && std::filesystem::exists(root / "draft" / "config.json");
+    NSDictionary *draft = dflash ? readObject(root / "draft" / "config.json", "draft config") : nil;
+    std::optional<DSparkHeader> dspark;
+    if (drafted && !dflash) dspark = readDSparkHeader(root / "draft");
+    ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft, dspark);
     result.sourceIdentity = std::move(sourceIdentity);
+    // Without a draft a cached state is the target's cell alone, which a
+    // target of no recurrent or auxiliary state (Flint's) leaves empty: the
+    // SSD cache's state slots hold no state of 0 bytes (SlotFile), and the
+    // cache would go off whole, its KV with it.
+    if (!drafted && !result.stateLayout.cachedBytes())
+      throw std::invalid_argument(std::string(result.family()) + " serves only with a DFlash2 draft");
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;
   }
@@ -980,9 +1096,20 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
                                             const std::optional<std::filesystem::path> &draft) {
   @autoreleasepool {
     NSDictionary *target = readObject(config, "upstream model config");
-    NSDictionary *checkpoint = draft ? readObject(*draft, "draft config") : nil;
+    // A DFlash2 draft's config.json, or a directory of a DSpark draft's GGUF
+    // headers.
+    const bool dspark = draft && std::filesystem::is_directory(*draft);
+    NSDictionary *checkpoint = draft && !dspark ? readObject(*draft, "draft config") : nil;
+    const std::optional<DSparkHeader> header =
+        dspark ? std::optional<DSparkHeader>(readDSparkHeader(*draft)) : std::nullopt;
     // Unnamed: the record names an installation, which this precedes.
-    const ModelDescriptor descriptor = describeSourceModel({}, targetFormat, visionFormat, target, checkpoint);
+    const ModelDescriptor descriptor =
+        describeSourceModel({}, targetFormat, visionFormat, target, checkpoint, header);
+    // A DSpark draft's tensors as its loader plans them.
+    if (header) {
+      const OpenGguf draftHeaders(findTargetGgufs(*draft), GgufContents::Headers);
+      static_cast<void>(planDSparkImages(draftHeaders.file(), descriptor.draft));
+    }
     if (descriptor.targetSource == TargetSource::Gguf) {
       if (!ggufHeaders) throw std::invalid_argument("a GGUF target is checked with its headers");
       const OpenGguf headers(findTargetGgufs(*ggufHeaders), GgufContents::Headers);

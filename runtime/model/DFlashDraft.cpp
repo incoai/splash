@@ -1,6 +1,7 @@
 #include "DFlashDraft.hpp"
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
+#include "metal/abi/DSpark.h"
 #include "metal/abi/DraftAttention.h"
 #include "ops/Embedding.hpp"
 
@@ -80,12 +81,64 @@ DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint
   return layout;
 }
 
+DFlashDraftLayout dsparkLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t targetLayers,
+                               const DSparkHeader &header) {
+  constexpr uint32_t most = ExecutionLimits::maximumDraftTargetLayers;
+  const std::vector<uint32_t> &features = header.targetFeatures;
+  if (features.empty() || features.size() > most || features.back() != targetLayers ||
+      std::ranges::adjacent_find(features, std::ranges::greater_equal{}) != features.end() || !features.front())
+    throw std::invalid_argument("a DSpark draft reads 1 to " + std::to_string(most) +
+                                " target features, ascending, past layer 0, the last the target's final norm");
+  if (!header.layers || header.layers > 32 || header.slidingLayers >> header.layers)
+    throw std::invalid_argument("a DSpark draft's windowed layers are among its layers");
+  if (!header.intermediateSize || header.intermediateSize % 64)
+    throw std::invalid_argument("a DSpark draft's intermediate size is a positive multiple of 64");
+  if (!(header.rotaryTheta > 0)) throw std::invalid_argument("a DSpark draft's rotary theta is positive");
+  if (header.markovRank != SPLASH_DSPARK_RANK)
+    throw std::invalid_argument("DSpark kernels are compiled for a Markov rank of " +
+                                std::to_string(SPLASH_DSPARK_RANK));
+  if (header.slidingLayers && (!header.slidingWindow || header.slidingWindow >= SPLASH_DRAFT_SLIDING_WINDOW))
+    throw std::invalid_argument("a DSpark draft's window lies inside its rings");
+  if (!header.proposedVocabulary || header.proposedVocabulary > vocabularySize || !(header.logitCap > 0))
+    throw std::invalid_argument("a DSpark draft proposes tokens of its target's vocabulary at a positive cap");
+  if (header.projectionFormat >= GGUF_FMT_COUNT)
+    throw std::invalid_argument("a DSpark draft's projections are of a quantized format");
+  constexpr uint32_t heads = 3 * SPLASH_DRAFT_KV_HEADS;
+  constexpr uint32_t attention = heads * SPLASH_DRAFT_HEAD_DIMENSION;
+  DFlashDraftLayout layout{.kind = DraftKind::DSpark,
+                           .layers = header.layers,
+                           .hiddenSize = hiddenSize,
+                           .vocabularySize = vocabularySize,
+                           .dynamicSize = 0,
+                           .qkvSize = attention + 2 * SPLASH_DRAFT_KV_HEADS * SPLASH_DRAFT_HEAD_DIMENSION,
+                           .attentionSize = attention,
+                           .intermediateSize = header.intermediateSize,
+                           .attentionHeadDimension = SPLASH_DRAFT_HEAD_DIMENSION,
+                           .rotaryTheta = header.rotaryTheta,
+                           .selectorRank = header.markovRank,
+                           .kvHeads = SPLASH_DRAFT_KV_HEADS,
+                           .targetLayerCount = static_cast<uint32_t>(features.size()),
+                           .slidingLayers = header.slidingLayers,
+                           .slidingWindow = header.slidingWindow,
+                           .proposedVocabulary = header.proposedVocabulary,
+                           .logitCap = header.logitCap,
+                           .projectionFormat = header.projectionFormat};
+  // A layer's input is the output of the layer before it; the final norm
+  // keeps its name.
+  for (size_t feature = 0; feature < features.size(); ++feature)
+    layout.targetLayers[feature] = feature + 1 < features.size() ? features[feature] - 1 : features[feature];
+  return layout;
+}
+
 DFlashDraftRing::DFlashDraftRing(
     metal::MetalBackend &backend, std::shared_ptr<StateAllocationTracker> tracker,
     DraftStateLayout layout, std::string_view label)
     : tracker_(std::move(tracker)), layers_(layout.layers) {
   if (!tracker_)
     throw std::invalid_argument("draft state allocation tracker is empty");
+  // A model without a draft has rings of no layers, which hold nothing.
+  if (!layout.ringBytes())
+    return;
   const uint64_t before = backend.memoryStats().allocatedBytes;
   const metal::MetalBuffer base = backend.allocateBuffer(
       layout.ringBytes(), metal::BufferStorage::Shared, label);
@@ -95,6 +148,10 @@ DFlashDraftRing::DFlashDraftRing(
     cursor += layout.tensorBytes();
     layer.values = backend.view(base, cursor, layout.tensorBytes());
     cursor += layout.tensorBytes();
+  }
+  if (layout.auxiliaryBytes && !layers_.empty()) {
+    layers_.front().auxiliary = backend.view(base, cursor, layout.auxiliaryBytes);
+    cursor += layout.auxiliaryBytes;
   }
   if (cursor != layout.ringBytes())
     throw std::logic_error("draft ring accounting mismatch");
@@ -115,6 +172,9 @@ DFlashContextWindow::DFlashContextWindow(
     : tracker_(std::move(tracker)) {
   if (!tracker_)
     throw std::invalid_argument("draft state allocation tracker is empty");
+  // A model without a draft has an empty window.
+  if (!layout.windowBytes())
+    return;
   const uint64_t before = backend.memoryStats().allocatedBytes;
   buffer_ = backend.allocateBuffer(layout.windowBytes(), metal::BufferStorage::Shared, label);
   actualAllocatedBytes_ =

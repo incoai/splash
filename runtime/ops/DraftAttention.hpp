@@ -21,6 +21,15 @@ struct DraftAttentionShape final {
   bool operator==(const DraftAttentionShape &) const = default;
 };
 
+// The ring keys each row of a draft's block sees: those of the `keys`
+// positions before the row's own (a DFlash2 draft's), or with rowUniform
+// those before the block's first row, the anchor's, for every row (a DSpark
+// draft's layers). Fewer than a ring's slots.
+struct DraftAttentionWindow final {
+  uint32_t keys = SPLASH_DRAFT_SLIDING_WINDOW - 1;
+  bool rowUniform = false;
+};
+
 struct DraftAttentionWorkspace final {
   uint64_t convolutionBytes = 0;
   uint64_t qkvBytes = 0;
@@ -93,10 +102,13 @@ public:
   static void addPrepare(metal::CommandGraph &graph,
                          DraftPrepareBuffers buffers,
                          const DraftAttentionPlan &plan);
+  // Each lane's block over its ring's keys in `window`; the attention rows
+  // land in the grouped queries' place, of the shape's query heads.
   static void addDecode(metal::CommandGraph &graph,
                         DraftDecodeAttentionBuffers buffers,
                         std::span<const uint32_t> cacheLengths,
-                        const DraftAttentionPlan &plan);
+                        const DraftAttentionPlan &plan,
+                        DraftAttentionWindow window = {});
   // The context writers. A row of contextKv holds its keys, then its values
   // (kvHeads * headDimension each); its normalized, rotated keys and its
   // values go to its position's slot of the ring.

@@ -266,7 +266,8 @@ SPARSE_LOCATED_SPLIT(attention_bf16_sparse_located_kv2_g12, 2, 12, 256, bfloat)
     const SplashAttentionOutput place = splash_attention_output(               \
         params, s, rows,                                                       \
         tile.first_position - sequence.committed_tokens + fused_row / Group);  \
-    splash_attention_output_row<Heads * Group, Heads, HeadDim, true, Table>(   \
+    splash_attention_output_row<Heads * Group, Heads, HeadDim,                 \
+        SplashPackedGates<Heads * Group, Heads, HeadDim>, Table>(              \
         value, packed_qkv, hidden, table, sums, place.packed, place.output,    \
         group.x * Group + fused_row % Group, thread_index, place.writes,       \
         pairs);                                                                \
