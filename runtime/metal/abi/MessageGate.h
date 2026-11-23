@@ -34,6 +34,23 @@
 #define MESSAGE_GATE_MAXIMUM_RANK 64u
 #define MESSAGE_GATE_MAXIMUM_GATES 3u
 
+// The fused gates of more rows (ops::MessageGate, a prompt chunk's): one
+// kernel, message_gate_rows, of a gate's MESSAGE_GATE_TILE_ROWS rows a
+// threadgroup of MESSAGE_GATE_TILE_THREADS threads (grid z the gates, as
+// above), which reads the tile's rows and the gate's weights itself and keeps
+// its rank values in threadgroup memory: the tile's inverse RMS, its rank
+// values, its gated rows, which it stores to the gate's scratch and reads
+// back, and their norm, the projections on simdgroup float MMA, each
+// simdgroup 8 columns of a 64-column block for the tile's rows, so that the
+// tile reads each weight once, the down projection's normalized inputs staged
+// in threadgroup memory. Its rows of whole 64-value steps, its rank a
+// multiple of 8. A 2,583-token Inkling-2-Mini prefill's gates took 102 ms on
+// it on a 16-core M5 Pro, against 141 ms as the float projections' four
+// dispatches a gate and 128 ms with each simdgroup reading its own operands
+// from device memory (2 x 4 tiles of 16 x 16 a threadgroup).
+#define MESSAGE_GATE_TILE_ROWS 32u
+#define MESSAGE_GATE_TILE_THREADS 256u
+
 // A gate of `rows` rows of `hidden` values: the row x at column x_column of
 // rows of x_stride values and its message at message_column of rows of
 // message_stride values, both fp32; `rank` values a row between its

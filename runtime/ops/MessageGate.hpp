@@ -7,13 +7,15 @@
 // bf16 projection in the source); the gated row (1 - tanh(forget g)) x +
 // tanh(gain g) m in fp32; then the weighted RMS norm of the projections that
 // read it, into their bf16 input. Its three projections are float segments.
-// A call of a decode step's rows at most (kFusedRows) runs its gates fused,
-// up to kMaximumGates of them in each of two kernels that read the weights
-// themselves (metal/abi/MessageGate.h), where they are F32 or BF16 rows, all
-// of one, of a rank and rows of whole float4s; more rows, a prompt chunk's,
-// and any other weights run each gate's normalization, its projections
-// through ops::addGgufFloat and its norm, the float tile reading the weights
-// once for many rows.
+// A call whose weights are F32 or BF16 rows, all of one, of a rank and rows
+// of whole float4s, runs its gates fused, up to kMaximumGates of them in each
+// kernel, which reads the weights itself (metal/abi/MessageGate.h): a decode
+// step's rows at most (kFusedRows) in two kernels, more rows, a prompt
+// chunk's, of whole 64-value steps and a rank of whole runs of 8, in one
+// tiled kernel, a tile of rows a threadgroup. Any other weights run each
+// gate's normalization, its projections through ops::addGgufFloat and its
+// norm, the float tile reading the weights once for many rows. Every path
+// rounds at the same points; their sums add in other orders.
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -47,13 +49,15 @@ struct MessageGateInput final {
 
 // The rows a call's gates read: x and the messages, fp32 rows of a stride (a
 // mix's output of several queries, the messages of four); and its scratch.
-// Fused: the rank values, bf16 [gates][rows][rank] (low), the gated rows,
-// fp32 [gates][rows][hidden] (forget), the groups' partial sums (gain) and
-// the counters, one a group of MESSAGE_GATE_GROUP_ROWS rows a gate, zero
-// before and after (kCountersBytes for the most). Otherwise, a gate at a
-// time: the down projection's bf16 input [rows][2 hidden] (concat) and
-// output [rows][rank] (low), and the forget and gain projections' fp32 rows
-// [rows][hidden].
+// Fused, a decode step's rows: the rank values, bf16 [gates][rows][rank]
+// (low), the gated rows, fp32 [gates][rows][hidden] (forget), the groups'
+// partial sums (gain) and the counters, one a group of
+// MESSAGE_GATE_GROUP_ROWS rows a gate, zero before and after (kCountersBytes
+// for the most). Fused, more rows: the gated rows, fp32 [rows][hidden], of
+// gate 0 in forget, of gate 1 in gain and of gate 2 in concat. Otherwise, a
+// gate at a time: the down projection's bf16 input [rows][2 hidden] (concat)
+// and output [rows][rank] (low), and the forget and gain projections' fp32
+// rows [rows][hidden].
 struct MessageGateBuffers final {
   metal::MetalBuffer x;
   uint32_t xStride = 0;
@@ -65,6 +69,11 @@ struct MessageGateBuffers final {
   metal::MetalBuffer gain;
   metal::MetalBuffer counters;
 };
+
+// The kernels of a call: the fused ones where its rows and weights take them
+// (Fused), or the general path for any weights (FloatProjections), which the
+// precision checks compare them with.
+enum class MessageGateKernels : uint8_t { Fused, FloatProjections };
 
 struct MessageGate final {
   // The most rows the fused gates take: a decode step's at the widest batch.
@@ -81,7 +90,8 @@ struct MessageGate final {
   // reading the outputs prepare their own tables, so the scratch describes
   // nothing.
   static PreparedInput add(metal::CommandGraph &graph, const MessageGateBuffers &buffers,
-                           std::span<const MessageGateInput> gates, uint32_t hidden, uint32_t rows, FloatTile tile);
+                           std::span<const MessageGateInput> gates, uint32_t hidden, uint32_t rows, FloatTile tile,
+                           MessageGateKernels kernels = MessageGateKernels::Fused);
 };
 
 } // namespace splash::ops

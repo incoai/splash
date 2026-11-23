@@ -3,6 +3,7 @@
 #include "metal/abi/MessageGate.h"
 #include "metal/kernels/common/rms_inverse.h"
 #include "metal/kernels/common/row_sums.h"
+#include "metal/kernels/common/sgmatrix.h"
 #include "metal/kernels/common/split_reduce.h"
 
 #include <metal_stdlib>
@@ -342,6 +343,311 @@ kernel void message_gate_apply(device const float *x [[buffer(0)]], device const
   split_release(counter, tid);
 }
 
+// ---- The fused gates of a prompt chunk's rows (metal/abi/MessageGate.h) ----
+//
+// message_gate_rows runs a gate of MESSAGE_GATE_TILE_ROWS rows a threadgroup
+// from its rows to its output, in four phases that hand over through
+// threadgroup memory and, for the gated rows, the threadgroup's own rows of
+// device scratch: each row's and message's inverse RMS; the rank values, the
+// down projection of the normalized concatenation, each normalized value
+// rounded to bf16 as message_gate_prepare rounds it, each rank value rounded
+// to bf16 as the float projection writes it; forget, gain and the gated row in
+// fp32, a 64-value block of the rows after another, into the gated rows'
+// scratch, with each row's squares; and the gated rows through the weighted
+// RMS norm into bf16, as message_gate_norm writes each value. The products
+// run on simdgroup float 8x8 MMA with exact operands (bf16 values widened, the
+// weights as stored, BF16 ones widened, as shared/gguf_float.metal's), so a
+// sum differs from the float projections' only by its fp32 order. Simdgroup s
+// takes columns [8 s, 8 s + 8) of a 64-column block of either projection for
+// the tile's 32 rows (four 8-row fragments), so the tile reads each weight
+// once; the down projection's normalized inputs of a 64-input step, which
+// every simdgroup multiplies, are staged in threadgroup memory, two steps'
+// stages alternating. MMA j of a 64-input step multiplies inputs 8 i + j over
+// its index i (gguf_float's order): lane (fm, fn) reads a row's inputs
+// [8 fn, 8 fn + 16) and a weights' row's [8 fm, 8 fm + 8) of the step, whole
+// runs of 8. Rows past the chunk read its last row with scales of zero and
+// store nothing.
+constant constexpr uint kTileRows = MESSAGE_GATE_TILE_ROWS;
+constant constexpr uint kTileSimdgroups = MESSAGE_GATE_TILE_THREADS / 32;
+constant constexpr uint kTileStep = 64;
+constant constexpr uint kTileFragments = kTileRows / 8;
+// A staged row of a step's 64 inputs, or of the rank values, bf16 values
+// padded by 8 so that the fragments' rows start in other banks.
+constant constexpr uint kTileStride = kTileStep + 8;
+static_assert(kTileSimdgroups * 8 == kTileStep, "a tile's simdgroups take a block's 64 columns, 8 each");
+static_assert(MESSAGE_GATE_MAXIMUM_RANK == kTileStep, "a rank's values are one step of the forget and gain sums");
+static_assert(kTileRows * kTileStep / MESSAGE_GATE_TILE_THREADS == 8, "a thread stages a run of 8 inputs a step");
+static_assert(kTileFragments == 4, "a lane's partial squares are a float4, a fragment each");
+
+// Eight consecutive weights of a row from input k, widened to fp32: two
+// quads, zero where `inside` is false.
+struct MessageGateEight {
+  float4 low, high;
+  float operator[](uint i) const { return i < 4 ? low[i] : high[i - 4]; }
+};
+inline MessageGateEight message_gate_eight(device const float *row, uint k, bool inside) {
+  device const float4 *quads = reinterpret_cast<device const float4 *>(row + k);
+  return inside ? MessageGateEight{quads[0], quads[1]} : MessageGateEight{float4(0.0f), float4(0.0f)};
+}
+inline MessageGateEight message_gate_eight(device const bfloat *row, uint k, bool inside) {
+  device const bfloat4 *quads = reinterpret_cast<device const bfloat4 *>(row + k);
+  return inside ? MessageGateEight{float4(quads[0]), float4(quads[1])} : MessageGateEight{float4(0.0f), float4(0.0f)};
+}
+
+// What message_gate_rows' phases share: each row's and message's inverse RMS
+// (zero past the chunk's rows); the down projection's two stages of a step's
+// normalized inputs [row][kTileStride], bf16 as rounded, whose memory the rank
+// values, bf16 as rounded [row][kTileStride] (zero past the rank), and a
+// partial of each fragment's rows' squares a lane then take; and the rows'
+// inverse RMS of the gated rows.
+struct MessageGateRowsShared {
+  float scales[2 * kTileRows];
+  union {
+    bfloat stages[2][kTileRows * kTileStride];
+    struct {
+      bfloat lows[kTileRows * kTileStride];
+      float4 partials[kTileSimdgroups * 32];
+    } gated;
+  };
+  float inverses[kTileRows];
+};
+
+// Phase one: vector i of the tile, row i / 2's x (i even) or message, a
+// simdgroup a vector: a lane's quads lane + 32 j in order, each quad's squares
+// added in order, then simd_sum.
+__attribute__((noinline)) void message_gate_rows_scales(device const float *x, device const float *message,
+                                                        constant MessageGateFusedParams &p, uint g, uint first,
+                                                        uint count, uint lane, uint sg,
+                                                        threadgroup MessageGateRowsShared &shared) {
+  const uint quads = p.hidden / 4;
+  for (uint i = sg; i < 2 * kTileRows; i += kTileSimdgroups) {
+    device const float4 *row =
+        reinterpret_cast<device const float4 *>(message_gate_row(x, message, p, g, first, count, i / 2, i % 2 == 0));
+    float squares = 0.0f;
+    if (i / 2 < count)
+      for (uint d = lane; d < quads; d += 32) {
+        const float4 v = row[d];
+        squares += v.x * v.x;
+        squares += v.y * v.y;
+        squares += v.z * v.z;
+        squares += v.w * v.w;
+      }
+    squares = simd_sum(squares);
+    if (lane == 0) shared.scales[i] = i / 2 < count ? rsqrt(squares / p.hidden + kRmsEpsilon) : 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// A thread's run of 8 of the concatenation's step `step` (x's half and then
+// the message's): its row tid / 8's inputs from 8 (tid % 8), as read.
+struct MessageGateRun {
+  float4 low, high;
+};
+inline MessageGateRun message_gate_rows_load(device const float *x, device const float *message,
+                                             constant MessageGateFusedParams &p, uint g, uint first, uint count,
+                                             uint step, uint steps, uint tid) {
+  const bool own = step < steps;
+  device const float4 *run = reinterpret_cast<device const float4 *>(
+      message_gate_row(x, message, p, g, first, count, tid / 8, own) + (own ? step : step - steps) * kTileStep +
+      8 * (tid % 8));
+  return {run[0], run[1]};
+}
+// The run normalized by its row's scale and rounded to bf16, into stage
+// `stage`.
+inline void message_gate_rows_stage(MessageGateRun run, bool own, uint tid, threadgroup bfloat *stage,
+                                    threadgroup const float *scales) {
+  const uint r = tid / 8;
+  const float scale = scales[2 * r + (own ? 0 : 1)];
+  threadgroup bfloat4 *out = reinterpret_cast<threadgroup bfloat4 *>(stage + r * kTileStride + 8 * (tid % 8));
+  out[0] = bfloat4(run.low * scale);
+  out[1] = bfloat4(run.high * scale);
+}
+// A lane's 16 staged values of a fragment's row from 8 fn, widened: the first
+// 8 and the next 8.
+inline void message_gate_rows_read(threadgroup const bfloat *row, thread MessageGateEight &low,
+                                   thread MessageGateEight &high) {
+  threadgroup const bfloat4 *a = reinterpret_cast<threadgroup const bfloat4 *>(row);
+  low = {float4(a[0]), float4(a[1])};
+  high = {float4(a[2]), float4(a[3])};
+}
+
+// Phase two: the tile's rank values, the down weights' rows ([rank][2
+// hidden]) against the normalized concatenation, x's half and then the
+// message's, a step of 64 inputs at a time, simdgroup s rank values
+// [8 s, 8 s + 8), into `shared.gated.lows`. Each half's even and odd MMAs
+// accumulate apart (four chains of 1,152 products at Inkling-2-Mini's 4,608
+// inputs, as gguf_float splits its own), added at the end in order.
+template <typename Weight>
+__attribute__((noinline)) void message_gate_rows_down(device const float *x, device const float *message,
+                                                      device const Weight *down, constant MessageGateFusedParams &p,
+                                                      uint g, uint first, uint count, uint tid, uint lane, uint sg,
+                                                      threadgroup MessageGateRowsShared &shared) {
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint steps = p.hidden / kTileStep, column = 8 * sg + l.fn;
+  device const Weight *w0 = down + ulong(min(column, p.rank - 1)) * 2 * p.hidden,
+                      *w1 = down + ulong(min(column + 1, p.rank - 1)) * 2 * p.hidden;
+  float2 acc[kTileFragments][4];
+  for (uint f = 0; f < kTileFragments; ++f) acc[f][0] = acc[f][1] = acc[f][2] = acc[f][3] = float2(0.0f);
+  message_gate_rows_stage(message_gate_rows_load(x, message, p, g, first, count, 0, steps, tid), true, tid,
+                          shared.stages[0], shared.scales);
+  // The weights load a step ahead.
+  MessageGateEight next0 = message_gate_eight(w0, 8 * l.fm, column < p.rank),
+                   next1 = message_gate_eight(w1, 8 * l.fm, column + 1 < p.rank);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint step = 0; step < 2 * steps; ++step) {
+    const bool next = step + 1 < 2 * steps;
+    const MessageGateRun run =
+        next ? message_gate_rows_load(x, message, p, g, first, count, step + 1, steps, tid) : MessageGateRun{};
+    const MessageGateEight b0 = next0, b1 = next1;
+    if (next) {
+      next0 = message_gate_eight(w0, (step + 1) * kTileStep + 8 * l.fm, column < p.rank);
+      next1 = message_gate_eight(w1, (step + 1) * kTileStep + 8 * l.fm, column + 1 < p.rank);
+    }
+    threadgroup const bfloat *stage = shared.stages[step % 2];
+    const uint chain = step < steps ? 0 : 2;
+    for (uint f = 0; f < kTileFragments; ++f) {
+      MessageGateEight low, high;
+      message_gate_rows_read(stage + (8 * f + l.fm) * kTileStride + 8 * l.fn, low, high);
+      for (uint j = 0; j < 8; ++j)
+        sgmatrix::mma_acc<float>(acc[f][chain + j % 2], float2(low[j], high[j]), float2(b0[j], b1[j]));
+    }
+    if (next) message_gate_rows_stage(run, step + 1 < steps, tid, shared.stages[(step + 1) % 2], shared.scales);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint f = 0; f < kTileFragments; ++f) {
+    const uint r = 8 * f + l.fm;
+    const float2 sum = (acc[f][0] + acc[f][1]) + (acc[f][2] + acc[f][3]);
+    shared.gated.lows[r * kTileStride + column] = bfloat(sum.x);
+    shared.gated.lows[r * kTileStride + column + 1] = bfloat(sum.y);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Phase three: forget and gain of a block of 64 values of the tile's rows
+// after another, simdgroup s values [8 s, 8 s + 8) of the block, the weights'
+// rows ([hidden][rank]) against the rank values, the gated value
+// (message_gated's) into `gated` [rows][hidden], and each row's squares, a
+// lane's in block order, into `shared.gated.partials`.
+template <typename Weight>
+__attribute__((noinline)) void message_gate_rows_gated(device const float *x, device const float *message,
+                                                       device const Weight *forget, device const Weight *gain,
+                                                       device float *gated, constant MessageGateFusedParams &p,
+                                                       uint g, uint first, uint count, uint lane, uint sg,
+                                                       threadgroup MessageGateRowsShared &shared) {
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint blocks = p.hidden / kTileStep;
+  const bool inside = 8 * l.fm < p.rank;
+  const uint k = inside ? 8 * l.fm : 0;
+  float squares[kTileFragments];
+  for (uint f = 0; f < kTileFragments; ++f) squares[f] = 0.0f;
+  // The weights load a block ahead.
+  const auto load = [&](uint block, thread MessageGateEight(&w)[4]) {
+    const uint column = block * kTileStep + 8 * sg + l.fn;
+    w[0] = message_gate_eight(forget + ulong(column) * p.rank, k, inside);
+    w[1] = message_gate_eight(forget + ulong(column + 1) * p.rank, k, inside);
+    w[2] = message_gate_eight(gain + ulong(column) * p.rank, k, inside);
+    w[3] = message_gate_eight(gain + ulong(column + 1) * p.rank, k, inside);
+  };
+  MessageGateEight next[4];
+  load(0, next);
+  for (uint block = 0; block < blocks; ++block) {
+    const uint column = block * kTileStep + 8 * sg + l.fn;
+    const MessageGateEight f0 = next[0], f1 = next[1], e0 = next[2], e1 = next[3];
+    if (block + 1 < blocks) load(block + 1, next);
+    // The block's x and message values of the lane's rows, read before the
+    // products (a row past the chunk's reads its last).
+    float2 xs[kTileFragments], ms[kTileFragments];
+    for (uint f = 0; f < kTileFragments; ++f) {
+      const ulong row = first + min(8 * f + l.fm, count - 1);
+      xs[f] = *reinterpret_cast<device const float2 *>(x + row * p.x_stride + p.x_columns[g] + column);
+      ms[f] = *reinterpret_cast<device const float2 *>(message + row * p.message_stride + p.message_columns[g] + column);
+    }
+    // Every fragment's MMAs run in every lane, the rows past the chunk's too:
+    // a lane's row decides only its stores.
+    float2 forgets[kTileFragments], gains[kTileFragments];
+    for (uint f = 0; f < kTileFragments; ++f) {
+      MessageGateEight low, high;
+      message_gate_rows_read(shared.gated.lows + (8 * f + l.fm) * kTileStride + 8 * l.fn, low, high);
+      forgets[f] = gains[f] = float2(0.0f);
+      for (uint j = 0; j < 8; ++j) {
+        sgmatrix::mma_acc<float>(forgets[f], float2(low[j], high[j]), float2(f0[j], f1[j]));
+        sgmatrix::mma_acc<float>(gains[f], float2(low[j], high[j]), float2(e0[j], e1[j]));
+      }
+    }
+    for (uint f = 0; f < kTileFragments; ++f) {
+      const uint r = 8 * f + l.fm;
+      if (r < count) {
+        const ulong row = first + r;
+        const float2 xv = xs[f], mv = ms[f];
+        float2 v;
+        v.x = (1.0f - precise::tanh(forgets[f].x)) * xv.x + precise::tanh(gains[f].x) * mv.x;
+        v.y = (1.0f - precise::tanh(forgets[f].y)) * xv.y + precise::tanh(gains[f].y) * mv.y;
+        *reinterpret_cast<device float2 *>(gated + row * p.hidden + column) = v;
+        squares[f] += v.x * v.x;
+        squares[f] += v.y * v.y;
+      }
+    }
+  }
+  shared.gated.partials[sg * 32 + lane] = float4(squares[0], squares[1], squares[2], squares[3]);
+}
+
+// Phase four: each row's squares, by a thread a row over the simdgroups and
+// their lanes of its row in order, then the tile's gated rows through the
+// weighted RMS norm into bf16, the threads striding the rows' quads.
+__attribute__((noinline)) void message_gate_rows_norm(device const float *gated, device const float *norm,
+                                                      device bfloat *output, constant MessageGateFusedParams &p,
+                                                      uint first, uint count, uint tid,
+                                                      threadgroup MessageGateRowsShared &shared) {
+  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+  if (tid < count) {
+    const uint f = tid / 8, fm = tid % 8;
+    float total = 0.0f;
+    for (uint s = 0; s < kTileSimdgroups; ++s)
+      for (uint lane = 0; lane < 32; ++lane)
+        if (sgmatrix::lane_map(lane).fm == fm) total += shared.gated.partials[s * 32 + lane][f];
+    shared.inverses[tid] = rsqrt(total / p.hidden + kRmsEpsilon);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint quads = p.hidden / 4;
+  device const float4 *rows = reinterpret_cast<device const float4 *>(gated + ulong(first) * p.hidden);
+  device bfloat4 *out = reinterpret_cast<device bfloat4 *>(output + ulong(first) * p.hidden);
+  for (uint q = tid; q < count * quads; q += MESSAGE_GATE_TILE_THREADS) {
+    const uint r = q / quads, e = 4 * (q % quads);
+    const float4 weights = float4(norm[e], norm[e + 1], norm[e + 2], norm[e + 3]);
+    out[q] = bfloat4((rows[q] * shared.inverses[r]) * weights);
+  }
+}
+
+// A gate's gated rows of a tile of MESSAGE_GATE_TILE_ROWS rows a threadgroup,
+// gate g's gated rows' scratch `gated` g. Grid: (tiles, 1, gates).
+template <typename Weight>
+kernel void message_gate_rows(device const float *x [[buffer(0)]], device const float *message [[buffer(1)]],
+                              device const Weight *down0 [[buffer(2)]], device const Weight *down1 [[buffer(3)]],
+                              device const Weight *down2 [[buffer(4)]], device const Weight *forget0 [[buffer(5)]],
+                              device const Weight *forget1 [[buffer(6)]], device const Weight *forget2 [[buffer(7)]],
+                              device const Weight *gain0 [[buffer(8)]], device const Weight *gain1 [[buffer(9)]],
+                              device const Weight *gain2 [[buffer(10)]], device const float *norm0 [[buffer(11)]],
+                              device const float *norm1 [[buffer(12)]], device const float *norm2 [[buffer(13)]],
+                              device float *gated0 [[buffer(14)]], device float *gated1 [[buffer(15)]],
+                              device float *gated2 [[buffer(16)]], device bfloat *output0 [[buffer(17)]],
+                              device bfloat *output1 [[buffer(18)]], device bfloat *output2 [[buffer(19)]],
+                              constant MessageGateFusedParams &p [[buffer(20)]],
+                              uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup MessageGateRowsShared shared;
+  const uint first = group.x * kTileRows, g = group.z;
+  if (first >= p.rows || g >= p.gates) return;
+  const uint count = min(kTileRows, p.rows - first);
+  device float *gated = message_gate_pick(g, gated0, gated1, gated2);
+  message_gate_rows_scales(x, message, p, g, first, count, lane, sg, shared);
+  message_gate_rows_down(x, message, message_gate_pick(g, down0, down1, down2), p, g, first, count, tid, lane, sg,
+                         shared);
+  message_gate_rows_gated(x, message, message_gate_pick(g, forget0, forget1, forget2),
+                          message_gate_pick(g, gain0, gain1, gain2), gated, p, g, first, count, lane, sg, shared);
+  message_gate_rows_norm(gated, message_gate_pick(g, norm0, norm1, norm2), message_gate_pick(g, output0, output1, output2),
+                         p, first, count, tid, shared);
+}
+
 // The instances: F32 weights (_f32) and BF16 (_bf16), as a GGUF stores the
 // gates' projections.
 #define MESSAGE_GATE_INSTANCES(Weight, suffix)                                                                    \
@@ -353,7 +659,14 @@ kernel void message_gate_apply(device const float *x [[buffer(0)]], device const
       device const Weight *, device const Weight *, device const Weight *, device const Weight *,                 \
       device const bfloat *, device const float *, device const float *, device const float *,                    \
       device coherent(device) float *, device coherent(device) float *, device atomic_uint *, device bfloat *,    \
-      device bfloat *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint, uint);
+      device bfloat *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint, uint);              \
+  template [[host_name("message_gate_rows" suffix)]] kernel void message_gate_rows<Weight>(                       \
+      device const float *, device const float *, device const Weight *, device const Weight *,                   \
+      device const Weight *, device const Weight *, device const Weight *, device const Weight *,                 \
+      device const Weight *, device const Weight *, device const Weight *, device const float *,                  \
+      device const float *, device const float *, device float *, device float *, device float *,                 \
+      device bfloat *, device bfloat *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint,     \
+      uint);
 MESSAGE_GATE_INSTANCES(float, "_f32")
 MESSAGE_GATE_INSTANCES(bfloat, "_bf16")
 #undef MESSAGE_GATE_INSTANCES

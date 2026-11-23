@@ -19,8 +19,10 @@ constexpr uint32_t kMixerQueries = 3;
 constexpr uint32_t kMessages = 4;
 // A layer's mixer gates run as one call (ops::MessageGate): a decode step's
 // fused gates take each its rank values and gated rows, a step's rows each;
-// a prompt chunk's take theirs from a chunk's single rows, which hold those
-// of the most rows the fused gates take.
+// a prompt chunk's of a decode step's rows at most take theirs from a
+// chunk's single rows, which hold those of the most rows the fused gates
+// take; a longer chunk's tiled gates keep each gate's gated rows in its own
+// of the forget, gain and concatenation rows, fp32 rows of hiddenSize each.
 static_assert(kMixerQueries <= ops::MessageGate::kMaximumGates, "a layer's mixer gates run as one call");
 static_assert(kChunkRows >= kMixerQueries * ops::MessageGate::kFusedRows,
               "a prompt chunk's gated rows hold its fused gates' of their most rows");

@@ -27,8 +27,9 @@ bool fusedWeights(const MessageGateWeights &weights, uint32_t format, uint32_t r
 
 PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuffers &buffers,
                                std::span<const MessageGateInput> gates, uint32_t hidden, uint32_t rows,
-                               FloatTile tile) {
-  if (gates.empty() || !hidden || !rows) throw std::invalid_argument("invalid message gates");
+                               FloatTile tile, MessageGateKernels kernels) {
+  if (gates.empty() || !hidden || !rows || !gates.front().weights.down.outputSize)
+    throw std::invalid_argument("invalid message gates");
   const uint32_t rank = gates.front().weights.down.outputSize;
   for (const MessageGateInput &gate : gates) {
     const MessageGateWeights &weights = gate.weights;
@@ -46,27 +47,22 @@ PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuff
     requireBytes(gate.norm.buffer, gate.norm.bytes(hidden), "message gate norm");
     requireBytes(gate.output, uint64_t{rows} * hidden * sizeof(uint16_t), "message gate output");
   }
-  const metal::DispatchSize threads{MESSAGE_GATE_THREADS, 1, 1};
-  // The fused gates run a decode step's rows of F32 or BF16 weights, all of
-  // one, their rows in whole float4s.
+  // The fused gates run F32 or BF16 weights, all of one, their rows in whole
+  // float4s: a decode step's rows on the two kernels, more rows on the tiled
+  // one, of whole 64-value steps and a rank of whole runs of 8.
   const uint32_t format = gates.front().weights.down.formatId;
   const bool fused =
-      rows <= kFusedRows && gates.size() <= kMaximumGates && hidden % 4 == 0 && buffers.xStride % 4 == 0 &&
-      buffers.messageStride % 4 == 0 && std::ranges::all_of(gates, [&](const MessageGateInput &gate) {
+      kernels == MessageGateKernels::Fused && gates.size() <= kMaximumGates && hidden % 4 == 0 &&
+      buffers.xStride % 4 == 0 && buffers.messageStride % 4 == 0 &&
+      std::ranges::all_of(gates, [&](const MessageGateInput &gate) {
         return fusedWeights(gate.weights, format, rank) && quads(buffers.xStride, gate.xColumn) &&
                quads(buffers.messageStride, gate.messageColumn);
       });
-  if (fused) {
+  const bool decodeRows = rows <= kFusedRows;
+  if (fused && (decodeRows || (hidden % 64 == 0 && rank % 8 == 0))) {
     const auto count = static_cast<uint32_t>(gates.size());
     const uint64_t weightBytes = format == GGUF_FMT_BF16 ? sizeof(uint16_t) : sizeof(float);
     const std::string suffix = format == GGUF_FMT_BF16 ? "_bf16" : "_f32";
-    const uint32_t groups = (rows + MESSAGE_GATE_GROUP_ROWS - 1) / MESSAGE_GATE_GROUP_ROWS;
-    const uint32_t slices = (hidden + MESSAGE_GATE_THREADS - 1) / MESSAGE_GATE_THREADS;
-    requireBytes(buffers.low, uint64_t{count} * rows * rank * sizeof(uint16_t), "message gate rank values");
-    requireBytes(buffers.forget, uint64_t{count} * rows * hidden * sizeof(float), "message gate gated rows");
-    requireBytes(buffers.gain, uint64_t{count} * groups * slices * MESSAGE_GATE_GROUP_ROWS * sizeof(float),
-                 "message gate partial sums");
-    requireBytes(buffers.counters, uint64_t{count} * groups * sizeof(uint32_t), "message gate counters");
     MessageGateFusedParams p{rows, hidden, buffers.xStride, buffers.messageStride, rank, count, {}, {}};
     // A slot past the call's gates binds its first gate's buffers, which the
     // kernels never read.
@@ -79,6 +75,30 @@ PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuff
       p.x_columns[index] = gates[index].xColumn;
       p.message_columns[index] = gates[index].messageColumn;
     }
+    if (!decodeRows) {
+      // Gate g's gated rows, fp32 [rows][hidden], in forget, gain and concat.
+      const std::array<metal::MetalBuffer, kMaximumGates> gated{buffers.forget, buffers.gain, buffers.concat};
+      for (uint32_t index = 0; index < count; ++index)
+        requireBytes(gated[index], uint64_t{rows} * hidden * sizeof(float), "message gate gated rows");
+      const auto scratch = [&](uint32_t index) { return gated[index < count ? index : 0]; };
+      graph.add("message_gate_rows" + suffix,
+                {buffers.x, buffers.message, slot(0).weights.down.plane0, slot(1).weights.down.plane0,
+                 slot(2).weights.down.plane0, slot(0).weights.forget.plane0, slot(1).weights.forget.plane0,
+                 slot(2).weights.forget.plane0, slot(0).weights.gain.plane0, slot(1).weights.gain.plane0,
+                 slot(2).weights.gain.plane0, slot(0).norm.buffer, slot(1).norm.buffer, slot(2).norm.buffer,
+                 scratch(0), scratch(1), scratch(2), slot(0).output, slot(1).output, slot(2).output},
+                p, {(rows + MESSAGE_GATE_TILE_ROWS - 1) / MESSAGE_GATE_TILE_ROWS, 1, count},
+                {MESSAGE_GATE_TILE_THREADS, 1, 1});
+      return {};
+    }
+    const metal::DispatchSize threads{MESSAGE_GATE_THREADS, 1, 1};
+    const uint32_t groups = (rows + MESSAGE_GATE_GROUP_ROWS - 1) / MESSAGE_GATE_GROUP_ROWS;
+    const uint32_t slices = (hidden + MESSAGE_GATE_THREADS - 1) / MESSAGE_GATE_THREADS;
+    requireBytes(buffers.low, uint64_t{count} * rows * rank * sizeof(uint16_t), "message gate rank values");
+    requireBytes(buffers.forget, uint64_t{count} * rows * hidden * sizeof(float), "message gate gated rows");
+    requireBytes(buffers.gain, uint64_t{count} * groups * slices * MESSAGE_GATE_GROUP_ROWS * sizeof(float),
+                 "message gate partial sums");
+    requireBytes(buffers.counters, uint64_t{count} * groups * sizeof(uint32_t), "message gate counters");
     graph.add("message_gate_down" + suffix,
               {buffers.x, buffers.message, slot(0).weights.down.plane0, slot(1).weights.down.plane0,
                slot(2).weights.down.plane0, buffers.low},
@@ -92,6 +112,7 @@ PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuff
               p, {slices, groups, count}, threads);
     return {};
   }
+  const metal::DispatchSize threads{MESSAGE_GATE_THREADS, 1, 1};
   requireBytes(buffers.concat, uint64_t{rows} * 2 * hidden * sizeof(uint16_t), "message gate concatenation");
   const metal::DispatchSize groups{rows, 1, 1};
   for (const MessageGateInput &gate : gates) {

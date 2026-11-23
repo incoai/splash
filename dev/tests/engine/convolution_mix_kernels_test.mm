@@ -864,12 +864,13 @@ struct GateCase {
   }
 };
 
-// Runs rows [first, first + count) of the case's gates as one call, into
-// `outputs` (a buffer a gate, [rows][hidden] bf16), over views of the shared
-// rows; the counters stay zero.
+// Runs rows [first, first + count) of the case's gates as one call on
+// `kernels`, into `outputs` (a buffer a gate, [rows][hidden] bf16), over
+// views of the shared rows; the counters stay zero.
 void runGates(MetalBackend &backend, const GateCase &c, const MetalBuffer &x, const MetalBuffer &message,
               std::span<const ops::MessageGateWeights> weights, std::span<const MetalBuffer> norms,
-              std::span<const MetalBuffer> outputs, const MetalBuffer &counters, uint32_t first, uint32_t count) {
+              std::span<const MetalBuffer> outputs, const MetalBuffer &counters, uint32_t first, uint32_t count,
+              ops::MessageGateKernels kernels = ops::MessageGateKernels::Fused) {
   const uint32_t hidden = GateCase::kHidden, rank = GateCase::kRank;
   std::vector<ops::MessageGateInput> gates;
   for (uint32_t g = 0; g < c.gates; ++g)
@@ -886,18 +887,27 @@ void runGates(MetalBackend &backend, const GateCase &c, const MetalBuffer &x, co
       scratch(backend, size_t{count} * hidden * 4),
       counters};
   CommandGraph graph;
-  ops::MessageGate::add(graph, buffers, gates, hidden, count, ops::FloatTile::Simdgroup);
+  ops::MessageGate::add(graph, buffers, gates, hidden, count, ops::FloatTile::Simdgroup, kernels);
   run(backend, graph);
+}
+
+// The kernels a call of `rows` rows on `kernels` runs.
+std::string gateKernels(uint32_t rows, ops::MessageGateKernels kernels) {
+  return kernels == ops::MessageGateKernels::FloatProjections ? "float projections"
+         : rows <= ops::MessageGate::kFusedRows               ? "fused"
+                                                              : "tiled";
 }
 
 // Each gate of a call of one or three gates (a layer's FFN gate; its q, k and
 // v gates of x queries of their own or of one) against fp64 with the
 // source's bf16 roundings of the down projection's input and output: fused
-// (a decode step's rows: one group and a group and a part) and through the
-// float projections (a prompt chunk's), of F32 weights and of BF16, the
-// counters back at zero. The weights' values are the same in either format,
-// and so is every product, so the two formats' outputs are the same bits.
-void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX) {
+// (a decode step's rows: one group and a group and a part), tiled (more rows,
+// a prompt chunk's: whole tiles and a part of one) and through the float
+// projections, of F32 weights and of BF16, the counters back at zero. The
+// weights' values are the same in either format, and so is every product, so
+// the two formats' outputs are the same bits.
+void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX,
+              ops::MessageGateKernels kernels = ops::MessageGateKernels::Fused) {
   std::mt19937 rng(31 + gates + (sharedX ? 7 : 0));
   const GateCase c(rng, rows, gates, sharedX);
   const uint32_t hidden = GateCase::kHidden;
@@ -916,7 +926,7 @@ void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX
       weights.push_back(c.weights(backend, g, bfloat16));
       outputs.push_back(scratch(backend, size_t{rows} * hidden * 2));
     }
-    runGates(backend, c, x, message, weights, norms, outputs, counters, 0, rows);
+    runGates(backend, c, x, message, weights, norms, outputs, counters, 0, rows, kernels);
     for (uint32_t g = 0; g < gates; ++g) {
       got[bfloat16].push_back(download<uint16_t>(outputs[g], size_t{rows} * hidden));
       for (uint32_t r = 0; r < rows; ++r) {
@@ -930,75 +940,90 @@ void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX
   const std::string kind = gates == 1 ? "" : sharedX ? " of one x" : " of three x";
   check(ok && got[0] == got[1] && std::all_of(zeros.begin(), zeros.end(), [](uint32_t value) { return value == 0; }),
         "message gates, " + std::to_string(gates) + " a call" + kind + ", of " + std::to_string(rows) + " rows (" +
-            (rows <= ops::MessageGate::kFusedRows ? "fused" : "float projections") +
+            gateKernels(rows, kernels) +
             ") through their norms, x and the messages at columns of wider rows, F32 and BF16 weights alike");
 }
 
-// The gates' two paths on the same rows: a call of three gates of more rows
-// than MessageGate::kFusedRows (a prompt chunk's: the float projections, a
-// gate at a time) against calls of at most that many of those rows (a decode
-// step's: the fused kernels, the three gates together), each over views of
-// the same buffers, row by row. Rounding points are the same; what moves is
-// the order of the sums: the rows' and messages' squares (the fused kernels
-// add a row's by quads), the rank values', forget's, gain's and the norm's.
-// Through them a normalized input's or a rank value's bf16 rounding moves by
-// a step now and then, which moves its row's every value by a little of the
-// row's size: a difference counts in bf16 steps of the larger of the two
-// values and their row's root mean square (a value near zero moves by its
-// row's steps, not its own). An M5 Max (2026-11-22) measured 2,200 of
-// 1,382,400 values differing (a share of 1.6e-3), each by one such step at
-// most; bounded at twice those, 2 steps and a share of 3.2e-3. A gate that
-// read another row, message, column, rank value or gate's weights moves
-// values by their row's size, hundreds of steps.
+// The gates' three paths on the same rows: a call of three gates of more rows
+// than MessageGate::kFusedRows through the float projections (a gate at a
+// time, the path of any weights), the same call on the tiled kernel (a
+// prompt chunk's fused gates: whole tiles and a part of one) and calls of at
+// most kFusedRows of those rows (a decode step's: the fused kernels), each
+// over views of the same buffers, row by row, each pair. Rounding points are
+// the same; what moves is the order of the sums: the rows' and messages'
+// squares (the fused kernels add a row's by quads), the rank values',
+// forget's, gain's and the norm's. Through them a normalized input's or a
+// rank value's bf16 rounding moves by a step now and then, which moves its
+// row's every value by a little of the row's size: a difference counts in
+// bf16 steps of the larger of the two values and their row's root mean
+// square (a value near zero moves by its row's steps, not its own). An M5 Max
+// (2026-11-22) measured 2,200 of 1,382,400 values differing between the
+// float projections and the fused kernels (a share of 1.6e-3), each by one
+// such step at most; bounded at twice those, 2 steps and a share of 3.2e-3.
+// An M6 (2026-11-23) measured the tiled kernel's rows against the float
+// projections' at 2,815 values (2.0e-3) and against the fused kernels' at
+// 1,688, each by one step at most. A gate that read another row, message,
+// column, rank value or gate's weights moves values by their row's size,
+// hundreds of steps (a planted bug that normalized a message by its row's
+// scale moved 1,366,693 values by up to 499).
 constexpr double kPathsSteps = 2, kPathsShare = 3.2e-3;
 void gatePathsTest(MetalBackend &backend) {
   std::mt19937 rng(37);
   const uint32_t rows = ops::MessageGate::kFusedRows + 72, gates = 3, hidden = GateCase::kHidden;
   const GateCase c(rng, rows, gates, false);
   std::vector<ops::MessageGateWeights> weights;
-  std::vector<MetalBuffer> norms, general, fused;
+  std::vector<MetalBuffer> norms, general, tiled, fused;
   for (uint32_t g = 0; g < gates; ++g) {
     weights.push_back(c.weights(backend, g, true));
     norms.push_back(upload(backend, c.norm[g]));
     general.push_back(scratch(backend, size_t{rows} * hidden * 2));
+    tiled.push_back(scratch(backend, size_t{rows} * hidden * 2));
     fused.push_back(scratch(backend, size_t{rows} * hidden * 2));
   }
   const MetalBuffer x = upload(backend, c.x), message = upload(backend, c.message),
                     counters = scratch(backend, ops::MessageGate::kCountersBytes);
   std::memset(counters.contents(), 0, counters.sizeBytes());
-  runGates(backend, c, x, message, weights, norms, general, counters, 0, rows);
+  runGates(backend, c, x, message, weights, norms, general, counters, 0, rows,
+           ops::MessageGateKernels::FloatProjections);
+  runGates(backend, c, x, message, weights, norms, tiled, counters, 0, rows);
   for (uint32_t first = 0; first < rows; first += ops::MessageGate::kFusedRows)
     runGates(backend, c, x, message, weights, norms, fused, counters, first,
              std::min(ops::MessageGate::kFusedRows, rows - first));
-  double steps = 0;
-  size_t differ = 0, values = 0;
-  for (uint32_t g = 0; g < gates; ++g) {
-    const auto a = download<uint16_t>(general[g], size_t{rows} * hidden),
-               b = download<uint16_t>(fused[g], size_t{rows} * hidden);
-    values += a.size();
-    for (uint32_t r = 0; r < rows; ++r) {
-      double squares = 0;
-      for (uint32_t d = 0; d < hidden; ++d) {
-        const double value = f32(a[size_t{r} * hidden + d]);
-        squares += value * value;
-      }
-      const double size = std::sqrt(squares / hidden);
-      for (size_t i = size_t{r} * hidden; i < size_t{r + 1} * hidden; ++i) {
-        if (a[i] == b[i]) continue;
-        ++differ;
-        const double larger = std::max({std::fabs(double(f32(a[i]))), std::fabs(double(f32(b[i]))), size});
-        int exponent = 0;
-        std::frexp(larger, &exponent);
-        steps = std::max(steps, std::fabs(double(f32(a[i])) - f32(b[i])) / std::ldexp(1.0, exponent - 8));
+  const auto compare = [&](std::span<const MetalBuffer> one, std::span<const MetalBuffer> other,
+                           const std::string &names) {
+    double steps = 0;
+    size_t differ = 0, values = 0;
+    for (uint32_t g = 0; g < gates; ++g) {
+      const auto a = download<uint16_t>(one[g], size_t{rows} * hidden),
+                 b = download<uint16_t>(other[g], size_t{rows} * hidden);
+      values += a.size();
+      for (uint32_t r = 0; r < rows; ++r) {
+        double squares = 0;
+        for (uint32_t d = 0; d < hidden; ++d) {
+          const double value = f32(a[size_t{r} * hidden + d]);
+          squares += value * value;
+        }
+        const double size = std::sqrt(squares / hidden);
+        for (size_t i = size_t{r} * hidden; i < size_t{r + 1} * hidden; ++i) {
+          if (a[i] == b[i]) continue;
+          ++differ;
+          const double larger = std::max({std::fabs(double(f32(a[i]))), std::fabs(double(f32(b[i]))), size});
+          int exponent = 0;
+          std::frexp(larger, &exponent);
+          steps = std::max(steps, std::fabs(double(f32(a[i])) - f32(b[i])) / std::ldexp(1.0, exponent - 8));
+        }
       }
     }
-  }
-  const double share = double(differ) / values;
-  check(steps <= kPathsSteps && share <= kPathsShare,
-        "message gates, 3 a call, of " + std::to_string(rows) +
-            " rows: the float projections' rows and the fused kernels': " + std::to_string(differ) + " of " +
-            std::to_string(values) + " values differ, at most " + std::to_string(steps) + " bf16 steps (bounds " +
-            std::to_string(kPathsShare) + " of them, " + std::to_string(kPathsSteps) + " steps)");
+    const double share = double(differ) / values;
+    check(steps <= kPathsSteps && share <= kPathsShare,
+          "message gates, 3 a call, of " + std::to_string(rows) + " rows: " + names + ": " + std::to_string(differ) +
+              " of " + std::to_string(values) + " values differ, at most " + std::to_string(steps) +
+              " bf16 steps (bounds " + std::to_string(kPathsShare) + " of them, " + std::to_string(kPathsSteps) +
+              " steps)");
+  };
+  compare(general, fused, "the float projections' rows and the fused kernels'");
+  compare(general, tiled, "the float projections' rows and the tiled kernel's");
+  compare(tiled, fused, "the tiled kernel's rows and the fused kernels'");
 }
 
 // The finish of rows of logits: the softcap below `tokens`, -inf past it.
@@ -1063,7 +1088,9 @@ int main(int argc, const char *argv[]) {
         gateTest(backend, rows, 1, true);
         gateTest(backend, rows, 3, false);
       }
-      gateTest(backend, 13, 3, true);
+      for (const uint32_t rows : {13u, ops::MessageGate::kFusedRows + 1}) gateTest(backend, rows, 3, true);
+      for (const uint32_t rows : {13u, ops::MessageGate::kFusedRows + 1})
+        gateTest(backend, rows, 3, false, ops::MessageGateKernels::FloatProjections);
       gatePathsTest(backend);
       logitFinishTest(backend);
     } catch (const std::exception &error) {

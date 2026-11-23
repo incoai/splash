@@ -585,9 +585,10 @@ constexpr double kLogitsBound = 0.02;
 // its prefill row measured at most 0.00049 and its decode row 0.109 (a
 // one-token lane's), on an M5 Pro and an M6 alike; twice those. The lanes'
 // joint prefill takes other tiles than a prompt's own command, and its 1,000
-// rows run the message gates' float projections where a prompt of at most
-// MessageGate::kFusedRows rows alone, and every decode step, runs the fused
-// gates (ops/MessageGate.hpp): other summation orders of the same roundings,
+// rows run the message gates' tiled kernel where a prompt of at most
+// MessageGate::kFusedRows rows alone, and every decode step, runs the decode
+// step's fused gates (ops/MessageGate.hpp): other summation orders of the
+// same roundings,
 // which this fixture carries through its 24 applications into the lane's KV
 // and states, which its decode step reads.
 constexpr double kLanePrefillBound = 0.001, kLaneDecodeBound = 0.22;
