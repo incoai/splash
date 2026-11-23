@@ -108,11 +108,18 @@ private:
   // The application's attention of its normalized inputs into
   // buffers.attentionOutput, its output projection's rows.
   void addAttention(PrefillStep &step, uint32_t application, const std::array<metal::MetalBuffer, 3> &inputs) const;
-  // The message gate `message` (0 to 3: q, k, v, FFN) of the application's
-  // fp32 mix rows of `queries` queries, query `column`'s, by its message, into
-  // `output` through `norm`.
-  void addGate(const PrefillStep &step, uint32_t application, uint32_t queries, uint32_t column, uint32_t message,
-               const ops::NormWeights &norm, metal::MetalBuffer output) const;
+  // One of an application's message gates: `message` (0 to 3: q, k, v, FFN)
+  // of its fp32 mix rows, query `column`'s, by its message, into `output`
+  // through `norm`.
+  struct Gate final {
+    uint32_t message = 0;
+    uint32_t column = 0;
+    ops::NormWeights norm;
+    metal::MetalBuffer output;
+  };
+  // The application's gates `gates` of its mix rows of `queries` queries, one
+  // call (ops::MessageGate::add).
+  void addGates(const PrefillStep &step, uint32_t application, uint32_t queries, std::span<const Gate> gates) const;
   // One of the application's convolutions over the step's rows: its state
   // columns in each lane's matrix, the sequences' states in and out, the
   // states captured inside them, and a decode step's tree and tape.

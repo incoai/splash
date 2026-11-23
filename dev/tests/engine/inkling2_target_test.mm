@@ -374,7 +374,7 @@ constexpr double kLogitsBound = 0.02;
 // joint prefill takes other tiles than a prompt's own command, and its 1,000
 // rows run the message gates' float projections where a prompt of at most
 // MessageGate::kFusedRows rows alone, and every decode step, runs the fused
-// gate (ops/MessageGate.hpp): other summation orders of the same roundings,
+// gates (ops/MessageGate.hpp): other summation orders of the same roundings,
 // which this fixture carries through its 24 applications into the lane's KV
 // and states, which its decode step reads.
 constexpr double kLanePrefillBound = 0.001, kLaneDecodeBound = 0.22;

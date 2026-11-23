@@ -153,7 +153,8 @@ void Inkling2LoopTarget::addPrefillLayer(PrefillStep &step, uint32_t application
   const ops::BlockResidualShape shape{.hidden = hidden, .stack = schedule_.ffnStates(application), .queries = 1};
   if (schedule_.gated(application)) {
     ops::BlockResidualMix::addMix(step.graph, states, layer.ffnQuery, s.mixed, shape, step.rows);
-    addGate(step, application, 1, 0, 3, layer.ffnNorm, b.normalized);
+    const Gate gate{.message = 3, .column = 0, .norm = layer.ffnNorm, .output = b.normalized};
+    addGates(step, application, 1, std::span(&gate, 1));
   } else {
     ops::BlockResidualMix::addMixNorm(step.graph, states, layer.ffnQuery, std::span(&layer.ffnNorm, 1),
                                       std::span(&b.normalized, 1), shape, step.rows);
@@ -203,8 +204,10 @@ std::array<metal::MetalBuffer, 3> Inkling2LoopTarget::addMixerInputs(PrefillStep
                                   layer.messages->queries, s.messages,
                                   {.hidden = hidden, .stack = planes - 1, .queries = 4}, step.rows);
     ops::BlockResidualMix::addMix(step.graph, states, layer.mixerQueries, s.mixed, shape, step.rows);
+    std::array<Gate, 3> gates;
     for (uint32_t index = 0; index < 3; ++index)
-      addGate(step, application, queries, full ? index : 0, index, norms[index], separate[index]);
+      gates[index] = {.message = index, .column = full ? index : 0, .norm = norms[index], .output = separate[index]};
+    addGates(step, application, queries, gates);
     return separate;
   }
   if (!queries) {
@@ -216,27 +219,33 @@ std::array<metal::MetalBuffer, 3> Inkling2LoopTarget::addMixerInputs(PrefillStep
   return full ? separate : shared;
 }
 
-void Inkling2LoopTarget::addGate(const PrefillStep &step, uint32_t application, uint32_t queries, uint32_t column,
-                                 uint32_t message, const ops::NormWeights &norm, metal::MetalBuffer output) const {
-  const Inkling2LoopGateWeights &gate = weights_.layers[schedule_.weightLayer(application)].messages->gates[message];
+void Inkling2LoopTarget::addGates(const PrefillStep &step, uint32_t application, uint32_t queries,
+                                  std::span<const Gate> gates) const {
+  const Inkling2LoopMessageWeights &messages = *weights_.layers[schedule_.weightLayer(application)].messages;
   const Inkling2LoopScratch &s = step.scratch;
   const uint32_t hidden = geometry_.hiddenSize;
-  const ops::MessageGateWeights weights = gateWeights(gate);
+  std::array<ops::MessageGateInput, ops::MessageGate::kMaximumGates> inputs;
+  if (gates.size() > inputs.size()) throw std::logic_error("more Inkling-2-Mini gates than a call takes");
+  for (size_t index = 0; index < gates.size(); ++index) {
+    const Gate &gate = gates[index];
+    inputs[index] = {.weights = gateWeights(messages.gates[gate.message]),
+                     .norm = gate.norm,
+                     .xColumn = gate.column * hidden,
+                     .messageColumn = gate.message * hidden,
+                     .output = gate.output};
+  }
   ops::MessageGate::add(step.graph,
                         {.x = s.mixed,
                          .xStride = queries * hidden,
-                         .xColumn = column * hidden,
                          .message = s.messages,
                          .messageStride = 4 * hidden,
-                         .messageColumn = message * hidden,
                          .concat = s.gateConcat,
                          .low = s.gateLow,
                          .forget = s.gateForget,
                          .gain = s.gateGain,
-                         .output = std::move(output),
                          .counters = s.gateCounters},
-                        weights, norm, hidden, step.rows,
-                        linear(step).ggufFloatTile(step.rows, hidden, weights.forget.formatId));
+                        std::span(inputs).first(gates.size()), hidden, step.rows,
+                        linear(step).ggufFloatTile(step.rows, hidden, inputs.front().weights.forget.formatId));
 }
 
 // A prompt sequence's history through the command's reads of spilled K/V

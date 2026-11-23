@@ -28,10 +28,11 @@ namespace splash::model {
 // each (KV heads x taps a row); the relative states and row sinks the
 // attention's projection stages for its split (fp32, in the queries' staged
 // rows); a message gate's concatenated norms (2 hiddenSize), low rank
-// (loopGateRank) and forget and gain rows (fp32), and its fused form's
-// counters (ops::MessageGate::kCountersBytes, zero between gates); zero rows,
-// which the MoE
-// adds its weighted sum to (ops::MoeBuffers::residual); and a decode step's
+// (loopGateRank, three gates' in a row) and forget and gain rows (fp32; a
+// decode step's forget rows three fused gates' gated rows), and the fused
+// gates' counters (ops::MessageGate::kCountersBytes, zero between calls);
+// zero rows, which the MoE adds its weighted sum to
+// (ops::MoeBuffers::residual); and a decode step's
 // convolution inputs of every application, rows of stateColumns() values,
 // which its commit reads.
 struct Inkling2LoopScratch final {

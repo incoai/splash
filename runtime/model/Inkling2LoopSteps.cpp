@@ -17,6 +17,13 @@ constexpr uint32_t kChunkRows = ExecutionLimits::prefillTokenBudget;
 constexpr uint32_t kMixerQueries = 3;
 // The messages of a loop layer: its q, k, v and FFN inputs'.
 constexpr uint32_t kMessages = 4;
+// A layer's mixer gates run as one call (ops::MessageGate): a decode step's
+// fused gates take each its rank values and gated rows, a step's rows each;
+// a prompt chunk's take theirs from a chunk's single rows, which hold those
+// of the most rows the fused gates take.
+static_assert(kMixerQueries <= ops::MessageGate::kMaximumGates, "a layer's mixer gates run as one call");
+static_assert(kChunkRows >= kMixerQueries * ops::MessageGate::kFusedRows,
+              "a prompt chunk's gated rows hold its fused gates' of their most rows");
 
 template <class T> constexpr uint64_t bytesFor(uint64_t elements) noexcept { return elements * sizeof(T); }
 
@@ -67,8 +74,8 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
       {&Inkling2LoopScratch::rowSinks, bytesFor<float>(g.attentionQueryHeads),
        bytesFor<float>(stagedLaneRows * g.attentionQueryHeads), false},
       {&Inkling2LoopScratch::gateConcat, bytesFor<uint16_t>(2 * hidden), 0, false},
-      {&Inkling2LoopScratch::gateLow, bytesFor<uint16_t>(shape.gateRank), 0, false},
-      {&Inkling2LoopScratch::gateForget, bytesFor<float>(hidden), 0, false},
+      {&Inkling2LoopScratch::gateLow, bytesFor<uint16_t>(kMixerQueries * shape.gateRank), 0, false},
+      {&Inkling2LoopScratch::gateForget, bytesFor<float>((decode ? kMixerQueries : 1) * hidden), 0, false},
       {&Inkling2LoopScratch::gateGain, bytesFor<float>(hidden), 0, false},
       {&Inkling2LoopScratch::gateCounters, 0, ops::MessageGate::kCountersBytes, false},
       {&Inkling2LoopScratch::zeros, bytesFor<uint16_t>(hidden), 0, false},
