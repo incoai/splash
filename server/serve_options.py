@@ -918,9 +918,9 @@ SERVE_OPTIONS = (
             help="auto rounds activations to 8 bits where the GPU multiplies "
             "them twice as fast (M5 and later) and leaves the others bf16: "
             "long prompts through MLX 4- and 5-bit weights (about a quarter "
-            "less time to the first token), rotated PQ2_0 decode and attention "
-            "over the INT8 KV cache; bf16 keeps every activation bf16, for "
-            "evaluations and bf16 parity (default: auto)",
+            "less time to the first token) and Q8_0 ones, rotated PQ2_0 decode "
+            "and attention over the INT8 KV cache; bf16 keeps every activation "
+            "bf16, for evaluations and bf16 parity (default: auto)",
         ),
         engine=EngineArgument("--activations"),
     ),
