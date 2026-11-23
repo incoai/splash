@@ -27,47 +27,12 @@ void requireLayout(kv::Layout layout) {
   if (!RelativeAttention::stores(layout)) throw std::invalid_argument("no relative attention kernel for layout");
 }
 
+// A layout's KV path commit kernel.
+std::string commitKernel(kv::Layout layout) { return "relative_attention_" + kernelFormat(layout) + "_commit"; }
+
 void requireVariant(RelativeAttentionVariant variant) {
   if (variant.windowTokens && variant.windowTokens != RelativeAttention::kWindowTokens)
     throw std::invalid_argument("no relative attention kernel for the layer's window");
-}
-
-// A layout's KV format, as the kernels' names hold it.
-std::string kernelFormat(kv::Layout layout) { return layout.format == kv::Format::BFloat16 ? "bf16" : "q8"; }
-
-// The workspace of `rows` fused rows' partials and statistics, and the fused
-// rows of one tile split of every KV head (PagedAttention.cpp's
-// attentionWorkspace and slotRows).
-AttentionWorkspace workspaceOf(uint64_t rows) {
-  return {rows * RelativeAttention::kHeadDimension * sizeof(float), rows * 2 * sizeof(float)};
-}
-uint64_t slotRows() { return uint64_t{kv::kAttentionTileRows} * RelativeAttention::kQueryHeads; }
-
-// Sequence s's rows from row `first` of its layout entry on.
-SplashAttentionSequence sequenceRows(const kv::ChunkedPrefillParams &chunk, const CommandRows &rows, size_t s,
-                                     uint32_t first) {
-  return {.committed_tokens = chunk.committed_tokens + first,
-          .row_bound = chunk.chunk_tokens - first,
-          .layout_row = first,
-          .stage_row = rows.stageRow[s] + first,
-          .chunk_stride = chunk.chunk_stride,
-          .page_table_entries = chunk.page_table_entries,
-          .split_count = 0,
-          .first_tile = 0,
-          .first_slot = 0,
-          .block_stride = 0,
-          .block_list = 0};
-}
-
-void requireRows(const AttentionRows &rows, const CommandRows &command, size_t sequences) {
-  if (!rows.rows || rows.rows > command.bounds)
-    throw std::invalid_argument("attention rows exceed their sequences' bounds");
-  requireBytes(rows.layout, sequences * sizeof(SplashLaneRows), "attention layout");
-  if (rows.tree) requireBytes(rows.tree, uint64_t{rows.rows} * sizeof(SplashTreeRow), "attention tree rows");
-}
-
-void requirePageTable(const metal::MetalBuffer &table, const kv::ChunkedPrefillParams &chunk) {
-  requireBytes(table, uint64_t{kv::chunkedPrefillRequiredPages(chunk)} * sizeof(SplashKvPage), "page table");
 }
 
 // The staging a command's kernels reach, of `reach` rows of the last
@@ -82,8 +47,6 @@ void requireStaging(const RelativeAttentionStaging &staging, const CommandRows &
   requireBytes(staging.sinks, command.rowBytes(kGroup * halves, reach), "attention sinks");
 }
 
-bool sameLayer(SplashKvLayer a, SplashKvLayer b) { return a.extent_pages == b.extent_pages && a.offset == b.offset; }
-
 // Relative attention writes every row: no target attends a chunk's last rows
 // alone through it (QwenTarget's paged attention does).
 void requireEveryRow(const AttentionOutputRows &output) {
@@ -96,7 +59,7 @@ void requireEveryRow(const AttentionOutputRows &output) {
 AttentionWorkspace RelativeAttentionPlan::workspace() const noexcept {
   uint64_t slots = 0;
   for (const Dispatch &dispatch : dispatches()) slots = std::max<uint64_t>(slots, dispatch.slots);
-  return workspaceOf(slots * slotRows());
+  return attentionWorkspace(slots * slotRows(RelativeAttention::kQueryHeads), RelativeAttention::kHeadDimension);
 }
 
 metal::DispatchSize RelativeAttentionPlan::splitGroups(const Dispatch &dispatch) const noexcept {
@@ -133,7 +96,7 @@ RelativeAttentionStagingBytes RelativeAttention::stagingBytes(std::span<const kv
 AttentionWorkspace RelativeAttention::workspace(uint32_t slots, kv::Layout layout) {
   requireLayout(layout);
   if (!slots) throw std::invalid_argument("invalid attention workspace slots");
-  return workspaceOf(slots * slotRows());
+  return attentionWorkspace(slots * slotRows(kQueryHeads), kHeadDimension);
 }
 
 RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefillParams> sequences,
@@ -158,7 +121,7 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
         throw std::invalid_argument("a decode step's lanes share a lane cap of at most a verify block's rows");
   if (decode && !calibration.cores)
     throw std::invalid_argument("a decode step's splits fill a device's cores: a calibration of none");
-  const AttentionWorkspace slot = workspaceOf(slotRows());
+  const AttentionWorkspace slot = attentionWorkspace(slotRows(kQueryHeads), kHeadDimension);
   const uint64_t slots = std::min(capacity.partialsBytes / slot.partialsBytes,
                                   capacity.statisticsBytes / slot.statisticsBytes);
   RelativeAttentionPlan plan(layout, step,
@@ -452,23 +415,7 @@ void RelativeAttention::addPathCommit(metal::CommandGraph &graph, kv::Layout lay
                                       std::span<const uint32_t> committed, uint32_t laneRows,
                                       const metal::MetalBuffer &paths) {
   requireLayout(layout);
-  const uint32_t lanes = static_cast<uint32_t>(committed.size());
-  if (!lanes || lanes > kMaximumSequences || pageTables.size() != lanes || !extentPages || !laneRows ||
-      laneRows > SPLASH_TARGET_VERIFY_ROWS)
-    throw std::invalid_argument("invalid KV path commit");
-  SplashKvPathCommitParams params{
-      .extent_pages = extentPages, .regions = layout.attentionLayers, .committed_tokens = {}};
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const uint64_t pages = (uint64_t{committed[lane]} + laneRows + kv::kPageTokens - 1) / kv::kPageTokens;
-    requireBytes(pageTables[lane], pages * sizeof(SplashKvPage), "page table");
-    params.committed_tokens[lane] = committed[lane];
-  }
-  requireBytes(paths, uint64_t{lanes} * sizeof(uint32_t), "KV path commit paths");
-  const auto tables = laneBindings(pageTables);
-  std::vector<metal::MetalBuffer> bindings(tables.begin(), tables.end());
-  bindings.push_back(paths);
-  graph.add("relative_attention_" + kernelFormat(layout) + "_commit", std::move(bindings), params,
-            {uint64_t{layout.attentionLayers} * layout.kvHeads, lanes, 1}, {layout.headDimension, 1, 1});
+  addKvPathCommit(graph, commitKernel, layout, extentPages, pageTables, committed, laneRows, paths);
 }
 
 } // namespace splash::ops

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/BufferExtent.hpp"
+#include "ops/LaneBindings.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
 
@@ -12,12 +14,25 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // The planning the attention operators share, which every split and reduce
 // of the paged attention (ops::PagedAttention) and of relative attention
 // (ops::RelativeAttention) follows: the pages a tile reads, its history
-// splits, a command's staging, and the dispatches a plan's sequences share.
+// splits, a command's staging, the dispatches a plan's sequences share, and
+// the checks and bindings of their rows, page tables and path commits.
 namespace splash::ops {
+
+// A layout's KV format, as the kernels' names hold it.
+inline std::string kernelFormat(kv::Layout layout) { return layout.format == kv::Format::BFloat16 ? "bf16" : "q8"; }
+
+// The workspace of `rows` fused rows' partials and statistics.
+inline AttentionWorkspace attentionWorkspace(uint64_t rows, uint32_t headDimension) {
+  return {rows * headDimension * sizeof(float), rows * 2 * sizeof(float)};
+}
+
+// The fused rows of one tile split's partials, of every KV head and part.
+inline uint64_t slotRows(uint32_t queryHeads) { return uint64_t{kv::kAttentionTileRows} * queryHeads; }
 
 // The pages a tile that sees visibleTokens reads: with a window of
 // windowTokens keys before each row, no more than its window's.
@@ -87,6 +102,41 @@ inline CommandRows commandRows(std::span<const kv::ChunkedPrefillParams> sequenc
   return result;
 }
 
+// Sequence s's rows from row `first` of its layout entry on.
+inline SplashAttentionSequence sequenceRows(const kv::ChunkedPrefillParams &chunk, const CommandRows &rows, size_t s,
+                                            uint32_t first) {
+  return {.committed_tokens = chunk.committed_tokens + first,
+          .row_bound = chunk.chunk_tokens - first,
+          .layout_row = first,
+          .stage_row = rows.stageRow[s] + first,
+          .chunk_stride = chunk.chunk_stride,
+          .page_table_entries = chunk.page_table_entries,
+          .split_count = 0,
+          .first_tile = 0,
+          .first_slot = 0,
+          .block_stride = 0,
+          .block_list = 0};
+}
+
+// A command's rows (AttentionRows) of its sequences: at least a row, at most
+// their bounds' sum, each sequence's layout entry, and a tree row a row.
+inline void requireRows(const AttentionRows &rows, const CommandRows &command, size_t sequences) {
+  if (!rows.rows || rows.rows > command.bounds)
+    throw std::invalid_argument("attention rows exceed their sequences' bounds");
+  requireBytes(rows.layout, sequences * sizeof(SplashLaneRows), "attention layout");
+  if (rows.tree) requireBytes(rows.tree, uint64_t{rows.rows} * sizeof(SplashTreeRow), "attention tree rows");
+}
+
+// A chunk's page table holds the pages of its visible tokens.
+inline void requirePageTable(const metal::MetalBuffer &table, const kv::ChunkedPrefillParams &chunk) {
+  requireBytes(table, uint64_t{kv::chunkedPrefillRequiredPages(chunk)} * sizeof(SplashKvPage), "page table");
+}
+
+// Whether two sequences' histories lie in the same layer of their pools.
+inline bool sameLayer(SplashKvLayer a, SplashKvLayer b) {
+  return a.extent_pages == b.extent_pages && a.offset == b.offset;
+}
+
 // Gathers a plan's sequences (in row order) into `dispatches` while their
 // tiles' splits fit `workspaceSlots` tile splits, so that no sequence's
 // partition depends on another's; returns the dispatches. Each split of a
@@ -111,6 +161,30 @@ inline uint32_t groupDispatches(std::span<const AttentionPlan::Sequence> sequenc
     dispatch->slots += slots;
   }
   return count;
+}
+
+// The commit of each lane's accepted path after a decode step
+// (PagedAttention::addPathCommit) by kernel(layout), the operator's commit
+// kernel of the layout's pages, which it names once the commit is checked.
+inline void addKvPathCommit(metal::CommandGraph &graph, std::string (*kernel)(kv::Layout), kv::Layout layout,
+                            uint32_t extentPages, std::span<const metal::MetalBuffer> pageTables,
+                            std::span<const uint32_t> committed, uint32_t laneRows, const metal::MetalBuffer &paths) {
+  const uint32_t lanes = static_cast<uint32_t>(committed.size());
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || pageTables.size() != lanes || !extentPages || !laneRows ||
+      laneRows > SPLASH_TARGET_VERIFY_ROWS)
+    throw std::invalid_argument("invalid KV path commit");
+  SplashKvPathCommitParams params{.extent_pages = extentPages, .regions = layout.attentionLayers, .committed_tokens = {}};
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const uint64_t pages = (uint64_t{committed[lane]} + laneRows + kv::kPageTokens - 1) / kv::kPageTokens;
+    requireBytes(pageTables[lane], pages * sizeof(SplashKvPage), "page table");
+    params.committed_tokens[lane] = committed[lane];
+  }
+  requireBytes(paths, uint64_t{lanes} * sizeof(uint32_t), "KV path commit paths");
+  const auto tables = laneBindings(pageTables);
+  std::vector<metal::MetalBuffer> bindings(tables.begin(), tables.end());
+  bindings.push_back(paths);
+  graph.add(kernel(layout), std::move(bindings), params, {uint64_t{layout.attentionLayers} * layout.kvHeads, lanes, 1},
+            {layout.headDimension, 1, 1});
 }
 
 } // namespace splash::ops
