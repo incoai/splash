@@ -449,7 +449,8 @@ sliding layer's, but where messages gate its inputs apart) as one projection
 of the two tensors side by side (`keyValueProjection`,
 `ops::Projection::sideBySide`), on one tensor's own plan, so each tensor's
 columns are the bits of its own projection, in one dispatch from one prepared
-input; and it convolves every layer's keys and values in one dispatch
+input where its tile fuses them (the column and register tiles, and the staged
+tile of one row group); and it convolves every layer's keys and values in one dispatch
 (`ops::ShortConvolution::addConvolutionPair`), each the bits of its own
 dispatch, a pair from one projection's rows reading them as views
 (`ShortConvBuffers::inputStride`, `inputColumn`). Its draft reads it as its
@@ -2857,8 +2858,8 @@ cells beside the lanes' cells (`state.idle_cached_cells` 2 beside
 whose state commit alone writes auxiliary state after its retained rows
 (Qwen3.8-Flash-Next's PLE history and its indexer's pending keys) folds none
 and captures none in decode (`Model::capturesInDecode`), and its decode writes
-the rings alone. A target without GDN layers keeps no GDN
-state: its cells have no bytes, every lane and state shares one empty cell
+the rings alone. A target without GDN layers or auxiliary state keeps no
+state in its cells: they have no bytes, every lane and state shares one empty cell
 that holds no memory, so a lane holds the draft's rings and window and a
 cached state the window alone, and `state.idle_gdn_cells` and
 `idle_cached_cells` stay 0.
