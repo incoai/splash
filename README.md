@@ -80,11 +80,12 @@ up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
 not supported: the installer refuses a GGUF whose projections and experts are
 all BF16, F16 or F32.
 [Prism ML Ternary Bonsai 2](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
-is also supported in PQ2_0 (7.2 GB), including vision. Pass `OWNER/REPO:VARIANT`
-to `--model`, as in the quick start. MLX targets can be affine 2–8-bit,
-including mixed precision, mxfp4, mxfp8 or nvfp4. NVIDIA's and unsloth's NVFP4
-checkpoints and NVFP4 GGUFs also load. Inkling-2-Mini also loads from its
-release, `thinkingmachines/Inkling-2-Mini`, and serves text only. Smaller
+is also supported in PQ2_0 (7.2 GB), including vision. Inkling-2-Mini also loads
+from its release, `thinkingmachines/Inkling-2-Mini`, and serves text only; the
+desktop app suggests it on Macs with 36 GB or more. Pass `OWNER/REPO:VARIANT` to
+`--model`, as in the quick start. MLX targets can be affine 2–8-bit, including
+mixed precision, mxfp4, mxfp8 or nvfp4. NVIDIA's and unsloth's NVFP4
+checkpoints and NVFP4 GGUFs also load. Smaller Qwen3.8-27B and Qwen3.6-35B-A3B
 variants run on [24 GB Macs](docs/performance.md#smaller-ggufs-on-24-gb-macs).
 [27B variants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main) ·
 [35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main) ·
