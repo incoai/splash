@@ -57,7 +57,7 @@ void BlockResidualMix::addMix(metal::CommandGraph &graph, const BlockResidualSta
   requireBytes(output, uint64_t{rows} * shape.queries * shape.hidden * sizeof(float), "block residual mix output");
   graph.add(instance("block_residual_mix", states),
             {stackBinding(states, shape), states.current, std::move(queries), std::move(output)},
-            mixParams(states, shape, rows), {rows, 1, 1}, {kThreads, 1, 1});
+            mixParams(states, shape, rows), {rows, shape.queries, 1}, {kThreads, 1, 1});
 }
 
 PreparedInput BlockResidualMix::addMixNorm(metal::CommandGraph &graph, const BlockResidualStates &states,
@@ -85,7 +85,7 @@ PreparedInput BlockResidualMix::addMixNorm(metal::CommandGraph &graph, const Blo
     bindings.push_back(out);
   }
   graph.add(instance("block_residual_mix_norm", states), std::move(bindings), mixParams(states, shape, rows),
-            {rows, 1, 1}, {kThreads, 1, 1});
+            {rows, shape.queries, 1}, {kThreads, 1, 1});
   return {};
 }
 
