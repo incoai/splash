@@ -13,7 +13,7 @@
 //   layer and its expert passes alone (replayed after it, its tiles grouped) stream its distinct experts' and shared
 //   slices' weights;
 // - prefill chunks of 64 to 2048 rows routed at random;
-// - every dispatch of the 2048-row chunk and of the 8- and 32-row steps replayed as its own command.
+// - every dispatch of the 2048-row chunk and of the 1-, 2-, 8- and 32-row steps replayed as its own command.
 //   gguf-moe-benchmark <metallib> tiles [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
 // - steps of 8 to 512 rows on 8- and on 32-row expert tiles (MoeExpertTile, selectMoe's choice), routed at random or,
 //   per lane of 16 rows, from a pool of three times top-k, with the rows each routed expert takes on average.
@@ -284,6 +284,8 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
   }
   // Where the time goes: every dispatch replayed as its own command.
   for (const auto &[label, plan] : {std::pair{"prefill 2048", plans.moe(shape, routerFormat, 2048, splash::ops::StepKind::Prefill)},
+                                    std::pair{"decode 1", plans.moe(shape, routerFormat, 1, splash::ops::StepKind::Decode)},
+                                    std::pair{"decode 2", plans.moe(shape, routerFormat, 2, splash::ops::StepKind::Decode)},
                                     std::pair{"decode 8", plans.moe(shape, routerFormat, kLaneRows, splash::ops::StepKind::Decode)},
                                     std::pair{"decode 32", plans.moe(shape, routerFormat, 4 * kLaneRows, splash::ops::StepKind::Decode)}}) {
     const Layers l = layers(plan, Routing::Random);
