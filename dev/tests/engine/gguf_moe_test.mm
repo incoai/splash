@@ -1248,11 +1248,10 @@ void bufferExtents(MetalBackend &backend) {
 // The int8 passes (MoeConfig::int8Passes) of a block whose six projections are one format the int8 tile takes:
 // af4g64, af5g64 and Q8_0 run them, each pass inside the int8 rule's interval, a row's result the same in every chunk
 // (its codes and sums depend on its own inputs alone); af3g64, which the int8 tile does not take, keeps the staged
-// passes, and so
-// does a plan without int8Passes (--activations bf16). As the plans select them, the passes run only where the
-// device's family runs the int8 prefill tile (ProjectionCalibration::prefillInt8: not Apple9, where the tile's
-// int8 fragments do not compute these products); elsewhere every plan keeps the staged passes. The wide fixtures of
-// gguf-moe-e512 and gguf-moe-sigmoid (experts of 640 and 512 on a hidden size of 256) run them too.
+// passes, and so does a plan without int8Passes (--activations bf16). As the plans select them, the passes run only
+// where the device's family runs the int8 prefill tile (ProjectionCalibration::prefillInt8: not Apple9, where the
+// tile's int8 fragments do not compute these products); elsewhere every plan keeps the staged passes. The wide
+// fixtures of gguf-moe-e512 and gguf-moe-sigmoid (experts of 640 and 512 on a hidden size of 256) run them too.
 int int8Experts(MetalBackend &backend) {
   int failures = 0;
   // The int8 passes are compiled for the SiLU routings' shared slices alone.
