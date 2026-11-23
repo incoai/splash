@@ -295,17 +295,17 @@ matmul, so a row's result also depends on the rows decoded or prefilled beside
 it. On M5 and later Macs with `--activations auto`, the default, attention
 over INT8 KV scores INT8 queries where its splits read 8 pages or more, which
 follows the chunk's rows and history and, in verify, the batch's longest lane;
-a target's MLX 4- or 5-bit projection rounds its prefill rows to int8 when their
-chunk, with the rows prefilled beside them, has more than 64 rows; and a rotated
-PQ2_0 projection decodes in int8 activations on plans of 16 rows or more, though
-not on a lone lane's split plans of 8 rows, which keep bf16. Concurrent requests
-change the batch and the chunking, and chunk boundaries also come from the
-cached boundary a request resumes from, from a boundary another request waits to
-resume from, and from one whose state, or the KV past it, memory could not hold.
-With `--state-format bf16` the state is also rounded at each state a chunk
-captures (a replay point, junction or checkpoint). So under `--verify-rows
-all` a greedy or seeded request repeats its output when it runs alone with the
-same cached prefixes; alongside other
+a target's MLX 4- or 5-bit or Q8_0 projection rounds its prefill rows to int8
+when their chunk, with the rows prefilled beside them, has more than 64 rows;
+and a rotated PQ2_0 projection decodes in int8 activations on plans of 16 rows
+or more, though not on a lone lane's split plans of 8 rows, which keep bf16.
+Concurrent requests change the batch and the chunking, and chunk boundaries also
+come from the cached boundary a request resumes from, from a boundary another
+request waits to resume from, and from one whose state, or the KV past it,
+memory could not hold. With `--state-format bf16` the state is also rounded at
+each state a chunk captures (a replay point, junction or checkpoint). So under
+`--verify-rows all` a greedy or seeded request repeats its output when it runs
+alone with the same cached prefixes; alongside other
 requests, or with other prefixes cached, it can differ. A request's own repeat
 is such a case: served from the prefix cache, it computes only the rows past the
 state its first run cached, so its output can differ from that run's, which
