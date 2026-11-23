@@ -77,6 +77,11 @@ template [[host_name("moe_expert_gguf_m64_down_s0")]] kernel MoeExpertGgufKernel
 // simdgroup writes bf16(up) * silu(gate) as gguf_epilogue<EpUpWithGate> does, so the intermediate is bitwise that of
 // the gate and up passes apart (moe_gguf_expert_tile of projections 0 and 1), which gguf-moe's reference runs. Each
 // simdgroup's sums are its expert's scale of its projection (moe_expert_scale, `scale`) times the products'.
+// Activation: the up simdgroup's output, Activation::value(up, gate) of the bf16 up and gate values: MoeSiluGate's
+// bf16(up) * silu(gate), as gguf_epilogue<EpUpWithGate>, or a compiled routing's (kernels/common/softcapped_swiglu.h).
+struct MoeSiluGate {
+  static float value(float up, float gate) { return up * splash_silu(gate); }
+};
 // The gate/up pass's column tile (moe_column_tile), out of line: inlined in every format, it grew the 32-row kernel
 // until a 10-core M4 (Apple9) under shader validation summed one element of the staged accumulator wrongly, the same
 // kernel right without validation.
@@ -94,11 +99,12 @@ __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, u
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (up)
     for (uint row = 0; row < rows; ++row)
-      output[out + ulong(row) * N + origin + simd_lane] = bfloat(
-          float(bfloat(sums[row] * scale)) * splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
+      output[out + ulong(row) * N + origin + simd_lane] = bfloat(MoeSiluGate::value(
+          float(bfloat(sums[row] * scale)), float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
 }
-// The column tile of a gate/up pass of another activation than SiLU (Activation::value(up, gate) of the bf16 up
-// and gate values, kernels/common/softcapped_swiglu.h), out of line as moe_gate_up_column is.
+// The column tile of a gate/up pass of another activation than SiLU, moe_gate_up_column's code as a template. One
+// template for both changes the SiLU kernels' AIR: a template's lambda takes the template's linkage, and the compiler
+// keeps moe_formats' switch out of line for it, where it inlines the switch of a plain function's lambda into the tile.
 template <class Activation>
 __attribute__((noinline)) void moe_gate_up_column_activated(device bfloat *x, uint rows, uint K, uint N,
                                                             MoeGgufSegment s, float scale, uint origin,
@@ -133,9 +139,6 @@ __attribute__((noinline)) void moe_gate_up_staged(device bfloat *x, MoeGgufSegme
   gguf_elements(acc,
                 [&](uint row, uint column, float v) { park[row * GGUF_STAGED_COLUMNS + column] = bfloat(v * scale); });
 }
-// Activation: MoeSiluGate, bf16(up) * silu(gate) as gguf_epilogue<EpUpWithGate>, or another of a compiled routing
-// (moe_gate_up_column_activated).
-struct MoeSiluGate {};
 template <ushort Rows, ushort Tables, uint Shared, class Activation>
 kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
                                     device const MoeTileDescriptor *tiles [[buffer(1)]],
@@ -199,15 +202,9 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
     });
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (up)
-      for (uint row = 0; row < tile.rows; ++row) {
-        if constexpr (is_same<Activation, MoeSiluGate>::value)
-          output[out + ulong(row) * N + origin + simd_lane] =
-              bfloat(float(park[row * GGUF_STAGED_COLUMNS + simd_lane]) *
-                     splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
-        else
-          output[out + ulong(row) * N + origin + simd_lane] = bfloat(Activation::value(
-              float(park[row * GGUF_STAGED_COLUMNS + simd_lane]), float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
-      }
+      for (uint row = 0; row < tile.rows; ++row)
+        output[out + ulong(row) * N + origin + simd_lane] = bfloat(Activation::value(
+            float(park[row * GGUF_STAGED_COLUMNS + simd_lane]), float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
   };
   moe_live_rows<Rows>(tile.rows, run);
 }
