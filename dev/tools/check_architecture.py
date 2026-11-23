@@ -252,8 +252,10 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # still yields memory and its lane as Background. 31,088 adds 3 for a
 # suspended lane's reply state, kept by an ended one's measure. 31,096 adds 8
 # for a head's state, which a persistent tier copies ahead though its
-# conversation went on.
-ENGINE_LINE_BUDGET = 31_096
+# conversation went on. 31,103 adds 7 for the split's warmup, which holds only
+# the pages its rows use and allocates again an extent the first audit
+# released.
+ENGINE_LINE_BUDGET = 31_103
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

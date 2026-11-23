@@ -81,7 +81,8 @@ EngineMemoryPlan memoryPlan() {
       device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
 }
 
-ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
+ActualMemoryReport validActual(const EngineMemoryPlan &plan,
+                               std::optional<uint64_t> kvBytes = std::nullopt) {
   const auto &budget = plan.breakdown();
   ActualMemoryReport actual;
   actual.targetWeightsBytes = budget.targetWeightsBytes;
@@ -90,7 +91,7 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   actual.stateAllocatedBytes = budget.laneStateBytes;
   actual.sharedPrefillBytes = budget.sharedPrefillBytes;
   actual.sharedDecodeBytes = budget.sharedDecodeBytes;
-  actual.kvAllocatedBytes = budget.kvExtentBytes;
+  actual.kvAllocatedBytes = kvBytes.value_or(budget.kvExtentBytes);
   actual.backendAllocatedBytes =
       actual.targetWeightsBytes + actual.draftWeightsBytes +
       actual.visionWeightsBytes +
@@ -591,6 +592,57 @@ void testTheSplitSetsUpLast() {
   }
 }
 
+void testTheSplitRestoresItsRunwayPages() {
+  const EngineMemoryPlan plan = memoryPlan();
+  constexpr uint32_t extentPages = 48;
+  constexpr uint32_t runwayPages = model::ExecutionLimits::runwayPages(extentPages, 4);
+  constexpr uint32_t rows = 285;
+  constexpr uint32_t prefillPages = 9;
+  for (bool refuse : {false, true}) {
+    test::TestKvStorage backing(runwayPages, 4096, extentPages);
+    KvPool pool(backing, runwayPages);
+    Executor executor;
+    executor.warmupHook = [&](int step, model::WarmupStepResult &) {
+      if (step != 0 || executor.prefillRows.back() != rows)
+        return;
+      require(backing.allocated(0) && backing.form(0) == kv::PageForm::Full &&
+                  pool.snapshot().pagesActive == prefillPages,
+              "the split's prefill did not restore and hold only the pages it needed");
+      for (uint32_t page = 0; page < prefillPages; ++page)
+        require(pool.pageActive(page), "the split's prefill did not hold its page prefix");
+    };
+    uint32_t audits = 0;
+    std::vector<protocol::WarmingEvent> progress;
+    const auto report = ServingRuntime::requireWarmup(
+        plan, {}, executor, pool,
+        [&](const protocol::WarmingEvent &event) { progress.push_back(event); },
+        [&] {
+          const auto snapshot = pool.snapshot();
+          require(snapshot.pagesActive == 0 && snapshot.allocatedBytes == backing.allocatedBytes(),
+                  "warmup kept pages held at the audit or disagreed with storage");
+          const auto actual = validActual(plan, snapshot.allocatedBytes);
+          static_cast<void>(pool.reclaimEmptyExtents(true, std::numeric_limits<uint32_t>::max()));
+          ++audits;
+          return actual;
+        },
+        [&](double) {
+          require(audits == 1 && !backing.allocated(0) && backing.allocated(1),
+                  "the audit did not trim the first extent of the runway");
+          backing.growthBlocked = refuse;
+          return rows;
+        });
+    requireReady(report);
+    std::vector<uint32_t> prefills{model::ExecutionLimits::prefillTokenBudget};
+    if (!refuse)
+      prefills.push_back(rows);
+    require(executor.prefillRows == prefills && backing.allocationAttempts == 3,
+            "the split's prefill did not follow the runway allocation's result");
+    require(audits == 2 && progress == counted(7, 7) &&
+                pool.snapshot().pagesActive == 0 && pool.snapshot().pagesAllocated == extentPages,
+            "the split's prefill did not return the runway to the second audit");
+  }
+}
+
 void testStartupRetryWindowOpensAtFirstFailure() {
   using namespace std::chrono_literals;
   // A refusal of host memory before the weights load.
@@ -766,6 +818,7 @@ int main() {
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsAndMemoryAreFailClosed();
     testTheSplitSetsUpLast();
+    testTheSplitRestoresItsRunwayPages();
     testStartupRetryWindowOpensAtFirstFailure();
     testProtocolLimitsFollowTheModel();
     testReadyEventForTheServedModel();
