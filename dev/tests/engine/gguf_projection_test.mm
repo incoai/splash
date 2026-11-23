@@ -580,8 +580,8 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
 void columnTile(MetalBackend &backend, const Linear &linear) {
   constexpr uint32_t N = 512, columns = N + kPadding;
   const std::vector<Fmt> formats = tileFormats(LinearTile::GgufStaged);
-  const auto rowsUnwritten = [](const Outcome &out, uint32_t live, const std::string &label) {
-    for (uint64_t i = uint64_t{live} * columns; i < out.output.size(); ++i)
+  const auto rowsUnwritten = [](const Outcome &out, uint32_t live, uint32_t width, const std::string &label) {
+    for (uint64_t i = uint64_t{live} * width; i < out.output.size(); ++i)
       if (out.output[i] != kUnwritten) return fail(label + ": writes a row past the live ones");
   };
   for (const uint32_t K : {2048u, 2304u})
@@ -610,7 +610,7 @@ void columnTile(MetalBackend &backend, const Linear &linear) {
             const std::vector<uint16_t> rows = storageRows(x, K, live, kLaneRows);
             std::vector<uint16_t> aux = storageRows(residual, columns, live, kLaneRows);
             const Outcome out = run(backend, linear, plan, up, gated, rows, aux, kPoisonNaN, N, label);
-            rowsUnwritten(out, live, label);
+            rowsUnwritten(out, live, columns, label);
             if (epilogue == LinearEpilogue::GateUp) {
               // A one-pass gate/up keeps its gate in registers, its sum the gate's plain projection's bit for bit:
               // the output is the up pass of that gate.
@@ -630,24 +630,44 @@ void columnTile(MetalBackend &backend, const Linear &linear) {
             }
           }
       }
-      // The fused projection of this format and the two after it, plain: each segment's outputs as alone.
+      // The fused projection of this format and the two after it, plain: within fp64, each segment's outputs those
+      // of its projection alone, bit for bit.
       const Fmt f1 = formats[(i + 1) % formats.size()], f2 = formats[(i + 2) % formats.size()];
       if (K % quant_column_unit(kQuantFormats[f1].block_elements) || K % quant_column_unit(kQuantFormats[f2].block_elements))
         continue;
       const Tensor b = tensor(backend, f1, 256, K), c = tensor(backend, f2, 256, K);
-      const Projection fused = projection({&w, &b, &c}, N + 512 + kPadding);
+      const std::vector<const Tensor *> parts{&w, &b, &c};
+      const Projection fused = projection(parts, N + 512 + kPadding);
       const std::vector<float> x = activations(Inputs::Dense, GGUF_COLUMN_ROWS, K);
-      const std::vector<Dot> dots = products({&w, &b, &c}, fused.outputSize, x, GGUF_COLUMN_ROWS);
-      const LinearWorkload wl{{fused.outputSize, K}, GGUF_COLUMN_ROWS, LinearEpilogue::None};
-      const LinearPlan plan = linear.plan(wl, fused);
-      const std::string label = std::string(fmtName(f)) + "|" + fmtName(f1) + "|" + fmtName(f2) + " K=" +
-                                std::to_string(K) + " fused";
-      const Outcome out = run(backend, linear, plan, fused, nullptr, storageRows(x, K, GGUF_COLUMN_ROWS, kLaneRows),
-                              {}, kPoisonNaN, N + 512, label);
-      checkValues(out, within(dots, true), within(dots, true), {}, wl, GGUF_COLUMN_ROWS, N + 512, label);
+      const std::vector<Dot> dots = products(parts, fused.outputSize, x, GGUF_COLUMN_ROWS);
+      for (uint32_t live = 1; live <= GGUF_COLUMN_ROWS; ++live) {
+        const LinearWorkload wl{{fused.outputSize, K}, live, LinearEpilogue::None};
+        const std::vector<uint16_t> rows = storageRows(x, K, live, kLaneRows);
+        const std::string label = std::string(fmtName(f)) + "|" + fmtName(f1) + "|" + fmtName(f2) + " K=" +
+                                  std::to_string(K) + " fused live=" + std::to_string(live);
+        const Outcome out = run(backend, linear, linear.plan(wl, fused), fused, nullptr, rows, {}, kPoisonNaN, N + 512,
+                                label);
+        rowsUnwritten(out, live, fused.outputSize, label);
+        checkValues(out, within(dots, true), within(dots, true), {}, wl, live, N + 512, label);
+        uint32_t offset = 0;
+        for (const Tensor *part : parts) {
+          const Projection alone = projection({part}, part->N);
+          const LinearWorkload one{{part->N, K}, live, LinearEpilogue::None};
+          const Outcome single =
+              run(backend, linear, linear.plan(one, alone), alone, nullptr, rows, {}, kPoisonNaN, part->N, label);
+          for (uint32_t r = 0; r < live; ++r)
+            if (!std::equal(single.output.begin() + uint64_t{r} * part->N, single.output.begin() + (r + 1) * part->N,
+                            out.output.begin() + uint64_t{r} * fused.outputSize + offset)) {
+              fail(label + ": the " + fmtName(part->format) + " segment differs from its projection alone");
+              break;
+            }
+          offset += part->N;
+        }
+      }
     }
   section("column decode: every format and fused triples, K 2048 and 2304, one and two live rows, plain/residual/"
-          "gate-up and fp32 plain within fp64, rows past the live ones unread and unwritten");
+          "gate-up and fp32 plain within fp64, fused segments equal to each one's projection, rows past the live ones "
+          "unread and unwritten");
 }
 
 // One fused projection of three segments of different formats ([512 | 256 | 256, K]) on one tile and walk, each format

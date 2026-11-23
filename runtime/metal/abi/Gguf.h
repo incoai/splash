@@ -44,9 +44,10 @@
 // GGUF_COLUMN_ROWS live rows in registers, which the MoE expert tiles run for
 // an expert's only tile of that many rows and ops::Linear for a decode step of
 // that many live rows (kernels/decode/linear_gguf_column.metal):
-// GGUF_COLUMN_SPLITS simdgroups of 32 columns, one a lane, each summing its
-// part of K.
+// GGUF_COLUMN_SPLITS simdgroups of GGUF_COLUMN_COLUMNS columns, one a lane,
+// each summing its part of K.
 #define GGUF_COLUMN_ROWS 2u
+#define GGUF_COLUMN_COLUMNS 32u
 #define GGUF_COLUMN_SPLITS 8u
 #define GGUF_COLUMN_THREADS (GGUF_COLUMN_SPLITS * 32u)
 struct GgufColumnParams {
@@ -57,6 +58,17 @@ struct GgufColumnParams {
   uint32_t format;      // the tensor's GGUF_FMT_*, a one-pass gate/up's both tensors'
 };
 static_assert(sizeof(GgufColumnParams) == 20, "GGUF column parameters are 20 bytes on both sides");
+// A fused projection's segments on the column tile (gguf_column_fused), as
+// GgufDecodeFusedParams's on the staged tile.
+struct GgufColumnFusedParams {
+  uint32_t rows;        // live rows, 1 to GGUF_COLUMN_ROWS
+  uint32_t input_size;  // K
+  uint32_t out_stride;  // columns of a destination row
+  uint32_t cols[3];     // columns per segment; 0 past the last
+  uint32_t fmt[3];      // GGUF_FMT_* per segment
+  uint32_t offset[3];   // first destination column per segment
+};
+static_assert(sizeof(GgufColumnFusedParams) == 48, "GGUF column fused parameters are 48 bytes on both sides");
 
 // The register tile's activations, Table16 (kernels/common/gguf_sgmatrix.h):
 // per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,

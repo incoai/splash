@@ -13,6 +13,7 @@
 #pragma clang fp reassociate(off)
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/gguf_column_tile.h"
+#include "metal/kernels/common/gguf_segments.h"
 #include "metal/kernels/common/gguf_tile.h"
 
 namespace gguf_column {
@@ -31,11 +32,11 @@ template <bool GateUp> struct Shared {
 
 template <GgufEpilogue Ep, bool GateUp, class Out>
 inline void project(device const bfloat *input, Planes planes, Planes up, device const bfloat *aux,
-                    device Out *output, constant GgufColumnParams &p, uint tile, uint sg, uint lane,
+                    device Out *output, const GgufColumnParams p, uint tile, uint sg, uint lane,
                     threadgroup Shared<GateUp> &shared) {
   const uint tid = sg * 32 + lane, K = p.input_size, groups = K / 32;
   const uint first = sg * groups / GGUF_COLUMN_SPLITS, last = (sg + 1) * groups / GGUF_COLUMN_SPLITS;
-  const uint column = tile * 32 + lane;
+  const uint column = tile * GGUF_COLUMN_COLUMNS + lane;
   float sums[GGUF_COLUMN_ROWS], up_sums[GGUF_COLUMN_ROWS];
   quant_format_switch(p.format, [&](auto f) {
     typedef decltype(f) F;
@@ -68,9 +69,9 @@ inline void project(device const bfloat *input, Planes planes, Planes up, device
 
 } // namespace gguf_column
 
-// Grid (the segment's columns / 32), GGUF_COLUMN_THREADS threads. Bindings: input, the tensor's planes (w0, w1,
-// meta), output; then the residual (_r), or a one-pass gate/up's up planes (_gate_up: the first are the gate's); then
-// GgufColumnParams.
+// Grid (the tensor's columns / GGUF_COLUMN_COLUMNS), GGUF_COLUMN_THREADS threads. Bindings: input, the tensor's planes
+// (w0, w1, meta), output; then the residual (_r), or a one-pass gate/up's up planes (_gate_up: the first are the
+// gate's); then GgufColumnParams.
 #define GGUF_COLUMN_ARGS                                                                                       \
   device const bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],   \
       device uchar *meta [[buffer(3)]]
@@ -101,6 +102,24 @@ kernel void gguf_column_r(GGUF_COLUMN_ARGS, device bfloat *output [[buffer(4)]],
   gguf_column::project<EpResidual, false, bfloat>(input, {w0, w1, meta}, {w0, w1, meta}, residual, output, p, tile,
                                                   sg, lane, shared);
 }
+// A fused projection's segments in one dispatch (kernels/common/gguf_segments.h), as gguf_decode_fused_m<rows> runs
+// them on the staged tile: the threadgroup's columns pick their segment, whose planes and format they decode as the
+// segment's own dispatch does, bit for bit. Grid (the segments' columns / GGUF_COLUMN_COLUMNS). Bindings: input, the
+// segments' planes, output; then GgufColumnFusedParams.
+kernel void gguf_column_fused(device const bfloat *input [[buffer(0)]], GGUF_SEGMENTS,
+                              device bfloat *output [[buffer(10)]], constant GgufColumnFusedParams &p [[buffer(11)]],
+                              GGUF_COLUMN_THREAD_ARGS) {
+  threadgroup gguf_column::Shared<false> shared;
+  GGUF_SEGMENT_OF(tile, p.cols, GGUF_COLUMN_COLUMNS);
+  const GgufColumnParams segment{p.rows, p.input_size, p.out_stride, p.offset[s], p.fmt[s]};
+  gguf_column::project<EpNone, false, bfloat>(input, {w0, w1, meta}, {w0, w1, meta}, input, output, segment, local,
+                                              sg, lane, shared);
+}
 #undef GGUF_COLUMN_PLAIN
 #undef GGUF_COLUMN_THREAD_ARGS
 #undef GGUF_COLUMN_ARGS
+#undef GGUF_SEGMENT_OF
+#undef GGUF_SEGMENT_PLANE
+#undef GGUF_SEGMENT_INDEX
+#undef GGUF_SEGMENTS
+#undef GGUF_SEGMENT

@@ -657,7 +657,8 @@ The rules:
    one column of a GEMV in registers over those rows alone (the MoE expert
    tiles' column tile, `kernels/common/gguf_column_tile.h`), eight simdgroups
    of a threadgroup splitting K and adding their parts in order, a gate/up
-   pair of one format in one pass; on the M5 Max a [2048 x 6144] af4g64
+   pair of one format in one pass, a fused projection's segments in one
+   dispatch, each column as its own tensor's; on the M5 Max a [2048 x 6144] af4g64
    projection at one row takes 18.4 us on the column tile and 28 us on the
    staged tile. Otherwise the register tile runs where it takes every
    quantized segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the
@@ -1091,7 +1092,8 @@ up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
 experts' gate and up in one pass `moe_expert_gguf_m<rows>_gate_up` and their down pass
 `moe_expert_gguf_m<rows>_down`; the fused projections run
-`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and in prefill chunks
+`gguf_column_fused` on the column tile, `gguf_decode_fused_m<rows>` and
+`gguf_decode_sg_fused_l<lanes>` in decode and in prefill chunks
 of up to 64 rows, and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that
 format's segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
 `gguf_prefill_int8_<format>_a` per segment). A `gguf_decode_fused_m<rows>` pipeline decodes
@@ -1132,7 +1134,8 @@ split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, w
 row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
 products of their codes, lanes and pass modes bitwise, a non-finite input's row alone not
 finite, and a plan of one or two rows on the column tile in every format and in fused
-triples within the bound, the rows past its own unread and unwritten; and
+triples within the bound, a fused triple's segments bitwise each one's projection alone, the
+rows past its own unread and unwritten; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
 against fp64, bitwise against the full grids and two gate/up passes, a decode step routing its
