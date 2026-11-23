@@ -1,6 +1,7 @@
 #pragma clang fp reassociate(off)
 #include "metal/abi/BlockResidualMix.h"
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/block_residual_mix_row.h"
 #include "metal/kernels/common/rms_inverse.h"
 
 #include <metal_stdlib>
@@ -42,19 +43,6 @@ struct BlockResidualMixShared {
   float inverse[kStates];
   float weights[kStates];
   float output_inverse;
-};
-
-// A row's states: the stack's planes, then the current rows.
-template <class Current> struct BlockResidualMixRow {
-  device const bfloat *stack;
-  device const Current *current;
-  uint stack_states;
-  uint plane;
-
-  float state(uint s, uint d) const {
-    return s < stack_states ? float(stack[ulong(s) * plane + d]) : float(current[d]);
-  }
-  uint states() const { return stack_states + 1; }
 };
 
 // Each thread's `count` sums (of an array of Count) reduced together: per

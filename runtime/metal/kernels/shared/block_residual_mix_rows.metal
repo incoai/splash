@@ -1,6 +1,7 @@
 #pragma clang fp reassociate(off)
 #include "metal/abi/BlockResidualMix.h"
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/block_residual_mix_row.h"
 #include "metal/kernels/common/rms_inverse.h"
 
 #include <metal_stdlib>
@@ -39,19 +40,6 @@ struct MixRowShared {
   float output_inverse[kRowNorms];
 };
 
-// A row's states: the stack's planes, then the current rows.
-template <class Current> struct MixRowStates {
-  device const bfloat *stack;
-  device const Current *current;
-  uint stack_states;
-  uint plane;
-
-  float state(uint s, uint d) const {
-    return s < stack_states ? float(stack[ulong(s) * plane + d]) : float(current[d]);
-  }
-  uint states() const { return stack_states + 1; }
-};
-
 // The sum over the threadgroup of each thread's `sum`: per simdgroup, then
 // over the simdgroups in order by thread 0, which hands the total to
 // `finish` and parks what it returns at `parked`; every thread past the
@@ -74,7 +62,7 @@ inline void mix_row_reduce(float sum, threadgroup float *partials, threadgroup f
 // state (query . normalized state, the sums of the threads' columns in
 // order) and, by thread 0, the softmax of each query's scaled scores.
 template <class Current>
-__attribute__((noinline)) void mix_row_weights(MixRowStates<Current> mix, device const float *queries,
+__attribute__((noinline)) void mix_row_weights(BlockResidualMixRow<Current> mix, device const float *queries,
                                                constant BlockResidualMixParams &p, uint tid, uint lane, uint sg,
                                                threadgroup MixRowShared &shared) {
   const uint states = mix.states();
@@ -114,7 +102,7 @@ __attribute__((noinline)) void mix_row_weights(MixRowStates<Current> mix, device
 // Query q's output at column d: the weighted sum of the normalized states,
 // from the parked norms and weights.
 template <class Current>
-inline float mix_row_output(MixRowStates<Current> mix, uint q, uint d, threadgroup const MixRowShared &shared) {
+inline float mix_row_output(BlockResidualMixRow<Current> mix, uint q, uint d, threadgroup const MixRowShared &shared) {
   float sum = 0.0f;
   for (uint s = 0; s < mix.states(); ++s)
     sum += shared.weights[q * kRowStates + s] * (mix.state(s, d) * shared.inverse[s]);
@@ -123,7 +111,7 @@ inline float mix_row_output(MixRowStates<Current> mix, uint q, uint d, threadgro
 
 // Phase two of block_residual_mix_rows: each query's output as fp32 rows.
 template <class Current>
-__attribute__((noinline)) void mix_row_outputs(MixRowStates<Current> mix, device float *output,
+__attribute__((noinline)) void mix_row_outputs(BlockResidualMixRow<Current> mix, device float *output,
                                                constant BlockResidualMixParams &p, uint row, uint tid,
                                                threadgroup const MixRowShared &shared) {
   for (uint q = 0; q < p.queries; ++q)
@@ -134,7 +122,7 @@ __attribute__((noinline)) void mix_row_outputs(MixRowStates<Current> mix, device
 // Phase two of block_residual_mix_norm_rows: each query's output's inverse
 // RMS, then its normalized and weighted bf16 rows.
 template <class Current>
-__attribute__((noinline)) void mix_row_norm_outputs(MixRowStates<Current> mix, device const float *norm0,
+__attribute__((noinline)) void mix_row_norm_outputs(BlockResidualMixRow<Current> mix, device const float *norm0,
                                                     device const float *norm1, device const float *norm2,
                                                     device bfloat *output0, device bfloat *output1,
                                                     device bfloat *output2, constant BlockResidualMixParams &p,
@@ -171,7 +159,7 @@ kernel void block_residual_mix_rows(device const bfloat *stack [[buffer(0)]],
                                     uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup MixRowShared shared;
   if (row >= p.rows) return;
-  const MixRowStates<Current> mix{stack + ulong(row) * p.hidden, current + ulong(row) * p.hidden, p.stack,
+  const BlockResidualMixRow<Current> mix{stack + ulong(row) * p.hidden, current + ulong(row) * p.hidden, p.stack,
                                   p.stack_plane};
   mix_row_weights(mix, queries, p, tid, lane, sg, shared);
   mix_row_outputs(mix, output, p, row, tid, shared);
@@ -198,7 +186,7 @@ kernel void block_residual_mix_norm_rows(device const bfloat *stack [[buffer(0)]
                                          uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup MixRowShared shared;
   if (row >= p.rows) return;
-  const MixRowStates<Current> mix{stack + ulong(row) * p.hidden, current + ulong(row) * p.hidden, p.stack,
+  const BlockResidualMixRow<Current> mix{stack + ulong(row) * p.hidden, current + ulong(row) * p.hidden, p.stack,
                                   p.stack_plane};
   mix_row_weights(mix, queries, p, tid, lane, sg, shared);
   mix_row_norm_outputs(mix, norm0, norm1, norm2, output0, output1, output2, p, row, tid, lane, sg, shared);
