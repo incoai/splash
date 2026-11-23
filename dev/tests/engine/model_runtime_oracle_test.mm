@@ -3035,36 +3035,46 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
 }
 
 // Under --verify-rows all a cycle's rows do not follow its output left, as
-// 1.6.2's did not: a lane of 2 to 7 tokens left verifies the draft's block a
-// lane of 64 left does, and emits the start of what that lane emits, no more
-// than it has left, so that an answer under a lower output limit starts one
-// under a higher; it counts as drafted, as 1.6.2 did, the proposals it could
-// retain, one fewer than its tokens left.
+// 1.6.2's did not: a lane of 2 to 9 tokens left (a block's rows and one)
+// verifies the draft's block a lane of 64 left does, and emits the start of
+// what that lane emits, so that an answer under a lower output limit starts
+// one under a higher: as many of the tokens that lane's cycle retains as it
+// has left, and, where they leave it one token, the anchor that lane goes on
+// from, its last token, which needs no cycle of its own (emitTerminalAnchor).
+// However many proposals the target accepts, one of the limits leaves that
+// one token. It counts as drafted, as 1.6.2 did, the proposals it could
+// retain, one fewer than its tokens left or a block's rows, the fewer.
 void requireCyclesVerifyTheirOutputLeft(model::Runtime &executor) {
   const std::vector<uint32_t> &prompt = targetTokens->thinkingPrompt;
   const std::vector<uint32_t> pages = pageRange(108, 4);
   constexpr uint32_t block = model::StepCosts::kNarrowCap;
+  static_assert(block == 8, "the output limits run from 2 to a block's rows and one");
+  // The tokens the cycle of 64 left emits, then the anchor it goes on from.
   std::vector<uint32_t> longer;
-  for (const uint32_t left : {64U, 2U, 3U, 5U, 7U}) {
+  std::string counts;
+  for (const uint32_t left : {64U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U}) {
     EngineRequest request = makeRequest(340 + left, prompt, left);
     request.flags = RequestIgnoreEndOfSequence;
     beginCold(executor, request, 0);
     requireOpen(prefillChunk(executor, request.id, 0, prompt, pages), "an output limit's fixture");
     const ModelStepResult cycle = decodeOne(executor, request.id, prompt.size(), pages);
     const uint32_t rows = model::RuntimeInstrumentation::lastVerifyRows(executor, 0);
-    executor.end(request.id);
     if (longer.empty())
-      longer = cycle.outputTokens;
+      longer = withAnchor(executor, request.id, cycle.outputTokens);
+    executor.end(request.id);
     const size_t emitted = cycle.outputTokens.size();
     require(rows == block && cycle.draftedTokens == std::min(block, left) - 1,
             "a cycle of " + std::to_string(left) + " tokens left verified " + std::to_string(rows) +
                 " rows and drafted " + std::to_string(cycle.draftedTokens));
-    require(emitted && emitted <= std::min<size_t>(left, longer.size()) &&
+    // All it has left where that is no more than the longer cycle's tokens
+    // and next anchor; else the longer cycle's tokens.
+    require(emitted == (left <= longer.size() ? left : longer.size() - 1) &&
                 std::ranges::equal(cycle.outputTokens, std::span(longer).first(emitted)),
             "a cycle of " + std::to_string(left) + " tokens left emitted " + std::to_string(emitted) +
-                " tokens, not the start of a cycle's with more left");
+                " tokens, not the start of a cycle's with more left and its next anchor");
+    counts += (counts.empty() ? "" : ",") + std::to_string(emitted);
   }
-  std::cout << "output_left_rows=PASS\n";
+  std::cout << "output_left_rows=PASS emitted=" << counts << "\n";
 }
 
 // A constrained lane's first token at any batch lane: lanes of distinct
