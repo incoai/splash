@@ -474,8 +474,8 @@ static_assert([] {
 // or its FFN's), which the passes after the first apply: down
 // [loopGateRank, 2 hiddenSize] of the unweighted norms of the input and of
 // the message side by side, forget and gain [hiddenSize, loopGateRank] of
-// that; F32 or BF16 rows as stored, which the float projection runs in fp32
-// into fp32 (FloatOutput::Float32).
+// that; F32 or BF16 rows as stored (a quantized gate's F32 values), which the
+// float projection runs in fp32 into fp32 (FloatOutput::Float32).
 struct Inkling2LoopGateWeights final {
   ops::Projection down;
   ops::Projection forget;
@@ -512,8 +512,8 @@ struct Inkling2LoopFullInputs final {
 // A weight layer's attention. inputProjection is the packed projection of
 // its q input, bf16, its segments in this order: queries (3072), gate (3072),
 // relative scores (384), the three quantized ones, which the fused decode
-// runs in one dispatch, then a sink logit per query head (24, stored as a
-// full layer's taps are, a float segment run apart): querySegmentsWidth()
+// runs in one dispatch, then a sink logit per query head (24, F32 or BF16 as
+// a loop layer's gates, a float segment run apart): querySegmentsWidth()
 // columns of queryProjectionWidth() (6592), those past them padding. key and
 // value project its k and v inputs (kvWidth each). F32 vectors as the GGUF
 // holds them: queryScale [heads][headDimension] and relativeScale

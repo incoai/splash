@@ -86,6 +86,9 @@ bool smallProjectionType(uint32_t type) { return floatProjectionType(type) || qu
 // A tensor of F32 rows (floatRows): F32, or BF16 or Q8_0, which widen or
 // decode to it.
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
+// A tensor the float projection runs (floatTensor): a float projection's
+// type, or any of a format, which decodes to F32.
+bool floatTensorType(uint32_t type) { return floatProjectionType(type) || quantizedType(type); }
 
 // A repack of a [rows, columns] tensor in format, of no image section yet;
 // throws unless the shape is whole plane tiles.
@@ -377,15 +380,19 @@ public:
     copiedRows(*tensor, storedRowBytes(*tensor));
   }
 
-  // An F32 or BF16 tensor [rows, columns] as stored, which the float
-  // projection runs in fp32 (the QSA indexer's projections).
+  // A tensor [rows, columns] the float projection runs in fp32 (the QSA
+  // indexer's projections, Inkling 2's message gates and sink projections):
+  // F32 or BF16 rows as stored, or another type's (a GGUF that quantizes
+  // them, as AtomicChat's Q8_0 gates) as the F32 values the GPU decodes them
+  // to, as the format's gather does.
   void floatTensor(const std::string &name, uint64_t rows, uint64_t columns) {
-    const GgufTensor *tensor = find(name, floatProjectionType);
+    const GgufTensor *tensor = find(name, floatTensorType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
-      throw GgufError("expected an F32 or BF16 [" + std::to_string(rows) + ", " + std::to_string(columns) +
-                      "] tensor: " + name);
-    copiedRows(*tensor, storedRowBytes(*tensor));
+      throw GgufError("expected a [" + std::to_string(rows) + ", " + std::to_string(columns) + "] tensor: " + name);
+    if (floatProjectionType(tensor->type)) return copiedRows(*tensor, storedRowBytes(*tensor));
+    image_.descriptor(ggml::kF32, rows, columns, {}, {rows * columns * sizeof(float), 0, 0}, name);
+    image_.copy(tensorRows(*tensor, rows, storedRowBytes(*tensor)), Conversion::DequantizeToFloat32);
   }
 
   // A projection [rows, columns] of fewer rows than a plane tile holds: F32

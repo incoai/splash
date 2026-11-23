@@ -119,10 +119,11 @@ struct Fill {
 // rows as stored (decodedColumns), which the GPU decodes as the format's
 // gather does (kernels/common/gguf_embedding_formats.h) and the kernels read
 // unquantized (a safetensors shared-expert gate, GDN alpha and beta of two
-// types or of F16, and a GGUF's Q8_0 hyper-connection injection weights and
-// shared-expert scalar gate), or as the F32 1 + w of a BF16 RMSNorm weight w,
-// which a checkpoint stores 1 below the weight the norm multiplies by (exact
-// but where |w| < 2^-16 or |w| >= 2^24, which it may round once).
+// types or of F16, a GGUF's Q8_0 hyper-connection injection weights and
+// shared-expert scalar gate and its quantized tensors of a float projection),
+// or as the F32 1 + w of a BF16 RMSNorm weight w, which a checkpoint stores 1
+// below the weight the norm multiplies by (exact but where |w| < 2^-16 or
+// |w| >= 2^24, which it may round once).
 enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
@@ -304,8 +305,9 @@ private:
 // planImages' families hold theirs: Norm, a vector of `rows` multipliers the
 // kernels read as F32 (as stored, or 16-bit floats widened); Values, `rows`
 // F32 values as stored; Quantized, a quantized tensor [rows, columns]
-// repacked into planes; FloatTensor, F32 or BF16 rows [rows, columns] as
-// stored; SmallProjection, a projection [rows, columns] of fewer rows than a
+// repacked into planes; FloatTensor, a tensor [rows, columns] the float
+// projection runs, F32 or BF16 rows as stored or another type's decoded to
+// F32; SmallProjection, a projection [rows, columns] of fewer rows than a
 // plane tile, its F32 or BF16 rows as stored or a quantized tensor repacked
 // with zero rows to a whole tile; Router, a MoE router [rows, columns] as
 // stored; RoutedExperts, the routed experts of the layer whose tensors' names

@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <array>
 #include <bit>
 #include <cstring>
 #include <map>
@@ -1211,8 +1212,9 @@ bool samePlannedImages(const std::vector<model::gguf::Image> &left, const std::v
 
 // Inkling-2-Mini's GGUF plans an image per weight layer (not per
 // application), then the head's and the embedding's: each layer's queries,
-// gate and relative scores beside its BF16 sink projection as stored, a full
-// layer's BF16 tap projections, a loop layer's F32 gates as stored, its
+// gate and relative scores beside its BF16 sink projection as stored (a
+// quantized one's F32 values), a full layer's BF16 tap projections, a loop
+// layer's F32 gates as stored (a quantized one's F32 values), its
 // experts and their scales (each experts tensor's .scale, NVFP4's not in its
 // rows' g, or 1s without one, also beside experts of other formats), and the
 // experts that stream its layers'. Its metadata names each mismatch (a head
@@ -1339,6 +1341,44 @@ void checkInkling2(const std::filesystem::path &directory) {
                     test_gguf::Bytes(g.hiddenSize * g.expertIntermediateSize / 32 * 34)});
   check(names(planned(inkling2Metadata(g), shared), {"ffn_gate_shexp.weight (unused) in 1 layer"}),
         "planner refuses a shared expert no section reads");
+
+  // Quantized message gates, as AtomicChat's Q8_0 and Q5_0, and sink projections, as llama-quantize's files keep
+  // them in their queries' format: each the F32 values it decodes to, a float tensor, so that no sink projection is a
+  // fourth quantized segment of its packed projection.
+  {
+    std::vector<Tensor> quantized = tensors;
+    const std::string p = "blk." + std::to_string(g.loopFirstLayer) + ".";
+    for (const auto &[stem, format] :
+         {std::pair{p + "loop_q_ctrl_", gguf_reference::Q80}, std::pair{p + "loop_ffn_ctrl_", gguf_reference::Q50}})
+      for (const char *part : {"down.weight", "forget.weight", "gain.weight"}) {
+        Tensor &gate = tensorNamed(quantized, stem + part);
+        gate.type = kQuantFormats[format].ggml_type;
+        gate.data = fixture(format, uint32_t(gate.dims[1]), uint32_t(gate.dims[0]), 1250);
+      }
+    const std::array sinkFormats{gguf_reference::Q80, gguf_reference::Q4K, gguf_reference::IQ4NL};
+    for (uint32_t layer = 0; layer < sinkFormats.size(); ++layer) {
+      Tensor &sinks = tensorNamed(quantized, "blk." + std::to_string(layer) + ".attn_sink_proj.weight");
+      sinks.type = kQuantFormats[sinkFormats[layer]].ggml_type;
+      sinks.data = fixture(sinkFormats[layer], uint32_t(sinks.dims[1]), uint32_t(sinks.dims[0]), 1260 + layer);
+    }
+    const Plan gates = planned(inkling2Metadata(g), quantized);
+    const auto decoded = [&](uint32_t layer, const std::string &name) {
+      const model::gguf::Copy *copy = gates.error ? nullptr : copyOf(gates.images[layer], name);
+      return copy && copy->conversion == model::gguf::Conversion::DequantizeToFloat32 &&
+             copy->source.rows == tensorNamed(quantized, name).dims[1] && !repackOf(gates.images[layer], name);
+    };
+    const uint32_t loop = g.loopFirstLayer;
+    check(!gates.error && decoded(loop, p + "loop_q_ctrl_down.weight") &&
+              decoded(loop, p + "loop_ffn_ctrl_gain.weight") &&
+              asStored(copyOf(gates.images[loop], p + "loop_k_ctrl_down.weight"),
+                       tensorNamed(quantized, p + "loop_k_ctrl_down.weight").data),
+          "planner decodes Q8_0 and Q5_0 message gates to F32, F32 ones as stored" +
+              (gates.error ? ": " + *gates.error : ""));
+    bool sinksDecoded = !gates.error;
+    for (uint32_t layer = 0; layer < sinkFormats.size(); ++layer)
+      sinksDecoded &= decoded(layer, "blk." + std::to_string(layer) + ".attn_sink_proj.weight");
+    check(sinksDecoded, "planner decodes Q8_0, Q4_K and IQ4_NL sink projections to F32");
+  }
 
   // Unsloth's own layout of the same tensors (inkling2): its images are the converter's, byte for byte, its
   // message queries gathered from its two shared tensors; its metadata is held per application and by its own

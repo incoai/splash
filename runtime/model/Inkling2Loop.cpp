@@ -18,28 +18,32 @@ namespace {
 // The bytes of `count` F32 values.
 constexpr uint64_t floatBytes(uint64_t count) noexcept { return count * kFloat32Bytes; }
 
-// A segment of fewer rows than a tile (a layer's sinks, a full layer's taps)
-// as its image holds it (gguf::Builder::smallProjection): F32 or BF16 rows as
-// stored, or a quantized tensor of whole tiles, its rows past `rows` zero.
-ops::QuantizedSegment readSmallSegment(WeightFile &file, uint32_t rows, uint32_t inputs, std::string_view label) {
+// A full layer's taps projection: its one segment of fewer rows than a tile
+// as its image holds it (gguf::Builder::smallProjection), F32 or BF16 rows as
+// stored or a quantized tensor of whole tiles, its rows past `rows` zero; the
+// projection's columns to a whole tile, those past its rows padding; bf16, as
+// the convolution reads its taps.
+ops::Projection readTaps(WeightFile &file, uint32_t rows, uint32_t inputs, std::string_view label) {
   ops::QuantizedSegment segment = readQuantizedSegment(file, label);
   if ((segment.outputSize != rows && segment.outputSize != gguf::tiledRows(rows)) || segment.inputSize != inputs)
+    throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
+  return {static_cast<uint32_t>(gguf::tiledRows(rows)), inputs, ops::BlockWeights{{std::move(segment)}}};
+}
+
+// A tensor [rows, inputs] the float projection runs in fp32 (a layer's sinks,
+// a loop layer's gates) as its image holds it (gguf::Builder::floatTensor):
+// F32 or BF16 rows.
+ops::QuantizedSegment readFloatTensor(WeightFile &file, uint32_t rows, uint32_t inputs, std::string_view label) {
+  ops::QuantizedSegment segment = readFloatSegment(file, label);
+  if (segment.outputSize != rows || segment.inputSize != inputs)
     throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
   return segment;
 }
 
-// A full layer's taps projection: its one small segment, the projection's
-// columns to a whole tile, those past its rows padding; bf16, as the
-// convolution reads its taps.
-ops::Projection readTaps(WeightFile &file, uint32_t rows, uint32_t inputs, std::string_view label) {
-  return {static_cast<uint32_t>(gguf::tiledRows(rows)), inputs,
-          ops::BlockWeights{{readSmallSegment(file, rows, inputs, label)}}};
-}
-
 // The packed projection of a q input: queries | gate | relative scores (one
 // segment each, of a tile's rows each) then the sinks, the columns past them
-// to a whole tile padding. Its float segments run apart from its quantized
-// ones, which run fused (ops::Linear).
+// to a whole tile padding. The sinks' float segment runs apart from the three
+// quantized ones, which run fused (ops::Linear).
 ops::Projection readQueryProjection(WeightFile &file, const BlockTargetFormat &format,
                                     const Inkling2LoopLayout &layout) {
   const uint32_t hidden = layout.hiddenSize;
@@ -54,7 +58,7 @@ ops::Projection readQueryProjection(WeightFile &file, const BlockTargetFormat &f
     offset += segment.outputSize;
     weights.segments.push_back(std::move(segment));
   }
-  ops::QuantizedSegment sinks = readSmallSegment(file, layout.attentionQueryHeads, hidden, "attn-sinks");
+  ops::QuantizedSegment sinks = readFloatTensor(file, layout.attentionQueryHeads, hidden, "attn-sinks");
   sinks.columnOffset = offset;
   weights.segments.push_back(std::move(sinks));
   return {layout.queryProjectionWidth(), hidden, std::move(weights)};
@@ -63,10 +67,7 @@ ops::Projection readQueryProjection(WeightFile &file, const BlockTargetFormat &f
 // A float projection [outputs, inputs] of F32 or BF16 rows as stored, run in
 // fp32 into fp32 (a loop layer's gates).
 ops::Projection readFloatProjection(WeightFile &file, uint32_t outputs, uint32_t inputs, std::string_view label) {
-  ops::QuantizedSegment segment = readFloatSegment(file, label);
-  if (segment.outputSize != outputs || segment.inputSize != inputs)
-    throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
-  ops::Projection projection(outputs, inputs, ops::BlockWeights{{std::move(segment)}});
+  ops::Projection projection(outputs, inputs, ops::BlockWeights{{readFloatTensor(file, outputs, inputs, label)}});
   projection.destination = ops::FloatOutput::Float32;
   return projection;
 }

@@ -194,6 +194,11 @@ have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
   native rows (as an MLX target's quantized router loads);
 - the shared-expert scalar gate: F32, BF16 or Q8_0, loaded as the F32 values
   it holds;
+- the projections a family runs in fp32 (Qwen3.8-Flash-Next's QSA indexer
+  projections, Inkling 2's message gates and sink projections): F32 or BF16
+  as stored, or any of the linears' formats, loaded as the F32 values it
+  holds (AtomicChat's Q8_0 and Q4_K/Q5_0 gates, the sink projections of
+  lmstudio-community's and ggml-org's files in their queries' format);
 - the GDN convolution, decay and time-step bias: F32;
 - GDN alpha and beta: each any of the linears' formats or F32. Two of one
   quantized type other than BF16 and F16 load as one segment of the GDN input

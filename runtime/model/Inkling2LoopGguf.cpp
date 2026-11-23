@@ -142,7 +142,9 @@ void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout, con
 // sliding layer's norm (attn_norm), or a full layer's norms of its q, k and v
 // inputs (attn_{q,k,v}_inp_norm) and the projections that add to its key's
 // and value's taps (attn_{k,v}_conv_proj, BF16 in its GGUF); the queries,
-// gate and relative scores (Q8_0 in its GGUF) and the sink projection (BF16),
+// gate and relative scores (Q8_0 in its GGUF) and the sink projection (BF16,
+// or a quantized one's F32 values: llama-quantize's files quantize it as the
+// queries, and the projection's fused tiles take at most three segments),
 // which the loader packs into one projection of the q input; the keys and
 // values; the queries' and relative scores' learned scales (attn_q_clip,
 // attn_rel_clip); the relative bias; the key and value convolutions; the
@@ -150,8 +152,9 @@ void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout, con
 // block mix query and norm, the router and routed experts (the fused gate
 // and up, ffn_gate_up_exps, each NVFP4 with an expert's F32 .scale in layers
 // 0-19), the router's bias (exp_probs_b) and the FFN output's convolution;
-// and in a loop layer its message queries and its q, k, v and FFN gates,
-// F32, by the names of the file's layout. The small F32 tensors as stored.
+// and in a loop layer its message queries and its q, k, v and FFN gates
+// (F32, or a quantized gate's F32 values), by the names of the file's layout.
+// The small F32 tensors as stored.
 std::vector<gguf::Section> layerImage(const Inkling2LoopLayout &layout, const GgufLayout &gguf, uint32_t index) {
   using Kind = gguf::Section::Kind;
   const std::string p = "blk." + std::to_string(index) + ".";
@@ -172,7 +175,7 @@ std::vector<gguf::Section> layerImage(const Inkling2LoopLayout &layout, const Gg
   add(Kind::Quantized, "attn_q.weight", layout.attentionWidth, hidden);
   add(Kind::Quantized, "attn_gate.weight", layout.attentionWidth, hidden);
   add(Kind::Quantized, "attn_rel.weight", layout.relativeWidth(), hidden);
-  add(Kind::SmallProjection, "attn_sink_proj.weight", layout.attentionQueryHeads, hidden);
+  add(Kind::FloatTensor, "attn_sink_proj.weight", layout.attentionQueryHeads, hidden);
   add(Kind::Quantized, "attn_k.weight", kvRows, hidden);
   add(Kind::Quantized, "attn_v.weight", kvRows, hidden);
   add(Kind::Values, "attn_q_clip.weight", layout.attentionWidth);
