@@ -201,11 +201,16 @@ MLX's `global_scale` (the release's amax) or mlx-lm's `weight_scale_2` (its
 quotient), mxfp8 ones as they are ([MLX targets](#mlx-targets)). The release's
 attention projections and head are BF16 and load as Q8_0, as an MLX target's
 unquantized projections do, its token table as its bf16 rows, its routers as
-their BF16 rows. Its logits, teacher-forced over 1,933 positions of five prompts, are
-within a mean KL of 0.0024 nats of those of its BF16 projections (UD-Q4_K_M's
-are as near), pick the same top-1 at 98.7% of positions, and keep each
-prompt's NLL of the greedy continuation within 0.004 (0.1838 pooled, BF16's
-0.1847). A full layer's static convolution taps (`static_w`) and the relative bias
+their BF16 rows. With those projections on bf16 activations, as
+`--activations bf16` runs them, its logits, teacher-forced over 1,933
+positions of five prompts, are within a mean KL of 0.0024 nats of those of its
+BF16 projections (UD-Q4_K_M's are as near), pick the same top-1 at 98.7% of
+positions, and keep each prompt's NLL of the greedy continuation within 0.004
+(0.1838 pooled, BF16's 0.1847). On M5 and later Macs, by default, a prefill
+chunk of more than 64 rows runs those Q8_0 projections on int8 activations,
+which adds its own error ([int8-activation
+prefill](internals.md#int8-activation-prefill)). A full layer's static
+convolution taps (`static_w`) and the relative bias
 (`rel_logits_proj.proj`) are stored transposed, the taps last first, and the
 release keeps its loop layers' message queries in two lists of every loop
 layer's (`middle_cycle_cross_pass_queries`, its q and FFN rows, and
