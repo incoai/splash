@@ -245,7 +245,10 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 30,996 takes 4 away: the refit reads its own GPU alone beside its split.
 # 31,008 adds 12 for the start that calibrates the split again
 # (--ane-calibration again, splash serve --recalibrate-ane).
-ENGINE_LINE_BUDGET = 31_008
+# 31,035 adds 27 for a head's state that keeps the lane's last prefill
+# checkpoint cached, as the prompt's replay point does (Engine::keepsCheckpoint,
+# headBoundary), and captures the checkpoint a command reaches on its way to it.
+ENGINE_LINE_BUDGET = 31_035
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
