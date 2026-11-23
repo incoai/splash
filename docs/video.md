@@ -19,6 +19,7 @@ GPU) with 48 GB.
 | `GET /v1/videos/{id}/content` | the mp4; `?variant=preview` the TAEH3 preview once decoded |
 | `GET /v1/videos` | a list (`limit` up to 100, `order`, `after`) |
 | `DELETE /v1/videos/{id}` | forgets the job, cancelling it at its next DiT block or decode clip |
+| `GET /` | the trial page (`server/video.html`) in place of the chat page: a clip from a prompt, frames or references, its queue, progress, cancel and mp4; public, and gone with `--no-webui` |
 
 `POST` takes JSON, or the multipart form OpenAI's SDK sends: `prompt`,
 `model`, `seconds` (a whole number from `4` to `15`, `10` the default:

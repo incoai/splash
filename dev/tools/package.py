@@ -83,6 +83,7 @@ SERVER_FILES = (
     "video_protocol.py",
     "references.py",
     "chat.html",
+    "video.html",
     "favicon.svg",
 )
 # How each API dialect answers (server/dialects).

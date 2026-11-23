@@ -1,7 +1,8 @@
 """A video model's server: OpenAI-shaped /v1/videos jobs on the video engine.
 
 `python -m server.server` of a video model's assembly (install/video.py)
-serves these routes alone, beside /health, /ready, /status and /v1/models:
+serves these routes alone, beside its trial page (video.html), /health,
+/ready, /status and /v1/models:
 POST /v1/videos, GET /v1/videos, GET /v1/videos/{id},
 GET /v1/videos/{id}/content and DELETE /v1/videos/{id}. A language model's
 routes answer 404: a language model is served by an instance of its own.
@@ -103,6 +104,9 @@ PHASE_PROGRESS = {
 CLOSE_SECONDS = 30.0
 START_SECONDS = supervision.START_TIMEOUT_SECONDS
 JOB_ID = re.compile(r"/v1/videos/(video_[0-9a-f]{32})(/content)?")
+# The trial page, which a video model's server serves in place of the chat
+# page, at its routes and as it does: public, and gone with --no-webui.
+VIDEO_HTML = Path(__file__).with_name("video.html").read_bytes()
 
 
 def serves(model_root: Path):
@@ -1102,7 +1106,9 @@ def handler(base):
     class VideoHandler(base):
         def do_GET(self):
             path = self.route
-            if path == "/health":
+            if path in ("/", "/index.html", "/favicon.ico"):
+                self._get_page()
+            elif path == "/health":
                 self.send_json(200, {"status": "ok"})
             elif path == "/ready":
                 # Ready once started: an idle server runs no engine, and
@@ -1161,6 +1167,12 @@ def handler(base):
                     )
                     return
             self._absent()
+
+        def _get_page(self):
+            if self.server.webui and self.route != "/favicon.ico":
+                self._send(200, VIDEO_HTML, "text/html; charset=utf-8")
+            else:
+                super()._get_page()
 
         def _absent(self):
             self.safe_error(

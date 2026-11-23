@@ -68,6 +68,7 @@ class VideoServerTest(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
+        self.server = server
         self.url = f"http://127.0.0.1:{server.server_port}/v1"
         self.client = openai.OpenAI(
             base_url=self.url,
@@ -97,6 +98,21 @@ class VideoServerTest(unittest.TestCase):
         self.assertTrue(videos_api.delete(video.id).deleted)
         with self.assertRaises(openai.NotFoundError):
             videos_api.retrieve(video.id)
+
+    def test_the_root_is_the_trial_page_public_and_gone_without_the_webui(self):
+        self.serve()
+        self.server.api_key = "key"
+        root = self.url.removesuffix("/v1")
+        page = httpx.get(root + "/")
+        self.assertEqual(page.headers["content-type"], "text/html; charset=utf-8")
+        self.assertEqual((page.status_code, page.content), (200, videos.VIDEO_HTML))
+        icon = httpx.get(root + "/favicon.ico")
+        self.assertEqual(
+            (icon.status_code, icon.headers["content-type"]), (200, "image/svg+xml")
+        )
+        self.assertEqual(httpx.get(self.url + "/videos").status_code, 401)
+        self.server.webui = False
+        self.assertEqual(httpx.get(root + "/").status_code, 404)
 
     def test_a_job_starts_from_its_input_reference_and_ends_on_its_last_frame(self):
         self.serve()
