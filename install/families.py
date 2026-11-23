@@ -90,10 +90,10 @@ FAMILIES = (
     ),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
-    # Its draft is an internal preview. Its vision tower is not served yet.
+    # Its vision tower is not served yet.
     ModelFamily(
         "Inkling-2-Mini",
-        "incoai-internal/Inkling-2-Mini-DFlash2",
+        "incoai/Inkling-2-Mini-DFlash2",
         INKLING2,
         INKLING2_SAMPLING,
         vision=False,

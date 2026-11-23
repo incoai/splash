@@ -27,7 +27,7 @@
 //    softcapped, no shared expert; logits softcapped at 30.
 //  - A vocabulary head of 201024 rows, 200058 of them tokens; one stop
 //    token, and no mask token of its own.
-//  - Its DFlash2 draft (incoai-internal/Inkling-2-Mini-DFlash2) reads the
+//  - Its DFlash2 draft (incoai/Inkling-2-Mini-DFlash2) reads the
 //    rows applications 5, 23 and 41 read and the final norm's, its token
 //    rows through the table's norm, and its head's finish: no padding row,
 //    and the softcap on its candidates' scores after its selector's edges.

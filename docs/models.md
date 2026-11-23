@@ -318,10 +318,8 @@ as MXFP8, below). The repository keeps the
 converter's layout in `Mainline_Support/` with the extension `.gguf_file`,
 which target selection does not read: such a file installs from a local copy
 named `.gguf` ([Local model files](#local-model-files)). An installation of
-one holds its draft,
-`incoai-internal/Inkling-2-Mini-DFlash2`, an internal preview that installs
-with a Hub token that reads it or from a local copy (`--draft-model`,
-[Drafts](#drafts)), and serves text only ([Vision](#vision)). Its states are
+one holds its draft, `incoai/Inkling-2-Mini-DFlash2` ([Drafts](#drafts)), and
+serves text only ([Vision](#vision)). Its states are
 captured in prefill alone ([Replay points and
 checkpoints](internals.md#replay-points-and-checkpoints)), so a conversation's
 next turn finds its earlier prompts in the cache but prefills each reply again.

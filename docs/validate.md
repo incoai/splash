@@ -369,10 +369,10 @@ candidates, unary scores, softcapped selector scores and greedy proposals
 are held to the golden set's tolerances, by default its `af4g64` outputs,
 the draft as Splash quantizes its projections (the README of the
 Inkling-2-Mini oracle's golden vectors states the layout and the rules). On
-an M5 Pro, the
-Inkling-2-Mini preview draft passes all 33 blocks of the oracle's five
-prompts: unary scores within 0.84 of the reference's (tolerance 1.5),
-softcapped scores within 0.43 (1.0), and its 168 graded proposals equal.
+an M5 Pro, the Inkling-2-Mini draft's preview revision (499fbb70) passes all
+33 blocks of the oracle's five prompts: unary scores within 0.84 of the
+reference's (tolerance 1.5), softcapped scores within 0.43 (1.0), and its 168
+graded proposals equal.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that
