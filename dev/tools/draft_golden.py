@@ -156,6 +156,18 @@ def grade(lattice: dict, ref: dict, block: int, cap: float, tokens: int) -> dict
     }
 
 
+def target_tokens(model_root: Path, flash: dict) -> int:
+    """The tokens a draft's candidates may name: its config's valid_vocab_size
+    where the config states it, else its target's, the target text config's
+    unpadded_vocab_size or, where every head row is a token, its vocab_size, as
+    the engine takes them (ModelDescriptor.mm, readDraftLayout)."""
+    if "valid_vocab_size" in flash:
+        return int(flash["valid_vocab_size"])
+    config = json.loads((model_root / "config.json").read_text())
+    text = config.get("text_config", config)
+    return int(text.get("unpadded_vocab_size", text["vocab_size"]))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("metallib")
@@ -173,6 +185,7 @@ def main() -> int:
         "dflash_config"
     ]
     cap = float(flash.get("final_logit_softcapping", 0.0))
+    tokens = target_tokens(args.model_root, flash)
     manifest = json.loads((args.golden / "manifest.json").read_text())
     args.work.mkdir(parents=True, exist_ok=True)
     prefix = args.set + "." if args.set else ""
@@ -219,9 +232,7 @@ def main() -> int:
             lattice = json.loads(
                 (args.work / f"{name}-{anchor + 8}.draft.json").read_text()
             )
-            result = grade(
-                lattice, ref, block, cap, int(flash.get("valid_vocab_size", 1 << 31))
-            )
+            result = grade(lattice, ref, block, cap, tokens)
             graded, equal, skipped = result["proposals"]
             print(
                 f"{'FAIL ' if result['failures'] else ''}{name} block {block} (anchor {anchor}): "
