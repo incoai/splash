@@ -1056,10 +1056,11 @@ std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> 
 // router tile, of the classes of the target's shape, router format and
 // experts' formats (each a kernel of its own, so each warmed by some chunk);
 // and after each of kAttentionHistories,
-// its attention's kernels and whether its block indexer selects its rows'
-// blocks (BlockIndexer::sparse: Flash-Next's prompt past 2,048 tokens, whose
-// kernels a verify does not run). No class's chunk repeats the most rows'.
-// Adds each that is not to `misses`. It
+// its attention's kernels (relative attention's as its dispatches run them,
+// direct or split and reduce, of its own classes) and whether its block
+// indexer selects its rows' blocks (BlockIndexer::sparse: Flash-Next's
+// prompt past 2,048 tokens, whose kernels a verify does not run). No class's
+// chunk repeats the most rows'. Adds each that is not to `misses`. It
 // checks one matrix shape and the columns of kFloatColumns; the other kernels
 // a chunk's rows pick, the staged norm and the hyper-connection norm's
 // quarters (single thresholds today, whose sides the chunks of one row and of
@@ -1090,8 +1091,11 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
     return uint32_t(t) << 8 | (t == LinearTile::GgufStaged ? plan.storageRows() : 0);
   };
   // Of one matrix, whose shape the tile a chunk's rows pick does not follow,
-  // in each set of formats the plans tell apart.
+  // in each set of formats the plans tell apart; and the input each reads
+  // as an attention's out-projection, by rows, which the attention's last
+  // kernel writes (a register tile's table: LinearPlan::input).
   std::vector<UnitFormats> units;
+  std::set<std::vector<LinearInput>> outputInputs;
   for (const FormatSet &set : formatSets()) {
     std::optional<Projection> p;
     try {
@@ -1103,6 +1107,9 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
     const UnitFormats formats = unitFormats(std::span(&unit, 1));
     if (std::ranges::find(units, formats) != units.end()) continue;
     units.push_back(formats);
+    std::vector<LinearInput> inputs(SPLASH_PREFILL_TOKEN_BUDGET + 1);
+    for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) inputs[rows] = linear.plan(*p, rows).input();
+    outputInputs.insert(std::move(inputs));
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
       std::vector<uint32_t> whole(SPLASH_PREFILL_TOKEN_BUDGET + 1), read(SPLASH_PREFILL_TOKEN_BUDGET + 1);
       for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
@@ -1148,17 +1155,40 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
                 return plan.splitPipeline() + " " + plan.reducePipeline();
               });
     }
+    // Relative attention's kernels as a chunk runs them, a dispatch's direct
+    // kernel or its split and reduce, the last writing the out-projection's
+    // input (outputInputs); its warmup's chunks, its own classes' (fewer than
+    // a MoE target's, its experts' passes adding classes of their own), run
+    // from no history and created after the longest history its context
+    // holds: its chunks of the most rows run the direct kernel after no
+    // history, the split over INT8 queries only after a long one.
     if (relativeAttention(family))
       for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
         kv::Layout layout = family.kvLayout();
         layout.format = format;
-        for (const uint32_t window : relativeWindows(family))
-          check("relative attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
-                    std::to_string(window),
-                kAttentionHistories, [&](uint32_t rows, uint32_t history) {
-                  const RelativeAttentionPlan plan = relativeChunkPlan(plans, rows, history, layout, {window});
-                  return plan.splitPipeline() + " " + plan.reducePipeline();
-                });
+        const std::vector<uint32_t> chunks = warmed(plans.prefillRowClasses(std::nullopt, layout));
+        for (const uint32_t window : relativeWindows(family)) {
+          std::map<std::pair<uint32_t, uint32_t>, std::pair<std::string, std::string>> kernels;
+          const auto planned = [&](uint32_t rows, uint32_t history) -> const std::pair<std::string, std::string> & {
+            const auto [at, added] = kernels.try_emplace({rows, history});
+            if (added) {
+              const RelativeAttentionPlan plan = relativeChunkPlan(plans, rows, history, layout, {window});
+              for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches())
+                at->second = plan.direct(dispatch) ? std::pair{std::string(), plan.directPipeline()}
+                                                   : std::pair{plan.splitPipeline(), plan.reducePipeline()};
+            }
+            return at->second;
+          };
+          for (const std::vector<LinearInput> &inputs : outputInputs)
+            check("relative attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
+                      std::to_string(window),
+                  kAttentionHistories,
+                  [&](uint32_t rows, uint32_t history) {
+                    const auto &[split, last] = planned(rows, history);
+                    return split + " " + last + tableSuffix(inputs[rows]);
+                  },
+                  family.nativeContextTokens, chunks);
+        }
       }
     if (const uint32_t top = family.indexerTopBlocks)
       check("block indexer " + f, kAttentionHistories,

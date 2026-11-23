@@ -35,16 +35,20 @@ public:
   // step's rows, DFlashDraft::addContextCommit): draftLinear's in a decode step.
   [[nodiscard]] const Linear &draftDecodeLinear() const noexcept { return draftDecodeLinear_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
-  // The fewest rows of each class of prefill chunk whose projections or MoE
-  // experts run kernels of their own: each staged tile height a chunk takes,
-  // the prefill tile, and each set of expert passes where `moe` names a MoE
-  // target's blocks' shape and router format (ExecutionPlans.cpp); but not
-  // a class the most rows start, whose chunk is warmup's of the most rows.
-  // Startup warmup runs a chunk of each and one of the most rows;
-  // kernel-selection checks that they select every projection and float
-  // tile, MoE expert passes and router tile a chunk of any rows selects, and
-  // its prefill attention after each history it plans.
-  [[nodiscard]] std::vector<uint32_t> prefillRowClasses(std::optional<std::pair<MoeShape, uint32_t>> moe) const;
+  // The fewest rows of each class of prefill chunk whose projections, MoE
+  // experts or relative attention run kernels of their own: each staged tile
+  // height a chunk takes, the prefill tile, each set of expert passes where
+  // `moe` names a MoE target's blocks' shape and router format, and each set
+  // of kernels the relative attention of a chunk after no history runs where
+  // `relativeAttention` names the KV layout of a target whose layers attend
+  // through it (ExecutionPlans.cpp); but not a class the most rows start,
+  // whose chunk is warmup's of the most rows. Startup warmup runs a chunk of
+  // each and one of the most rows; kernel-selection checks that they select
+  // every projection and float tile, MoE expert passes and router tile a
+  // chunk of any rows selects, and the kernels its prefill attention runs
+  // after each history it plans.
+  [[nodiscard]] std::vector<uint32_t> prefillRowClasses(std::optional<std::pair<MoeShape, uint32_t>> moe,
+                                                        std::optional<kv::Layout> relativeAttention = {}) const;
   // The fewest rows of each class of decode step of up to `mostRows` rows,
   // at most a verify block a lane, whose kernels it picks by its rows: its
   // projections' tile and staged height, as prefillRowClasses walks them, a
