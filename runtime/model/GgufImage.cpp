@@ -348,6 +348,26 @@ public:
     if (const GgufTensor *tensor = floatVector(name, elements)) image_.copy(tensorRows(*tensor, 1, tensor->bytes));
   }
 
+  // `elements` F32 values gathered from rows of F32 tensors (Section::gathered).
+  void gatheredValues(const std::vector<Section::Rows> &parts, uint64_t elements) {
+    std::vector<TensorRows> sources;
+    uint64_t values = 0;
+    for (const Section::Rows &part : parts) {
+      const GgufTensor *tensor = find(part.tensor, floatType);
+      if (!tensor) continue;
+      if (!part.count || part.count > tensor->rows() || part.first > tensor->rows() - part.count)
+        throw GgufError("unexpected shape for " + part.tensor);
+      TensorRows rows = tensorRows(*tensor, tensor->rows(), tensor->columns() * sizeof(float));
+      rows.first = part.first;
+      rows.rows = part.count;
+      values += part.count * tensor->columns();
+      sources.push_back(std::move(rows));
+    }
+    if (sources.size() < parts.size()) return;
+    if (values != elements) throw GgufError("unexpected shape for " + parts.front().tensor);
+    image_.gather(sources);
+  }
+
   // Token rows as stored, gathered by the embedding kernel.
   void embeddingRows(const std::string &name) {
     const GgufTensor *tensor = find(name, quantizedType);
@@ -775,7 +795,9 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
 void addSection(Builder &b, const QwenTargetDimensions &g, const Section &section) {
   switch (section.kind) {
   case Section::Kind::Norm: return b.floatNorm(section.name, section.rows);
-  case Section::Kind::Values: return b.floatValues(section.name, section.rows);
+  case Section::Kind::Values:
+    return section.gathered.empty() ? b.floatValues(section.name, section.rows)
+                                    : b.gatheredValues(section.gathered, section.rows);
   case Section::Kind::Quantized: return b.quantized(section.name, section.rows, section.columns);
   case Section::Kind::FloatTensor: return b.floatTensor(section.name, section.rows, section.columns);
   case Section::Kind::SmallProjection: return b.smallProjection(section.name, section.rows, section.columns);
@@ -872,6 +894,16 @@ void ImageBuilder::copy(TensorRows source, Conversion conversion) {
 
 void ImageBuilder::copyAt(uint64_t destination, TensorRows source, Conversion conversion) {
   image_.copies.push_back({destination, std::move(source), conversion});
+}
+
+void ImageBuilder::gather(const std::vector<TensorRows> &sources, Conversion conversion) {
+  uint64_t bytes = 0;
+  for (const TensorRows &source : sources) bytes += convertedBytes(source, conversion, source.rows * source.rowBytes);
+  uint64_t destination = section(bytes);
+  for (const TensorRows &source : sources) {
+    copyAt(destination, source, conversion);
+    destination += convertedBytes(source, conversion, source.rows * source.rowBytes);
+  }
 }
 
 void ImageBuilder::descriptor(uint32_t type, uint64_t rows, uint64_t columns, const QuantFormat &format,

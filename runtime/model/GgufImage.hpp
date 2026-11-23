@@ -226,6 +226,9 @@ public:
   [[nodiscard]] uint64_t section(uint64_t bytes);
   // Rows copied into a section of their own, converted as `conversion` says.
   void copy(TensorRows source, Conversion conversion = Conversion::None);
+  // Rows of several sources copied one after another into a section of their
+  // own, converted as `conversion` says.
+  void gather(const std::vector<TensorRows> &sources, Conversion conversion = Conversion::None);
   // Rows copied to `destination`, inside a section already laid out.
   void copyAt(uint64_t destination, TensorRows source, Conversion conversion);
   // The descriptor of a tensor of `type`, quantized in `format` (a float or
@@ -307,13 +310,22 @@ private:
 // with zero rows to a whole tile; Router, a MoE router [rows, columns] as
 // stored; RoutedExperts, the routed experts of the layer whose tensors' names
 // begin with `name`, `rows` experts `columns` wide over the geometry's
-// hiddenSize, and their scales (ImageBuilder::expertScales).
+// hiddenSize, and their scales (ImageBuilder::expertScales). A Values section
+// may instead gather its values from rows of other tensors (`gathered`, each
+// rows [first, first + count) of an F32 tensor, one after another), as a GGUF
+// may keep a layer's vectors in rows of tensors that every layer's share.
 struct Section final {
   enum class Kind : uint8_t { Norm, Values, Quantized, FloatTensor, SmallProjection, Router, RoutedExperts };
+  struct Rows final {
+    std::string tensor;
+    uint64_t first = 0;
+    uint64_t count = 0;
+  };
   Kind kind;
   std::string name;
   uint64_t rows = 0;
   uint64_t columns = 0;
+  std::vector<Rows> gathered{};
 };
 
 // The images of a target whose family lists its images' tensors: its

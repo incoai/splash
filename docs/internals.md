@@ -290,7 +290,9 @@ each layer the runtime runs plans through its own `ggufTargetPlan`
 (`GgufTarget.hpp`): the count of its layer images, its metadata checked key by
 key (`gguf::MetadataCheck`, which the shared check is written with), and the
 sections each image holds, which the shared planner lays out
-(`gguf::planTargetImages`, `gguf::Section`). Inkling 2's
+(`gguf::planTargetImages`, `gguf::Section`); a section of F32 values may
+gather them from rows of tensors that every layer's share
+(`Section::gathered`, one copy a part, `ImageBuilder::gather`). Inkling 2's
 (`Inkling2LoopGguf.cpp`) plans its 24 weight layers, which its steps run as 48
 applications.
 `GgufPreparation` stages rows in image order on the CPU within the

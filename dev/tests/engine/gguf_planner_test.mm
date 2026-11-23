@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <utility>
 
 using namespace gguf_fixtures;
@@ -1285,6 +1286,69 @@ void checkInkling2(const std::filesystem::path &directory) {
         "planner refuses a shared expert no section reads");
 }
 
+// A family's Values section gathered from rows of other tensors
+// (gguf::Section::gathered), as a GGUF may keep a layer's vectors in rows of
+// tensors every layer's share: one section of the rows in the order listed,
+// each part a copy of its tensor's rows as stored, the shared tensors read by
+// every layer that gathers from them; rows past a tensor's are refused, and a
+// missing tensor is named.
+void checkGatheredValues(const std::filesystem::path &directory) {
+  const model::Inkling2LoopLayout g = inkling2Layout();
+  const uint64_t hidden = g.hiddenSize;
+  std::vector<Tensor> tensors;
+  for (Tensor &tensor : inkling2Tensors(g, 1500))
+    if (tensor.name == "output.weight" || tensor.name == "token_embd.weight") tensors.push_back(std::move(tensor));
+  tensors.push_back({"shared_a.weight", {hidden, 3}, model::ggml::kF32, floatValues(hidden * 3, 1501)});
+  tensors.push_back({"shared_b.weight", {hidden, 2}, model::ggml::kF32, floatValues(hidden * 2, 1502)});
+  const auto path = directory / "gathered.gguf";
+  using Kind = model::gguf::Section::Kind;
+  // Layer l's rows: shared_a's row l + 1, shared_b's rows 0 and 1, shared_a's row l.
+  const auto gathered = [&](const std::vector<Tensor> &written, uint64_t first) -> Plan {
+    splash::test::writeFile(path, test_gguf::file({test_gguf::stringKey("general.architecture", "test")}, written));
+    try {
+      model::WeightSource source(path);
+      const model::GgufFile gguf(source);
+      return {model::gguf::planTargetImages(
+                  gguf, g, 2, {},
+                  [&](uint32_t layer) {
+                    return std::vector<model::gguf::Section>{
+                        {Kind::Values, "gathered", 4 * hidden, 0,
+                         {{"shared_a.weight", first + layer, 1},
+                          {"shared_b.weight", 0, 2},
+                          {"shared_a.weight", layer, 1}}}};
+                  },
+                  {}),
+              std::nullopt};
+    } catch (const model::GgufError &error) {
+      return {{}, error.what()};
+    }
+  };
+  const Plan plan = gathered(tensors, 1);
+  check(!plan.error && plan.images.size() == 4, "planner gathers a section from rows of shared tensors" +
+                                                    (plan.error ? ": " + *plan.error : ""));
+  if (plan.error) return;
+  for (uint32_t layer = 0; layer < 2; ++layer) {
+    const std::vector<model::gguf::Copy> &copies = plan.images[layer].copies;
+    const uint64_t row = hidden * sizeof(float);
+    const std::vector<std::tuple<std::string, uint64_t, uint64_t, uint64_t>> expected{
+        {"shared_a.weight", layer + 1, 1, 0}, {"shared_b.weight", 0, 2, row}, {"shared_a.weight", layer, 1, 3 * row}};
+    bool rows = copies.size() == expected.size();
+    for (size_t part = 0; rows && part < copies.size(); ++part) {
+      const auto &[name, first, count, offset] = expected[part];
+      const model::gguf::Copy &copy = copies[part];
+      rows = copy.source.name == name && copy.source.first == first && copy.source.rows == count &&
+             copy.source.rowBytes == row && copy.conversion == model::gguf::Conversion::None &&
+             copy.destination == copies.front().destination + offset;
+    }
+    check(rows, "planner copies layer " + std::to_string(layer) + "'s gathered rows in order into one section");
+  }
+  check(names(gathered(tensors, 2), {"unexpected shape for shared_a.weight"}),
+        "planner refuses gathered rows past their tensor's");
+  std::vector<Tensor> missing = tensors;
+  std::erase_if(missing, [](const Tensor &tensor) { return tensor.name == "shared_b.weight"; });
+  check(names(gathered(missing, 1), {"shared_b.weight (missing)"}), "planner names a missing gathered tensor");
+}
+
 } // namespace
 
 int main() {
@@ -1301,6 +1365,7 @@ int main() {
     guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
     guarded("planner on Flint", [&] { checkFlint(directory.path()); });
     guarded("planner on NVFP4 activation scales", [&] { checkNvfp4InputScale(directory.path()); });
+    guarded("planner on gathered values", [&] { checkGatheredValues(directory.path()); });
     guarded("planner on Inkling-2-Mini", [&] { checkInkling2(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
