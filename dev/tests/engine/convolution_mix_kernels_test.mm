@@ -8,6 +8,10 @@
 //   captured inside the sequences by the convolution's dispatches;
 // - a verify block's tree, whose rows tap their paths, the tape, and the
 //   commit of accepted paths of two lanes, rejected rows and all;
+// - a verify step's convolution in its MoE combine's dispatch
+//   (ShortConvolution::addCombineConvolution, kernels/shared/moe.metal), bit
+//   for bit as moe_combine and then the convolution of its rows (`bitwise`,
+//   uninstrumented), and against fp64;
 // - the mix of 1, 3 and 4 queries over 1 to 5 states (bf16 stack planes, bf16
 //   or fp32 current rows), plain and through its norms, of 5 rows (a
 //   threadgroup a row and query) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a
@@ -29,9 +33,11 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -400,6 +406,146 @@ void convTreeTest(MetalBackend &backend, ops::ShortConvShape shape) {
   }
 }
 
+// A verify step's combine running its convolution
+// (ShortConvolution::addCombineConvolution, moe_combine_convolution) against
+// moe_combine into bf16 rows and then the RoundedSum convolution of them
+// along the lanes' trees: two lanes, a tree of 8 rows (as convTreeTest's) and
+// a chain of 3, beside a row of no lane (every route left out, as a verified
+// grouping leaves them); a lane of a verify block's 32 rows, a tree; and a
+// lane of one row. 8 routes a row, every seventh left out, on zero residual
+// rows (Inkling-2-Mini's) or others. Uninstrumented (`exact`) the output and
+// the tape bit for bit, under shader validation, which compiles the kernels
+// apart, within a bf16 step; and each lane row's output and tape against the
+// fp64 combine and its convolution along the row's path; a row of no lane
+// written by neither.
+void combineConvolutionTest(MetalBackend &backend, bool exact) {
+  struct Case {
+    std::string name;
+    std::vector<ops::LaneRows> lanes;
+    uint32_t rows;
+    bool zeroResidual;
+  };
+  const std::vector<Case> cases{{"two lanes and a row of no lane", {{0, 8}, {8, 3}}, 12, true},
+                                {"a lane of 32 rows", {{0, 32}}, 32, false},
+                                {"a lane of one row", {{0, 1}}, 1, false}};
+  constexpr uint32_t channels = 2304, routes = 8;
+  constexpr uint16_t kSentinel = 0x7FC1;
+  for (const Case &k : cases) {
+    std::mt19937 rng(41 + k.rows);
+    const uint32_t rows = k.rows, grouped = rows * routes, lanes = static_cast<uint32_t>(k.lanes.size());
+    const ops::ShortConvShape shape{channels, 0};
+    const ops::ShortConvState state{128, channels + 384};
+    const ConvCase c = convCase(rng, shape, state, rows, lanes);
+    // Lane 0 of the first case convTreeTest's tree, of the second a tree of
+    // 32 rows, the others chains.
+    std::vector<ops::TreeRow> tree(rows, splash::test::chainRow(0));
+    for (uint32_t l = 0; l < lanes; ++l)
+      for (uint32_t r = 0; r < k.lanes[l].rows; ++r) {
+        uint32_t parent = r - 1;
+        if (l == 0 && k.lanes[l].rows == 8) parent = std::array<uint32_t, 8>{0, 0, 1, 2, 3, 1, 5, 0}[r];
+        if (l == 0 && k.lanes[l].rows == 32 && r > 1 && r % 4 == 0) parent = r - 2;
+        const uint32_t first = k.lanes[l].first;
+        tree[first + r] = r ? ops::TreeRow{tree[first + parent].ancestors | 1u << r, static_cast<uint16_t>(parent),
+                                           static_cast<uint16_t>(tree[first + parent].depth + 1)}
+                            : splash::test::chainRow(0);
+      }
+    std::vector<bool> inLane(rows, false);
+    for (const ops::LaneRows &lane : k.lanes)
+      for (uint32_t r = lane.first; r < lane.first + lane.rows; ++r) inLane[r] = true;
+    // Each route's grouped row, a shuffle of them, ~0u where left out.
+    std::vector<uint32_t> routeRows(grouped);
+    std::iota(routeRows.begin(), routeRows.end(), 0u);
+    std::shuffle(routeRows.begin(), routeRows.end(), rng);
+    for (uint32_t i = 0; i < grouped; ++i)
+      if (i % 7 == 3 || !inLane[i / routes]) routeRows[i] = ~0u;
+    std::vector<float> weights(grouped);
+    for (float &w : weights) w = std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
+    const std::vector<float> expert = bf16Values(randoms(rng, size_t{grouped} * channels, 1.0f));
+    const std::vector<float> sumResidual =
+        k.zeroResidual ? std::vector<float>(size_t{rows} * channels, 0.0f)
+                       : bf16Values(randoms(rng, size_t{rows} * channels, 0.5f));
+    std::vector<MetalBuffer> in;
+    for (uint32_t l = 0; l < lanes; ++l) in.push_back(upload(backend, bf16s(c.states[l])));
+    const MetalBuffer expertBuffer = upload(backend, bf16s(expert)), routeBuffer = upload(backend, routeRows),
+                      weightBuffer = upload(backend, weights), sumBuffer = upload(backend, bf16s(sumResidual)),
+                      taps = upload(backend, c.taps), residual = upload(backend, c.residual),
+                      treeBuffer = upload(backend, tree), layout = laneRowsOf(backend, k.lanes);
+    const MoeCombineParams params{rows, channels, routes};
+    const ops::LayoutRows layoutRows{lanes, rows, splash::test::mostRows(k.lanes)};
+    const auto sentinels = [&](size_t count) { return upload(backend, std::vector<uint16_t>(count, kSentinel)); };
+    // moe_combine, then the convolution of its rows.
+    const MetalBuffer combined = scratch(backend, size_t{rows} * channels * 2),
+                      outputBefore = sentinels(size_t{rows} * channels),
+                      tapeBefore = sentinels(size_t{rows} * state.stride);
+    CommandGraph before;
+    before.add("moe_combine", {expertBuffer, routeBuffer, weightBuffer, sumBuffer, combined}, params,
+               {rows, channels / 256, 1});
+    ops::ShortConvolution::addConvolution(before, {combined, taps, {}, 0, residual, outputBefore}, shape,
+                                          ops::ShortConvOutput::RoundedSum, in, {}, state, layout, layoutRows, {},
+                                          treeBuffer, tapeBefore);
+    run(backend, before);
+    // The combine running the convolution.
+    const MetalBuffer output = sentinels(size_t{rows} * channels), tape = sentinels(size_t{rows} * state.stride);
+    CommandGraph fused;
+    ops::ShortConvolution::addCombineConvolution(fused, {expertBuffer, routeBuffer, weightBuffer, sumBuffer, params},
+                                                 {{}, taps, {}, 0, residual, output}, shape, in, state, layout,
+                                                 layoutRows, treeBuffer, tape);
+    run(backend, fused);
+    const auto got = download<uint16_t>(output, size_t{rows} * channels),
+               want = download<uint16_t>(outputBefore, size_t{rows} * channels),
+               gotTape = download<uint16_t>(tape, size_t{rows} * state.stride),
+               wantTape = download<uint16_t>(tapeBefore, size_t{rows} * state.stride);
+    // The fp64 combine of row r at channel ch, rounded to the bf16 the
+    // convolution reads.
+    const auto sum = [&](uint32_t r, uint32_t ch) {
+      double value = sumResidual[size_t{r} * channels + ch];
+      for (uint32_t slot = 0; slot < routes; ++slot) {
+        const uint32_t row = routeRows[r * routes + slot];
+        if (row != ~0u) value += double(weights[r * routes + slot]) * expert[size_t{row} * channels + ch];
+      }
+      return roundBf16(value);
+    };
+    bool same = true, sameTape = true, ok = true, okTape = true, untouched = true;
+    for (uint32_t l = 0; l < lanes; ++l)
+      for (uint32_t r = k.lanes[l].first; r < k.lanes[l].first + k.lanes[l].rows; ++r)
+        for (uint32_t ch = 0; ch < channels; ++ch) {
+          const size_t i = size_t{r} * channels + ch, t = size_t{r} * state.stride + state.column + ch;
+          same &= exact ? got[i] == want[i] : closeBf16(f32(got[i]), f32(want[i]));
+          sameTape &= exact ? gotTape[t] == wantTape[t] : closeBf16(f32(gotTape[t]), f32(wantTape[t]));
+          // Input `depth` along the row's path, or the lane's state's.
+          const auto input = [&](int depth) -> double {
+            if (depth < 0) return c.states[l][size_t(int(kStateRows) + depth) * state.stride + state.column + ch];
+            uint32_t row = r;
+            while (tree[row].depth > uint32_t(depth)) row = k.lanes[l].first + tree[row].parent;
+            return sum(row, ch);
+          };
+          double weighted = 0;
+          for (uint32_t tap = 0; tap < kTaps; ++tap)
+            weighted += c.taps[size_t{ch} * kTaps + (kTaps - 1 - tap)] * input(int(tree[r].depth) - int(tap));
+          const double y = (weighted + sum(r, ch)) / std::sqrt(double(kTaps + 1));
+          // bf16(y) on the fp32 residual: one bf16 step of y, then the sum's
+          // (as convPromptTest's RoundedSum).
+          const double total = c.residual[i] + y;
+          ok &= std::fabs(f32(got[i]) - total) <= std::fabs(y) / 128 + std::fabs(total) / 128 + 1e-3;
+          okTape &= closeBf16(f32(gotTape[t]), sum(r, ch));
+        }
+    for (uint32_t r = 0; r < rows; ++r)
+      for (uint32_t col = 0; col < state.stride; ++col) {
+        const bool convolved = inLane[r] && col >= state.column && col < state.column + channels;
+        if (!convolved) untouched &= gotTape[size_t{r} * state.stride + col] == kSentinel;
+        if (!inLane[r] && col < channels) untouched &= got[size_t{r} * channels + col] == kSentinel;
+      }
+    const std::string scope = "MoE combine convolution (" + k.name + ")";
+    check(same, scope + (exact ? ": the output bit for bit as the combine's convolution's"
+                               : ": the output within a bf16 step of the combine's convolution's"));
+    check(sameTape, scope + (exact ? ": the tape bit for bit as the combine's convolution's"
+                                   : ": the tape within a bf16 step of the combine's convolution's"));
+    check(ok, scope + ": each row the fp64 combine's convolution along its path");
+    check(okTape, scope + ": each row's combined input in the tape");
+    check(untouched, scope + ": no row of no lane and no other column written");
+  }
+}
+
 // The fp64 mix of row r: each query's output, and through its norm.
 // The stack's planes hold planeRows rows each, more than the mix's.
 struct MixCase {
@@ -738,14 +884,24 @@ void logitFinishTest(MetalBackend &backend) {
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     try {
-      if (argc != 2) throw std::runtime_error("usage: convolution-mix-kernels METALLIB");
+      const bool bitwise = argc == 3 && std::string(argv[2]) == "bitwise";
+      if (argc != 2 && !bitwise) throw std::runtime_error("usage: convolution-mix-kernels METALLIB [bitwise]");
       MetalBackend backend(argv[1]);
+      if (bitwise) {
+        // Uninstrumented: the combine's convolution alone, exact.
+        if (std::getenv("MTL_SHADER_VALIDATION")) throw std::runtime_error("bitwise runs without shader validation");
+        combineConvolutionTest(backend, true);
+        std::cout << (failures ? "convolution and mix kernel bitwise tests FAILED\n"
+                               : "convolution and mix kernel bitwise tests PASS\n");
+        return failures ? 1 : 0;
+      }
       // A key or value projection's dynamic convolution (8 heads of 128) and
       // an output's static one.
       for (const ops::ShortConvShape shape : {ops::ShortConvShape{2304, 0}, ops::ShortConvShape{1024, 8}}) {
         convPromptTest(backend, shape);
         convTreeTest(backend, shape);
       }
+      combineConvolutionTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
       for (const bool currentFloat : {false, true}) {
         for (const uint32_t queries : {1u, 3u, 4u})
           for (uint32_t stack = 1; stack <= 4; ++stack)

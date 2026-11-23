@@ -1,6 +1,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/ShortConvolution.h"
 #include "metal/kernels/common/lane_bindings.h"
+#include "metal/kernels/common/short_convolution_row.h"
 #include "metal/kernels/common/verify_tree.h"
 
 #include <metal_stdlib>
@@ -63,17 +64,7 @@ inline void short_convolution_row(device const bfloat *input, device const bfloa
     // Every channel of a dynamic head shares the row's taps of the head.
     device const bfloat *dynamic =
         dynamic_taps + ulong(packed) * p.dynamic_stride + (p.heads ? c / (p.channels / p.heads) : 0u) * kTaps;
-    float sum = 0.0f;
-    // Lag k's static tap is column kTaps - 1 - k of the channel's (the
-    // stored order), its dynamic tap the head's k.
-    for (uint k = 0; k < kTaps; ++k) {
-      const int back = depth - int(k);
-      const float weight = taps[ulong(c) * kTaps + (kTaps - 1 - k)] + (p.heads ? float(dynamic[k]) : 0.0f);
-      sum += weight * float(at(back >= 0 && p.tree ? int(splash_path_row(path, uint(back))) : back));
-    }
-    const float y = float(bfloat((sum + float(own)) / p.divisor));
-    const ulong i = ulong(packed) * p.channels + c;
-    output[i] = Out((p.residual ? float(residual[i]) : 0.0f) + y);
+    short_convolution_output(at, taps, dynamic, residual, output, p, c, packed, path, depth, own);
     if (p.tree) tape[ulong(packed) * p.state_stride + column] = own;
     return;
   }

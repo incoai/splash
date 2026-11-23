@@ -8,6 +8,7 @@
 #endif
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/ShortConvolution.h"
 #include "metal/abi/VerifyTree.h"
 
 // The expert slots of the routing kernels (ops::MoE): a row's router scores
@@ -298,3 +299,22 @@ struct MoeCombineParams {
 
 static_assert(sizeof(MoeCombineParams) == 12,
               "MoE combine parameters are 12 bytes on both sides");
+
+// A verify step's combine with the short convolution of its rows
+// (moe_combine_convolution, ops::MoeCombineConvolution): the combine's, and
+// the convolution's of static taps (heads 0) along the lanes' trees (tree 1)
+// onto an fp32 residual (residual 1, SHORT_CONVOLUTION_OUTPUT_ROUNDED_SUM),
+// its sequences the step's lanes. A threadgroup runs a lane's rows, at most
+// MOE_COMBINE_CONVOLUTION_ROWS (a verify block's), of
+// MOE_COMBINE_CONVOLUTION_CHANNELS channels, a thread a row's channel: the
+// rows its convolution taps are the lane's own, which it combined, or its
+// state's.
+#define MOE_COMBINE_CONVOLUTION_ROWS 32u
+#define MOE_COMBINE_CONVOLUTION_CHANNELS 32u
+struct MoeCombineConvolutionParams {
+  struct MoeCombineParams combine;
+  struct ShortConvolutionParams convolution;
+};
+
+static_assert(sizeof(MoeCombineConvolutionParams) == 100,
+              "MoE combine convolution parameters are 100 bytes on both sides");

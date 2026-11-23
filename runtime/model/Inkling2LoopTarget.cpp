@@ -160,7 +160,8 @@ void Inkling2LoopTarget::addPrefillLayer(PrefillStep &step, uint32_t application
                                       std::span(&b.normalized, 1), shape, step.rows);
   }
   // The MoE's weighted sum alone (added to zero rows), into the rows its
-  // convolution reads after the layer's load (addPrefillExperts).
+  // convolution reads after the layer's load, or a decode step's straight
+  // into its convolution (addPrefillExperts).
   step.ffn.input = b.normalized;
   step.ffn.residual = s.zeros;
   step.ffn.output = b.attentionOutput;
@@ -356,16 +357,38 @@ void Inkling2LoopTarget::addConvolution(const PrefillStep &step, uint32_t applic
                                         step.decode ? step.scratch.tape : metal::MetalBuffer{});
 }
 
+// A prompt chunk's MoE sum goes to the rows its convolution then reads; a
+// decode step's combine runs the convolution of its lanes' rows along their
+// trees itself, a lane's rows a threadgroup's (ops::MoeCombineConvolution),
+// the same bits in one dispatch fewer an application. The convolution of a
+// prompt's rows, which may outnumber a threadgroup's and write the states
+// after them, stays a dispatch of its own.
 void Inkling2LoopTarget::addPrefillExperts(PrefillStep &step, uint32_t application) const {
   const Inkling2LoopLayerWeights &layer = weights_.layers[schedule_.weightLayer(application)];
+  const ops::ShortConvBuffers convolution{.input = step.buffers.attentionOutput,
+                                          .taps = layer.ffnConvolution,
+                                          .residual = step.scratch.residual,
+                                          .output = rows(step, schedule_.output(application))};
+  const ops::ShortConvShape shape{.channels = geometry_.hiddenSize};
+  if (const QwenTargetDecodeBuffers *d = step.decode) {
+    std::vector<metal::MetalBuffer> stateIn;
+    for (const QwenTargetPrefillSequence &sequence : step.sequences) stateIn.push_back(sequence.auxiliaryIn);
+    const ops::MoeCombineConvolution combined{
+        .buffers = convolution,
+        .shape = shape,
+        .stateIn = stateIn,
+        .state = {.column = schedule_.convolutionColumn(application, Inkling2LoopConvolution::Ffn),
+                  .stride = schedule_.stateColumns()},
+        .layout = step.buffers.laneRows,
+        .rows = step.layoutRows,
+        .tree = d->tree,
+        .tape = step.scratch.tape};
+    ops::MoE::addRouted(step.graph, step.ffn, layer.ffn, *step.moe, &combined);
+    return;
+  }
   ops::MoE::addRouted(step.graph, step.ffn, layer.ffn, *step.moe);
-  const metal::MetalBuffer output = rows(step, schedule_.output(application));
-  addConvolution(step, application, Inkling2LoopConvolution::Ffn,
-                 {.input = step.buffers.attentionOutput,
-                  .taps = layer.ffnConvolution,
-                  .residual = step.scratch.residual,
-                  .output = output},
-                 {.channels = geometry_.hiddenSize}, ops::ShortConvOutput::RoundedSum);
+  addConvolution(step, application, Inkling2LoopConvolution::Ffn, convolution, shape,
+                 ops::ShortConvOutput::RoundedSum);
 }
 
 // A decode step's every row, and a prompt chunk's rows of its sequences'

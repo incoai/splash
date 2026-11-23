@@ -439,7 +439,11 @@ the Qwen readers. Inkling 2 (`Inkling2Loop.hpp`) states the shared dimensions
 as the layers its steps run, one per layer application, every one attending,
 and keeps its weight layers, its loop's schedule (`Inkling2LoopSchedule`) and
 its own values in its layout; its own loader reads a layer image a weight
-layer, and its target (`Inkling2LoopTarget.hpp`) runs its own operators. Its
+layer, and its target (`Inkling2LoopTarget.hpp`) runs its own operators; a
+decode step's MoE combine convolves the FFN's rows along the lanes' trees in
+its own dispatch, a lane's rows a threadgroup's, which pass their combined
+values through threadgroup memory (`ops::MoeCombineConvolution`), the bits the
+combine and the convolution write apart. Its
 draft reads it as its producer captured it (`QwenTargetDimensions`'s
 `draftReadsLayerInputs`): the target captures, at an id the draft reads, the
 rows passed into that application, its block residual's partial sum before it,

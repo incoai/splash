@@ -263,14 +263,24 @@ void addInt8Experts(metal::CommandGraph &graph, const MoeBuffers &buffers, const
   pass("down", weights.down, intermediate, hidden, scratch.expertOutput);
 }
 
-void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan) {
+// The combine, or with `convolution` the combine running a verify step's
+// convolution of its rows (MoeCombineConvolution).
+void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan,
+                const MoeCombineConvolution *convolution) {
   const MoeShape shape = plan.shape();
   const MoeScratch &scratch = buffers.scratch;
+  const MoeCombineParams params{plan.rows(), shape.hiddenSize, shape.routesPerToken()};
+  if (convolution) {
+    const MoeCombineConvolution &c = *convolution;
+    ShortConvolution::addCombineConvolution(
+        graph, {scratch.expertOutput, scratch.routeRows, scratch.routingWeights, buffers.residual, params},
+        c.buffers, c.shape, c.stateIn, c.state, c.layout, c.rows, c.tree, c.tape);
+    return;
+  }
   graph.add("moe_combine",
             {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
              buffers.residual, buffers.output},
-            MoeCombineParams{plan.rows(), shape.hiddenSize, shape.routesPerToken()},
-            {plan.rows(), shape.hiddenSize / 256, 1});
+            params, {plan.rows(), shape.hiddenSize / 256, 1});
 }
 
 } // namespace
@@ -326,7 +336,8 @@ void MoE::addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
 // slot table, after addResident's beside the load; a resident block's gather
 // and passes over every expert. Then the combine.
 void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                    const BlockMoeWeights &weights, const MoePlan &plan) {
+                    const BlockMoeWeights &weights, const MoePlan &plan,
+                    const MoeCombineConvolution *convolution) {
   const MoeGroupParams group = groupParams(plan, weights);
   if (weights.stream) {
     addExperts(graph, buffers.scratch, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED);
@@ -336,7 +347,7 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
     addGather(graph, buffers, plan);
     addExperts(graph, buffers.scratch, weights, weights.slotTable, plan, group, MOE_TILES_ALL);
   }
-  addCombine(graph, buffers, plan);
+  addCombine(graph, buffers, plan, convolution);
 }
 
 void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,

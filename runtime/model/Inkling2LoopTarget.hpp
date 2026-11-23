@@ -9,7 +9,8 @@
 // with its relative bias, row sinks and gate (ops/RelativeAttention.hpp);
 // convolves its keys, values and output (ops/ShortConvolution.hpp); mixes the
 // stack and its residual into its MoE's input; and convolves the MoE's output
-// onto its residual into its output rows. The head reads the output norm of
+// onto its residual into its output rows, a decode step's in its MoE
+// combine's dispatch (ops::MoeCombineConvolution). The head reads the output norm of
 // the final mix, and the shared head finishes its logits (QwenTarget::addHead,
 // ops/LogitFinish.hpp). Its DFlash2 draft reads the rows passed into its
 // captured applications and the final norm's, as its producer captured them,
@@ -86,7 +87,7 @@ private:
   // loop layer loads again.
   [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t application) const;
   // Its routed work and the FFN's convolution onto the residual into its
-  // output rows.
+  // output rows, a decode step's run by the MoE combine.
   void addPrefillExperts(PrefillStep &step, uint32_t application) const;
   // The final mix and output norm into buffers.hidden[1], a decode step's
   // into its final hidden rows, which the draft captures at id

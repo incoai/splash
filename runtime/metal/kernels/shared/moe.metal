@@ -1,6 +1,8 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/activation.h"
+#include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/moe_expert_slab.h"
+#include "metal/kernels/common/short_convolution_row.h"
 
 // Routes group rows by expert so each tile streams its weights once. Each row
 // carries top_k routed experts plus the Shared slices of the shared expert
@@ -428,6 +430,25 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
   }
 }
 
+// Row `row`'s combined value at `dimension`: its residual plus each route's
+// expert output times its routing weight, in route order, in fp32.
+inline float moe_combine_value(device const bfloat *expert_output, device const uint *route_rows,
+                               device const float *routing_weights, device const bfloat *residual,
+                               constant MoeCombineParams &params, uint row, uint dimension) {
+  float value = float(residual[ulong(row) * params.hidden_size + dimension]);
+  ulong route = ulong(row) * params.routes_per_row;
+  for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    // A route a verified grouping left out (MoeGroupParams) adds nothing.
+    const uint grouped = route_rows[route + slot];
+    if (grouped == ~0u)
+      continue;
+    value += routing_weights[route + slot] *
+             float(expert_output[ulong(grouped) * params.hidden_size +
+                                 dimension]);
+  }
+  return value;
+}
+
 kernel void moe_combine(
     device const bfloat *expert_output [[buffer(0)]],
     device const uint *route_rows [[buffer(1)]],
@@ -441,16 +462,56 @@ kernel void moe_combine(
   uint dimension = group.y * 256 + thread_index;
   if (row >= params.rows || dimension >= params.hidden_size)
     return;
-  float value = float(residual[ulong(row) * params.hidden_size + dimension]);
-  ulong route = ulong(row) * params.routes_per_row;
-  for (uint slot = 0; slot < params.routes_per_row; ++slot) {
-    // A route a verified grouping left out (MoeGroupParams) adds nothing.
-    const uint grouped = route_rows[route + slot];
-    if (grouped == ~0u)
-      continue;
-    value += routing_weights[route + slot] *
-             float(expert_output[ulong(grouped) * params.hidden_size +
-                                 dimension]);
+  output[ulong(row) * params.hidden_size + dimension] =
+      bfloat(moe_combine_value(expert_output, route_rows, routing_weights, residual, params, row, dimension));
+}
+
+// A verify step's combine and the short convolution of its rows
+// (MoeCombineConvolutionParams, ops::MoeCombineConvolution), what moe_combine
+// and then short_convolution's ROUNDED_SUM of its rows write, in one
+// dispatch: threadgroup (channel group, lane) runs the lane's rows of
+// MOE_COMBINE_CONVOLUTION_CHANNELS channels, thread (x, y) the lane's row y
+// at the group's channel x. Each combines its row's channel as moe_combine
+// does into the threadgroup's rows and the tape; then each convolves it along
+// its row's path from those rows (and before the lane's anchor its state,
+// state_in lane) onto the residual. No combined row reaches memory but the
+// tape. A lane whose rows run past the step's writes nothing.
+kernel void moe_combine_convolution(
+    device const bfloat *expert_output [[buffer(0)]], device const uint *route_rows [[buffer(1)]],
+    device const float *routing_weights [[buffer(2)]], device const bfloat *combine_residual [[buffer(3)]],
+    device const bfloat *state_in0 [[buffer(4)]], device const bfloat *state_in1 [[buffer(5)]],
+    device const bfloat *state_in2 [[buffer(6)]], device const bfloat *state_in3 [[buffer(7)]],
+    device const bfloat *state_in4 [[buffer(8)]], device const bfloat *state_in5 [[buffer(9)]],
+    device const bfloat *state_in6 [[buffer(10)]], device const bfloat *state_in7 [[buffer(11)]],
+    device const float *taps [[buffer(12)]], device const float *residual [[buffer(13)]],
+    device bfloat *output [[buffer(14)]], device const SplashLaneRows *layout [[buffer(15)]],
+    device const SplashTreeRow *tree [[buffer(16)]], device bfloat *tape [[buffer(17)]],
+    constant MoeCombineConvolutionParams &params [[buffer(18)]], uint2 group [[threadgroup_position_in_grid]],
+    uint2 position [[thread_position_in_threadgroup]]) {
+  constexpr int kStateRows = int(SHORT_CONVOLUTION_STATE_ROWS);
+  threadgroup bfloat combined[MOE_COMBINE_CONVOLUTION_ROWS][MOE_COMBINE_CONVOLUTION_CHANNELS];
+  constant ShortConvolutionParams &p = params.convolution;
+  const uint lane = group.y, row = position.y, c = group.x * MOE_COMBINE_CONVOLUTION_CHANNELS + position.x;
+  if (lane >= min(p.sequences, SPLASH_MAXIMUM_BATCH_WIDTH)) return;
+  const SplashLaneRows rows = layout[lane];
+  if (ulong(rows.first) + rows.rows > p.rows) return;
+  const bool live = row < rows.rows && c < p.channels;
+  const uint packed = rows.first + row;
+  const ulong column = p.state_column + c;
+  if (live) {
+    const bfloat value = bfloat(moe_combine_value(expert_output, route_rows, routing_weights, combine_residual,
+                                                  params.combine, packed, c));
+    combined[row][position.x] = value;
+    tape[ulong(packed) * p.state_stride + column] = value;
   }
-  output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!live) return;
+  device const bfloat *state_in = SPLASH_LANE_BINDING(lane, state_in0, state_in1, state_in2, state_in3, state_in4,
+                                                      state_in5, state_in6, state_in7);
+  const auto at = [&](int t) -> bfloat {
+    return t >= 0 ? combined[t][position.x] : state_in[ulong(kStateRows + t) * p.state_stride + column];
+  };
+  // The convolution's taps are static (p.heads 0): it reads no dynamic tap.
+  short_convolution_output(at, taps, state_in, residual, output, p, c, packed, tree[packed].ancestors,
+                           int(tree[packed].depth), combined[row][position.x]);
 }

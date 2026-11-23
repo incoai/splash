@@ -5,6 +5,7 @@
 #include "metal/abi/MoE.h"
 #include "ops/LaneRows.hpp"
 #include "ops/Linear.hpp"
+#include "ops/ShortConvolution.hpp"
 
 #include <algorithm>
 #include <array>
@@ -447,6 +448,25 @@ struct MoeBuffers final {
   metal::MetalBuffer laneRows;
 };
 
+// A verify step's short convolution of its combined rows, which its combine
+// runs in its own dispatch (ShortConvolution::addCombineConvolution): of
+// static taps along the lanes' trees (`layout`, `rows`, `tree`; each lane's
+// state stateIn[l]), onto buffers.residual, fp32, rounded into
+// buffers.output (ShortConvOutput::RoundedSum), each row's combined input
+// into the tape at the state's columns. The bits the combine into
+// MoeBuffers::output and that convolution of it write, which is then
+// unwritten.
+struct MoeCombineConvolution final {
+  ShortConvBuffers buffers;
+  ShortConvShape shape;
+  std::span<const metal::MetalBuffer> stateIn;
+  ShortConvState state;
+  metal::MetalBuffer layout;
+  LayoutRows rows;
+  metal::MetalBuffer tree;
+  metal::MetalBuffer tape;
+};
+
 // Routes and executes grouped experts from immutable weight views.
 struct MoE final {
   // The plan of a step of 1 to SPLASH_PREFILL_TOKEN_BUDGET rows.
@@ -461,13 +481,15 @@ struct MoE final {
   // chunks, QwenTarget::addPrefillLayers) run their routings, one load of
   // the union beside the first step's resident work, then each step's work
   // through its combine before the next step's: they share the scratch their
-  // gathers and passes write, all but their routing.
+  // gathers and passes write, all but their routing. With `convolution` (a
+  // verify step's) the combine runs it on its rows (MoeCombineConvolution).
   static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const BlockMoeWeights &weights, const MoePlan &plan);
   static void addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
                           const BlockMoeWeights &weights, const MoePlan &plan);
   static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                        const BlockMoeWeights &weights, const MoePlan &plan);
+                        const BlockMoeWeights &weights, const MoePlan &plan,
+                        const MoeCombineConvolution *convolution = nullptr);
   // The routing of `rows` rows of `input` by a block's `router`,
   // `sharedScalarGate` (unread without shape.sharedGate) and `selectionBias`
   // (unread without shape.selectionBias): the router's fp32
