@@ -7,15 +7,21 @@
 // bf16 projection in the source); the gated row (1 - tanh(forget g)) x +
 // tanh(gain g) m in fp32; then the weighted RMS norm of the projections that
 // read it, into their bf16 input. Its three projections are float segments.
-// A call whose weights are F32 or BF16 rows, all of one, of a rank and rows
-// of whole float4s, runs its gates fused, up to kMaximumGates of them in each
-// kernel, which reads the weights itself (metal/abi/MessageGate.h): a decode
-// step's rows at most (kFusedRows) in two kernels, more rows, a prompt
-// chunk's, of whole 64-value steps and a rank of whole runs of 8, in one
-// tiled kernel, a tile of rows a threadgroup. Any other weights run each
+// A call of at most kMaximumGates gates whose weights are F32 or BF16 rows,
+// all of one format, of a rank of at most MESSAGE_GATE_MAXIMUM_RANK and a
+// multiple of 4, x and the messages in whole float4s, runs its gates fused,
+// in kernels that read the weights themselves (metal/abi/MessageGate.h): a
+// decode step's rows at most (kFusedRows) in two kernels, more rows, a prompt
+// chunk's, in one tiled kernel, a tile of rows a threadgroup, where hidden is
+// a multiple of 64 and the rank of 8. Inkling-2-Mini's gates are such rows
+// whatever their checkpoint holds: its loaders keep F32 and BF16 tensors as
+// stored and decode a quantized one, as some GGUFs keep the gates, to F32
+// (FloatTensor sections, model/GgufImage.hpp). Every other call runs each
 // gate's normalization, its projections through ops::addGgufFloat and its
-// norm, the float tile reading the weights once for many rows. Every path
-// rounds at the same points; their sums add in other orders.
+// norm, the float tile reading the weights once for many rows: a quantized
+// format's rows, F32 and BF16 gates in one call, another rank or stride, and
+// more rows than a decode step's of another hidden or rank. Every path rounds
+// at the same points; their sums add in other orders.
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"

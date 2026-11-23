@@ -820,9 +820,12 @@ every projection
   over INT8 queries, and elsewhere over the bf16 queries 129 rows take.
   These need no memory the first did not, and are required as it is. Every other kernel choice a
   chunk's rows make has one threshold (the float tiles, the MoE router's
-  tile, the staged norm, the hyper-connection norm's quarters, and the
-  Neural Engine split, which takes no class's first chunk), so the chunks of
-  one row and of the most take both sides. `kernel-selection` checks that
+  tile, the staged norm, the hyper-connection norm's quarters, the block
+  residual mix's kernel of a threadgroup a row from 65 rows, Inkling-2-Mini's
+  message gates' `message_gate_rows` from 129 rows, where 128 and fewer run a
+  decode step's two fused kernels, and the Neural Engine split, which takes
+  no class's first chunk), so the chunks of one row and of the most take both
+  sides. `kernel-selection` checks that
   every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
   its fifteen devices, and the kernels its prefill attention runs after each
   history it plans, are these chunks', and that no class's chunk repeats the

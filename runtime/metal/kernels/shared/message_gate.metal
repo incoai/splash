@@ -471,12 +471,34 @@ inline void message_gate_rows_read(threadgroup const bfloat *row, thread Message
   high = {float4(a[2]), float4(a[3])};
 }
 
+// A half's chains of a lane's four fragments: each fragment's even and odd
+// MMAs apart, in fields, so that no array lives across phase two's barriers.
+struct MessageGateRowsChains {
+  float2 even0, odd0, even1, odd1, even2, odd2, even3, odd3;
+};
+// A fragment's MMAs of a step, from its row of the stage: MMA j, j = 0 to 7 in
+// order, into `even` for even j and into `odd` for odd j.
+inline void message_gate_rows_mma(threadgroup const bfloat *row, MessageGateEight b0, MessageGateEight b1,
+                                  thread float2 &even, thread float2 &odd) {
+  MessageGateEight low, high;
+  message_gate_rows_read(row, low, high);
+  for (uint j = 0; j < 8; j += 2) {
+    sgmatrix::mma_acc<float>(even, float2(low[j], high[j]), float2(b0[j], b1[j]));
+    sgmatrix::mma_acc<float>(odd, float2(low[j + 1], high[j + 1]), float2(b0[j + 1], b1[j + 1]));
+  }
+}
+
 // Phase two: the tile's rank values, the down weights' rows ([rank][2
 // hidden]) against the normalized concatenation, x's half and then the
 // message's, a step of 64 inputs at a time, simdgroup s rank values
 // [8 s, 8 s + 8), into `shared.gated.lows`. Each half's even and odd MMAs
 // accumulate apart (four chains of 1,152 products at Inkling-2-Mini's 4,608
-// inputs, as gguf_float splits its own), added at the end in order.
+// inputs, as gguf_float splits its own), added at the end in order. The
+// chains live across every step's barrier, so they are fields, not an array
+// indexed at run time (which the decode kernels above keep none of across a
+// barrier, and which the AIR held in memory here even with the loops over
+// them marked to unroll): each half's steps run in a loop of their own,
+// which takes that half's chains.
 template <typename Weight>
 __attribute__((noinline)) void message_gate_rows_down(device const float *x, device const float *message,
                                                       device const Weight *down, constant MessageGateFusedParams &p,
@@ -486,40 +508,45 @@ __attribute__((noinline)) void message_gate_rows_down(device const float *x, dev
   const uint steps = p.hidden / kTileStep, column = 8 * sg + l.fn;
   device const Weight *w0 = down + ulong(min(column, p.rank - 1)) * 2 * p.hidden,
                       *w1 = down + ulong(min(column + 1, p.rank - 1)) * 2 * p.hidden;
-  float2 acc[kTileFragments][4];
-  for (uint f = 0; f < kTileFragments; ++f) acc[f][0] = acc[f][1] = acc[f][2] = acc[f][3] = float2(0.0f);
+  // x's half's chains (own) and the message's (other).
+  MessageGateRowsChains own{}, other{};
   message_gate_rows_stage(message_gate_rows_load(x, message, p, g, first, count, 0, steps, tid), true, tid,
                           shared.stages[0], shared.scales);
   // The weights load a step ahead.
   MessageGateEight next0 = message_gate_eight(w0, 8 * l.fm, column < p.rank),
                    next1 = message_gate_eight(w1, 8 * l.fm, column + 1 < p.rank);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint step = 0; step < 2 * steps; ++step) {
+  // Step `step` into its half's chains, the four fragments' in order; the next
+  // step's inputs staged and its weights loaded.
+  const auto run = [&](uint step, thread MessageGateRowsChains &chains) __attribute__((always_inline)) {
     const bool next = step + 1 < 2 * steps;
-    const MessageGateRun run =
+    const MessageGateRun ahead =
         next ? message_gate_rows_load(x, message, p, g, first, count, step + 1, steps, tid) : MessageGateRun{};
     const MessageGateEight b0 = next0, b1 = next1;
     if (next) {
       next0 = message_gate_eight(w0, (step + 1) * kTileStep + 8 * l.fm, column < p.rank);
       next1 = message_gate_eight(w1, (step + 1) * kTileStep + 8 * l.fm, column + 1 < p.rank);
     }
-    threadgroup const bfloat *stage = shared.stages[step % 2];
-    const uint chain = step < steps ? 0 : 2;
-    for (uint f = 0; f < kTileFragments; ++f) {
-      MessageGateEight low, high;
-      message_gate_rows_read(stage + (8 * f + l.fm) * kTileStride + 8 * l.fn, low, high);
-      for (uint j = 0; j < 8; ++j)
-        sgmatrix::mma_acc<float>(acc[f][chain + j % 2], float2(low[j], high[j]), float2(b0[j], b1[j]));
-    }
-    if (next) message_gate_rows_stage(run, step + 1 < steps, tid, shared.stages[(step + 1) % 2], shared.scales);
+    threadgroup const bfloat *row = shared.stages[step % 2] + l.fm * kTileStride + 8 * l.fn;
+    message_gate_rows_mma(row, b0, b1, chains.even0, chains.odd0);
+    message_gate_rows_mma(row + 8 * kTileStride, b0, b1, chains.even1, chains.odd1);
+    message_gate_rows_mma(row + 16 * kTileStride, b0, b1, chains.even2, chains.odd2);
+    message_gate_rows_mma(row + 24 * kTileStride, b0, b1, chains.even3, chains.odd3);
+    if (next) message_gate_rows_stage(ahead, step + 1 < steps, tid, shared.stages[(step + 1) % 2], shared.scales);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-  for (uint f = 0; f < kTileFragments; ++f) {
+  };
+  for (uint step = 0; step < steps; ++step) run(step, own);
+  for (uint step = steps; step < 2 * steps; ++step) run(step, other);
+  // Fragment f's rank values: (x's even + odd) + (the message's even + odd).
+  const auto store = [&](uint f, float2 sum) {
     const uint r = 8 * f + l.fm;
-    const float2 sum = (acc[f][0] + acc[f][1]) + (acc[f][2] + acc[f][3]);
     shared.gated.lows[r * kTileStride + column] = bfloat(sum.x);
     shared.gated.lows[r * kTileStride + column + 1] = bfloat(sum.y);
-  }
+  };
+  store(0, (own.even0 + own.odd0) + (other.even0 + other.odd0));
+  store(1, (own.even1 + own.odd1) + (other.even1 + other.odd1));
+  store(2, (own.even2 + own.odd2) + (other.even2 + other.odd2));
+  store(3, (own.even3 + own.odd3) + (other.even3 + other.odd3));
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 

@@ -69,7 +69,10 @@ std::set<std::string> relativeKernels(const ExecutionPlans &plans, kv::Layout la
 // kernel is the most rows', at 129. Every other
 // kernel a chunk's rows pick today changes once along them (selectFloatTile,
 // a MoE router's among them, the staged norm, the hyper-connection norm's
-// quarters, and the Neural Engine split, which takes no class's first chunk:
+// quarters, the block residual mix's, a threadgroup a row from
+// BLOCK_RESIDUAL_MIX_QUERY_ROWS + 1 rows (65), Inkling-2-Mini's message
+// gates', message_gate_rows from MessageGate::kFusedRows + 1 (129), and the
+// Neural Engine split, which takes no class's first chunk:
 // AneFfn::kMinimumRows), so a chunk of one row and one of the most take both
 // sides. A class no warmup ran created its kernels while its request waited:
 // 19 s for the 27B's cold 17-row chunk on a 16-core Apple9 plan.

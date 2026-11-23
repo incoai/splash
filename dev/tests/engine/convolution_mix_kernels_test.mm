@@ -798,23 +798,26 @@ void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool curre
 // full layer's q, k and v each its own; a sliding layer's all query 0) and
 // its message g, each of its own weights (of bf16 values, as the bf16
 // checkpoint's are, stored as a GGUF keeps them: F32 or BF16 rows), norm and
-// output.
+// output; `hidden` values a row and a rank of `rank`, Inkling-2-Mini's by
+// default.
 struct GateCase {
   static constexpr uint32_t kHidden = 2304, kRank = 64;
   uint32_t rows = 0, gates = 0;
   bool sharedX = false;
+  uint32_t hidden = kHidden, rank = kRank;
   std::vector<float> x, message;
   std::vector<std::vector<float>> down, forget, gain, norm;
 
-  GateCase(std::mt19937 &rng, uint32_t rows_, uint32_t gates_, bool sharedX_)
-      : rows(rows_), gates(gates_), sharedX(sharedX_) {
-    x = randoms(rng, size_t{rows} * 3 * kHidden, 1.5f);
-    message = randoms(rng, size_t{rows} * 4 * kHidden, 0.7f);
+  GateCase(std::mt19937 &rng, uint32_t rows_, uint32_t gates_, bool sharedX_, uint32_t hidden_ = kHidden,
+           uint32_t rank_ = kRank)
+      : rows(rows_), gates(gates_), sharedX(sharedX_), hidden(hidden_), rank(rank_) {
+    x = randoms(rng, size_t{rows} * 3 * hidden, 1.5f);
+    message = randoms(rng, size_t{rows} * 4 * hidden, 0.7f);
     for (uint32_t g = 0; g < gates; ++g) {
-      down.push_back(bf16Values(randoms(rng, size_t{kRank} * 2 * kHidden, 0.02f)));
-      forget.push_back(bf16Values(randoms(rng, size_t{kHidden} * kRank, 0.1f)));
-      gain.push_back(bf16Values(randoms(rng, size_t{kHidden} * kRank, 0.1f)));
-      norm.push_back(randoms(rng, kHidden, 0.5f));
+      down.push_back(bf16Values(randoms(rng, size_t{rank} * 2 * hidden, 0.02f)));
+      forget.push_back(bf16Values(randoms(rng, size_t{hidden} * rank, 0.1f)));
+      gain.push_back(bf16Values(randoms(rng, size_t{hidden} * rank, 0.1f)));
+      norm.push_back(randoms(rng, hidden, 0.5f));
     }
   }
   [[nodiscard]] uint32_t column(uint32_t g) const { return sharedX ? 0 : g; }
@@ -823,12 +826,11 @@ struct GateCase {
       return bfloat16 ? ops::QuantizedSegment::rows(GGUF_FMT_BF16, outputs, inputs, upload(backend, bf16s(values)))
                       : ops::QuantizedSegment::floats(outputs, inputs, upload(backend, values));
     };
-    return {rows(down[g], kRank, 2 * kHidden), rows(forget[g], kHidden, kRank), rows(gain[g], kHidden, kRank)};
+    return {rows(down[g], rank, 2 * hidden), rows(forget[g], hidden, rank), rows(gain[g], hidden, rank)};
   }
   // Gate g's row r against fp64, with the source's bf16 roundings of the
   // down projection's input and output, before the norm's weights' rounding.
   [[nodiscard]] std::vector<double> reference(uint32_t g, uint32_t r) const {
-    const uint32_t hidden = kHidden, rank = kRank;
     const float *xr = &x[(size_t{r} * 3 + column(g)) * hidden], *mr = &message[(size_t{r} * 4 + g) * hidden];
     double xs = 0, ms = 0;
     for (uint32_t d = 0; d < hidden; ++d) {
@@ -871,7 +873,7 @@ void runGates(MetalBackend &backend, const GateCase &c, const MetalBuffer &x, co
               std::span<const ops::MessageGateWeights> weights, std::span<const MetalBuffer> norms,
               std::span<const MetalBuffer> outputs, const MetalBuffer &counters, uint32_t first, uint32_t count,
               ops::MessageGateKernels kernels = ops::MessageGateKernels::Fused) {
-  const uint32_t hidden = GateCase::kHidden, rank = GateCase::kRank;
+  const uint32_t hidden = c.hidden, rank = c.rank;
   std::vector<ops::MessageGateInput> gates;
   for (uint32_t g = 0; g < c.gates; ++g)
     gates.push_back({weights[g], {norms[g], true}, c.column(g) * hidden, g * hidden,
@@ -905,12 +907,15 @@ std::string gateKernels(uint32_t rows, ops::MessageGateKernels kernels) {
 // a prompt chunk's: whole tiles and a part of one) and through the float
 // projections, of F32 weights and of BF16, the counters back at zero. The
 // weights' values are the same in either format, and so is every product, so
-// the two formats' outputs are the same bits.
+// the two formats' outputs are the same bits. Inkling-2-Mini's hidden and
+// rank, or others the tiled kernel takes: fewer 64-value steps, and a rank
+// short of its 64 columns, whose simdgroups past it read no down weights and
+// whose lanes past it no forget or gain weights.
 void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX,
-              ops::MessageGateKernels kernels = ops::MessageGateKernels::Fused) {
+              ops::MessageGateKernels kernels = ops::MessageGateKernels::Fused, uint32_t hidden = GateCase::kHidden,
+              uint32_t rank = GateCase::kRank) {
   std::mt19937 rng(31 + gates + (sharedX ? 7 : 0));
-  const GateCase c(rng, rows, gates, sharedX);
-  const uint32_t hidden = GateCase::kHidden;
+  const GateCase c(rng, rows, gates, sharedX, hidden, rank);
   const MetalBuffer x = upload(backend, c.x), message = upload(backend, c.message);
   std::vector<MetalBuffer> norms;
   for (uint32_t g = 0; g < gates; ++g) norms.push_back(upload(backend, c.norm[g]));
@@ -938,9 +943,12 @@ void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX
   }
   const auto zeros = download<uint32_t>(counters, ops::MessageGate::kCountersBytes / 4);
   const std::string kind = gates == 1 ? "" : sharedX ? " of one x" : " of three x";
+  const std::string shape = hidden == GateCase::kHidden && rank == GateCase::kRank
+                                ? ""
+                                : ", hidden " + std::to_string(hidden) + " and rank " + std::to_string(rank);
   check(ok && got[0] == got[1] && std::all_of(zeros.begin(), zeros.end(), [](uint32_t value) { return value == 0; }),
         "message gates, " + std::to_string(gates) + " a call" + kind + ", of " + std::to_string(rows) + " rows (" +
-            gateKernels(rows, kernels) +
+            gateKernels(rows, kernels) + shape +
             ") through their norms, x and the messages at columns of wider rows, F32 and BF16 weights alike");
 }
 
@@ -1091,6 +1099,22 @@ int main(int argc, const char *argv[]) {
       for (const uint32_t rows : {13u, ops::MessageGate::kFusedRows + 1}) gateTest(backend, rows, 3, true);
       for (const uint32_t rows : {13u, ops::MessageGate::kFusedRows + 1})
         gateTest(backend, rows, 3, false, ops::MessageGateKernels::FloatProjections);
+      // The tiled kernel at other shapes: three 64-value steps a half at its
+      // full rank and at ranks short of its 64 columns, its last tile of 1
+      // row and of 31; and Inkling-2-Mini's hidden at rank 24, of 129 rows (of
+      // 159, one value in 1,099,008 lands 1.15 times the tolerance from fp64
+      // on the float projections and this kernel alike, 2.3 bf16 steps of its
+      // row: a rounding the fp64 reference takes the other way, as one value
+      // of 200 rows at rank 64 does on either path).
+      for (const uint32_t rank : {64u, 8u, 24u, 56u})
+        for (const uint32_t rows : {ops::MessageGate::kFusedRows + 1, ops::MessageGate::kFusedRows + 31}) {
+          gateTest(backend, rows, 1, true, ops::MessageGateKernels::Fused, 192, rank);
+          gateTest(backend, rows, 3, false, ops::MessageGateKernels::Fused, 192, rank);
+        }
+      gateTest(backend, ops::MessageGate::kFusedRows + 1, 1, true, ops::MessageGateKernels::Fused, GateCase::kHidden,
+               24);
+      gateTest(backend, ops::MessageGate::kFusedRows + 1, 3, false, ops::MessageGateKernels::Fused,
+               GateCase::kHidden, 24);
       gatePathsTest(backend);
       logitFinishTest(backend);
     } catch (const std::exception &error) {
