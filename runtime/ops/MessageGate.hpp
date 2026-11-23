@@ -9,8 +9,9 @@
 // read it, into their bf16 input. Its three projections are float segments.
 // A call of up to kMaximumGates gates runs them fused, in kernels that read
 // the weights themselves (metal/abi/MessageGate.h): a decode step's rows at
-// most (kFusedRows) in two kernels, more rows, a prompt chunk's, in one tiled
-// kernel, a tile of rows a threadgroup. They take weights of F32 or BF16
+// most (kFusedRows) in three kernels, each row normalized once for its down
+// projection, more rows, a prompt chunk's, in one tiled kernel, a tile of
+// rows a threadgroup. They take weights of F32 or BF16
 // rows, all of a call's of one format, a rank of 8 to MESSAGE_GATE_MAXIMUM_RANK
 // in runs of 8 and a hidden of whole 64-value steps, x and the messages in
 // whole float4s, and add refuses any other call (requireWeights says why).
@@ -55,12 +56,13 @@ struct MessageGateInput final {
 
 // The rows a call's gates read: x and the messages, fp32 rows of a stride (a
 // mix's output of several queries, the messages of four); and its scratch. A
-// decode step's rows: the rank values, bf16 [gates][rows][rank] (low), the
-// gated rows, fp32 [gates][rows][hidden] (forget), the groups' partial sums
-// (gain) and the counters, one a group of MESSAGE_GATE_GROUP_ROWS rows a
-// gate, zero before and after (kCountersBytes for the most). More rows: the
-// gated rows, fp32 [rows][hidden], of gate 0 in forget, of gate 1 in gain and
-// of gate 2 in concat.
+// decode step's rows: the normalized concatenations, bf16
+// [gates][rows][2 hidden], and then over the same bytes the gated rows, fp32
+// [gates][rows][hidden] (forget), the rank values, bf16 [gates][rows][rank]
+// (low), the groups' partial sums (gain) and the counters, one a group of
+// MESSAGE_GATE_GROUP_ROWS rows a gate, zero before and after (kCountersBytes
+// for the most). More rows: the gated rows, fp32 [rows][hidden], of gate 0 in
+// forget, of gate 1 in gain and of gate 2 in concat.
 struct MessageGateBuffers final {
   metal::MetalBuffer x;
   uint32_t xStride = 0;

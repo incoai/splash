@@ -16,21 +16,25 @@
 
 #define MESSAGE_GATE_THREADS 256u
 
-// The fused gates (ops::MessageGate, a decode step's rows): two kernels, each
-// over groups of MESSAGE_GATE_GROUP_ROWS rows and up to
-// MESSAGE_GATE_MAXIMUM_GATES gates of the same rows (a layer's q, k and v
-// inputs: grid z), which read a gate's weights, F32 or BF16 rows as stored,
-// once a group.
-// message_gate_down normalizes and concatenates its group's rows itself and
-// writes MESSAGE_GATE_DOWN_OUTPUTS of their rank values a threadgroup (32
-// threadgroups a gate for a rank of 64; a simdgroup a value, 8 threadgroups,
-// took 2.0 ms of a decode step's 96 gates against 1.25 ms on an M5 Pro, F32
-// weights a gate a dispatch); message_gate_apply takes MESSAGE_GATE_THREADS
-// of a row's values a threadgroup (a slice), a thread each: forget, gain and
-// the gated row, whose squares the slices of a group add, the last to arrive
-// in slice order, which then writes the group's normalized rows (slices of
-// 128 and 64 values, two and four threads a value, ran no faster). A rank is
-// at most MESSAGE_GATE_MAXIMUM_RANK, a multiple of four.
+// The fused gates (ops::MessageGate, a decode step's rows): three kernels over
+// up to MESSAGE_GATE_MAXIMUM_GATES gates of the same rows (a layer's q, k and
+// v inputs: grid z), the last two over groups of MESSAGE_GATE_GROUP_ROWS rows,
+// which read a gate's weights, F32 or BF16 rows as stored, once a group.
+// message_gate_normalize normalizes and concatenates each row of a gate once,
+// a threadgroup a row, into the bf16 rows that each of the down projection's
+// threadgroups of the row's group reads, where each had normalized its
+// group's rows itself: an eight-row decode step's gates took 2.13 ms where
+// they took 2.64 (Inkling-2-Mini on a 16-core M5 Pro, separate dispatches),
+// the step 0.47 ms less. message_gate_down writes MESSAGE_GATE_DOWN_OUTPUTS
+// of the group's rank values a threadgroup (32 threadgroups a gate for a rank
+// of 64; a simdgroup a value, 8 threadgroups, took 2.0 ms of a decode step's
+// 96 gates against 1.25 ms on an M5 Pro, F32 weights a gate a dispatch);
+// message_gate_apply takes MESSAGE_GATE_THREADS of a row's values a
+// threadgroup (a slice), a thread each: forget, gain and the gated row, whose
+// squares the slices of a group add, the last to arrive in slice order, which
+// then writes the group's normalized rows (slices of 128 and 64 values, two
+// and four threads a value, ran no faster). A rank is at most
+// MESSAGE_GATE_MAXIMUM_RANK, a multiple of four.
 #define MESSAGE_GATE_GROUP_ROWS 8u
 #define MESSAGE_GATE_DOWN_OUTPUTS 2u
 #define MESSAGE_GATE_MAXIMUM_RANK 64u

@@ -826,7 +826,7 @@ every projection
   tile, the staged norm, the hyper-connection norm's quarters, the block
   residual mix's kernel of a threadgroup a row from 65 rows, Inkling-2-Mini's
   message gates' `message_gate_rows` from 129 rows, where 128 and fewer run a
-  decode step's two fused kernels, and the Neural Engine split, which takes
+  decode step's three fused kernels, and the Neural Engine split, which takes
   no class's first chunk), so the chunks of one row and of the most take both
   sides. `kernel-selection` checks that
   every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
