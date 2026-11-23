@@ -382,11 +382,22 @@ void run(metal::MetalBackend &backend, const Case &data, const Step &step, const
   const metal::CommandGraph graph = encode(data, step, plan, partials, statistics);
   const auto &dispatches = graph.dispatches();
   const std::string format = data.layout.format == kv::Format::Int8 ? "q8" : "bf16";
-  require(dispatches.size() == 3 &&
-              dispatches[0].pipelineName ==
-                  "relative_attention_" + format + "_prepare" + (data.variant.positionScaled ? "_scaled" : "") &&
-              dispatches[2].threadsPerThreadgroup.x == kHeadDimension,
+  require(dispatches[0].pipelineName ==
+              "relative_attention_" + format + "_prepare" + (data.variant.positionScaled ? "_scaled" : ""),
           "the prepare names another variant's kernel");
+  // A dispatch of one split a sequence runs the direct kernel, any other the
+  // split and the reduce.
+  size_t at = 1;
+  for (const ops::RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches()) {
+    const bool direct = plan.direct(dispatch);
+    require(direct == (dispatch.splits == 1) && dispatches.size() >= at + (direct ? 1 : 2) &&
+                (direct ? dispatches[at].pipelineName == plan.directPipeline()
+                        : dispatches[at].pipelineName == plan.splitPipeline() &&
+                              dispatches[at + 1].threadsPerThreadgroup.x == kHeadDimension),
+            "an attention dispatch runs other kernels than its splits'");
+    at += direct ? 1 : 2;
+  }
+  require(dispatches.size() == at, "an attention runs more dispatches than its plan's");
   for (uint32_t lane = 0; lane < data.lanes; ++lane)
     require(plan.sequences()[lane].splits == test::attentionSplits(step.rows, data.histories[lane] + step.first,
                                                                    false, data.variant.windowTokens),
@@ -675,27 +686,122 @@ std::string describe(const Case &data, std::string_view phase) {
   return text;
 }
 
+// The direct kernel writes the split and reduce's bits: a lane's prompt chunk
+// whose plan runs it (one split), after its prepare, attended by it through
+// addAttention and by the split and the reduce of the paged attention's tiles
+// of 8 rows at the same split (as checkSplitCounts encodes them), each into
+// output rows plain and with the out-projection's Table16 input: the same
+// output, table and sums bits. Returns whether the plan runs it.
+bool checkDirectBits(metal::MetalBackend &backend, const Case &data, const Step &step,
+                     const ops::RelativeAttentionPlan &plan, const std::string &what) {
+  if (data.lanes != 1 || plan.dispatches().size() != 1 || !plan.direct(plan.dispatches()[0])) return false;
+  const std::vector<kv::ChunkedPrefillParams> sequences = sequencesOf(data, step);
+  const ops::AttentionRows rows{step.layout, step.rows, step.tree};
+  const std::vector<ops::AttentionHistory> histories{{data.layer, data.tables[0]}};
+  constexpr uint32_t width = kQueryHeads * kHeadDimension;
+  const ops::AttentionWorkspace workspace = plan.workspace();
+  struct Written final {
+    std::vector<std::byte> hidden, table, sums;
+    bool operator==(const Written &) const = default;
+  };
+  const auto bytes = [](const metal::MetalBuffer &buffer) {
+    const auto *begin = contents<std::byte>(buffer);
+    return std::vector<std::byte>(begin, begin + buffer.sizeBytes());
+  };
+  const auto attend = [&](bool direct, ops::LinearInput input) {
+    const metal::MetalBuffer partials = poisoned(backend, workspace.partialsBytes);
+    const metal::MetalBuffer statistics = poisoned(backend, workspace.statisticsBytes);
+    const metal::MetalBuffer hidden = poisoned(backend, uint64_t{step.rows} * width * 2);
+    const metal::MetalBuffer table =
+        poisoned(backend, ops::tableBytes(width, uint64_t{ops::tableTiles(step.rows)} * GGUF_TABLE16_ROWS));
+    const metal::MetalBuffer sums = poisoned(backend, ops::tableSumsBytes(ops::LinearInput::Table16, width, step.rows));
+    const bool tabled = input == ops::LinearInput::Table16;
+    metal::CommandGraph graph;
+    if (direct) {
+      RelativeAttention::addAttention(graph, plan, step.staging, data.weights, partials, statistics, sequences,
+                                      histories, rows,
+                                      {step.inputs.projection, hidden, ops::AttentionOutput::Every,
+                                       {table, sums, {}, {}}, input});
+      require(graph.dispatches().size() == 1 &&
+                  graph.dispatches()[0].pipelineName == plan.directPipeline() + ops::tableSuffix(input),
+              what + ": a chunk of one split runs other kernels than the direct one");
+    } else {
+      SplashAttentionParams params{.sequences = 1, .first_sequence = 0, .rows = step.rows,
+                                   .tiles = kv::attentionTiles(step.rows), .trees = 0, .last_rows = 0,
+                                   .kv = data.layer, .sequence = {}};
+      params.sequence[0] = {.committed_tokens = sequences[0].committed_tokens, .row_bound = step.rows,
+                            .layout_row = 0, .stage_row = 0, .chunk_stride = step.stride,
+                            .page_table_entries = sequences[0].page_table_entries, .split_count = 1,
+                            .first_tile = 0, .first_slot = 0, .block_stride = 0, .block_list = 0};
+      std::vector<metal::MetalBuffer> split{step.staging.queries, partials, statistics};
+      split.insert(split.end(), data.tables.begin(), data.tables.end());
+      split.insert(split.end(), {partials, step.layout, step.staging.states, data.weights.bias});
+      graph.add(plan.splitPipeline(), std::move(split), params, {kKvHeads, kv::attentionTiles(step.rows), 1});
+      graph.add(plan.reducePipeline() + ops::tableSuffix(input),
+                {partials, statistics, step.inputs.projection, hidden, tabled ? table : hidden,
+                 tabled ? sums : hidden, step.layout, step.staging.sinks},
+                params, {kKvHeads, kv::kAttentionTileRows * kGroup, kv::attentionTiles(step.rows)},
+                {kHeadDimension, 1, 1});
+    }
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    return Written{bytes(hidden), tabled ? bytes(table) : std::vector<std::byte>{},
+                   tabled ? bytes(sums) : std::vector<std::byte>{}};
+  };
+  for (const ops::LinearInput input : {ops::LinearInput::Plain, ops::LinearInput::Table16}) {
+    const Written direct = attend(true, input), split = attend(false, input);
+    if (direct == split) continue;
+    // The first output element that differs, and how many do.
+    std::string where;
+    size_t differ = 0;
+    for (size_t at = 0; at + 1 < direct.hidden.size(); at += 2)
+      if (std::memcmp(&direct.hidden[at], &split.hidden[at], 2)) {
+        if (!differ++) {
+          uint16_t a = 0, b = 0;
+          std::memcpy(&a, &direct.hidden[at], 2);
+          std::memcpy(&b, &split.hidden[at], 2);
+          const size_t element = at / 2;
+          where = " (row " + std::to_string(element / width) + " head " +
+                  std::to_string(element % width / kHeadDimension) + " dimension " +
+                  std::to_string(element % kHeadDimension) + ": " + std::to_string(bf16ToFloat(a)) + " against " +
+                  std::to_string(bf16ToFloat(b)) + ")";
+        }
+      }
+    throw std::runtime_error(what + ": the direct kernel wrote other bits than the split and reduce" +
+                             (input == ops::LinearInput::Table16 ? " with the Table16 input" : "") + ", " +
+                             std::to_string(differ) + " output elements" + where +
+                             (direct.table != split.table || direct.sums != split.sums ? ", and its table" : ""));
+  }
+  return true;
+}
+
 // A prefill of `rows` rows after a cached prefix of `history` tokens, as one
 // chunk, and again as the chunks `split` lists, each over the K/V its
-// predecessors stored: its prepare and its every checked row.
+// predecessors stored: its prepare and its every checked row, and the bits of
+// each chunk of one split (checkDirectBits).
 void checkPrefill(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
                   ops::RelativeAttentionVariant variant, uint32_t history, uint32_t rows,
                   std::vector<uint32_t> split = {}) {
   const Case data = makeCase(backend, format, int8Queries, variant, 1, rows, {history, 0, 0, 0});
   const std::string what = describe(data, "prefill") + " rows " + std::to_string(rows);
   double largest = 0;
+  uint32_t direct = 0, chunks = 0;
   split.insert(split.begin(), rows);
   for (const uint32_t chunk : split)
     for (uint32_t first = 0; first < rows; first += chunk) {
       const uint32_t chunkRows = std::min(chunk, rows - first);
       const Step step =
           makeStep(backend, data, first, chunkRows, (chunkRows + kPageTokens - 1) / kPageTokens * kPageTokens);
-      run(backend, data, step, planOf(data, step));
+      const ops::RelativeAttentionPlan plan = planOf(data, step);
+      const std::string at = what + " in chunks of " + std::to_string(chunk);
+      run(backend, data, step, plan);
       checkPrepare(data, step, what);
-      largest = std::max(largest, checkOutput(data, step, what + " in chunks of " + std::to_string(chunk)));
+      largest = std::max(largest, checkOutput(data, step, at));
+      direct += checkDirectBits(backend, data, step, plan, at + " from row " + std::to_string(first));
+      ++chunks;
     }
   std::cout << what << (split.size() > 1 ? " and in chunks" : "") << ": " << data.poisoned
-            << " table entries of NaNs below the window, largest error " << largest << " of its bound PASS\n";
+            << " table entries of NaNs below the window, largest error " << largest << " of its bound, " << direct
+            << " of " << chunks << " chunks direct, the split and reduce's bits PASS\n";
 }
 
 // A verify step of chains of a lane's eight rows each, one to a batch of
@@ -1012,12 +1118,25 @@ void checkPlans() {
       const ops::RelativeAttentionPlan plan = RelativeAttention::plan(
           sequence, layout, test::attentionRow(ops::kNever), ops::Int8Activations::On, chunk, variant);
       require(plan.splitPipeline() == "relative_attention_" + name + "_split" + window &&
-                  plan.reducePipeline() == "relative_attention_reduce" + window,
+                  plan.reducePipeline() == "relative_attention_reduce" + window &&
+                  plan.directPipeline() == "relative_attention_" + name + "_direct" + window,
               "a plan names another variant's kernels");
+      // 300 rows after 5,000 tokens: a sliding layer's window in one split,
+      // whose dispatch runs the direct kernel over 19 tiles of 16 rows, a
+      // full layer's history in more.
+      require(plan.dispatches().size() == 1 &&
+                  plan.direct(plan.dispatches()[0]) == (variant.windowTokens != 0) &&
+                  plan.directGroups(plan.dispatches()[0]).x == kKvHeads &&
+                  plan.directGroups(plan.dispatches()[0]).y == 19,
+              "a plan runs the direct kernel other than for one split");
       const ops::RelativeAttentionPlan codes = RelativeAttention::plan(
           lane, layout, test::attentionRow(1), ops::Int8Activations::On, chunk, variant);
       require(codes.splitPipeline() ==
-                  "relative_attention_" + std::string(format == kv::Format::Int8 ? "q8q" : "bf16") + "_split" + window,
+                      "relative_attention_" + std::string(format == kv::Format::Int8 ? "q8q" : "bf16") + "_split" +
+                          window &&
+                  codes.directPipeline() ==
+                      "relative_attention_" + std::string(format == kv::Format::Int8 ? "q8q" : "bf16") + "_direct" +
+                          window,
               "INT8 queries score INT8 pages alone");
       const ops::RelativeAttentionPlan last = RelativeAttention::lastTiles(plan);
       require(last.sequences()[0].firstTile + 1 == kv::attentionTiles(300), "the last tiles are not the last");
@@ -1042,7 +1161,9 @@ void checkPlans() {
                                      (variant.windowTokens ? "_w1023" : "") + (variant.positionScaled ? "_scaled" : "");
           const ops::RelativeAttentionPlan plan = decode(ops::kNever);
           require(plan.decodePipeline() == "relative_attention_" + name + "_decode" + suffix &&
-                      plan.splitPipeline().empty() && plan.reducePipeline().empty() && plan.dispatches().size() == 1,
+                      plan.splitPipeline().empty() && plan.reducePipeline().empty() &&
+                      plan.directPipeline().empty() && plan.dispatches().size() == 1 &&
+                      !plan.direct(plan.dispatches()[0]),
                   "a decode plan names another kernel");
           for (size_t s = 0; s < steps.size(); ++s) {
             const uint32_t pages = (steps[s].committed_tokens + cap + kPageTokens - 1) / kPageTokens;

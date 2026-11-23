@@ -32,3 +32,9 @@
 // lane's history into at most SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS runs:
 // the run that finishes last combines them, a simdgroup lane each.
 #define SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS 32u
+
+// A prompt chunk's dispatch whose tiles each read their history in one split
+// (ops::RelativeAttention::addAttention) runs them as tiles of
+// SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS rows, two of the paged attention's,
+// each of which writes its output rows itself (the direct kernels).
+#define SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS 16u

@@ -19,6 +19,9 @@ constexpr uint32_t kMaximumSequences = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kGroup = RelativeAttention::kQueryHeads / RelativeAttention::kKvHeads;
 constexpr uint32_t kStates = SPLASH_RELATIVE_ATTENTION_STATES;
 static_assert(SPLASH_ATTENTION_TILE_PARTS(kGroup) == 1, "a group of three runs whole tiles");
+static_assert(SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS == 2 * kv::kAttentionTileRows &&
+                  SPLASH_TARGET_KV_BLOCK_TOKENS % SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS == 0,
+              "a direct tile is two of the paged attention's, whole within a staged stride");
 
 void requireLayout(kv::Layout layout) {
   if (!RelativeAttention::stores(layout)) throw std::invalid_argument("no relative attention kernel for layout");
@@ -97,6 +100,17 @@ metal::DispatchSize RelativeAttentionPlan::reduceGroups(const Dispatch &dispatch
   return {layout.kvHeads, kv::kAttentionTileRows * kGroup, dispatch.tiles};
 }
 
+uint32_t RelativeAttentionPlan::directTiles(const Sequence &sequence) noexcept {
+  return (sequence.rows - sequence.firstTile * kv::kAttentionTileRows + SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS - 1) /
+         SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS;
+}
+
+metal::DispatchSize RelativeAttentionPlan::directGroups(const Dispatch &dispatch) const noexcept {
+  uint64_t tiles = 0;
+  for (uint32_t d = 0; d < dispatch.sequences; ++d) tiles += directTiles(sequences_[dispatch.sequence[d]]);
+  return {layout.kvHeads, tiles, 1};
+}
+
 bool RelativeAttention::stores(kv::Layout layout) noexcept {
   return layout.valid() && layout.kvHeads == kKvHeads && layout.headDimension == kHeadDimension &&
          layout.reads == kv::Reads::EveryPage && !layout.valuesTokenMajor && !layout.indexDimension;
@@ -157,6 +171,7 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
   } else {
     plan.splitPipeline_ = "relative_attention_" + format + "_split" + window;
     plan.reducePipeline_ = "relative_attention_reduce" + window;
+    plan.directPipeline_ = "relative_attention_" + format + "_direct" + window;
   }
   group(plan);
   return plan;
@@ -256,9 +271,15 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
       throw std::invalid_argument("attention tree rows take whole blocks of at most 32 rows");
   }
   requireRows(rows, command, sequences.size());
-  // The tiles read the staging in whole tiles of rows, which each sequence's
-  // stride holds.
-  requireStaging(staging, command, kv::attentionTiles(command.last.chunk_tokens) * kv::kAttentionTileRows);
+  // The tiles read the staging in whole tiles of rows, the direct kernel's of
+  // SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS, which each sequence's stride holds
+  // (a multiple of a KV block's tokens).
+  const RelativeAttentionPlan::Sequence &lastSequence = planned.back();
+  requireStaging(staging, command,
+                 lastSequence.splits == 1 ? lastSequence.firstTile * kv::kAttentionTileRows +
+                                                RelativeAttentionPlan::directTiles(lastSequence) *
+                                                    SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS
+                                          : kv::attentionTiles(command.last.chunk_tokens) * kv::kAttentionTileRows);
   requireBytes(weights.bias, uint64_t{SPLASH_RELATIVE_ATTENTION_EXTENT} * kStates * sizeof(float),
                "attention relative bias");
   const bool last = output.output == AttentionOutput::Last, table = output.input != LinearInput::Plain;
@@ -277,11 +298,17 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
   const AttentionWorkspace workspace = plan.workspace();
   requireBytes(partials, workspace.partialsBytes, "attention partials");
   requireBytes(statistics, workspace.statisticsBytes, "attention statistics");
+  // A dispatch of one split a sequence runs the direct kernel, whose tiles
+  // of SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS rows count first_tile and the
+  // dispatch's tiles, and whose slots, a tile's INT8 query codes, are fewer
+  // than the split's.
   const auto encode = [&](const RelativeAttentionPlan::Dispatch &dispatch, SplashKvLayer layer, uint32_t firstSlot) {
+    const bool direct = plan.direct(dispatch);
     kv::AttentionParams params{.sequences = dispatch.sequences,
                                .first_sequence = dispatch.sequence[0],
                                .rows = rows.rows,
-                               .tiles = dispatch.tiles,
+                               .tiles = direct ? static_cast<uint32_t>(plan.directGroups(dispatch).y)
+                                               : dispatch.tiles,
                                .trees = rows.tree ? 1U : 0U,
                                .last_rows = last ? 1U : 0U,
                                .kv = layer,
@@ -297,17 +324,25 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
       entry.split_count = sequence.splits;
       entry.first_tile = tile;
       entry.first_slot = slot;
-      const uint32_t tiles = kv::attentionTiles(sequence.rows) - sequence.firstTile;
+      const uint32_t tiles = direct ? RelativeAttentionPlan::directTiles(sequence)
+                                    : kv::attentionTiles(sequence.rows) - sequence.firstTile;
       tile += tiles;
       slot += tiles * kKvHeads * sequence.splits;
       tables[d] = histories[s].pageTable;
     }
     const auto bound = laneBindings(std::span(tables).first(dispatch.sequences));
-    std::vector<metal::MetalBuffer> split{staging.queries, partials, statistics};
+    std::vector<metal::MetalBuffer> split{staging.queries, partials};
+    if (!direct) split.push_back(statistics);
     split.insert(split.end(), bound.begin(), bound.end());
     // Without tree rows a split binds another buffer of the dispatch for
     // them, of which it reads nothing.
     split.insert(split.end(), {rows.tree ? rows.tree : partials, rows.layout, staging.states, weights.bias});
+    if (direct) {
+      split.insert(split.end(), {output.packed, output.hidden, tableInput, tableSums, staging.sinks});
+      graph.add(plan.directPipeline() + tableSuffix(output.input), std::move(split), params,
+                plan.directGroups(dispatch));
+      return slot;
+    }
     graph.add(plan.splitPipeline(), std::move(split), params, plan.splitGroups(dispatch));
     graph.add(reducePipeline,
               {partials, statistics, output.packed, output.hidden, tableInput, tableSums, rows.layout, staging.sinks},

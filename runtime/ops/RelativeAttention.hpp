@@ -25,7 +25,10 @@ namespace splash::ops {
 // compiled geometry is the model's: kQueryHeads query heads over the KV heads
 // of the layouts it stores (stores), kWindowTokens keys before each row for a
 // sliding layer. A prompt chunk's layer runs a prepare, a split and a reduce
-// (addProjection, addAttention); a decode step's runs them in one dispatch
+// (addProjection, addAttention), or where each of a dispatch's sequences
+// reads its history in one split, a prepare and the direct kernel, whose
+// tiles of SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS rows write their rows
+// themselves, the same bits; a decode step's runs them in one dispatch
 // (addDecode), each lane's block one tile.
 
 // How one layer attends: over its whole history, or a window of the
@@ -90,9 +93,10 @@ struct RelativeAttentionWorkspace final {
 // a step, as AttentionPlan: each sequence's history splits and the tiles of
 // it that run, its kernels, and the dispatches its sequences share. A
 // prompt chunk's plan (StepKind::Prefill) runs a split and a reduce of its
-// sequences' tiles; a decode step's (StepKind::Decode) its single pass, each
-// lane's block of rows one tile of up to a verify block's rows, whose splits
-// each take two slots: their partials' and their staging's.
+// sequences' tiles, or the direct kernel of a dispatch whose sequences each
+// take one split (direct); a decode step's (StepKind::Decode) its single
+// pass, each lane's block of rows one tile of up to a verify block's rows,
+// whose splits each take two slots: their partials' and their staging's.
 class RelativeAttentionPlan final {
 public:
   using Sequence = AttentionPlan::Sequence;
@@ -106,15 +110,27 @@ public:
   [[nodiscard]] std::span<const Sequence> sequences() const noexcept { return {sequences_.data(), sequenceCount_}; }
   [[nodiscard]] std::span<const Dispatch> dispatches() const noexcept { return {dispatches_.data(), dispatchCount_}; }
   [[nodiscard]] AttentionWorkspace workspace() const noexcept;
-  // A prompt chunk's split and reduce kernels, or a decode step's single
-  // pass; the others are empty.
+  // A prompt chunk's split and reduce kernels and its direct kernel (a
+  // dispatch whose sequences each take one split: direct), or a decode
+  // step's single pass; the others are empty.
   [[nodiscard]] const std::string &splitPipeline() const noexcept { return splitPipeline_; }
   [[nodiscard]] const std::string &reducePipeline() const noexcept { return reducePipeline_; }
+  [[nodiscard]] const std::string &directPipeline() const noexcept { return directPipeline_; }
   [[nodiscard]] const std::string &decodePipeline() const noexcept { return decodePipeline_; }
   // The split's grid, or the single pass's: KV heads, the dispatch's
   // sequences and their most splits.
   [[nodiscard]] metal::DispatchSize splitGroups(const Dispatch &dispatch) const noexcept;
   [[nodiscard]] metal::DispatchSize reduceGroups(const Dispatch &dispatch) const noexcept;
+  // Whether a prompt chunk's dispatch runs the direct kernel instead of the
+  // split and reduce: each of its sequences reads its history in one split.
+  [[nodiscard]] bool direct(const Dispatch &dispatch) const noexcept {
+    return step == StepKind::Prefill && dispatch.splits == 1;
+  }
+  // The direct kernel's grid: KV heads and the dispatch's tiles of
+  // SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS rows (directTiles).
+  [[nodiscard]] metal::DispatchSize directGroups(const Dispatch &dispatch) const noexcept;
+  // A sequence's tiles of the direct kernel, from its first tile's first row.
+  [[nodiscard]] static uint32_t directTiles(const Sequence &sequence) noexcept;
 
 private:
   friend class RelativeAttention;
@@ -126,6 +142,7 @@ private:
   uint32_t dispatchCount_ = 0;
   std::string splitPipeline_;
   std::string reducePipeline_;
+  std::string directPipeline_;
   std::string decodePipeline_;
 };
 
@@ -229,8 +246,11 @@ public:
   // reading its history where `histories` say (dense: no block lists),
   // adding the layer's bias (weights.bias) and its rows' sinks. A dispatch
   // whose sequences read their layer in two placements runs as a dispatch per
-  // run of them that reads one. With rows' tree each sequence is a decode
-  // lane's block of at most 32 rows whose rows attend their paths.
+  // run of them that reads one, and each run whose sequences each read their
+  // history in one split runs the direct kernel in place of the split and
+  // the reduce (RelativeAttentionPlan::direct), the same bits. With rows'
+  // tree each sequence is a decode lane's block of at most 32 rows whose
+  // rows attend their paths.
   static PreparedInput addAttention(metal::CommandGraph &graph, const RelativeAttentionPlan &plan,
                                     const RelativeAttentionStaging &staging, const RelativeAttentionWeights &weights,
                                     const metal::MetalBuffer &partials, const metal::MetalBuffer &statistics,

@@ -7,7 +7,9 @@
 // Relative attention (ops::RelativeAttention, kernels/common/
 // relative_attention_tile.h): its prepare, then the page loop over the tiles
 // of a dispatch's sequences and the reduce, laid out and bound as the paged
-// attention's (kernels/shared/paged_attention.metal), each tile
+// attention's (kernels/shared/paged_attention.metal), or, a dispatch whose
+// tiles each read their history in one split, the direct kernels, which
+// write their tiles' rows themselves (Direct below); each tile
 // SPLASH_ATTENTION_TILE_ROWS query rows of one KV head, every sequence of a
 // command in one dispatch, its rows its entry of the command's layout. The
 // geometry is Inkling-2-Mini's: 24 query heads over 8 KV heads of 128
@@ -232,6 +234,187 @@ RELATIVE_ATTENTION_REDUCE(relative_attention_reduce, 0)
 RELATIVE_ATTENTION_REDUCE(relative_attention_reduce_w1023, 1023)
 #undef RELATIVE_ATTENTION_REDUCE
 #undef RELATIVE_ATTENTION_REDUCE_KERNEL
+
+// Direct (ops::RelativeAttention::addAttention, a dispatch whose sequences
+// each read their history in one split): a threadgroup of 256 threads per (KV
+// head, tile), each tile SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS rows of one KV
+// head, a sequence's tiles the dispatch's from its first_tile on in tiles of
+// that many rows. A tile runs the split's page loop over its one run of pages,
+// those of its first row's window to its last row's: the union of the runs of
+// its two paged-attention tiles of the same rows, whose other pages none of a
+// row's keys sit on, so that their probabilities are zero and leave the row's
+// statistics and output as they were. It then writes its rows' output as the
+// reduce does from that
+// one split: a thread a fused row its weight and denominator, each thread the
+// gated outputs of the running output's elements it holds, and, with Table, a
+// simdgroup a span of a fused row's outputs (read back from `hidden`) into the
+// out-projection's Table16 input. The INT8 query codes take the slot of
+// partials at the tile's first_slot plus its tile and KV head. Measured on a
+// 2,048-row chunk's layer (20-core M5 Pro): the reduce and the partials it
+// reads took a sliding layer's attention 10% of its time after 2,048 tokens
+// (4.55 ms against 4.10 without) and a full layer's 1.7% after 8,192; a
+// tile of twice the rows, which reads each page once for both, ran 5-11%
+// faster than two tiles at short histories (0 to 2,048 tokens) and 0.6-4%
+// at 8,192 and 30,720.
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement, bool Int8Queries,
+          bool Table>
+inline void relative_attention_direct_phase(
+    device bfloat *queries, device float *partials, device const SplashKvPage *page_table,
+    device const SplashTreeRow *tree, device const SplashLaneRows *layout, device const float *relative_states,
+    device const float *relative_bias, device const bfloat *projection, device bfloat *hidden, device bfloat *table,
+    device float *sums, device const float *sinks, constant SplashAttentionParams &params, threadgroup float *scores,
+    threadgroup bfloat *probabilities, threadgroup float *row_max, threadgroup float *row_sum,
+    threadgroup float *previous_scale, threadgroup atomic_uint *rescale, uint3 group, uint thread_index, uint lane,
+    uint simd_group, uint s) {
+  constexpr uint Rows = SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS;
+  constexpr uint M = QueryHeadsPerKVHead * Rows, D = HeadDim, QHeads = KVHeads * QueryHeadsPerKVHead;
+  constexpr uint Width = QHeads * HeadDim, Simdgroups = 8;
+  using Row = RelativeAttentionRow<QHeads, HeadDim>;
+  const uint kv_head = group.x;
+  constant SplashAttentionSequence &sequence = params.sequence[s];
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, s);
+  const uint tile = group.y - sequence.first_tile, start = tile * Rows;
+  if (!splash_attention_contract_valid(params, sequence) || sequence.split_count != 1 || kv_head >= KVHeads ||
+      start >= rows.rows)
+    return;
+  const uint first_position = sequence.committed_tokens + start, active_rows = min(Rows, rows.rows - start);
+  const ulong offset =
+      (ulong(sequence.stage_row) + ulong(kv_head) * sequence.chunk_stride + start) * QueryHeadsPerKVHead * HeadDim;
+  const RelativeAttentionPages run =
+      relative_attention_pages<Window>(first_position, active_rows, params.trees != 0, sequence.committed_tokens, 1, 0);
+  device float *codes = partials + (ulong(sequence.first_slot) + ulong(tile) * KVHeads + kv_head) *
+                                       (SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead) * HeadDim;
+  static_assert(M * HeadDim <= SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead * HeadDim * sizeof(float),
+                "a tile's query codes fit a slot of the paged attention's partials");
+  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement, Int8Queries>(
+      queries + offset, reinterpret_cast<device int8_t *>(codes),
+      relative_states + offset / HeadDim * SPLASH_RELATIVE_ATTENTION_STATES, relative_bias, page_table, params.kv,
+      kv_head, first_position, active_rows, run, scores, probabilities, row_max, row_sum, previous_scale, rescale,
+      splash_attention_tree(params, sequence, rows, tree, first_position), thread_index,
+      [&](thread auto &running, bool running_full) {
+        // relative_attention_combine_splits of the one split: each active
+        // fused row's weight into previous_scale and its denominator into
+        // row_sum, from its statistics and its sink. The denominator rounds
+        // its split's product before it adds the sink's term, as the reduce's
+        // loop over splits does: contracted into one fused multiply-add, the
+        // two gave other bits.
+        if (thread_index < M && thread_index / QueryHeadsPerKVHead < active_rows) {
+#pragma clang fp contract(off)
+          const float sink = sinks[offset / HeadDim + thread_index];
+          const float maximum = row_max[thread_index];
+          const float row_maximum = max(maximum, sink);
+          const float weight = fast::exp(maximum - row_maximum);
+          float denominator = 0.0f;
+          denominator += weight * row_sum[thread_index];
+          denominator += fast::exp(sink - row_maximum);
+          previous_scale[thread_index] = weight;
+          row_sum[thread_index] = denominator;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (ushort index = 0; index < running.get_capacity(); ++index) {
+          if (!running_full && !running.is_valid_element(index))
+            continue;
+          const auto coordinates = running.get_multidimensional_index(index);
+          const uint fused_row = uint(coordinates[1]), dimension = uint(coordinates[0]);
+          const uint row = fused_row / QueryHeadsPerKVHead;
+          if (row >= active_rows)
+            continue;
+          const SplashAttentionOutput place = splash_attention_output(params, s, rows, start + row);
+          if (!place.writes)
+            continue;
+          float numerator = 0.0f;
+          numerator += previous_scale[fused_row] * running[index];
+          const float denominator = row_sum[fused_row];
+          const bfloat value = bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+          const uint query_head = kv_head * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead;
+          const float gate =
+              float(projection[place.packed * Row::Stride + Row::GateOffset + query_head * HeadDim + dimension]);
+          hidden[place.output * Width + query_head * HeadDim + dimension] =
+              bfloat(float(value) * splash_sigmoid(gate));
+        }
+        if constexpr (Table) {
+          static_assert(D == 128, "two spans of 64 outputs a head");
+          threadgroup_barrier(mem_flags::mem_device);
+          for (uint span = simd_group; span < 2 * M; span += Simdgroups) {
+            const uint fused_row = span / 2, row = fused_row / QueryHeadsPerKVHead;
+            if (row >= active_rows)
+              continue;
+            const SplashAttentionOutput place = splash_attention_output(params, s, rows, start + row);
+            if (!place.writes)
+              continue;
+            const uint first =
+                (kv_head * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead) * HeadDim + span % 2 * 64 + 2 * lane;
+            device const bfloat *pair = hidden + place.output * Width + first;
+            gguf_sg::Table16::write(table + place.output / 8 * Width * 8,
+                                    sums + place.output / 8 * gguf_sg::Table16::sums_per_tile(Width), Width,
+                                    first / 64, place.output % 8, lane, pair[0], pair[1]);
+          }
+        }
+      });
+}
+
+// The split's bindings without its statistics, then the reduce's: the
+// projection rows (their gates), the out-projection's input rows, its table
+// and the table's sums (other buffers of the dispatch without a table) and
+// the rows' sinks' staging, before the parameters. Over the whole history and
+// a sliding layer's window, for INT8 pages with bf16 or INT8 queries and BF16
+// pages, each plain and, _table16, writing the out-projection's Table16 input
+// too.
+#define RELATIVE_ATTENTION_DIRECT_KERNEL(Name, Window, CacheElement, Int8Queries, Table)                         \
+  kernel void Name(                                                                                           \
+      device bfloat *queries [[buffer(0)]],                                                                   \
+      device float *partials [[buffer(1)]],                                                                   \
+      device const SplashKvPage *page_table0 [[buffer(2)]],                                                   \
+      device const SplashKvPage *page_table1 [[buffer(3)]],                                                   \
+      device const SplashKvPage *page_table2 [[buffer(4)]],                                                   \
+      device const SplashKvPage *page_table3 [[buffer(5)]],                                                   \
+      device const SplashKvPage *page_table4 [[buffer(6)]],                                                   \
+      device const SplashKvPage *page_table5 [[buffer(7)]],                                                   \
+      device const SplashKvPage *page_table6 [[buffer(8)]],                                                   \
+      device const SplashKvPage *page_table7 [[buffer(9)]],                                                   \
+      device const SplashTreeRow *tree [[buffer(10)]],                                                        \
+      device const SplashLaneRows *layout [[buffer(11)]],                                                     \
+      device const float *relative_states [[buffer(12)]],                                                     \
+      device const float *relative_bias [[buffer(13)]],                                                       \
+      device const bfloat *projection [[buffer(14)]],                                                         \
+      device bfloat *hidden [[buffer(15)]],                                                                   \
+      device bfloat *table [[buffer(16)]],                                                                    \
+      device float *sums [[buffer(17)]],                                                                      \
+      device const float *sinks [[buffer(18)]],                                                               \
+      constant SplashAttentionParams &params [[buffer(19)]],                                                  \
+      uint3 group [[threadgroup_position_in_grid]],                                                           \
+      uint thread_index [[thread_index_in_threadgroup]],                                                      \
+      uint lane [[thread_index_in_simdgroup]],                                                                \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                                                   \
+    constexpr uint M = 3 * SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS;                                             \
+    constexpr uint N = SplashKvPageTokens;                                                                    \
+    alignas(16) threadgroup float scores[M * N];                                                              \
+    alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
+    threadgroup float row_max[M];                                                                             \
+    threadgroup float row_sum[M];                                                                             \
+    threadgroup float previous_scale[M];                                                                      \
+    threadgroup atomic_uint rescale;                                                                          \
+    const uint s = splash_attention_sequence_of_tile(params, group.y);                                        \
+    relative_attention_direct_phase<8, 3, 128, Window, CacheElement, Int8Queries, Table>(                     \
+        queries, partials,                                                                                    \
+        SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5,  \
+                            page_table6, page_table7),                                                        \
+        tree, layout, relative_states, relative_bias, projection, hidden, table, sums, sinks, params, scores,  \
+        probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index, lane, simd_group, s);   \
+  }
+#define RELATIVE_ATTENTION_DIRECT_OUTPUTS(Name, Window, CacheElement, Int8Queries)                              \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(Name, Window, CacheElement, Int8Queries, false)                              \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(Name##_table16, Window, CacheElement, Int8Queries, true)
+#define RELATIVE_ATTENTION_DIRECTS(Suffix, Window)                                                            \
+  RELATIVE_ATTENTION_DIRECT_OUTPUTS(relative_attention_q8_direct##Suffix, Window, int8_t, false)              \
+  RELATIVE_ATTENTION_DIRECT_OUTPUTS(relative_attention_q8q_direct##Suffix, Window, int8_t, true)              \
+  RELATIVE_ATTENTION_DIRECT_OUTPUTS(relative_attention_bf16_direct##Suffix, Window, bfloat, false)
+RELATIVE_ATTENTION_DIRECTS(, 0)
+RELATIVE_ATTENTION_DIRECTS(_w1023, 1023)
+#undef RELATIVE_ATTENTION_DIRECTS
+#undef RELATIVE_ATTENTION_DIRECT_OUTPUTS
+#undef RELATIVE_ATTENTION_DIRECT_KERNEL
 
 // Single pass (ops::RelativeAttention::addDecode): a decode step's prepare,
 // split and reduce in one dispatch, a threadgroup of 256 threads per (KV

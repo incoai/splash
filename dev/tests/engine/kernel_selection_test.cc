@@ -164,12 +164,14 @@ public:
       if (!name.empty()) names_.try_emplace(name, where);
   }
   // A relative attention plan's (ops::RelativeAttention) split and reduce
-  // kernels, or a decode plan's single pass, plain and writing the
-  // out-projection's table; and a layer's prepare of a variant and the path
-  // commit of its pages.
+  // kernels and its direct kernel, or a decode plan's single pass, those that
+  // write rows plain and writing the out-projection's table; and a layer's
+  // prepare of a variant and the path commit of its pages.
   void attention(const std::string &where, const RelativeAttentionPlan &plan) {
     const std::string &output = plan.step == StepKind::Decode ? plan.decodePipeline() : plan.reducePipeline();
-    for (const std::string &name : {plan.splitPipeline(), output, output + tableSuffix(LinearInput::Table16)})
+    const std::string &direct = plan.directPipeline();
+    for (const std::string &name : {plan.splitPipeline(), output, output + tableSuffix(LinearInput::Table16), direct,
+                                    direct.empty() ? direct : direct + tableSuffix(LinearInput::Table16)})
       if (!name.empty()) names_.try_emplace(name, where);
   }
   void relativePrepare(const std::string &where, kv::Layout layout, RelativeAttentionVariant variant) {
@@ -628,7 +630,9 @@ std::string describe(const RelativeAttentionPlan &plan) {
     line += std::to_string(sequence.splits) + (&sequence == &plan.sequences().back() ? "" : ",");
   for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches())
     line += " [" + std::to_string(dispatch.sequences) + " tiles " + std::to_string(dispatch.tiles) + " groups " +
-            describe(plan.splitGroups(dispatch)) + (decode ? "" : " " + describe(plan.reduceGroups(dispatch))) +
+            (plan.direct(dispatch) ? plan.directPipeline() + " " + describe(plan.directGroups(dispatch))
+                                   : describe(plan.splitGroups(dispatch)) +
+                                         (decode ? "" : " " + describe(plan.reduceGroups(dispatch)))) +
             "]";
   return line + " workspace " + describe(plan.workspace());
 }
