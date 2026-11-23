@@ -628,6 +628,21 @@ class QwenGrammarTests(unittest.TestCase):
         )
         self.assertEqual(GLM_ARGS.argument_tags, ("<arg_key>", "</tool_call>"))
 
+    def test_a_syntax_that_lays_a_call_out_otherwise_is_refused(self):
+        for syntax, changes in (
+            # A json call names its function in a header that name_close
+            # ends, and states its object's keys.
+            (INKLING2_JSON, {"name_close": ""}),
+            (INKLING2_JSON, {"json_name_key": None}),
+            (INKLING2_JSON, {"json_arguments_key": None}),
+            (INKLING2_JSON, {"arguments": "xml"}),
+            # A tags call has none, and its name ends at a tag.
+            (GLM_ARGS, {"json_name_key": "name"}),
+            (GLM_ARGS, {"key_open": ""}),
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                replace(syntax, **changes)
+
 
 class FlintTokenizerContractTests(unittest.TestCase):
     def test_flint_s_tokens_are_checked_against_its_format(self):
@@ -1107,10 +1122,10 @@ class InklingCallReadingTests(unittest.TestCase):
 
     POLICY = tool_policy(SCHEMAS)
 
-    def read(self, text, size, incomplete=False):
+    def read(self, text, size, incomplete=False, syntax=INKLING2_JSON):
         splitter = model_output.ReasoningSplitter(False, True, INKLING2)
         projector = model_output.StreamingToolCallProjector(
-            self.POLICY, "r", syntax=INKLING2_JSON, think_close=END
+            self.POLICY, "r", syntax=syntax, think_close=END
         )
         reasoning, events = [], []
         pieces = [text[offset : offset + size] for offset in range(0, len(text), size)]
@@ -1175,6 +1190,32 @@ class InklingCallReadingTests(unittest.TestCase):
                 self.assertEqual(
                     json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
                 )
+
+    def test_a_json_call_s_object_takes_the_keys_its_syntax_states(self):
+        self.assertEqual(
+            INKLING2_JSON.json_prefix("weather"), '{"name":"weather","args":'
+        )
+        syntax = replace(
+            INKLING2_JSON, json_name_key="function", json_arguments_key="arguments"
+        )
+        self.assertEqual(
+            syntax.json_prefix("wéather"), '{"function":"wéather","arguments":'
+        )
+        header = MODEL + "weather<|content_invoke_tool_json|>"
+        for body in (
+            # Streamed after the object's name, and laid out otherwise, read
+            # whole.
+            '{"function":"weather","arguments":{"city":"Paris"}}',
+            '{ "arguments": {"city": "Paris"}, "function": "weather" }',
+        ):
+            text = header + body + END
+            for size in (1, 5, len(text)):
+                with self.subTest(body=body, size=size):
+                    _, _, calls, _ = self.read(text, size, syntax=syntax)
+                    self.assertEqual(
+                        json.loads(calls[0]["function"]["arguments"]),
+                        {"city": "Paris"},
+                    )
 
 
 class InklingGrammarTests(unittest.TestCase):

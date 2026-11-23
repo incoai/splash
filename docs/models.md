@@ -984,7 +984,10 @@ its target layout's; the tags that open and close its reasoning (`<think>` and
 reasoning itself, and those that frame its answer's text where it has any;
 the call syntax, with the tags a call opens and closes with and the token of
 its opening, its arguments either tags around each argument or one JSON
-object; whether the model opens its own message; the special tokens decoding
+object, after a header that names the function, whose keys for the name and
+the arguments the syntax states (`"name"` and `"args"` for Inkling 2; a syntax
+that lays a call out otherwise is refused where it is defined); whether the
+model opens its own message; the special tokens decoding
 keeps in the text it reads (`visible_tags`: Inkling 2's tags, every other
 special token, its stop token among them, decoding to nothing); and the
 special token after which prompt tokenization reuses a cached prompt's tokens,

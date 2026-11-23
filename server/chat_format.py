@@ -33,9 +33,12 @@ class ToolCallSyntax:
     arguments. Arguments of the "tags" kind are each argument, then
     arguments_close; an argument is key_open, its name and key_close, then
     value_open, its value and value_close. Arguments of the "json" kind are
-    one JSON object, {"name": NAME, "args": ARGUMENTS}, as the call's whole
-    text before call_close. Grammars write calls that way (tool_schema.py),
-    and the projector reads them that way (output.py)."""
+    one JSON object of the function's name and its arguments under the keys
+    the syntax states, {json_name_key: NAME, json_arguments_key: ARGUMENTS},
+    as the call's whole text before call_close, after the header that names
+    the function (name_close ends it). Grammars write calls that way
+    (tool_schema.py), and the projector reads them that way (output.py); a
+    syntax that lays a call out otherwise is refused where it is defined."""
 
     name_open: str
     name_close: str
@@ -53,6 +56,27 @@ class ToolCallSyntax:
     call_close: str = TOOL_CALL_CLOSE
     # How its arguments are laid out: "tags" or "json".
     arguments: str = "tags"
+    # A "json" call's object keys: its function's name's and its arguments'
+    # (json_prefix); a "tags" call has none.
+    json_name_key: str | None = None
+    json_arguments_key: str | None = None
+
+    def __post_init__(self):
+        """A call's name ends at a tag after it (name_end). A "json" call
+        names its function in a header before its object, which name_close
+        ends, and states its object's keys; a "tags" call states none."""
+        if self.arguments not in ("tags", "json"):
+            raise ValueError(f"a call's arguments are tags or json: {self.arguments!r}")
+        if not (self.name_close or self.key_open):
+            raise ValueError("a call's name ends at a tag (name_close or key_open)")
+        keys = (self.json_name_key, self.json_arguments_key)
+        if self.arguments == "json" and not (self.name_close and all(keys)):
+            raise ValueError(
+                "a json call's header ends at name_close, and the call states "
+                "its object's keys (json_name_key, json_arguments_key)"
+            )
+        if self.arguments == "tags" and any(key is not None for key in keys):
+            raise ValueError("a tags call has no object keys")
 
     @property
     def call_open(self):
@@ -66,10 +90,14 @@ class ToolCallSyntax:
 
     def json_prefix(self, name):
         """What a call of the "json" kind writes of tool `name` before its
-        arguments, as the template writes it: its object's name, compact, as
-        the template's tojson writes it, its characters unescaped."""
-        name = json.dumps(name, ensure_ascii=False, separators=(",", ":"))
-        return '{"name":' + name + ',"args":'
+        arguments, as the template writes it: its object's name under its
+        key, then its arguments' key, compact, as the template's tojson
+        writes them, their characters unescaped."""
+        name_key, name, arguments_key = (
+            json.dumps(text, ensure_ascii=False, separators=(",", ":"))
+            for text in (self.json_name_key, name, self.json_arguments_key)
+        )
+        return "{" + name_key + ":" + name + "," + arguments_key + ":"
 
     @property
     def name_end(self):
@@ -138,6 +166,8 @@ INKLING2_JSON = ToolCallSyntax(
     call_tag="<|message_model|>",
     call_close="<|end_message|>",
     arguments="json",
+    json_name_key="name",
+    json_arguments_key="args",
 )
 
 

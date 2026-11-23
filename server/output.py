@@ -503,8 +503,9 @@ class StreamingToolCallProjector:
         """End a call of the "json" kind at its close, `text` the rest of its
         object. Its arguments streamed as written, after the object's name
         (body_arguments), end at the object's own close; an object laid out
-        otherwise is read whole: its args, or its text as written where it
-        holds none, as a cut call keeps its text."""
+        otherwise is read whole: its arguments, under the syntax's
+        json_arguments_key, or its text as written where it holds none, as a
+        cut call keeps its text."""
         if self.state == "body_arguments":
             text = text.rstrip()
             self._emit_argument(text.removesuffix("}"), events)
@@ -513,7 +514,8 @@ class StreamingToolCallProjector:
                 value = json_codec.loads(text)
             except ValueError:
                 value = None
-            arguments = value.get("args") if isinstance(value, dict) else None
+            key = self.syntax.json_arguments_key
+            arguments = value.get(key) if isinstance(value, dict) else None
             if isinstance(arguments, dict):
                 text = json_codec.dumps(arguments)
             self._emit_argument(text.strip() or "{}", events)
