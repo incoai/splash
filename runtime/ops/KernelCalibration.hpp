@@ -284,7 +284,9 @@ inline constexpr ProjectionCalibration kApple10Projection{
     // the decode tiles runs the int8 prefill tile where it takes the formats:
     // at least 1.13x less time than the bf16 tile over the 27B's projection
     // shapes in af4g64 and af5g64 at 65-2048 rows (M5 Max, M5 Pro and M6,
-    // measured).
+    // measured); with Q8_0 projections on it, Inkling-2-Mini's GGUF
+    // prefill takes 0.4-1.5% less time at 512-32K tokens and
+    // Qwen3.6-35B-A3B's 3.8-4.1% at 512-4K (20-core M5 Pro, measured).
     .prefillInt8 = true,
 };
 

@@ -296,9 +296,10 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // holds runs the int8 prefill tile, unsplit, where its work takes the int8
 // prefill paths and the tile takes the unit (1.13-2.4x less time than the bf16
 // tiles over the 27B's shapes at 65-2048 rows on a 32-core M5 Max, a 16-core
-// M5 Pro and a 12-core M6), and a staged plan runs the int8 decode tiles
-// where they take the unit and its plan (decodeInt8), at the plan's storage
-// rows, splits and passes.
+// M5 Pro and a 12-core M6; with Q8_0 units on it, Inkling-2-Mini's and
+// Qwen3.6-35B-A3B's GGUF prefills 0.4-4.1% less on a 20-core M5 Pro), and a staged
+// plan runs the int8 decode tiles where they take the unit and its plan
+// (decodeInt8), at the plan's storage rows, splits and passes.
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations, StepKind step,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   LinearConfig config = bf16Projection(calibration, step, w, unit, pairTensors);

@@ -19,9 +19,9 @@
 // - int8 decode: rotated PQ2_0 projections on the int8 decode tiles (LinearConfig::decodeInt8) within the fp32
 //   rounding of the exact products of their int8 codes, at every lane count, split, walk and pass mode, the
 //   production plans in int8 activations, and a non-finite input's row alone not finite;
-// - int8 prefill (af4g64, af5g64, where the family runs it): the products of the inputs rounded per row and 64-input
-//   group, also with an outlier input per row, within a bound of the bf16 tile's error, a chunk's last rows at their
-//   own height and a view of leading inputs bitwise, and a non-finite input's row alone not finite;
+// - int8 prefill (af4g64, af5g64 and Q8_0, where the family runs it): the products of the inputs rounded per row and
+//   64-input group, also with an outlier input per row, within a bound of the bf16 tile's error, a chunk's last rows at
+//   their own height and a view of leading inputs bitwise, and a non-finite input's row alone not finite;
 // - row views: the fp32 decode of a view of a tensor's leading and last rows (the draft's vocabulary head over its
 //   subset), a dispatch per range, bitwise those columns of the whole tensor's, every format on both decode tiles
 //   and rotated PQ2_0 in bf16 and int8 activations;
@@ -1237,21 +1237,22 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
 }
 
 // ---------------------------------------------------------------- int8 prefill
-// LinearTile::GgufPrefillInt8 over af4g64 and af5g64, where the device's family runs it. Its outputs are the products
-// of the inputs rounded to int8 per row and 64-input group (scaled by the group's largest magnitude), within the
-// error of the bf16 tile's on the exact inputs, on dense inputs and on dense inputs with one input of 1000 per row (a
-// model's outlier channel), which a scale per row would let zero the rest of its row. On dense inputs the RMS error
+// LinearTile::GgufPrefillInt8 over af4g64, af5g64 and Q8_0, where the device's family runs it. Its outputs are the
+// products of the inputs rounded to int8 per row and 64-input group (scaled by the group's largest magnitude), within
+// the error of the bf16 tile's on the exact inputs, on dense inputs and on dense inputs with one input of 1000 per row
+// (a model's outlier channel), which a scale per row would let zero the rest of its row. On dense inputs the RMS error
 // it adds over the bf16 tile's, relative to the outputs, stays within kBound. Outputs are finite and rows past the
 // chunk unwritten, at each epilogue, chunks of 168, 136 and 65 rows ending inside a row tile, one of 600 rows whose
 // walk ends on a partial block of row tiles, also over 5 column tiles, whose GEMM grid, 16 threadgroups wide, ends in
-// one past its tiles, the full budget and fused segments, of one format and of both. A
-// chunk's last 1 and 4 rows at their own height, as a prefill's last layer runs the rows something reads
-// (Linear::plan of a chunk's rows), write the chunk's bits. A fused projection quantizes its rows once and
-// runs a GEMM dispatch per segment, and a SwiGLU's up takes its gate's codes (LinearInput::PrefillInt8), bit for bit.
-// A view of leading inputs gives its inputs repacked bit for bit. A non-finite input leaves its row's outputs not
-// finite, as the bf16 tile's, and no other row's changed. Unlike the int8 decode test's exact model, these bounds are
-// RMS ones against the bf16 tile's own error: this tile's per-group affine folds lie outside projectionBound's model
-// of exact products accumulated in fp32.
+// one past its tiles, the full budget and fused segments, of one format and of two (af4g64 with af5g64, and with Q8_0,
+// as a safetensors target's BF16 projections load beside its MLX ones). A chunk's last 1 and 4 rows at their own
+// height, as a prefill's last layer runs the rows something reads (Linear::plan of a chunk's rows), write the chunk's
+// bits. A fused projection quantizes its rows once and runs a GEMM dispatch per segment, and a SwiGLU's up takes its
+// gate's codes (LinearInput::PrefillInt8), bit for bit, whatever the two formats: Q8_0's tile reads the codes in the
+// affine tiles' order. A view of leading inputs gives its inputs repacked bit for bit. A non-finite input leaves its
+// row's outputs not finite, as the bf16 tile's, and no other row's changed. Unlike the int8 decode test's exact model,
+// these bounds are RMS ones against the bf16 tile's own error: this tile's per-group affine folds lie outside
+// projectionBound's model of exact products accumulated in fp32.
 void prefillInt8(MetalBackend &backend, const Linear &linear) {
   if (!linear.calibration().projection.prefillInt8) {
     section("int8 prefill: skipped, the family does not run it");
@@ -1260,7 +1261,7 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
   constexpr LinearConfig kTile{.tile = LinearTile::GgufPrefill}, kInt8{.tile = LinearTile::GgufPrefillInt8};
   constexpr double kBound = 1e-2;
   // The tile computes the products of the rounded inputs: its error from them stays within this multiple of the bf16
-  // tile's error on the exact inputs (1.01x measured, 20-core M5 Pro).
+  // tile's error on the exact inputs (1.01x measured, 20-core M5 Pro; at most 1.024x with Q8_0's cases, 12-core M6).
   constexpr double kRoundedBound = 1.25;
   constexpr float kOutlier = 1000;
   double worst = 0, worstRounded = 0;
@@ -1349,7 +1350,7 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
       if (!sameRows(alone.output, 0, out.output, rows - last, last, columns)) fail(own + ": differ from the chunk's");
     }
   };
-  for (const Fmt f : {Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF5G64)}) {
+  for (const Fmt f : {Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF5G64), Fmt(GGUF_FMT_Q80)}) {
     for (const uint32_t K : {1024u, 5120u}) {
       const Tensor t = tensor(backend, f, 1024, K);
       const Projection p = projection({&t}, t.N);
@@ -1397,22 +1398,35 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
         run(backend, linear, plan, compact, nullptr, x, aux, kPoisonNaN, N, label).output)
       fail(label + ": differs from the repacked leading inputs");
   }
-  // af4g64 and af5g64 segments fused, as a mixed 4/5-bit MLX quantization does.
-  for (const uint32_t K : {1024u, 5120u}) {
-    const Tensor a = tensor(backend, Fmt(GGUF_FMT_AF4G64), 512, K), b = tensor(backend, Fmt(GGUF_FMT_AF5G64), 256, K),
-                 c = tensor(backend, Fmt(GGUF_FMT_AF4G64), 256, K);
-    const std::vector<const Tensor *> parts{&a, &b, &c};
-    for (const bool outliers : {false, true})
-      chunk(projection(parts, segmentColumns(parts) + kPadding), parts, LinearEpilogue::None, 168, outliers,
-            "af4g64+af5g64 fused");
-  }
-  // A SwiGLU's up after its gate over the same rows takes the codes and scales the gate's plan left in the scratch
-  // (LinearInput::PrefillInt8): it quantizes nothing itself and writes the bits of its plan run alone.
+  // Q8_0 at K 320, five 64-input groups, no multiple of 256: Flash-Next's hyper-connection up projection takes 320
+  // inputs in Q8_0.
   {
+    const Tensor t = tensor(backend, Q80, 1024, 320);
+    const Projection p = projection({&t}, t.N);
+    for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual})
+      for (const bool outliers : {false, true}) chunk(p, {&t}, e, 168, outliers, "q80");
+  }
+  // af4g64 segments fused with af5g64, as a mixed 4/5-bit MLX quantization does, and with Q8_0, as a safetensors
+  // target's BF16 projections load beside its MLX ones (one quantization of the rows for both tiles' schedules).
+  for (const uint32_t other : {GGUF_FMT_AF5G64, GGUF_FMT_Q80})
+    for (const uint32_t K : {1024u, 5120u}) {
+      const Tensor a = tensor(backend, Fmt(GGUF_FMT_AF4G64), 512, K), b = tensor(backend, Fmt(other), 256, K),
+                   c = tensor(backend, Fmt(GGUF_FMT_AF4G64), 256, K);
+      const std::vector<const Tensor *> parts{&a, &b, &c};
+      for (const bool outliers : {false, true})
+        chunk(projection(parts, segmentColumns(parts) + kPadding), parts, LinearEpilogue::None, 168, outliers,
+              std::string("af4g64+") + fmtName(Fmt(other)) + " fused");
+    }
+  // A SwiGLU's up after its gate over the same rows takes the codes and scales the gate's plan left in the scratch
+  // (LinearInput::PrefillInt8): it quantizes nothing itself and writes the bits of its plan run alone, an affine gate's
+  // up and a Q8_0 gate's alike.
+  for (const auto [gateFormat, upFormat] : {std::pair{GGUF_FMT_AF4G64, GGUF_FMT_AF5G64},
+                                            std::pair{GGUF_FMT_Q80, GGUF_FMT_AF4G64},
+                                            std::pair{GGUF_FMT_AF4G64, GGUF_FMT_Q80}}) {
     constexpr uint32_t N = 256, K = 1024, kRows = 168;
-    const Tensor gateTensor = tensor(backend, Fmt(GGUF_FMT_AF4G64), N, K),
-                 upTensor = tensor(backend, Fmt(GGUF_FMT_AF5G64), N, K);
+    const Tensor gateTensor = tensor(backend, Fmt(gateFormat), N, K), upTensor = tensor(backend, Fmt(upFormat), N, K);
     const Projection gate = projection({&gateTensor}, N), up = projection({&upTensor}, N);
+    const std::string pair = std::string("int8 SwiGLU ") + fmtName(Fmt(gateFormat)) + "/" + fmtName(Fmt(upFormat));
     const LinearPlan gatePlan =
         Linear::plan({{N, K}, kRows, LinearEpilogue::None}, kInt8, FloatOutput::BFloat16);
     const LinearPlan upPlan =
@@ -1437,15 +1451,15 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
     if (codes.layout != LinearInput::PrefillInt8 ||
         std::any_of(graph.dispatches().begin() + gateDispatches, graph.dispatches().end(),
                     [](const ComputeDispatch &d) { return d.pipelineName == "gguf_prefill_int8_quantize"; }))
-      fail("int8 SwiGLU: the up projection quantized its gate's rows again");
+      fail(pair + ": the up projection quantized its gate's rows again");
     const Outcome alone = run(backend, linear, upPlan, up, nullptr, x, gateOutput.halves(), kPoisonNaN, N,
-                              "int8 SwiGLU up alone");
+                              pair + " up alone");
     if (!sameRows(upOutput.halves(), 0, alone.output, 0, kRows, N))
-      fail("int8 SwiGLU: the up projection on its gate's codes differs from its own");
+      fail(pair + ": the up projection on its gate's codes differs from its own");
   }
   // A NaN in one row's inputs and an infinity in another's leave those rows' outputs not finite, on this tile as on
   // the bf16 tile, and every other row's as they were.
-  for (const Fmt f : {Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF5G64)}) {
+  for (const Fmt f : {Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF5G64), Fmt(GGUF_FMT_Q80)}) {
     constexpr uint32_t K = 1024, kRows = 136, kNaNRow = 3, kInfiniteRow = 70;
     const Tensor t = tensor(backend, f, 256, K);
     const Projection p = projection({&t}, t.N);
@@ -1472,12 +1486,13 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
       }
     }
   }
-  section("int8 prefill: af4g64, af5g64 and both fused, K 1024 and 5120, plain/residual/up-with-gate over 168-, "
-          "136- and 65-row chunks with and without outliers, 600 rows and the " +
+  section("int8 prefill: af4g64, af5g64, q80, af4g64 fused with af5g64 and with q80, K 1024 and 5120 (q80 320 too), "
+          "plain/residual/up-with-gate over 168-, 136- and 65-row chunks with and without outliers, 600 rows and the " +
           std::to_string(SPLASH_PREFILL_TOKEN_BUDGET) + "-row budget: worst added relative RMS " +
           std::to_string(worst) + ", worst error from the inputs rounded per group " + std::to_string(worstRounded) +
           "x the bf16 tile's; a fused projection quantized once and a GEMM a segment; last rows, leading inputs and "
-          "an up on its gate's codes bitwise; a non-finite input leaves its row alone not finite");
+          "an up on its gate's codes (affine and q80 gates) bitwise; a non-finite input leaves its row alone not "
+          "finite");
 }
 
 // ---------------------------------------------------------------- leading inputs

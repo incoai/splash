@@ -91,7 +91,7 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // (Apple9), over an activation table, all the plan's rows in one threadgroup,
 // up to kMaximumRegisterRows, optional K splits.
 // GgufPrefillInt8: a prefill chunk's plans past one row group of MLX affine
-// 4- and 5-bit g64 weights (quant_prefill_int8_format) in int8 activations, quantized per row
+// 4- and 5-bit g64 and Q8_0 weights (quant_prefill_int8_format) in int8 activations, quantized per row
 // and 64-input group into the scratch table, against the weights' exact codes
 // (kernels/prefill/gguf_prefill_int8.metal); not exact, unsplit, the prefill
 // tile's storage rows.

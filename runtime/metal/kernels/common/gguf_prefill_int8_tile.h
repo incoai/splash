@@ -1,7 +1,7 @@
 #pragma once
-// The int8-activation tile for MLX affine 4- and 5-bit weights in groups of 64 (af4g64, af5g64), which the dense
-// prefill GEMMs (kernels/prefill/gguf_prefill_int8.metal) and the MoE experts' prefill passes
-// (kernels/shared/moe_int8.metal) run: see gguf_prefill_int8.metal for its arithmetic and fragment schedule.
+// The int8-activation tile for MLX affine 4- and 5-bit weights in groups of 64 (af4g64, af5g64) and Q8_0, which the
+// dense prefill GEMMs (kernels/prefill/gguf_prefill_int8.metal) and the MoE experts' prefill passes
+// (kernels/shared/moe_int8.metal) run: see gguf_prefill_int8.metal for its arithmetic and fragment schedules.
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/gguf_tile.h"
 
@@ -34,6 +34,7 @@ inline uint prefill_int8_fifth(uint b) {
 
 // A tile of GGUF_PREFILL_INT8_SIMDGROUPS simdgroups, each 32 rows (two 16-row fragments) by 32 columns, at (column
 // tile, row tile) `tile`, its sums times `scale` (an expert pass's expert scale, moe_int8.metal) before the epilogue.
+// BITS is the weights' code width: 4 or 5 for af4g64 and af5g64, 8 for Q8_0.
 template <int BITS, GgufEpilogue Ep>
 inline void prefill_int8_tile(device const char *codes, device const float2 *scales, device const uchar *w0,
                               device const uchar *w1, device const uchar *meta, device bfloat *output,
@@ -68,67 +69,125 @@ inline void prefill_int8_tile(device const char *codes, device const float2 *sca
     for (int e = 0; e < kInt8Elements; ++e) cf[i][e] = 0.0f;
 
   // The lane's weight column n_lane + 8 (q & 1) + 16 (q >> 1) for right-operand run q, all in one plane tile (a
-  // 64-column tile never straddles one): plane0 records of 16 bytes, plane1 of 4, a 32-group T records further on.
-  // The lane reads bytes 8 (x & 1) .. +7 of 32-group 2g + (x >> 1).
+  // 64-column tile never straddles one), its record record0 of 32-group 0, a 32-group T records further on. MLX
+  // affine: plane0 records of 16 bytes, plane1 of 4; the lane reads bytes 8 (x & 1) .. +7 of 32-group 2g + (x >> 1).
   const uint n_lane = uint(col_base + coord.y);
   const ulong record0 = ulong(n_lane / T) * plane_groups32 * T + n_lane % T;
   device const uchar *wl0 = w0 + record0 * 16 + 8 * (cx & 1);
   device const uchar *wl1 = w1 + record0 * 4 + 2 * (cx & 1);
   const int h32 = cx >> 1;
-  // Meta (s, z as bf16 in one uint) of the lane's destination columns n_run + 16h + j: 4 consecutive records.
+  // Meta (s, z as bf16 in one uint) of the lane's destination columns n_run + 16h + j: 4 consecutive records (an
+  // affine format's; Q8_0's d are halves).
   const uint n_run = uint(col_base + coord.x);
   device const uint *ml = (device const uint *)(meta) + ulong(n_run / T) * plane_units * T + n_run % T;
   const int m_base = row_base + coord.y;
 
-  for (int g = 0; g < groups; ++g) {
-    const ulong g32 = ulong(2 * g + h32) * T;
-    uint2 wv[4];
-    uint hb[4];
+  if constexpr (BITS == 8) {
+    // Q8_0: plane0 records of 32 int8 codes, chunk c at bytes 8c .. 8c + 7 (slots 8c .. 8c + 7), meta a half d per
+    // 32-group. Steps 2h and 2h + 1 of a 64-input group take its 32-group h alone, lane column x its chunk x, chunk
+    // slots {0, 4, 1, 5} in the even step and {2, 6, 3, 7} in the odd one, which the quantizer's order holds at
+    // 32h + 8x + 4 (t & 1) (prefill_int8_position): the steps' int32 sums are one 32-group's, folded into fp32 with
+    // its d.
+    device const uchar *wq = w0 + record0 * 32 + 8 * cx;
+    device const half *mq = (device const half *)(meta) + ulong(n_run / T) * plane_groups32 * T + n_run % T;
+    for (int g = 0; g < groups; ++g) {
+      float sa[kInt8RowFrags][2];
 #pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      const int off = (q & 1) * 8 + (q >> 1) * 16;
-      wv[q] = *((device const uint2 *)(wl0 + (g32 + off) * 16));
-      if (BITS == 5) hb[q] = *((device const ushort *)(wl1 + (g32 + off) * 4));
+      for (int i = 0; i < kInt8RowFrags; ++i)
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+          sa[i][r] = scales[ulong(g) * p.storage_rows + min(m_base + i * kInt8FragM + r * 8, M - 1)].x;
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const ulong g32 = ulong(2 * g + h) * T;
+        uint2 wv[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+          wv[q] = *((device const uint2 *)(wq + (g32 + (q & 1) * 8 + (q >> 1) * 16) * 32));
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+#pragma unroll
+          for (int q = 0; q < 4; ++q) {
+            const char4 lo = as_type<char4>(wv[q].x), hi = as_type<char4>(wv[q].y);
+            const int base = (q >> 1) * 8 + (q & 1) * 4;
+            ct_b[base + 0] = t ? lo.z : lo.x; ct_b[base + 1] = t ? hi.z : hi.x;
+            ct_b[base + 2] = t ? lo.w : lo.y; ct_b[base + 3] = t ? hi.w : hi.y;
+          }
+#pragma unroll
+          for (int hf = 0; hf < kInt8RowFrags; ++hf) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+              const int m = min(m_base + hf * kInt8FragM + r * 8, M - 1);
+              const ulong at = ulong(m) * K + g * GGUF_PREFILL_INT8_GROUP + 32 * h + cx * 8 + t * 4;
+              const char4 quad = as_type<char4>(*((device const uint *)(codes + at)));
+              ct_a[r * 4 + 0] = quad.x; ct_a[r * 4 + 1] = quad.y; ct_a[r * 4 + 2] = quad.z; ct_a[r * 4 + 3] = quad.w;
+            }
+            if (t == 0) { if (hf == 0) op_set.run(ct_a, ct_b, acc0); else op_set.run(ct_a, ct_b, acc1); }
+            else { if (hf == 0) op.run(ct_a, ct_b, acc0); else op.run(ct_a, ct_b, acc1); }
+          }
+        }
+        // The 32-group's d of the lane's two runs of four columns.
+        const half4 d0 = *((device const half4 *)(mq + g32)), d1 = *((device const half4 *)(mq + g32 + 16));
+#pragma unroll
+        for (int e = 0; e < kInt8Elements; ++e) {
+          const int r = (e & 7) >> 2;
+          const float d = float((e >> 3) ? d1[e & 3] : d0[e & 3]);
+          cf[0][e] = fma(sa[0][r] * d, float(acc0[e]), cf[0][e]);
+          cf[1][e] = fma(sa[1][r] * d, float(acc1[e]), cf[1][e]);
+        }
+      }
     }
-#pragma unroll
-    for (int t = 0; t < 4; ++t) {
+  } else {
+    for (int g = 0; g < groups; ++g) {
+      const ulong g32 = ulong(2 * g + h32) * T;
+      uint2 wv[4];
+      uint hb[4];
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        uint bits = (wv[q][t >> 1] >> (4 * (t & 1))) & 0x0f0f0f0fu;
-        if (BITS == 5) bits |= prefill_int8_fifth((hb[q] >> (8 * (t >> 1) + 2 * (t & 1))) & 0xFFu);
-        const char4 quad = as_type<char4>(bits);
-        const int base = (q >> 1) * 8 + (q & 1) * 4;
-        ct_b[base + 0] = quad.x; ct_b[base + 1] = quad.y; ct_b[base + 2] = quad.z; ct_b[base + 3] = quad.w;
+        const int off = (q & 1) * 8 + (q >> 1) * 16;
+        wv[q] = *((device const uint2 *)(wl0 + (g32 + off) * 16));
+        if (BITS == 5) hb[q] = *((device const ushort *)(wl1 + (g32 + off) * 4));
       }
 #pragma unroll
-      for (int hf = 0; hf < kInt8RowFrags; ++hf) {
+      for (int t = 0; t < 4; ++t) {
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-          const int m = min(m_base + hf * kInt8FragM + r * 8, M - 1);
-          const ulong at = ulong(m) * K + g * GGUF_PREFILL_INT8_GROUP + cx * 16 + t * 4;
-          const char4 quad = as_type<char4>(*((device const uint *)(codes + at)));
-          ct_a[r * 4 + 0] = quad.x; ct_a[r * 4 + 1] = quad.y; ct_a[r * 4 + 2] = quad.z; ct_a[r * 4 + 3] = quad.w;
+        for (int q = 0; q < 4; ++q) {
+          uint bits = (wv[q][t >> 1] >> (4 * (t & 1))) & 0x0f0f0f0fu;
+          if (BITS == 5) bits |= prefill_int8_fifth((hb[q] >> (8 * (t >> 1) + 2 * (t & 1))) & 0xFFu);
+          const char4 quad = as_type<char4>(bits);
+          const int base = (q >> 1) * 8 + (q & 1) * 4;
+          ct_b[base + 0] = quad.x; ct_b[base + 1] = quad.y; ct_b[base + 2] = quad.z; ct_b[base + 3] = quad.w;
         }
-        if (t == 0) { if (hf == 0) op_set.run(ct_a, ct_b, acc0); else op_set.run(ct_a, ct_b, acc1); }
-        else { if (hf == 0) op.run(ct_a, ct_b, acc0); else op.run(ct_a, ct_b, acc1); }
+#pragma unroll
+        for (int hf = 0; hf < kInt8RowFrags; ++hf) {
+#pragma unroll
+          for (int r = 0; r < 2; ++r) {
+            const int m = min(m_base + hf * kInt8FragM + r * 8, M - 1);
+            const ulong at = ulong(m) * K + g * GGUF_PREFILL_INT8_GROUP + cx * 16 + t * 4;
+            const char4 quad = as_type<char4>(*((device const uint *)(codes + at)));
+            ct_a[r * 4 + 0] = quad.x; ct_a[r * 4 + 1] = quad.y; ct_a[r * 4 + 2] = quad.z; ct_a[r * 4 + 3] = quad.w;
+          }
+          if (t == 0) { if (hf == 0) op_set.run(ct_a, ct_b, acc0); else op_set.run(ct_a, ct_b, acc1); }
+          else { if (hf == 0) op.run(ct_a, ct_b, acc0); else op.run(ct_a, ct_b, acc1); }
+        }
       }
-    }
-    // The group's correction: s, z of the lane's two runs of four columns, and the scales of its four rows.
-    const uint4 mv0 = *((device const uint4 *)(ml + ulong(g) * T));
-    const uint4 mv1 = *((device const uint4 *)(ml + ulong(g) * T + 16));
-    float2 sa[kInt8RowFrags][2];
+      // The group's correction: s, z of the lane's two runs of four columns, and the scales of its four rows.
+      const uint4 mv0 = *((device const uint4 *)(ml + ulong(g) * T));
+      const uint4 mv1 = *((device const uint4 *)(ml + ulong(g) * T + 16));
+      float2 sa[kInt8RowFrags][2];
 #pragma unroll
-    for (int i = 0; i < kInt8RowFrags; ++i)
+      for (int i = 0; i < kInt8RowFrags; ++i)
 #pragma unroll
-      for (int r = 0; r < 2; ++r)
-        sa[i][r] = scales[ulong(g) * p.storage_rows + min(m_base + i * kInt8FragM + r * 8, M - 1)];
+        for (int r = 0; r < 2; ++r)
+          sa[i][r] = scales[ulong(g) * p.storage_rows + min(m_base + i * kInt8FragM + r * 8, M - 1)];
 #pragma unroll
-    for (int e = 0; e < kInt8Elements; ++e) {
-      const int r = (e & 7) >> 2;
-      const uint mt = (e >> 3) ? mv1[e & 3] : mv0[e & 3];
-      const float s = float(as_type<bfloat>(ushort(mt & 0xFFFF))), z = float(as_type<bfloat>(ushort(mt >> 16)));
-      cf[0][e] = fma(sa[0][r].x * s, float(acc0[e]), fma(z, sa[0][r].y, cf[0][e]));
-      cf[1][e] = fma(sa[1][r].x * s, float(acc1[e]), fma(z, sa[1][r].y, cf[1][e]));
+      for (int e = 0; e < kInt8Elements; ++e) {
+        const int r = (e & 7) >> 2;
+        const uint mt = (e >> 3) ? mv1[e & 3] : mv0[e & 3];
+        const float s = float(as_type<bfloat>(ushort(mt & 0xFFFF))), z = float(as_type<bfloat>(ushort(mt >> 16)));
+        cf[0][e] = fma(sa[0][r].x * s, float(acc0[e]), fma(z, sa[0][r].y, cf[0][e]));
+        cf[1][e] = fma(sa[1][r].x * s, float(acc1[e]), fma(z, sa[1][r].y, cf[1][e]));
+      }
     }
   }
 #pragma unroll

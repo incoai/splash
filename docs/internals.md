@@ -1196,7 +1196,7 @@ the walks spread also in one, `pair` and `pair16`) and every K split, and marks 
 pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
 `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
 chunk of `R` rows (more than 32), for `R` up to 64 the staged 64-row tile at every K split, and for
-`af4g64` and `af5g64` the int8-activation tile (`prefill int8`) and its GEMM alone on codes the
+`af4g64`, `af5g64` and `q80` the int8-activation tile (`prefill int8`) and its GEMM alone on codes the
 scratch holds (`int8 codes`, as a SwiGLU's up runs on its gate's); the formats `float-bf16` and
 `float-f32`, and `float-<format>` for a quantized format's native rows (such as `float-af8g64`),
 time the float projection (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles
@@ -1256,7 +1256,7 @@ history without.
 
 On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill chunk past one
 staged tile (more than 64 rows) of a projection whose quantized segments are all MLX affine 4- or
-5-bit in groups of 64 (`af4g64`, `af5g64`) runs `LinearTile::GgufPrefillInt8`
+5-bit in groups of 64 (`af4g64`, `af5g64`) or Q8_0 runs `LinearTile::GgufPrefillInt8`
 (`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
 (`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never),
 with int8 activations on. With them off (`--activations bf16`) every chunk runs the bf16 tiles,
@@ -1266,14 +1266,20 @@ group of each row as int8 codes with its own scale, by the int8-activation rule
 (`LinearInput::PrefillInt8`) rather than quantizing the same rows again; the GEMM
 (`gguf_prefill_int8_<format>_<e>`, one dispatch per segment) feeds the weights' 4- or 5-bit codes
 straight from the planes into int8 `matmul2d` fragments and folds each
-group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. The weights stay
+group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. Q8_0's codes are int8
+already: its tile runs a 64-input group as two pairs of fragment steps, each pair one 32-input group
+of the weights, and folds `(sa d) sum(qa q)` per 32-group with that group's `d`. It reads the codes
+the affine tiles read, in another schedule (a lane's two steps of a 32-group take one uint2 of each
+weight column's plane record), so a fused projection of affine and Q8_0 segments (a checkpoint's
+BF16 projections, loaded as Q8_0, beside its MLX ones) and a SwiGLU of the two still quantize their
+rows once. The weights stay
 exact; only the activations round, per row and group, so an outlier channel costs only its own 64
 inputs. A group holding an infinity or a NaN, which its codes alone would round to finite values,
 takes NaN scales, so that its row's outputs are not finite, as the bf16 tile's are: a lane whose
 state went bad still fails alone. A row's prefill results therefore depend on whether its chunk,
 with the rows of the lanes prefilling beside it, has more than 64 rows, but not on its neighbours'
 values: a prefill's last layer runs its read rows alone on the chunk's tile and keeps their bits. A
-tile is two simdgroups of 32 rows by 32 columns for both formats, and threadgroups take 16 row tiles
+tile is two simdgroups of 32 rows by 32 columns for every format, and threadgroups take 16 row tiles
 down each column tile before the next (`GGUF_PREFILL_INT8_WALK`), so a column tile's weights stream
 once per 16 row tiles: walking every column tile of a row tile first left the M6's 2048-row down
 projections at 0.95-1.12x the bf16 tile's speed. The GEMM's grid is 16 threadgroups wide and takes
@@ -1282,12 +1288,17 @@ whatever the segment's column count; a grid of column tiles by row tiles kept th
 column tiles were a multiple of 16 (M6, 2048 rows: 260 column tiles took 29% longer than 256, on the
 16-wide grid 1.7%, as their columns). Over the 27B's projection shapes in `af4g64` and
 `af5g64` at 65-2048 rows the tile takes 1.13-2.4x less time than the bf16 tile on a 32-core M5 Max,
-a 16-core M5 Pro and a 12-core M6. The quantizer stores each 32-input group's codes in the GEMM's
+a 16-core M5 Pro and a 12-core M6. With its Q8_0 projections on the tile, Inkling-2-Mini
+UD-Q4_K_M prefills 1.3% faster at 512 tokens, 0.4% at 4K and 1.5% at 32K, and Qwen3.6-35B-A3B
+UD-Q4_K_M 3.8% at 512 and 4.1% at 4K (fused GPU time, 20-core M5 Pro, three alternating pairs).
+The quantizer stores each 32-input group's codes in the GEMM's
 fragment order (`prefill_int8_position`): the four inputs a lane takes in a fragment step, in the
 planes' slot order, are one word. The codes and scales are the prefill arena's
 `LinearTable` and `LinearSums`, sized for a full chunk of the target's widest projection whose
 formats the tile takes (`ProjectionShape::prefillInt8Formats`; 40 MB on Qwen3.8-27B MLX 4-bit, its
-down projection) wherever the family runs the tile; a GGUF target's arena holds none. The tile also
+down projection) wherever the family runs the tile; a GGUF target's, for its widest Q8_0 projection
+(9 MiB on Qwen3.6-35B-A3B GGUF, its 4096-input GDN and attention outputs; 7 MiB on Inkling-2-Mini,
+its attention output). The tile also
 takes the Neural Engine split's leading-input view. A DFlash2 draft, prepared `af4g64` whatever the
 target's format, prefills on the bf16 tiles (`ExecutionPlans::draftLinear`): its prefill gains
 nothing from the tile, while its context projection, the widest a prefill runs (25,600 inputs on
@@ -1295,7 +1306,11 @@ the 27B), would set the tile's scratch, 38 MB on Qwen3.6-35B-A3B GGUF, enough at
 to stream the routed experts its plan otherwise holds whole. Over 24 real 1K-8K prefixes the
 next-token KL against bf16 prefill on the GPU alone is
 2.2e-3 on Qwen3.8-27B MLX 4-bit (median 3.6e-4) and 2.3e-3 on Qwen3.6-35B-A3B MLX 4-bit, the most
-likely token unchanged at every prefix. At default flags on a 20-core M5 Pro, where the 27B's Neural
+likely token unchanged at every prefix. Teacher-forced over 256 positions after a 4K- and a 32K-token
+prefill, the Q8_0 projections' int8 prefill keeps the bf16 prefill's most likely token at 93-94% of
+Qwen3.6-35B-A3B UD-Q4_K_M's positions (mean KL 1.6e-2 and 2.1e-2) and 92-95% of Inkling-2-Mini
+UD-Q4_K_M's (mean KL 0.14 and 0.29, median under 7e-4), the true ids' NLL within 0.04 either way.
+At default flags on a 20-core M5 Pro, where the 27B's Neural
 Engine split takes 10 of 34 units, it is 9.4e-4, against 1.1e-3 for the bf16 tiles with the split at
 its own 15 units; both change the most likely token at the same one prefix of 24. Time to the first
 token falls by a quarter at 2K and 10K tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B
@@ -1306,9 +1321,10 @@ GEMM per segment, and an up on its gate's codes bitwise its own run; `gguf-proje
 times it as `prefill int8`.
 
 A MoE target's experts run on the same tile in such a chunk where every block's experts are
-resident and each projection's routed and shared experts share af4g64 or af5g64
+resident and each projection's routed and shared experts share af4g64, af5g64 or Q8_0
 (`ops::moeInt8Experts`; Qwen3.6-35B-A3B MLX 4-bit, not Flint's af3g64 nor a set
-with Q8_0 shared experts): `gguf_prefill_int8_quantize` rounds the chunk's MoE input rows once,
+with Q8_0 shared experts beside routed experts of another format, as the unsloth GGUFs
+hold them): `gguf_prefill_int8_quantize` rounds the chunk's MoE input rows once,
 `moe_gather_int8` copies each route's codes and scales into the grouping's tiles, and
 `moe_expert_int8_<format>_<gate|up|down>` (`kernels/shared/moe_int8.metal`) run the tile over them,
 each tile's expert reached as the staged passes reach it, with the SwiGLU intermediate rounded by the

@@ -9,8 +9,8 @@
 // With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32), for R up to
 // 128 the staged tile of R rows (past 64 its two row groups, ops::stagedRowGroups) at every K split on the policy's
 // walk too, and past 64 the decode tiles' two passes, a plan of 64 rows and one of the rest (passes64), and for
-// segments the int8 prefill tile takes (af4g64, af5g64) that tile (prefill int8) and its GEMM alone on the codes the
-// scratch holds (int8 codes, as a SwiGLU's up runs on its gate's); gateup is then the up projection's gated
+// segments the int8 prefill tile takes (af4g64, af5g64, q80) that tile (prefill int8) and its GEMM alone on the codes
+// the scratch holds (int8 codes, as a SwiGLU's up runs on its gate's); gateup is then the up projection's gated
 // epilogue, and logits the vocabulary head's plain projection into fp32 rows, on the decode tiles alone. Each median
 // is followed by the first and third quartiles of its rounds. The weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each
 // projection with the next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the

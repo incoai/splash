@@ -1243,9 +1243,10 @@ void bufferExtents(MetalBackend &backend) {
                         });
 }
 
-// The int8 passes (MoeConfig::int8Passes) of a block whose six projections are one MLX affine format: af4g64 and
-// af5g64 run them, each pass inside the int8 rule's interval, a row's result the same in every chunk (its codes and
-// sums depend on its own inputs alone); af3g64, which the int8 tile does not take, keeps the staged passes, and so
+// The int8 passes (MoeConfig::int8Passes) of a block whose six projections are one format the int8 tile takes:
+// af4g64, af5g64 and Q8_0 run them, each pass inside the int8 rule's interval, a row's result the same in every chunk
+// (its codes and sums depend on its own inputs alone); af3g64, which the int8 tile does not take, keeps the staged
+// passes, and so
 // does a plan without int8Passes (--activations bf16). As the plans select them, the passes run only where the
 // device's family runs the int8 prefill tile (ProjectionCalibration::prefillInt8: not Apple9, where the tile's
 // int8 fragments do not compute these products); elsewhere every plan keeps the staged passes. The wide fixtures of
@@ -1269,7 +1270,7 @@ int int8Experts(MetalBackend &backend) {
   b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
   b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
-  for (const Fmt f : {fmtNamed("af4g64"), fmtNamed("af5g64"), fmtNamed("af3g64")}) {
+  for (const Fmt f : {fmtNamed("af4g64"), fmtNamed("af5g64"), fmtNamed("q80"), fmtNamed("af3g64")}) {
     const Model m = makeModel(backend, kShape, f, false, true);
     std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
     const bool takes = quant_prefill_int8_format(f);

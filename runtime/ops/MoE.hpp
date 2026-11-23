@@ -403,7 +403,7 @@ struct MoeConfig final {
   // the plan's rows and the router's format (selectFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
   // A resident block's prefill passes on int8 activations where its expert
-  // projections are af4g64 or af5g64 (MoE::addRouted, moe_int8.metal).
+  // projections are af4g64, af5g64 or Q8_0 (MoE::addRouted, moe_int8.metal).
   bool int8Passes = false;
   bool operator==(const MoeConfig &) const = default;
 };

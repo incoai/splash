@@ -12,7 +12,7 @@
 // column tile the GGUF_TILE_COLUMNS output columns of one threadgroup (grid.x
 // counts column tiles), and an expert tile the grouped rows of one MoE expert.
 // The int8 prefill tile's activation group is the MLX weight group of 64
-// inputs (GGUF_PREFILL_INT8_GROUP).
+// inputs, two Q8_0 groups (GGUF_PREFILL_INT8_GROUP).
 #define GGUF_TILE_COLUMNS 64u
 // Decode tile of the staged kernels, which runs plans of up to
 // GGUF_STAGED_ROWS rows, a decode step's or a prompt chunk's alike: two
@@ -117,12 +117,13 @@ struct GgufPrefillSegmentsParams {
 static_assert(sizeof(GgufPrefillSegmentsParams) == 36, "GGUF segmented prefill parameters are 36 bytes on both sides");
 
 // Int8 prefill tile (kernels/prefill/gguf_prefill_int8.metal), MLX affine
-// weights in groups of 64: gguf_prefill_int8_quantize writes each 64-input
-// group of each chunk row as int8 codes and a float2 (scale, scale * sum of
-// the codes); gguf_prefill_int8_<format>_<a|r|g> multiplies them by the weight
-// codes in int8 and folds each group's affine correction in fp32. A tile is a
-// column tile of GGUF_PREFILL_INT8_SIMDGROUPS simdgroups of 32 columns by
-// GGUF_PREFILL_INT8_ROWS rows, for both formats: af5g64 on 64-row tiles lost
+// weights in groups of 64 and Q8_0: gguf_prefill_int8_quantize writes each
+// 64-input group of each chunk row as int8 codes and a float2 (scale, scale *
+// sum of the codes); gguf_prefill_int8_<format>_<a|r|g> multiplies them by the
+// weight codes in int8 and folds each group's affine correction (each Q8_0
+// 32-group's d) in fp32. A tile is a column tile of
+// GGUF_PREFILL_INT8_SIMDGROUPS simdgroups of 32 columns by
+// GGUF_PREFILL_INT8_ROWS rows, for every format: af5g64 on 64-row tiles lost
 // to the bf16 tile at 65-96 rows (0.95x, 16-core M5 Pro, measured).
 #define GGUF_PREFILL_INT8_GROUP 64u
 #define GGUF_PREFILL_INT8_SIMDGROUPS (GGUF_TILE_COLUMNS / 32u)

@@ -193,8 +193,8 @@ void chunkRowPlans() {
 }
 
 // The int8 prefill tile (ProjectionCalibration::prefillInt8): Apple10 and
-// Apple11 run every plan past the staged tile of a unit of af4g64 and af5g64
-// segments on it, at the prefill tile's storage, Apple9 none; a unit with a
+// Apple11 run every plan past the staged tile of a unit of af4g64, af5g64 and
+// Q8_0 segments on it, at the prefill tile's storage, Apple9 none; a unit with a
 // segment of another format keeps the prefill tile, and so does every unit
 // with int8 activations off, whose plans are then the bf16 ones and whose
 // device row is the same; a workload of no formats plans the same either way.
@@ -204,6 +204,7 @@ void chunkRowPlans() {
 void prefillInt8Rule() {
   const Projection af4 = blockProjection(5120, 17408, 1, GGUF_FMT_AF4G64);
   const Projection af5 = blockProjection(12288, 5120, 3, GGUF_FMT_AF5G64);
+  const Projection q80 = blockProjection(8192, 2048, 2, GGUF_FMT_Q80);
   const std::array<uint32_t, 3> mixedFormats{GGUF_FMT_AF4G64, GGUF_FMT_AF5G64, GGUF_FMT_Q4K};
   const Projection mixed = blockProjection(12288, 5120, mixedFormats);
   for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 40U}, {10U, 16U}, {10U, 32U}, {11U, 12U}}) {
@@ -218,7 +219,8 @@ void prefillInt8Rule() {
             "int8 activations changed a prefill plan of no formats");
     for (const uint32_t rows : {33U, 64U, 65U, 128U, 2048U})
       for (const auto &[p, epilogue] : {std::pair{&af4, LinearEpilogue::Residual}, {&af5, LinearEpilogue::None},
-                                        {&af4, LinearEpilogue::UpWithGate}, {&mixed, LinearEpilogue::None}}) {
+                                        {&af4, LinearEpilogue::UpWithGate}, {&q80, LinearEpilogue::None},
+                                        {&q80, LinearEpilogue::Residual}, {&mixed, LinearEpilogue::None}}) {
         const LinearPlan plan = linear.plan(*p, rows, epilogue), off = bf16.plan(*p, rows, epilogue);
         const LinearTile bf16Tile = rows <= kMaximumDecodeTileRows ? LinearTile::GgufStaged : LinearTile::GgufPrefill;
         const LinearTile tile =
