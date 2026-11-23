@@ -115,7 +115,7 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
     hdr[it] = F::loadMeta(tmeta + (ulong(g / F::MetaGroups) * QUANT_TILE_ROWS + col) * F::MetaBytes);
   }
   // One step: dequantize `step` into stage `buffer`, load `next`'s payload and meta unit when there is a next step
-  // (`more`), and run the step's matmul.
+  // (`more`; the last step reloads its own payload), and run the step's matmul.
   const auto run_step = [&](uint step, uint next, bool more, uint buffer) __attribute__((always_inline)) {
     threadgroup half *buf = stage + buffer * (KS * Cols);
 #pragma unroll
@@ -126,16 +126,20 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
     }
     if constexpr (Threads == 32) simdgroup_barrier(mem_flags::mem_threadgroup);
     else threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (more) {
+    // The last step reloads its own payload, which the walk discards, so the loads take no condition. Loaded behind
+    // `more`, as 1.7.1's decode kernels did, Metal shader validation on a 16-core M5 Pro (macOS 27.2.1) reported some
+    // of them, in bounds, as invalid loads and read them as zero: every other quad of a simdgroup's columns staged a
+    // step from zero codes (IQ4_NL's -127 d) in 34 of 80 runs of an IQ4_NL 24-row plan at 16 partitions, and Q4_K's
+    // 32-row tile read wrong too (gguf-projection, staged decode repeated). 1.7.0's kernels read none so, nor do these.
+    const uint fetch = more ? next : step;
 #pragma unroll
-      for (ushort it = 0; it < IPT; ++it) {
-        const uint item = thread_index + it * Threads; if (item >= Items) break;
-        const uint col = item % Cols, gi = item / Cols; const ulong g = ulong(next) * GPS + gi;
-        packed[it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
-        const uint unit = uint(g / F::MetaGroups);
-        if (unit != (step * GPS + gi) / F::MetaGroups)
-          hdr[it] = F::loadMeta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * F::MetaBytes);
-      }
+    for (ushort it = 0; it < IPT; ++it) {
+      const uint item = thread_index + it * Threads; if (item >= Items) break;
+      const uint col = item % Cols, gi = item / Cols; const ulong g = ulong(fetch) * GPS + gi;
+      packed[it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
+      const uint unit = uint(g / F::MetaGroups);
+      if (unit != (step * GPS + gi) / F::MetaGroups)
+        hdr[it] = F::loadMeta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * F::MetaBytes);
     }
     if (matmuls) {
       auto a_slice = a.template slice<KS, Rows>(step * KS, 0);

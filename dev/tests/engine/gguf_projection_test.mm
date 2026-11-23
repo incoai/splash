@@ -7,6 +7,8 @@
 //   equal a one-lane projection of them bitwise, as does one lane on the staged 16-row tile over a NaN padding lane
 //   (LinearConfig::sixteenRows); the plain epilogue into fp32 (the logits) holds the values its bf16 output rounds,
 //   bit for bit, each within fp64 before rounding;
+// - decode repeated: the staged 16- and 32-row tiles at 8 and 16 K partitions, in IQ4_NL, Q2_0 and Q4_K, each plan run
+//   several times, every run within fp64 and its lanes bitwise their one-lane projections;
 // - fused: three segments of different formats in one projection equal the projections of each segment alone, on the
 //   register tile at K 4096, so that formats of 256-input units split sixteen ways too, and one lane of them on the
 //   16-row tile the 8-row tile's;
@@ -793,6 +795,53 @@ void sideBySidePlans(MetalBackend &backend) {
   section("side by side: Q8_0 and Q4_K [1024 | 1024, 2304] on the production decode plans of 1-128 rows, Apple9 (10 "
           "cores), Apple10 (16, 20) and Apple11 (12), " + std::to_string(tiles.size()) +
           " tile and split configurations, each its tensors' own and each tensor's columns bitwise its own plan's");
+}
+
+// The staged tile's 16- and 32-row tiles (two to four lanes) at K splits 8 and 16, partitions of 8 and 4 steps, in
+// IQ4_NL, Q2_0 and Q4_K ([512, 2048], dense and sparse inputs), each plan run kRepeats times: every run within fp64
+// and each lane's rows bitwise its one-lane projection. Shader validation on a 16-core M5 Pro read some of 1.7.1's
+// in-bounds payload loads as zero (gguf_staged_steps), and its tiles staged a step of every other quad of a
+// simdgroup's columns from zero codes: 32 failures here on those kernels, where the decode section runs a plan once.
+void stagedRepeats(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 512, columns = N + kPadding, K = 2048, kRepeats = 6;
+  for (const Fmt f : {IQ4NL, Q20, Q4K}) {
+    const Tensor w = tensor(backend, f, N, K);
+    const Projection p = projection({&w}, columns);
+    for (const Inputs inputs : {Inputs::Dense, Inputs::Sparse}) {
+      const std::vector<float> x = activations(inputs, kMaximumRows, K);
+      const std::vector<Dot> dots = products({&w}, columns, x, kMaximumRows);
+      for (const uint32_t splits : {8u, 16u}) {
+        const std::string what = std::string(fmtName(f)) + (inputs == Inputs::Sparse ? " sparse" : " dense") +
+                                 " S=" + std::to_string(splits);
+        const LinearConfig c = config(LinearTile::GgufStaged, splits);
+        std::vector<Outcome> alone;
+        for (uint32_t lane = 0; lane < kMaximumLanes; ++lane) {
+          const std::vector<float> rows(x.begin() + uint64_t{lane} * kLaneRows * K,
+                                        x.begin() + uint64_t{lane + 1} * kLaneRows * K);
+          const LinearPlan plan = Linear::plan(decode({columns, K}, 1, LinearEpilogue::None), c, FloatOutput::BFloat16);
+          alone.push_back(run(backend, linear, plan, p, nullptr, storageRows(rows, K, kLaneRows, kLaneRows), {},
+                              kPoisonNaN, N, what + " lane " + std::to_string(lane) + " alone"));
+        }
+        for (uint32_t lanes = 2; lanes <= kMaximumLanes; ++lanes) {
+          const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::None);
+          const LinearPlan plan = Linear::plan(wl, c, FloatOutput::BFloat16);
+          const std::vector<uint16_t> input = storageRows(x, K, wl.rows, plan.storageRows());
+          for (uint32_t repeat = 0; repeat < kRepeats; ++repeat) {
+            const std::string label = what + " L=" + std::to_string(lanes) + " run " + std::to_string(repeat);
+            const Outcome out = run(backend, linear, plan, p, nullptr, input, {}, kPoisonFinite, N, label);
+            checkValues(out, within(dots, true), {}, {}, wl, wl.rows, N, label);
+            for (uint32_t lane = 0; lane < lanes; ++lane)
+              if (!sameRows(out.output, lane * kLaneRows, alone[lane].output, 0, kLaneRows, columns)) {
+                fail(label + ": lane " + std::to_string(lane) + " differs from its one-lane projection");
+                break;
+              }
+          }
+        }
+      }
+    }
+  }
+  section("staged decode repeated: IQ4_NL, Q2_0 and Q4_K at K 2048, 2-4 lanes, S 8 and 16, dense and sparse inputs, " +
+          std::to_string(kRepeats) + " runs a plan, each within fp64 and its lanes bitwise their one-lane projections");
 }
 
 // Gate/up on one tile for the gate of each format it takes with the up of the next one ([256, 1024]), so that every
@@ -2154,6 +2203,7 @@ int main(int argc, char **argv) {
         gateUpPairs(backend, linear, tile);
       }
       decodeTile(backend, linear, LinearTile::GgufStaged, true, decodeInputs(true), tileFormats(LinearTile::GgufStaged));
+      stagedRepeats(backend, linear);
       columnTile(backend, linear);
       fusedDecode(backend, linear, LinearTile::GgufStaged, true);
       sideBySidePlans(backend);
