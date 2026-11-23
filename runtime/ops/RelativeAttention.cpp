@@ -177,15 +177,6 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
   return plan;
 }
 
-RelativeAttentionPlan RelativeAttention::lastTiles(const RelativeAttentionPlan &plan) {
-  if (plan.step == StepKind::Decode) throw std::invalid_argument("a decode step's lanes are one tile each");
-  RelativeAttentionPlan tails = plan;
-  for (RelativeAttentionPlan::Sequence &sequence : std::span(tails.sequences_).first(tails.sequenceCount_))
-    sequence.firstTile = kv::attentionTiles(sequence.rows) - 1;
-  group(tails);
-  return tails;
-}
-
 uint32_t RelativeAttention::decodeMostSplits(uint32_t laneCap, uint32_t cores) {
   const uint32_t most = laneCap > kv::kAttentionTileRows ? (cores + 8) / 4 : (cores + 16) / 3;
   return std::clamp<uint32_t>(most, 1, SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS);

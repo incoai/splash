@@ -200,9 +200,6 @@ public:
                                                   Int8Activations int8Activations, AttentionWorkspace capacity,
                                                   RelativeAttentionVariant variant = {},
                                                   StepKind step = StepKind::Prefill);
-  // A prompt chunk's `plan`'s sequences from the tile that holds each one's
-  // last row.
-  [[nodiscard]] static RelativeAttentionPlan lastTiles(const RelativeAttentionPlan &plan);
   // The history splits of a decode lane's tile of `laneCap` rows that reads
   // `pages` pages on a GPU of `cores` cores: one per kDecodeCorePages / cores
   // pages, but at least one a page up to a verify block's most, and at most

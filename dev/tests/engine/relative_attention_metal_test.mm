@@ -1138,8 +1138,6 @@ void checkPlans() {
                       "relative_attention_" + std::string(format == kv::Format::Int8 ? "q8q" : "bf16") + "_direct" +
                           window,
               "INT8 queries score INT8 pages alone");
-      const ops::RelativeAttentionPlan last = RelativeAttention::lastTiles(plan);
-      require(last.sequences()[0].firstTile + 1 == kv::attentionTiles(300), "the last tiles are not the last");
     }
     // A decode step's single pass: the kernel of its lane cap (_r16 past the
     // narrow cap's rows), window, position scale and queries' format, and a
@@ -1177,8 +1175,6 @@ void checkPlans() {
                       "relative_attention_" + std::string(format == kv::Format::Int8 ? "q8q" : "bf16") + "_decode" +
                           suffix,
                   "a decode plan's INT8 queries score INT8 pages alone");
-          rejects([&] { static_cast<void>(RelativeAttention::lastTiles(plan)); }, "one tile each",
-                  "a decode plan's last tiles were planned");
         }
   }
   // A lane's splits: one per kDecodeCorePages / cores pages, but one a page
