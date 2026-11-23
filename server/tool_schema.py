@@ -1034,11 +1034,10 @@ def _reasoning(thinking, chat_format):
 
 
 def _written_tags(chat_format, text):
-    """`text`, a row of the chat format's visible tags (special tokens), as a
-    grammar writes them: each as its token."""
-    return " ".join(
-        re.findall("|".join(map(re.escape, chat_format.visible_tags)), text)
-    )
+    """`text`, a text frame or close of the chat format, as a grammar writes
+    it: its visible tags (special tokens, ChatFormat.frame_tags), each as its
+    token."""
+    return " ".join(chat_format.frame_tags(text))
 
 
 def _answer(schema, chat_format):

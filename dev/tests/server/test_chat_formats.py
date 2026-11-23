@@ -643,6 +643,33 @@ class QwenGrammarTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 replace(syntax, **changes)
 
+    def test_a_format_whose_text_frames_are_not_its_visible_tags_is_refused(self):
+        # A grammar writes a frame as its tags' tokens: Inkling 2's answer
+        # frame is its two tags.
+        self.assertEqual(
+            INKLING2.frame_tags(INKLING2.text_frames[0]),
+            ("<|message_model|>", "<|content_text|>"),
+        )
+        unseen = tuple(
+            tag for tag in INKLING2.visible_tags if tag != "<|content_text|>"
+        )
+        for changes in (
+            # Text between a frame's tags, which a grammar would leave out,
+            {"text_frames": ("<|message_model|>final<|content_text|>",)},
+            # a frame's tag the format does not keep visible,
+            {"visible_tags": unseen},
+            # a close of anything else,
+            {"text_close": "<|end_message|>\n"},
+            {"text_close": ""},
+            # and frames without a close, or a close without frames.
+            {"text_close": None},
+            {"text_frames": ()},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                replace(INKLING2, **changes)
+        with self.assertRaises(ValueError):
+            replace(QWEN, text_close="<|im_end|>")
+
 
 class FlintTokenizerContractTests(unittest.TestCase):
     def test_flint_s_tokens_are_checked_against_its_format(self):
@@ -1322,7 +1349,10 @@ class InklingTokenizerContractTests(unittest.TestCase):
                 "as native tokens",
             ),
             ({"think_end_id": chat_format.think_end_id + 1}, "as native token"),
-            ({"visible_tags": ("<|message_nobody|>",)}, "the tag"),
+            (
+                {"visible_tags": chat_format.visible_tags + ("<|message_nobody|>",)},
+                "the tag",
+            ),
             ({"stop_tokens": ("<|content_model_end_sampling|>x",)}, "stop text"),
         ):
             with self.subTest(changed=changed):

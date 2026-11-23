@@ -981,7 +981,10 @@ format of the family its installation found, which the assembly records:
 A format holds the model's vocabulary and the engine's stop tokens, which are
 its target layout's; the tags that open and close its reasoning (`<think>` and
 `</think>` for Qwen and Flint), with their tokens where the model opens its
-reasoning itself, and those that frame its answer's text where it has any;
+reasoning itself, and those that frame its answer's text where it has any,
+each frame and its close the format's visible tags alone, which grammars
+write as their tokens (a format whose frames hold other text is refused where
+it is defined);
 the call syntax, with the tags a call opens and closes with and the token of
 its opening, its arguments either tags around each argument or one JSON
 object, after a header that names the function, whose keys for the name and

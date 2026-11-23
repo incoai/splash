@@ -239,6 +239,38 @@ class ChatFormat:
     # widens to the image's tokens; None for a template without one.
     image_pad: str | None
 
+    def __post_init__(self):
+        """A format frames its answer's text with a close or not at all, and
+        each frame and the close is its visible tags alone (frame_tags),
+        which a grammar writes as their tokens: a format whose frames hold
+        other text is refused where it is defined, not left out of every
+        grammar."""
+        if bool(self.text_frames) != (self.text_close is not None):
+            raise ValueError("a format that frames its answer's text closes it")
+        for text in self.text_frames + ((self.text_close,) if self.text_frames else ()):
+            self.frame_tags(text)
+
+    def frame_tags(self, text):
+        """The visible tags a text frame or close is, back to back, in order:
+        each a token a grammar writes (tool_schema). Raises ValueError for a
+        text that is anything else."""
+        tags, at = [], 0
+        while at < len(text):
+            tag = next(
+                (tag for tag in self.visible_tags if text.startswith(tag, at)), None
+            )
+            if tag is None:
+                raise ValueError(
+                    f"a text frame is the format's visible tags alone: {text!r}"
+                )
+            tags.append(tag)
+            at += len(tag)
+        if not tags:
+            raise ValueError(
+                "a text frame is the format's visible tags alone, one at least"
+            )
+        return tuple(tags)
+
     @property
     def prompt_switches_reasoning(self):
         """Whether a request's effort turns the model's reasoning on and off:
