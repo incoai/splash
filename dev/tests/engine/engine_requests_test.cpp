@@ -927,6 +927,43 @@ void testPreemptedReplyCheckpointIsDropped() {
   tickUntil(h, now, [&] { return idle(engine); }, "the requests did not end");
 }
 
+// A lane suspended with a reply WriteBehind::kMinimumTokens past its prompt's replay point keeps its newest reply
+// state (Cache::keepReply), whatever its client: a reclaim meanwhile writes it, once, rather than drop it, and the
+// lane resumes from it, not from its prompt's replay point (32), which would replay its whole reply. A shorter
+// reply's state is dropped (testPreemptedReplyCheckpointIsDropped). The suspension comes mid-page, as a resume
+// replays a token at least: a state at the page the lane's KV ends at serves its next turn, not its resume.
+void testALongPreemptedReplyKeepsItsNewestState() {
+  test::EngineHarness h({.pages = 512});
+  Executor &executor = h.model;
+  engine::Engine &engine = h.engine;
+  executor.decodeFinishes = false;
+  executor.offloadTier = std::make_shared<OffloadControl>();
+  executor.offloadTier->ready = true;
+  executor.restoreControl->ready = true;
+  std::vector<uint32_t> prompt(60);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  fillOtherLanes(engine);
+  engine.submit(conversationTurn(1, prompt, 2400));
+  h.runUntil([&] { return capturedAt(executor, 1, 2112) && h.events.outputs[1].size() >= 2112 - 60 + 10; },
+             "decode did not pass its page at 2112", 100'000);
+  EngineRequest arriving = request(5, std::vector<uint32_t>(9, 5));
+  arriving.priority = RequestPriority::Foreground;
+  engine.submit(std::move(arriving));
+  h.runUntil([&] { return executor.suspensions == 1 && !engine.commandInFlight(); },
+             "the arrival did not take the reply's lane", 100'000);
+  reclaimUpToInUse(h.cache);
+  const StateCacheSnapshot cached = h.cache.snapshot().stateCache;
+  require(cached.offloads == 1, "reclaim did not write a long preempted reply's newest state once (" +
+                                    std::to_string(cached.offloads) + " writes)");
+  engine.cancel(5);
+  h.runUntil([&] { return executor.restored != 0; }, "the reply did not resume", 100'000);
+  require(executor.restored >= 2080, "the reply resumed at " + std::to_string(executor.restored) +
+                                         ", not at its newest state");
+  for (const uint64_t id : {1, 11, 12, 13})
+    engine.cancel(id);
+  h.runUntil([&] { return idle(engine); }, "the requests did not end", 100'000);
+}
+
 // A running reply's checkpoint that reclaim takes is dropped rather than
 // written to the SSD tier, as the lane's next one replaces it a page on.
 void testRunningReplyCheckpointIsDropped() {
@@ -2740,6 +2777,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testReplyStatesFollowSpeculativeCycles", testReplyStatesFollowSpeculativeCycles},
       {"testPreemptedReplyKeepsItsDeepestState", testPreemptedReplyKeepsItsDeepestState},
       {"testPreemptedReplyCheckpointIsDropped", testPreemptedReplyCheckpointIsDropped},
+      {"testALongPreemptedReplyKeepsItsNewestState", testALongPreemptedReplyKeepsItsNewestState},
       {"testRunningReplyCheckpointIsDropped", testRunningReplyCheckpointIsDropped},
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
       {"testASecondConversationResumesAtASharedHead", testASecondConversationResumesAtASharedHead},

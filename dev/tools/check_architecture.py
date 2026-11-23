@@ -249,8 +249,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # checkpoint cached, as the prompt's replay point does (Engine::keepsCheckpoint,
 # headBoundary), and captures the checkpoint a command reaches on its way to it.
 # 31,085 adds 50 for a Background request that ages to Normal after 10 s and
-# still yields memory and its lane as Background.
-ENGINE_LINE_BUDGET = 31_085
+# still yields memory and its lane as Background. 31,088 adds 3 for a
+# suspended lane's reply state, kept by an ended one's measure.
+ENGINE_LINE_BUDGET = 31_088
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

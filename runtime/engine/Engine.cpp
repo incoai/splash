@@ -2248,8 +2248,11 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
   // write over its prompt's replay point (WriteBehind::kMinimumTokens) is
   // kept: a shorter one recomputes faster than its state writes. Kept, the
   // 384-token replies of 12 agent conversations at a 27 GB limit wrote 24%
-  // more to the SSD to save 2.4% of their prefill.
-  if (!keepContinuation && active.rendersReplies &&
+  // more to the SSD to save 2.4% of their prefill. A suspended lane keeps its
+  // reply's newest state by the same measure, whatever its client: the point
+  // it resumes from, which a reclaim meanwhile writes, once, rather than drop
+  // it and leave the resume to replay the whole reply.
+  if ((keepContinuation || active.rendersReplies) &&
       active.exactTokens.size() >= promptReplayBoundary(active) + WriteBehind::kMinimumTokens)
     cache_.keepReply(active.latestCheckpoint);
   if (passCommand_.holds(id))

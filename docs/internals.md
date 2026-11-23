@@ -2884,9 +2884,14 @@ not leaves its reply's opportunistic again. Only a reply that holds at least
 `WriteBehind::kMinimumTokens` past its prompt's replay point is kept, as a
 shorter one recomputes faster than its state writes: kept, the 384-token
 replies of 12 agent conversations at a 27 GB limit wrote 24% more to the SSD
-to save 2.4% of their prefill. A suspended lane's checkpoints
-stay opportunistic: once they went, the lane replays its reply from its prompt's
-replay point, as one that captured none. A decoding lane's latest state retires
+to save 2.4% of their prefill. A suspended lane whose reply holds as much
+keeps its reply's newest state the same way, whatever its client: the point it
+resumes from, which a reclaim meanwhile writes, once, and which its next capture
+after the resume retires. A shorter reply's checkpoints stay opportunistic: once
+they went, the lane replays its reply from its prompt's replay point, as one
+that captured none. A lane suspended right after the cycle that captured the
+page its KV ends at resumes below that state whichever it keeps, as a resume
+replays a token at least. A decoding lane's latest state retires
 only once the next is published, beside which its cycle holds that next state's
 reservation, so once the lanes end the pool holds those reservations' cached
 cells beside the lanes' cells (`state.idle_cached_cells` 2 beside
