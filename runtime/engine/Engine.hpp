@@ -489,6 +489,8 @@ private:
     // out (EngineEventSink::firstTokenParts).
     TtftParts held{};
     std::optional<double> heldSince;
+    // A Background request's first tick, from which it ages to Normal (age).
+    std::optional<double> backgroundSince;
     TtftPart heldBy = TtftPart::Rest;
     bool firstTokenSent = false;
     // Its last token event, and since then what a decode gap past the bound
@@ -999,6 +1001,16 @@ private:
   // unit's wait for a decoder (unitWait_), the rest. Before a
   // request's first tokens, firstTokens sends what held it.
   void holds(double nowMilliseconds) noexcept;
+  // Background requests kBackgroundAgeMilliseconds past their first tick run
+  // as Normal from then on: in admission, prefill and decode order, and in
+  // what their claims may take.
+  void age(double nowMilliseconds);
+  // The priority a request yields memory and its lane as: an aged request's
+  // Background. It runs as Normal but ranks below attended work (rankOf), a
+  // Normal start suspends it (preemptBelow), and suspended it holds no new
+  // Normal start back (suspendedTier): with one lane state the host admits,
+  // an attended start waited 8.4 s for each step of a run to end.
+  [[nodiscard]] static RequestPriority yieldsAs(const Request &request) noexcept;
   [[nodiscard]] TtftPart holderOf(const Request &request) const;
   void firstTokens(Request &request);
   // A lane's token event at `now`: a gap past G since its last counts under

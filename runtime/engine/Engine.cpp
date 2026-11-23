@@ -24,6 +24,11 @@ constexpr double kMaskWaitMilliseconds = double(supervision::kMaskWait.count());
 // A junction costs a cached state, its capture and up to a draft window of
 // draft-context rows; a later request must save at least that much prefill.
 constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
+// A Background request still in the engine this long after its first tick
+// runs as Normal (Engine::age): work that outlasts a title or a summary is a
+// run the user asked for, and strict priority starved one behind attended
+// work for minutes (14.5 min for 9 tool calls on a busy 64 GB Mac).
+constexpr double kBackgroundAgeMilliseconds = 10'000.0;
 
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";
@@ -198,6 +203,7 @@ bool Engine::tick(double now) {
   // however the tick ends, what holds each from now on is as it leaves the
   // engine.
   holds(now);
+  age(now);
   // The wait the last tick left the next prefill unit in, for a decoder whose
   // memory lands, is this tick's to decide again: one that plans it again
   // goes on with it, and any other ends it, however it ends, the time it
@@ -497,9 +503,8 @@ std::optional<RequestPriority> Engine::suspendedTier() const {
   std::optional<RequestPriority> tier;
   for (const auto &[id, active] : requests_) {
     // A finalized request keeps the scheduler's flag until it is swept.
-    if (!active.finalized && scheduler_.suspended(id) &&
-        (!tier || active.request.priority < *tier))
-      tier = active.request.priority;
+    if (!active.finalized && scheduler_.suspended(id) && (!tier || yieldsAs(active) < *tier))
+      tier = yieldsAs(active);
   }
   return tier;
 }
@@ -508,13 +513,25 @@ bool Engine::admissionTries(const Request &active, std::optional<RequestPriority
                             bool draining) const {
   if (!tier)
     return !draining;
-  return active.request.priority < *tier ||
-         (scheduler_.suspended(active.request.id) && !draining);
+  return yieldsAs(active) < *tier || (scheduler_.suspended(active.request.id) && !draining);
 }
 
 bool Engine::belowRunnable(const Request &active) const {
   const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
   return runnable && active.request.priority > *runnable;
+}
+
+void Engine::age(double now) {
+  for (auto &[id, active] : requests_) {
+    if (active.finalized || active.request.priority != RequestPriority::Background)
+      continue;
+    const double since = active.backgroundSince.value_or(now);
+    active.backgroundSince = since;
+    if (now - since < kBackgroundAgeMilliseconds)
+      continue;
+    active.request.priority = RequestPriority::Normal;
+    scheduler_.setPriority(id, RequestPriority::Normal);
+  }
 }
 
 void Engine::holds(double now) noexcept {
@@ -801,7 +818,7 @@ bool Engine::admitQueued(double now) {
       if (lanesFull) {
         if (!laneSought) {
           laneSought = true;
-          if (preemptBelow(active.request.priority, now)) {
+          if (preemptBelow(yieldsAs(active), now)) {
             // The suspension is this pass's progress, whatever the next admits.
             static_cast<void>(admitQueued(now));
             return true;

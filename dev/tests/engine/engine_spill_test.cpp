@@ -1008,6 +1008,39 @@ void testAStartMemoryCannotHoldBesideALowerLaneMakesItYield() {
           "it, or the two did not decode");
 }
 
+// A Background lane aged to Normal still yields to a Normal start memory cannot hold beside it: it is
+// suspended, goes back to Background, and stays suspended while the start prefills in full chunks, so the
+// start's first token comes before the lane's third. Both then decode in full.
+void testAnAgedLaneYieldsToANormalStartMemoryCannotHoldBesideIt() {
+  ShortOfBoth both(1'200ULL << 20);
+  Spilling &spill = both.spill;
+  EngineRequest background = Spilling::prompt(1, 1, 1'000, 100);
+  background.priority = RequestPriority::Background;
+  background.deadlineMilliseconds = 1e9;
+  spill.engine.submit(std::move(background));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the Background lane did not decode");
+  spill.now += 11'000;
+  static_cast<void>(spill.engine.tick(spill.now++));
+  spill.tier.complete();
+  EngineRequest normal = Spilling::prompt(2, 2, 2'046, 50);
+  normal.priority = RequestPriority::Normal;
+  normal.deadlineMilliseconds = 1e9;
+  spill.engine.submit(std::move(normal));
+  size_t laneTokensBeforeStart = 0;
+  spill.runUntil(
+      [&] {
+        if (!spill.events.outputs.contains(2))
+          laneTokensBeforeStart = spill.events.outputs.at(1).size();
+        return idle(spill.engine);
+      },
+      "the requests did not end");
+  require(spill.engine.snapshot().prioritySuspensions == 1 && laneTokensBeforeStart <= 2 &&
+              spill.events.completedCount == 2 && spill.events.failures.empty() &&
+              spill.events.usage.at(2).second == 50 && spill.events.usage.at(1).second == 100,
+          "an aged Background lane did not yield to a Normal start memory could not hold beside it, or the two "
+          "did not decode");
+}
+
 // Beside a Foreground lane whose KV and projected growth keep memory from holding it, a Foreground start
 // that cannot spill waits for that lane and suspends none of the Background lanes beside it, which would
 // bring it no closer to running: they keep their lanes and KV. Once that lane ends it starts, and all four
@@ -1273,15 +1306,15 @@ void testAResidentStartDoesNotHoldAQuotaWaitOpen() {
     require(done(), message);
   };
   // The quota's holder runs below the others' priority: it does not run
-  // while they do.
-  submit(1, 33, 4000, RequestPriority::Background);
+  // while they do. It is Normal, as a Background one ages to Normal in 10 s.
+  submit(1, 33, 4000, RequestPriority::Normal);
   run([&] { return spill.events.outputs.contains(1); }, "the first request did not decode");
-  submit(2, 8, 4000, RequestPriority::Normal);
+  submit(2, 8, 4000, RequestPriority::Foreground);
   run([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
       "the second request did not wait for the quota");
   // A shorter Resident prompt leads the waiting one and starts beside it; it
   // decodes for twice the wait's limit.
-  submit(3, 1, KvCache::pageTokens - 1, RequestPriority::Normal);
+  submit(3, 1, KvCache::pageTokens - 1, RequestPriority::Foreground);
   run([&] { return spill.events.outputs.contains(3); }, "the Resident start did not decode");
   const double startedAt = spill.now;
   const size_t held = spill.events.outputs.at(1).size();
@@ -4688,6 +4721,8 @@ std::span<const test::TestCase> spillTests() {
       {"testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds", testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds},
       {"testAStartMemoryCannotHoldBesideALowerLaneMakesItYield",
        testAStartMemoryCannotHoldBesideALowerLaneMakesItYield},
+      {"testAnAgedLaneYieldsToANormalStartMemoryCannotHoldBesideIt",
+       testAnAgedLaneYieldsToANormalStartMemoryCannotHoldBesideIt},
       {"testALanesGrowthConvertsNoOtherLane", testALanesGrowthConvertsNoOtherLane},
       {"testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning",
        testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning},

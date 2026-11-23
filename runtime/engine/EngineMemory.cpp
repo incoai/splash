@@ -176,8 +176,8 @@ Engine::LaneDemand Engine::laneDemand() const {
 std::optional<RequestPriority> Engine::highestLanePriority() const {
   std::optional<RequestPriority> highest;
   for (const auto &[_, active] : requests_)
-    if (active.lane && !active.finalized && (!highest || active.request.priority < *highest))
-      highest = active.request.priority;
+    if (active.lane && !active.finalized && (!highest || yieldsAs(active) < *highest))
+      highest = yieldsAs(active);
   return highest;
 }
 
@@ -424,7 +424,7 @@ void Engine::waitForResources(Request &active, double now, const Denial &denial)
   const std::optional<RequestPriority> highest = highestLanePriority();
   if (!scheduler_.suspended(active.request.id) && !denial.pending && !denial.diskQuota &&
       (!denial.projection || (highest && *highest > active.request.priority)))
-    static_cast<void>(preemptBelow(active.request.priority, now));
+    static_cast<void>(preemptBelow(yieldsAs(active), now));
 }
 
 bool Engine::competesForQuota(const Request &active) const {
@@ -873,10 +873,14 @@ void Engine::ClaimHandle::reset() noexcept {
   id = {};
 }
 
+RequestPriority Engine::yieldsAs(const Request &active) noexcept {
+  return active.backgroundSince ? RequestPriority::Background : active.request.priority;
+}
+
 ClaimRank Engine::rankOf(const Request &active) const {
   const Phase phase = scheduler_.phase(active.request.id);
   return {.priority = static_cast<uint8_t>(static_cast<uint8_t>(RequestPriority::Background) -
-                                           static_cast<uint8_t>(active.request.priority)),
+                                           static_cast<uint8_t>(yieldsAs(active))),
           // At equal priority, prefer uninterrupted streaming over less
           // replay work.
           .decoding = phase == Phase::Decode || phase == Phase::WaitingMask,
@@ -921,7 +925,7 @@ uint64_t Engine::kvCapacity(uint64_t requestId) const {
 bool Engine::preemptBelow(RequestPriority priority, double now) {
   // The lane that yields first has the lowest priority of all residents.
   Request *const victim = laneToYield();
-  if (!victim || victim->request.priority <= priority)
+  if (!victim || yieldsAs(*victim) <= priority)
     return false;
   if (yieldsEndedLanes(*victim))
     return true;
@@ -930,6 +934,14 @@ bool Engine::preemptBelow(RequestPriority priority, double now) {
   // would (Scheduler::yieldsTo).
   suspendLane(*victim, kvCapacity(victim->request.id), metal::AllocationFailure::None,
               StateFailure::ConcurrencyLimit, now);
+  // An aged Background lane runs as Normal, so once suspended it would be
+  // admitted again at once and decode beside the start it gave way to. It
+  // goes back to Background and ages from now (age).
+  if (victim->backgroundSince && victim->request.priority != RequestPriority::Background) {
+    victim->request.priority = RequestPriority::Background;
+    victim->backgroundSince = now;
+    scheduler_.setPriority(victim->request.id, RequestPriority::Background);
+  }
   // What the lane held is free: an earlier failure may fit now.
   allocationFailed_ = false;
   ++counters_.prioritySuspensions;

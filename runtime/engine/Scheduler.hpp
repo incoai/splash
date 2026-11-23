@@ -157,6 +157,9 @@ public:
   void setLimits(const model::CommandLimits &limits) noexcept { config_.limits = limits; }
 
   void submit(RequestSpec request);
+  // Sets a request's priority: a Background one ages to Normal (Engine::age)
+  // and goes back to Background when it yields its lane (Engine::preemptBelow).
+  void setPriority(uint64_t requestId, RequestPriority priority);
   void deferAdmission(uint64_t requestId);
   void waitForResources(uint64_t requestId);
   void waitForPrefix(uint64_t requestId);

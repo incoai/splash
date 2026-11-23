@@ -2167,6 +2167,52 @@ void testTerminalAnchorWithoutKvIsNotCached() {
 // selects it, before the first decode cycle that commits it; that cycle's
 // event leaves it out, and the usage counts what the client got, also when the
 // request is cancelled before that cycle.
+// A Background request behind attended work ages to Normal: beside a Normal
+// lane that decodes without end it waits, then starts once it has been in the
+// engine kBackgroundAgeMilliseconds (10 s). Strict priority held a run's step
+// for minutes. It still yields memory as Background: a Normal start refused
+// memory suspends it, not the Normal lane, and then runs.
+void testABackgroundRequestAgesToNormal() {
+  test::EngineHarness h({.pages = 512});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  executor.decodeFinishes = false;
+  const auto submit = [&](uint64_t id, RequestPriority priority) {
+    auto value = request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+    value.priority = priority;
+    value.maxNewTokens = 1'000'000;
+    value.deadlineMilliseconds = 1e9;
+    engine.submit(std::move(value));
+  };
+  // Ticks until done(), the clock 100 ms on after each.
+  const auto runFor = [&](double milliseconds, const std::function<bool()> &done) {
+    for (const double end = h.now() + milliseconds; h.now() < end && !done();) {
+      static_cast<void>(h.tick());
+      h.advanceTo(h.now() + 100.0);
+    }
+  };
+  submit(1, RequestPriority::Normal);
+  runFor(1'000.0, [&] { return events.outputs.contains(1); });
+  require(events.outputs.contains(1), "the Normal request did not decode");
+  submit(2, RequestPriority::Background);
+  const double submitted = h.now();
+  runFor(9'000.0, [&] { return events.outputs.contains(2); });
+  require(!events.outputs.contains(2), "the Background request ran beside the Normal lane before it aged");
+  runFor(2'000.0, [&] { return events.outputs.contains(2); });
+  require(events.outputs.contains(2) && h.now() - submitted >= 10'000.0,
+          "the Background request did not start once it had waited 10 s");
+  executor.beginGrowthBlocked = [&] { return executor.lastBeginId == 3 && executor.requests.at(2).resident; };
+  submit(3, RequestPriority::Normal);
+  runFor(1'000.0, [&] { return events.outputs.contains(3); });
+  require(events.outputs.contains(3) && engine.snapshot().prioritySuspensions == 1 &&
+              executor.resumedPrompts.size() == 1 && executor.resumedPrompts.front().front() == 2,
+          "a Normal start refused memory did not suspend the aged Background lane to run");
+  for (const uint64_t id : {1, 2, 3})
+    engine.cancel(id);
+  h.runUntilIdle();
+}
+
 void testFirstTokenIsSentAtPrefill() {
   for (const bool cancel : {false, true}) {
     test::EngineHarness h({.pages = 8, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
@@ -2734,6 +2780,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testTerminalAnchorWithoutKvIsNotCached", testTerminalAnchorWithoutKvIsNotCached},
       {"testPrefillCanCompleteTheRequest", testPrefillCanCompleteTheRequest},
       {"testFirstTokenIsSentAtPrefill", testFirstTokenIsSentAtPrefill},
+      {"testABackgroundRequestAgesToNormal", testABackgroundRequestAgesToNormal},
       {"testFirstTokenSentBeforeASuspensionIsNotSentAgain", testFirstTokenSentBeforeASuspensionIsNotSentAgain},
       {"testResumedLaneClearsThePagesPastItsRestoredChain", testResumedLaneClearsThePagesPastItsRestoredChain},
       {"testReplayFindsItsOwnBlocks", testReplayFindsItsOwnBlocks},

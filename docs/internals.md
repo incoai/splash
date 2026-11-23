@@ -2645,6 +2645,15 @@ the 35B's). A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before.
 
+A Background request still in the engine 10 s after its first tick runs as
+Normal (`Engine::age`): in admission, prefill and decode order and in what its
+claims may take, as work that outlasts a title or a summary is a run the user
+asked for, which strict priority starved behind attended work for minutes. It
+still yields memory and its lane as Background (`Engine::yieldsAs`): it ranks
+below attended work, a Normal start refused memory suspends it, and suspended it
+holds no new Normal start back; once suspended it goes back to Background and
+ages again from then, so it does not decode beside the start it gave way to.
+
 ### Expert store and regrowth
 
 A run that can spill gets memory back from its KV instead, while each chunk

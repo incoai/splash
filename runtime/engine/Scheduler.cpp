@@ -74,6 +74,12 @@ void Scheduler::submit(RequestSpec request) {
   requests_.emplace(state.spec.id, std::move(state));
 }
 
+void Scheduler::setPriority(uint64_t id, RequestPriority priority) {
+  Request &request = get(id);
+  request.spec.priority = priority;
+  request.overtaken = 0;
+}
+
 void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
   Request &request = get(id);
   if (request.phase != Phase::Queued &&
