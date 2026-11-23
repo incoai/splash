@@ -311,6 +311,15 @@ void ggufMoePlans() {
   // Apple9 keep 32-row tiles. The prefill bound holds the 64-row plans.
   MoeShape eightOf128 = shape;
   eightOf128.experts = 128;
+  // Flint's routing (a sigmoid router's top 6 of 256 experts and two ungated
+  // shared slices), whose chunks average at most 48 routes an expert, takes
+  // 64-row tiles on no device, and a plan of it on them throws: its passes
+  // have no 64-row kernels.
+  MoeShape flint = shape;
+  flint.expertsPerToken = 6;
+  flint.router = MoeRouter::SigmoidNormalized;
+  flint.sharedSlices = 2;
+  flint.sharedGate = false;
   for (const auto [family, cores] : {std::pair{10U, 16U}, {10U, 19U}, {10U, 20U}, {10U, 31U}, {10U, 10U}, {10U, 32U},
                                      {10U, 40U}, {11U, 20U}, {9U, 20U}}) {
     DeviceCapabilities capabilities = device(family);
@@ -324,6 +333,10 @@ void ggufMoePlans() {
                 "GGUF MoE prefill plan of " + std::to_string(block.experts) + " experts on Apple" +
                     std::to_string(family) + ", " + std::to_string(cores) + " cores, at " + std::to_string(rows) +
                     " rows left its tiles");
+    for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows)
+      require(plans.moe(flint, kRouterFormat, rows, StepKind::Prefill).tileRows() <= 32,
+              "Flint's MoE prefill plan on Apple" + std::to_string(family) + ", " + std::to_string(cores) +
+                  " cores, at " + std::to_string(rows) + " rows runs 64-row tiles");
     for (const MoeShape &block : {shape, eightOf128}) {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
         require(plans.moe(block, kRouterFormat, lanes * 16, StepKind::Decode).tileRows() <= 32,
@@ -333,6 +346,8 @@ void ggufMoePlans() {
              kMoeWorkspaceFields);
     }
   }
+  rejects([&] { (void)MoE::plan(flint, 2048, MoeConfig{MoeExpertTile::M64}); },
+          "no 64-row passes for two shared slices", "a MoE plan of two shared slices on 64-row tiles was accepted");
 }
 
 // A dense tile of a sequence of more than one tile takes a history split per

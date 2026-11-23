@@ -194,7 +194,9 @@ public:
   // a prompt chunk's with the history splits and INT8-query choice of
   // PagedAttention::plan; a decode step's (`step`), whose lanes share their
   // bound, the step's lane cap, with a lane's splits of decodeSplits and the
-  // same INT8-query choice.
+  // same INT8-query choice, of the variants its single pass is compiled for
+  // alone, a full layer's (the whole history, positionScaled) and a sliding
+  // layer's (kWindowTokens, unscaled): another throws.
   [[nodiscard]] static RelativeAttentionPlan plan(std::span<const kv::ChunkedPrefillParams> sequences,
                                                   kv::Layout layout, const AttentionCalibration &calibration,
                                                   Int8Activations int8Activations, AttentionWorkspace capacity,

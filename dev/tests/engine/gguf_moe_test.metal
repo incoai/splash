@@ -76,8 +76,6 @@ template [[host_name("gguf_moe_test_m32_up_s0_softcap4_25")]] kernel GgufMoeTest
     gguf_moe_test_pass<32, 0, true, SoftcappedSwiglu<4, 25>>;
 template [[host_name("gguf_moe_test_m64_gate")]] kernel GgufMoeTestPass gguf_moe_test_pass<64, 1, false>;
 template [[host_name("gguf_moe_test_m64_up")]] kernel GgufMoeTestPass gguf_moe_test_pass<64, 1, true>;
-template [[host_name("gguf_moe_test_m64_gate_s2")]] kernel GgufMoeTestPass gguf_moe_test_pass<64, 2, false>;
-template [[host_name("gguf_moe_test_m64_up_s2")]] kernel GgufMoeTestPass gguf_moe_test_pass<64, 2, true>;
 template [[host_name("gguf_moe_test_m64_gate_s0_softcap4_25")]] kernel GgufMoeTestPass gguf_moe_test_pass<64, 0, false>;
 template [[host_name("gguf_moe_test_m64_up_s0_softcap4_25")]] kernel GgufMoeTestPass
     gguf_moe_test_pass<64, 0, true, SoftcappedSwiglu<4, 25>>;

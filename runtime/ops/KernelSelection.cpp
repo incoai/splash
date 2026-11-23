@@ -400,9 +400,10 @@ bool moeInt8Experts(const MoeShape &shape, std::span<const BlockMoeWeights *cons
 // rows; a row's bits are the same on every tile. From 20 cores Inkling-2-Mini
 // (8 of 128) takes them from 1024 rows, the 35B and the 122B (8 of 256) at
 // 2048; on the 16-core Inkling-2-Mini at 2048 alone. Flint and Flash-Next
-// never do (a 2048-row chunk averages 48 and 40 routes an expert). The int8
-// passes, whose tile holds 32 rows (GGUF_PREFILL_INT8_ROWS), keep 32-row
-// tiles.
+// never do (a 2048-row chunk averages 48 and 40 routes an expert), and
+// Flint's routing, of two shared slices, has no 64-row passes (MoePlan
+// refuses them). The int8 passes, whose tile holds 32 rows
+// (GGUF_PREFILL_INT8_ROWS), keep 32-row tiles.
 //
 // A chunk's experts run the int8 passes where its dense projections run the
 // int8 prefill tile (int8PrefillPaths: a prefill chunk's, int8 activations

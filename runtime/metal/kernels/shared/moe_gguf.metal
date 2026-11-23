@@ -61,8 +61,9 @@ template [[host_name("moe_expert_gguf_m8_down_s2")]] kernel MoeExpertGgufKernel 
 template [[host_name("moe_expert_gguf_m32_down_s2")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<32, 2>;
 template [[host_name("moe_expert_gguf_m8_down_s0")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<8, 0>;
 template [[host_name("moe_expert_gguf_m32_down_s0")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<32, 0>;
+// The 64-row passes, here and below, of a routing of one shared slice or none: two slices' (Flint's), whose prefill
+// chunks average at most 48 routes an expert (ops::selectMoe), run none (ops::MoePlan refuses them).
 template [[host_name("moe_expert_gguf_m64_down")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<64, 1>;
-template [[host_name("moe_expert_gguf_m64_down_s2")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<64, 2>;
 template [[host_name("moe_expert_gguf_m64_down_s0")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<64, 0>;
 
 // The gate and up passes in one (ops/MoE.cpp): threadgroup (x, y) runs a gate simdgroup and an up simdgroup on the same
@@ -234,10 +235,6 @@ template [[host_name("moe_expert_gguf_m64_gate_up")]] kernel MoeExpertGgufGateUp
     moe_expert_gguf_gate_up<64, 1, 1, MoeSiluGate>;
 template [[host_name("moe_expert_gguf_m64_gate_up_mixed")]] kernel MoeExpertGgufGateUpKernel
     moe_expert_gguf_gate_up<64, 2, 1, MoeSiluGate>;
-template [[host_name("moe_expert_gguf_m64_gate_up_s2")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<64, 1, 2, MoeSiluGate>;
-template [[host_name("moe_expert_gguf_m64_gate_up_mixed_s2")]] kernel MoeExpertGgufGateUpKernel
-    moe_expert_gguf_gate_up<64, 2, 2, MoeSiluGate>;
 // A compiled routing's softcapped activation (ops::kCompiledMoeRoutings), without a shared expert.
 template [[host_name("moe_expert_gguf_m8_gate_up_s0_softcap4_25")]] kernel MoeExpertGgufGateUpKernel
     moe_expert_gguf_gate_up<8, 1, 0, SoftcappedSwiglu<4, 25>>;

@@ -42,7 +42,8 @@
 //   default; gguf-moe-sigmoid builds Flint's, sigmoid weights over the sum of
 //   the top 6 and two ungated 512-wide slices of a 1024-wide shared expert,
 //   each slice's passes against the fp64 products of its rows and column
-//   window of the whole expert.
+//   window of the whole expert, on 8- and 32-row tiles alone: no 64-row
+//   passes are compiled for two slices (ops::MoePlan refuses them).
 // Streamed experts (model::ExpertStore) run in expert_store_test.mm.
 // `gguf-moe METALLIB float-stress N` runs the native rows' check alone N
 // times, on fresh rows each time, for a failure one run may not show. Run it
@@ -168,6 +169,10 @@ constexpr MoeShape kShape{.hiddenSize = kHidden,
                           .gateSoftcap = GGUF_MOE_GATE_SOFTCAP,
                           .upSoftcap = GGUF_MOE_UP_SOFTCAP};
 static_assert(kShape.valid(), "the test's routing is compiled");
+// The 64-row passes are compiled for a routing of one shared slice or none
+// (ops::MoePlan refuses two slices 64-row tiles): gguf-moe-sigmoid runs 8- and
+// 32-row tiles alone.
+constexpr bool kWideTiles = kSharedSlices != 2;
 // The floor chunk's slots and each elastic chunk's but the last in the tests
 // of chunked experts: neither a power of two, the floor of other slots than
 // an elastic chunk, two elastic chunks or more, and the last holds fewer.
@@ -1115,9 +1120,10 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   return result;
 }
 
-// Each buffer a decode plan and a 32- and a 64-row prefill plan reach,
-// at its extent and one element short, and each weight: the planes of every
-// shared expert tensor and each region of every chunk of the routed experts
+// Each buffer a decode plan and a 32- and a 64-row prefill plan reach (the
+// latter where the routing has 64-row passes), at its extent and one element
+// short, and each weight: the planes of every shared expert tensor and each
+// region of every chunk of the routed experts
 // (a floor chunk and elastic chunks of other slots, the last holding fewer),
 // whose rows fill whole tiles, in units of a row's group of 32 inputs or meta
 // unit (metal/abi/QuantFormat.h), also of routed formats with a second plane
@@ -1135,9 +1141,10 @@ void bufferExtents(MetalBackend &backend) {
   b.moe.input = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-input");
   b.moe.residual = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
-  for (const MoePlan &plan : {MoE::plan(shape, SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8}),
-                              MoE::plan(shape, 33, MoeConfig{MoeExpertTile::M32}),
-                              MoE::plan(shape, 65, MoeConfig{MoeExpertTile::M64})}) {
+  std::vector<MoePlan> plans{MoE::plan(shape, SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8}),
+                             MoE::plan(shape, 33, MoeConfig{MoeExpertTile::M32})};
+  if (kWideTiles) plans.push_back(MoE::plan(shape, 65, MoeConfig{MoeExpertTile::M64}));
+  for (const MoePlan &plan : plans) {
     allocate(backend, b, plan);
     splash::test::requireMoeExtents(backend, b.moe, m.weights, plan);
   }
@@ -1331,6 +1338,7 @@ int int8Experts(MetalBackend &backend) {
 
 int moe(MetalBackend &backend) {
   int failures = 0;
+  if (!kWideTiles) printf("64-row tiles: not compiled for the routing's two shared slices\n");
   Buffers b;
   b.input = activations(uint64_t{kMaximumRows} * kHidden);
   b.residual = activations(uint64_t{kMaximumRows} * kHidden);
@@ -1343,10 +1351,11 @@ int moe(MetalBackend &backend) {
   // (moe_live_rows) differ by chunk, with the router on each float tile: a
   // row's result is the same in every chunk on one tile (either tile's scores
   // of a row depend on that row alone). With the simdgroup router each chunk
-  // runs on 64-row tiles too, every row bitwise its result on 32-row tiles:
-  // its routes run the same tile kinds on both (an expert's only tile of at
-  // most GGUF_COLUMN_ROWS rows is its only tile on either), and the 64-row
-  // matmul sums a row's products in the order of the 8-, 16- and 32-row ones.
+  // runs on 64-row tiles too (kWideTiles), every row bitwise its result on
+  // 32-row tiles: its routes run the same tile kinds on both (an expert's only
+  // tile of at most GGUF_COLUMN_ROWS rows is its only tile on either), and the
+  // 64-row matmul sums a row's products in the order of the 8-, 16- and 32-row
+  // ones.
   const auto prefill32 = [&](const Model &m, std::map<std::pair<uint32_t, uint32_t>, GateUp> &products,
                              const std::string &formats) {
     for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
@@ -1361,7 +1370,7 @@ int moe(MetalBackend &backend) {
         const std::string label = formats + " prefill rows=" + std::to_string(rows) +
                                   (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
         const MoeRun result = runPlan(backend, m, b, plan, products, stats, label);
-        if (router == FloatTile::Simdgroup) {
+        if (router == FloatTile::Simdgroup && kWideTiles) {
           config.expertTile = MoeExpertTile::M64;
           const MoeRun wide = runPlan(backend, m, b, MoE::plan(shape, rows, config), products, stats,
                                       label + " (64-row tiles)");
@@ -1469,9 +1478,9 @@ int moe(MetalBackend &backend) {
 // Q4_K gate/up model, 1, 12 and 48 rows leave ragged tiles of 8- and 16-row
 // matmuls; at 256 rows the concentrated load fills whole tiles and the skewed
 // one leaves 16-row tails. A row's result is the same at every row count, and
-// on 64-row tiles, whose 256 concentrated rows fill four whole tiles of each
-// of experts 0 and 1 and whose skewed tails run 8- to 64-row matmuls, bitwise
-// its result on 32-row tiles.
+// on 64-row tiles (kWideTiles), whose 256 concentrated rows fill four whole
+// tiles of each of experts 0 and 1 and whose skewed tails run 8- to 64-row
+// matmuls, bitwise its result on 32-row tiles.
 int routingLoads(MetalBackend &backend) {
   enum class Load { Concentrated, Skewed };
   const MoeShape shape = kShape;
@@ -1518,14 +1527,16 @@ int routingLoads(MetalBackend &backend) {
         require(selected[r * kRoutes] == first && selected[r * kRoutes + 1] == (first + 1) % kExperts,
                 label + ": fixture routes to its intended first two experts");
       }
-      const MoeRun wide = runPlan(backend, m, b, MoE::plan(shape, rows, MoeConfig{MoeExpertTile::M64}), products,
-                                  stats, label + " (64-row tiles)");
-      const RowComparison w = compareRows(wide, result, rows);
-      sixtyFour += w.compared;
-      if (w.compared != rows || w.differ) {
-        printf("  %s: on 64-row tiles %u of %u rows compared bitwise, %u differ FAIL\n", label.c_str(), w.compared,
-               rows, w.differ);
-        ++failures;
+      if (kWideTiles) {
+        const MoeRun wide = runPlan(backend, m, b, MoE::plan(shape, rows, MoeConfig{MoeExpertTile::M64}), products,
+                                    stats, label + " (64-row tiles)");
+        const RowComparison w = compareRows(wide, result, rows);
+        sixtyFour += w.compared;
+        if (w.compared != rows || w.differ) {
+          printf("  %s: on 64-row tiles %u of %u rows compared bitwise, %u differ FAIL\n", label.c_str(), w.compared,
+                 rows, w.differ);
+          ++failures;
+        }
       }
       if (widest.output.empty()) {
         Stats repeat;

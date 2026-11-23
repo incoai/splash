@@ -1073,7 +1073,10 @@ void checkDecodeSplitCounts(metal::MetalBackend &backend, kv::Format format, boo
 
 // Where every row's window holds its whole history, the window changes
 // nothing: the windowed kernels' outputs are the whole history's bit for bit
-// (both unscaled), at the same split partition.
+// (both unscaled), at the same split partition. A decode step's single pass
+// over the whole history is a full layer's, position-scaled (the variants it
+// is compiled for), whose log scale is exactly 1 at these positions (below
+// 8,192: relative_attention_log_scale).
 void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format, bool int8Queries) {
   const auto outputs = [&](ops::RelativeAttentionVariant variant, bool verify, uint32_t lanes, uint32_t rows,
                            std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories) {
@@ -1099,7 +1102,7 @@ void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format, b
     const auto *begin = contents<uint16_t>(step.output);
     return std::vector<uint16_t>(begin, begin + step.output.sizeBytes() / 2);
   };
-  require(decoded(kSliding) == decoded(whole), "a windowed decode inside its window differs from the whole history's");
+  require(decoded(kSliding) == decoded(kFull), "a windowed decode inside its window differs from the whole history's");
   require(outputs(kSliding, false, 1, 600, {0, 0, 0, 0}) == outputs(whole, false, 1, 600, {0, 0, 0, 0}) &&
               outputs(kSliding, false, 1, 24, {900, 0, 0, 0}) == outputs(whole, false, 1, 24, {900, 0, 0, 0}),
           "a windowed prefill inside its window differs from the whole history's");
@@ -1142,12 +1145,13 @@ void checkPlans() {
               "INT8 queries score INT8 pages alone");
     }
     // A decode step's single pass: the kernel of its lane cap (_r16 past the
-    // narrow cap's rows), window, position scale and queries' format, and a
-    // lane's splits of its own pages.
+    // narrow cap's rows), its layer's variant (a sliding layer's window, a
+    // full layer's position scale) and queries' format, and a lane's splits
+    // of its own pages.
     const ops::AttentionWorkspace lanes = RelativeAttention::laneWorkspace(layout);
     for (const uint32_t cap : {kLaneRows, uint32_t{SPLASH_TARGET_VERIFY_ROWS}})
       for (const uint32_t cores : {kCores, 32U})
-        for (const auto variant : {kSliding, kFull, ops::RelativeAttentionVariant{}}) {
+        for (const auto variant : {kSliding, kFull}) {
           const std::array steps{ops::PagedAttention::chunkParams(5000, cap, kPageTokens, (5000 + cap + 31) / 32),
                                  ops::PagedAttention::chunkParams(70, cap, kPageTokens, (70 + cap + 31) / 32)};
           const auto decode = [&](uint32_t int8QueriesFromPages) {
@@ -1216,6 +1220,22 @@ void checkPlans() {
                                                   kSliding, ops::StepKind::Decode));
       },
       "a calibration of none", "a decode step was planned for no device's cores");
+  // The single pass is compiled for a full layer's variant and a sliding
+  // layer's alone: the whole history unscaled and a window position-scaled
+  // have no kernel.
+  ops::AttentionCalibration calibration = test::attentionRow(1);
+  calibration.cores = kCores;
+  for (const ops::RelativeAttentionVariant variant :
+       {ops::RelativeAttentionVariant{},
+        ops::RelativeAttentionVariant{.windowTokens = kWindow, .positionScaled = true}})
+    rejects(
+        [&] {
+          static_cast<void>(RelativeAttention::plan(lane, layoutOf(kv::Format::Int8), calibration,
+                                                    ops::Int8Activations::On,
+                                                    RelativeAttention::workspace(256, layoutOf(kv::Format::Int8)),
+                                                    variant, ops::StepKind::Decode));
+        },
+        "no relative attention decode kernel", "a decode step of a variant no layer attends was planned");
   for (const uint32_t cap : {kLaneRows + 1, uint32_t{SPLASH_TARGET_VERIFY_ROWS} + 1})
     rejects(
         [&] {

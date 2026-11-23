@@ -18,7 +18,7 @@
 // - steps of 8 to 512 rows on 8- and on 32-row expert tiles (MoeExpertTile, selectMoe's choice), routed at random or,
 //   per lane of 16 rows, from a pool of three times top-k, with the rows each routed expert takes on average;
 // - prefill chunks of 256 to 2048 rows routed at random on 32- and on 64-row expert tiles, each timed twice in the
-//   order 32, 64, 64, 32, with the chunk's routes per expert.
+//   order 32, 64, 64, 32, with the chunk's routes per expert (not Flint's, whose routing has no 64-row passes).
 // Each command runs layers of their own routes and buffers over one set of weights larger than the system cache, so a
 // layer streams its experts from DRAM: kDecodeLayers per decode step, kPrefillLayers per prefill chunk. Printed are
 // medians of GPU ms per layer over `rounds` (20) commands.
@@ -210,6 +210,8 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
                routing == Routing::Random ? "random" : "pooled", rowsPerExpert(m8, rows), eight, thirtyTwo,
                thirtyTwo / eight, uint32_t(plans.moe(shape, routerFormat, rows, splash::ops::StepKind::Prefill).configuration().expertTile));
       }
+    // Two shared slices (Flint's routing) have no 64-row passes (MoePlan).
+    if (shape.sharedSlices == 2) return 0;
     printf("  rows | routes per expert | M32 ms | M64 ms | M64/M32 | plan's tile\n");
     for (const uint32_t rows : {256u, 512u, 768u, 1024u, 1536u, 2048u}) {
       const Layers m32 = layers(tiled(rows, splash::ops::MoeExpertTile::M32), Routing::Random);

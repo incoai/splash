@@ -735,10 +735,12 @@ The rules:
    routes average `ops::MoeCalibration::wideTileRoutes` or more an expert
    runs 64-row tiles, which dequantize an expert's weights once for up to 64
    of its rows. From 20 cores that is 64 routes: from 1024 rows on
-   Inkling-2-Mini, at 2048 on Qwen3.6-35B-A3B and Qwen3.5-122B-A10B. The
-   16-core takes 128, where 64-row tiles took the 35B's prefill 1.5-2.5%
-   longer and Inkling's 1024- and 1536-row chunks no shorter: at 2048 rows on
-   Inkling-2-Mini alone. A row's result is the same bits on every tile. One
+   Inkling-2-Mini, at 2048 on Qwen3.6-35B-A3B and Qwen3.5-122B-A10B; never
+   on Flint (48 at 2048 rows), whose routing of two shared slices has no
+   64-row passes (`ops::MoePlan` refuses them). The 16-core takes 128,
+   where 64-row tiles took the 35B's prefill 1.5-2.5% longer and Inkling's
+   1024- and 1536-row chunks no shorter: at 2048 rows on Inkling-2-Mini
+   alone. A row's result is the same bits on every tile. One
    plan per step serves every block, so its router follows rule 3 in the
    format of most blocks' routers
    (`ops::moeRouterFormat`). Every tile's grouped rows are the step's
@@ -1219,7 +1221,8 @@ routing its lanes' rows alone, no row of no lane, and with the experts in
 permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
 bitwise as in one chunk, and refuses floor and elastic chunks one unit short, a malformed chunk list
 or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts
-and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
+and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices, on
+8- and 32-row tiles alone;
 and `expert-store`, streamed experts at four shapes bitwise against the resident ones, in loads
 of every kind, through a release and a restore, in a floor and three smaller elastic chunks,
 beside a size of one block, which the store reads whole into its floor

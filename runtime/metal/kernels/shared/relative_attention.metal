@@ -516,10 +516,11 @@ inline void relative_attention_decode_phase(
 // and the table's sums (other buffers of the dispatch without a table), the
 // page tables, the command's tree rows (another buffer of the dispatch
 // without), its layout and the parameters. Each is compiled for blocks of up
-// to 8 rows and, _r16, a verify block's 16; over the whole history and
-// windowed (_w1023); unscaled and position-scaled (_scaled); plain and
-// writing the out-projection's Table16 input too (_table16); for INT8 pages
-// with bf16 or INT8 queries, and BF16 pages.
+// to 8 rows and, _r16, a verify block's 16; for the layers' two variants
+// alone, a full layer's (the whole history, position-scaled: _scaled) and a
+// sliding one's (windowed, unscaled: _w1023); plain and writing the
+// out-projection's Table16 input too (_table16); for INT8 pages with bf16 or
+// INT8 queries, and BF16 pages.
 #define RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, Table) \
   kernel void Name(                                                                                           \
       device const bfloat *projection [[buffer(0)]],                                                          \
@@ -579,10 +580,8 @@ inline void relative_attention_decode_phase(
   RELATIVE_ATTENTION_DECODE_OUTPUTS(relative_attention_bf16_decode##Suffix, RowsPerTile, Window, PositionScaled, \
                                     bfloat, false)
 #define RELATIVE_ATTENTION_DECODE_VARIANTS(Suffix, RowsPerTile)                                                \
-  RELATIVE_ATTENTION_DECODE_FORMATS(Suffix, RowsPerTile, 0, false)                                             \
   RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_scaled, RowsPerTile, 0, true)                                     \
-  RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_w1023, RowsPerTile, 1023, false)                                  \
-  RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_w1023_scaled, RowsPerTile, 1023, true)
+  RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_w1023, RowsPerTile, 1023, false)
 RELATIVE_ATTENTION_DECODE_VARIANTS(, 8)
 RELATIVE_ATTENTION_DECODE_VARIANTS(_r16, 16)
 #undef RELATIVE_ATTENTION_DECODE_VARIANTS

@@ -137,6 +137,12 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
   requireVariant(variant);
   static_cast<void>(commandRows(sequences, layout));
   const bool decode = step == StepKind::Decode;
+  // The single pass is compiled for the layers' two variants alone: a full
+  // layer's, over the whole history and position-scaled, and a sliding
+  // layer's, windowed and unscaled.
+  if (decode && variant.positionScaled == (variant.windowTokens != 0))
+    throw std::invalid_argument("no relative attention decode kernel for the variant: a full layer's whole history "
+                                "is position-scaled, a sliding layer's window unscaled");
   // A decode step's lanes share the step's lane cap, at most a verify
   // block's rows: one tile of the single pass each.
   if (decode)
