@@ -293,21 +293,21 @@ inline void relative_attention_direct_phase(
       kv_head, first_position, active_rows, run, scores, probabilities, row_max, row_sum, previous_scale, rescale,
       splash_attention_tree(params, sequence, rows, tree, first_position), thread_index,
       [&](thread auto &running, bool running_full) {
-        // relative_attention_combine_splits of the one split: each active
-        // fused row's weight into previous_scale and its denominator into
-        // row_sum, from its statistics and its sink. The denominator rounds
-        // its split's product before it adds the sink's term, as the reduce's
-        // loop over splits does: contracted into one fused multiply-add, the
-        // two gave other bits.
+        // The combine of the one split (relative_attention_tile.h's
+        // Reduce): each active fused row's weight into previous_scale and
+        // its denominator into row_sum, from its statistics and its sink,
+        // the split's product rounded before the sink's term is added
+        // (contract(off)), as the reduce's loop over splits rounds a row's
+        // one product: contracted into one fused multiply-add, the two gave
+        // other bits.
         if (thread_index < M && thread_index / QueryHeadsPerKVHead < active_rows) {
 #pragma clang fp contract(off)
           const float sink = sinks[offset / HeadDim + thread_index];
           const float maximum = row_max[thread_index];
           const float row_maximum = max(maximum, sink);
-          const float weight = fast::exp(maximum - row_maximum);
-          float denominator = 0.0f;
-          denominator += weight * row_sum[thread_index];
-          denominator += fast::exp(sink - row_maximum);
+          const float weight = relative_attention_split_weight(maximum, row_maximum);
+          const float denominator =
+              relative_attention_denominator(weight * row_sum[thread_index], sink, row_maximum);
           previous_scale[thread_index] = weight;
           row_sum[thread_index] = denominator;
         }
@@ -332,7 +332,7 @@ inline void relative_attention_direct_phase(
           const float gate =
               float(projection[place.packed * Row::Stride + Row::GateOffset + query_head * HeadDim + dimension]);
           hidden[place.output * Width + query_head * HeadDim + dimension] =
-              bfloat(float(value) * splash_sigmoid(gate));
+              relative_attention_gated(float(value), gate);
         }
         if constexpr (Table) {
           static_assert(D == 128, "two spans of 64 outputs a head");

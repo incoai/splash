@@ -510,6 +510,44 @@ inline void relative_attention_page_loop(
 
 // ---- Reduce ---------------------------------------------------------------
 
+// A fused row's combine of its splits and its sink, which the reduce
+// (relative_attention_combine_splits, relative_attention_output_row), a
+// decode step's single pass (relative_attention_combine_weights, _row,
+// relative_attention_output_quad) and the direct kernels, of one split
+// (relative_attention_direct_phase), each compute in the same order and
+// rounding: each split's weight, from its maximum and the row's over its
+// splits' and its sink (relative_attention_split_weight); the denominator,
+// the splits' weighted sums in their order and then the sink's term
+// (relative_attention_denominator); each element's quotient of its splits'
+// weighted outputs and the denominator, 0 without one, rounded to bf16; and
+// its gated output (relative_attention_gated). The weight and the
+// denominator are computed uncontracted (contract(off)): a row of one split
+// rounds its split's product before it adds the sink's term, as the loop
+// over splits does, where one fused multiply-add of the two gave other bits.
+// Each is always inlined, so that its callers compile as they did with its
+// expression in place.
+
+// The weight of a split of maximum `maximum` in a row of maximum
+// `row_maximum`.
+__attribute__((always_inline)) inline float relative_attention_split_weight(float maximum, float row_maximum) {
+#pragma clang fp contract(off)
+  return fast::exp(maximum - row_maximum);
+}
+
+// A row's denominator: its splits' weighted sums, `splits`, then its sink's
+// term.
+__attribute__((always_inline)) inline float relative_attention_denominator(float splits, float sink,
+                                                                           float row_maximum) {
+#pragma clang fp contract(off)
+  return splits + fast::exp(sink - row_maximum);
+}
+
+// An element's gated output: its value as the combine rounds it, `value`,
+// times the sigmoid of its query head's `gate`, rounded to bf16.
+__attribute__((always_inline)) inline bfloat relative_attention_gated(float value, float gate) {
+  return bfloat(value * splash_sigmoid(gate));
+}
+
 // splash_attention_combine_splits with the row's own sink, `sink` (the
 // scores' scale is not applied to it): one more key with no value, in the
 // maximum and, after the splits in their order, the denominator.
@@ -532,7 +570,7 @@ inline bfloat relative_attention_combine_splits(
   const float split_maximum = simd_max(lane < D / 32 ? group_values[lane] : -INFINITY);
   const float row_maximum = max(split_maximum, sink);
   if (thread_index < written)
-    weights[thread_index] = fast::exp(maximum - row_maximum);
+    weights[thread_index] = relative_attention_split_weight(maximum, row_maximum);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float numerator = 0.0f, denominator = 0.0f;
   // Both accumulations in the original split order, as the shared combine's.
@@ -543,7 +581,7 @@ inline bfloat relative_attention_combine_splits(
         partials[((head_slot + split) * M + fused_row) * D + thread_index];
     denominator += weight * statistics[stat + 1];
   }
-  denominator += fast::exp(sink - row_maximum);
+  denominator = relative_attention_denominator(denominator, sink, row_maximum);
   return bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 
@@ -562,7 +600,7 @@ inline void relative_attention_output_row(bfloat value, device const bfloat *pro
   bfloat element = value;
   if (writes) {
     const float gate = float(projection[packed * Row::Stride + Row::GateOffset + query_head * HeadDim + dimension]);
-    element = bfloat(float(value) * splash_sigmoid(gate));
+    element = relative_attention_gated(float(value), gate);
     hidden[output * Width + query_head * HeadDim + dimension] = element;
   }
   if constexpr (Table) {
@@ -712,11 +750,11 @@ inline void relative_attention_combine_weights(device coherent(device) const flo
   float denominator = 0.0f;
   for (uint split = 0; split < written; ++split) {
     const ulong stat = ((head_slot + split) * M + fused_row) * 2;
-    const float weight = fast::exp(statistics[stat] - maximum);
+    const float weight = relative_attention_split_weight(statistics[stat], maximum);
     weights[fused_row * written + split] = weight;
     denominator += weight * statistics[stat + 1];
   }
-  denominators[fused_row] = denominator + fast::exp(sink - maximum);
+  denominators[fused_row] = relative_attention_denominator(denominator, sink, maximum);
 }
 
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim>
@@ -766,10 +804,10 @@ inline void relative_attention_output_quad(float4 value, device const bfloat *pr
     return;
   const bfloat4 gates = *reinterpret_cast<device const bfloat4 *>(projection + place.packed * Row::Stride +
                                                                    Row::GateOffset + query_head * HeadDim + dimension);
-  const bfloat4 element(bfloat(float(bfloat(value.x)) * splash_sigmoid(float(gates.x))),
-                        bfloat(float(bfloat(value.y)) * splash_sigmoid(float(gates.y))),
-                        bfloat(float(bfloat(value.z)) * splash_sigmoid(float(gates.z))),
-                        bfloat(float(bfloat(value.w)) * splash_sigmoid(float(gates.w))));
+  const bfloat4 element(relative_attention_gated(float(bfloat(value.x)), float(gates.x)),
+                        relative_attention_gated(float(bfloat(value.y)), float(gates.y)),
+                        relative_attention_gated(float(bfloat(value.z)), float(gates.z)),
+                        relative_attention_gated(float(bfloat(value.w)), float(gates.w)));
   *reinterpret_cast<device bfloat4 *>(hidden + place.output * Width + query_head * HeadDim + dimension) = element;
   if constexpr (Table)
 #pragma unroll
