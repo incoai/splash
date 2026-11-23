@@ -523,11 +523,13 @@ std::vector<MoeFormatSet> moeFormatSets() {
   sets.push_back({"router-mixed", {{GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, f32},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16}}});
-  // MLX experts: 4- and 5-bit ones (and Q8_0 ones) take the int8 prefill passes where the
-  // device's plans run int8 activations (moeInt8Experts); 3-bit ones (Flint's)
-  // and 4-bit experts beside other shared experts keep the staged passes.
-  for (const uint32_t bits : {GGUF_FMT_AF3G64, GGUF_FMT_AF4G64, GGUF_FMT_AF5G64})
-    sets.push_back({formatName(bits), std::vector<BlockFormats>(4, {bits, bits, bits, bits, GGUF_FMT_AF8G64})});
+  // Experts of MLX 4 and 5 bits and of Q8_0 take the int8 prefill passes
+  // where the device's plans run int8 activations (moeInt8Experts); MLX
+  // 3-bit ones (Flint's) and 4-bit experts beside other shared experts keep
+  // the staged passes.
+  for (const uint32_t format : {GGUF_FMT_AF3G64, GGUF_FMT_AF4G64, GGUF_FMT_AF5G64, GGUF_FMT_Q80})
+    sets.push_back(
+        {formatName(format), std::vector<BlockFormats>(4, {format, format, format, format, GGUF_FMT_AF8G64})});
   sets.push_back({"af4g64-shared-q8_0", std::vector<BlockFormats>(4, {GGUF_FMT_AF4G64, GGUF_FMT_AF4G64, GGUF_FMT_AF4G64,
                                                                       GGUF_FMT_Q80, GGUF_FMT_AF8G64})});
   return sets;
