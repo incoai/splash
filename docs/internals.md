@@ -1313,21 +1313,22 @@ target's format, prefills on the bf16 tiles (`ExecutionPlans::draftLinear`): its
 nothing from the tile, while its context projection, the widest a prefill runs (25,600 inputs on
 the 27B), would set the tile's scratch, 38 MB on Qwen3.6-35B-A3B GGUF, enough at `--max-memory 24G`
 to stream the routed experts its plan otherwise holds whole. Over 24 real 1K-8K prefixes the
-next-token KL against bf16 prefill on the GPU alone is
-2.2e-3 on Qwen3.8-27B MLX 4-bit (median 3.6e-4) and 2.3e-3 on Qwen3.6-35B-A3B MLX 4-bit, the most
-likely token unchanged at every prefix. Teacher-forced over 256 positions after a 4K- and a 32K-token
-prefill, the Q8_0 projections' int8 prefill keeps the bf16 prefill's most likely token at 93-94% of
-Qwen3.6-35B-A3B UD-Q4_K_M's positions (mean KL 1.6e-2 and 2.1e-2) and 92-95% of Inkling-2-Mini
-UD-Q4_K_M's (mean KL 0.14 and 0.29, median under 7e-4), the true ids' NLL within 0.04 either way.
-At default flags on a 20-core M5 Pro, where the 27B's Neural
-Engine split takes 10 of 34 units, it is 9.4e-4, against 1.1e-3 for the bf16 tiles with the split at
-its own 15 units; both change the most likely token at the same one prefix of 24. Time to the first
-token falls by a quarter at 2K and 10K tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B
-(16-core M5 Pro). `gguf-projection` checks that the tile computes the products of the inputs so
-rounded within the bf16 tile's error, also with an outlier input per row, and bounds the RMS error
-it adds over the bf16 tile on dense inputs at 1%, that a fused projection quantizes once and runs a
-GEMM per segment, and an up on its gate's codes bitwise its own run; `gguf-projection-benchmark`
-times it as `prefill int8`.
+next-token KL against bf16 prefill on the GPU alone is 2.2e-3 on Qwen3.8-27B MLX 4-bit (median
+3.6e-4) and 2.3e-3 on Qwen3.6-35B-A3B MLX 4-bit, the most likely token unchanged at every prefix. At
+default flags on a 20-core M5 Pro, where the 27B's Neural Engine split takes 10 of 34 units, it is
+9.4e-4, against 1.1e-3 for the bf16 tiles with the split at its own 15 units; both change the most
+likely token at the same one prefix of 24. Time to the first token falls by a quarter at 2K and 10K
+tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B (16-core M5 Pro). Teacher-forced over
+256 positions after a 4K- and a 32K-token prefill, the Q8_0 projections' int8 prefill keeps the bf16
+prefill's most likely token at 93-94% of Qwen3.6-35B-A3B UD-Q4_K_M's positions (mean KL 1.6e-2 and
+2.1e-2) and 92-95% of Inkling-2-Mini UD-Q4_K_M's (mean KL 0.14 and 0.29, median under 7e-4), the
+true ids' NLL within 0.04 either way. For Inkling-2-Mini that mean KL is about 1.6-1.9x what its
+INT8 attention queries alone give at the same positions (0.087 and 0.154: the build without the Q8_0
+tile, `--activations auto` against `bf16`). `gguf-projection` checks that the tile computes the
+products of the inputs so rounded within the bf16 tile's error, also with an outlier input per row,
+and bounds the RMS error it adds over the bf16 tile on dense inputs at 1%, that a fused projection
+quantizes once and runs a GEMM per segment, and an up on its gate's codes bitwise its own run;
+`gguf-projection-benchmark` times it as `prefill int8`.
 
 A MoE target's experts run on the same tile in such a chunk where every block's experts are
 resident and each projection's routed and shared experts share af4g64, af5g64 or Q8_0
