@@ -84,6 +84,13 @@ void requireStaging(const RelativeAttentionStaging &staging, const CommandRows &
 
 bool sameLayer(SplashKvLayer a, SplashKvLayer b) { return a.extent_pages == b.extent_pages && a.offset == b.offset; }
 
+// Relative attention writes every row: no target attends a chunk's last rows
+// alone through it (QwenTarget's paged attention does).
+void requireEveryRow(const AttentionOutputRows &output) {
+  if (output.output != AttentionOutput::Every)
+    throw std::invalid_argument("relative attention writes every row, not each sequence's last row alone");
+}
+
 } // namespace
 
 AttentionWorkspace RelativeAttentionPlan::workspace() const noexcept {
@@ -255,6 +262,7 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
                                               std::span<const kv::ChunkedPrefillParams> sequences,
                                               std::span<const AttentionHistory> histories, const AttentionRows &rows,
                                               const AttentionOutputRows &output) {
+  requireEveryRow(output);
   const CommandRows command = commandRows(sequences, plan.layout);
   const std::span<const RelativeAttentionPlan::Sequence> planned = plan.sequences();
   if (planned.size() != sequences.size() || histories.size() != sequences.size())
@@ -279,16 +287,12 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
                                           : kv::attentionTiles(command.last.chunk_tokens) * kv::kAttentionTileRows);
   requireBytes(weights.bias, uint64_t{SPLASH_RELATIVE_ATTENTION_EXTENT} * kStates * sizeof(float),
                "attention relative bias");
-  const bool last = output.output == AttentionOutput::Last, table = output.input != LinearInput::Plain;
-  for (const RelativeAttentionPlan::Sequence &sequence : planned)
-    if (last && sequence.firstTile + 1 != kv::attentionTiles(sequence.rows))
-      throw std::invalid_argument("an attention of each sequence's last row takes the plan of its last tiles");
+  const bool table = output.input != LinearInput::Plain;
   const uint32_t width = kQueryHeads * kHeadDimension;
-  const uint32_t outputRows = last ? static_cast<uint32_t>(sequences.size()) : rows.rows;
   // The reduce reads each row's gates, the block after its queries.
   requireBytes(output.packed, rowBytes(rows.rows, kProjectionStride, 2 * uint64_t{width}, 2), "attention gate");
-  requireBytes(output.hidden, uint64_t{outputRows} * width * 2, "attention hidden");
-  if (table) requireTableScratch(output.scratch, output.input, width, outputRows);
+  requireBytes(output.hidden, uint64_t{rows.rows} * width * 2, "attention hidden");
+  if (table) requireTableScratch(output.scratch, output.input, width, rows.rows);
   const metal::MetalBuffer &tableInput = table ? output.scratch.input : output.hidden;
   const metal::MetalBuffer &tableSums = table ? output.scratch.sums : output.hidden;
   const std::string reducePipeline = plan.reducePipeline() + tableSuffix(output.input);
@@ -307,7 +311,7 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
                                .tiles = direct ? static_cast<uint32_t>(plan.directGroups(dispatch).y)
                                                : dispatch.tiles,
                                .trees = rows.tree ? 1U : 0U,
-                               .last_rows = last ? 1U : 0U,
+                               .last_rows = 0,
                                .kv = layer,
                                .sequence = {}};
     std::array<metal::MetalBuffer, kMaximumSequences> tables;
@@ -376,6 +380,7 @@ PreparedInput RelativeAttention::addDecode(metal::CommandGraph &graph, const Rel
                                            const AttentionRows &rows, const RelativeAttentionWorkspace &workspace,
                                            const AttentionOutputRows &output) {
   if (plan.step != StepKind::Decode) throw std::invalid_argument("a single pass takes a decode step's plan");
+  requireEveryRow(output);
   const CommandRows command = commandRows(sequences, plan.layout);
   const std::span<const RelativeAttentionPlan::Sequence> planned = plan.sequences();
   if (planned.size() != sequences.size() || pageTables.size() != sequences.size())
@@ -395,11 +400,10 @@ PreparedInput RelativeAttention::addDecode(metal::CommandGraph &graph, const Rel
   requireBytes(weights.relativeScale, uint64_t{kQueryHeads} * kStates * sizeof(float), "attention relative scale");
   requireBytes(weights.bias, uint64_t{SPLASH_RELATIVE_ATTENTION_EXTENT} * kStates * sizeof(float),
                "attention relative bias");
-  const bool last = output.output == AttentionOutput::Last, table = output.input != LinearInput::Plain;
+  const bool table = output.input != LinearInput::Plain;
   const uint32_t width = kQueryHeads * kHeadDimension;
-  const uint32_t outputRows = last ? static_cast<uint32_t>(sequences.size()) : rows.rows;
-  requireBytes(output.hidden, uint64_t{outputRows} * width * 2, "attention hidden");
-  if (table) requireTableScratch(output.scratch, output.input, width, outputRows);
+  requireBytes(output.hidden, uint64_t{rows.rows} * width * 2, "attention hidden");
+  if (table) requireTableScratch(output.scratch, output.input, width, rows.rows);
   const AttentionWorkspace needed = plan.workspace();
   requireBytes(workspace.partials, needed.partialsBytes, "attention partials");
   requireBytes(workspace.statistics, needed.statisticsBytes, "attention statistics");
@@ -410,7 +414,7 @@ PreparedInput RelativeAttention::addDecode(metal::CommandGraph &graph, const Rel
                                .rows = rows.rows,
                                .tiles = dispatch.tiles,
                                .trees = rows.tree ? 1U : 0U,
-                               .last_rows = last ? 1U : 0U,
+                               .last_rows = 0,
                                .kv = layer,
                                .sequence = {}};
     std::array<metal::MetalBuffer, kMaximumSequences> tables;

@@ -1110,7 +1110,9 @@ void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format, b
             << " bit for bit the whole history's PASS\n";
 }
 
-// The plans' kernels, and the layouts and windows they refuse.
+// The plans' kernels, and the layouts and windows they refuse; and an output
+// of each sequence's last row alone, which a prompt chunk's attention and a
+// decode step's single pass refuse.
 void checkPlans() {
   const std::array sequence{ops::PagedAttention::chunkParams(5000, 300, 320, (5300 + 31) / 32)};
   const std::array lane{ops::PagedAttention::chunkParams(5000, kLaneRows, kPageTokens, (5008 + 31) / 32)};
@@ -1259,6 +1261,22 @@ void checkPlans() {
                                                   {.windowTokens = 512}));
       },
       "no relative attention kernel", "another window was accepted");
+  // Before any buffer: relative attention writes every row.
+  const ops::AttentionWorkspace capacity = RelativeAttention::workspace(256, layoutOf(kv::Format::Int8));
+  const ops::RelativeAttentionPlan chunk = RelativeAttention::plan(
+      sequence, layoutOf(kv::Format::Int8), test::attentionRow(1), ops::Int8Activations::On, capacity, kSliding);
+  const ops::RelativeAttentionPlan step = RelativeAttention::plan(
+      lane, layoutOf(kv::Format::Int8), calibration, ops::Int8Activations::On, capacity, kSliding,
+      ops::StepKind::Decode);
+  const ops::AttentionOutputRows last{{}, {}, ops::AttentionOutput::Last};
+  metal::CommandGraph graph;
+  rejects(
+      [&] {
+        static_cast<void>(RelativeAttention::addAttention(graph, chunk, {}, {}, {}, {}, sequence, {}, {}, last));
+      },
+      "writes every row", "a prompt chunk's attention of each sequence's last row was encoded");
+  rejects([&] { static_cast<void>(RelativeAttention::addDecode(graph, step, {}, {}, {}, {}, lane, {}, {}, last)); },
+          "writes every row", "a decode step's single pass of each sequence's last row was encoded");
   std::cout << "plans: kernels of each variant, and refusals PASS\n";
 }
 

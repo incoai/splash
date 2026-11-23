@@ -184,6 +184,12 @@ void ShortConvolution::addConvolutionPair(metal::CommandGraph &graph, std::span<
       inputStride(first, shape) != inputStride(second, shape) ||
       (shape.dynamic() && first.dynamicStride != second.dynamicStride))
     throw std::invalid_argument("invalid short convolution pair");
+  // In one dispatch each writes its state's columns of the tape and its
+  // output: the two's columns lie apart, and their outputs are not one view.
+  const uint32_t apart = states[0].column > states[1].column ? states[0].column - states[1].column
+                                                             : states[1].column - states[0].column;
+  if (apart < shape.channels) throw std::invalid_argument("a short convolution pair's state columns overlap");
+  if (first.output.sameView(second.output)) throw std::invalid_argument("a short convolution pair writes one output");
   requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "short convolution layout");
   for (size_t index = 0; index < buffers.size(); ++index) {
     requireState(shape, states[index]);
@@ -221,7 +227,9 @@ ShortConvolutionParams ShortConvolution::verifyParams(const ShortConvBuffers &bu
   requireState(shape, state);
   // A verify block's paths are row masks of 32 rows.
   requireLayoutRows(rows, 32);
-  if (shape.dynamic() || stateIn.size() != rows.sequences || !buffers.residual || !tree || !tape)
+  // It convolves the rows it computes: no view of wider input rows.
+  if (shape.dynamic() || stateIn.size() != rows.sequences || !buffers.residual || !tree || !tape ||
+      buffers.inputStride || buffers.inputColumn)
     throw std::invalid_argument("invalid short convolution of a verify step's computed rows");
   requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "short convolution layout");
   requireBytes(buffers.taps, uint64_t{shape.channels} * kTaps * sizeof(float), "short convolution taps");

@@ -273,9 +273,11 @@ void Inkling2LoopTarget::addGates(const PrefillStep &step, uint32_t application,
 // spills, in the decode step's single pass. A decode step projects the keys
 // and values of one row (a sliding layer's but where messages gate its inputs
 // apart) side by side as one projection (keyValueProjection), each the bits
-// of its own, one dispatch and one prepared input for both, and convolves
-// them in one dispatch (ops::ShortConvolution::addConvolutionPair), each the
-// bits of its own dispatch.
+// of its own, in one dispatch from one prepared input where its tile fuses
+// them (the column and register tiles, and the staged tile of one row group),
+// and convolves them in one dispatch
+// (ops::ShortConvolution::addConvolutionPair), each the bits of its own
+// dispatch.
 void Inkling2LoopTarget::addAttention(PrefillStep &step, uint32_t application,
                                       const std::array<metal::MetalBuffer, 3> &inputs) const {
   const uint32_t weightLayer = schedule_.weightLayer(application);
@@ -289,6 +291,9 @@ void Inkling2LoopTarget::addAttention(PrefillStep &step, uint32_t application,
   ops::ShortConvBuffers keys{.input = s.keys, .taps = mixer.keyConvolution, .output = s.convolvedKeys};
   ops::ShortConvBuffers values{.input = s.values, .taps = mixer.valueConvolution, .output = s.convolvedValues};
   const std::optional<ops::Projection> &keyValues = keyValues_[weightLayer];
+  // Side by side on a decode step alone: it was measured on decode steps'
+  // rows (fewer dispatches, and one table on the register tile), not on a
+  // prompt chunk's, whose scratch holds no rows of the pair (keyValues).
   if (step.decode && keyValues && inputs[1].sameView(inputs[2])) {
     linear.addProjection(step.graph, inputs[1], *keyValues, s.keyValues, rows, b.linearScratch);
     keys.input = values.input = s.keyValues;

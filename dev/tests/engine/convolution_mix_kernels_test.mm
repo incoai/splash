@@ -553,6 +553,69 @@ void convPairTest(MetalBackend &backend, ops::ShortConvShape shape, bool oneProj
   }
 }
 
+// Host side, nothing run: a pair's convolutions each write their state's
+// columns of the tape and their output in one dispatch, so addConvolutionPair
+// refuses two whose columns overlap, by a column or wholly, and two of one
+// output; Inkling-2-Mini's keys and values, a convolution's channels apart
+// (Inkling2LoopSchedule::convolutionColumn), are encoded either way round.
+// And a combine's convolution (verifyParams), which convolves the rows the
+// combine computes, refuses a view of wider input rows.
+void convPairRefusals(MetalBackend &backend) {
+  constexpr uint32_t rows = 3, channels = 1024, stride = 2 * channels;
+  const ops::ShortConvShape shape{channels, 0};
+  const std::array<ops::LaneRows, 1> lanes{{{0, rows}}};
+  const MetalBuffer layout = laneRowsOf(backend, lanes), tree = scratch(backend, rows * sizeof(ops::TreeRow)),
+                    tape = scratch(backend, uint64_t{rows} * stride * 2),
+                    state = scratch(backend, ops::ShortConvolution::stateBytes(stride));
+  const std::vector<MetalBuffer> in{state};
+  const auto buffersOf = [&] {
+    return ops::ShortConvBuffers{.input = scratch(backend, uint64_t{rows} * channels * 2),
+                                 .taps = scratch(backend, uint64_t{channels} * kTaps * 4),
+                                 .output = scratch(backend, uint64_t{rows} * channels * 2)};
+  };
+  const std::array<ops::ShortConvBuffers, 2> pair{buffersOf(), buffersOf()};
+  std::array<ops::ShortConvBuffers, 2> oneOutput = pair;
+  oneOutput[1].output = oneOutput[0].output;
+  // Whether the pair encodes, at its convolutions' state columns `first` and `second`.
+  const auto encodes = [&](const std::array<ops::ShortConvBuffers, 2> &buffers, uint32_t first, uint32_t second) {
+    const std::array<ops::ShortConvState, 2> states{ops::ShortConvState{first, stride},
+                                                    ops::ShortConvState{second, stride}};
+    CommandGraph graph;
+    try {
+      ops::ShortConvolution::addConvolutionPair(graph, buffers, shape, states, in, layout, {1, rows, rows}, tree,
+                                                tape);
+    } catch (const std::invalid_argument &) {
+      return false;
+    }
+    return graph.dispatches().size() == 1;
+  };
+  check(encodes(pair, 0, channels) && encodes(pair, channels, 0),
+        "short convolution pair: state columns side by side encoded");
+  check(!encodes(pair, 0, channels - 1) && !encodes(pair, channels - 1, 0) && !encodes(pair, channels, channels),
+        "short convolution pair: overlapping state columns refused");
+  check(!encodes(oneOutput, 0, channels), "short convolution pair: one output refused");
+  // The combine's convolution: plain, then of a view.
+  ops::ShortConvBuffers combined{.taps = pair[0].taps,
+                                 .residual = scratch(backend, uint64_t{rows} * channels * 4),
+                                 .output = pair[0].output};
+  const auto verifies = [&](const ops::ShortConvBuffers &buffers) {
+    try {
+      static_cast<void>(ops::ShortConvolution::verifyParams(buffers, shape, in, {0, stride}, layout,
+                                                            {1, rows, rows}, tree, tape));
+    } catch (const std::invalid_argument &) {
+      return false;
+    }
+    return true;
+  };
+  const bool plain = verifies(combined);
+  combined.inputStride = stride;
+  const bool strided = verifies(combined);
+  combined.inputStride = 0;
+  combined.inputColumn = channels;
+  check(plain && !strided && !verifies(combined),
+        "short convolution of a combine's rows: a view of wider input rows refused");
+}
+
 // A verify step's combine running its convolution
 // (MoE::addCombineConvolution, moe_combine_convolution) against
 // moe_combine into bf16 rows and then the RoundedSum convolution of them
@@ -1154,6 +1217,7 @@ int main(int argc, const char *argv[]) {
       for (const ops::ShortConvShape shape : {ops::ShortConvShape{1024, 0}, ops::ShortConvShape{1024, 8}})
         for (const bool oneProjection : {false, true})
           convPairTest(backend, shape, oneProjection, !std::getenv("MTL_SHADER_VALIDATION"));
+      convPairRefusals(backend);
       for (const bool currentFloat : {false, true}) {
         for (const uint32_t queries : {1u, 3u, 4u})
           for (uint32_t stack = 1; stack <= 4; ++stack)

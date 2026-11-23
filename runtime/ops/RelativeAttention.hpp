@@ -241,7 +241,8 @@ public:
                             kv::Layout layout, RelativeAttentionVariant variant = {});
   // The plan's dispatches over the staging into the out-projection's input
   // rows (`output`, as PagedAttention::addAttention's: output.packed the
-  // layer's projection rows, whose gates multiply them), each sequence
+  // layer's projection rows, whose gates multiply them), every row of them
+  // (an output of each sequence's last row alone throws), each sequence
   // reading its history where `histories` say (dense: no block lists),
   // adding the layer's bias (weights.bias) and its rows' sinks. A dispatch
   // whose sequences read their layer in two placements runs as a dispatch per
@@ -249,9 +250,10 @@ public:
   // history in one split runs the direct kernel in place of the split and
   // the reduce (RelativeAttentionPlan::direct), the same bits, into plain
   // rows alone: such a chunk, of more than 128 rows, has an out-projection
-  // that reads no table, and a table input throws. With rows'
-  // tree each sequence is a decode lane's block of at most 32 rows whose
-  // rows attend their paths.
+  // that reads no table, and a table input throws. With rows' tree each
+  // sequence is a decode lane's block of at most 32 rows whose rows attend
+  // their paths, which tests alone run: a decode step runs the single pass
+  // (addDecode), whose reference they are.
   static PreparedInput addAttention(metal::CommandGraph &graph, const RelativeAttentionPlan &plan,
                                     const RelativeAttentionStaging &staging, const RelativeAttentionWeights &weights,
                                     const metal::MetalBuffer &partials, const metal::MetalBuffer &statistics,
@@ -263,8 +265,8 @@ public:
   // compute, each lane's rows' K/V written into the pages of `layer` through
   // its page table, from which it also reads its history, and its rows
   // attending as addAttention's (with rows' tree, their paths) into
-  // `output`, as addAttention writes them, gated by layerRows' projection
-  // rows (output.packed is not read).
+  // `output`, every row as addAttention writes them, gated by layerRows'
+  // projection rows (output.packed is not read).
   static PreparedInput addDecode(metal::CommandGraph &graph, const RelativeAttentionPlan &plan,
                                  const RelativeAttentionRows &layerRows, const RelativeAttentionWeights &weights,
                                  SplashKvLayer layer, std::span<const metal::MetalBuffer> pageTables,

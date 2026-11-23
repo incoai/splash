@@ -110,6 +110,9 @@ struct ShortConvolution final {
   // with its own buffers and its state's columns (`states`, of one stride),
   // the bits of its own dispatch: a decode step's keys and values. Their
   // inputs' rows are of one stride; their dynamic taps', where dynamic, too.
+  // Their state's columns, and so their columns of the tape, lie apart, and
+  // their outputs are not one view: a pair of overlapping columns, or of one
+  // output, throws.
   static void addConvolutionPair(metal::CommandGraph &graph, std::span<const ShortConvBuffers, 2> buffers,
                                  ShortConvShape shape, std::span<const ShortConvState, 2> states,
                                  std::span<const metal::MetalBuffer> stateIn, metal::MetalBuffer layout,
@@ -118,7 +121,8 @@ struct ShortConvolution final {
   // `tree` and `tape`) of static taps, RoundedSum, that another operator's
   // kernel runs on the rows it computes, in its own dispatch
   // (MoE::addCombineConvolution): its buffers checked as addConvolution
-  // checks them, but buffers.input, which that kernel does not read.
+  // checks them, but buffers.input, which that kernel does not read; a view
+  // of wider input rows (inputStride, inputColumn) throws.
   [[nodiscard]] static ShortConvolutionParams verifyParams(const ShortConvBuffers &buffers, ShortConvShape shape,
                                                            std::span<const metal::MetalBuffer> stateIn,
                                                            ShortConvState state, metal::MetalBuffer layout,
