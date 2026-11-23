@@ -721,12 +721,15 @@ The rules:
    while a step's routes average at most one row per expert (a decode step's
    of up to 32 rows of every family) and 32-row tiles beyond. On the M5 Pro
    (Apple10, 16 to 31 cores) a prefill chunk on the staged passes whose
-   routes average 64 or more an expert runs 64-row tiles
-   (`ops::MoeCalibration::wideTileRoutes`), which dequantize an expert's
-   weights once for up to 64 of its rows: from 1024 rows on Inkling-2-Mini,
-   at 2048 on Qwen3.6-35B-A3B and Qwen3.5-122B-A10B. A row's result is the
-   same bits on every tile. One plan per step serves every block, so its
-   router follows rule 3 in the format of most blocks' routers
+   routes average `ops::MoeCalibration::wideTileRoutes` or more an expert
+   runs 64-row tiles, which dequantize an expert's weights once for up to 64
+   of its rows. From 20 cores that is 64 routes: from 1024 rows on
+   Inkling-2-Mini, at 2048 on Qwen3.6-35B-A3B and Qwen3.5-122B-A10B. The
+   16-core takes 128, where 64-row tiles took the 35B's prefill 1.5-2.5%
+   longer and Inkling's 1024- and 1536-row chunks no shorter: at 2048 rows on
+   Inkling-2-Mini alone. A row's result is the same bits on every tile. One
+   plan per step serves every block, so its router follows rule 3 in the
+   format of most blocks' routers
    (`ops::moeRouterFormat`). Every tile's grouped rows are the step's
    routes', packed (`ops::MoeScratch`). With int8 activations
    on, a prefill chunk whose dense projections run the
@@ -794,8 +797,9 @@ every projection
   (`ops::selectMoe`), each a class: the 32-row staged passes from the rows
   whose routes outnumber its experts (33 on Qwen3.6-35B-A3B and
   Qwen3.5-122B-A10B, 43 on Flint, 52 on Qwen3.8-Flash-Next), the M5 Pro's
-  64-row passes from the rows whose routes average 64 an expert (1024 on
-  Inkling-2-Mini, 2048 on the 35B and the 122B), and the int8 passes where
+  64-row passes from the rows whose routes average its `wideTileRoutes` an
+  expert (from 20 cores 1024 on Inkling-2-Mini and 2048 on the 35B and the
+  122B, on the 16-core 2048 on Inkling-2-Mini), and the int8 passes where
   they run (from 192, 256 and 308 rows). These need no memory
   the first did not, and are required as it is. Every other kernel choice a
   chunk's rows make has one threshold (the float tiles, the MoE router's

@@ -393,14 +393,16 @@ bool moeInt8Experts(const MoeShape &shape, std::span<const BlockMoeWeights *cons
 // selectFloatTile by its rows' format.
 //
 // A prefill chunk on the staged passes whose routes average
-// MoeCalibration::wideTileRoutes or more an expert (64 on the M5 Pro, never
-// elsewhere: KernelCalibration.hpp) runs 64-row tiles, which stream an
-// expert's weights once for up to 64 of its rows, their tiles running 8-,
-// 16-, 32- or 64-row matmuls by their live rows; a row's bits are the same on
-// every tile. Inkling-2-Mini (8 of 128) takes them from 1024 rows, the 35B
-// and the 122B (8 of 256) at 2048, Flint and Flash-Next never (a 2048-row
-// chunk averages 48 and 40 routes an expert). The int8 passes, whose tile
-// holds 32 rows (GGUF_PREFILL_INT8_ROWS), keep 32-row tiles.
+// MoeCalibration::wideTileRoutes or more an expert (on the M5 Pro 64 from 20
+// cores and 128 on the 16-core, never elsewhere: KernelCalibration.hpp) runs
+// 64-row tiles, which stream an expert's weights once for up to 64 of its
+// rows, their tiles running 8-, 16-, 32- or 64-row matmuls by their live
+// rows; a row's bits are the same on every tile. From 20 cores Inkling-2-Mini
+// (8 of 128) takes them from 1024 rows, the 35B and the 122B (8 of 256) at
+// 2048; on the 16-core Inkling-2-Mini at 2048 alone. Flint and Flash-Next
+// never do (a 2048-row chunk averages 48 and 40 routes an expert). The int8
+// passes, whose tile holds 32 rows (GGUF_PREFILL_INT8_ROWS), keep 32-row
+// tiles.
 //
 // A chunk's experts run the int8 passes where its dense projections run the
 // int8 prefill tile (int8PrefillPaths: a prefill chunk's, int8 activations
