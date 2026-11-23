@@ -2812,7 +2812,19 @@ reply back token for token resumes from, that of a reply cancelled or ended by a
 stop sequence too, as far as the prompt renders it back. The prompt's replay
 point stays the point its conversation resumes from, the one reclaim keeps as
 the resume point and the SSD cache copies ahead, which a retry or a next prompt
-that renders the reply otherwise resumes from.
+that renders the reply otherwise resumes from. Resumed from a reply's
+state, a next turn holds the reply's rows as its decode computed them, not as
+a prefill of its prompt would: a GDN target's decode runs the recurrence a
+row at a time where a prefill scans the rows in chunks, which leaves the
+state a little off a prefill's, in its codes and in the running format
+alike. Against a cold prefill of a 309-token next turn, its next token's
+distribution lay at KL 3.0e-3 on Qwen3.6-35B-A3B UD-Q4_K_M through its codes
+(6.4e-3 in the running format, 5.8e-5 from a bf16 state) and 1.0e-5 on
+Qwen3.8-27B UD-Q4_K_M (16-core M5 Pro), where a state a prefill captured lies
+within the release logits check's noise floor (1.2e-3) and Inkling-2-Mini's,
+whose decode leaves no recurrence in its state, at 1e-6 to 7e-6.
+model-runtime-oracle's reply_state_cold holds a GDN target's to twice the
+largest of these, 1.3e-2, and every other state to 1.2e-3.
 
 A reply's state is opportunistic (`StateCache::markReply`): reclaim takes it
 among the units that free for nothing, a checkpoint first in the cache's order,

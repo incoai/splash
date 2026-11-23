@@ -2564,12 +2564,27 @@ void requireCacheHitMatchesCold(model::Runtime &executor, std::span<const uint32
 // from the reply's state at its last page, which the reply's decode captured
 // (Engine::reserveReplyCapture reserves each page a cycle's retained rows may
 // reach, Runtime::encodeDecodeCaptures folds it): the next turn's next token
-// is a cold prefill's and its distribution within requireCacheHitMatchesCold's
-// bound of the cold one's. The reply decodes 100 tokens past a chat prompt of
-// 200 on lane 0, each cycle capturing the page its rows may reach as the
-// engine reserves it; the next prompt is the prompt, the reply and 9 tokens
-// of a next turn, prefilled whole (cold) and from the last page the reply's
-// cycles captured, restored, its rows after prefilled (hit).
+// is a cold prefill's and its distribution within a bound of the cold one's
+// that follows how the resumed state was produced. The reply decodes 100
+// tokens past a chat prompt of 200 on lane 0, each cycle capturing the page
+// its rows may reach as the engine reserves it; the next prompt is the
+// prompt, the reply and 9 tokens of a next turn, prefilled whole (cold) and
+// from the last page the reply's cycles captured, restored, its rows after
+// prefilled (hit).
+// The bound: a state a prefill captured holds the prefill's own arithmetic,
+// and requireCacheHitMatchesCold bounds its hit by the release logits
+// check's noise floor (kBound); so is a state whose decode leaves no
+// recurrence in it held here, a target's without GDN layers (Inkling-2-Mini's
+// fold stores its convolutions' input rows exactly: KL 1e-6 to 7e-6). A GDN
+// target's decode runs the recurrence a row at a time over the reply's rows
+// where a prefill scans them in chunks, which leaves the state it captured a
+// little off a prefill's (requireDecodeCaptureMatchesTheLane), in its codes or
+// in the running format alike, and no other check bounds a hit of such a
+// state: kDecodedRecurrenceBound is twice the largest KL measured, on a
+// 16-core M5 Pro (11-23): Qwen3.6-35B-A3B UD-Q4_K_M, an fp32 state through
+// its codes 3.0e-3 (the 8-lane runtime's too), in the running format
+// (--cached-states exact) 6.4e-3, a bf16 state through its codes 5.8e-5;
+// Qwen3.8-27B UD-Q4_K_M through its codes 1.0e-5.
 void requireReplyStateMatchesCold(model::Runtime &executor, const model::QwenStateStorage &states,
                                   std::span<const uint32_t> chat, uint32_t vocabulary) {
   if (!executor.capturesInDecode()) {
@@ -2577,7 +2592,8 @@ void requireReplyStateMatchesCold(model::Runtime &executor, const model::QwenSta
     return;
   }
   constexpr uint32_t kPrompt = 200, kReply = 100, kNextTurn = 9;
-  constexpr double kBound = 1.2e-3;
+  constexpr double kBound = 1.2e-3, kDecodedRecurrenceBound = 1.3e-2;
+  const double bound = states.layout().target.layers ? kDecodedRecurrenceBound : kBound;
   const std::vector<uint32_t> prompt = repeatedChat(chat, kPrompt);
   // A cycle verifies up to a block past the tokens it holds, and the output
   // limit leaves each cycle a block.
@@ -2661,8 +2677,8 @@ void requireReplyStateMatchesCold(model::Runtime &executor, const model::QwenSta
     if (p[index] != -INFINITY) divergence += std::exp(p[index]) * (p[index] - q[index]);
   std::cout << "reply_state_cold prompt=" << kPrompt << " reply=" << reply.size() << " captures=" << captures
             << " resumed_at=" << page << " next_prompt=" << length << " cold_top=" << top(cold)
-            << " hit_top=" << top(hit) << " kl=" << divergence << '\n';
-  require(top(hit) == top(cold) && divergence <= kBound,
+            << " hit_top=" << top(hit) << " kl=" << divergence << " bound=" << bound << '\n';
+  require(top(hit) == top(cold) && divergence <= bound,
           "a next turn resumed from its reply's state left the cold prefill's next token or bound");
   std::cout << "reply_state_cold=PASS\n";
 }
