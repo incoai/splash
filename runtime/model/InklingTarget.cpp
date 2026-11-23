@@ -124,7 +124,12 @@ std::array<metal::MetalBuffer, 3> InklingTarget::addAttentionInputs(PrefillStep 
   const uint32_t weight = geometry_.weightLayer(layer), hidden = geometry_.hiddenSize, rows = step.rows;
   const InklingAttentionWeights &mixer = weights_.layers[weight].mixer;
   const bool global = inklingGlobalLayer(geometry_, weight);
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  std::array<metal::MetalBuffer, 3> normalized{b.normalized, s.keyInput, s.valueInput};
+  const uint32_t streams = global || states.messages ? 3 : 1;
   std::array<metal::MetalBuffer, 3> inputs;
+  // Without messages the mix normalizes the inputs.
+  bool normed = false;
   if (!layer) {
     inputs.fill(s.states[kInklingEmbeddingState]);
   } else {
@@ -133,24 +138,26 @@ std::array<metal::MetalBuffer, 3> InklingTarget::addAttentionInputs(PrefillStep 
       mixed.push_back(stateRows(step, states.blocks[block]));
     mixed.push_back(stateRows(step, states.input));
     const uint32_t queries = global ? 3 : 1;
+    std::vector<ops::BlockResidualNorm> norms;
+    if (!states.messages)
+      for (uint32_t stream = 0; stream < streams; ++stream)
+        norms.push_back({mixer.inputNorms[global ? stream : 0], normalized[stream]});
     ops::BlockResidual::add(step.graph, mixed, mixer.residualQueries, std::span(s.inputs).first(queries), hidden,
-                            hidden, rows);
+                            hidden, rows, norms);
+    normed = !norms.empty();
     for (uint32_t stream = 0; stream < inputs.size(); ++stream) inputs[stream] = s.inputs[global ? stream : 0];
   }
   if (states.messages) {
     const auto &gates = loopGates_.at(weight - geometry_.loopStart);
-    std::array<ops::LoopControlStream, 3> streams;
-    for (uint32_t stream = 0; stream < streams.size(); ++stream) {
+    std::array<ops::LoopControlStream, 3> gateStreams;
+    for (uint32_t stream = 0; stream < gateStreams.size(); ++stream) {
       const metal::MetalBuffer output = global ? inputs[stream] : s.messages[stream];
-      streams[stream] = {&gates[stream], inputs[stream], s.messages[stream], output, s.low[stream]};
+      gateStreams[stream] = {&gates[stream], inputs[stream], s.messages[stream], output, s.low[stream]};
       inputs[stream] = output;
     }
-    ops::LoopControl::add(step.graph, streams, {hidden, InklingLayout::loopGateRank, hidden, hidden, hidden}, rows);
+    ops::LoopControl::add(step.graph, gateStreams, {hidden, InklingLayout::loopGateRank, hidden, hidden, hidden}, rows);
   }
-  const QwenTargetPrefillBuffers &b = step.buffers;
-  std::array<metal::MetalBuffer, 3> normalized{b.normalized, s.keyInput, s.valueInput};
-  const uint32_t streams = global || states.messages ? 3 : 1;
-  for (uint32_t stream = 0; stream < streams; ++stream)
+  for (uint32_t stream = 0; stream < streams && !normed; ++stream)
     ops::Normalization::addRmsRows(step.graph, inputs[stream], kF32, mixer.inputNorms[global ? stream : 0],
                                    normalized[stream], kBf16, hidden, rows);
   if (streams == 1) normalized[1] = normalized[2] = normalized[0];
@@ -277,14 +284,17 @@ void InklingTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
   std::vector<ops::StridedRows> mixed;
   for (uint32_t block = 0; block < states.ffnBlocks; ++block) mixed.push_back(stateRows(step, states.blocks[block]));
   mixed.push_back(stateRows(step, states.output));
-  ops::BlockResidual::add(step.graph, mixed, w.ffnResidualQuery, std::span(s.inputs).first(1), hidden, hidden, rows);
+  // Without messages the mix normalizes the MoE's input.
+  const ops::BlockResidualNorm ffnNorm{w.ffnNorm, b.normalized};
+  ops::BlockResidual::add(step.graph, mixed, w.ffnResidualQuery, std::span(s.inputs).first(1), hidden, hidden, rows,
+                          states.messages ? std::span<const ops::BlockResidualNorm>{} : std::span(&ffnNorm, 1));
   if (states.messages) {
     const ops::LoopControlStream stream{&loopGates_.at(weight - geometry_.loopStart).back(), s.inputs[0],
                                         s.messages.back(), s.inputs[0], s.low.back()};
     ops::LoopControl::add(step.graph, std::span(&stream, 1),
                           {hidden, InklingLayout::loopGateRank, hidden, hidden, hidden}, rows);
+    ops::Normalization::addRmsRows(step.graph, s.inputs[0], kF32, w.ffnNorm, b.normalized, kBf16, hidden, rows);
   }
-  ops::Normalization::addRmsRows(step.graph, s.inputs[0], kF32, w.ffnNorm, b.normalized, kBf16, hidden, rows);
   // The MoE adds its output to zeros into the attention output's rows, which
   // its convolution reads; a decode step's lanes route their rows alone.
   step.ffn = {.input = b.normalized, .residual = s.zeros, .output = b.attentionOutput, .scratch = b.moe};
@@ -339,12 +349,11 @@ metal::MetalBuffer InklingTarget::addPrefillEnd(PrefillStep &step) const {
   const uint32_t hidden = geometry_.hiddenSize;
   std::array<ops::StridedRows, kInklingFinalStates.size()> states;
   std::ranges::transform(kInklingFinalStates, states.begin(), [&](uint32_t state) { return stateRows(step, state); });
-  ops::BlockResidual::add(step.graph, states, weights_.outputQuery, std::span(s.inputs).first(1), hidden, hidden,
-                          step.rows);
   const QwenTargetDecodeBuffers *d = step.decode;
   const metal::MetalBuffer normalized = d ? d->finalHidden : step.buffers.hidden[1];
-  ops::Normalization::addRmsRows(step.graph, s.inputs[0], kF32, weights_.finalNorm, normalized, kBf16, hidden,
-                                 step.rows);
+  const ops::BlockResidualNorm finalNorm{weights_.finalNorm, normalized};
+  ops::BlockResidual::add(step.graph, states, weights_.outputQuery, std::span(s.inputs).first(1), hidden, hidden,
+                          step.rows, std::span(&finalNorm, 1));
   addCaptures(step, geometry_.layers, normalized, kBf16);
   if (d) addHead(step.graph, linear(step), normalized, d->logits, step.rows, step.buffers.linearScratch, {});
   return normalized;

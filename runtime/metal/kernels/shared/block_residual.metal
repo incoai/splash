@@ -1,5 +1,6 @@
 #include "metal/abi/BlockResidual.h"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 #include <metal_stdlib>
 
@@ -28,19 +29,19 @@ static_assert(kSums <= kThreads, "a thread totals each sum");
 // rms(s_k), so that out_j = sum_k b_jk s_k over the values the threads hold.
 // A thread writes its channels of the outputs only after reading them of
 // every state, so an output may be one of the states' rows.
-kernel void block_residual(device const float *state0 [[buffer(0)]], device const float *state1 [[buffer(1)]],
-                           device const float *state2 [[buffer(2)]], device const float *state3 [[buffer(3)]],
-                           device const float *state4 [[buffer(4)]], device const float *state5 [[buffer(5)]],
-                           device const float *queries [[buffer(6)]], device float *output0 [[buffer(7)]],
-                           device float *output1 [[buffer(8)]], device float *output2 [[buffer(9)]],
-                           device float *output3 [[buffer(10)]], constant BlockResidualParams &p [[buffer(11)]],
-                           uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float partials[kSimdgroups * kSums];
-  threadgroup float totals[kSums];
-  threadgroup float weights[kQueries * kStates];
+// The first p.norms outputs are then normalized as norm_rms_rows does an fp32
+// row (kernels/shared/normalization.metal): the output row staged in
+// threadgroup memory, threads 0-255 add the squares of columns t + 256 i in
+// column order and rms_inverse_of_sums reduces them over those 8 simdgroups,
+// each value is bf16((out * inverse) * weight): the same bits, without a
+// dispatch that reads the row back.
+template <class W>
+inline void block_residual(device const float *const (&bound)[kStates], device const float *queries,
+                           device float *const (&outputs)[kQueries], device const W *const (&norm_weights)[kQueries],
+                           device bfloat *const (&normalized)[kQueries], constant BlockResidualParams &p, uint row,
+                           uint tid, uint lane, uint sg, threadgroup float *partials, threadgroup float *totals,
+                           threadgroup float *weights, threadgroup float *stage, threadgroup float *reductions) {
   if (row >= p.rows) return;
-  device const float *const bound[kStates] = {state0, state1, state2, state3, state4, state5};
   float values[kPerThread][kStates];
   float sums[kSums];
 #pragma unroll
@@ -90,7 +91,7 @@ kernel void block_residual(device const float *state0 [[buffer(0)]], device cons
     for (uint k = 0; k < kStates; ++k) weights[j * kStates + k] = j < p.queries ? logits[k] / total * inverse[k] : 0.0f;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  device float *const outputs[kQueries] = {output0, output1, output2, output3};
+  float mixed[kPerThread][kQueries];
 #pragma unroll
   for (uint i = 0; i < kPerThread; ++i) {
     const uint c = tid + i * kThreads;
@@ -101,7 +102,55 @@ kernel void block_residual(device const float *state0 [[buffer(0)]], device cons
       float out = 0.0f;
 #pragma unroll
       for (uint k = 0; k < kStates; ++k) out += weights[j * kStates + k] * values[i][k];
+      mixed[i][j] = out;
       outputs[j][ulong(row) * p.output_stride + c] = out;
     }
   }
+  for (uint j = 0; j < kQueries && j < p.norms; ++j) {
+#pragma clang fp reassociate(off)
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (uint i = 0; i < kPerThread; ++i) {
+      const uint c = tid + i * kThreads;
+      if (c < p.hidden) stage[c] = mixed[i][j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float squares = tid < 256 ? row_squares((threadgroup const float *)stage, p.hidden, tid) : 0.0f;
+    const float inverse = rms_inverse_of_sums<8>(squares, p.hidden, reductions, tid, lane, sg);
+#pragma unroll
+    for (uint i = 0; i < kPerThread; ++i) {
+      const uint c = tid + i * kThreads;
+      if (c < p.hidden)
+        normalized[j][ulong(row) * p.hidden + c] = bfloat((mixed[i][j] * inverse) * float(norm_weights[j][c]));
+    }
+  }
 }
+
+// Buffers: 0-5 states, 6 queries, 7-10 outputs, 11-14 the norms' multipliers,
+// 15-18 the normalized outputs, 19 parameters (slots past p.states, p.queries
+// and p.norms bind any buffer; they are not read or written).
+#define BLOCK_RESIDUAL_KERNEL(Name, W)                                                                                \
+  kernel void Name(device const float *state0 [[buffer(0)]], device const float *state1 [[buffer(1)]],                \
+                   device const float *state2 [[buffer(2)]], device const float *state3 [[buffer(3)]],                \
+                   device const float *state4 [[buffer(4)]], device const float *state5 [[buffer(5)]],                \
+                   device const float *queries [[buffer(6)]], device float *output0 [[buffer(7)]],                    \
+                   device float *output1 [[buffer(8)]], device float *output2 [[buffer(9)]],                          \
+                   device float *output3 [[buffer(10)]], device const W *norm0 [[buffer(11)]],                        \
+                   device const W *norm1 [[buffer(12)]], device const W *norm2 [[buffer(13)]],                        \
+                   device const W *norm3 [[buffer(14)]], device bfloat *normalized0 [[buffer(15)]],                   \
+                   device bfloat *normalized1 [[buffer(16)]], device bfloat *normalized2 [[buffer(17)]],              \
+                   device bfloat *normalized3 [[buffer(18)]], constant BlockResidualParams &p [[buffer(19)]],         \
+                   uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],               \
+                   uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {             \
+    device const float *const bound[kStates] = {state0, state1, state2, state3, state4, state5};                      \
+    device float *const outputs[kQueries] = {output0, output1, output2, output3};                                     \
+    device const W *const norms[kQueries] = {norm0, norm1, norm2, norm3};                                             \
+    device bfloat *const normalized[kQueries] = {normalized0, normalized1, normalized2, normalized3};                 \
+    threadgroup float partials[kSimdgroups * kSums], totals[kSums], weights[kQueries * kStates];                      \
+    threadgroup float stage[BLOCK_RESIDUAL_MAXIMUM_HIDDEN], reductions[kSimdgroups];                                  \
+    block_residual<W>(bound, queries, outputs, norms, normalized, p, row, tid, lane, sg, partials, totals, weights,    \
+                      stage, reductions);                                                                             \
+  }
+BLOCK_RESIDUAL_KERNEL(block_residual, bfloat)
+BLOCK_RESIDUAL_KERNEL(block_residual_f32, float)
+#undef BLOCK_RESIDUAL_KERNEL

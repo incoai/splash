@@ -787,6 +787,67 @@ void blockResidualTest(MetalBackend &backend, uint32_t n, uint32_t m, uint32_t r
   check(ok, scope + " (worst |error| " + std::to_string(worst) + ")");
 }
 
+// A mix whose outputs it normalizes itself gives the bits of the mix followed
+// by Normalization::addRmsRows of its fp32 outputs: `m` queries over `n`
+// states of `rows` rows, the first `norms` outputs normalized with F32 or
+// BF16 multipliers, the fp32 outputs unchanged.
+void blockResidualNormTest(MetalBackend &backend, uint32_t n, uint32_t m, uint32_t norms, uint32_t rows,
+                           bool float32Weights) {
+  std::mt19937 rng(900 + n * 31 + m * 7 + norms + rows + (float32Weights ? 1 : 0));
+  const std::string scope = "block residual normalizing " + std::to_string(norms) + " of " + std::to_string(m) +
+                            " outputs over " + std::to_string(n) + " states, " + std::to_string(rows) + " rows, " +
+                            (float32Weights ? "F32" : "BF16") + " multipliers";
+  std::vector<ops::StridedRows> states;
+  for (uint32_t k = 0; k < n; ++k) {
+    std::vector<float> v = randoms(rng, size_t{rows} * kHidden, 1.0f);
+    for (uint32_t r = 0; r < rows; ++r)
+      for (uint32_t c = 0; c < kHidden; ++c) v[size_t{r} * kHidden + c] *= 0.05f + float((r * 5 + k) % 13);
+    states.push_back({upload(backend, v), kHidden});
+  }
+  const MetalBuffer queries = upload(backend, randoms(rng, size_t{m} * kHidden, 0.2f));
+  const FloatElement weightElement = float32Weights ? FloatElement::Float32 : FloatElement::BFloat16;
+  std::vector<ops::NormWeights> weights;
+  for (uint32_t j = 0; j < norms; ++j) {
+    std::vector<float> gamma = randoms(rng, kHidden, 0.5f);
+    for (float &v : gamma) v = as(v, weightElement);
+    weights.push_back({uploadAs(backend, gamma, weightElement), float32Weights});
+  }
+  const auto buffers = [&](uint64_t bytes, uint32_t count) {
+    std::vector<MetalBuffer> b;
+    for (uint32_t j = 0; j < count; ++j) b.push_back(scratch(backend, bytes));
+    return b;
+  };
+  const std::vector<MetalBuffer> mixed = buffers(uint64_t{rows} * kHidden * 4, m),
+                                 fused = buffers(uint64_t{rows} * kHidden * 4, m),
+                                 separate = buffers(uint64_t{rows} * kHidden * 2, norms),
+                                 together = buffers(uint64_t{rows} * kHidden * 2, norms);
+  CommandGraph graph;
+  ops::BlockResidual::add(graph, states, queries, mixed, kHidden, kHidden, rows);
+  for (uint32_t j = 0; j < norms; ++j)
+    ops::Normalization::addRmsRows(graph, mixed[j], FloatElement::Float32, weights[j], separate[j],
+                                   FloatElement::BFloat16, kHidden, rows);
+  std::vector<ops::BlockResidualNorm> spec;
+  for (uint32_t j = 0; j < norms; ++j) spec.push_back({weights[j], together[j]});
+  ops::BlockResidual::add(graph, states, queries, fused, kHidden, kHidden, rows, spec);
+  run(backend, graph);
+  bool ok = true;
+  for (uint32_t j = 0; j < m; ++j)
+    ok &= sameBits(downloadAs(mixed[j], size_t{rows} * kHidden, FloatElement::Float32),
+                   downloadAs(fused[j], size_t{rows} * kHidden, FloatElement::Float32));
+  for (uint32_t j = 0; j < norms; ++j)
+    ok &= sameBits(downloadAs(separate[j], size_t{rows} * kHidden, FloatElement::BFloat16),
+                   downloadAs(together[j], size_t{rows} * kHidden, FloatElement::BFloat16));
+  if (norms) {
+    std::vector<ops::BlockResidualNorm> mixedTypes = spec;
+    mixedTypes.front().weights.float32 = !float32Weights;
+    ok &= norms < 2 || throws([&] {
+      CommandGraph refused;
+      ops::BlockResidual::add(refused, states, queries, fused, kHidden, kHidden, rows, mixedTypes);
+    });
+  }
+  check(ok, scope + ": the bits of the mix, then its norms");
+}
+
 void blockResidualRefusals(MetalBackend &backend) {
   const uint32_t rows = 3;
   const MetalBuffer state = scratch(backend, uint64_t{rows} * kHidden * 4), queries = scratch(backend, 4 * kHidden * 4),
@@ -1079,6 +1140,12 @@ int main(int argc, const char *argv[]) {
       blockResidualTest(backend, 5, 1, 1, false, true);
       blockResidualTest(backend, 3, 3, 9, true, true);
       blockResidualRefusals(backend);
+      for (const bool float32Weights : {true, false}) {
+        blockResidualNormTest(backend, 2, 1, 1, 1, float32Weights);
+        blockResidualNormTest(backend, 4, 3, 3, 8, float32Weights);
+        blockResidualNormTest(backend, 5, 1, 1, 37, float32Weights);
+      }
+      blockResidualNormTest(backend, 3, 3, 0, 3, true);
 
       for (const FloatElement element : {F, B}) {
         loopControlTest(backend, 1, 1, element, LoopOutput::Own);

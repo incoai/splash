@@ -5,7 +5,9 @@
 // learned queries attend over `states` state vectors of `hidden` fp32 values
 // (completed blocks' states and the current partial one), each RMS normalized
 // without a gain: s^_k = s_k / sqrt(mean(s_k^2) + eps), a_jk = softmax_k(q_j .
-// s^_k * scale), out_j = sum_k a_jk s^_k. Rows are independent.
+// s^_k * scale), out_j = sum_k a_jk s^_k. Rows are independent. The first
+// `norms` outputs are also RMS normalized with their multipliers into bf16
+// rows, the bits of ops::Normalization::addRmsRows over the fp32 output.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #else
@@ -20,7 +22,8 @@
 #define BLOCK_RESIDUAL_MAXIMUM_HIDDEN 4096u
 
 // State k's rows are state_stride[k] elements apart, each query's output's
-// output_stride; the queries are rows of `hidden` values.
+// output_stride; the queries are rows of `hidden` values; a normalized
+// output's rows are `hidden` bf16 values apart.
 struct BlockResidualParams {
   uint32_t rows;
   uint32_t hidden;
@@ -29,6 +32,8 @@ struct BlockResidualParams {
   uint32_t state_stride[BLOCK_RESIDUAL_MAXIMUM_STATES];
   uint32_t output_stride;
   float scale;
+  uint32_t norms;
+  uint32_t pad;
 };
 
-static_assert(sizeof(BlockResidualParams) == 48, "block residual parameters are 48 bytes on both sides");
+static_assert(sizeof(BlockResidualParams) == 56, "block residual parameters are 56 bytes on both sides");

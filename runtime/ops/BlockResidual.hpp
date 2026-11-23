@@ -12,11 +12,18 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/BlockResidual.h"
 #include "ops/FloatRows.hpp"
+#include "ops/Normalization.hpp"
 
 #include <cstdint>
 #include <span>
 
 namespace splash::ops {
+
+// A normalized output: its multipliers and its bf16 rows.
+struct BlockResidualNorm final {
+  NormWeights weights;
+  metal::MetalBuffer output;
+};
 
 struct BlockResidual final {
   // For each of `rows` rows and each query j (rows of `hidden` fp32 values in
@@ -27,8 +34,12 @@ struct BlockResidual final {
   // BLOCK_RESIDUAL_MAXIMUM_HIDDEN values, the scores scaled by
   // 1 / sqrt(hidden). The outputs' rows are outputStride elements apart; an
   // output may be one of the states.
+  // `norms`, at most one per output and all of one multiplier type, RMS
+  // normalize the first norms.size() outputs into bf16 rows of `hidden`
+  // values, the bits Normalization::addRmsRows makes of the fp32 outputs.
   static void add(metal::CommandGraph &graph, std::span<const StridedRows> states, metal::MetalBuffer queries,
-                  std::span<const metal::MetalBuffer> outputs, uint32_t outputStride, uint32_t hidden, uint32_t rows);
+                  std::span<const metal::MetalBuffer> outputs, uint32_t outputStride, uint32_t hidden, uint32_t rows,
+                  std::span<const BlockResidualNorm> norms = {});
 };
 
 } // namespace splash::ops
