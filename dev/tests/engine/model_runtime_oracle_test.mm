@@ -2574,8 +2574,10 @@ void requireCacheHitMatchesCold(model::Runtime &executor, std::span<const uint32
 // The bound: a state a prefill captured holds the prefill's own arithmetic,
 // and requireCacheHitMatchesCold bounds its hit by the release logits
 // check's noise floor (kBound); so is a state whose decode leaves no
-// recurrence in it held here, a target's without GDN layers (Inkling-2-Mini's
-// fold stores its convolutions' input rows exactly: KL 1e-6 to 7e-6). A GDN
+// recurrence in it held here, a target's without GDN layers: its rows are the
+// decode steps' projections rather than a prefill's, but none carries an error
+// into the next, as a recurrence would (Inkling-2-Mini's hits measure KL 1e-6
+// to 7e-6 against the bound). A GDN
 // target's decode runs the recurrence a row at a time over the reply's rows
 // where a prefill scans them in chunks, which leaves the state it captured a
 // little off a prefill's (requireDecodeCaptureMatchesTheLane), in its codes or
