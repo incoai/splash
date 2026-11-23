@@ -1056,8 +1056,9 @@ void testFlint(const std::filesystem::path &fixtures) {
 // and the one the installer derives from its GGUF (the release's keys the
 // header holds, and max_position_embeddings, num_experts and eos_token_id in
 // text_config), each a GGUF target of its family's layout: 24 weight layers
-// its steps run as 48 applications. Its clip is held as an F32, as its header
-// states it; another loop, another layer count or a safetensors source is
+// its steps run as 48 applications; the release's is its safetensors target's
+// too, its quantization_config Model Optimizer's NVFP4. Its clip is held as
+// an F32, as its header states it; another loop or another layer count is
 // refused by name. Its DFlash2 draft's config, as its release publishes it,
 // reads the rows applications 5, 23 and 41 read and the final norm's, id 48
 // (capture_final_norm), its token rows through the table's norm
@@ -1118,8 +1119,10 @@ void testInkling2(const std::filesystem::path &fixtures) {
           "text config loop_config core_end mismatch", "another loop was accepted");
   refuses(release.with(&SourceModel::config, R"("num_hidden_layers": 24)", R"("num_hidden_layers": 48)"),
           "text config num_hidden_layers", "its applications as its layers were accepted");
-  refuses(release.with(&SourceModel::record, R"("gguf")", R"("mlx-affine")"), "Inkling-2-Mini loads from a GGUF",
-          "a safetensors Inkling-2-Mini was accepted");
+  const model::ModelDescriptor checkpoint = inspect(release.with(&SourceModel::record, R"("gguf")", R"("mlx-affine")"));
+  require(checkpoint.target == descriptor.target && checkpoint.targetSource == model::TargetSource::Safetensors &&
+              checkpoint.valid(),
+          "the release's Inkling-2-Mini config made another descriptor as a safetensors target");
 }
 
 int main(int argc, char **argv) {

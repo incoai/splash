@@ -921,6 +921,7 @@ uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_
   switch (conversion) {
   case Conversion::NarrowToBfloat16: return sourceBytes / 2;
   case Conversion::WidenToFloat32: case Conversion::CenteredNorm: return sourceBytes * 2;
+  case Conversion::TransposeToFloat32: return source.type == ggml::kBF16 ? sourceBytes * 2 : sourceBytes;
   case Conversion::Decay: return source.type == ggml::kBF16 ? sourceBytes * 2 : sourceBytes;
   case Conversion::DequantizeToFloat32: {
     const uint64_t columns = decodedColumns(source);
@@ -964,7 +965,7 @@ uint64_t ImageBuilder::section(uint64_t bytes) {
 }
 
 void ImageBuilder::copy(TensorRows source, Conversion conversion) {
-  const uint64_t bytes = convertedBytes(source, conversion, source.rows * source.rowBytes);
+  const uint64_t bytes = convertedBytes(source, conversion, source.rows * source.imageRowBytes());
   copyAt(section(bytes), std::move(source), conversion);
 }
 

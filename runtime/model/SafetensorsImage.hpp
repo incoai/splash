@@ -23,6 +23,7 @@
 #include "model/QwenHybridLayout.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -97,5 +98,45 @@ enum class NormStorage : uint8_t { Multipliers, BelowMultipliers };
 [[nodiscard]] std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint,
                                                   const QwenTargetDimensions &geometry, NormStorage norms,
                                                   gguf::PlanOptions options = {});
+
+// Where a checkpoint holds (a part of) a section of a family's images
+// (gguf::Section), as the family's names give it (planTargetImages): a module
+// for a section of a projection, the router, the routed experts, the head or
+// the token table, which its tensors quantize (or its .weight holds
+// unquantized), else a tensor, read as rows of its last dimension's values;
+// and the part the section takes of it: rows [first, first + rows) (rows 0:
+// all from first), each row's column window `window` of `windows` (Inkling 2's
+// release interleaves its experts' gate and up rows, which are windows of a
+// row pair), or its values transposed, its rows the section's columns, with
+// `reversed` its rows last first.
+struct SectionSource final {
+  std::string name;
+  uint64_t first = 0, rows = 0;
+  uint32_t windows = 1, window = 0;
+  bool transposed = false, reversed = false;
+};
+// A family's names for the sections of its images: the sources of a section,
+// one but for the routed experts' three (gate, up and down) and a Values
+// section's parts, which it gathers in order.
+using SectionSources = std::function<std::vector<SectionSource>(const gguf::Section &)>;
+
+// The images of a target whose family lists its images' sections, as its
+// GGUF plan lays them out (gguf::planTargetImages): `layerImages` layer images
+// of the sections `layer` lists, the head's of `head` and then the head
+// (output.weight), and the embedding's (token_embd.weight), each section of
+// the sources `sources` names, its values in the kind of section's form:
+// Norm and Values the F32 values of F32 or BF16 tensors (gathered, or a
+// transposed one's); Quantized the planes of a quantized or BF16 module's
+// rows (projection rows, Q8_0 for BF16); FloatTensor a tensor's or an
+// unquantized module's F32 or BF16 rows as stored, a quantized module's F32
+// values or a transposed tensor's; SmallProjection a float module's rows as
+// stored or a quantized one's planes padded to whole tiles; Router a module's
+// rows as stored, a quantized one's native rows; RoutedExperts the planes of
+// three modules' experts and their expert scales; the token table a quantized
+// module's native rows or its bf16 rows. The checkpoint outlives them.
+[[nodiscard]] std::vector<gguf::Image>
+planTargetImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, uint32_t layerImages,
+                 gguf::PlanOptions options, const std::function<std::vector<gguf::Section>(uint32_t)> &layer,
+                 const std::vector<gguf::Section> &head, const SectionSources &sources);
 
 } // namespace splash::model::safetensors

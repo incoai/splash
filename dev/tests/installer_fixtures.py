@@ -29,9 +29,6 @@ MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
 FLINT = families.named("Flint")
 INKLING = families.named("Inkling-2-Mini")
-# The families whose targets the engine loads from a GGUF only: no MLX
-# checkpoint of theirs is served.
-GGUF_ONLY = (INKLING,)
 # The families whose config.json fixture is the one the installer derives
 # from their GGUF, or the release's where it holds the keys of that one
 # (Inkling 2's); an MLX config.json of one is mlx-config.json.

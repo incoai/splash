@@ -1093,19 +1093,19 @@ void testSyntheticFloatMoeModel(MetalBackend &backend, const std::filesystem::pa
 }
 
 // An MLX MoE target loads as block images: the experts in mixed formats, the
-// routed up projection BF16 values MXFP8 holds exactly as MXFP8 (as a GGUF's
-// 16-bit experts load), the routed down projection mxfp4, the 8-bit affine
-// router as its native rows,
-// which the float projection decodes, and the bf16 shared-expert gate as the
-// F32 values the MoE selection reads; streamableWeights plans the bytes it
-// loads.
+// routed gate projection nvfp4 with each expert's global_scale, which divided
+// by 6 * 448 is its expert scale, the routed up projection BF16 values MXFP8
+// holds exactly as MXFP8 (as a GGUF's 16-bit experts load), the routed down
+// projection mxfp4, the 8-bit affine router as its native rows, which the
+// float projection decodes, and the bf16 shared-expert gate as the F32 values
+// the MoE selection reads; streamableWeights plans the bytes it loads.
 void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::path &root) {
     const auto target = syntheticTarget<Qwen3_6MoeLayout>();
     // Bits and group size of each FFN module (mxfp4's for the routed down
     // projection); the others 4-bit in groups of 64.
     const std::map<std::string_view, std::pair<uint32_t, uint32_t>> formats{
         {"gate", {8, 64}},
-        {"switch_mlp.gate_proj", {5, 32}},
+        {"switch_mlp.gate_proj", {4, 16}},
         {"switch_mlp.up_proj", {2, 128}},
         {"switch_mlp.down_proj", {4, 32}},
         {"shared_expert.gate_proj", {6, 64}},
@@ -1118,18 +1118,34 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
         return formats.at(std::string_view(module).substr(ffn + 5));
     };
     std::vector<SyntheticTensor> tensors = splash::test::mlxTargetTensors(target, bitsAndGroup);
-    // The routed down projection's scales are mxfp4's E8M0 exponents, without
-    // biases, and the shared-expert gate is a bf16 weight.
+    // The routed gate projection's scales are nvfp4's E4M3 bytes (each below
+    // 0x7F, no NaN) and the down projection's mxfp4's E8M0 exponents, both
+    // without biases, the gate beside each expert's global_scale; the
+    // shared-expert gate is a bf16 weight.
     std::erase_if(tensors, [](const SyntheticTensor &tensor) {
-        return tensor.name.ends_with("switch_mlp.down_proj.biases") ||
+        return tensor.name.ends_with("switch_mlp.gate_proj.biases") ||
+               tensor.name.ends_with("switch_mlp.down_proj.biases") ||
                tensor.name.ends_with("shared_expert_gate.scales") ||
                tensor.name.ends_with("shared_expert_gate.biases");
     });
+    std::vector<float> globalScales(target.experts);
+    for (uint32_t e = 0; e < target.experts; ++e) globalScales[e] = 0.5f + 0.25f * float(e);
+    std::vector<uint8_t> globalBytes(globalScales.size() * 4);
+    std::memcpy(globalBytes.data(), globalScales.data(), globalBytes.size());
+    std::vector<SyntheticTensor> scales;
     for (SyntheticTensor &tensor : tensors) {
+        if (tensor.name.ends_with("switch_mlp.gate_proj.scales")) {
+            tensor.dtype = "U8";
+            tensor.data.resize(tensor.data.size() / 2);
+            for (uint8_t &byte : tensor.data) byte &= 0x3F;
+            const std::string module = tensor.name.substr(0, tensor.name.size() - 7);
+            scales.push_back({module + ".global_scale", "F32", {target.experts}, globalBytes});
+        }
         if (tensor.name.ends_with("switch_mlp.down_proj.scales")) tensor.dtype = "U8";
         if (tensor.name.ends_with("shared_expert_gate.weight"))
             tensor = {tensor.name, "BF16", {1, target.hiddenSize}};
     }
+    tensors.insert(tensors.end(), scales.begin(), scales.end());
     // The routed up projection a BF16 weight of k / 128 for k of -16..16, which
     // MXFP8 holds exactly: E4M3 values of at most three mantissa bits under one
     // power of two a block.
@@ -1156,7 +1172,14 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
     };
     for (const auto &layer : weights.layers) {
         const splash::ops::BlockMoeWeights &ffn = layer.ffn;
-        require(ffn.gate.routed.formatId == format("switch_mlp.gate_proj") &&
+        std::vector<float> expertScales(3 * target.experts);
+        std::memcpy(expertScales.data(), ffn.expertScales.contents(), expertScales.size() * 4);
+        bool scaled = true;
+        for (uint32_t e = 0; e < target.experts; ++e)
+            scaled &= expertScales[e] == globalScales[e] / (6.0f * 448.0f) &&
+                      expertScales[target.experts + e] == 1.0f && expertScales[2 * target.experts + e] == 1.0f;
+        require(scaled, "a block MoE's nvfp4 experts did not take their global scales as their expert scales");
+        require(ffn.gate.routed.formatId == (target.hiddenSize % 256 ? GGUF_FMT_NVFP464 : GGUF_FMT_NVFP4) &&
                     ffn.up.routed.formatId == GGUF_FMT_MXFP8 &&
                     ffn.down.routed.formatId == GGUF_FMT_MXFP4 &&
                     ffn.gate.shared.formatId == format("shared_expert.gate_proj") &&
@@ -1264,7 +1287,8 @@ void testSyntheticFlintModel(MetalBackend &backend, const std::filesystem::path 
                 down->sources.size() == 2 && down->sources[0].windows == 2 && down->sources[1].window == 1,
             "an MLX Flint's shared expert down projection is not two slices of the routed width");
     splash::model::WeightImages streamedImages(backend, "sources");
-    splash::model::SafetensorsTargetLoader streamed(backend, streamedImages, root / "target", target, {},
+    splash::model::SafetensorsTargetLoader streamed(backend, streamedImages, root / "target",
+                                                     splash::model::safetensorsTargetPlan(target), {},
                                                      {.memoryBytes = 64ull << 20});
     require(streamed.streamedExperts().blocks.size() == target.layers - target.leadingDenseLayers,
             "an MLX Flint's streamed experts are not its MoE layers'");
@@ -1460,7 +1484,8 @@ void testSyntheticFlashNext(MetalBackend &backend, const std::filesystem::path &
     const std::vector<SyntheticTensor> tensors = flashNextTensors(target);
     splash::test::writeSyntheticShard(root / "target" / "model.safetensors", tensors);
     splash::model::WeightImages images(backend, "sources");
-    splash::model::SafetensorsTargetLoader loaded(backend, images, root / "target", target);
+    splash::model::SafetensorsTargetLoader loaded(backend, images, root / "target",
+                                                   splash::model::safetensorsTargetPlan(target));
     const Qwen4ExpWeights weights =
         splash::model::loadQwen4ExpWeights(backend, target, splash::model::QwenTargetFiles{std::ref(loaded)});
     const auto first = [](const splash::ops::NormWeights &norm) {
@@ -1497,7 +1522,7 @@ void testSyntheticFlashNext(MetalBackend &backend, const std::filesystem::path &
     // Streamed, rows across the shards' boundaries.
     splash::model::WeightImages streamedImages(backend, "sources");
     splash::model::SafetensorsTargetLoader streaming(
-        backend, streamedImages, root / "target", target,
+        backend, streamedImages, root / "target", splash::model::safetensorsTargetPlan(target),
         {.cacheBytes = 1 << 20, .readers = std::make_shared<splash::model::SsdReaders>(splash::model::kSsdReaders)});
     const Qwen4ExpWeights streamed =
         splash::model::loadQwen4ExpWeights(backend, target, splash::model::QwenTargetFiles{std::ref(streaming)});

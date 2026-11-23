@@ -22,6 +22,15 @@ using gguf::SafetensorsSource;
 using gguf::Repack;
 using gguf::TensorRows;
 
+// The range of NVFP4's two scales, E2M1's largest value 6 times E4M3's 448,
+// by which MLX's nvfp4 dequantization divides a global_scale.
+constexpr float kMlxNvfp4ScaleRange = 6.0F * 448.0F;
+
+// The native form of NVFP4 rows of `columns` elements: its blocks of 256, or
+// of 64 for rows that are not whole 256-element blocks (an expert down
+// projection of 1152 inputs), as a GGUF's NVFP4 takes them.
+uint32_t nvfp4Form(uint64_t columns) { return columns % 256 ? GGUF_FMT_NVFP464 : GGUF_FMT_NVFP4; }
+
 // The prefix of a checkpoint's language-model modules and its head's name,
 // by the names it takes (ModuleNames).
 std::string modelPrefix(ModuleNames names) {
@@ -120,10 +129,19 @@ public:
     image_.expertRepack(std::move(repack));
   }
 
-  // The routed experts' scales (gguf::ImageBuilder::expertScales): 1s.
-  void expertScales() {
-    const std::vector<float> ones(geometry_.experts, 1.0F);
-    image_.expertScales(geometry_.experts, {ones, ones, ones});
+  // The routed experts' scales (gguf::ImageBuilder::expertScales): each MLX
+  // experts module's global scales (expertScaleValues: 1s for experts of
+  // another format), and 1s for experts of a module each, whose rows hold
+  // their own tensor scale.
+  void expertScales(const std::string &mlp) {
+    std::array<gguf::ImageBuilder::ExpertScales, 3> scales;
+    const std::array<std::string_view, 3> projections{"gate_proj", "up_proj", "down_proj"};
+    for (size_t projection = 0; projection < projections.size(); ++projection)
+      scales[projection] = names_ == ModuleNames::Transformers
+                               ? std::vector<float>(geometry_.experts, 1.0F)
+                               : expertScaleValues(mlp + "switch_mlp." + std::string(projections[projection]),
+                                                   geometry_.experts);
+    image_.expertScales(geometry_.experts, scales);
   }
 
   // beta (value heads rows) | alpha (value heads rows): one tensor of their
@@ -243,6 +261,34 @@ public:
     image_.copy(rows(module + ".weight", table, ggml::kBF16, vocabulary, table.bytes / vocabulary));
   }
 
+  // A section of a family's images from its sources (planTargetImages), in
+  // the form its kind takes.
+  void section(const gguf::Section &section, const std::vector<SectionSource> &sources) {
+    using Kind = gguf::Section::Kind;
+    if (section.kind == Kind::RoutedExperts ? sources.size() != 3
+                                            : sources.empty() || (sources.size() > 1 && section.kind != Kind::Values))
+      throw WeightStoreError("no source of the checkpoint holds " + section.name);
+    const SectionSource &source = sources.front();
+    // A float tensor, router or small projection a tensor holds, rather than
+    // a module's tensors, is its rows as stored.
+    const bool tensor = checkpoint_.find(source.name) != nullptr;
+    switch (section.kind) {
+    case Kind::Norm:
+    case Kind::Values: return sectionValues(section, sources);
+    case Kind::Quantized: return sectionProjection(source, section.rows, section.columns);
+    case Kind::FloatTensor:
+      return tensor ? sectionFloatTensor(source, section.rows, section.columns)
+                    : moduleFloatTensor(source, section.rows, section.columns);
+    case Kind::SmallProjection:
+      return tensor ? sectionFloatTensor(source, section.rows, section.columns)
+                    : sectionSmallProjection(source, section.rows, section.columns);
+    case Kind::Router:
+      return tensor ? sectionFloatTensor(source, section.rows, section.columns)
+                    : router(source.name, section.rows, section.columns);
+    case Kind::RoutedExperts: return sectionExperts(sources, section.rows, section.columns);
+    }
+  }
+
   [[nodiscard]] gguf::Image finish() {
     gguf::Image image = image_.finish();
     image.streamedRows = streamedRows_;
@@ -250,6 +296,183 @@ public:
   }
 
 private:
+  // A Norm or Values section of `section.rows` values: the F32 values of its
+  // sources' rows, gathered in order, a BF16 tensor's widened (a Norm's as
+  // the image holds norms), or of one transposed source's matrix.
+  void sectionValues(const gguf::Section &section, const std::vector<SectionSource> &sources) {
+    std::vector<TensorRows> parts;
+    uint64_t values = 0;
+    for (const SectionSource &source : sources) {
+      parts.push_back(floatSourceRows(source));
+      values += parts.back().rows * parts.back().imageRowBytes() / valueBytes(parts.back());
+    }
+    const bool transposed = sources.front().transposed, bfloat16 = parts.front().type == ggml::kBF16;
+    if (values != section.rows || (transposed && sources.size() > 1) ||
+        std::ranges::any_of(parts, [&](const TensorRows &part) { return part.type != parts.front().type; }) ||
+        std::ranges::any_of(sources, [&](const SectionSource &part) { return !transposed && part.windows != 1; }))
+      throw WeightStoreError("source tensor type or shape does not match: " + sources.front().name);
+    image_.gather(parts, transposed                         ? Conversion::TransposeToFloat32
+                         : !bfloat16                        ? Conversion::None
+                         : section.kind == gguf::Section::Kind::Norm ? norms_
+                                                            : Conversion::WidenToFloat32);
+  }
+
+  // A Quantized section [rows, columns]: the planes of its source's rows of
+  // its module's projection rows (projectionRows).
+  void sectionProjection(const SectionSource &source, uint64_t rows, uint64_t columns) {
+    const TensorRows part = moduleRows(source, rows, columns, projectionRows(source.name, moduleRows(source), columns));
+    Repack repack = image_.planes(gguf_format_of(part.type), rows, columns, source.name);
+    repack.sources.push_back(part);
+    image_.repack(std::move(repack));
+  }
+
+  // A FloatTensor section [rows, columns]: its source's F32 or BF16 rows as
+  // stored after their descriptor, or the F32 values of a transposed source.
+  void sectionFloatTensor(const SectionSource &source, uint64_t rows, uint64_t columns) {
+    const TensorRows part = floatSourceRows(source);
+    const uint64_t partColumns = part.imageRowBytes() / valueBytes(part);
+    if (source.transposed ? part.rows != columns || partColumns != rows : part.rows != rows || partColumns != columns)
+      throw WeightStoreError("source tensor type or shape does not match: " + source.name);
+    const uint32_t type = source.transposed ? ggml::kF32 : part.type;
+    image_.descriptor(type, rows, columns, {}, {rows * columns * (type == ggml::kF32 ? 4 : 2), 0, 0}, source.name);
+    image_.copy(part, source.transposed ? Conversion::TransposeToFloat32 : Conversion::None);
+  }
+
+  // A FloatTensor section [rows, columns] of its source's rows of a module
+  // (Inkling 2's sinks): of an unquantized one its F32 or BF16 rows as stored
+  // after their descriptor, of a quantized one their F32 values, as a GGUF's
+  // (gguf::Builder::floatTensor).
+  void moduleFloatTensor(const SectionSource &source, uint64_t rows, uint64_t columns) {
+    if (const std::optional<TensorRows> quantizedRows = quantized(source.name, moduleRows(source), columns)) {
+      image_.descriptor(ggml::kF32, rows, columns, {}, {rows * columns * sizeof(float), 0, 0}, source.name);
+      image_.copy(moduleRows(source, rows, columns, *quantizedRows), Conversion::DequantizeToFloat32);
+      return;
+    }
+    SectionSource weight = source;
+    weight.name += ".weight";
+    sectionFloatTensor(weight, rows, columns);
+  }
+
+  // A SmallProjection section [rows, columns] of fewer rows than a plane
+  // tile: its source's rows of a quantized module as planes, zero rows past
+  // them to a whole tile, or of an unquantized one as its F32 or BF16 rows as
+  // stored after their descriptor.
+  void sectionSmallProjection(const SectionSource &source, uint64_t rows, uint64_t columns) {
+    if (const std::optional<TensorRows> quantizedRows = quantized(source.name, moduleRows(source), columns)) {
+      const TensorRows part = moduleRows(source, rows, columns, *quantizedRows);
+      Repack repack = image_.planes(gguf_format_of(part.type), gguf::tiledRows(rows), columns, source.name);
+      repack.sources.push_back(part);
+      image_.repack(std::move(repack));
+      return;
+    }
+    SectionSource weight = source;
+    weight.name += ".weight";
+    sectionFloatTensor(weight, rows, columns);
+  }
+
+  // A RoutedExperts section of `experts` experts `width` wide: the planes of
+  // its sources' gate, up and down rows of their modules' experts
+  // (projectionRows), each of a source's column window of its rows (the
+  // window of a row pair Inkling 2's release interleaves gate and up in), and
+  // their expert scales (expertScaleValues).
+  void sectionExperts(const std::vector<SectionSource> &sources, uint64_t experts, uint64_t width) {
+    const uint64_t hidden = geometry_.hiddenSize;
+    std::array<gguf::ImageBuilder::ExpertScales, 3> scales;
+    for (size_t projection = 0; projection < sources.size(); ++projection) {
+      const SectionSource &source = sources[projection];
+      const uint64_t rows = projection == 2 ? hidden : width, columns = projection == 2 ? width : hidden;
+      TensorRows part = projectionRows(source.name, source.windows * rows, columns, experts);
+      if (part.scale.rowsPerValue % source.windows || !source.windows || source.window >= source.windows)
+        throw WeightStoreError("source tensor type or shape does not match: " + source.name);
+      part.rows /= source.windows;
+      part.rowBytes *= source.windows;
+      part.float16RowBytes *= source.windows;
+      part.scale.rowsPerValue /= source.windows;
+      part.windows = source.windows;
+      part.window = source.window;
+      Repack repack = image_.expertPlanes(gguf_format_of(part.type), experts * rows, columns, source.name);
+      repack.sources.push_back(std::move(part));
+      image_.expertRepack(std::move(repack));
+      scales[projection] = expertScaleValues(source.name, experts);
+    }
+    image_.expertScales(experts, scales);
+  }
+
+  // The bytes of each value of F32 or BF16 rows.
+  static uint64_t valueBytes(const TensorRows &rows) { return rows.type == ggml::kBF16 ? 2 : 4; }
+
+  // The rows a source takes of its F32 or BF16 tensor, read as rows of its
+  // last dimension's values, trailing dimensions of 1 aside (MLX's
+  // convolution weights, [channels, taps, 1]): rows [first, first + rows)
+  // (all from first for 0), in reverse with `reversed`, each its column
+  // window.
+  TensorRows floatSourceRows(const SectionSource &source) const {
+    const SourceTensor &tensor = checkpoint_.require(source.name);
+    const uint32_t type = tensor.dtype == "BF16" ? ggml::kBF16 : ggml::kF32;
+    const auto last = std::find_if(tensor.shape.rbegin(), tensor.shape.rend(), [](uint64_t size) { return size != 1; });
+    const uint64_t columns = tensor.shape.empty() ? 0 : last == tensor.shape.rend() ? 1 : *last,
+                   rowBytes = columns * (type == ggml::kBF16 ? 2 : 4), all = rowBytes ? tensor.bytes / rowBytes : 0;
+    const uint64_t rows = source.rows ? source.rows : all - std::min(all, source.first);
+    if ((tensor.dtype != "BF16" && tensor.dtype != "F32") || !rows || source.first + rows > all ||
+        !source.windows || source.window >= source.windows || columns % source.windows)
+      throw WeightStoreError("source tensor type or shape does not match: " + source.name);
+    TensorRows result = this->rows(source.name, tensor, type, rows, rowBytes);
+    result.first = source.first;
+    result.order.reversed = source.reversed;
+    result.windows = source.windows;
+    result.window = source.window;
+    return result;
+  }
+
+  // The rows of a module's weight (its .weight's first dimension), of which a
+  // source takes a part.
+  uint64_t moduleRows(const SectionSource &source) const {
+    const SourceTensor &weight = checkpoint_.require(source.name + ".weight");
+    if (weight.shape.size() != 2) throw WeightStoreError("source tensor type or shape does not match: " + source.name);
+    return weight.shape.front();
+  }
+  // Rows [first, first + rows) of a module's rows `all` (a source's part of
+  // them), which it takes whole.
+  static TensorRows moduleRows(const SectionSource &source, uint64_t rows, uint64_t columns, TensorRows all) {
+    if (source.transposed || source.windows != 1 || source.first + rows > all.rows || !columns)
+      throw WeightStoreError("source tensor type or shape does not match: " + source.name);
+    all.first = source.first;
+    all.rows = rows;
+    return all;
+  }
+
+  // The expert scales of a routed experts module (gguf::ImageBuilder::
+  // expertScales), each expert's NVFP4 global scale: Inkling 2's release's
+  // _weight_amax over its _weight_outer_scale_denominator, as llama.cpp's
+  // converter divides them (into the .scale of its GGUFs, bit for bit), MLX's
+  // global_scale over the 6 * 448 its dequantization divides it by (the
+  // release's amax, which its converters keep), or mlx-lm's weight_scale_2
+  // as stored; 1s for experts of any other format.
+  std::vector<float> expertScaleValues(const std::string &module, uint64_t experts) const {
+    // The F32 values of a tensor of `count` values ([count], or one of shape []).
+    const auto values = [&](const std::string &name, uint64_t count) {
+      std::vector<float> result(count);
+      const SourceTensor &tensor = count == 1 ? scalar(name, {"F32"}) : require(name, {"F32"}, {count});
+      tensor.read(0, {reinterpret_cast<uint8_t *>(result.data()), count * sizeof(float)});
+      return result;
+    };
+    std::vector<float> scales(experts, 1.0F);
+    float divisor = 1.0F;
+    if (checkpoint_.find(module + "_weight_amax")) {
+      scales = values(module + "_weight_amax", experts);
+      divisor = values(module + "_weight_outer_scale_denominator", 1).front();
+    } else if (checkpoint_.find(module + ".global_scale")) {
+      scales = values(module + ".global_scale", experts);
+      divisor = kMlxNvfp4ScaleRange;
+    } else if (checkpoint_.find(module + ".weight_scale_2")) {
+      scales = values(module + ".weight_scale_2", experts);
+    }
+    for (float &scale : scales) {
+      scale /= divisor;
+      if (!std::isfinite(scale)) throw WeightStoreError("non-finite expert scale of " + module);
+    }
+    return scales;
+  }
   const SourceTensor &require(const std::string &name, std::initializer_list<std::string_view> dtypes,
                               const std::vector<uint64_t> &shape) const {
     const SourceTensor &tensor = checkpoint_.require(name);
@@ -321,6 +544,7 @@ private:
   std::optional<TensorRows> quantized(const std::string &module, uint64_t rows, uint64_t columns,
                                       uint64_t experts = 1) const {
     if (experts == 1 && checkpoint_.find(module + ".weight_scale")) return floatQuantized(module, rows, columns);
+    if (experts > 1 && checkpoint_.find(module + "_weight")) return releaseExperts(module, rows, columns, experts);
     const SourceTensor &codes = checkpoint_.require(module + ".weight");
     const SourceTensor *scales = checkpoint_.find(module + ".scales");
     if (!scales) return std::nullopt;
@@ -342,7 +566,8 @@ private:
                                   : group == 16           ? "nvfp4"
                                   : bits == 8             ? "mxfp8"
                                                           : "mxfp4";
-    const uint32_t format = mlxFormat(mode, uint32_t(bits), uint32_t(group));
+    uint32_t format = mlxFormat(mode, uint32_t(bits), uint32_t(group));
+    if (format == GGUF_FMT_NVFP4) format = nvfp4Form(columns);
     const SourceTensor *biases = affine ? &require(module + ".biases", {"BF16"}, scales->shape) : nullptr;
     if (format == GGUF_FMT_COUNT)
       throw WeightStoreError(module + " is " + std::to_string(bits) + "-bit in groups of " + std::to_string(group) +
@@ -350,8 +575,36 @@ private:
                              std::string(kMlxAffineFormats) + " with bf16 scales, or as " +
                              std::string(kMlxFloatFormats));
     requireWholeBlocks(module, format, columns);
-    return TensorRows{module, kQuantFormats[format].ggml_type, 0, experts * rows,
+    TensorRows result{module, kQuantFormats[format].ggml_type, 0, experts * rows,
                       ggufRowBytes(kQuantFormats[format], columns), {}, codes.file, {&codes, scales, biases}};
+    // A projection's nvfp4 global scale, which converters that keep NVIDIA's
+    // codes write: MLX's global_scale (over 6 * 448) or ModelOpt's
+    // weight_scale_2, its native rows' g (experts take theirs as their expert
+    // scales, expertScaleValues).
+    const bool global = checkpoint_.find(module + ".global_scale") != nullptr;
+    if (mode == "nvfp4" && experts == 1 && (global || checkpoint_.find(module + ".weight_scale_2"))) {
+      const SourceTensor &g = scalar(module + (global ? ".global_scale" : ".weight_scale_2"), {"F32"});
+      result.scale = {g.file, g.offset, g.bytes, rows, false, false, global ? kMlxNvfp4ScaleRange : 1.0F};
+    }
+    return result;
+  }
+
+  // A module's native rows as Inkling 2's release stores its routed experts
+  // (its hf_quant_config.json's quant_method inkling2): `<module>_weight`
+  // [experts, rows, ...] beside `<module>_weight_scale`, NVFP4's U8 codes, two
+  // a byte, with F8_E4M3 scales per 16 elements, or MXFP8's F8_E4M3 values
+  // with U8 E8M0 exponents per 32. An NVFP4 expert's global scale is its
+  // expert scale (expertScaleValues), so its native rows' g is 1.
+  TensorRows releaseExperts(const std::string &module, uint64_t rows, uint64_t columns, uint64_t experts) const {
+    const SourceTensor &codes = checkpoint_.require(module + "_weight");
+    const bool nvfp4 = codes.dtype == "U8";
+    const uint32_t format = nvfp4 ? nvfp4Form(columns) : GGUF_FMT_MXFP8;
+    require(module + "_weight", {nvfp4 ? "U8" : "F8_E4M3"}, {experts, rows, nvfp4 ? columns / 2 : columns});
+    const SourceTensor &scales = require(module + "_weight_scale", {nvfp4 ? "F8_E4M3" : "U8"},
+                                         {experts, rows, columns / (nvfp4 ? 16 : 32)});
+    requireWholeBlocks(module, format, columns);
+    return {module, kQuantFormats[format].ggml_type, 0, experts * rows, ggufRowBytes(kQuantFormats[format], columns),
+            {}, codes.file, {&codes, &scales}};
   }
 
   // A module's native rows in NVFP4 or FP8 as Model Optimizer and
@@ -372,7 +625,7 @@ private:
     bool perRow = false;
     uint32_t format;
     if (weight.dtype == "U8") {
-      format = GGUF_FMT_NVFP4;
+      format = nvfp4Form(columns);
       require(codes, {"U8"}, {rows, columns / 2});
       source.scales = &require(module + ".weight_scale", {"F8_E4M3"}, {rows, columns / 16});
       scale = &scalar(module + (packed ? ".weight_global_scale" : ".weight_scale_2"), {"F32"});
@@ -399,8 +652,9 @@ private:
                    checkpoint_.require(name).shape.empty() ? std::vector<uint64_t>{} : std::vector<uint64_t>{1});
   }
 
-  // Native rows hold whole native blocks of the module's format; only nvfp4's
-  // and fp8's, of 256 elements, are wider than its groups.
+  // Native rows hold whole native blocks of the module's format; only fp8's,
+  // of 256 elements, and NVFP4's (whose rows of 64 take NVFP4_64's) are wider
+  // than its groups.
   static void requireWholeBlocks(const std::string &module, uint32_t format, uint64_t columns) {
     if (columns % kQuantFormats[format].block_elements)
       throw WeightStoreError(module + "'s rows are not whole " + kQuantFormats[format].name + " blocks of " +
@@ -472,7 +726,7 @@ template <class Walk> void ffn(Walk &b, const QwenTargetDimensions &g, const std
     b.experts(mlp, "gate_proj", width, g.hiddenSize);
     b.experts(mlp, "up_proj", width, g.hiddenSize);
     b.experts(mlp, "down_proj", g.hiddenSize, width);
-    b.expertScales();
+    b.expertScales(mlp);
     b.projection(mlp + "shared_expert.gate_proj", shared, g.hiddenSize);
     b.projection(mlp + "shared_expert.up_proj", shared, g.hiddenSize);
     b.projection(mlp + "shared_expert.down_proj", g.hiddenSize, width, g.sharedExpertSlices);
@@ -623,6 +877,39 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
         return Builder(checkpoint, geometry, names, norms, std::move(name), layer, type, options);
       },
       [&](Builder &b) { images.push_back(b.finish()); });
+  return images;
+}
+
+std::vector<gguf::Image> planTargetImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry,
+                                         uint32_t layerImages, gguf::PlanOptions options,
+                                         const std::function<std::vector<gguf::Section>(uint32_t)> &layer,
+                                         const std::vector<gguf::Section> &head, const SectionSources &sources) {
+  using Kind = gguf::Section::Kind;
+  // Its norms the F32 values its GGUF's hold; the convolution's form, which
+  // only a Qwen walk reads, is mlx-vlm's.
+  const auto builder = [&](std::string name, uint32_t index, uint32_t type) {
+    return Builder(checkpoint, geometry, ModuleNames::Mlx, Conversion::WidenToFloat32, std::move(name), index, type,
+                   options);
+  };
+  const auto plan = [&](Builder &b, const std::vector<gguf::Section> &sections) {
+    for (const gguf::Section &section : sections) b.section(section, sources(section));
+  };
+  std::vector<gguf::Image> images;
+  for (uint32_t index = 0; index < layerImages; ++index) {
+    Builder b = builder("layer-" + std::to_string(index) + ".bin", index, geometry.isFullAttentionLayer(index) ? 1u : 0u);
+    plan(b, layer(index));
+    images.push_back(b.finish());
+  }
+  Builder headImage = builder("head.bin", layerImages, 2u);
+  plan(headImage, head);
+  plan(headImage, {{Kind::Quantized, "output.weight", geometry.vocabularySize, geometry.hiddenSize}});
+  images.push_back(headImage.finish());
+  Builder embedding = builder("embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
+  const std::vector<SectionSource> table =
+      sources({Kind::Quantized, "token_embd.weight", geometry.vocabularySize, geometry.hiddenSize});
+  if (table.size() != 1) throw WeightStoreError("no source of the checkpoint holds token_embd.weight");
+  embedding.embedding(table.front().name);
+  images.push_back(embedding.finish());
   return images;
 }
 

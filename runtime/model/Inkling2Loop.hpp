@@ -60,6 +60,7 @@
 namespace splash::model {
 
 struct GgufTargetPlan;
+struct SafetensorsTargetPlan;
 struct SparseRowStoreOptions;
 
 // Where an application reads its input rows and writes its output rows, bf16
@@ -572,14 +573,19 @@ struct Inkling2LoopWeights final : QwenTargetWeightsBase {
 // weight layers and whose attention rotates.
 void requireInkling2Layout(const Inkling2LoopLayout &layout);
 
-// Its weights from its GGUF's images (model/Inkling2LoopGguf.cpp): a layer
-// image a weight layer, then the head's and the embedding's.
+// Its weights from the images of its GGUF or its checkpoint
+// (model/Inkling2LoopSections.hpp): a layer image a weight layer, then the
+// head's and the embedding's.
 [[nodiscard]] Inkling2LoopWeights loadInkling2LoopWeights(metal::MetalBackend &backend, Inkling2LoopLayout layout,
                                                           const QwenTargetFiles &files);
 
 // How its GGUFs plan: its weightLayers layer images, then the head's and the
 // embedding's, its metadata checked key by key (model/Inkling2LoopGguf.cpp).
 [[nodiscard]] GgufTargetPlan ggufTargetPlan(const Inkling2LoopLayout &layout);
+// How its safetensors checkpoints plan, its release's and its MLX
+// conversions': the images its GGUFs' plan lays out, of the tensors each
+// names for them (model/Inkling2LoopSafetensors.cpp).
+[[nodiscard]] SafetensorsTargetPlan safetensorsTargetPlan(const Inkling2LoopLayout &layout);
 
 // The projections its layers dispatch beyond their mixers' fused queries and
 // outputs, which qwenTargetGeometry takes as any mixer's (includeMixer):

@@ -417,8 +417,8 @@ void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSou
 }
 
 // Inkling-2-Mini's text configuration, in its config.json's text_config (its
-// release's, or the one the installer derives from its GGUF), of a GGUF
-// target alone, whose metadata its plan checks (ggufTargetPlan): the sizes
+// release's or an MLX conversion's, or the one the installer derives from its
+// GGUF, whose metadata its plan checks, ggufTargetPlan): the sizes
 // (sizeDifference), then the rest as the layout's values make them: its
 // tokens (unpadded_vocab_size), its window and sliding layers
 // (local_layer_ids), its loop (loop_config: its layers, passes and gate
@@ -431,9 +431,6 @@ void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSou
 // are held as the layout's F32 values, the nearest F32 of the config's.
 void validateTextConfig(NSDictionary *text, const Inkling2LoopLayout &target, TargetSource source) {
   const std::string_view name = sourceName(source);
-  if (source != TargetSource::Gguf)
-    throw std::invalid_argument(std::string(target.family) + " loads from a GGUF, not a " + std::string(name) +
-                                " checkpoint");
   if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
   requireNumbers(text, name, "text config",
                  {{"unpadded_vocab_size", target.vocabularyTokens},

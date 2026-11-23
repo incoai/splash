@@ -7,6 +7,7 @@
 #include "model/GgufImage.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/Inkling2Loop.hpp"
+#include "model/Inkling2LoopSections.hpp"
 
 #include <array>
 #include <span>
@@ -214,6 +215,13 @@ std::vector<gguf::Section> headImage(const Inkling2LoopLayout &layout) {
 }
 
 } // namespace
+
+// The sections of its images by llama.cpp's converter's names, which its
+// safetensors plan reads checkpoints by too.
+std::vector<gguf::Section> inkling2::layerSections(const Inkling2LoopLayout &layout, uint32_t index) {
+  return layerImage(layout, kConverterLayout, index);
+}
+std::vector<gguf::Section> inkling2::headSections(const Inkling2LoopLayout &layout) { return headImage(layout); }
 
 GgufTargetPlan ggufTargetPlan(const Inkling2LoopLayout &layout) {
   return {.layerImages = layout.weightLayers,

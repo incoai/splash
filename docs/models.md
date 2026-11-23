@@ -54,9 +54,11 @@ mapping of an application to its weight layer in its own members
 (`Inkling2LoopSchedule`); its layers attend through its own operator, not the
 shared attention (a layout type's `sharedAttention`), so the kernel tests'
 attention shapes leave it out. It is served up to Splash's serving ceiling,
-1,010,000 tokens, below its own window of 1,048,576. It loads from a GGUF
-alone; its configuration, under `text_config`, is held to its values key by
-key (its weight layers, its own window at `model_max_length`,
+1,010,000 tokens, below its own window of 1,048,576. It loads from a GGUF or
+from its release's checkpoint or an MLX conversion of it ([Inkling 2's
+checkpoints](#inkling-2s-checkpoints)); its configuration, under
+`text_config`, is held to its values key by key (its weight layers, its own
+window at `model_max_length`,
 `unpadded_vocab_size`, `local_layer_ids`, `loop_config`, its experts' width;
 the relative bias, clips, softcaps, routing and the rest where it states
 them), its clip and log-scaling alpha as F32 values. Its vocabulary keeps
@@ -97,7 +99,13 @@ weight is an E2M1 code times
 its group's power of two, a uint8 scale, which is GGUF's MXFP4; an mxfp8 weight
 is an E4M3 value, a byte of `.weight`, times its group's power of two, the
 same scale; an nvfp4 weight is an E2M1 code times its 16 elements' E4M3 scale,
-a uint8, which is NVFP4 with a tensor scale of 1.
+a uint8, and the global scale its module holds where its converter kept
+NVIDIA's (MLX's `global_scale` over the 6 × 448 MLX's dequantization divides
+it by, or Model Optimizer's `weight_scale_2`), which is NVFP4 with that tensor
+scale, 1 without one, in every family's checkpoints; an experts module holds
+one per expert, its experts' scales. Rows of a
+multiple of 64 inputs but not of 256 take NVFP4's 64-element form, as a
+GGUF's do ([GGUF targets](#gguf-targets)).
 
 An MLX target loads into the `MDGG0001` images a GGUF target's do
 (`SafetensorsTargetLoader`, [Weight loading](internals.md#weight-loading)):
@@ -116,9 +124,13 @@ MLX's grouped order. A checkpoint's names are mlx-vlm's (`language_model.model.*
 as the Qwen releases') or mlx-lm's (`model.*` and `lm_head`, as
 `mlx-community/flint-mixed-3-4bit`'s), told apart by where its token table is,
 and each family's tensors are read in the order its GGUF images hold them
-(`safetensors::planImages`): Flint's sinks (`self_attn.softmax_offset`) widen
-to the F32 its GGUF holds, its leading layers' FFN is dense and its shared
-expert, two routed experts wide and ungated, runs as two slices.
+(`safetensors::planImages`), Inkling 2's by the sections its GGUF plan lays
+out ([Inkling 2's checkpoints](#inkling-2s-checkpoints)). One planner serves
+both, as `GgufImage.cpp`'s does a GGUF: the families' walks and Inkling 2's
+sections plan through the same Builder's primitives (`SafetensorsImage.cpp`).
+Flint's sinks (`self_attn.softmax_offset`) widen to the F32 its GGUF holds, its
+leading layers' FFN is dense and its shared expert, two routed experts wide and
+ungated, runs as two slices.
 
 ## Model Optimizer targets
 
@@ -162,6 +174,45 @@ weight's codes are
 `.weight_packed`, its `g` the reciprocal of the F32 `.weight_global_scale`;
 an FP8 weight's F32 or BF16 `.weight_scale` is the tensor's `g` or, `[rows,
 1]`, each row's, which that row's meta units hold.
+
+## Inkling 2's checkpoints
+
+Inkling 2's release (`thinkingmachines/Inkling-2-Mini`, `model.llm.*`) and its
+MLX conversions load into the images of its GGUFs
+(`Inkling2LoopSafetensors.cpp`): each section its GGUF plan lays out
+(`Inkling2LoopSections.hpp`) is read from the tensors a checkpoint names for
+it, by the release's names or by those of its converters, which are aliases of
+them: oMLX's (`model.*`, a sliding layer's queries, keys, values, relative
+scores, gate and sinks fused into one `in_proj`, a full layer's queries,
+relative scores, gate and sinks into its `q_proj` and its taps' projections
+into its `k_proj` and `v_proj`, a loop layer's message gates transposed in two
+tensors), mlx-vlm's (`model.language_model.*`) and mlx-lm's
+(`language_model.model.*`, its experts' gate and up apart), told apart by the
+token table's name. The release's routed experts are NVFP4 in layers 0-19, U8
+codes and F8_E4M3 scales per 16 (`<module>_weight`, `_weight_scale`), each
+expert's global scale its F32 `_weight_amax` over the
+`_weight_outer_scale_denominator` (2688, `hf_quant_config.json`'s
+`amax_denominator`), as llama.cpp's converter divides them into its GGUFs'
+`.scale`, and MXFP8 in layers 20-23, F8_E4M3 values with a U8 E8M0 exponent per
+32; their gate and up rows are interleaved, a row each, which the planner
+takes as two windows of each row pair (oMLX's `w13` and mlx-vlm's
+`gate_up_proj` keep them so). A conversion keeps those codes: nvfp4 experts with
+MLX's `global_scale` (the release's amax) or mlx-lm's `weight_scale_2` (its
+quotient), mxfp8 ones as they are ([MLX targets](#mlx-targets)). The release's
+attention projections and head are BF16 and load as Q8_0, as an MLX target's
+unquantized projections do, its token table as its bf16 rows, its routers as
+their BF16 rows. Its logits, teacher-forced over 1,933 positions of five prompts, are
+within a mean KL of 0.0024 nats of those of its BF16 projections (UD-Q4_K_M's
+are as near), pick the same top-1 at 98.7% of positions, and keep each
+prompt's NLL of the greedy continuation within 0.004 (0.1838 pooled, BF16's
+0.1847). A full layer's static convolution taps (`static_w`) and the relative bias
+(`rel_logits_proj.proj`) are stored transposed, the taps last first, and the
+release keeps its loop layers' message queries in two lists of every loop
+layer's (`middle_cycle_cross_pass_queries`, its q and FFN rows, and
+`_kv_queries`, its k and v rows), its block mix queries in lists of every
+layer's (`attn_res.attn_queries`, `mlp_queries`). Its MTP head and vision
+tower are not loaded. Where a checkpoint and a GGUF hold the same values, the
+images are the same bytes (`gguf-preparation`).
 
 ## GGUF targets
 

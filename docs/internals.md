@@ -216,13 +216,22 @@ every format, and the planner chooses the form by a tensor's width
 experts' scales after them, F32 [3][experts] (`ImageBuilder::expertScales`):
 a GGUF experts tensor's `.scale` as stored, whatever its type, and 1 for
 experts without one, which the expert passes multiply their sums by
-([GGUF targets](models.md#gguf-targets)).
+([GGUF targets](models.md#gguf-targets)); a checkpoint's, planned as values
+(`ImageBuilder::ExpertScales`), its experts' global scales: Inkling 2's
+release's amax over its denominator, MLX's `global_scale` over 6 × 448 or
+`weight_scale_2` as stored ([Inkling 2's
+checkpoints](models.md#inkling-2s-checkpoints)). A checkpoint's matrix the
+image holds transposed (Inkling 2's static taps and relative bias, oMLX's
+packed message gates) is written as its transpose's F32 values
+(`Conversion::TransposeToFloat32`), its stored rows taken in reverse where it
+keeps them last first (`RowOrder::reversed`).
 
 Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
 BF16 or F16 hyper-connection projections and of such 16-bit routed experts
 ([GGUF targets](models.md#gguf-targets)) and of a safetensors target's BF16 or
-F16 projections, and
+F16 projections, in the F32 quotient of an expert's global scale a checkpoint
+holds as one (as llama.cpp's converter computes Inkling 2's `.scale`), and
 in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
 target's quantized shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's

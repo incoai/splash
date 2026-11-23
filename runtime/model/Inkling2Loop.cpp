@@ -3,6 +3,7 @@
 #include "model/GgufImage.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
+#include "model/SafetensorsTarget.hpp"
 #include "model/SparseRowStore.hpp"
 
 #include <array>
@@ -143,15 +144,14 @@ void requireInkling2Layout(const Inkling2LoopLayout &layout) {
 
 // The layer images in weight layer order, then the head's (the token table's
 // norm, the head's block mix query, the final norm and the head) and the
-// embedding's (the token table). Its routed experts open first, as
-// loadQwenTarget opens them; its allocations are all that loading it
-// allocates, and its fingerprint is its files'.
+// embedding's (the token table), of a GGUF's or a checkpoint's images alike.
+// Its routed experts open first, as loadQwenTarget opens them; its
+// allocations are all that loading it allocates, and its fingerprint is its
+// files'.
 Inkling2LoopWeights loadInkling2LoopWeights(metal::MetalBackend &backend, Inkling2LoopLayout layout,
                                             const QwenTargetFiles &files) {
   requireInkling2Layout(layout);
-  const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files);
-  if (!gguf) throw WeightStoreError("Inkling-2-Mini loads from a GGUF");
-  GgufTargetLoader &loader = gguf->get();
+  TargetImages &loader = std::visit([](const auto &source) -> TargetImages & { return source.get(); }, files);
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   const MoeExperts experts = openMoeExperts(backend, files, layout);
   const BlockTargetFormat format;

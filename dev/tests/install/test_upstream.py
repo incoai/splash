@@ -24,7 +24,6 @@ from dev.tests.installer_fixtures import (
     DRAFT_COMMIT,
     FLINT,
     GGUF_CONFIGS,
-    GGUF_ONLY,
     INKLING,
     MODEL,
     MOE,
@@ -82,10 +81,8 @@ class UpstreamTest(unittest.TestCase):
 
     def test_family_is_identified_by_architecture_not_name(self):
         # The engine's check (its model-check command), with and without the
-        # draft, of each family an MLX checkpoint serves.
+        # draft, of each family's MLX checkpoint (Inkling 2's release's).
         for family in families.FAMILIES:
-            if family in GGUF_ONLY:
-                continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
             vision = "safetensors" if family.vision else "none"

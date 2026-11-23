@@ -336,6 +336,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Flint.cpp \
 	runtime/model/Inkling2Loop.cpp \
 	runtime/model/Inkling2LoopGguf.cpp \
+	runtime/model/Inkling2LoopSafetensors.cpp \
 	runtime/model/Inkling2LoopSteps.cpp \
 	runtime/model/Inkling2LoopTarget.cpp \
 	runtime/model/QwenVision.cpp \

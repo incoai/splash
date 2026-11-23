@@ -32,11 +32,14 @@ namespace splash::model::gguf {
 // order; from there on, blocks of headRows rows are value heads, which
 // llama.cpp stores tiled (value head of its key head * keyHeads + key head)
 // and splash groups by key head (key head * valueHeadsPerKey + value head).
+// Or, `reversed`, the rows last first (Inkling 2's static convolution taps,
+// which its release stores in the order llama.cpp's converter flips).
 struct RowOrder {
   uint64_t from = UINT64_MAX; // UINT64_MAX: rows as stored
   uint32_t headRows = 0;
   uint32_t keyHeads = 0;
   uint32_t valueHeadsPerKey = 0;
+  bool reversed = false;
 };
 
 // A quantized safetensors tensor's codes and scales, and an affine one's
@@ -44,9 +47,9 @@ struct RowOrder {
 // (metal/abi/QuantFormat.h): per group an affine tensor's bf16 scale, its
 // bias and its codes, an mxfp4 tensor's block_mxfp4, its E8M0 scale and
 // codes (GGUF_FMT_MXFP4), or an mxfp8 tensor's E8M0 scale and E4M3 values;
-// per 256 elements an nvfp4 tensor's E4M3 scales, its
-// row's tensor scale (TensorScale) and codes, or an fp8 tensor's row's tensor
-// scale and E4M3 values. Or a BF16 weight, which the writer quantizes into
+// per 256 elements (NVFP4_64's 64) an nvfp4 tensor's E4M3 scales, its row's
+// tensor scale (TensorScale) and codes, or an fp8 tensor's row's tensor scale
+// and E4M3 values. Or a BF16 weight, which the writer quantizes into
 // native af4g64 rows as MLX's affine quantization rounds it (a DFlash2
 // draft's projections).
 struct SafetensorsSource {
@@ -66,13 +69,15 @@ struct SafetensorsSource {
 // weight_global_scale its 1 / g and its per-channel fp8 weight_scale each
 // row's g [rows, 1], and a llama.cpp NVFP4 projection's .scale its g (an
 // experts tensor's are its layer's expert scales,
-// ImageBuilder::expertScales). Without one (rowsPerValue 0), as in MLX's
-// nvfp4, g is 1.
+// ImageBuilder::expertScales); MLX's nvfp4 global_scale holds g times the
+// divisor 6 * 448 its dequantization divides by. Without one (rowsPerValue
+// 0), as in MLX's own nvfp4, g is 1.
 struct TensorScale {
   const WeightSource *file = nullptr;
   uint64_t offset = 0, bytes = 0;
   uint64_t rowsPerValue = 0;
   bool bfloat16 = false, reciprocal = false;
+  float divisor = 1.0F;
 };
 
 // Rows [first, first + rows) of one source tensor in image order, read from
@@ -123,10 +128,21 @@ struct Fill {
 // unquantized (a safetensors shared-expert gate, GDN alpha and beta of two
 // types or of F16, a GGUF's Q8_0 hyper-connection injection weights and
 // shared-expert scalar gate and its quantized tensors of a float projection),
-// or as the F32 1 + w of a BF16 RMSNorm weight w, which a checkpoint stores 1
+// as the F32 1 + w of a BF16 RMSNorm weight w, which a checkpoint stores 1
 // below the weight the norm multiplies by (exact but where |w| < 2^-16 or
-// |w| >= 2^24, which it may round once).
-enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
+// |w| >= 2^24, which it may round once), or as the F32 values of BF16 or F32
+// rows transposed, the source's rows the columns written (a checkpoint's
+// matrix stored transposed of the one its image holds, as Inkling 2's
+// relative bias is), every row in one step.
+enum class Conversion : uint8_t {
+  None,
+  NarrowToBfloat16,
+  WidenToFloat32,
+  Decay,
+  DequantizeToFloat32,
+  CenteredNorm,
+  TransposeToFloat32
+};
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
   uint64_t destination = 0;
