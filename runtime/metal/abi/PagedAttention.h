@@ -209,6 +209,36 @@ struct SplashAttentionParams {
 static_assert(sizeof(SplashAttentionParams) == 32 + 44 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Attention parameters are the same size on both sides");
 
+// A verify step's relative prepare that convolves its keys and values itself
+// (ops::PagedAttention::addRelativeProjection with a RelativeConvolution),
+// with the arithmetic of metal/abi/ShortConvolution.h's convolution: the
+// key and value sides' rows side_stride F32 apart, a dynamic convolution's
+// per-head taps at lambda_offset of a row (heads of head_channels channels;
+// 0: static taps only); each lane's history of the layer, BF16 rows
+// history_stride apart with the keys' channels first and the values' at
+// value_offset; the tape its commit reads, rows tape_stride apart with the
+// same channels; and the output scale.
+struct SplashRelativeConvolution {
+  uint32_t side_stride;
+  uint32_t lambda_offset;
+  uint32_t head_channels;
+  uint32_t history_stride;
+  uint32_t tape_stride;
+  uint32_t value_offset;
+  float scale;
+  uint32_t pad;
+};
+
+static_assert(sizeof(SplashRelativeConvolution) == 32, "Relative convolution parameters are 32 bytes on both sides");
+
+struct SplashRelativeConvolutionParams {
+  SplashAttentionParams attention;
+  SplashRelativeConvolution convolution;
+};
+
+static_assert(sizeof(SplashRelativeConvolutionParams) == sizeof(SplashAttentionParams) + 32,
+              "Relative convolution parameters are the same size on both sides");
+
 // The commit of each lane's accepted path after a decode step
 // (ops::PagedAttention::addPathCommit): a step stores a lane's rows at the
 // slots of their rows of its block, committed_tokens[lane] plus the row, so

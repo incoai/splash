@@ -130,6 +130,10 @@ public:
   [[nodiscard]] metal::MetalBuffer history(const metal::MetalBuffer &auxiliary, uint32_t layer,
                                            InklingConvolution convolution) const;
   [[nodiscard]] metal::MetalBuffer histories(const metal::MetalBuffer &auxiliary) const;
+  // The key and value convolutions' history of layer `layer`, from the keys'
+  // first channel through the values' last: what a verify step's relative
+  // prepare convolves from (ops::RelativeConvolution).
+  [[nodiscard]] metal::MetalBuffer keyValueHistory(const metal::MetalBuffer &auxiliary, uint32_t layer) const;
   // A decode step's rows of a layer's convolution on its tape, from row 0.
   [[nodiscard]] ops::StridedRows tape(const InklingScratch &scratch, uint32_t layer,
                                       InklingConvolution convolution) const;

@@ -8,6 +8,7 @@
 #include "metal/abi/KvExtent.h"
 #include "ops/KernelCalibration.hpp"
 #include "ops/PagedAttention.hpp"
+#include "ops/ShortConvolution.hpp"
 
 #include <algorithm>
 #include <array>
@@ -852,6 +853,111 @@ void checkTreeVerify(metal::MetalBackend &backend, kv::Format format, bool int8Q
   report(data, what, prepared, output, whole);
 }
 
+// A verify step's prepare that convolves its keys and values itself
+// (ops::RelativeConvolution) stores the same K/V, stages the same queries and
+// relative states and writes the same tape, bit for bit, as the two
+// convolutions (ops::ShortConvolution with tree rows) and then the prepare;
+// a global layer's convolutions are dynamic. Tree blocks as checkTreeVerify's.
+void checkConvolvedPrepare(metal::MetalBackend &backend, kv::Format format, ops::AttentionVariant variant,
+                           std::array<uint32_t, 4> histories, std::array<uint32_t, 4> blockRows) {
+  constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS, kTaps = SHORT_CONVOLUTION_TAPS;
+  constexpr uint32_t kHistoryStride = 2 * kKeyWidth + 64, kValueOffset = kKeyWidth;
+  const bool dynamic = variant.positionScaled;
+  const uint32_t headChannels = dynamic ? kHeadDimension : 0;
+  const uint32_t sideStride = kKeyWidth + (dynamic ? kKvHeads * kTaps : 0) + 32;
+  std::array<Case, 2> cases{makeCase(backend, format, false, variant, 4, kRows, histories),
+                            makeCase(backend, format, false, variant, 4, kRows, histories)};
+  std::array<Staging, 2> stagings;
+  for (Case &data : cases) {
+    data.tree = true;
+    for (uint32_t lane = 0; lane < 4; ++lane)
+      for (uint32_t row = 0; row < blockRows[lane]; ++row)
+        data.trees[lane].parent.push_back(!row ? 0 : lane == 1 ? (row - 1) / 2 : row - 1);
+  }
+  for (size_t at = 0; at < 2; ++at) stagings[at] = stage(backend, cases[at], 0, kRows, kPageTokens, blockRows);
+  const uint32_t packedRows = stagings[0].packedRows;
+  // The sides (their dynamic taps past the keys' or values' channels), the
+  // taps, each lane's history and a poisoned tape, the same for both ways.
+  const auto randomFloats = [&](uint32_t kind, uint64_t count, float scale) {
+    const metal::MetalBuffer buffer = zeroed(backend, count * 4);
+    for (uint64_t i = 0; i < count; ++i) contents<float>(buffer)[i] = scale * unit(seedOf(kind, 0, 0, 0, 0) + i);
+    return buffer;
+  };
+  const metal::MetalBuffer keySide = randomFloats(20, uint64_t{packedRows} * sideStride, 2.0f);
+  const metal::MetalBuffer valueSide = randomFloats(21, uint64_t{packedRows} * sideStride, 2.0f);
+  const metal::MetalBuffer keyTaps = randomFloats(22, uint64_t{kKeyWidth} * kTaps, 0.5f);
+  const metal::MetalBuffer valueTaps = randomFloats(23, uint64_t{kKeyWidth} * kTaps, 0.5f);
+  std::array<metal::MetalBuffer, 4> lanes;
+  for (uint32_t lane = 0; lane < 4; ++lane) {
+    lanes[lane] = zeroed(backend, uint64_t{SHORT_CONVOLUTION_HISTORY} * kHistoryStride * 2);
+    for (uint64_t i = 0; i < uint64_t{SHORT_CONVOLUTION_HISTORY} * kHistoryStride; ++i)
+      contents<uint16_t>(lanes[lane])[i] = floatToBf16(2.0f * unit(seedOf(24, lane, 0, 0, 0) + i));
+  }
+  std::array<metal::MetalBuffer, 2> tapes{poisoned(backend, uint64_t{packedRows} * kHistoryStride * 2),
+                                          poisoned(backend, uint64_t{packedRows} * kHistoryStride * 2)};
+  const auto view = [&](const metal::MetalBuffer &buffer, uint64_t offset) {
+    return backend.view(buffer, offset, buffer.sizeBytes() - offset);
+  };
+  const ops::ShortConvolutionShape shape{kKeyWidth, headChannels, ops::FloatElement::Float32,
+                                         ops::FloatElement::BFloat16};
+  for (size_t at = 0; at < 2; ++at) {
+    Case &data = cases[at];
+    Staging &staging = stagings[at];
+    const std::vector<kv::ChunkedPrefillParams> sequences = sequencesOf(data, staging);
+    const ops::AttentionRows rows{staging.layout, staging.packedRows, staging.tree};
+    metal::CommandGraph graph;
+    ops::RelativeConvolution convolution{.keySide = keySide,
+                                         .valueSide = valueSide,
+                                         .sideStride = sideStride,
+                                         .lambdaOffset = dynamic ? kKeyWidth : 0,
+                                         .headChannels = headChannels,
+                                         .keyTaps = keyTaps,
+                                         .valueTaps = valueTaps,
+                                         .histories = lanes,
+                                         .historyStride = kHistoryStride,
+                                         .tape = tapes[at],
+                                         .tapeStride = kHistoryStride,
+                                         .valueOffset = kValueOffset,
+                                         .scale = shape.scale()};
+    if (at == 0) {
+      for (const bool values : {false, true}) {
+        const metal::MetalBuffer &side = values ? valueSide : keySide;
+        std::array<metal::MetalBuffer, 4> before;
+        for (uint32_t lane = 0; lane < 4; ++lane) before[lane] = view(lanes[lane], values ? kValueOffset * 2 : 0);
+        ops::ShortConvolution::addConvolution(
+            graph,
+            {{side, sideStride}, dynamic ? ops::StridedRows{view(side, kKeyWidth * 4), sideStride} : ops::StridedRows{},
+             values ? valueTaps : keyTaps, {values ? staging.values : staging.keys, kKeyWidth}, false},
+            {before, {}, kHistoryStride}, shape, staging.layout, {4, packedRows, kRows},
+            {staging.tree, {view(tapes[at], values ? kValueOffset * 2 : 0), kHistoryStride}});
+      }
+    }
+    ops::PagedAttention::addRelativeProjection(
+        graph, {staging.querySide, staging.keys, staging.values, data.weights.queryScale, data.weights.relativeScale},
+        staging.queries, staging.states, data.layer, std::span(data.tables).first(4), sequences, rows, kQueryHeads,
+        data.layout, variant, at == 0 ? nullptr : &convolution);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  }
+  const auto same = [](const metal::MetalBuffer &a, const metal::MetalBuffer &b, uint64_t bytes) {
+    return std::memcmp(a.contents(), b.contents(), bytes) == 0;
+  };
+  const std::string what = describe(cases[0], "convolving prepare");
+  require(same(stagings[0].queries, stagings[1].queries, stagings[0].queries.sizeBytes()),
+          what + ": queries differ from the convolutions then the prepare");
+  require(same(stagings[0].states, stagings[1].states, uint64_t{packedRows} * kQueryHeads * kWidth * 4),
+          what + ": relative states differ from the convolutions then the prepare");
+  require(same(tapes[0], tapes[1], tapes[0].sizeBytes()), what + ": the tape differs from the convolutions'");
+  for (uint32_t lane = 0; lane < 4; ++lane)
+    for (const uint32_t page : cases[0].pages[lane]) {
+      const auto a = cases[0].pool.layerSpans(page, kLayer), b = cases[1].pool.layerSpans(page, kLayer);
+      for (size_t tensor = 0; tensor < a.size(); ++tensor)
+        require(a[tensor].size() == b[tensor].size() &&
+                    std::memcmp(a[tensor].data(), b[tensor].data(), a[tensor].size()) == 0,
+                what + ": stored K/V differ from the convolutions then the prepare");
+    }
+  std::cout << what << ": queries, relative states, tape and K/V bitwise PASS\n";
+}
+
 // What the geometry's plans and encoders take and refuse: its two variants'
 // kernels, a rotated variant, a position scale of another geometry, the
 // other geometries' projection, and its attention without its bias or
@@ -945,6 +1051,7 @@ int main(int argc, char **argv) {
         // rows, past position 8192, the window and over short histories.
         checkTreeVerify(backend, format, int8Queries, variant, {9000, 1100, 37, 0}, {16, 16, 16, 16});
         checkTreeVerify(backend, format, int8Queries, variant, {8190, 1020, 5, 2047}, {16, 5, 9, 12});
+        if (!int8Queries) checkConvolvedPrepare(backend, format, variant, {9000, 1100, 37, 0}, {16, 5, 9, 12});
       }
     std::cout << "largest errors: prepare " << gPrepare.text() << " (q " << gPrepare.queries.bound << ", r "
               << gPrepare.states.bound << ", K/V " << gPrepare.kv.bound << " of their bounds)\n";

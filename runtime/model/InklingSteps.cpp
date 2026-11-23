@@ -204,6 +204,15 @@ metal::MetalBuffer InklingSteps::history(const metal::MetalBuffer &auxiliary, ui
                        ops::shortConvolutionHistoryBytes(kStateElement, channels(convolution), historyStride()));
 }
 
+metal::MetalBuffer InklingSteps::keyValueHistory(const metal::MetalBuffer &auxiliary, uint32_t layer) const {
+  if (layer >= geometry_.layers) throw std::out_of_range("Inkling convolution history layer");
+  const uint64_t base = geometry_.pleHistoryBytes() + geometry_.indexerPendingBytes();
+  const uint64_t layerElements = uint64_t{SHORT_CONVOLUTION_HISTORY} * historyStride();
+  const uint32_t channels = this->channels(InklingConvolution::Key) + this->channels(InklingConvolution::Value);
+  return backend_.view(auxiliary, base + layer * layerElements * kShortConvolutionStateValueBytes,
+                       ops::shortConvolutionHistoryBytes(kStateElement, channels, historyStride()));
+}
+
 metal::MetalBuffer InklingSteps::histories(const metal::MetalBuffer &auxiliary) const {
   return backend_.view(auxiliary, geometry_.pleHistoryBytes() + geometry_.indexerPendingBytes(),
                        geometry_.shortConvolutionStateBytes());

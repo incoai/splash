@@ -11,6 +11,7 @@
 #include "ops/Sampling.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -243,12 +244,37 @@ void InklingTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
     const uint64_t at = uint64_t{sides.lags} * sizeof(float);
     return ops::StridedRows{backend_.view(sideBuffer, at, sideBuffer.sizeBytes() - at), sideRows};
   };
-  addConvolution(step, layer, InklingConvolution::Key,
-                 {{s.keySide, sideRows}, lags(s.keySide), w.mixer.keyConvolution, {s.keys, kvWidth}, false},
-                 {kvWidth, headChannels, kF32});
-  addConvolution(step, layer, InklingConvolution::Value,
-                 {{s.valueSide, sideRows}, lags(s.valueSide), w.mixer.valueConvolution, {s.values, kvWidth}, false},
-                 {kvWidth, headChannels, kF32});
+  // A prompt's keys and values go through their convolutions; a verify
+  // step's relative prepare convolves them itself, one dispatch where the
+  // convolutions and the prepare would take three.
+  const ops::ShortConvolutionShape kvShape{kvWidth, headChannels, kF32, kStateElement};
+  std::array<metal::MetalBuffer, kLanes> kvHistories;
+  std::optional<ops::RelativeConvolution> convolved;
+  if (step.decode) {
+    for (size_t index = 0; index < step.sequences.size(); ++index)
+      kvHistories[index] = steps_.keyValueHistory(step.sequences[index].auxiliaryIn, layer);
+    const ops::StridedRows tape = steps_.tape(s, layer, InklingConvolution::Key);
+    convolved = ops::RelativeConvolution{.keySide = s.keySide,
+                                         .valueSide = s.valueSide,
+                                         .sideStride = sideRows,
+                                         .lambdaOffset = global ? sides.lags : 0,
+                                         .headChannels = headChannels,
+                                         .keyTaps = w.mixer.keyConvolution,
+                                         .valueTaps = w.mixer.valueConvolution,
+                                         .histories = std::span(kvHistories).first(step.sequences.size()),
+                                         .historyStride = steps_.historyStride(),
+                                         .tape = tape.buffer,
+                                         .tapeStride = tape.stride,
+                                         .valueOffset = steps_.channelOffset(InklingConvolution::Value),
+                                         .scale = kvShape.scale()};
+  } else {
+    addConvolution(step, layer, InklingConvolution::Key,
+                   {{s.keySide, sideRows}, lags(s.keySide), w.mixer.keyConvolution, {s.keys, kvWidth}, false},
+                   {kvWidth, headChannels, kF32});
+    addConvolution(step, layer, InklingConvolution::Value,
+                   {{s.valueSide, sideRows}, lags(s.valueSide), w.mixer.valueConvolution, {s.values, kvWidth}, false},
+                   {kvWidth, headChannels, kF32});
+  }
   // The relative prepare stores each row's key and value in its page slot;
   // a global layer scales its queries and relative states by tau of their
   // positions.
@@ -259,7 +285,7 @@ void InklingTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
   ops::PagedAttention::addRelativeProjection(
       step.graph, {s.querySide, s.keys, s.values, w.mixer.queryClip, w.mixer.relativeClip}, b.fullQueries,
       s.relative, step.kvLayers[layer], std::span(step.pageTables).first(sequences.size()), sequences, attentionRows,
-      geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
+      geometry_.attentionQueryHeads, geometry_.kvLayout, variant, convolved ? &*convolved : nullptr);
   const auto histories = attentionHistories(step, layer);
   const ops::AttentionPlan &plan = variant.windowTokens ? *step.windowedAttention : *step.attention;
   const ops::LinearPlan outputPlan = linear.plan(w.mixer.outputProjection, rows);

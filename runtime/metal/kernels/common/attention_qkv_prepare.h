@@ -128,9 +128,9 @@ inline float2 relative_head_sums(float2 own, threadgroup float2 *partials, uint 
   return total;
 }
 
-template <uint QHeads, uint KHeads, uint HeadDim, bool PositionScaled, typename CacheElement>
+template <uint QHeads, uint KHeads, uint HeadDim, bool PositionScaled, typename CacheElement, class KeyValue>
 inline void relative_qkv_storage_phase(
-    device const float *query_side, device const float *keys, device const float *values,
+    device const float *query_side, KeyValue key_value,
     device const float *query_scale, device const float *relative_scale, device bfloat *queries,
     device float *relative, device const SplashKvPage *page_table, device const SplashTreeRow *tree,
     device const SplashLaneRows *layout, constant SplashAttentionParams &params, threadgroup float2 *partials,
@@ -138,7 +138,7 @@ inline void relative_qkv_storage_phase(
   static_assert(QHeads % KHeads == 0 && HeadDim % 32 == 0 && SPLASH_RELATIVE_WIDTH <= 32,
                 "a relative state's dimensions are the first simdgroup's lanes");
   constexpr uint Group = QHeads / KHeads, Width = SPLASH_RELATIVE_WIDTH;
-  constexpr uint SideStride = SPLASH_RELATIVE_QUERY_SIDE(QHeads, HeadDim), KWidth = KHeads * HeadDim;
+  constexpr uint SideStride = SPLASH_RELATIVE_QUERY_SIDE(QHeads, HeadDim);
   const uint sequence_row = group.y;
   constant SplashAttentionSequence &sequence = params.sequence[group.z];
   const bool query = group.x < QHeads;
@@ -174,8 +174,8 @@ inline void relative_qkv_storage_phase(
           coordinate * relative_clip_factor(squares.y, SPLASH_RELATIVE_STATE_CLIP) * tau;
     return;
   }
-  const float key = keys[packed * KWidth + head * HeadDim + thread_index];
-  const float value = values[packed * KWidth + head * HeadDim + thread_index];
+  const float2 convolved = key_value(packed, head * HeadDim + thread_index, rows.first);
+  const float key = convolved.x, value = convolved.y;
   const float2 squares = relative_head_sums<HeadDim>(float2(key * key, value * value), partials, lane, simd_group);
   const float clipped = key * relative_clip_factor(squares.x, SPLASH_RELATIVE_QK_CLIP);
   const float normalized = value * rsqrt(squares.y / HeadDim + kRmsEpsilon);

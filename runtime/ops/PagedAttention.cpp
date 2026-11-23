@@ -1,5 +1,6 @@
 #include "ops/PagedAttention.hpp"
 
+#include "metal/abi/ShortConvolution.h"
 #include "ops/BufferExtent.hpp"
 #include "ops/LaneBindings.hpp"
 
@@ -498,10 +499,67 @@ void PagedAttention::addRelativeProjection(metal::CommandGraph &graph, const Rel
                                            SplashKvLayer layer, std::span<const metal::MetalBuffer> pageTables,
                                            std::span<const kv::ChunkedPrefillParams> sequences,
                                            const AttentionRows &rows, uint32_t queryHeads, kv::Layout layout,
-                                           AttentionVariant variant) {
+                                           AttentionVariant variant, const RelativeConvolution *convolution) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   if (!kernel.relative || variant.rotated)
     throw std::invalid_argument("a relative projection takes an unrotated relative geometry");
+  if (convolution) {
+    // A verify step that convolves its keys and values itself: the sides,
+    // taps, a history a lane and the tape in place of the keys and values,
+    // and the convolution's parameters after the attention's.
+    const RelativeConvolution &conv = *convolution;
+    const CommandRows command = commandRows(sequences, layout);
+    if (!rows.tree || sequences.size() > SPLASH_MAXIMUM_BATCH_WIDTH || pageTables.size() != sequences.size() ||
+        conv.histories.size() != sequences.size())
+      throw std::invalid_argument("a convolving prepare takes a verify step's lanes, a page table and a history each");
+    requireRows(rows, command, sequences.size());
+    const uint64_t keyWidth = uint64_t{layout.kvHeads} * layout.headDimension;
+    requireBytes(inputs.querySide,
+                 uint64_t{rows.rows} * relativeQuerySideWidth(queryHeads, layout.headDimension) * sizeof(float),
+                 "attention query side");
+    const uint64_t sideRow = uint64_t{conv.sideStride} * sizeof(float);
+    const uint64_t taps = uint64_t{SHORT_CONVOLUTION_TAPS};
+    if (conv.sideStride < keyWidth ||
+        (conv.headChannels && conv.lambdaOffset + keyWidth / conv.headChannels * taps > conv.sideStride))
+      throw std::invalid_argument("a convolving prepare's side rows do not hold its inputs and taps");
+    requireBytes(conv.keySide, uint64_t{rows.rows - 1} * sideRow + keyWidth * sizeof(float), "attention key side");
+    requireBytes(conv.valueSide, uint64_t{rows.rows - 1} * sideRow + keyWidth * sizeof(float),
+                 "attention value side");
+    requireBytes(conv.keyTaps, keyWidth * taps * sizeof(float), "key convolution taps");
+    requireBytes(conv.valueTaps, keyWidth * taps * sizeof(float), "value convolution taps");
+    const uint64_t historyBytes =
+        (uint64_t{SHORT_CONVOLUTION_HISTORY - 1} * conv.historyStride + conv.valueOffset + keyWidth) * 2;
+    for (const metal::MetalBuffer &history : conv.histories) requireBytes(history, historyBytes, "key and value history");
+    requireBytes(conv.tape,
+                 (uint64_t{rows.rows - 1} * conv.tapeStride + conv.valueOffset + keyWidth) * 2,
+                 "key and value tape");
+    requireBytes(inputs.queryScale, uint64_t{queryHeads} * layout.headDimension * sizeof(float),
+                 "attention query scale");
+    requireBytes(inputs.relativeScale, uint64_t{queryHeads} * kRelativeWidth * sizeof(float),
+                 "attention relative scale");
+    requireBytes(states, relativeStateBytes(rows.rows, queryHeads), "attention relative states");
+    requireQueries(queries, command, queryHeads / layout.kvHeads, layout, command.last.chunk_tokens);
+    for (size_t s = 0; s < sequences.size(); ++s) requirePageTable(pageTables[s], sequences[s]);
+    std::vector<metal::MetalBuffer> bindings{inputs.querySide,    conv.keySide, conv.valueSide,
+                                             inputs.queryScale,   inputs.relativeScale, std::move(queries),
+                                             std::move(states)};
+    // A lane past the step's binds lane 0's page table and history, which it never reads.
+    for (size_t s = 0; s < SPLASH_MAXIMUM_BATCH_WIDTH; ++s)
+      bindings.push_back(pageTables[s < pageTables.size() ? s : 0]);
+    bindings.insert(bindings.end(), {rows.tree, rows.layout, conv.keyTaps, conv.valueTaps});
+    for (size_t s = 0; s < SPLASH_MAXIMUM_BATCH_WIDTH; ++s)
+      bindings.push_back(conv.histories[s < conv.histories.size() ? s : 0]);
+    bindings.push_back(conv.tape);
+    const SplashRelativeConvolutionParams params{
+        everyRow(sequences, command, rows, layer),
+        {conv.sideStride, conv.lambdaOffset, conv.headChannels, conv.historyStride,
+         conv.tapeStride, conv.valueOffset, conv.scale, 0}};
+    graph.add(kernelName(kernelFormat(layout) + "_qkv_conv", std::string(kernel.suffix) +
+                                                                 (variant.positionScaled ? "_scaled" : "")),
+              std::move(bindings), params,
+              rowGroups(queryHeads + layout.kvHeads, command, sequences.size()), {layout.headDimension, 1, 1});
+    return;
+  }
   const CommandRows command = commandRows(sequences, layout);
   if (pageTables.size() != sequences.size())
     throw std::invalid_argument("a q/k projection takes a page table per sequence");

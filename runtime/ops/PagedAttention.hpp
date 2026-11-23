@@ -137,6 +137,32 @@ struct RelativeProjection final {
   metal::MetalBuffer relativeScale;
 };
 
+// A verify step's key and value convolutions, which its relative prepare
+// computes itself from their sides, reading no keys or values of
+// RelativeProjection's (metal/abi/PagedAttention.h SplashRelativeConvolution):
+// the key and value sides' F32 rows, sideStride apart, with a dynamic
+// convolution's per-head taps at lambdaOffset of a row (heads of headChannels
+// channels, 0 for a static convolution); each convolution's F32 taps as
+// stored; each lane's BF16 history of the layer, rows historyStride apart, the
+// keys' channels first and the values' at valueOffset; the tape the step's
+// commit reads, rows tapeStride apart with the same channels; and the output
+// scale.
+struct RelativeConvolution final {
+  metal::MetalBuffer keySide;
+  metal::MetalBuffer valueSide;
+  uint32_t sideStride = 0;
+  uint32_t lambdaOffset = 0;
+  uint32_t headChannels = 0;
+  metal::MetalBuffer keyTaps;
+  metal::MetalBuffer valueTaps;
+  std::span<const metal::MetalBuffer> histories;
+  uint32_t historyStride = 0;
+  metal::MetalBuffer tape;
+  uint32_t tapeStride = 0;
+  uint32_t valueOffset = 0;
+  float scale = 0.0F;
+};
+
 // What a relative geometry's attention biases its scores by: its rows'
 // relative states, [packed row][query head][kRelativeWidth] F32, as the
 // prepare writes them, and the layer's table, kRelativeExtent rows of
@@ -369,12 +395,17 @@ public:
   // committed tokens plus its row, or with rows' tree plus its depth); and
   // each KV head's clipped key and RMS-normalized value stored in the pages
   // of `layer` through each sequence's page table (metal/abi/
-  // PagedAttention.h). The variant is unrotated.
+  // PagedAttention.h). The variant is unrotated. With a convolution, a
+  // verify step's (rows with their tree), the prepare convolves the keys and
+  // values from their sides itself (RelativeConvolution) and writes the
+  // tape, so that the step dispatches no convolution of its keys and
+  // values; inputs' keys and values are then not read.
   static void addRelativeProjection(metal::CommandGraph &graph, const RelativeProjection &inputs,
                                     metal::MetalBuffer queries, metal::MetalBuffer states, SplashKvLayer layer,
                                     std::span<const metal::MetalBuffer> pageTables,
                                     std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
-                                    uint32_t queryHeads, kv::Layout layout, AttentionVariant variant);
+                                    uint32_t queryHeads, kv::Layout layout, AttentionVariant variant,
+                                    const RelativeConvolution *convolution = nullptr);
   // The plan's dispatches over the staged queries into the out-projection's
   // input rows (`output`, AttentionOutputRows), which must not alias them,
   // each sequence reading its history where `histories` say: each reduce
