@@ -940,7 +940,14 @@ per height sped no Mac without slowing some model. The floors are fitted, not me
 search over every measured case's fastest split gave 6 and 10 for `saturating` (a lone chain
 measures 5.4 and 9 threadgroups' bytes) and 2 and 3 for `following` (one threadgroup per core
 past a full wave measures 2.7-3.5 of the tile's and 6-8.5 of the pair's); they stand in for what
-the law leaves out. Floors at the measured trailing waves take as much time in total on the
+the law leaves out. From 32 cores (`kApple10LargeProjection`) a unit of 6.25 bits per weight or
+more (Q6_K, Q8_0, MLX 6- and 8-bit, FP8), whose threadgroups each stream that many more bytes a
+step, saturates from four (`WaveLaw::wideSaturating`): on the 32-core M5 Max (macOS 27.0) four
+took up to 36% less time than six on every such projection of the 35B, the 27B and
+Inkling-2-Mini measured at 8 to 64 rows where their splits differ, and nowhere more, while
+narrower formats took up to 19% more at four and the 12-core M6 25% more on a Q8_0 projection at
+56 and 64 rows, so both keep six.
+Floors at the measured trailing waves take as much time in total on the
 sweeps but leave more cases slower. The law's totals on the sweeps (1.1%, 1.6% and 0.05% less
 time than the earlier rules on the M5 Max, the M5 Pro and the M6) are in-sample, the fit's own
 records; the ABBA decode runs and a 16-core emulation are the only out-of-sample checks, and the

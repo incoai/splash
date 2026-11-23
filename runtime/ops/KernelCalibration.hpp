@@ -55,6 +55,10 @@ struct WaveLaw final {
   // gguf_decode_<format>_m<rows>_gate_up: one simdgroup, 32 columns of each
   // tensor.
   StagedOccupancy gateUpPair;
+  // From wideBits16 sixteenths of a bit per weight `tile`'s first wave
+  // saturates from wideSaturating threadgroups per core, each streaming that
+  // many more bytes a step; a unit of unknown formats takes `tile`'s floor.
+  uint32_t wideBits16, wideSaturating;
   // `tile`'s residency at 16 rows, which decides only one unsplit lane's
   // height (sixteenRowLane).
   uint32_t sixteenRowResident;
@@ -171,13 +175,16 @@ inline constexpr std::span<const SplitTier> kApple9StagedTiers = std::span(kRegi
 inline constexpr WaveLaw kApple10StagedLaw{
     .tile = {10, 6, 2},
     .gateUpPair = {16, 10, 3},
+    .wideBits16 = 100,
+    .wideSaturating = 6,
     .sixteenRowResident = 9,
     .partitionInputs = 512,
     .maximumSplits = 8,
 };
 static_assert(kApple10StagedLaw.tile.resident >= kApple10StagedLaw.tile.saturating &&
+                  kApple10StagedLaw.tile.saturating >= kApple10StagedLaw.wideSaturating &&
                   kApple10StagedLaw.gateUpPair.resident >= kApple10StagedLaw.gateUpPair.saturating,
-              "a full wave streams at DRAM's rate");
+              "a full wave streams at DRAM's rate, a wider unit's from fewer threadgroups");
 
 // Apple9 decodes on the register tile but for a unit the staged tile holds
 // unpadded whose quantized segments are all GridLookup, or Q2_K from two
@@ -281,6 +288,30 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .prefillInt8 = true,
 };
 
+// From 32 cores (the 32-core M5 Max) the staged tile's first wave of a unit of
+// 6.25 bits per weight or more (Q6_K, Q8_0, MLX 6- and 8-bit, FP8) saturates
+// from four threadgroups per core. On 28 projections of the 35B, the 27B and
+// Inkling-2-Mini in ten formats at 8 to 64 rows (macOS 27.0), four took up to
+// 36% less time than six where their splits differ (the 35B's 2048 x 4096 Q8_0
+// output projection on four partitions rather than eight, 18-36% less at 16 to
+// 64 rows, the same shape in MLX 8-bit 16-32% less at 16 to 64 and in Q6_K
+// 12-28% at 16 to 48; its fused Q8_0 attention input on one rather than two,
+// 12-36% less at 8 to 32 rows; Inkling's fused Q8_0 attention input, 16-24%
+// less at 8 and 16; Q6_K at 5120 x 6144, 11-21% less at 8 to 48), and nowhere
+// more. Narrower formats keep six: four took up to 19% more there (the IQ4_NL,
+// MXFP4, MLX 4-bit, Q4_K, IQ4_XS and NVFP4 down projections of 5120 x 17408 at
+// 8 and 16 rows), and the 12-core M6 keeps six, where four took 25% more on
+// Inkling's 3072 x 2304 Q8_0 projections at 56 and 64 rows. The 40-core M5 Max,
+// unmeasured, takes the 32-core one's.
+inline constexpr uint32_t kApple10LargeGpuCores = 32;
+inline constexpr ProjectionCalibration kApple10LargeProjection = [] {
+  ProjectionCalibration row = kApple10Projection;
+  WaveLaw law = kApple10StagedLaw;
+  law.wideSaturating = 4;
+  row.stagedSplits = law;
+  return row;
+}();
+
 // Apple11 takes Apple10's row but for the 16-row lane from 4.5 bits: the M6's
 // 16-row tile takes as long a wave as its 8-row tile there (5120-input Q4_K,
 // 12-core M6), so its lanes keep 8 rows; 16 took 10% more on the 27B
@@ -373,8 +404,11 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
                               : cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention;
   attention.cores = cores;
   if (gpu != GpuClass::Apple9)
-    return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
-            kApple10DenseTile, attention};
+    return {cores,
+            gpu == GpuClass::Apple11            ? kApple11Projection
+            : cores >= kApple10LargeGpuCores ? kApple10LargeProjection
+                                              : kApple10Projection,
+            kApple10FloatTile, kApple10DenseTile, attention};
   return {cores, kApple9Projection, kApple9FloatTile, kApple9DenseTile, attention};
 }
 

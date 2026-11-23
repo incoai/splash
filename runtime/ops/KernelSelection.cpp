@@ -85,16 +85,19 @@ uint64_t stagedTime(uint64_t groups, uint32_t steps, uint32_t splits, uint32_t r
 
 // The wave law's split of `rows` rows (a gate/up pair's two tensors when it
 // may run in one pass), and passes, of least time; ties keep fewer
-// partitions, then one pass. The law tells the pass modes apart only where a
-// last wave falls below its floor (the 27B pair's 17 one-pass threadgroups per
-// core on a 32-core M5 Max: the 17th runs a second wave alone, 333 us against
-// 245 in two passes). Elsewhere it ties, and one pass takes up to 22% less
-// time in 133 of the 152 tied cases measured. Below
+// partitions, then one pass. A `wide` unit's tile saturates from
+// law.wideSaturating threadgroups per core. The law tells the pass modes
+// apart only where a last wave falls below its floor (the 27B pair's 17
+// one-pass threadgroups per core on a 32-core M5 Max: the 17th runs a second
+// wave alone, 333 us against 245 in two passes). Elsewhere it ties, and one
+// pass takes up to 22% less time in 133 of the 152 tied cases measured. Below
 // ProjectionCalibration::onePassFromCores a pair runs two passes whatever the
 // law.
 SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16, uint32_t cores,
-                       Passes passes) {
+                       Passes passes, bool wide) {
   const uint32_t tileRows = stagedTileRows(rows);
+  StagedOccupancy tile = law.tile;
+  if (wide) tile.saturating = law.wideSaturating;
   SplitChoice best;
   uint64_t least = UINT64_MAX;
   for (uint32_t splits = 1; splits <= law.maximumSplits && (k / 32) % splits == 0 &&
@@ -109,7 +112,7 @@ SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows
     if (passes != Passes::One) {
       // A pair's two passes take twice one tensor's time.
       const uint64_t time =
-          (passes == Passes::Either ? 2 : 1) * stagedTime(tiles, steps, splits, tileRows, bits16, cores, law.tile);
+          (passes == Passes::Either ? 2 : 1) * stagedTime(tiles, steps, splits, tileRows, bits16, cores, tile);
       if (time < least) least = time, best = {splits, false};
     }
   }
@@ -284,7 +287,8 @@ UnitFormats unitFormats(const ProjectionShape &shape) noexcept {
 SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16, uint32_t cores,
                       Passes passes) noexcept {
   if (const TierLaw *tiers = std::get_if<TierLaw>(&law)) return {tierSplits(n, k, cores, tiers->tiers), false};
-  return waveSplits(std::get<WaveLaw>(law), n, k, rows, bits16 ? bits16 : kMostWeightBits16, cores, passes);
+  const WaveLaw &wave = std::get<WaveLaw>(law);
+  return waveSplits(wave, n, k, rows, bits16 ? bits16 : kMostWeightBits16, cores, passes, bits16 >= wave.wideBits16);
 }
 
 // The configuration in bf16 activations (bf16Projection), then with int8
@@ -308,9 +312,11 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
 // The plan of the shape's flags; where the register tile may run (it runs a
 // unit of FourBitsOrMore), a unit of other formats or one it does not take
 // stages, of the most bits per weight, whose partials weigh least against the
-// weights: the most K partitions of each pass mode, since the law's split
-// never falls with the bits per weight and never rises with the rows (a
-// split's partials grow with its rows alone, the same in either pass mode);
+// weights, at the tile's floor, which a wide unit's lowers: the most K
+// partitions of each pass mode, since at one floor the law's split never
+// falls with the bits per weight, never falls as the floor rises and never
+// rises with the rows (a split's partials grow with its rows alone, the same
+// in either pass mode);
 // and a gate/up pair of one format in one pass where it may and the one-pass
 // tile holds its rows. With int8 activations on, a unit the int8 decode tiles
 // take also has each staged configuration's int8 form where decodeInt8 takes
