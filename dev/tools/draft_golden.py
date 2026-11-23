@@ -70,7 +70,7 @@ def softcap(values, cap):
     )
 
 
-def grade(lattice: dict, ref: dict, block: int, cap: float, tokens: int) -> dict:
+def grade(lattice: dict, ref: dict, block: int, cap: float, vocabulary: int) -> dict:
     ids = np.array(lattice["candidates"]).reshape(POSITIONS, CANDIDATES)
     unary = np.array(lattice["unary"], np.float64).reshape(POSITIONS, CANDIDATES)
     edges = np.array(lattice["edges"], np.float64).reshape(
@@ -79,7 +79,7 @@ def grade(lattice: dict, ref: dict, block: int, cap: float, tokens: int) -> dict
     ref_ids, ref_unary = ref["logits_topk_ids"][block], ref["logits_topk_values"][block]
     top24_ids, top24 = ref["logits_top24_ids"][block], ref["logits_top24_values"][block]
     failures = []
-    if (ids >= tokens).any():
+    if (ids >= vocabulary).any():
         failures.append("a candidate past the head's tokens")
     worst_logit = worst_rms = worst_capped = 0.0
     equal_sets = []
@@ -165,7 +165,11 @@ def target_tokens(model_root: Path, flash: dict) -> int:
         return int(flash["valid_vocab_size"])
     config = json.loads((model_root / "config.json").read_text())
     text = config.get("text_config", config)
-    return int(text.get("unpadded_vocab_size", text["vocab_size"]))
+    return int(
+        text["unpadded_vocab_size"]
+        if "unpadded_vocab_size" in text
+        else text["vocab_size"]
+    )
 
 
 def main() -> int:
@@ -185,16 +189,15 @@ def main() -> int:
         "dflash_config"
     ]
     cap = float(flash.get("final_logit_softcapping", 0.0))
-    tokens = target_tokens(args.model_root, flash)
+    vocabulary = target_tokens(args.model_root, flash)
     manifest = json.loads((args.golden / "manifest.json").read_text())
     args.work.mkdir(parents=True, exist_ok=True)
     prefix = args.set + "." if args.set else ""
     failed = 0
     for name, entry in manifest["prompts"].items():
         golden = read_safetensors(args.golden / entry["file"])
-        tokens = golden["tokens"].astype("<u4")
-        tokens_file = args.work / f"{name}.u32"
-        tokens.tofile(tokens_file)
+        prompt_file = args.work / f"{name}.u32"
+        golden["tokens"].astype("<u4").tofile(prompt_file)
         ref = {
             key[len(prefix) :]: value
             for key, value in golden.items()
@@ -209,7 +212,7 @@ def main() -> int:
                 args.teacher_logits,
                 args.metallib,
                 str(args.model_root),
-                str(tokens_file),
+                str(prompt_file),
                 str(out),
                 "--window",
                 f"{anchor + 8}:8",
@@ -232,7 +235,7 @@ def main() -> int:
             lattice = json.loads(
                 (args.work / f"{name}-{anchor + 8}.draft.json").read_text()
             )
-            result = grade(lattice, ref, block, cap, tokens)
+            result = grade(lattice, ref, block, cap, vocabulary)
             graded, equal, skipped = result["proposals"]
             print(
                 f"{'FAIL ' if result['failures'] else ''}{name} block {block} (anchor {anchor}): "
