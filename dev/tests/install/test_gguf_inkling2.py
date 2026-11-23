@@ -1,11 +1,13 @@
 """Inkling 2's GGUFs (general.architecture inkling2_loop): the configuration
 and tokenizer the installer derives from a header like
 unsloth/Inkling-2-Mini-GGUF's Mainline_Support/Inkling-2-Mini-UD-Q4_K_M
-file (revision ae9327c5fbc7333116ba32eee78bb5d2bbefae4f). Its architecture
-metadata and its tensor table, read from the file's header, are fixtures
-(dev/tests/fixtures/model-configs/inkling-2-mini), and so are the
-config.json and the chat template of the release it was made from,
-thinkingmachines/Inkling-2-Mini (revision
+file (revision ae9327c5fbc7333116ba32eee78bb5d2bbefae4f), and from one in
+Unsloth's own layout (inkling2), its root Inkling-2-Mini-UD-Q4_K_M.gguf
+(revision 45fd08764f2b0bf16b03a5483a80e5c7aaec8772). Their architecture
+metadata and tensor tables, read from the files' headers, are fixtures
+(dev/tests/fixtures/model-configs/inkling-2-mini, gguf-*-inkling2.json
+Unsloth's layout), and so are the config.json and the chat template of the
+release they were made from, thinkingmachines/Inkling-2-Mini (revision
 b85c3cfa615fc413cc9af3379f491b963f3b586a), which the header's
 tokenizer.chat_template holds byte for byte."""
 
@@ -73,15 +75,19 @@ GENERIC = {
     "num_experts": "n_routed_experts",
 }
 LOOP_BOUNDS = "inkling2_loop.loop.start, inkling2_loop.loop.end"
+# Unsloth's layout: its architecture metadata, and its loop's bounds.
+UNSLOTH_METADATA = "gguf-metadata-inkling2.json"
+UNSLOTH_LOOP_BOUNDS = "inkling2.loop.core_start, inkling2.loop.core_end"
 
 
-def header_values():
-    """The header's metadata: the fixture's architecture metadata and a
-    tokenizer of Inkling 2's 200058 tokens, its added tokens at their IDs.
-    The vocabulary holds "abc" whole, which no merge makes."""
+def header_values(metadata="gguf-metadata.json"):
+    """The header's metadata: the fixture's architecture metadata (of
+    llama.cpp's converter's layout, or `metadata`) and a tokenizer of Inkling
+    2's 200058 tokens, its added tokens at their IDs. The vocabulary holds
+    "abc" whole, which no merge makes."""
     tokens = sorted(pre_tokenizers.ByteLevel.alphabet()) + ["ab", "abc"]
     tokens += [f"[base{index}]" for index in range(BASE - len(tokens))]
-    return json.loads((FIXTURES / "gguf-metadata.json").read_text()) | {
+    return json.loads((FIXTURES / metadata).read_text()) | {
         "tokenizer.ggml.model": "gpt2",
         "tokenizer.ggml.pre": "inkling2",
         "tokenizer.ggml.tokens": tokens + ADDED,
@@ -294,6 +300,79 @@ class Inkling2GgufTests(unittest.TestCase):
                     values[key] = value
                 with self.assertRaisesRegex(models.ModelError, reason):
                     gguf.model_config(self.metadata(values))
+
+    def test_unsloth_s_layout_derives_the_same_config(self):
+        # Unsloth's layout states its layer counts and arrays per layer
+        # application (48: the loop's twelve layers three times), its loop by
+        # other keys and no loop.varying, over the same tensors: the config is
+        # the converter's layout's.
+        values = header_values(UNSLOTH_METADATA)
+        self.assertEqual(values["inkling2.block_count"], 48)
+        self.assertEqual(
+            gguf.model_config(self.metadata(values)),
+            gguf.model_config(self.metadata()),
+        )
+
+    def test_unsloth_s_layout_maps_applications_to_weight_layers(self):
+        # Two passes of layers 4-19 of 24: 40 applications. A weight layer past
+        # the loop reads its application's value (layer 20's at 36), and the
+        # loop's from its first pass.
+        values = header_values(UNSLOTH_METADATA)
+        weight = [layer % 4 != 3 for layer in range(LAYERS)]
+        applications = weight[:20] + weight[4:]
+        applications[36] = False
+        values |= {
+            "inkling2.block_count": 40,
+            "inkling2.attention.sliding_window_pattern": applications,
+            "inkling2.attention.head_count": [16] * 40,
+            "inkling2.attention.head_count_kv": [4] * 40,
+            "inkling2.loop.core_start": 4,
+            "inkling2.loop.core_end": 20,
+            "inkling2.num_loops": 2,
+        }
+        text = gguf.model_config(self.metadata(values))["text_config"]
+        weight[20] = False
+        self.assertEqual(
+            text["local_layer_ids"],
+            [layer for layer, slides in enumerate(weight) if slides],
+        )
+        self.assertEqual(
+            (
+                text["num_hidden_layers"],
+                text["num_attention_heads"],
+                text["swa_num_key_value_heads"],
+                text["loop_config"],
+            ),
+            (
+                LAYERS,
+                16,
+                4,
+                {
+                    "core_start": 4,
+                    "core_end": 20,
+                    "num_passes": 2,
+                    "gate_rank": 64,
+                    "is_varloop": False,
+                },
+            ),
+        )
+        for key, value, reason in (
+            ("inkling2.loop.core_end", 30, UNSLOTH_LOOP_BOUNDS),
+            ("inkling2.num_loops", None, "inkling2.num_loops"),
+            (
+                "inkling2.attention.sliding_window_pattern",
+                applications[:-1],
+                "inkling2.attention.sliding_window_pattern",
+            ),
+        ):
+            with self.subTest(key=key, value=value):
+                changed = dict(values)
+                if value is None:
+                    del changed[key]
+                else:
+                    changed[key] = value
+                with self.assertRaisesRegex(models.ModelError, reason):
+                    gguf.model_config(self.metadata(changed))
 
     def test_the_derived_tokenizer_is_inkling_2_s(self):
         files = gguf.tokenizer_files(self.metadata())

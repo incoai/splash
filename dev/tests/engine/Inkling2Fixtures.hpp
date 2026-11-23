@@ -16,6 +16,8 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace gguf_fixtures {
@@ -200,9 +202,13 @@ inline std::vector<Tensor> inkling2Tensors(const model::Inkling2LoopLayout &g, u
 
 // The header's keys of a GGUF of an inkling2_loop layout, as the converter
 // writes them: the head counts one per weight layer, no RoPE, its sliding
-// layers a bool each.
-inline std::vector<test_gguf::Key> inkling2Metadata(const model::Inkling2LoopLayout &g) {
-  const std::string arch(model::Inkling2LoopLayout::ggufArchitecture);
+// layers a bool each. With `unsloth`, as Unsloth's own layout states them
+// (inkling2): its layer count, head counts and sliding layers per layer
+// application, its loop by core_start, core_end and num_loops, and no
+// loop.varying.
+inline std::vector<test_gguf::Key> inkling2Metadata(const model::Inkling2LoopLayout &g, bool unsloth = false) {
+  const std::string arch = unsloth ? "inkling2" : std::string(model::Inkling2LoopLayout::ggufArchitecture);
+  const uint32_t layers = unsloth ? g.layers : g.weightLayers;
   std::vector<test_gguf::Key> keys{test_gguf::stringKey("general.architecture", arch)};
   const auto key = [&](const char *name, uint32_t value) {
     keys.push_back(test_gguf::uint32Key(arch + "." + name, value));
@@ -210,15 +216,15 @@ inline std::vector<test_gguf::Key> inkling2Metadata(const model::Inkling2LoopLay
   const auto real = [&](const char *name, float value) {
     keys.push_back(test_gguf::float32Key(arch + "." + name, value));
   };
-  key("block_count", g.weightLayers);
+  key("block_count", layers);
   key("context_length", g.modelContextTokens);
   key("embedding_length", g.hiddenSize);
   key("vocab_size", g.vocabularySize);
   key("vocab_size_unpadded", g.vocabularyTokens);
   keys.push_back(test_gguf::int32ArrayKey(arch + ".attention.head_count",
-                                          std::vector<int32_t>(g.weightLayers, int32_t(g.attentionQueryHeads))));
+                                          std::vector<int32_t>(layers, int32_t(g.attentionQueryHeads))));
   keys.push_back(test_gguf::int32ArrayKey(arch + ".attention.head_count_kv",
-                                          std::vector<int32_t>(g.weightLayers, int32_t(g.attentionKvHeads))));
+                                          std::vector<int32_t>(layers, int32_t(g.attentionKvHeads))));
   for (const char *name : {"attention.key_length", "attention.value_length", "attention.key_length_swa",
                            "attention.value_length_swa"})
     key(name, g.attentionHeadDimension);
@@ -226,7 +232,8 @@ inline std::vector<test_gguf::Key> inkling2Metadata(const model::Inkling2LoopLay
   real("attention.layer_norm_rms_epsilon", 1e-6F);
   key("attention.sliding_window", g.slidingWindow);
   std::vector<bool> sliding;
-  for (uint32_t layer = 0; layer < g.weightLayers; ++layer) sliding.push_back(g.slides(layer));
+  for (uint32_t layer = 0; layer < layers; ++layer)
+    sliding.push_back(unsloth ? !g.schedule().full(layer) : g.slides(layer));
   keys.push_back(test_gguf::boolArrayKey(arch + ".attention.sliding_window_pattern", sliding));
   key("attention.relative_length", g.relativeRank);
   key("attention.relative_extent", g.relativeExtent);
@@ -236,11 +243,11 @@ inline std::vector<test_gguf::Key> inkling2Metadata(const model::Inkling2LoopLay
   real("attention.log_scale_alpha", g.logScalingAlpha);
   key("shortconv.l_cache", g.convolutionTaps);
   key("attn_res.block_size", g.blockResidualPeriod);
-  key("loop.start", g.loopFirstLayer);
-  key("loop.end", g.loopEndLayer);
-  key("loop.count", g.loopPasses);
+  key(unsloth ? "loop.core_start" : "loop.start", g.loopFirstLayer);
+  key(unsloth ? "loop.core_end" : "loop.end", g.loopEndLayer);
+  key(unsloth ? "num_loops" : "loop.count", g.loopPasses);
   key("loop.gate_rank", g.loopGateRank);
-  keys.push_back(test_gguf::boolKey(arch + ".loop.varying", false));
+  if (!unsloth) keys.push_back(test_gguf::boolKey(arch + ".loop.varying", false));
   real("activation.situ_beta", g.expertGateSoftcap);
   real("activation.situ_linear_beta", g.expertUpSoftcap);
   real("final_logit_softcapping", g.logitSoftcap);
@@ -281,6 +288,39 @@ inline model::Inkling2LoopLayout inkling2EngineLayout() {
   g.expertsPerToken = 8;
   g.expertIntermediateSize = 320;
   return g;
+}
+
+// The converter's tensors (inkling2Tensors) in Unsloth's own layout, as its
+// own converter writes them: a loop layer's message gates by the input they
+// gate (loop_attn_, loop_k_, loop_v_ and loop_mlp_ for loop_q_ctrl_ to
+// loop_ffn_ctrl_), and every loop layer's message queries (q, k, v, FFN) in
+// two tensors of them all, in layer order: loop_res_query of each layer's q
+// and FFN rows, loop_kv_res_query of its k and v rows.
+inline std::vector<Tensor> unslothInkling2Tensors(const model::Inkling2LoopLayout &g, std::vector<Tensor> tensors) {
+  const uint64_t hidden = g.hiddenSize, rowBytes = hidden * sizeof(float);
+  const uint64_t loopLayers = g.loopEndLayer - g.loopFirstLayer;
+  Tensor queries{"loop_res_query.weight", {hidden, 2 * loopLayers}, model::ggml::kF32, {}};
+  Tensor kvQueries{"loop_kv_res_query.weight", {hidden, 2 * loopLayers}, model::ggml::kF32, {}};
+  std::vector<Tensor> unsloth;
+  for (Tensor &tensor : tensors) {
+    if (tensor.name.ends_with(".loop_msg_query.weight")) {
+      // Rows q, k, v, FFN.
+      const auto row = [&](uint64_t r) { return tensor.data.begin() + int64_t(r * rowBytes); };
+      queries.data.insert(queries.data.end(), row(0), row(1));
+      queries.data.insert(queries.data.end(), row(3), row(4));
+      kvQueries.data.insert(kvQueries.data.end(), row(1), row(3));
+      continue;
+    }
+    for (const auto &[converter, own] :
+         {std::pair{"loop_q_ctrl_", "loop_attn_"}, std::pair{"loop_k_ctrl_", "loop_k_"},
+          std::pair{"loop_v_ctrl_", "loop_v_"}, std::pair{"loop_ffn_ctrl_", "loop_mlp_"}})
+      if (const size_t at = tensor.name.find(converter); at != std::string::npos)
+        tensor.name.replace(at, std::string_view(converter).size(), own);
+    unsloth.push_back(std::move(tensor));
+  }
+  unsloth.push_back(std::move(queries));
+  unsloth.push_back(std::move(kvQueries));
+  return unsloth;
 }
 
 // Writes a GGUF of an inkling2_loop layout of seeded values (inkling2Tensors).

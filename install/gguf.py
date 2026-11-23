@@ -533,19 +533,34 @@ def flint_text_config(metadata, arch):
     }
 
 
+# The loop's keys in each of Inkling 2's GGUF layouts: its first layer, the
+# layer past its last and its passes. llama.cpp's converter writes
+# inkling2_loop; Unsloth's own layout (inkling2, the root files of
+# unsloth/Inkling-2-Mini-GGUF) holds the same tensors of its weight layers
+# but states its layer counts and arrays per layer application, the loop's
+# layers once a pass, and no loop.varying (its passes are every token's).
+INKLING2_LOOP_KEYS = {
+    "inkling2_loop": ("loop.start", "loop.end", "loop.count"),
+    "inkling2": ("loop.core_start", "loop.core_end", "num_loops"),
+}
+
+
 def inkling2_text_config(metadata, arch):
     """What Inkling 2's text_config states beyond the sizes every
-    architecture's does, by its release's keys, from its header: its window
-    (model_max_length), its vocabulary padded to the token table's rows
-    (vocab_size) and its tokens (unpadded_vocab_size, the tokenizer's), the
-    relative bias's width and reach, the log scaling of its full layers'
+    architecture's does, by its release's keys, from its header of either
+    layout (INKLING2_LOOP_KEYS): its weight layers (num_hidden_layers, the
+    applications less the loop's later passes in Unsloth's layout), its
+    window (model_max_length), its vocabulary padded to the token table's
+    rows (vocab_size) and its tokens (unpadded_vocab_size, the tokenizer's),
+    the relative bias's width and reach, the log scaling of its full layers'
     queries, its RMS epsilon, its query, key and bias clips, the layers that
-    slide (local_layer_ids, from attention.sliding_window_pattern) and their
-    window and heads, its short convolutions' taps, its block mixes' layers,
-    the logits' and its experts' softcaps, the experts each token takes,
-    their width and how their weights scale, its loop (loop_config), and the
-    token that ends a turn, which its release states beside text_config.
-    The engine's model check holds each to the family's."""
+    slide (local_layer_ids, from attention.sliding_window_pattern, of each
+    weight layer's first application) and their window and heads, its short
+    convolutions' taps, its block mixes' layers, the logits' and its
+    experts' softcaps, the experts each token takes, their width and how
+    their weights scale, its loop (loop_config), and the token that ends a
+    turn, which its release states beside text_config. The engine's model
+    check holds each to the family's."""
 
     def key(name):
         return f"{arch}.{name}"
@@ -557,21 +572,27 @@ def inkling2_text_config(metadata, arch):
     padded = metadata.positive(key("vocab_size"))
     if padded < unpadded:
         raise ModelError("invalid GGUF metadata: " + key("vocab_size"))
-    sliding = [
-        layer
-        for layer, slides in enumerate(
-            layer_pattern(metadata, arch, "attention.sliding_window_pattern")
-        )
-        if slides
-    ]
     # Layers [core_start, core_end) run num_passes times.
-    start = metadata.require(key("loop.start"), int)
-    end = metadata.positive(key("loop.end"))
-    if not 0 <= start < end <= loaded_layers(metadata, arch):
-        raise ModelError(
-            f"invalid GGUF metadata: {key('loop.start')}, {key('loop.end')}"
-        )
+    start_key, end_key, passes_key = INKLING2_LOOP_KEYS[arch]
+    start = metadata.require(key(start_key), int)
+    end = metadata.positive(key(end_key))
+    passes = metadata.positive(key(passes_key))
+    applications = loaded_layers(metadata, arch)
+    # The applications past the loop's first pass, which Unsloth's layout counts.
+    repeated = (passes - 1) * (end - start) if arch == "inkling2" else 0
+    layers = applications - repeated
+    if not 0 <= start < end <= layers:
+        raise ModelError(f"invalid GGUF metadata: {key(start_key)}, {key(end_key)}")
+
+    def application(layer):
+        """A weight layer's first application in the header's arrays."""
+        return layer + repeated if layer >= end else layer
+
+    pattern = layer_pattern(metadata, arch, "attention.sliding_window_pattern")
+    sliding = [layer for layer in range(layers) if pattern[application(layer)]]
+    sliding_applications = [application(layer) for layer in sliding]
     return {
+        "num_hidden_layers": layers,
         "model_max_length": metadata.positive(key("context_length")),
         "vocab_size": padded,
         "unpadded_vocab_size": unpadded,
@@ -586,10 +607,10 @@ def inkling2_text_config(metadata, arch):
         "sliding_window_size": metadata.positive(key("attention.sliding_window")),
         "swa_head_dim": metadata.positive(key("attention.key_length_swa")),
         "swa_num_attention_heads": layer_size(
-            metadata, arch, "attention.head_count", sliding
+            metadata, arch, "attention.head_count", sliding_applications
         ),
         "swa_num_key_value_heads": layer_size(
-            metadata, arch, "attention.head_count_kv", sliding
+            metadata, arch, "attention.head_count_kv", sliding_applications
         ),
         "sconv_kernel_size": metadata.positive(key("shortconv.l_cache")),
         "n_layers_per_attn_res_block": metadata.positive(key("attn_res.block_size")),
@@ -604,9 +625,10 @@ def inkling2_text_config(metadata, arch):
         "loop_config": {
             "core_start": start,
             "core_end": end,
-            "num_passes": metadata.positive(key("loop.count")),
+            "num_passes": passes,
             "gate_rank": metadata.positive(key("loop.gate_rank")),
-            "is_varloop": metadata.require(key("loop.varying"), bool),
+            "is_varloop": arch != "inkling2"
+            and metadata.require(key("loop.varying"), bool),
         },
         "eos_token_id": metadata.require("tokenizer.ggml.eos_token_id", int),
     }
@@ -747,6 +769,9 @@ ARCHITECTURES = {
         flat=True,
     ),
     "inkling2_loop": Architecture(
+        "inkling2_loop_text", moe=True, text_config=inkling2_text_config
+    ),
+    "inkling2": Architecture(
         "inkling2_loop_text", moe=True, text_config=inkling2_text_config
     ),
 }

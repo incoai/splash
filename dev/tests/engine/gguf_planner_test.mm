@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <tuple>
 #include <utility>
 
@@ -1154,6 +1155,60 @@ model::Inkling2LoopLayout inkling2Layout() {
   return g;
 }
 
+// The bytes a copy's or a repack's source rows hold in their file: its rows
+// as stored (NVFP4's or a float's that the writer converts) and its tensor
+// scale's values.
+std::vector<uint8_t> sourceBytes(const model::gguf::TensorRows &rows) {
+  const uint64_t stored = rows.ggufNvfp4RowBytes ? rows.ggufNvfp4RowBytes
+                          : rows.ggufFloatRowBytes ? rows.ggufFloatRowBytes
+                                                   : rows.rowBytes;
+  std::vector<uint8_t> bytes(rows.rows * stored + rows.scale.bytes);
+  rows.file->readData(rows.offset + rows.first * stored, std::span(bytes).first(rows.rows * stored));
+  if (rows.scale.bytes)
+    rows.scale.file->readData(rows.scale.offset, std::span(bytes).subspan(rows.rows * stored));
+  return bytes;
+}
+// Whether two plans write the same images: the same sections and fills, the
+// same bytes copied to each place, converted alike (copies as stored compared
+// by the bytes they write, however many copies write them), and the same
+// repacks of sources reading the same bytes.
+bool samePlannedImages(const std::vector<model::gguf::Image> &left, const std::vector<model::gguf::Image> &right) {
+  // Each copy's source bytes at its destination, and its conversion there.
+  const auto copied = [](const model::gguf::Image &image) {
+    std::pair<std::vector<uint8_t>, std::map<uint64_t, model::gguf::Conversion>> result{
+        std::vector<uint8_t>(image.bytes), {}};
+    for (const model::gguf::Fill &fill : image.fills)
+      std::copy(fill.bytes.begin(), fill.bytes.end(), result.first.begin() + int64_t(fill.offset));
+    for (const model::gguf::Copy &copy : image.copies) {
+      const std::vector<uint8_t> bytes = sourceBytes(copy.source);
+      std::copy(bytes.begin(), bytes.end(), result.first.begin() + int64_t(copy.destination));
+      if (copy.conversion != model::gguf::Conversion::None) result.second[copy.destination] = copy.conversion;
+    }
+    return result;
+  };
+  const auto sameRows = [](const model::gguf::TensorRows &a, const model::gguf::TensorRows &b) {
+    return a.type == b.type && a.rows == b.rows && a.rowBytes == b.rowBytes && a.order.from == b.order.from &&
+           a.windows == b.windows && a.window == b.window && a.scale.rowsPerValue == b.scale.rowsPerValue &&
+           sourceBytes(a) == sourceBytes(b);
+  };
+  if (left.size() != right.size()) return false;
+  for (size_t index = 0; index < left.size(); ++index) {
+    const model::gguf::Image &a = left[index], &b = right[index];
+    if (a.name != b.name || a.layer != b.layer || a.type != b.type || a.bytes != b.bytes ||
+        a.residentBytes != b.residentBytes || a.repacks.size() != b.repacks.size() || copied(a) != copied(b))
+      return false;
+    for (size_t i = 0; i < a.repacks.size(); ++i) {
+      const model::gguf::Repack &x = a.repacks[i], &y = b.repacks[i];
+      if (x.format != y.format || x.rows != y.rows || x.columns != y.columns || x.plane0 != y.plane0 ||
+          x.plane1 != y.plane1 || x.meta != y.meta || x.sources.size() != y.sources.size())
+        return false;
+      for (size_t source = 0; source < x.sources.size(); ++source)
+        if (!sameRows(x.sources[source], y.sources[source])) return false;
+    }
+  }
+  return true;
+}
+
 // Inkling-2-Mini's GGUF plans an image per weight layer (not per
 // application), then the head's and the embedding's: each layer's queries,
 // gate and relative scores beside its BF16 sink projection as stored, a full
@@ -1284,6 +1339,41 @@ void checkInkling2(const std::filesystem::path &directory) {
                     test_gguf::Bytes(g.hiddenSize * g.expertIntermediateSize / 32 * 34)});
   check(names(planned(inkling2Metadata(g), shared), {"ffn_gate_shexp.weight (unused) in 1 layer"}),
         "planner refuses a shared expert no section reads");
+
+  // Unsloth's own layout of the same tensors (inkling2): its images are the converter's, byte for byte, its
+  // message queries gathered from its two shared tensors; its metadata is held per application and by its own
+  // loop keys, and its converter's names are refused.
+  {
+    const std::vector<Tensor> unslothTensors = unslothInkling2Tensors(g, tensors);
+    const auto unslothPath = directory / "inkling2-unsloth.gguf";
+    splash::test::writeFile(path, test_gguf::file(inkling2Metadata(g), tensors));
+    splash::test::writeFile(unslothPath, test_gguf::file(inkling2Metadata(g, true), unslothTensors));
+    model::WeightSource converterSource(path), unslothSource(unslothPath);
+    const model::GgufFile converter(converterSource), unsloth(unslothSource);
+    for (const bool stream : {false, true})
+      check(samePlannedImages(model::ggufTargetPlan(g).images(converter, {.streamExperts = stream}),
+                              model::ggufTargetPlan(g).images(unsloth, {.streamExperts = stream})),
+            std::string("planner plans Unsloth's layout as the converter's") + (stream ? ", experts streamed" : ""));
+  }
+  const auto withUnslothKey = [&](const test_gguf::Key &replacement) {
+    std::vector<test_gguf::Key> keys = inkling2Metadata(g, true);
+    for (test_gguf::Key &key : keys)
+      if (key.name == replacement.name) key = replacement;
+    return keys;
+  };
+  const std::vector<Tensor> unslothTensors = unslothInkling2Tensors(g, tensors);
+  check(names(planned(withUnslothKey(test_gguf::uint32Key("inkling2.num_loops", 3)), unslothTensors),
+              {"num_loops 3 (expected 2)"}),
+        "planner names Unsloth's layout's other loop passes");
+  std::vector<bool> sliding(g.layers, true);
+  check(names(planned(withUnslothKey(test_gguf::boolArrayKey("inkling2.attention.sliding_window_pattern", sliding)),
+                      unslothTensors),
+              {"does not match the target: attention.sliding_window_pattern"}),
+        "planner holds Unsloth's layout's sliding layers per application");
+  check(names(planned(inkling2Metadata(g, true), tensors),
+              {"loop_attn_down.weight (missing)", "loop_q_ctrl_down.weight (unused)",
+               "loop_res_query.weight (missing)"}),
+        "planner reads Unsloth's layout by its own names");
 }
 
 // A family's Values section gathered from rows of other tensors

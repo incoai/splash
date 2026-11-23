@@ -25,6 +25,7 @@ from dev.tests.installer_fixtures import (
     FLINT,
     GGUF_CONFIGS,
     GGUF_ONLY,
+    INKLING,
     MODEL,
     MOE,
     PROCESSOR,
@@ -122,6 +123,26 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
+        # Inkling 2's GGUF in Unsloth's own layout (the root files of
+        # unsloth/Inkling-2-Mini-GGUF) names its family too.
+        unsloth = self.root / "inkling2" / "target"
+        unsloth.mkdir(parents=True)
+        write_target(
+            unsloth / "model.gguf",
+            fixture(family=INKLING, metadata="gguf-metadata-inkling2.json"),
+            tensor_table(INKLING, "gguf-tensors-inkling2.json"),
+        )
+        configs = CONFIGS / INKLING.name.lower()
+        self.assertIs(
+            upstream.check_model(
+                "gguf",
+                "none",
+                configs / "config.json",
+                gguf_headers=unsloth,
+                draft=configs / "draft" / "config.json",
+            ),
+            INKLING,
+        )
         flash = families.named("Qwen3.8-Flash-Next")
         configs = CONFIGS / flash.name.lower()
         gguf_check = headers(flash)

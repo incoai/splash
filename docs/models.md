@@ -240,10 +240,23 @@ keys; besides those, the sizes every family's configuration states
 (`max_position_embeddings`, `num_experts`) and `eos_token_id`, which the
 release states beside `text_config`. A float is the shortest decimal of the
 header's float32 (`1e-06`), as the release writes it.
-`unsloth/Inkling-2-Mini-GGUF` keeps these GGUFs in `Mainline_Support/` with
-the extension `.gguf_file`, which target selection does not read: such a file
-installs from a local copy named `.gguf` ([Local model
-files](#local-model-files)). An installation of one holds its draft,
+Unsloth's own layout of the same tensors (`inkling2`, the root files of
+`unsloth/Inkling-2-Mini-GGUF`, which `--model
+unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M` selects) states its layer counts, head
+counts and sliding layers per layer application (48: the loop's layers once a
+pass), its loop by `loop.core_start`, `loop.core_end` and `num_loops`, with no
+`loop.varying`; it names a loop layer's message gates by the input they gate
+(`loop_attn_`, `loop_k_`, `loop_v_` and `loop_mlp_` for llama.cpp's
+`loop_q_ctrl_` to `loop_ffn_ctrl_`) and keeps every loop layer's message
+queries in rows of two tensors of them all (`loop_res_query`, each layer's q
+and FFN rows; `loop_kv_res_query`, its k and v rows). Its configuration is
+derived by those keys (`num_hidden_layers` its weight layers, each layer's
+values its first application's), and the engine plans it as the converter's,
+into the same images (`Inkling2LoopGguf.cpp`). The repository keeps the
+converter's layout in `Mainline_Support/` with the extension `.gguf_file`,
+which target selection does not read: such a file installs from a local copy
+named `.gguf` ([Local model files](#local-model-files)). An installation of
+one holds its draft,
 `incoai-internal/Inkling-2-Mini-DFlash2`, an internal preview that installs
 with a Hub token that reads it or from a local copy (`--draft-model`,
 [Drafts](#drafts)), and serves text only ([Vision](#vision)). Its states are

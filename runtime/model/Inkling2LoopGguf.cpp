@@ -1,7 +1,8 @@
-// Inkling-2-Mini's GGUF plan (Inkling2LoopLayout's ggufTargetPlan): its
-// metadata checked key by key (gguf::MetadataCheck), and its images, a layer
-// image per weight layer, then the head's and the embedding's, which the
-// shared planner lays out from the tensors each holds (gguf::planTargetImages).
+// Inkling-2-Mini's GGUF plan (Inkling2LoopLayout's ggufTargetPlan), of
+// either layout of its GGUFs (GgufLayout): its metadata checked key by key
+// (gguf::MetadataCheck), and its images, a layer image per weight layer, then
+// the head's and the embedding's, which the shared planner lays out from the
+// tensors each holds (gguf::planTargetImages).
 
 #include "model/GgufImage.hpp"
 #include "model/GgufTarget.hpp"
@@ -16,9 +17,57 @@
 namespace splash::model {
 namespace {
 
-// The inputs a loop layer's message gates take, in the order of its message
-// queries, as its tensors name them (loop_{q,k,v,ffn}_ctrl_*).
-constexpr std::array<std::string_view, 4> kGateInputs{"q", "k", "v", "ffn"};
+// The two layouts of Inkling 2's GGUFs, of the same tensors of its weight
+// layers: llama.cpp's converter's (inkling2_loop,
+// Inkling2LoopLayout::ggufArchitecture), and Unsloth's own (inkling2, the
+// root files of unsloth/Inkling-2-Mini-GGUF), which states its layer counts
+// and per-layer arrays per layer application (`perApplication`), its loop by
+// other keys and no loop.varying, names a loop layer's message gates by the
+// input they gate (`gates`, in the order of its message queries: the q, k, v
+// and FFN inputs) and keeps every loop layer's message queries in rows of two
+// tensors of them all (messageQueries).
+struct GgufLayout final {
+  std::string_view architecture;
+  bool perApplication;
+  std::string_view loopStart, loopEnd, loopPasses;
+  std::array<std::string_view, 4> gates;
+};
+constexpr GgufLayout kConverterLayout{Inkling2LoopLayout::ggufArchitecture,
+                                      false,
+                                      "loop.start",
+                                      "loop.end",
+                                      "loop.count",
+                                      {"loop_q_ctrl_", "loop_k_ctrl_", "loop_v_ctrl_", "loop_ffn_ctrl_"}};
+constexpr GgufLayout kUnslothLayout{"inkling2",
+                                    true,
+                                    "loop.core_start",
+                                    "loop.core_end",
+                                    "num_loops",
+                                    {"loop_attn_", "loop_k_", "loop_v_", "loop_mlp_"}};
+
+// The layout of `file`, by its architecture; MetadataCheck refuses any other.
+const GgufLayout &ggufLayout(const GgufFile &file) {
+  return file.metadata().architecture() == kUnslothLayout.architecture ? kUnslothLayout : kConverterLayout;
+}
+
+// A loop layer's message queries, of its q, k, v and FFN inputs: the
+// converter's loop_msg_query of the four; or, in Unsloth's layout, a q and an
+// FFN row of loop_res_query and a k and a v row of loop_kv_res_query, two a
+// loop layer in its order.
+gguf::Section messageQueries(const Inkling2LoopLayout &layout, const GgufLayout &gguf, uint32_t index) {
+  const uint64_t rows = 4 * uint64_t{layout.hiddenSize};
+  const std::string name = "blk." + std::to_string(index) + ".loop_msg_query.weight";
+  if (!gguf.perApplication) return {gguf::Section::Kind::Values, name, rows};
+  const uint64_t q = 2 * uint64_t{index - layout.loopFirstLayer};
+  return {gguf::Section::Kind::Values,
+          name,
+          rows,
+          0,
+          {{"loop_res_query.weight", q, 1},
+           {"loop_kv_res_query.weight", q, 1},
+           {"loop_kv_res_query.weight", q + 1, 1},
+           {"loop_res_query.weight", q + 1, 1}}};
+}
 
 // llama.cpp's converter writes its header (inkling2_loop.*): the shared
 // sizes, the attention's head counts as one per weight layer
@@ -31,17 +80,23 @@ constexpr std::array<std::string_view, 4> kGateInputs{"q", "k", "v", "ffn"};
 // token: loop.varying false), the softcaps, the experts and their routing's
 // scale (expert_weights_scale), and the experts' width, which it also
 // writes as feed_forward_length (every FFN is a MoE). It writes no shared
-// expert's keys and no gating function. Every mismatch is named at once.
-void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout) {
-  gguf::MetadataCheck check(file, Inkling2LoopLayout::ggufArchitecture);
-  const uint32_t layers = layout.weightLayers;
-  // An array of a value per weight layer, each the layer's.
+// expert's keys and no gating function. Unsloth's layout states the same
+// under its own architecture but its layer count and arrays per application
+// and its loop's keys (GgufLayout). Every mismatch is named at once.
+void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout, const GgufLayout &gguf) {
+  gguf::MetadataCheck check(file, gguf.architecture);
+  const uint32_t layers = gguf.perApplication ? layout.layers : layout.weightLayers;
+  // An array of a value per layer (weight layer or application), each the layer's.
   const auto perLayer = [layers](auto value) {
     return [layers, value](std::span<const double> values) {
       bool matches = values.size() == layers;
       for (uint32_t layer = 0; matches && layer < layers; ++layer) matches = values[layer] == double(value(layer));
       return matches;
     };
+  };
+  // Whether a layer slides: a weight layer as it does, an application as its weight layer does.
+  const auto slides = [&](uint32_t layer) {
+    return gguf.perApplication ? !layout.schedule().full(layer) : layout.slides(layer);
   };
   check.expect("block_count", layers);
   check.expect("context_length", layout.modelContextTokens);
@@ -56,7 +111,7 @@ void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout) {
   check.expect("rope.dimension_count", 0);
   check.expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
   check.expect("attention.sliding_window", layout.slidingWindow);
-  check.expectArray("attention.sliding_window_pattern", perLayer([&](uint32_t layer) { return layout.slides(layer); }));
+  check.expectArray("attention.sliding_window_pattern", perLayer(slides));
   check.expect("attention.relative_length", layout.relativeRank);
   check.expect("attention.relative_extent", layout.relativeExtent);
   check.expectFloat("attention.relative_clip", layout.relativeClip);
@@ -65,11 +120,11 @@ void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout) {
   check.expectFloat("attention.log_scale_alpha", layout.logScalingAlpha);
   check.expect("shortconv.l_cache", layout.convolutionTaps);
   check.expect("attn_res.block_size", layout.blockResidualPeriod);
-  check.expect("loop.start", layout.loopFirstLayer);
-  check.expect("loop.end", layout.loopEndLayer);
-  check.expect("loop.count", layout.loopPasses);
+  check.expect(gguf.loopStart, layout.loopFirstLayer);
+  check.expect(gguf.loopEnd, layout.loopEndLayer);
+  check.expect(gguf.loopPasses, layout.loopPasses);
   check.expect("loop.gate_rank", layout.loopGateRank);
-  check.expect("loop.varying", 0);
+  if (!gguf.perApplication) check.expect("loop.varying", 0);
   check.expectFloat("activation.situ_beta", layout.expertGateSoftcap);
   check.expectFloat("activation.situ_linear_beta", layout.expertUpSoftcap);
   check.expectFloat("final_logit_softcapping", layout.logitSoftcap);
@@ -96,8 +151,8 @@ void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout) {
 // and up, ffn_gate_up_exps, each NVFP4 with an expert's F32 .scale in layers
 // 0-19), the router's bias (exp_probs_b) and the FFN output's convolution;
 // and in a loop layer its message queries and its q, k, v and FFN gates,
-// F32. The small F32 tensors as stored.
-std::vector<gguf::Section> layerImage(const Inkling2LoopLayout &layout, uint32_t index) {
+// F32, by the names of the file's layout. The small F32 tensors as stored.
+std::vector<gguf::Section> layerImage(const Inkling2LoopLayout &layout, const GgufLayout &gguf, uint32_t index) {
   using Kind = gguf::Section::Kind;
   const std::string p = "blk." + std::to_string(index) + ".";
   const uint64_t hidden = layout.hiddenSize, taps = layout.convolutionTaps, kvRows = layout.kvWidth();
@@ -135,9 +190,9 @@ std::vector<gguf::Section> layerImage(const Inkling2LoopLayout &layout, uint32_t
   add(Kind::Values, "exp_probs_b.bias", layout.experts);
   add(Kind::Values, "ffn_post_conv.weight", hidden * taps);
   if (!layout.schedule().isLoopLayer(index)) return sections;
-  add(Kind::Values, "loop_msg_query.weight", kGateInputs.size() * hidden);
-  for (const std::string_view input : kGateInputs) {
-    const std::string stem = "loop_" + std::string(input) + "_ctrl_";
+  sections.push_back(messageQueries(layout, gguf, index));
+  for (const std::string_view gate : gguf.gates) {
+    const std::string stem(gate);
     add(Kind::FloatTensor, stem + "down.weight", layout.loopGateRank, 2 * hidden);
     add(Kind::FloatTensor, stem + "forget.weight", hidden, layout.loopGateRank);
     add(Kind::FloatTensor, stem + "gain.weight", hidden, layout.loopGateRank);
@@ -161,10 +216,11 @@ GgufTargetPlan ggufTargetPlan(const Inkling2LoopLayout &layout) {
   return {.layerImages = layout.weightLayers,
           .firstMoeLayer = 0,
           .images = [layout](const GgufFile &file, gguf::PlanOptions options) {
-            requireMetadata(file, layout);
+            const GgufLayout &gguf = ggufLayout(file);
+            requireMetadata(file, layout, gguf);
             return gguf::planTargetImages(
                 file, layout, layout.weightLayers, options,
-                [&](uint32_t index) { return layerImage(layout, index); }, headImage(layout));
+                [&](uint32_t index) { return layerImage(layout, gguf, index); }, headImage(layout));
           }};
 }
 

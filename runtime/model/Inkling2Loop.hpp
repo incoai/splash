@@ -1,8 +1,9 @@
 #pragma once
 
-// Inkling-2-Mini (GGUF architecture inkling2_loop, text model type
-// inkling2_loop_text): a decoder of 24 weight layers that all attend, its
-// layers 6 to 17 looped three times a token, over a sparse MoE FFN.
+// Inkling-2-Mini (GGUF architecture inkling2_loop, or inkling2 in Unsloth's
+// own layout; text model type inkling2_loop_text): a decoder of 24 weight
+// layers that all attend, its layers 6 to 17 looped three times a token, over
+// a sparse MoE FFN.
 //  - The loop: a token's forward runs layers 0-5, layers 6-17 once a pass,
 //    three passes, then layers 18-23: 48 layer applications, each with its
 //    own KV and convolution state. Passes after the first restart from the
@@ -266,7 +267,9 @@ struct Inkling2LoopSchedule final {
 // FFN's and head's own values. Its state layout (gdnStateLayout) adds its
 // convolutions' rows to the base's, which has no GDN layers.
 struct Inkling2LoopLayout final : QwenHybridLayout {
-  // Its config's text model type and its GGUFs' architecture.
+  // Its config's text model type and its GGUFs' architecture as llama.cpp's
+  // converter writes them (model/Inkling2LoopGguf.cpp plans Unsloth's layout
+  // too).
   static constexpr std::string_view modelType = "inkling2_loop_text";
   static constexpr std::string_view ggufArchitecture = "inkling2_loop";
   // Its layers attend through its own operator (ops::RelativeAttention), not
