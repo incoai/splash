@@ -245,7 +245,9 @@ public:
   // whose sequences read their layer in two placements runs as a dispatch per
   // run of them that reads one, and each run whose sequences each read their
   // history in one split runs the direct kernel in place of the split and
-  // the reduce (RelativeAttentionPlan::direct), the same bits. With rows'
+  // the reduce (RelativeAttentionPlan::direct), the same bits, into plain
+  // rows alone: such a chunk, of more than 128 rows, has an out-projection
+  // that reads no table, and a table input throws. With rows'
   // tree each sequence is a decode lane's block of at most 32 rows whose
   // rows attend their paths.
   static PreparedInput addAttention(metal::CommandGraph &graph, const RelativeAttentionPlan &plan,

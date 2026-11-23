@@ -164,14 +164,14 @@ public:
       if (!name.empty()) names_.try_emplace(name, where);
   }
   // A relative attention plan's (ops::RelativeAttention) split and reduce
-  // kernels and its direct kernel, or a decode plan's single pass, those that
-  // write rows plain and writing the out-projection's table; and a layer's
-  // prepare of a variant and the path commit of its pages.
+  // kernels, or a decode plan's single pass, those that write rows plain and
+  // writing the out-projection's table, and its direct kernel, which writes
+  // them plain alone; and a layer's prepare of a variant and the path commit
+  // of its pages.
   void attention(const std::string &where, const RelativeAttentionPlan &plan) {
     const std::string &output = plan.step == StepKind::Decode ? plan.decodePipeline() : plan.reducePipeline();
-    const std::string &direct = plan.directPipeline();
-    for (const std::string &name : {plan.splitPipeline(), output, output + tableSuffix(LinearInput::Table16), direct,
-                                    direct.empty() ? direct : direct + tableSuffix(LinearInput::Table16)})
+    for (const std::string &name :
+         {plan.splitPipeline(), output, output + tableSuffix(LinearInput::Table16), plan.directPipeline()})
       if (!name.empty()) names_.try_emplace(name, where);
   }
   void relativePrepare(const std::string &where, kv::Layout layout, RelativeAttentionVariant variant) {
@@ -1156,12 +1156,15 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
               });
     }
     // Relative attention's kernels as a chunk runs them, a dispatch's direct
-    // kernel or its split and reduce, the last writing the out-projection's
-    // input (outputInputs); its warmup's chunks, its own classes' (fewer than
-    // a MoE target's, its experts' passes adding classes of their own), run
-    // from no history and created after the longest history its context
-    // holds: its chunks of the most rows run the direct kernel after no
-    // history, the split over INT8 queries only after a long one.
+    // kernel, which writes plain rows alone, or its split and reduce, the
+    // reduce writing the out-projection's input (outputInputs); its warmup's
+    // chunks, its own classes' (fewer than a MoE target's, its experts'
+    // passes adding classes of their own), run from no history and created
+    // after the longest history its context holds: its chunks of the most
+    // rows run the direct kernel after no history, the split over INT8
+    // queries only after a long one. No chunk runs the direct kernel where
+    // its out-projection reads a table (RelativeAttention::addAttention
+    // refuses it).
     if (relativeAttention(family))
       for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
         kv::Layout layout = family.kvLayout();
@@ -1179,15 +1182,23 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
             }
             return at->second;
           };
+          const std::string what = "relative attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") +
+                                   " window " + std::to_string(window);
           for (const std::vector<LinearInput> &inputs : outputInputs)
-            check("relative attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
-                      std::to_string(window),
-                  kAttentionHistories,
+            check(what, kAttentionHistories,
                   [&](uint32_t rows, uint32_t history) {
                     const auto &[split, last] = planned(rows, history);
-                    return split + " " + last + tableSuffix(inputs[rows]);
+                    return split.empty() ? last : split + " " + last + tableSuffix(inputs[rows]);
                   },
                   family.nativeContextTokens, chunks);
+          for (const auto &[at, kernel] : kernels)
+            for (const std::vector<LinearInput> &inputs : outputInputs)
+              if (kernel.first.empty() && inputs[at.first] != LinearInput::Plain) {
+                misses.push_back(name + " " + what + ": a chunk of " + std::to_string(at.first) + " rows after " +
+                                 std::to_string(at.second) +
+                                 " tokens runs the direct kernel where its out-projection reads a table");
+                break;
+              }
         }
       }
     if (const uint32_t top = family.indexerTopBlocks)

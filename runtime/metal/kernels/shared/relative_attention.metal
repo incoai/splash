@@ -248,28 +248,28 @@ RELATIVE_ATTENTION_REDUCE(relative_attention_reduce_w1023, 1023)
 // statistics and output as they were. It then writes its rows' output as the
 // reduce does from that one split: a thread a fused row its weight and
 // denominator, each thread the gated outputs of the running output's elements
-// it holds, and, with Table, a simdgroup a span of a fused row's outputs (read
-// back from `hidden`) into the out-projection's Table16 input. The INT8 query
-// codes take the slot of partials at the tile's first_slot plus its tile and
-// KV head. Measured on a 2,048-row chunk's layer (20-core M5 Pro): the reduce
-// and the partials it reads took a sliding layer's attention 10% of its time
-// after 2,048 tokens (4.55 ms against 4.10 without) and a full layer's 1.7%
-// after 8,192; a tile of twice the rows, which reads each page once for both,
-// ran 5-11% faster than two tiles at short histories (0 to 2,048 tokens) and
-// 0.6-4% at 8,192 and 30,720.
-template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement, bool Int8Queries,
-          bool Table>
+// it holds. It writes no out-projection table: its chunks, of more than 128
+// rows, run the out-projection's prefill tile, which reads plain rows (the
+// table, its sums and the simdgroup indices it is given, as the reduce is,
+// go unused). The INT8 query codes take the slot of partials at the tile's
+// first_slot plus its tile and KV head. Measured on a 2,048-row chunk's layer
+// (20-core M5 Pro): the reduce and the partials it reads took a sliding
+// layer's attention 10% of its time after 2,048 tokens (4.55 ms against 4.10
+// without) and a full layer's 1.7% after 8,192; a tile of twice the rows,
+// which reads each page once for both, ran 5-11% faster than two tiles at
+// short histories (0 to 2,048 tokens) and 0.6-4% at 8,192 and 30,720.
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement, bool Int8Queries>
 inline void relative_attention_direct_phase(
     device bfloat *queries, device float *partials, device const SplashKvPage *page_table,
     device const SplashTreeRow *tree, device const SplashLaneRows *layout, device const float *relative_states,
-    device const float *relative_bias, device const bfloat *projection, device bfloat *hidden, device bfloat *table,
-    device float *sums, device const float *sinks, constant SplashAttentionParams &params, threadgroup float *scores,
+    device const float *relative_bias, device const bfloat *projection, device bfloat *hidden, device bfloat *,
+    device float *, device const float *sinks, constant SplashAttentionParams &params, threadgroup float *scores,
     threadgroup bfloat *probabilities, threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, threadgroup atomic_uint *rescale, uint3 group, uint thread_index, uint lane,
-    uint simd_group, uint s) {
+    threadgroup float *previous_scale, threadgroup atomic_uint *rescale, uint3 group, uint thread_index, uint, uint,
+    uint s) {
   constexpr uint Rows = SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS;
-  constexpr uint M = QueryHeadsPerKVHead * Rows, D = HeadDim, QHeads = KVHeads * QueryHeadsPerKVHead;
-  constexpr uint Width = QHeads * HeadDim, Simdgroups = 8;
+  constexpr uint M = QueryHeadsPerKVHead * Rows, QHeads = KVHeads * QueryHeadsPerKVHead;
+  constexpr uint Width = QHeads * HeadDim;
   using Row = RelativeAttentionRow<QHeads, HeadDim>;
   const uint kv_head = group.x;
   constant SplashAttentionSequence &sequence = params.sequence[s];
@@ -334,35 +334,16 @@ inline void relative_attention_direct_phase(
           hidden[place.output * Width + query_head * HeadDim + dimension] =
               relative_attention_gated(float(value), gate);
         }
-        if constexpr (Table) {
-          static_assert(D == 128, "two spans of 64 outputs a head");
-          threadgroup_barrier(mem_flags::mem_device);
-          for (uint span = simd_group; span < 2 * M; span += Simdgroups) {
-            const uint fused_row = span / 2, row = fused_row / QueryHeadsPerKVHead;
-            if (row >= active_rows)
-              continue;
-            const SplashAttentionOutput place = splash_attention_output(params, s, rows, start + row);
-            if (!place.writes)
-              continue;
-            const uint first =
-                (kv_head * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead) * HeadDim + span % 2 * 64 + 2 * lane;
-            device const bfloat *pair = hidden + place.output * Width + first;
-            gguf_sg::Table16::write(table + place.output / 8 * Width * 8,
-                                    sums + place.output / 8 * gguf_sg::Table16::sums_per_tile(Width), Width,
-                                    first / 64, place.output % 8, lane, pair[0], pair[1]);
-          }
-        }
       });
 }
 
-// The split's bindings without its statistics, then the reduce's: the
-// projection rows (their gates), the out-projection's input rows, its table
-// and the table's sums (other buffers of the dispatch without a table) and
+// The split's bindings without its statistics, then the plain reduce's: the
+// projection rows (their gates), the out-projection's input rows, a table
+// and its sums, which it does not write (other buffers of the dispatch), and
 // the rows' sinks' staging, before the parameters. Over the whole history and
 // a sliding layer's window, for INT8 pages with bf16 or INT8 queries and BF16
-// pages, each plain and, _table16, writing the out-projection's Table16 input
-// too.
-#define RELATIVE_ATTENTION_DIRECT_KERNEL(Name, Window, CacheElement, Int8Queries, Table)                         \
+// pages.
+#define RELATIVE_ATTENTION_DIRECT_KERNEL(Name, Window, CacheElement, Int8Queries)                                \
   kernel void Name(                                                                                           \
       device bfloat *queries [[buffer(0)]],                                                                   \
       device float *partials [[buffer(1)]],                                                                   \
@@ -397,24 +378,20 @@ inline void relative_attention_direct_phase(
     threadgroup float previous_scale[M];                                                                      \
     threadgroup atomic_uint rescale;                                                                          \
     const uint s = splash_attention_sequence_of_tile(params, group.y);                                        \
-    relative_attention_direct_phase<8, 3, 128, Window, CacheElement, Int8Queries, Table>(                     \
+    relative_attention_direct_phase<8, 3, 128, Window, CacheElement, Int8Queries>(                            \
         queries, partials,                                                                                    \
         SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5,  \
                             page_table6, page_table7),                                                        \
         tree, layout, relative_states, relative_bias, projection, hidden, table, sums, sinks, params, scores,  \
         probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index, lane, simd_group, s);   \
   }
-#define RELATIVE_ATTENTION_DIRECT_OUTPUTS(Name, Window, CacheElement, Int8Queries)                              \
-  RELATIVE_ATTENTION_DIRECT_KERNEL(Name, Window, CacheElement, Int8Queries, false)                              \
-  RELATIVE_ATTENTION_DIRECT_KERNEL(Name##_table16, Window, CacheElement, Int8Queries, true)
 #define RELATIVE_ATTENTION_DIRECTS(Suffix, Window)                                                            \
-  RELATIVE_ATTENTION_DIRECT_OUTPUTS(relative_attention_q8_direct##Suffix, Window, int8_t, false)              \
-  RELATIVE_ATTENTION_DIRECT_OUTPUTS(relative_attention_q8q_direct##Suffix, Window, int8_t, true)              \
-  RELATIVE_ATTENTION_DIRECT_OUTPUTS(relative_attention_bf16_direct##Suffix, Window, bfloat, false)
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8_direct##Suffix, Window, int8_t, false)               \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8q_direct##Suffix, Window, int8_t, true)               \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_bf16_direct##Suffix, Window, bfloat, false)
 RELATIVE_ATTENTION_DIRECTS(, 0)
 RELATIVE_ATTENTION_DIRECTS(_w1023, 1023)
 #undef RELATIVE_ATTENTION_DIRECTS
-#undef RELATIVE_ATTENTION_DIRECT_OUTPUTS
 #undef RELATIVE_ATTENTION_DIRECT_KERNEL
 
 // Single pass (ops::RelativeAttention::addDecode): a decode step's prepare,

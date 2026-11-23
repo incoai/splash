@@ -690,8 +690,9 @@ std::string describe(const Case &data, std::string_view phase) {
 // whose plan runs it (one split), after its prepare, attended by it through
 // addAttention and by the split and the reduce of the paged attention's tiles
 // of 8 rows at the same split (as checkSplitCounts encodes them), each into
-// output rows plain and with the out-projection's Table16 input: the same
-// output, table and sums bits. Returns whether the plan runs it.
+// plain output rows: the same output bits. It writes no out-projection table
+// (such a chunk's out-projection reads plain rows): addAttention refuses a
+// table input for it. Returns whether the plan runs it.
 bool checkDirectBits(metal::MetalBackend &backend, const Case &data, const Step &step,
                      const ops::RelativeAttentionPlan &plan, const std::string &what) {
   if (data.lanes != 1 || plan.dispatches().size() != 1 || !plan.direct(plan.dispatches()[0])) return false;
@@ -700,30 +701,17 @@ bool checkDirectBits(metal::MetalBackend &backend, const Case &data, const Step 
   const std::vector<ops::AttentionHistory> histories{{data.layer, data.tables[0]}};
   constexpr uint32_t width = kQueryHeads * kHeadDimension;
   const ops::AttentionWorkspace workspace = plan.workspace();
-  struct Written final {
-    std::vector<std::byte> hidden, table, sums;
-    bool operator==(const Written &) const = default;
-  };
-  const auto bytes = [](const metal::MetalBuffer &buffer) {
-    const auto *begin = contents<std::byte>(buffer);
-    return std::vector<std::byte>(begin, begin + buffer.sizeBytes());
-  };
-  const auto attend = [&](bool direct, ops::LinearInput input) {
+  const auto attend = [&](bool direct) {
     const metal::MetalBuffer partials = poisoned(backend, workspace.partialsBytes);
     const metal::MetalBuffer statistics = poisoned(backend, workspace.statisticsBytes);
     const metal::MetalBuffer hidden = poisoned(backend, uint64_t{step.rows} * width * 2);
-    const metal::MetalBuffer table =
-        poisoned(backend, ops::tableBytes(width, uint64_t{ops::tableTiles(step.rows)} * GGUF_TABLE16_ROWS));
-    const metal::MetalBuffer sums = poisoned(backend, ops::tableSumsBytes(ops::LinearInput::Table16, width, step.rows));
-    const bool tabled = input == ops::LinearInput::Table16;
     metal::CommandGraph graph;
     if (direct) {
       RelativeAttention::addAttention(graph, plan, step.staging, data.weights, partials, statistics, sequences,
                                       histories, rows,
-                                      {step.inputs.projection, hidden, ops::AttentionOutput::Every,
-                                       {table, sums, {}, {}}, input});
-      require(graph.dispatches().size() == 1 &&
-                  graph.dispatches()[0].pipelineName == plan.directPipeline() + ops::tableSuffix(input),
+                                      {step.inputs.projection, hidden, ops::AttentionOutput::Every, {},
+                                       ops::LinearInput::Plain});
+      require(graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == plan.directPipeline(),
               what + ": a chunk of one split runs other kernels than the direct one");
     } else {
       SplashAttentionParams params{.sequences = 1, .first_sequence = 0, .rows = step.rows,
@@ -737,41 +725,55 @@ bool checkDirectBits(metal::MetalBackend &backend, const Case &data, const Step 
       split.insert(split.end(), data.tables.begin(), data.tables.end());
       split.insert(split.end(), {partials, step.layout, step.staging.states, data.weights.bias});
       graph.add(plan.splitPipeline(), std::move(split), params, {kKvHeads, kv::attentionTiles(step.rows), 1});
-      graph.add(plan.reducePipeline() + ops::tableSuffix(input),
-                {partials, statistics, step.inputs.projection, hidden, tabled ? table : hidden,
-                 tabled ? sums : hidden, step.layout, step.staging.sinks},
+      graph.add(plan.reducePipeline(),
+                {partials, statistics, step.inputs.projection, hidden, hidden, hidden, step.layout,
+                 step.staging.sinks},
                 params, {kKvHeads, kv::kAttentionTileRows * kGroup, kv::attentionTiles(step.rows)},
                 {kHeadDimension, 1, 1});
     }
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-    return Written{bytes(hidden), tabled ? bytes(table) : std::vector<std::byte>{},
-                   tabled ? bytes(sums) : std::vector<std::byte>{}};
+    const auto *begin = contents<std::byte>(hidden);
+    return std::vector<std::byte>(begin, begin + hidden.sizeBytes());
   };
-  for (const ops::LinearInput input : {ops::LinearInput::Plain, ops::LinearInput::Table16}) {
-    const Written direct = attend(true, input), split = attend(false, input);
-    if (direct == split) continue;
-    // The first output element that differs, and how many do.
-    std::string where;
-    size_t differ = 0;
-    for (size_t at = 0; at + 1 < direct.hidden.size(); at += 2)
-      if (std::memcmp(&direct.hidden[at], &split.hidden[at], 2)) {
-        if (!differ++) {
-          uint16_t a = 0, b = 0;
-          std::memcpy(&a, &direct.hidden[at], 2);
-          std::memcpy(&b, &split.hidden[at], 2);
-          const size_t element = at / 2;
-          where = " (row " + std::to_string(element / width) + " head " +
-                  std::to_string(element % width / kHeadDimension) + " dimension " +
-                  std::to_string(element % kHeadDimension) + ": " + std::to_string(bf16ToFloat(a)) + " against " +
-                  std::to_string(bf16ToFloat(b)) + ")";
-        }
-      }
-    throw std::runtime_error(what + ": the direct kernel wrote other bits than the split and reduce" +
-                             (input == ops::LinearInput::Table16 ? " with the Table16 input" : "") + ", " +
-                             std::to_string(differ) + " output elements" + where +
-                             (direct.table != split.table || direct.sums != split.sums ? ", and its table" : ""));
+  {
+    const metal::MetalBuffer partials = poisoned(backend, workspace.partialsBytes);
+    const metal::MetalBuffer statistics = poisoned(backend, workspace.statisticsBytes);
+    const metal::MetalBuffer hidden = poisoned(backend, uint64_t{step.rows} * width * 2);
+    const metal::MetalBuffer table =
+        poisoned(backend, ops::tableBytes(width, uint64_t{ops::tableTiles(step.rows)} * GGUF_TABLE16_ROWS));
+    const metal::MetalBuffer sums = poisoned(backend, ops::tableSumsBytes(ops::LinearInput::Table16, width, step.rows));
+    metal::CommandGraph graph;
+    bool refused = false;
+    try {
+      RelativeAttention::addAttention(graph, plan, step.staging, data.weights, partials, statistics, sequences,
+                                      histories, rows,
+                                      {step.inputs.projection, hidden, ops::AttentionOutput::Every,
+                                       {table, sums, {}, {}}, ops::LinearInput::Table16});
+    } catch (const std::invalid_argument &) {
+      refused = true;
+    }
+    require(refused && graph.dispatches().empty(), what + ": the direct kernel took the out-projection's table");
   }
-  return true;
+  const std::vector<std::byte> direct = attend(true), split = attend(false);
+  if (direct == split) return true;
+  // The first output element that differs, and how many do.
+  std::string where;
+  size_t differ = 0;
+  for (size_t at = 0; at + 1 < direct.size(); at += 2)
+    if (std::memcmp(&direct[at], &split[at], 2)) {
+      if (!differ++) {
+        uint16_t a = 0, b = 0;
+        std::memcpy(&a, &direct[at], 2);
+        std::memcpy(&b, &split[at], 2);
+        const size_t element = at / 2;
+        where = " (row " + std::to_string(element / width) + " head " +
+                std::to_string(element % width / kHeadDimension) + " dimension " +
+                std::to_string(element % kHeadDimension) + ": " + std::to_string(bf16ToFloat(a)) + " against " +
+                std::to_string(bf16ToFloat(b)) + ")";
+      }
+    }
+  throw std::runtime_error(what + ": the direct kernel wrote other bits than the split and reduce, " +
+                           std::to_string(differ) + " output elements" + where);
 }
 
 // A prefill of `rows` rows after a cached prefix of `history` tokens, as one

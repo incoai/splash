@@ -329,9 +329,12 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
     // them, of which it reads nothing.
     split.insert(split.end(), {rows.tree ? rows.tree : partials, rows.layout, staging.states, weights.bias});
     if (direct) {
+      // It writes plain rows alone: a chunk of one split has more than 128
+      // rows, whose out-projection runs the prefill tile. It binds as the
+      // plain reduce does.
+      if (table) throw std::invalid_argument("the direct relative attention writes no out-projection table");
       split.insert(split.end(), {output.packed, output.hidden, tableInput, tableSums, staging.sinks});
-      graph.add(plan.directPipeline() + tableSuffix(output.input), std::move(split), params,
-                plan.directGroups(dispatch));
+      graph.add(plan.directPipeline(), std::move(split), params, plan.directGroups(dispatch));
       return slot;
     }
     graph.add(plan.splitPipeline(), std::move(split), params, plan.splitGroups(dispatch));
