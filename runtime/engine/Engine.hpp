@@ -394,8 +394,9 @@ private:
       // A rolling checkpoint, the lane's own progress, retired once the next
       // one or a junction is published, which takes its buffers, if it needs
       // them, only after its command has completed; the prompt's replay point
-      // leaves the last one cached when its own state fits beside it.
-      // Otherwise a state a later request resumes from.
+      // and the head's state leave the last one before them cached when their
+      // own state fits beside it (keepsCheckpoint). Otherwise a state a later
+      // request resumes from.
       bool disposable = false;
     };
 
@@ -773,6 +774,17 @@ private:
   // replayStateBoundary while the lane replays only its prompt.
   [[nodiscard]] static uint32_t
   promptReplayBoundary(const Request &request) noexcept;
+  // Where the lane keeps its head's state: the last whole page of the
+  // prompt's head (EngineRequest::headTokens), zero without one.
+  [[nodiscard]] static uint32_t headBoundary(const Request &request) noexcept;
+  // The states whose publication keeps the lane's checkpoint cached, as
+  // disposable as any, rather than retiring it: the prompt's replay point
+  // and the head's. A later request that shares the prompt up to the
+  // checkpoint but not up to such a state resumes there: a conversation's
+  // head often ends in text of its own, as an agent's environment block,
+  // inside the head's last page.
+  [[nodiscard]] static bool keepsCheckpoint(const Request &request,
+                                            Request::StateBoundary boundary) noexcept;
   [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
                                                       const Request &right);
   // An unstarted request waits while a resident producer has yet to publish
@@ -860,10 +872,11 @@ private:
   // starts from. A checkpoint the command passes on its way to a state that
   // retires it once published is not captured, and that state takes
   // buffers of its own class; refused the KV up to that state, the command
-  // ends at the checkpoint and captures it. The prompt's replay point
-  // refused buffers of its own takes those of a checkpoint the command
-  // captures before it. The KV past a boundary is an Optional claim: refused,
-  // it cuts the command there, and the rows past it run in a second command.
+  // ends at the checkpoint and captures it. A state that keeps the
+  // checkpoint (keepsCheckpoint) refused buffers of its own takes those of
+  // a checkpoint the command captures before it. The KV past a boundary is
+  // an Optional claim: refused, it cuts the command there, and the rows past
+  // it run in a second command.
   [[nodiscard]] uint32_t reserveCaptures(Request &request, const BatchItem &item,
                                          std::vector<StateCapture> &states,
                                          std::vector<LaneCapture> &captures, bool supersedes);

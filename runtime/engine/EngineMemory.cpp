@@ -706,11 +706,12 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
   const auto reserve = [&](size_t index) {
     const uint32_t tokens = boundaries[index].tokens;
     const StateClass kind = stateClass(index);
-    if (kind == StateClass::InUse && !states.empty() && boundaries[index - 1].disposable) {
-      // The prompt's replay point keeps the checkpoint captured before it
-      // beside buffers of its own, in its claim. Refused the pool and the
-      // admission, it takes that checkpoint's buffers, as it takes its
-      // lane's after a command: nothing is freed for it.
+    if (keepsCheckpoint(active, boundaries[index]) && !states.empty() && boundaries[index - 1].disposable) {
+      // The prompt's replay point and the head's state keep the checkpoint
+      // captured before them beside buffers of their own, in their claim.
+      // Refused the pool and the admission, each takes that checkpoint's
+      // buffers, as it takes its lane's after a command: nothing is freed
+      // for it.
       std::shared_ptr<StateReservation> buffers;
       static_cast<void>(allocate(
           [&] {
@@ -741,13 +742,13 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
   for (size_t index = active.stateBoundaryCursor;
        index < boundaries.size() && boundaries[index].tokens <= end; ++index) {
     const uint32_t tokens = boundaries[index].tokens;
-    // Published, every state but the prompt's replay point retires the
-    // checkpoint before it (apply): a checkpoint the command passes on its
-    // way to such a state is not captured, and that state takes buffers of
-    // its own class.
+    // Published, every state but the prompt's replay point and the head's
+    // retires the checkpoint before it (apply, keepsCheckpoint): a
+    // checkpoint the command passes on its way to such a state is not
+    // captured, and that state takes buffers of its own class.
     const bool passed = boundaries[index].disposable && index + 1 < boundaries.size() &&
                         boundaries[index + 1].tokens <= end &&
-                        stateClass(index + 1) != StateClass::InUse;
+                        !keepsCheckpoint(active, boundaries[index + 1]);
     if (!passed && !reserve(index))
       return tokens - start;
     if (tokens == end)

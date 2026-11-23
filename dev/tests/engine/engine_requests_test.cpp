@@ -1016,6 +1016,184 @@ void testASecondConversationResumesAtASharedHead() {
   }
 }
 
+// A conversation's head often ends in text of its own, as an agent's system prompt ends in its environment block (its
+// working directory, its git status). A second conversation whose prompt first differs inside the first's last head
+// page shares no state there: heads of 3,010 tokens, whose state is at 3,008, and first differences at 2,980 and 2,995.
+// The head's state keeps the lane's last prefill checkpoint below it cached, at 2,048, one more cached state beside the
+// head's and the replay point's, and the second conversation resumes there instead of at 0. One whose head's state lies
+// below its first difference (2,990 tokens, the state at 2,976) resumes at the head. With decode captures and without.
+void testAConversationWhoseHeadEndsDifferentlyResumesBelowIt() {
+  constexpr uint32_t kCheckpoint = 2048;
+  for (const bool captures : {false, true})
+    for (const auto &[headTokens, differs] :
+         std::initializer_list<std::pair<uint32_t, uint32_t>>{{3010, 2980}, {3010, 2995}, {2990, 2980}}) {
+      test::EngineHarness h({.pages = 1024, .engine = {.prefillCheckpointTokens = kCheckpoint}});
+      h.model.decodeStateCaptures = captures;
+      h.model.decodeFinishes = false;
+      const auto conversation = [&](uint64_t id, uint32_t session, uint32_t output) {
+        std::vector<uint32_t> prompt(headTokens + 1500);
+        std::iota(prompt.begin(), prompt.end(), 1);
+        // The session's own tokens from its first difference on, the head's end among them.
+        for (uint32_t index = differs; index < prompt.size(); ++index)
+          prompt[index] = session + index;
+        EngineRequest result = conversationTurn(id, prompt, output);
+        result.headTokens = headTokens;
+        return result;
+      };
+      const std::string variant = "head " + std::to_string(headTokens) + ", first difference at " +
+                                  std::to_string(differs) + (captures ? ", decode captures" : ", no decode captures");
+      h.engine.submit(conversation(1, 100'000, 150));
+      h.runUntil([&] { return idle(h.engine); }, "the first conversation did not complete");
+      const StateCacheSnapshot cached = h.cache.snapshot().stateCache;
+      h.engine.submit(conversation(2, 200'000, 8));
+      h.runUntil([&] { return idle(h.engine); }, "the second conversation did not complete");
+      const uint32_t head = headTokens / KvCache::pageTokens * KvCache::pageTokens;
+      const uint32_t resumed = head <= differs ? head : kCheckpoint;
+      require(h.events.starts.back() == resumed, variant + ": the second conversation resumed from " +
+                                                     std::to_string(h.events.starts.back()) + ", not " +
+                                                     std::to_string(resumed));
+      // Without reply states, the first conversation left the checkpoint, the head's state and the replay point.
+      require(captures || (cached.entries == 3 && cached.checkpointEntries == 1),
+              variant + ": the head's state did not keep the checkpoint below it beside the replay point");
+    }
+}
+
+// A new agent session in another directory: the same tools, one long block, and the same system prompt but for its
+// environment block at the end (the working directory, the git status), from 300 tokens before the head's end, below
+// the head's state. It resumes at the last checkpoint the first session's head state kept below it, instead of 0: at
+// most the checkpoints' spacing below the head's state (4,096 tokens), or 6,144 where the first session's prompt ends
+// within a prefill chunk (2,048 tokens) of the checkpoint past that one, which then is not planned. A later session in
+// the first directory resumes at the head's state. Heads and first messages of Claude Code's sizes (27,584 and 2,236
+// tokens) and smaller ones (13,000 and 2,000; 8,500 and 1,500, whose prompt ends too close to a checkpoint at 8,192).
+void testANewSessionInAnotherDirectoryResumesBelowItsHead() {
+  struct Session final {
+    uint32_t head = 0;
+    uint32_t message = 0;
+    uint32_t checkpoint = 0;
+  };
+  for (const Session &sizes : {Session{27'584, 2'236, 24'576}, Session{13'000, 2'000, 12'288},
+                               Session{8'500, 1'500, 4'096}}) {
+    test::EngineHarness h({.pages = 2048});
+    // A session's first request: the tools and the system prompt, whose last 300 tokens are its directory's, and a
+    // first message of its own.
+    const auto session = [&](uint64_t id, uint32_t directory, uint32_t message) {
+      std::vector<uint32_t> prompt(sizes.head + sizes.message);
+      std::iota(prompt.begin(), prompt.end(), 1);
+      for (uint32_t index = sizes.head - 300; index < sizes.head; ++index)
+        prompt[index] = directory + index;
+      for (uint32_t index = sizes.head; index < prompt.size(); ++index)
+        prompt[index] = message + index;
+      EngineRequest result = conversationTurn(id, prompt, 8);
+      result.headTokens = sizes.head;
+      return result;
+    };
+    const std::string variant = "head " + std::to_string(sizes.head) + ": ";
+    h.engine.submit(session(1, 100'000, 200'000));
+    h.runUntil([&] { return idle(h.engine); }, "the first session did not complete");
+    h.engine.submit(session(2, 300'000, 400'000));
+    h.runUntil([&] { return idle(h.engine); }, "the session in another directory did not complete");
+    require(h.events.starts.back() == sizes.checkpoint,
+            variant + "the session in another directory resumed from " + std::to_string(h.events.starts.back()) +
+                ", not the kept checkpoint's " + std::to_string(sizes.checkpoint));
+    h.engine.submit(session(3, 100'000, 500'000));
+    h.runUntil([&] { return idle(h.engine); }, "the later session in the first directory did not complete");
+    const uint32_t head = sizes.head / KvCache::pageTokens * KvCache::pageTokens;
+    require(h.events.starts.back() == head, variant + "the later session in the first directory resumed from " +
+                                                std::to_string(h.events.starts.back()) + ", not its head's " +
+                                                std::to_string(head));
+  }
+}
+
+// A command that reaches a checkpoint and then the head's end captures both, since the head's state keeps the
+// checkpoint, where it passes a checkpoint on its way to a junction. A conversation resumed at a state of 1,024 tokens
+// prefills from there, its command from 3,072 reaching the checkpoint at 4,096 and the head's state at 4,512, and the
+// next conversation, whose head first differs at 4,500, resumes at that checkpoint.
+void testACommandCapturesTheCheckpointBeforeTheHead() {
+  constexpr uint32_t kHead = 4530;
+  test::EngineHarness h({.pages = 1024});
+  const auto conversation = [&](uint64_t id, uint32_t differs, uint32_t session) {
+    std::vector<uint32_t> prompt(kHead + 2500);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    for (uint32_t index = differs; index < prompt.size(); ++index)
+      prompt[index] = session + index;
+    EngineRequest result = conversationTurn(id, prompt, 8);
+    result.headTokens = kHead;
+    return result;
+  };
+  // A request of the prompt's first 1,031 tokens keeps its replay point at 1,024.
+  const EngineRequest first = conversation(1, kHead, 20'000);
+  h.engine.submit(conversationTurn(1, std::vector<uint32_t>(first.prompt.begin(), first.prompt.begin() + 1031), 1));
+  h.runUntil([&] { return idle(h.engine); }, "the opening request did not complete");
+  h.engine.submit(conversation(2, kHead, 20'000));
+  h.runUntil([&] { return idle(h.engine); }, "the first conversation did not complete");
+  require(h.events.starts.back() == 1024, "the first conversation did not resume at 1,024");
+  const uint32_t checkpoint = engine::kPrefillCheckpointTokens;
+  require(checkpoint == 4096 && 3072 + model::ExecutionLimits::prefillTokenBudget > kHead,
+          "the checkpoint and the head's end do not lie in one command");
+  h.engine.submit(conversation(3, 4500, 30'000));
+  h.runUntil([&] { return idle(h.engine); }, "the second conversation did not complete");
+  require(h.events.starts.back() == checkpoint, "the conversation whose head differs resumed from " +
+                                                    std::to_string(h.events.starts.back()) +
+                                                    ", not the checkpoint's " + std::to_string(checkpoint));
+}
+
+// The agent run whose next conversation missed its head (Claude Code on Inkling-2-Mini): a conversation's first turn
+// prefills a head of 3,010 tokens and the rest of its prompt while a short side request decodes beside it, its later
+// turns render each reply back, one reply of 1,095 tokens, and then come a conversation sharing the whole head and one
+// whose head first differs inside its last page. The first resumes at the head's last whole page, the second at the
+// checkpoint the head's state kept below it. With decode captures (reply states) and without, with the KV cache's room
+// for every turn and with fewer pages.
+void testConversationsAfterRepliesResumeAtTheHeadOrBelowIt() {
+  constexpr uint32_t kHead = 3010;
+  constexpr uint32_t kCheckpoint = 2048;
+  for (const bool captures : {false, true})
+    for (const uint32_t pages : {1024U, 420U}) {
+      test::EngineHarness h({.pages = pages, .engine = {.prefillCheckpointTokens = kCheckpoint}});
+      h.model.decodeStateCaptures = captures;
+      h.model.decodeFinishes = false;
+      Events &events = h.events;
+      engine::Engine &engine = h.engine;
+      // A conversation's first turn, its tokens its own from `differs` on.
+      const auto conversation = [&](uint64_t id, uint32_t differs, uint32_t session, uint32_t output) {
+        std::vector<uint32_t> prompt(kHead + 1500);
+        std::iota(prompt.begin(), prompt.end(), 1);
+        for (uint32_t index = differs; index < prompt.size(); ++index)
+          prompt[index] = session + index;
+        EngineRequest result = conversationTurn(id, prompt, output);
+        result.headTokens = kHead;
+        return result;
+      };
+      const std::string variant =
+          std::to_string(pages) + " pages" + (captures ? ", decode captures" : ", no decode captures");
+      engine.submit(conversationTurn(1, std::vector<uint32_t>(100, 7), 230));
+      EngineRequest turn = conversation(2, kHead, 20'000, 150);
+      engine.submit(turn);
+      h.runUntil([&] { return idle(engine); }, "the first turn and the side request did not complete");
+      require(events.outputs[1].size() == 230 && events.outputs[2].size() == 150,
+              variant + ": the side request or the first turn ended early");
+      uint64_t id = 3;
+      for (const uint32_t output : {63U, 1095U, 45U, 135U}) {
+        turn = conversationTurn(id, nextTurn(turn.prompt, static_cast<uint32_t>(events.outputs[id - 1].size())),
+                                output);
+        turn.headTokens = kHead;
+        engine.submit(turn);
+        h.runUntil([&] { return idle(engine); }, "a later turn did not complete");
+        ++id;
+      }
+      engine.submit(conversation(id, kHead, 30'000, 8));
+      h.runUntil([&] { return idle(engine); }, "the conversation sharing the head did not complete");
+      const uint32_t head = kHead / KvCache::pageTokens * KvCache::pageTokens;
+      require(events.starts.back() == head, variant + ": the conversation sharing the head resumed from " +
+                                                std::to_string(events.starts.back()) + ", not its head's " +
+                                                std::to_string(head));
+      engine.submit(conversation(id + 1, 2995, 40'000, 8));
+      h.runUntil([&] { return idle(engine); }, "the conversation whose head differs did not complete");
+      require(events.starts.back() == kCheckpoint, variant + ": the conversation whose head differs resumed from " +
+                                                       std::to_string(events.starts.back()) + ", not the checkpoint's " +
+                                                       std::to_string(kCheckpoint));
+    }
+}
+
 // A finished request's KV holds part of the budget, so a later request's KV
 // meets the wall as it grows, where each wall test's budget puts it; captured
 // states are OffloadStates from then on, which reclaim may write to the SSD
@@ -2519,6 +2697,11 @@ std::span<const test::TestCase> requestsTests() {
       {"testRunningReplyCheckpointIsDropped", testRunningReplyCheckpointIsDropped},
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
       {"testASecondConversationResumesAtASharedHead", testASecondConversationResumesAtASharedHead},
+      {"testAConversationWhoseHeadEndsDifferentlyResumesBelowIt",
+       testAConversationWhoseHeadEndsDifferentlyResumesBelowIt},
+      {"testANewSessionInAnotherDirectoryResumesBelowItsHead", testANewSessionInAnotherDirectoryResumesBelowItsHead},
+      {"testACommandCapturesTheCheckpointBeforeTheHead", testACommandCapturesTheCheckpointBeforeTheHead},
+      {"testConversationsAfterRepliesResumeAtTheHeadOrBelowIt", testConversationsAfterRepliesResumeAtTheHeadOrBelowIt},
       {"testReplyCheckpointsAreNotWrittenAtTheWall", testReplyCheckpointsAreNotWrittenAtTheWall},
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},
       {"testRepliesAreKeptOnceAConversationRendersThemBack", testRepliesAreKeptOnceAConversationRendersThemBack},

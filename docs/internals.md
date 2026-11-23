@@ -2674,17 +2674,18 @@ in use, which only the claims [above](#memory-rules) may take.
 A prefill command captures the state of each boundary it reaches, in buffers
 reserved before it runs. A junction or a checkpoint retires its lane's
 checkpoint once published, and a checkpoint the same command would capture before it is not captured at all; the prompt's
-replay point keeps the lane's checkpoint cached. Until a state retires it, that
+replay point and the head's state (below) keep the lane's checkpoint cached,
+and a command captures one before them. Until a state retires it, that
 checkpoint is the lane's recovery point, which a command that is cancelled,
 expires or fails leaves to a retry, so no state takes its buffers, or room a
 reclaim could make of it, before its command. Refused the pool and an admission
 while its lane holds a checkpoint no reader pins, a state ends its command at
 its boundary and is taken from the lane once the command has completed: a
 junction or a checkpoint in that checkpoint's buffers, which it takes first,
-the replay point in them only when refused again. A checkpoint only on disk
-gives no buffers, and stays until the state is published. A checkpoint whose
-predecessor a reader pins ends its command too, and is published only once the
-pin has gone. Refused, the replay point, a claim of its request in service that
+the replay point and the head's state in them only when refused again. A
+checkpoint only on disk gives no buffers, and stays until the state is
+published. A checkpoint whose predecessor a reader pins ends its command too,
+and is published only once the pin has gone. Refused, the replay point, a claim of its request in service that
 can wait and reaches what is in use, takes what its row allows in the fixed
 order (a cache the model rebuilds or a chunk of the store among them), waits
 for memory on its way back, the copy of uncopied cache it starts included,
@@ -2724,8 +2725,9 @@ keeps it, and a retry resumes there. One only on the SSD retires when that
 state lands.
 The last stays cached once the replay point is published: a later request that
 shares the prompt up to it, such as another conversation with the same long
-system prompt, resumes there instead of from the start. It stays only if the
-replay state fits beside it; refused memory, the replay state takes its buffers
+system prompt, resumes there instead of from the start. So does the last one
+below a prompt's head once the head's state is published (below). It stays only
+if that state fits beside it; refused memory, the state takes its buffers
 rather than another lane's checkpoint. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
 SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
@@ -2741,6 +2743,24 @@ request resumes, as a junction must save that much. It is kept and evicted as
 any ordinary state, so the next conversation sharing the head resumes there,
 from RAM or, once a reclaim has written it, from the SSD, instead of
 prefilling the head again.
+Only a conversation whose prompt matches the head up to that page shares it,
+and an agent's head ends in text of its own: its system prompt's environment
+block (the working directory, the git status) comes after the tools. So the
+head's state keeps the lane's last prefill checkpoint below it cached, as the
+replay point keeps the one below it: a conversation whose head first differs
+inside the head's last page, or a new session in another directory, resumes at
+that checkpoint instead of from the start. It lies at most the checkpoints'
+spacing, 4096 tokens, below the head's state, or less than 6144 where the
+prompt's replay point lies within a prefill chunk past the multiple of 4096
+below the head, which then holds no checkpoint; a head whose state lies at 4096
+tokens or below keeps none, as a cold prefill plans its first checkpoint at
+4096. It costs one more cached state a head, 4.4 MiB for Inkling-2-Mini, 19.6
+MiB for Qwen3.6-35B-A3B and 46.9 MiB for Qwen3.8-27B, and no KV: its blocks are
+the head's. It stays a checkpoint, which reclaim takes first (and, with the SSD
+cache, writes to the SSD), as the replay point's is: no lane uses it once the
+head's state is published, and it serves only a conversation whose head ends
+differently, where the ordinary states that reclaim takes after it, the head's
+among them, serve every conversation that shares their whole prefix.
 
 A cached state holds a cached cell of the target's GDN state and the draft's
 context window, not the draft's rings. The cached cell

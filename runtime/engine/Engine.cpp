@@ -864,6 +864,15 @@ uint32_t Engine::promptReplayBoundary(const Request &active) noexcept {
   return (active.promptTokens - tail) / KvCache::pageTokens * KvCache::pageTokens;
 }
 
+uint32_t Engine::headBoundary(const Request &active) noexcept {
+  return active.request.headTokens / KvCache::pageTokens * KvCache::pageTokens;
+}
+
+bool Engine::keepsCheckpoint(const Request &active, Request::StateBoundary boundary) noexcept {
+  return !boundary.disposable &&
+         (boundary.tokens == promptReplayBoundary(active) || boundary.tokens == headBoundary(active));
+}
+
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
                                        const Request &right) {
   // Requests of different cache salts share no block.
@@ -1269,9 +1278,9 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
   // The head's end, so that the next conversation sharing the head resumes there on first use. An ordinary state,
-  // which a reclaim writes to the SSD as any other.
-  if (const uint32_t head = active.request.headTokens / KvCache::pageTokens * KvCache::pageTokens;
-      head >= stateBoundary + kMinimumJunctionGain)
+  // which a reclaim writes to the SSD as any other; it keeps the lane's last checkpoint before it cached
+  // (keepsCheckpoint) for a conversation whose head differs inside its last page.
+  if (const uint32_t head = headBoundary(active); head >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, head, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);
@@ -1410,8 +1419,8 @@ void Engine::publishReachedStateBoundaries(
         ++counters_.stateCaptures;
     } else if (objective.tokens != promptProcessed) {
       // A checkpoint the command did not capture: a later state of it
-      // retires the checkpoint once published, or the prompt's replay point
-      // took its buffers.
+      // retires the checkpoint once published, or a state that keeps it
+      // (keepsCheckpoint) took its buffers.
       if (!objective.disposable)
         throw std::logic_error("prefill passed a state boundary it did not capture");
       continue;
@@ -1443,6 +1452,8 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
   // rebuilt replay point counts as a replay-state publication, not a
   // junction.
   const bool replay = !checkpoint && objective.tokens == promptReplayBoundary(active);
+  // It and the head's state keep the lane's checkpoint cached.
+  const bool keeps = keepsCheckpoint(active, objective);
   uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
                        : replay   ? counters_.replayStatePublicationFailures
                                   : counters_.junctionMaterializationFailures;
@@ -1471,25 +1482,26 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     // the recovery point until this state is published, and retires after
     // the publication, as does the one a reused state leaves. No checkpoint
     // is published while a restore lease pins the one before it. The
-    // prompt's replay point keeps the lane's checkpoint (below).
+    // prompt's replay point and the head's state keep the lane's checkpoint
+    // (below).
     if (checkpoint && checkpointPinned(active)) {
       ++failures;
       return false;
     }
     const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
-    if (!replay && resident)
+    if (!keeps && resident)
       static_cast<void>(retireCheckpoint(active));
     // The command has completed, so the state it ended at for its lane's
-    // checkpoint is taken from the lane now. The replay point keeps that
-    // checkpoint only beside buffers of its own; refused them, it takes
-    // the checkpoint's unless a peer still holds it. Then what the ledger
-    // frees for the state's claim (stateClaim).
+    // checkpoint is taken from the lane now. The replay point and the
+    // head's state keep that checkpoint only beside buffers of their own;
+    // refused them, each takes the checkpoint's unless a peer still holds
+    // it. Then what the ledger frees for the state's claim (stateClaim).
     if (fromLane) {
       bool first = true;
       recycled = allocate(
                      [&] {
                        state = model_.snapshot(active.request.id);
-                       if (!state && std::exchange(first, false) && replay && resident &&
+                       if (!state && std::exchange(first, false) && keeps && resident &&
                            !checkpointShared(active) && retireCheckpoint(active))
                          state = model_.snapshot(active.request.id);
                        return StateBuffers{.ok = state != nullptr};
@@ -1527,13 +1539,14 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     }
   }
   // The previous recovery point, if the lane still holds one, retires now,
-  // except at the prompt's replay point: there it stays cached, as
-  // disposable as any checkpoint, for a later request that shares the
-  // prompt up to it but not up to the replay point. The lane holds it
-  // until this state is published; a refused publication leaves it the
-  // lane's recovery point, unless it retired above to give this state its
-  // buffers.
-  if (!replay)
+  // except at the prompt's replay point and the head's state: there it
+  // stays cached, as disposable as any checkpoint, for a later request that
+  // shares the prompt up to it but not up to that state, as a conversation
+  // whose head ends in text of its own does not share the head's last
+  // page. The lane holds it until this state is published; a refused
+  // publication leaves it the lane's recovery point, unless it retired
+  // above to give this state its buffers.
+  if (!keeps)
     static_cast<void>(retireCheckpoint(active));
   active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                        : StateCheckpoint{};
