@@ -391,9 +391,12 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 
 // The tile applies to grouping, gather and the expert passes together;
 // changing it never changes the physical rows in a command. Plans run their
-// passes on M8 tiles, or on M32 tiles where their routes average more than
-// a row per expert (selectMoe).
-enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
+// passes on M8 tiles, on M32 tiles where their routes average more than a row
+// per expert, and on M64 tiles where a prefill chunk's average the device's
+// MoeCalibration::wideTileRoutes (selectMoe). A row's bits are the same on
+// every tile: the tiles' 8-, 16-, 32- and 64-row matmuls sum its products in
+// one order (moe_live_rows).
+enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32, M64 = 64 };
 
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {

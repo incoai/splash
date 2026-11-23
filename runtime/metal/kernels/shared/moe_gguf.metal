@@ -26,9 +26,9 @@ template <uint Count> struct moe_formats {
 
 // Function constant 4, which production never defines, so that kMoeColumnTiles folds to true and an expert's only
 // tile of at most GGUF_COLUMN_ROWS live rows runs the column tile. The instrumented backend defines it true
-// (metal/BackendInstrumentation.hpp: stageExpertTiles): every tile then runs the staged tile, whose 8-, 16- and 32-row
-// matmuls give a row the same bits (gguf-moe), so that a route's output depends on its own row alone, not on how many
-// rows its step routes to its expert (moe_expert_slab.h).
+// (metal/BackendInstrumentation.hpp: stageExpertTiles): every tile then runs the staged tile, whose 8-, 16-, 32- and
+// 64-row matmuls give a row the same bits (gguf-moe), so that a route's output depends on its own row alone, not on how
+// many rows its step routes to its expert (moe_expert_slab.h).
 constant bool kMoeStagedOnly [[function_constant(4)]];
 constant bool kMoeColumnTiles = !is_function_constant_defined(kMoeStagedOnly) || !kMoeStagedOnly;
 
@@ -61,6 +61,9 @@ template [[host_name("moe_expert_gguf_m8_down_s2")]] kernel MoeExpertGgufKernel 
 template [[host_name("moe_expert_gguf_m32_down_s2")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<32, 2>;
 template [[host_name("moe_expert_gguf_m8_down_s0")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<8, 0>;
 template [[host_name("moe_expert_gguf_m32_down_s0")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<32, 0>;
+template [[host_name("moe_expert_gguf_m64_down")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<64, 1>;
+template [[host_name("moe_expert_gguf_m64_down_s2")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<64, 2>;
+template [[host_name("moe_expert_gguf_m64_down_s0")]] kernel MoeExpertGgufKernel moe_expert_gguf_down<64, 0>;
 
 // The gate and up passes in one (ops/MoE.cpp): threadgroup (x, y) runs a gate simdgroup and an up simdgroup on the same
 // 32 columns of tile y, grid (N / 32, tiles), each through its own stage in its own pass's formats, as in
@@ -227,6 +230,14 @@ template [[host_name("moe_expert_gguf_m8_gate_up_mixed_s2")]] kernel MoeExpertGg
     moe_expert_gguf_gate_up<8, 2, 2, MoeSiluGate>;
 template [[host_name("moe_expert_gguf_m32_gate_up_mixed_s2")]] kernel MoeExpertGgufGateUpKernel
     moe_expert_gguf_gate_up<32, 2, 2, MoeSiluGate>;
+template [[host_name("moe_expert_gguf_m64_gate_up")]] kernel MoeExpertGgufGateUpKernel
+    moe_expert_gguf_gate_up<64, 1, 1, MoeSiluGate>;
+template [[host_name("moe_expert_gguf_m64_gate_up_mixed")]] kernel MoeExpertGgufGateUpKernel
+    moe_expert_gguf_gate_up<64, 2, 1, MoeSiluGate>;
+template [[host_name("moe_expert_gguf_m64_gate_up_s2")]] kernel MoeExpertGgufGateUpKernel
+    moe_expert_gguf_gate_up<64, 1, 2, MoeSiluGate>;
+template [[host_name("moe_expert_gguf_m64_gate_up_mixed_s2")]] kernel MoeExpertGgufGateUpKernel
+    moe_expert_gguf_gate_up<64, 2, 2, MoeSiluGate>;
 // A compiled routing's softcapped activation (ops::kCompiledMoeRoutings), without a shared expert.
 template [[host_name("moe_expert_gguf_m8_gate_up_s0_softcap4_25")]] kernel MoeExpertGgufGateUpKernel
     moe_expert_gguf_gate_up<8, 1, 0, SoftcappedSwiglu<4, 25>>;
@@ -236,3 +247,7 @@ template [[host_name("moe_expert_gguf_m8_gate_up_mixed_s0_softcap4_25")]] kernel
     moe_expert_gguf_gate_up<8, 2, 0, SoftcappedSwiglu<4, 25>>;
 template [[host_name("moe_expert_gguf_m32_gate_up_mixed_s0_softcap4_25")]] kernel MoeExpertGgufGateUpKernel
     moe_expert_gguf_gate_up<32, 2, 0, SoftcappedSwiglu<4, 25>>;
+template [[host_name("moe_expert_gguf_m64_gate_up_s0_softcap4_25")]] kernel MoeExpertGgufGateUpKernel
+    moe_expert_gguf_gate_up<64, 1, 0, SoftcappedSwiglu<4, 25>>;
+template [[host_name("moe_expert_gguf_m64_gate_up_mixed_s0_softcap4_25")]] kernel MoeExpertGgufGateUpKernel
+    moe_expert_gguf_gate_up<64, 2, 0, SoftcappedSwiglu<4, 25>>;

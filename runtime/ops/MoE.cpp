@@ -187,6 +187,9 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
 
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config)
     : shape_(shape), rows_(rows), config_(config) {
+  // The int8 passes run an expert tile's rows in one int8 tile (moe_expert_int8).
+  if (config.int8Passes && tileRows() > GGUF_PREFILL_INT8_ROWS)
+    throw std::invalid_argument("invalid MoE int8 passes: expert tiles past the int8 tile's rows");
   workspace_ = workspaceFor(shape, rows, tileRows(), config.int8Passes);
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
@@ -232,8 +235,6 @@ void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoeP
 // passes (moeInt8Experts).
 void addInt8Experts(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
                     const MoePlan &plan) {
-  static_assert(uint32_t(MoeExpertTile::M32) <= GGUF_PREFILL_INT8_ROWS,
-                "the int8 tile holds an expert tile's rows (moe_expert_int8)");
   const MoeShape shape = plan.shape();
   const MoeScratch &scratch = buffers.scratch;
   const uint32_t rows = plan.rows(), hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;

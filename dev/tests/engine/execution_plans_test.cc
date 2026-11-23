@@ -303,6 +303,28 @@ void ggufMoePlans() {
     require(plans.moeWorkspace(shape, kRouterFormat, 2048, StepKind::Prefill) == devicePlans,
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
+  // The M5 Pro (Apple10, 16 to 31 cores) runs a prefill chunk whose routes
+  // average 64 or more an expert (2048 rows of 8 of 256 experts) on 64-row
+  // tiles (MoeCalibration::wideTileRoutes), and its decode steps and shorter
+  // chunks as every GPU does; the 10-core M5, the M5 Max, the M6 and Apple9
+  // keep 32-row tiles. The prefill bound holds the 64-row plans.
+  for (const auto [family, cores] :
+       {std::pair{10U, 16U}, {10U, 20U}, {10U, 31U}, {10U, 10U}, {10U, 32U}, {10U, 40U}, {11U, 20U}, {9U, 20U}}) {
+    DeviceCapabilities capabilities = device(family);
+    capabilities.gpuCoreCount = cores;
+    const ExecutionPlans plans(capabilities, Int8Activations::On);
+    const bool pro = family == 10 && cores >= 16 && cores < 32;
+    for (const uint32_t rows : {33U, 1024U, 2047U, 2048U})
+      require(plans.moe(shape, kRouterFormat, rows, StepKind::Prefill).tileRows() == (pro && rows == 2048 ? 64U : 32U),
+              "GGUF MoE prefill plan of Apple" + std::to_string(family) + ", " + std::to_string(cores) +
+                  " cores, at " + std::to_string(rows) + " rows left its tiles");
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+      require(plans.moe(shape, kRouterFormat, lanes * 16, StepKind::Decode).tileRows() <= 32,
+              "a GGUF MoE decode plan runs 64-row tiles");
+    const MoePlan widest = plans.moe(shape, kRouterFormat, 2048, StepKind::Prefill);
+    covers(plans.moeWorkspace(shape, kRouterFormat, 2048, StepKind::Prefill), widest.workspace(), 1,
+           kMoeWorkspaceFields);
+  }
 }
 
 // A dense tile of a sequence of more than one tile takes a history split per

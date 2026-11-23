@@ -135,6 +135,14 @@ struct AttentionCalibration final {
   uint32_t cores = 0;
 };
 
+// The MoE expert passes' tiles (selectMoe).
+struct MoeCalibration final {
+  // A prefill chunk on the staged expert passes whose routes average at least
+  // this many an expert runs 64-row expert tiles (MoeExpertTile::M64); kNever
+  // never.
+  uint32_t wideTileRoutes;
+};
+
 // Every measured constant of kernel selection for one device.
 struct KernelCalibration final {
   // DeviceCapabilities::plannedGpuCores.
@@ -143,6 +151,7 @@ struct KernelCalibration final {
   FloatTileCalibration floatTile;
   DenseTileCalibration denseTile;
   AttentionCalibration attention;
+  MoeCalibration moe;
 
   [[nodiscard]] static KernelCalibration of(const DeviceCapabilities &device) noexcept;
 };
@@ -396,6 +405,30 @@ inline constexpr AttentionCalibration kApple9SmallAttention = [] {
   return row;
 }();
 
+// ---- MoE experts ------------------------------------------------------------
+
+// A prefill chunk's GGUF expert passes dequantize an expert's weights once a
+// tile, on 32-row tiles for up to 32 of its rows, on 64-row tiles for up to
+// 64. The M5 Pro (Apple10, 16 to 31 cores) runs 64-row tiles where a chunk's
+// routes average 64 or more an expert. One layer on the 20-core M5 Pro
+// (gguf-moe-benchmark tiles, random routes, macOS 27.0): at Inkling-2-Mini's
+// shape (NVFP4, 8 of 128 experts) they took 5.7% less time than 32-row tiles
+// at 1024 rows (64 routes an expert), 5.0% at 1536 and 6.5% at 2048, and 1.0%
+// more at 256 (16); at the 35B's (Q4_K/Q5_K/Q8_0, 8 of 256) 1.8% less at 2048
+// (64), 1.1% less at 1536 (48) and 0.9% more at 1024 (32). In the prefill
+// (decode-profile, ABBA rounds against the 32-row tiles) Inkling's 4K and 32K
+// tokens took 3.0-3.5% less GPU time and its 512 the same (32 routes an
+// expert: its tiles do not change), the 35B's 4K within 0.3% either way.
+// 128-row tiles took 19% more time over Inkling's 4K prefill, their passes'
+// synchronization outweighing the dequantization they save. The 12-core M6
+// keeps 32-row tiles: there 64-row ones took 3-6% more on the 35B's formats at
+// 1024 to 2048 rows, though 9-15% less at Inkling's NVFP4 shape at 768 to 2048
+// (unmeasured end to end). So does Apple9, where they gained nothing on a
+// 10-core M4, and so do the 10-core M5 and the M5 Max, unmeasured.
+inline constexpr uint32_t kApple10ProGpuCores = 16;
+inline constexpr MoeCalibration kApple10ProMoe{.wideTileRoutes = 64};
+inline constexpr MoeCalibration kThirtyTwoRowMoe{.wideTileRoutes = kNever};
+
 // ---- The device's row ------------------------------------------------------
 
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
@@ -405,13 +438,16 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
       gpu != GpuClass::Apple9 ? kApple10Attention
                               : cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention;
   attention.cores = cores;
+  const MoeCalibration moe = gpu == GpuClass::Apple10 && cores >= kApple10ProGpuCores && cores < kApple10LargeGpuCores
+                                 ? kApple10ProMoe
+                                 : kThirtyTwoRowMoe;
   if (gpu != GpuClass::Apple9)
     return {cores,
             gpu == GpuClass::Apple11            ? kApple11Projection
             : cores >= kApple10LargeGpuCores ? kApple10LargeProjection
                                               : kApple10Projection,
-            kApple10FloatTile, kApple10DenseTile, attention};
-  return {cores, kApple9Projection, kApple9FloatTile, kApple9DenseTile, attention};
+            kApple10FloatTile, kApple10DenseTile, attention, moe};
+  return {cores, kApple9Projection, kApple9FloatTile, kApple9DenseTile, attention, moe};
 }
 
 } // namespace splash::ops

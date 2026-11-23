@@ -386,6 +386,16 @@ bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept {
 // step's routes (MoeScratch). The router's float tile follows
 // selectFloatTile by its rows' format.
 //
+// A prefill chunk on the staged passes whose routes average
+// MoeCalibration::wideTileRoutes or more an expert (64 on the M5 Pro, never
+// elsewhere: KernelCalibration.hpp) runs 64-row tiles, which stream an
+// expert's weights once for up to 64 of its rows, their tiles running 8-,
+// 16-, 32- or 64-row matmuls by their live rows; a row's bits are the same on
+// every tile. Inkling-2-Mini (8 of 128) takes them from 1024 rows, the 35B
+// and the 122B (8 of 256) at 2048, Flint and Flash-Next never (a 2048-row
+// chunk averages 48 and 40 routes an expert). The int8 passes, whose tile
+// holds 32 rows (GGUF_PREFILL_INT8_ROWS), keep 32-row tiles.
+//
 // A chunk's experts run the int8 passes where its dense projections run the
 // int8 prefill tile (int8PrefillPaths: a prefill chunk's, int8 activations
 // on, Apple10 and Apple11; more rows than the decode tiles' 64) and the
@@ -408,10 +418,14 @@ MoeConfig selectMoe(const KernelCalibration &calibration, Int8Activations int8Ac
                     const MoeShape &shape, uint32_t routerFormat, uint32_t rows) noexcept {
   const uint64_t routes = uint64_t{rows} * shape.expertsPerToken;
   MoeConfig config;
-  config.expertTile = routes > shape.experts ? MoeExpertTile::M32 : MoeExpertTile::M8;
   config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, routerFormat);
   config.int8Passes = shape.int8Experts && int8PrefillPaths(calibration, int8Activations, step) &&
                       rows > kMaximumDecodeTileRows && routes >= uint64_t{kInt8PassRoutesPerExpert} * shape.experts;
+  config.expertTile = routes <= shape.experts ? MoeExpertTile::M8
+                      : step == StepKind::Prefill && !config.int8Passes &&
+                              routes >= uint64_t{calibration.moe.wideTileRoutes} * shape.experts
+                          ? MoeExpertTile::M64
+                          : MoeExpertTile::M32;
   return config;
 }
 

@@ -17,9 +17,9 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations
 // A chunk's rows pick its projections' tile, and a tile's height names its
 // kernels (gguf_decode_<format>_m<rows>_*, the register tile's _l<tiles>), so
 // each tile and height a chunk takes is a class, and the prefill tile one
-// more; and a MoE target's expert passes (selectMoe: the 8- or 32-row staged
-// passes, or the int8 passes), each a class. Every other kernel a chunk's
-// rows pick today changes once along them (selectFloatTile, a MoE router's
+// more; and a MoE target's expert passes (selectMoe: the 8-, 32- or 64-row
+// staged passes, or the int8 passes), each a class. Every other kernel a
+// chunk's rows pick today changes once along them (selectFloatTile, a MoE router's
 // among them, the staged norm, the hyper-connection norm's quarters, and the
 // Neural Engine split, which takes no class's first chunk:
 // AneFfn::kMinimumRows), so a chunk of one row and one of the most take both

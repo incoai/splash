@@ -16,7 +16,9 @@
 // - every dispatch of the 2048-row chunk and of the 1-, 2-, 8- and 32-row steps replayed as its own command.
 //   gguf-moe-benchmark <metallib> tiles [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
 // - steps of 8 to 512 rows on 8- and on 32-row expert tiles (MoeExpertTile, selectMoe's choice), routed at random or,
-//   per lane of 16 rows, from a pool of three times top-k, with the rows each routed expert takes on average.
+//   per lane of 16 rows, from a pool of three times top-k, with the rows each routed expert takes on average;
+// - prefill chunks of 256 to 2048 rows routed at random on 32- and on 64-row expert tiles, each timed twice in the
+//   order 32, 64, 64, 32, with the chunk's routes per expert.
 // Each command runs layers of their own routes and buffers over one set of weights larger than the system cache, so a
 // layer streams its experts from DRAM: kDecodeLayers per decode step, kPrefillLayers per prefill chunk. Printed are
 // medians of GPU ms per layer over `rounds` (20) commands.
@@ -209,6 +211,16 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
                routing == Routing::Random ? "random" : "pooled", rowsPerExpert(m8, rows), eight, thirtyTwo,
                thirtyTwo / eight, uint32_t(plans.moe(shape, routerFormat, rows, splash::ops::StepKind::Prefill).configuration().expertTile));
       }
+    printf("  rows | routes per expert | M32 ms | M64 ms | M64/M32 | plan's tile\n");
+    for (const uint32_t rows : {256u, 512u, 768u, 1024u, 1536u, 2048u}) {
+      const Layers m32 = layers(tiled(rows, splash::ops::MoeExpertTile::M32), Routing::Random);
+      const Layers m64 = layers(tiled(rows, splash::ops::MoeExpertTile::M64), Routing::Random);
+      const double a = time(m32), b = time(m64), b2 = time(m64), a2 = time(m32);
+      const double thirtyTwo = (a + a2) / 2, sixtyFour = (b + b2) / 2;
+      printf("  %4u | %6.2f | %.4f | %.4f | %.3f | M%u\n", rows, double(rows) * topK / E, thirtyTwo, sixtyFour,
+             sixtyFour / thirtyTwo,
+             uint32_t(plans.moe(shape, routerFormat, rows, splash::ops::StepKind::Prefill).configuration().expertTile));
+    }
     return 0;
   }
   if (int8) {

@@ -719,7 +719,13 @@ The rules:
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
 4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
    while a step's routes average at most one row per expert (a decode step's
-   of up to 32 rows of every family) and 32-row tiles beyond. One plan per
+   of up to 32 rows of every family) and 32-row tiles beyond. On the M5 Pro
+   (Apple10, 16 to 31 cores) a prefill chunk on the staged passes whose
+   routes average 64 or more an expert runs 64-row tiles
+   (`ops::MoeCalibration::wideTileRoutes`), which dequantize an expert's
+   weights once for up to 64 of its rows: from 1024 rows on Inkling-2-Mini,
+   at 2048 on Qwen3.6-35B-A3B and Qwen3.5-122B-A10B. A row's result is the
+   same bits on every tile. One plan per
    step serves every block, so its router follows rule 3 in the format of
    most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
    are the step's routes', packed (`ops::MoeScratch`). With int8 activations
@@ -785,8 +791,10 @@ every projection
   prefill tile, from 65 rows; and a MoE target's expert passes
   (`ops::selectMoe`), each a class: the 32-row staged passes from the rows
   whose routes outnumber its experts (33 on Qwen3.6-35B-A3B and
-  Qwen3.5-122B-A10B, 43 on Flint, 52 on Qwen3.8-Flash-Next), and the int8
-  passes where they run (from 192, 256 and 308 rows). These need no memory
+  Qwen3.5-122B-A10B, 43 on Flint, 52 on Qwen3.8-Flash-Next), the M5 Pro's
+  64-row passes from the rows whose routes average 64 an expert (1024 on
+  Inkling-2-Mini, 2048 on the 35B and the 122B), and the int8 passes where
+  they run (from 192, 256 and 308 rows). These need no memory
   the first did not, and are required as it is. Every other kernel choice a
   chunk's rows make has one threshold (the float tiles, the MoE router's
   tile, the staged norm, the hyper-connection norm's quarters, and the
@@ -1029,7 +1037,7 @@ slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select
 (`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
 (`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`); the softmax router's one gated slice is the
 unsuffixed instances. The grouping packs the tiles' rows, a grouped row per route, each tile's after
-the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16- or 32-row matmul reads past
+the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16-, 32- or 64-row matmul reads past
 its live rows into the next tile's, or past the last tile into the `tileRows - 1` rows the scratch
 holds past the routes', and stores its live rows alone.
 The expert passes launch the live tiles alone: the grouping kernel writes each
@@ -1170,9 +1178,10 @@ finite, and a plan of one or two rows on the column tile in every format and in 
 triples within the bound, a fused triple's segments bitwise each one's projection alone, the
 rows past its own unread and unwritten; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
-plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
-against fp64, bitwise against the full grids and two gate/up passes, a decode step routing its
-lanes' rows alone, no row of no lane, and with the experts in
+plan, the staged 8-, 32- and 64-row tiles, in every format as each routed and shared expert tensor,
+against fp64, bitwise against the full grids and two gate/up passes, every row of the 64-row tiles
+bitwise its row of the 32-row tiles (also over four whole 64-row tiles an expert), a decode step
+routing its lanes' rows alone, no row of no lane, and with the experts in
 permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
 bitwise as in one chunk, and refuses floor and elastic chunks one unit short, a malformed chunk list
 or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts

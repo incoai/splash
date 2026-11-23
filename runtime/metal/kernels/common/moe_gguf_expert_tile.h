@@ -22,16 +22,17 @@ __attribute__((noinline)) void moe_expert_column(uint format, device bfloat *x, 
 // chunks of the table `chunks`, of a block whose shared expert is Shared slices (each instance's slices suffix,
 // ops::kCompiledMoeRoutings), in the format the tile picks at run time (within -11..+8% of a dispatch per format). Two
 // simdgroups each stream their own 32 columns through the decode tile, grid (N / 64, tiles), on 8-row tiles (decode
-// steps, short prefill chunks) or 32-row tiles (longer chunks, ops::selectMoe), where a tile runs the 8-, 16- or
-// 32-row matmul that holds its live rows (moe_live_rows): an expert's last tile is mostly partial, so on the 35B's
-// prefill routes 32-row tiles take 17-30% less time than 64-row ones. An expert's only tile of at most
-// GGUF_COLUMN_ROWS live rows runs the column tile instead (kernels/common/gguf_column_tile.h, moe_column_tile),
-// each lane one of the simdgroup's columns over the live rows: routes spread over many experts leave most decode tiles
-// at one or two rows, where the staged tile's padded matmul steps bound it. store(o, v) writes the output element o of
-// the fp32 sum v, which it rounds to bf16 first: a partial staged tile hands it the sum it parked as bf16. `formats`
-// switches to the formats the pass decodes (moe_gguf.metal's moe_formats, every format for gguf-moe's reference).
-// Without `column_tiles` every tile runs the staged tile (moe_gguf.metal's kMoeColumnTiles). Each sum is its
-// expert's scale of the projection (moe_expert_scale) times the products'.
+// steps, short prefill chunks), 32-row tiles (longer chunks) or 64-row tiles (an M5 Pro's chunks whose routes average
+// 64 an expert, ops::selectMoe), where a tile runs the 8-, 16-, 32- or 64-row matmul that holds its live rows
+// (moe_live_rows): an expert's last tile is mostly partial. Each matmul sums a row's products over each 32-input step
+// as the others do and the steps in one order, so a row's output is the same bits on every tile. An expert's only tile
+// of at most GGUF_COLUMN_ROWS live rows runs the column tile instead (kernels/common/gguf_column_tile.h,
+// moe_column_tile), each lane one of the simdgroup's columns over the live rows: routes spread over many experts leave
+// most decode tiles at one or two rows, where the staged tile's padded matmul steps bound it. store(o, v) writes the
+// output element o of the fp32 sum v, which it rounds to bf16 first: a partial staged tile hands it the sum it parked
+// as bf16. `formats` switches to the formats the pass decodes (moe_gguf.metal's moe_formats, every format for
+// gguf-moe's reference). Without `column_tiles` every tile runs the staged tile (moe_gguf.metal's kMoeColumnTiles).
+// Each sum is its expert's scale of the projection (moe_expert_scale) times the products'.
 template <ushort Rows, uint Shared, uint Projection, class Store, class Formats = any_quant_format>
 inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles,
                                  device const uint *tile_count, device uchar *sw0, device uchar *sw1,
