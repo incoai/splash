@@ -7,7 +7,9 @@
 //   split in two carrying the state (the same bits as one chunk), states
 //   captured inside the sequences by the convolution's dispatches;
 // - a verify block's tree, whose rows tap their paths, the tape, and the
-//   commit of accepted paths of two lanes, rejected rows and all;
+//   commit of accepted paths of two lanes, rejected rows and all, and a
+//   decode capture's fold of a path's first rows, bit for bit the commit of
+//   a lane that retained exactly those;
 // - a verify step's two convolutions in one dispatch
 //   (ShortConvolution::addConvolutionPair), the keys and values of rows of
 //   their own or of one projection's rows of both, bit for bit each one's own
@@ -36,6 +38,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -409,6 +412,41 @@ void convTreeTest(MetalBackend &backend, ops::ShortConvShape shape) {
     check(okCommit, scope + ": the commit of the paths to row " + std::to_string(leaf) + " and " +
                         std::to_string(kept) + " chain rows, every column");
   }
+  // A decode capture's fold of a lane's path (lane 0's to row 6, lane 1's
+  // whole chain) at each of its rows: the commit's bits where the lane
+  // retained exactly the path's first `taken` rows, its other lane's
+  // layout beside it; past the path's rows the fold leaves its state as it
+  // was.
+  const std::array<uint32_t, 2> paths{tree[6].ancestors, splash::test::chainPath(3)};
+  const uint64_t stateBytes = ops::ShortConvolution::stateBytes(state.stride);
+  const std::vector<uint16_t> untouched(stateBytes / 2, 0x7FC1);
+  bool okFold = true, okPast = true;
+  for (uint32_t l = 0; l < 2; ++l)
+    for (uint32_t taken = 1; taken <= uint32_t(std::popcount(paths[l])) + 1; ++taken) {
+      // The path's first `taken` rows, the commit's of a lane that retained
+      // them; the other lane retains its whole path.
+      uint32_t first = 0;
+      for (uint32_t rest = paths[l], row = 0; row < taken && rest; ++row, rest &= rest - 1)
+        first |= 1u << std::countr_zero(rest);
+      std::array<uint32_t, 2> retained = paths;
+      retained[l] = first;
+      std::vector<MetalBuffer> out{scratch(backend, stateBytes), scratch(backend, stateBytes)};
+      const MetalBuffer fold = upload(backend, untouched);
+      CommandGraph graph;
+      ops::ShortConvolution::addCommit(graph, fullTapeBuffer, in, out,
+                                       upload(backend, std::vector<uint32_t>(retained.begin(), retained.end())),
+                                       state.stride, layout, {2, rows, 8});
+      ops::ShortConvolution::addFold(graph, fullTapeBuffer, in[l], fold, upload(backend, std::vector<uint32_t>{paths[l]}),
+                                     state.stride, laneRowsOf(backend, std::span(&lanes[l], 1)), rows, taken);
+      run(backend, graph);
+      const auto folded = download<uint16_t>(fold, stateBytes / 2);
+      if (taken > uint32_t(std::popcount(paths[l])))
+        okPast &= folded == untouched;
+      else
+        okFold &= folded == download<uint16_t>(out[l], stateBytes / 2);
+    }
+  check(okFold, scope + ": a fold of each path's first rows, the commit of a lane that retained exactly those");
+  check(okPast, scope + ": a fold past its path's rows leaves its state as it was");
 }
 
 // A verify step's keys and values in one dispatch

@@ -858,7 +858,8 @@ public:
   // them leave RAM, their copies landing when it says so.
   std::shared_ptr<OffloadControl> offloadTier;
   // Its decode cycles capture states (Model::capturesInDecode), as every
-  // target but one with auxiliary state bytes does.
+  // target that folds its state does (QwenTarget::foldsState): all but one
+  // whose commit alone writes its auxiliary state.
   bool decodeStateCaptures = true;
   uint32_t deniedReservations = 0;
   std::optional<uint32_t> denyReservationAt;

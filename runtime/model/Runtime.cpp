@@ -2117,7 +2117,7 @@ struct Runtime::Impl {
     if (!capturesInDecode())
       return;
     CommandGraph graph;
-    encodeCapture(graph, lane, stateLane, states.current(stateLane).stateBase, states.window(stateLane), 1, 0,
+    encodeCapture(graph, lane, stateLane, states.current(stateLane), states.window(stateLane), 1, 0,
                   {1, kDraftRows, ops::verifyLaneCap(kDraftRows, 1)});
     backend.preparePipelines(graph.dispatches());
   }
@@ -2423,9 +2423,10 @@ struct Runtime::Impl {
     return anchors;
   }
 
-  // A target whose commit writes auxiliary state after every retained row
-  // has none of a fold's rows alone to give.
-  bool capturesInDecode() const noexcept { return !geometry.target.stateLayout.auxiliaryBytes; }
+  // A target that folds its state at a boundary inside a verify's retained
+  // rows (QwenTarget::foldsState) captures it there; one whose commit alone
+  // writes its auxiliary state has none of a fold's rows alone to give.
+  bool capturesInDecode() const noexcept { return targetModel->foldsState(); }
 
   // The state a decode item captures, at most one: at the page boundary
   // past the lane's position that a verify block's rows may reach within the
@@ -2918,11 +2919,13 @@ struct Runtime::Impl {
   // the path of its rows its acceptance wrote (DecodeTensor::
   // RetainedRows): the capture folds the path's first `rows` rows of the
   // verify's tape into the state the verify wrote and stores the result's
-  // codes in the state's cell (QwenTarget::addStateFold), and their context
-  // rows, which the draft's commit normalized, in the state's window. The
-  // completion seals the state only where the lane retained them
-  // (finalizeDecode). A boundary past the rows the lane may retain this
-  // cycle (`maximumRetained`) is none of its cycle's (prepareDecodeCapture).
+  // codes in the state's cell (QwenTarget::addStateFold), a folding family's
+  // auxiliary state those rows' fold of what its commit reads
+  // (Inkling2LoopTarget::addStateFold), and their context rows, which the
+  // draft's commit normalized, in the state's window. The completion seals
+  // the state only where the lane retained them (finalizeDecode). A
+  // boundary past the rows the lane may retain this cycle
+  // (`maximumRetained`) is none of its cycle's (prepareDecodeCapture).
   void encodeDecodeCaptures(CommandGraph &graph, std::span<Request *const> entries,
                             std::span<const ModelBatchItem> items, std::span<const uint32_t> maximumRetained,
                             const ops::StepRows &step) {
@@ -2932,24 +2935,31 @@ struct Runtime::Impl {
         if (rows > maximumRetained[lane])
           continue;
         const QwenCachedBuffers &state = static_cast<QwenStateReservation &>(*capture.reservation).buffers();
-        encodeCapture(graph, lane, entries[lane]->stateLane, state.gdn->buffers().stateBase, state.window->buffer(),
-                      rows, static_cast<uint32_t>(items[lane].logicalPosition), step);
+        encodeCapture(graph, lane, entries[lane]->stateLane, state.gdn->buffers(), state.window->buffer(), rows,
+                      static_cast<uint32_t>(items[lane].logicalPosition), step);
       }
     }
   }
 
   // A capture's commands on decode lane `lane` of state lane `stateLane`
   // (encodeDecodeCaptures), in a cycle of `step`: the fold of the first
-  // `rows` rows of the lane's retained path in the verify's tape into the GDN
-  // state `fold` and the commit of their context rows, from `position`, to
-  // the state's `window`.
-  void encodeCapture(CommandGraph &graph, uint32_t lane, uint32_t stateLane, const MetalBuffer &fold,
+  // `rows` rows of the lane's retained path into the cached cell `fold`, the
+  // GDN state's from the verify's tape and the auxiliary state's from the
+  // lane's before the step, and the commit of their context rows, from
+  // `position`, to the state's `window`.
+  void encodeCapture(CommandGraph &graph, uint32_t lane, uint32_t stateLane, const GdnParityBuffers &fold,
                      const MetalBuffer &window, uint32_t rows, uint32_t position, const ops::StepRows &step) const {
+    const uint64_t stepSlot = decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1);
     targetModel->addStateFold(graph,
-                              {decodeArena->get(lane, DecodeTensor::RetainedRows), states.next(stateLane).stateBase,
-                               decodeArena->all(DecodeTensor::GdnTape),
-                               decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1), fold},
-                              rows);
+                              {.retainedRows = decodeArena->get(lane, DecodeTensor::RetainedRows),
+                               .laneRows = decodeArena->get(lane, DecodeTensor::LaneLayout),
+                               .state = states.next(stateLane).stateBase,
+                               .gdnTape = decodeArena->all(DecodeTensor::GdnTape),
+                               .stepSlot = stepSlot,
+                               .auxiliaryIn = states.current(stateLane).auxiliary,
+                               .fold = fold.stateBase,
+                               .foldAuxiliary = fold.auxiliary},
+                              rows, step);
     // The window takes the first rows of the lane's retained path, which
     // its capture holds when the lane retained them.
     ops::DraftAttention::addWindowCommit(graph, decodeArena->all(DecodeTensor::ContextHidden),

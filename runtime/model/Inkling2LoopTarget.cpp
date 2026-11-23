@@ -443,6 +443,14 @@ void Inkling2LoopTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCo
                                    schedule_.stateColumns(), buffers.laneRows, {lanes, step.rows, step.laneCap});
 }
 
+void Inkling2LoopTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows,
+                                      const ops::StepRows &step) const {
+  QwenTarget::addStateFold(graph, buffers, rows, step);
+  ops::ShortConvolution::addFold(graph, steps_.verifyScratch().tape, std::move(buffers.auxiliaryIn),
+                                 std::move(buffers.foldAuxiliary), std::move(buffers.retainedRows),
+                                 schedule_.stateColumns(), std::move(buffers.laneRows), step.rows, rows);
+}
+
 void Inkling2LoopTarget::addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
                                          std::span<const metal::MetalBuffer> pageTables,
                                          std::span<const uint32_t> committed, uint32_t laneRows,

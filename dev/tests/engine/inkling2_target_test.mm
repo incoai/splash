@@ -35,7 +35,12 @@
 //   beside other prompts of the same lengths; four lanes of one prompt alike;
 //   the prompt and the four lanes with streamed experts, as with resident
 //   ones;
-// - each lane of the four against its prompt alone, within bounds.
+// - each lane of the four against its prompt alone, within bounds;
+// - a decode capture's fold of a lane's first retained rows, bit for bit the
+//   convolution state its commit writes where the lane retained exactly
+//   those: of a cycle that retained them alone and of one that retained more,
+//   on either lane of a step of two, each lane's chain forced by its grammar
+//   and walked by its masks.
 //
 //   inkling2-target METALLIB FIXTURE_DIR [bitwise]
 //   inkling2-target METALLIB --write-fixture DIR
@@ -77,6 +82,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -335,6 +341,142 @@ public:
       position += decoded[0].outputTokens.size();
     }
     executor.end(request.id);
+    return result;
+  }
+
+  // A decode capture's fold against the commit (Inkling2LoopTarget::
+  // addStateFold, addStateCommit): lanes 0 and 1, each a constrained request
+  // of its prompt (both of a length) whose grammar forces its chain from its
+  // first token on, so that its next cycle's rows are that chain (a draft's
+  // block a lane); that cycle captures the page `taken` rows past the
+  // prompts on both lanes, each lane's masks walking it down its chain's
+  // first `taken` rows, or every row where `whole`, the walk ended by `end`.
+  // Its result: each lane's convolution state after the cycle, which its
+  // commit wrote of the rows it retained, each lane's capture restored, and
+  // the rows each retained.
+  struct Folds final {
+    std::array<std::vector<uint8_t>, 2> committed;
+    std::array<std::vector<uint8_t>, 2> captured;
+    std::array<uint32_t, 2> retained{};
+  };
+  Folds folds(const std::array<std::vector<uint32_t>, 2> &prompts, const std::array<std::vector<uint32_t>, 2> &runs,
+              uint32_t taken, uint32_t end, std::array<bool, 2> whole) {
+    model::RuntimeContext context{backend_, model_, *pages_, *states_, operators_};
+    model::Runtime executor(context);
+    const auto rows = static_cast<uint32_t>(prompts[0].size()), boundary = rows + taken;
+    require(prompts[1].size() == rows && boundary % kv::kPageTokens == 0 && taken < runs[0].size() &&
+                runs[1].size() == runs[0].size(),
+            "a fold's boundary is no page inside its lanes' chains");
+    const uint32_t words = model::maskWordsPerToken(vocabulary_);
+    const auto singletons = [&](std::span<const uint32_t> tokens) {
+      std::vector<uint32_t> masks(tokens.size() * words, 0);
+      for (size_t row = 0; row < tokens.size(); ++row) masks[row * words + tokens[row] / 32] |= 1u << (tokens[row] % 32);
+      return masks;
+    };
+    const auto bytes = [](const metal::MetalBuffer &buffer) {
+      const auto *data = static_cast<const uint8_t *>(buffer.contents());
+      return std::vector<uint8_t>(data, data + buffer.sizeBytes());
+    };
+    std::array<uint64_t, 2> ids{};
+    std::array<std::vector<uint32_t>, 2> tables;
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const std::span<const uint32_t> prompt = prompts[lane], run = runs[lane];
+      EngineRequest request;
+      request.id = ids[lane] = ++id_;
+      request.prompt.assign(prompt.begin(), prompt.end());
+      request.maxNewTokens = 64;
+      request.constraint = ConstraintMode::TokenMask;
+      executor.beginColdRequest(request.modelView(), lane);
+      tables[lane].resize(lanePages_);
+      std::iota(tables[lane].begin(), tables[lane].end(), lane * lanePages_);
+      BatchPlan prefill{.kind = WorkKind::Prefill, .items = {{request.id, rows, 0}}, .decodeStage = DecodeStage::Regular};
+      ModelBatchItem item{request.id, 0, rows, tables[lane], 1};
+      item.inputTokens = prompt;
+      const std::vector<ModelStepResult> prefilled = executor.prefill(prefill, std::span(&item, 1));
+      require(prefilled.size() == 1 && prefilled[0].failure.empty() &&
+                  prefilled[0].nextDecodeStage == DecodeStage::ApplyInitialMask,
+              "a constrained prompt's prefill failed or asked for no first mask");
+      std::vector<uint32_t> forced;
+      for (const uint32_t token : run) forced.insert(forced.end(), {0u, token});
+      const std::optional<std::string> rejected = executor.provideMask(request.id, singletons(run.first(1)), forced);
+      require(!rejected, "the runtime rejected a forced run: " + rejected.value_or(""));
+      BatchPlan first{.kind = WorkKind::Decode, .items = {{request.id, 0}}, .decodeStage = DecodeStage::ApplyInitialMask};
+      ModelBatchItem step{request.id, rows, 0, tables[lane], 1};
+      const std::vector<ModelStepResult> selected = executor.decode(first, std::span(&step, 1));
+      require(selected.size() == 1 && selected[0].failure.empty(), "a constrained lane's first selection failed");
+    }
+    // The chain's cycle, a draft's block a lane, each lane capturing at the
+    // boundary; the items go once the command is submitted, as the engine's
+    // do.
+    model::RuntimeInstrumentation::forceStepRows(executor, 2 * model::ExecutionLimits::draftQueryRows);
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+    std::unique_ptr<ModelBatchTicket> ticket;
+    {
+      std::vector<ModelBatchItem> items;
+      for (uint32_t lane = 0; lane < 2; ++lane) {
+        plan.items.push_back({ids[lane], 0});
+        ModelBatchItem &item = items.emplace_back(ModelBatchItem{ids[lane], rows, 0, tables[lane], 1});
+        metal::AllocationFailure refusal;
+        item.stateCaptures.push_back({boundary, executor.reserveState(ids[lane], boundary, refusal)});
+        require(item.stateCaptures.back().reservation != nullptr, "the buffers of a decode capture were refused");
+      }
+      ticket = executor.submit(plan, items, [] {});
+    }
+    std::vector<ModelMaskRequest> requests;
+    while (requests.empty()) {
+      ticket->advance();
+      requests = ticket->takeMaskRequests();
+      require(!ticket->ready(), "a constrained cycle completed before its masks");
+      if (requests.empty()) std::this_thread::yield();
+    }
+    require(requests.size() == 2, "a constrained lane asked for no mask");
+    for (const ModelMaskRequest &request : requests) {
+      const uint32_t lane = request.requestId == ids[0] ? 0 : 1;
+      const std::span<const uint32_t> run = runs[lane];
+      bool chain = std::ranges::equal(request.simulationTokens, run);
+      for (uint32_t row = 1; chain && row < request.parents.size(); ++row) chain = request.parents[row] == row - 1;
+      require(chain, "a forced run's cycle verified other rows than its chain");
+      // A mask before the anchor, then one after each row: the chain's next
+      // token along the walk, `end` past it.
+      const auto walked = whole[lane] ? static_cast<uint32_t>(run.size()) : taken;
+      std::vector<uint32_t> tokens(run.size() + 1, end);
+      tokens[0] = run[0];
+      for (uint32_t row = 0; row + 1 < walked; ++row) tokens[1 + row] = run[row + 1];
+      const std::optional<std::string> refused = executor.provideMask(request.requestId, singletons(tokens), {});
+      require(!refused, "the runtime rejected a walk's masks: " + refused.value_or(""));
+    }
+    while (!ticket->ready()) {
+      ticket->advance();
+      require(ticket->takeMaskRequests().empty(), "a constrained cycle asked for its masks twice");
+      if (!ticket->ready()) std::this_thread::yield();
+    }
+    const std::vector<ModelStepResult> cycled = ticket->wait();
+    ticket.reset();
+    model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+    require(cycled.size() == 2, "a constrained cycle lost a lane");
+    Folds result;
+    std::array<std::shared_ptr<const CompositeState>, 2> captures;
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      require(cycled[lane].failure.empty() && cycled[lane].capturedStates.size() == 1,
+              "a lane's cycle failed or sealed no capture at its page: " + cycled[lane].failure);
+      captures[lane] = cycled[lane].capturedStates.front();
+      result.committed[lane] = bytes(states_->current(lane).auxiliary);
+      result.retained[lane] = static_cast<uint32_t>(states_->metadata(lane).lengths.targetTokens - rows);
+      executor.end(ids[lane]);
+    }
+    // Each capture restored into lane 2, of a request a token past it.
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      std::vector<uint32_t> through = prompts[lane];
+      through.insert(through.end(), runs[lane].begin(), runs[lane].begin() + taken + 1);
+      EngineRequest request;
+      request.id = ++id_;
+      request.prompt = std::move(through);
+      request.maxNewTokens = 1;
+      executor.beginColdRequest(request.modelView(), 2);
+      require(!executor.beginRestore(request.id, boundary, captures[lane], true, {}), "a RAM restore returned a read");
+      result.captured[lane] = bytes(states_->current(2).auxiliary);
+      executor.end(request.id);
+    }
     return result;
   }
 
@@ -896,6 +1038,44 @@ int runBitwise(Loaded &loaded) {
   check(streamed.run(ids, whole, 1).logits == harness.run(ids, whole, 1).logits,
         "streamed experts, the prompt: the resident experts' bits");
   check(streamed.runLanes(prompts) == lanes, "streamed experts, four lanes: the resident experts' bits");
+  // A decode capture's fold of a lane's first `taken` retained rows: the
+  // convolution state the lane's commit writes where it retained exactly
+  // those, bit for bit, whether its cycle retained them alone or a longer
+  // path past them. Each lane has a prompt and a chain of its own (eight
+  // later ids of the prompt each, the walks' end another, none a stop
+  // token), so a fold that read another lane's rows, path or state would
+  // give that lane's: of two cycles of the same rows, each lane walks its
+  // chain exactly `taken` rows in one and wholly in the other.
+  const ops::StopTokens &stops = loaded.fixture.layout.stopTokens;
+  std::array<std::vector<uint32_t>, 2> runs;
+  for (uint32_t lane = 0, at = 700; lane < 2; ++lane, at = 900)
+    for (; runs[lane].size() < model::ExecutionLimits::draftQueryRows; ++at)
+      if (!stops.contains(ids[at]) && std::ranges::find(runs[0], ids[at]) == runs[0].end() &&
+          std::ranges::find(runs[1], ids[at]) == runs[1].end())
+        runs[lane].push_back(ids[at]);
+  uint32_t end = ids[800];
+  while (stops.contains(end) || std::ranges::find(runs[0], end) != runs[0].end() ||
+         std::ranges::find(runs[1], end) != runs[1].end())
+    end = (end + 1) % tokens;
+  for (const uint32_t taken : {1u, 2u, 5u, 7u}) {
+    const uint32_t length = 4 * kv::kPageTokens - taken;
+    const std::array<std::vector<uint32_t>, 2> lanePrompts{std::vector<uint32_t>(ids.begin(), ids.begin() + length),
+                                                           std::vector<uint32_t>(ids.begin() + 100,
+                                                                                 ids.begin() + 100 + length)};
+    const Harness::Folds first = harness.folds(lanePrompts, runs, taken, end, {false, true});
+    const Harness::Folds second = harness.folds(lanePrompts, runs, taken, end, {true, false});
+    const uint32_t chain = model::ExecutionLimits::draftQueryRows;
+    const bool retained = first.retained == std::array<uint32_t, 2>{taken, chain} &&
+                          second.retained == std::array<uint32_t, 2>{chain, taken};
+    check(retained && first.captured[0] == first.committed[0] && second.captured[1] == second.committed[1] &&
+              first.committed[0] != second.committed[1],
+          "a decode capture of all " + std::to_string(taken) + " rows its lane retained, on either lane: the " +
+              "convolution state its commit writes, bit for bit");
+    check(retained && first.captured[1] == second.committed[1] && second.captured[0] == first.committed[0],
+          "a decode capture of the first " + std::to_string(taken) + " of " + std::to_string(chain) +
+              " retained rows, on either lane: the convolution state its commit writes of exactly those, bit for " +
+              "bit");
+  }
   return failures;
 }
 

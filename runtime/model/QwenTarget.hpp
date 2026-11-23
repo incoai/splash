@@ -391,18 +391,24 @@ struct QwenTargetCommitBuffers final {
   uint32_t indexLayerBytes = 0;
 };
 
-// The GDN state after the first rows of the path a lane accepted of its
-// verify, folded into a cached state's cell from the verify's tape
-// (addStateFold): the lane's retained rows (the path, a row mask of its
-// block, as acceptance wrote it), the cell the verify wrote, which holds the
-// state before its rows, the lanes' decode tapes and the offset of the
-// verify's slot in them, and the cached cell, which takes the state's codes.
+// The state after the first rows of the path a lane accepted of its verify,
+// folded into a cached state's cell (addStateFold): the lane's retained rows
+// (the path, a row mask of its block, as acceptance wrote it) and its rows of
+// the step as the device holds them (SplashLaneRows); for the GDN state, the
+// cell the verify wrote, which holds the state before its rows, the lanes'
+// decode tapes and the offset of the verify's slot in them; for a family's
+// auxiliary state, the lane's before the step, which its commit reads
+// (QwenTargetCommitBuffers::auxiliaryIn); and the cached cell, which takes
+// the GDN state's codes, and its auxiliary state.
 struct QwenTargetFoldBuffers final {
   metal::MetalBuffer retainedRows;
+  metal::MetalBuffer laneRows;
   metal::MetalBuffer state;
   metal::MetalBuffer gdnTape;
   uint64_t stepSlot = 0;
+  metal::MetalBuffer auxiliaryIn;
   metal::MetalBuffer fold;
+  metal::MetalBuffer foldAuxiliary;
 };
 
 // The bytes of a target's own step scratch beside the runtime's arenas, a
@@ -552,14 +558,24 @@ public:
   // computed of its rows. None for a target without auxiliary state.
   virtual void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
                               const ops::StepRows &step) const;
-  // After a verify's acceptance, the GDN state after its first `rows` rows of
-  // one lane, which the lane's next step would hold had the lane retained
-  // exactly those, as a cached state stores it (its convolution rows and its
-  // recurrent state's codes, ops::GDN::addFold), when the lane retained that
-  // many. None for a target without GDN layers; a target with auxiliary
-  // state, which its commit writes after every retained row, captures no
-  // state in decode (Model::capturesInDecode).
-  void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const;
+  // Whether addStateFold gives the whole state a lane holds at a boundary
+  // inside a verify's retained rows, so that decode captures states
+  // (Model::capturesInDecode): the GDN state's fold, and a family's own of
+  // its auxiliary state (Inkling-2-Mini's convolutions). A family whose
+  // commit alone writes its auxiliary state, after every retained row
+  // (Qwen3.8-Flash-Next's PLE history and its indexer's pending keys),
+  // folds none.
+  [[nodiscard]] virtual bool foldsState() const noexcept;
+  // After a verify's acceptance in a step of `step`, the state after its
+  // first `rows` rows of one lane, which the lane's next step would hold had
+  // the lane retained exactly those, as a cached state stores it: the GDN
+  // state's convolution rows and its recurrent state's codes
+  // (ops::GDN::addFold), and a folding family's auxiliary state, when the
+  // lane retained that many. The GDN's is none for a target without GDN
+  // layers; a target that folds no state (foldsState) captures none in
+  // decode.
+  virtual void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows,
+                            const ops::StepRows &step) const;
   // The commit of each lane's accepted path's K/V after a decode step, in
   // every attention layer (ops::PagedAttention::addPathCommit, whose
   // arguments these are): the shared attention's, or a family's that stores

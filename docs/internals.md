@@ -2797,7 +2797,14 @@ cell and the codec after it would move 470 MiB), and the state's window is a
 copy of the lane's plus those rows' context; the completion seals the state only
 where the lane retained those rows. Both writes are one function of the runtime
 (`encodeDecodeCaptures`), which names the rows a lane retained: the path of its
-rows its acceptance wrote, whose first rows before the page both take. Each such state is a rolling
+rows its acceptance wrote, whose first rows before the page both take. A
+target captures in decode where its fold gives the whole state at the page
+(`QwenTarget::foldsState`): Inkling-2-Mini's state is its convolutions' input
+rows alone, which its commit writes after the retained rows from the inputs
+its verify left on its own tape, and its fold is that dispatch over the
+path's first rows into the state's auxiliary state
+(`ops::ShortConvolution::addFold`), bit for bit what the commit writes where
+the lane retained exactly those rows. Each such state is a rolling
 checkpoint of the reply that retires the one before it, which a preempted lane
 resumes from once its KV holds a token past it, and the last, once the request
 ends, is the reply's state: the point a next request whose prompt renders the
@@ -2835,10 +2842,10 @@ reservation, so once the lanes end the pool holds those reservations' cached
 cells beside the lanes' cells (`state.idle_cached_cells` 2 beside
 `idle_gdn_cells` 8 after four lanes' 300-token replies at a 22 GB limit, where
 1.6.2 leaves 8 cells), which a claim takes first (step 1 above). A target
-whose state commit writes auxiliary state after its retained rows
-(Qwen3.8-Flash-Next, Inkling 2) captures none in decode
-(`Model::capturesInDecode`), and its decode writes the rings alone. A target
-without GDN layers keeps no GDN
+whose state commit alone writes auxiliary state after its retained rows
+(Qwen3.8-Flash-Next's PLE history and its indexer's pending keys) folds none
+and captures none in decode (`Model::capturesInDecode`), and its decode writes
+the rings alone. A target without GDN layers keeps no GDN
 state: its cells have no bytes, every lane and state shares one empty cell
 that holds no memory, so a lane holds the draft's rings and window and a
 cached state the window alone, and `state.idle_gdn_cells` and

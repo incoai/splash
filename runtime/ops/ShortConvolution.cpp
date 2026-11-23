@@ -253,32 +253,58 @@ void ShortConvolution::addCombineConvolution(metal::CommandGraph &graph, const S
             {MOE_COMBINE_CONVOLUTION_CHANNELS, rows.bound, 1});
 }
 
+namespace {
+
+// The commit's dispatch over `sequences` lanes of a step of `stepRows` rows,
+// each lane's state after its whole path, or with pathRows a fold's after
+// its path's first pathRows rows (short_convolution_commit).
+void addPathState(metal::CommandGraph &graph, metal::MetalBuffer tape, std::span<const metal::MetalBuffer> stateIn,
+                  std::span<const metal::MetalBuffer> stateOut, metal::MetalBuffer paths, uint32_t columns,
+                  metal::MetalBuffer layout, uint32_t sequences, uint32_t stepRows, uint32_t pathRows) {
+  if (!columns || stateIn.size() != sequences || stateOut.size() != sequences)
+    throw std::invalid_argument("invalid short convolution commit");
+  // The GPU's paths are of the lanes' verify rows, any of which they may hold.
+  requireBytes(tape, bfloat16Rows(stepRows, columns), "short convolution tape");
+  for (const metal::MetalBuffer &s : stateIn)
+    requireBytes(s, ShortConvolution::stateBytes(columns), "short convolution state");
+  for (const metal::MetalBuffer &s : stateOut)
+    requireBytes(s, ShortConvolution::stateBytes(columns), "short convolution next state");
+  requireBytes(paths, uint64_t{sequences} * sizeof(uint32_t), "short convolution accepted path");
+  requireBytes(layout, uint64_t{sequences} * sizeof(SplashLaneRows), "short convolution layout");
+  ShortConvolutionParams p{};
+  p.rows = stepRows;
+  p.channels = columns;
+  p.sequences = sequences;
+  p.state_stride = columns;
+  p.captures = pathRows ? 1u : 0u;
+  p.capture_rows[0] = pathRows;
+  const auto in = laneBindings(stateIn), out = laneBindings(stateOut);
+  graph.add("short_convolution_commit",
+            {std::move(tape), in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], out[0], out[1], out[2], out[3],
+             out[4], out[5], out[6], out[7], std::move(paths), std::move(layout)},
+            p, {kStateRows, groups(columns), sequences}, {kThreads, 1, 1});
+}
+
+} // namespace
+
 void ShortConvolution::addCommit(metal::CommandGraph &graph, metal::MetalBuffer tape,
                                  std::span<const metal::MetalBuffer> stateIn,
                                  std::span<const metal::MetalBuffer> stateOut, metal::MetalBuffer paths,
                                  uint32_t columns, metal::MetalBuffer layout, const LayoutRows &rows) {
   // A lane's path is a row mask of its rows.
   requireLayoutRows(rows, 32);
-  if (!columns || stateIn.size() != rows.sequences || stateOut.size() != rows.sequences)
-    throw std::invalid_argument("invalid short convolution commit");
-  // The GPU's paths are of the lanes' verify rows, any of which they may hold.
-  requireBytes(tape, bfloat16Rows(rows.rows, columns), "short convolution tape");
-  for (const metal::MetalBuffer &s : stateIn)
-    requireBytes(s, ShortConvolution::stateBytes(columns), "short convolution state");
-  for (const metal::MetalBuffer &s : stateOut)
-    requireBytes(s, ShortConvolution::stateBytes(columns), "short convolution next state");
-  requireBytes(paths, uint64_t{rows.sequences} * sizeof(uint32_t), "short convolution accepted path");
-  requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "short convolution layout");
-  ShortConvolutionParams p{};
-  p.rows = rows.rows;
-  p.channels = columns;
-  p.sequences = rows.sequences;
-  p.state_stride = columns;
-  const auto in = laneBindings(stateIn), out = laneBindings(stateOut);
-  graph.add("short_convolution_commit",
-            {std::move(tape), in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], out[0], out[1], out[2], out[3],
-             out[4], out[5], out[6], out[7], std::move(paths), std::move(layout)},
-            p, {kStateRows, groups(columns), rows.sequences}, {kThreads, 1, 1});
+  addPathState(graph, std::move(tape), stateIn, stateOut, std::move(paths), columns, std::move(layout),
+               rows.sequences, rows.rows, 0);
+}
+
+void ShortConvolution::addFold(metal::CommandGraph &graph, metal::MetalBuffer tape, metal::MetalBuffer stateIn,
+                               metal::MetalBuffer fold, metal::MetalBuffer path, uint32_t columns,
+                               metal::MetalBuffer layout, uint32_t stepRows, uint32_t pathRows) {
+  // A path is a row mask of a lane's rows, at most 32 of the step's.
+  if (!stepRows || !pathRows || pathRows > 32)
+    throw std::invalid_argument("invalid short convolution fold");
+  addPathState(graph, std::move(tape), std::span(&stateIn, 1), std::span(&fold, 1), std::move(path), columns,
+               std::move(layout), 1, stepRows, pathRows);
 }
 
 } // namespace splash::ops

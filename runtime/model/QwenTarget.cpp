@@ -122,9 +122,12 @@ void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers b
         throw std::invalid_argument("Qwen state commit lane without its auxiliary state");
 }
 
-void QwenTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const {
-  if (geometry_.stateLayout.auxiliaryBytes)
-    throw std::logic_error("a target with auxiliary state folds no state in decode");
+bool QwenTarget::foldsState() const noexcept { return !geometry_.stateLayout.auxiliaryBytes; }
+
+void QwenTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows,
+                              const ops::StepRows &) const {
+  if (!foldsState())
+    throw std::logic_error("a target that folds no state captures none in decode");
   if (!geometry_.stateLayout.layers)
     return;
   ops::GDN::addFold(graph,

@@ -163,8 +163,11 @@ kernel void short_convolution_pair(device const bfloat *input0 [[buffer(0)]], de
 // the lanes' state matrices (p.channels of them, rows of p.state_stride):
 // its rows on the path, which the step's convolutions copied into the tape,
 // then the state before (state_in l); threadgroup (j, y, lane) writes state
-// row j's columns from y x kConvolutionThreads on (state_out l). A lane
-// whose rows run past the step's writes nothing.
+// row j's columns from y x kConvolutionThreads on (state_out l). A fold
+// (p.captures) takes the path's first p.capture_rows[0] rows alone, the
+// state the commit writes where the lane retained exactly those, and a path
+// of fewer leaves its state_out as it was. A lane whose rows run past the
+// step's writes nothing.
 kernel void short_convolution_commit(device const bfloat *tape [[buffer(0)]],
                                      device const bfloat *state_in0 [[buffer(1)]],
                                      device const bfloat *state_in1 [[buffer(2)]],
@@ -187,8 +190,10 @@ kernel void short_convolution_commit(device const bfloat *tape [[buffer(0)]],
   if (lane >= min(p.sequences, SPLASH_MAXIMUM_BATCH_WIDTH) || c >= p.channels || j >= uint(kStateRows)) return;
   const SplashLaneRows rows = layout[lane];
   if (ulong(rows.first) + rows.rows > p.rows) return;
-  const uint path = paths[lane];
-  const int source = int(popcount(path)) - kStateRows + int(j);
+  const uint path = paths[lane], retained = popcount(path);
+  const uint taken = p.captures ? p.capture_rows[0] : retained;
+  if (taken > retained) return;
+  const int source = int(taken) - kStateRows + int(j);
   device const bfloat *state_in = SPLASH_LANE_BINDING(lane, state_in0, state_in1, state_in2, state_in3, state_in4,
                                                       state_in5, state_in6, state_in7);
   device bfloat *state_out = SPLASH_LANE_BINDING(lane, state_out0, state_out1, state_out2, state_out3, state_out4,

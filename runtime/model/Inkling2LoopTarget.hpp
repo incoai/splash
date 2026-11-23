@@ -16,7 +16,8 @@
 // captured applications and the final norm's, as its producer captured them,
 // and its token rows through the table's norm.
 // Its step scratch is Inkling2LoopSteps'; its convolutions' state is the
-// auxiliary state of a lane's cell, which a decode step's commit writes.
+// auxiliary state of a lane's cell, which a decode step's commit writes and
+// a decode capture's fold writes at a boundary inside the retained rows.
 
 #include "model/Inkling2LoopSteps.hpp"
 #include "model/QwenTarget.hpp"
@@ -54,6 +55,13 @@ public:
   // its verify wrote of every application's convolutions, in one dispatch.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
                       const ops::StepRows &step) const override;
+  // Its state is its convolutions' alone, which its fold writes.
+  [[nodiscard]] bool foldsState() const noexcept override { return true; }
+  // A lane's convolution state after the first `rows` rows of its accepted
+  // path, the commit's of a lane that retained exactly those, into the
+  // cached cell's auxiliary state (ops::ShortConvolution::addFold).
+  void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows,
+                    const ops::StepRows &step) const override;
   // The relative attention's commit of the K/V it stores.
   void addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
                        std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,

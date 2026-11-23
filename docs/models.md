@@ -324,10 +324,12 @@ converter's layout in `Mainline_Support/` with the extension `.gguf_file`,
 which target selection does not read: such a file installs from a local copy
 named `.gguf` ([Local model files](#local-model-files)). An installation of
 one holds its draft, `incoai/Inkling-2-Mini-DFlash2` ([Drafts](#drafts)), and
-serves text only ([Vision](#vision)). Its states are
-captured in prefill alone ([Replay points and
+serves text only ([Vision](#vision)). Its decode captures a reply's state at
+each page as the Qwen families' does, its convolutions' state folded at the
+page ([Replay points and
 checkpoints](internals.md#replay-points-and-checkpoints)), so a conversation's
-next turn finds its earlier prompts in the cache but prefills each reply again.
+next turn whose prompt renders the reply back resumes at the reply's last page
+instead of prefilling the reply again.
 
 A split GGUF is the parts of one name, `NAME-0000K-of-0000N.gguf`: every part
 from 1 to N must be present, at the root or in its folder, and a folder that

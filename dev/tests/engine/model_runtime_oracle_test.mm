@@ -2181,14 +2181,16 @@ void requireCapturesOutliveTheirItems(model::Runtime &executor,
 // the rows before its page captures it, and the lane's next cycle, which
 // folds those rows as the capture did, leaves the lane's cell at that state.
 // Restored, the capture gives that cell's convolution rows and its
-// recurrent state through the codes (StateCodecReference.hpp). Beside it, a
-// prefill of the same tokens captured at the same page: its own arithmetic
-// for the rows past the prompt leaves a state a little off the decode's, so
-// its codes are compared for the record only.
+// recurrent state through the codes (StateCodecReference.hpp), and the
+// auxiliary state of a target whose fold writes it (Inkling-2-Mini's
+// convolutions) as the capturing cycle's commit left it in the lane. Beside
+// it, a prefill of the same tokens captured at the same page: its own
+// arithmetic for the rows past the prompt leaves a state a little off the
+// decode's, so its codes are compared for the record only.
 void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenStateStorage &states,
                                         std::span<const uint32_t> chat) {
   if (!executor.capturesInDecode()) {
-    std::cout << "decode_capture=SKIP (the target writes auxiliary state with its retained rows)\n";
+    std::cout << "decode_capture=SKIP (the target folds no state in decode)\n";
     return;
   }
   const std::vector<uint32_t> decodePages = pageRange(100, 5), prefillPages = pageRange(105, 5);
@@ -2250,6 +2252,9 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   const auto [retained, generated] = firstCycle(430, prompt, boundary, captured);
   require(prompt + retained == boundary && captured.size() == 1 && generated.size() >= retained,
           "the capturing cycle did not retain exactly the rows before its page, as the same cycle did before");
+  // The auxiliary state the cycle's commit wrote of exactly those rows.
+  const std::vector<uint8_t> auxiliary =
+      states.layout().target.auxiliaryBytes ? bytesOf(states.current(0).auxiliary) : std::vector<uint8_t>{};
   // The lane's next cycle folds those rows: its cell is then the state at
   // the page.
   const ModelStepResult next = decodeOne(executor, 430, boundary, decodePages);
@@ -2310,6 +2315,10 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   }
   require(differing == 0, "a decode capture restores " + std::to_string(differing) +
                               " recurrent values other than the codes of the lane's state at its page");
+  const uint64_t auxiliaryAt = layout.convolutionBytes() + layout.recurrentBytes();
+  require(std::equal(auxiliary.begin(), auxiliary.end(),
+                     fromDecode.cell.begin() + static_cast<std::ptrdiff_t>(auxiliaryAt)),
+          "a decode capture's auxiliary state is not the lane's at its page");
 
   // For the record: a prefill of the same tokens captured at the same page.
   beginCold(executor, makeRequest(431, through, 1), 1);
@@ -2329,7 +2338,8 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   }
   const std::streamsize precision = std::cout.precision(9);
   std::cout << "decode_capture prompt=" << prompt << " rows=" << retained << " lane_codes_equal=1"
-            << " prefill_recurrent_cos=" << recurrent.result().cosine << '\n';
+            << " auxiliary_bytes_equal=" << auxiliary.size() << " prefill_recurrent_cos=" << recurrent.result().cosine
+            << '\n';
   std::cout.precision(precision);
   std::cout << "decode_capture=PASS\n";
 }
@@ -2406,7 +2416,7 @@ std::pair<uint32_t, uint32_t> promptCrossingAPage(model::Runtime &executor, cons
 void requireCaptureInsideItsPathMatchesExactRows(model::Runtime &executor, model::QwenStateStorage &states,
                                                  std::span<const uint32_t> chat) {
   if (!executor.capturesInDecode()) {
-    std::cout << "decode_capture_inside_path=SKIP (the target writes auxiliary state with its retained rows)\n";
+    std::cout << "decode_capture_inside_path=SKIP (the target folds no state in decode)\n";
     return;
   }
   const std::vector<uint32_t> pages = pageRange(100, 5);
@@ -2548,6 +2558,113 @@ void requireCacheHitMatchesCold(model::Runtime &executor, std::span<const uint32
     require(fromRam == cold, "an exact cached state's hit gave other logits than the cold prefill");
   require(fromDisk == fromRam, "a state read back from the disk tier restored other logits than its RAM copy");
   std::cout << "cache_hit_cold=PASS\n";
+}
+
+// A conversation's next turn whose prompt renders its reply back resumes
+// from the reply's state at its last page, which the reply's decode captured
+// (Engine::reserveReplyCapture reserves each page a cycle's retained rows may
+// reach, Runtime::encodeDecodeCaptures folds it): the next turn's next token
+// is a cold prefill's and its distribution within requireCacheHitMatchesCold's
+// bound of the cold one's. The reply decodes 100 tokens past a chat prompt of
+// 200 on lane 0, each cycle capturing the page its rows may reach as the
+// engine reserves it; the next prompt is the prompt, the reply and 9 tokens
+// of a next turn, prefilled whole (cold) and from the last page the reply's
+// cycles captured, restored, its rows after prefilled (hit).
+void requireReplyStateMatchesCold(model::Runtime &executor, const model::QwenStateStorage &states,
+                                  std::span<const uint32_t> chat, uint32_t vocabulary) {
+  if (!executor.capturesInDecode()) {
+    std::cout << "reply_state_cold=SKIP (the target folds no state in decode)\n";
+    return;
+  }
+  constexpr uint32_t kPrompt = 200, kReply = 100, kNextTurn = 9;
+  constexpr double kBound = 1.2e-3;
+  const std::vector<uint32_t> prompt = repeatedChat(chat, kPrompt);
+  // A cycle verifies up to a block past the tokens it holds, and the output
+  // limit leaves each cycle a block.
+  constexpr uint32_t kBlock = model::ExecutionLimits::targetVerifyRows;
+  const std::vector<uint32_t> replyPages = pageRange(0, (kPrompt + kReply + 2 * kBlock) / kv::kPageTokens + 1);
+  EngineRequest request = makeRequest(2900, prompt, kReply + 2 * kBlock);
+  request.flags = RequestIgnoreEndOfSequence;
+  beginCold(executor, request, 0);
+  executor.setDraftContextPlan(2900, planDraftContext(0, kPrompt, {}));
+  requireOpen(prefillChunk(executor, 2900, 0, prompt, replyPages), "reply state");
+  std::vector<uint32_t> reply;
+  std::shared_ptr<const CompositeState> state;
+  uint32_t page = 0, captures = 0;
+  while (reply.size() < kReply) {
+    const auto held = static_cast<uint32_t>(kPrompt + reply.size());
+    const uint32_t next = (held / kv::kPageTokens + 1) * kv::kPageTokens;
+    const BatchPlan plan{.kind = WorkKind::Decode, .items = {{2900, 0}}, .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item = withRevision({2900, held, 0, replyPages});
+    if (next - held <= kBlock) {
+      metal::AllocationFailure refusal;
+      item.stateCaptures.push_back({next, executor.reserveState(2900, next, refusal)});
+      require(item.stateCaptures.back().reservation != nullptr, "the buffers of a reply's state were refused");
+    }
+    std::vector<ModelStepResult> results = executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
+    require(results.size() == 1 && results[0].failure.empty() && !results[0].finished &&
+                !results[0].outputTokensWithoutKv,
+            "a reply's cycle failed or ended it");
+    reply.insert(reply.end(), results[0].outputTokens.begin(), results[0].outputTokens.end());
+    require(states.metadata(0).lengths.targetTokens == kPrompt + reply.size(),
+            "a reply's cycle holds other tokens than it emitted");
+    if (!results[0].capturedStates.empty()) {
+      state = results[0].capturedStates.front();
+      page = next;
+      ++captures;
+    }
+  }
+  executor.end(2900);
+  require(state != nullptr && page > kPrompt, "the reply's cycles captured no state past its prompt");
+  std::vector<uint32_t> turn = prompt;
+  turn.insert(turn.end(), reply.begin(), reply.end());
+  turn.insert(turn.end(), chat.begin(), chat.begin() + kNextTurn);
+  const auto length = static_cast<uint32_t>(turn.size());
+  const auto lastLogits = [&] {
+    const std::span<const float> logits = model::RuntimeInstrumentation::lastLogits(executor, 0);
+    require(logits.size() >= vocabulary, "the last row's logits are narrower than the vocabulary");
+    return std::vector<float>(logits.begin(), logits.begin() + vocabulary);
+  };
+  // A one-token budget: each prefill selects its next token itself.
+  beginCold(executor, makeRequest(2901, turn, 1), 1);
+  executor.setDraftContextPlan(2901, planDraftContext(0, length, {}));
+  require(prefillChunk(executor, 2901, 0, turn, pageRange(20, length / kv::kPageTokens + 1)).failure.empty(),
+          "the next turn's cold prefill failed");
+  const std::vector<float> cold = lastLogits();
+  executor.end(2901);
+  // The hit's pages below the reply's page hold the reply's K/V.
+  std::vector<uint32_t> hitPages(replyPages.begin(), replyPages.begin() + page / kv::kPageTokens);
+  for (uint32_t first = 40; hitPages.size() * kv::kPageTokens < length + kv::kPageTokens; ++first)
+    hitPages.push_back(first);
+  beginCold(executor, makeRequest(2902, turn, 1), 2);
+  restoreActivePrefix(executor, 2902, length, page, state);
+  require(prefillChunk(executor, 2902, page, std::span(turn).subspan(page), hitPages).failure.empty(),
+          "the next turn's prefill from its reply's state failed");
+  const std::vector<float> hit = lastLogits();
+  executor.end(2902);
+  const auto top = [](const std::vector<float> &logits) {
+    return static_cast<uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+  };
+  const auto logSoftmax = [](const std::vector<float> &logits) {
+    const double most = *std::max_element(logits.begin(), logits.end());
+    double sum = 0.0;
+    for (const float logit : logits)
+      sum += std::exp(logit - most);
+    std::vector<double> result(logits.size());
+    for (size_t index = 0; index < logits.size(); ++index)
+      result[index] = logits[index] - most - std::log(sum);
+    return result;
+  };
+  const std::vector<double> p = logSoftmax(cold), q = logSoftmax(hit);
+  double divergence = 0.0;
+  for (size_t index = 0; index < p.size(); ++index)
+    if (p[index] != -INFINITY) divergence += std::exp(p[index]) * (p[index] - q[index]);
+  std::cout << "reply_state_cold prompt=" << kPrompt << " reply=" << reply.size() << " captures=" << captures
+            << " resumed_at=" << page << " next_prompt=" << length << " cold_top=" << top(cold)
+            << " hit_top=" << top(hit) << " kl=" << divergence << '\n';
+  require(top(hit) == top(cold) && divergence <= kBound,
+          "a next turn resumed from its reply's state left the cold prefill's next token or bound");
+  std::cout << "reply_state_cold=PASS\n";
 }
 
 // Fills every byte of a lane's GDN recurrent state, the half of the cell its
@@ -7460,6 +7577,7 @@ int main(int argc, char **argv) {
     requireCaptureInsideItsPathMatchesExactRows(executor, states, samplingSeedTokens);
     requireCacheHitMatchesCold(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize,
                                exactCachedStates);
+    requireReplyStateMatchesCold(executor, states, samplingSeedTokens, model.descriptor.capabilities.vocabularySize);
     requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                         model.descriptor.hasVision());
     requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, model.descriptor.hasVision());

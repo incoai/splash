@@ -63,7 +63,9 @@
 // one dispatch, plain) runs a second convolution of its own buffers, its
 // input's channels from column pair_input_column, its state's and the tape's
 // from pair_state_column. The commit takes `channels` as the state matrix's
-// columns, every one of which it writes.
+// columns, every one of which it writes; with captures (one) it is a decode
+// capture's fold instead, of the first capture_rows[0] rows of each lane's
+// accepted path alone.
 struct ShortConvolutionParams {
   uint32_t rows;
   uint32_t channels;

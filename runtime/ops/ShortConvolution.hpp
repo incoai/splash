@@ -151,6 +151,15 @@ struct ShortConvolution final {
                         std::span<const metal::MetalBuffer> stateIn, std::span<const metal::MetalBuffer> stateOut,
                         metal::MetalBuffer paths, uint32_t columns, metal::MetalBuffer layout,
                         const LayoutRows &rows);
+  // A decode capture's fold of one lane (`path`, its accepted path, and
+  // `layout`, its SplashLaneRows of the step's `stepRows` rows in the tape):
+  // the state after the path's first `pathRows` rows, from `stateIn`, the
+  // state before the step, into `fold`, bit for bit the state addCommit
+  // writes where the lane retained exactly those rows, by the same kernel.
+  // A path of fewer rows leaves the fold as it was.
+  static void addFold(metal::CommandGraph &graph, metal::MetalBuffer tape, metal::MetalBuffer stateIn,
+                      metal::MetalBuffer fold, metal::MetalBuffer path, uint32_t columns, metal::MetalBuffer layout,
+                      uint32_t stepRows, uint32_t pathRows);
 };
 
 } // namespace splash::ops
