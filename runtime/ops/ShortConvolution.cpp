@@ -212,45 +212,29 @@ void ShortConvolution::addConvolutionPair(metal::CommandGraph &graph, std::span<
             p, {rows.bound, 2 * groups(shape.channels), rows.sequences}, {kThreads, 1, 1});
 }
 
-void ShortConvolution::addCombineConvolution(metal::CommandGraph &graph, const ShortConvCombine &combine,
-                                             const ShortConvBuffers &buffers, ShortConvShape shape,
-                                             std::span<const metal::MetalBuffer> stateIn, ShortConvState state,
-                                             metal::MetalBuffer layout, const LayoutRows &rows,
-                                             metal::MetalBuffer tree, metal::MetalBuffer tape) {
+ShortConvolutionParams ShortConvolution::verifyParams(const ShortConvBuffers &buffers, ShortConvShape shape,
+                                                      std::span<const metal::MetalBuffer> stateIn,
+                                                      ShortConvState state, metal::MetalBuffer layout,
+                                                      const LayoutRows &rows, metal::MetalBuffer tree,
+                                                      metal::MetalBuffer tape) {
   requireShape(shape);
   requireState(shape, state);
-  // A lane's rows are a threadgroup's, its verify block's at most.
-  requireLayoutRows(rows, MOE_COMBINE_CONVOLUTION_ROWS);
-  const MoeCombineParams &sums = combine.params;
-  if (shape.dynamic() || shape.channels % MOE_COMBINE_CONVOLUTION_CHANNELS || sums.hidden_size != shape.channels ||
-      sums.rows != rows.rows || !sums.routes_per_row || stateIn.size() != rows.sequences || !buffers.residual ||
-      !tree || !tape)
-    throw std::invalid_argument("invalid short convolution of a MoE combine");
-  const uint64_t routes = uint64_t{rows.rows} * sums.routes_per_row;
-  requireBytes(combine.routeRows, routes * sizeof(uint32_t), "MoE combine route rows");
-  requireBytes(combine.routingWeights, routes * sizeof(float), "MoE combine routing weights");
-  requireBytes(combine.residual, bfloat16Rows(rows.rows, shape.channels), "MoE combine residual");
+  // A verify block's paths are row masks of 32 rows.
+  requireLayoutRows(rows, 32);
+  if (shape.dynamic() || stateIn.size() != rows.sequences || !buffers.residual || !tree || !tape)
+    throw std::invalid_argument("invalid short convolution of a verify step's computed rows");
   requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "short convolution layout");
   requireBytes(buffers.taps, uint64_t{shape.channels} * kTaps * sizeof(float), "short convolution taps");
   requireBytes(buffers.residual, floatRows(rows.rows, shape.channels), "short convolution residual");
   requireBytes(buffers.output, bfloat16Rows(rows.rows, shape.channels), "short convolution output");
   for (const metal::MetalBuffer &s : stateIn) requireBytes(s, stateExtent(shape, state), "short convolution state");
-  requireBytes(tree, uint64_t{rows.rows} * sizeof(SplashTreeRow), "short convolution tree rows");
-  requireBytes(tape, rowBytes(rows.rows, state.stride, uint64_t{state.column} + shape.channels, sizeof(uint16_t)),
-               "short convolution tape");
+  requireTape(tree, tape, shape, state, rows.rows);
   ShortConvolutionParams p = convolutionParams(shape, rows.rows, state);
   p.output = SHORT_CONVOLUTION_OUTPUT_ROUNDED_SUM;
   p.residual = 1;
   p.tree = 1;
   p.sequences = rows.sequences;
-  const auto in = laneBindings(stateIn);
-  graph.add("moe_combine_convolution",
-            {combine.expertOutput, combine.routeRows, combine.routingWeights, combine.residual, in[0], in[1], in[2],
-             in[3], in[4], in[5], in[6], in[7], buffers.taps, buffers.residual, buffers.output, std::move(layout),
-             std::move(tree), std::move(tape)},
-            MoeCombineConvolutionParams{sums, p},
-            {shape.channels / MOE_COMBINE_CONVOLUTION_CHANNELS, rows.sequences, 1},
-            {MOE_COMBINE_CONVOLUTION_CHANNELS, rows.bound, 1});
+  return p;
 }
 
 namespace {

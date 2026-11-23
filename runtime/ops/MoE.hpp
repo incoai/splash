@@ -451,14 +451,24 @@ struct MoeBuffers final {
   metal::MetalBuffer laneRows;
 };
 
+// What a MoE block's combine reads (kernels/shared/moe.metal moe_combine):
+// the grouped rows' expert outputs, each route's grouped row and routing
+// weight, and the residual its sums start from, of `params`.
+struct MoeCombine final {
+  metal::MetalBuffer expertOutput;
+  metal::MetalBuffer routeRows;
+  metal::MetalBuffer routingWeights;
+  metal::MetalBuffer residual;
+  MoeCombineParams params{};
+};
+
 // A verify step's short convolution of its combined rows, which its combine
-// runs in its own dispatch (ShortConvolution::addCombineConvolution): of
-// static taps along the lanes' trees (`layout`, `rows`, `tree`; each lane's
-// state stateIn[l]), onto buffers.residual, fp32, rounded into
-// buffers.output (ShortConvOutput::RoundedSum), each row's combined input
-// into the tape at the state's columns. The bits the combine into
-// MoeBuffers::output and that convolution of it write, which is then
-// unwritten.
+// runs in its own dispatch (MoE::addCombineConvolution): of static taps
+// along the lanes' trees (`layout`, `rows`, `tree`; each lane's state
+// stateIn[l]), onto buffers.residual, fp32, rounded into buffers.output
+// (ShortConvOutput::RoundedSum), each row's combined input into the tape at
+// the state's columns. The bits the combine into MoeBuffers::output and that
+// convolution of it write, which is then unwritten.
 struct MoeCombineConvolution final {
   ShortConvBuffers buffers;
   ShortConvShape shape;
@@ -493,6 +503,18 @@ struct MoE final {
   static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                         const BlockMoeWeights &weights, const MoePlan &plan,
                         const MoeCombineConvolution *convolution = nullptr);
+  // A combine (`combine`, its rows the step's) running a verify step's
+  // convolution of its rows (`convolution`, ShortConvolution::verifyParams'),
+  // in one dispatch (moe_combine_convolution): the bits the combine into
+  // bf16 rows and then the convolution of them write into
+  // convolution.buffers.output and the tape, a lane's rows (at most
+  // MOE_COMBINE_CONVOLUTION_ROWS) a threadgroup's, which pass their combined
+  // values to the rows that tap them in threadgroup memory;
+  // convolution.buffers.input is unread, and no combined row is written but
+  // the tape's. The channels are the combine's hidden size, a multiple of
+  // MOE_COMBINE_CONVOLUTION_CHANNELS.
+  static void addCombineConvolution(metal::CommandGraph &graph, const MoeCombine &combine,
+                                    const MoeCombineConvolution &convolution);
   // The routing of `rows` rows of `input` by a block's `router`,
   // `sharedScalarGate` (unread without shape.sharedGate) and `selectionBias`
   // (unread without shape.selectionBias): the router's fp32

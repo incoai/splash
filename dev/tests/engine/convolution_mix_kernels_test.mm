@@ -16,8 +16,8 @@
 //   dispatch (`bitwise`, uninstrumented), the tape too, and each of those
 //   reading a view of the wider rows the bits of its own rows';
 // - a verify step's convolution in its MoE combine's dispatch
-//   (ShortConvolution::addCombineConvolution, kernels/shared/moe.metal), bit
-//   for bit as moe_combine and then the convolution of its rows (`bitwise`,
+//   (MoE::addCombineConvolution, kernels/shared/moe.metal), bit for bit as
+//   moe_combine and then the convolution of its rows (`bitwise`,
 //   uninstrumented), and against fp64;
 // - the mix of 1, 3 and 4 queries over 1 to 5 states (bf16 stack planes, bf16
 //   or fp32 current rows), plain and through its norms, of 5 rows (a
@@ -31,6 +31,7 @@
 #include "../../../runtime/ops/BlockResidualMix.hpp"
 #include "../../../runtime/ops/LogitFinish.hpp"
 #include "../../../runtime/ops/MessageGate.hpp"
+#include "../../../runtime/ops/MoE.hpp"
 #include "../../../runtime/ops/ShortConvolution.hpp"
 #include "ops/LaneRows.hpp"
 
@@ -549,7 +550,7 @@ void convPairTest(MetalBackend &backend, ops::ShortConvShape shape, bool oneProj
 }
 
 // A verify step's combine running its convolution
-// (ShortConvolution::addCombineConvolution, moe_combine_convolution) against
+// (MoE::addCombineConvolution, moe_combine_convolution) against
 // moe_combine into bf16 rows and then the RoundedSum convolution of them
 // along the lanes' trees: two lanes, a tree of 8 rows (as convTreeTest's) and
 // a chain of 3, beside a row of no lane (every route left out, as a verified
@@ -629,9 +630,9 @@ void combineConvolutionTest(MetalBackend &backend, bool exact) {
     // The combine running the convolution.
     const MetalBuffer output = sentinels(size_t{rows} * channels), tape = sentinels(size_t{rows} * state.stride);
     CommandGraph fused;
-    ops::ShortConvolution::addCombineConvolution(fused, {expertBuffer, routeBuffer, weightBuffer, sumBuffer, params},
-                                                 {{}, taps, {}, 0, residual, output}, shape, in, state, layout,
-                                                 layoutRows, treeBuffer, tape);
+    ops::MoE::addCombineConvolution(
+        fused, {expertBuffer, routeBuffer, weightBuffer, sumBuffer, params},
+        {{{}, taps, {}, 0, residual, output}, shape, in, state, layout, layoutRows, treeBuffer, tape});
     run(backend, fused);
     const auto got = download<uint16_t>(output, size_t{rows} * channels),
                want = download<uint16_t>(outputBefore, size_t{rows} * channels),

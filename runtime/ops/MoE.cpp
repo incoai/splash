@@ -4,6 +4,7 @@
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
 #include "ops/BufferExtent.hpp"
+#include "ops/LaneBindings.hpp"
 
 #include <algorithm>
 #include <array>
@@ -272,10 +273,9 @@ void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers, const Moe
   const MoeScratch &scratch = buffers.scratch;
   const MoeCombineParams params{plan.rows(), shape.hiddenSize, shape.routesPerToken()};
   if (convolution) {
-    const MoeCombineConvolution &c = *convolution;
-    ShortConvolution::addCombineConvolution(
+    MoE::addCombineConvolution(
         graph, {scratch.expertOutput, scratch.routeRows, scratch.routingWeights, buffers.residual, params},
-        c.buffers, c.shape, c.stateIn, c.state, c.layout, c.rows, c.tree, c.tape);
+        *convolution);
     return;
   }
   graph.add("moe_combine",
@@ -349,6 +349,31 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
     addExperts(graph, buffers.scratch, weights, weights.slotTable, plan, group, MOE_TILES_ALL);
   }
   addCombine(graph, buffers, plan, convolution);
+}
+
+void MoE::addCombineConvolution(metal::CommandGraph &graph, const MoeCombine &combine,
+                                const MoeCombineConvolution &convolution) {
+  const MoeCombineConvolution &c = convolution;
+  // A lane's rows are a threadgroup's, its verify block's at most.
+  requireLayoutRows(c.rows, MOE_COMBINE_CONVOLUTION_ROWS);
+  const MoeCombineParams &sums = combine.params;
+  if (c.shape.channels % MOE_COMBINE_CONVOLUTION_CHANNELS || sums.hidden_size != c.shape.channels ||
+      sums.rows != c.rows.rows || !sums.routes_per_row)
+    throw std::invalid_argument("invalid MoE combine of a short convolution");
+  const uint64_t routes = uint64_t{c.rows.rows} * sums.routes_per_row;
+  requireBytes(combine.routeRows, routes * sizeof(uint32_t), "MoE combine route rows");
+  requireBytes(combine.routingWeights, routes * sizeof(float), "MoE combine routing weights");
+  requireBytes(combine.residual, uint64_t{c.rows.rows} * sums.hidden_size * sizeof(uint16_t), "MoE combine residual");
+  const ShortConvolutionParams p =
+      ShortConvolution::verifyParams(c.buffers, c.shape, c.stateIn, c.state, c.layout, c.rows, c.tree, c.tape);
+  const auto in = laneBindings(c.stateIn);
+  graph.add("moe_combine_convolution",
+            {combine.expertOutput, combine.routeRows, combine.routingWeights, combine.residual, in[0], in[1], in[2],
+             in[3], in[4], in[5], in[6], in[7], c.buffers.taps, c.buffers.residual, c.buffers.output, c.layout, c.tree,
+             c.tape},
+            MoeCombineConvolutionParams{sums, p},
+            {c.shape.channels / MOE_COMBINE_CONVOLUTION_CHANNELS, c.rows.sequences, 1},
+            {MOE_COMBINE_CONVOLUTION_CHANNELS, c.rows.bound, 1});
 }
 
 void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
