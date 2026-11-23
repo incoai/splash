@@ -2758,8 +2758,15 @@ another message (`head_tokens` in the request frame), gets an ordinary state at
 its end on first prefill when it lies at least a draft window past where the
 request resumes, as a junction must save that much. It is kept and evicted as
 any ordinary state, so the next conversation sharing the head resumes there,
-from RAM or, once a reclaim has written it, from the SSD, instead of
-prefilling the head again.
+from RAM or from the SSD, instead of prefilling the head again. A persistent
+SSD cache copies it ahead as it copies a replay point, though its conversation
+went on from it (`WriteBehind::published`'s head, `Cache::persist`), so that a
+restart or a crash leaves it on the SSD; only a reclaim had written it there,
+and after a restart the next conversation prefilled the head again where none
+had, 17.3 s for a 9.7K-token head on Qwen3.8-27B. It costs one state's write a
+distinct head, 4.4 MiB for Inkling-2-Mini, 19.6 MiB for Qwen3.6-35B-A3B and
+46.9 MiB for Qwen3.8-27B, beside the head's KV, which the replay point's copy
+writes too.
 Only a conversation whose prompt matches the head up to that page shares it,
 and an agent's head ends in text of its own: its system prompt's environment
 block (the working directory, the git status) comes after the tools. So the
@@ -3275,7 +3282,9 @@ Restore points get their copies ahead of need (`WriteBehind`,
 `Cache::persist`), so that a reclaim later frees a cached conversation at once
 rather than waiting for its writes: an ordinary state published or reused at
 least 2048 tokens deep, 10 s after its publication, unless an ordinary state on
-its only branch below supersedes it by then, its conversation having gone on.
+its only branch below supersedes it by then, its conversation having gone on;
+a persistent tier copies a head's state while it stays ordinary, as new
+conversations start from it whether or not its own went on.
 Its state is written from its own buffers, which stay in RAM, out of every
 eviction order until the write lands, and then the pages of its chain that have
 no copy, root first, at most a quarter of the KV writes in flight

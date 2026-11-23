@@ -1567,8 +1567,10 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     static_cast<void>(retireCheckpoint(active));
   active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                        : StateCheckpoint{};
+  // The head's state goes to write-behind as a head, which new conversations
+  // start from whether or not this one goes on from it.
   if (!checkpoint)
-    writeBehind_.published(block, objective.tokens, now);
+    writeBehind_.published(block, objective.tokens, now, objective.tokens == headBoundary(active));
   return true;
 }
 

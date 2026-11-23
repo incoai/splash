@@ -63,8 +63,11 @@ public:
   // A point published or reused at this block, `tokens` deep. Nothing while
   // the disk tier takes no writes. Whether copies wait for demand is asked
   // now (copying), of the demand the last step was asked with, which a
-  // claim since changes at the next step.
-  void published(uint64_t block, uint32_t tokens, double now);
+  // claim since changes at the next step. A `head`, the state at a prompt's
+  // head (Engine::headBoundary), is copied by a persistent tier while it
+  // stays an ordinary state, as new conversations start from it whether or
+  // not its own went on.
+  void published(uint64_t block, uint32_t tokens, double now, bool head = false);
   // Steps the points that are due and not in use, unless a claim waits for
   // memory on its way back (claimWaiting), which needs the tier's writes and
   // the state write first. A temporary tier copies only while `demandBytes`
@@ -95,6 +98,7 @@ private:
   struct Point final {
     uint64_t block = 0;
     double due = 0.0;
+    bool head = false;
   };
   // Counts a step that settled its point; false while it is in progress.
   bool settle(PersistStatus status);
