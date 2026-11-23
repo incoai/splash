@@ -242,7 +242,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 30,996 takes 4 away: the refit reads its own GPU alone beside its split.
 # 31,008 adds 12 for the start that calibrates the split again
 # (--ane-calibration again, splash serve --recalibrate-ane).
-ENGINE_LINE_BUDGET = 31_008
+# 31,015 adds 7 for the split's warmup, which holds only the pages its rows
+# use and allocates again an extent the first audit released.
+ENGINE_LINE_BUDGET = 31_015
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
