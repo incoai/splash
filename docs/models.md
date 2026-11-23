@@ -530,9 +530,15 @@ last chain's path that its draft joined), and a table of what a step costs
 by its class: the steps whose kernels are the same (`ops::ExecutionPlans::
 decodeRowClasses`: a projection's tile and staged height, a float tile, a MoE
 target's expert tile), priced by a step of the class's last rows, up to
-sixteen rows a lane. The start measures the table on the Mac before it serves
-(in the decode warmups, three passes over a step of each class at each lane
-count, each step's median wall time: a first start's decode warmups of
+sixteen rows a lane. Nothing the step weighs comes from the cycle's own
+draft: a row verified for its own draws, or for its descendants' estimates,
+which its draws condition, would leave a sampled lane's tokens off the
+target's distribution (`VerifyRowsParams`). `inkling2-target` checks it on
+greedy and sampled lanes: a cycle whose draft draws its tree anew takes the
+same step and its lane verifies the same rows. The start measures the table
+on the Mac before it serves (in the decode warmups, three passes over a step
+of each class at each lane count, each step's median wall time: a first
+start's decode warmups of
 Qwen3.8-27B on a 48 GB M5 Pro take 11.1 s, a later start's 1.0 s), later
 starts of the same build, models and formats on the Mac read it back from
 beside the Neural Engine's calibrations instead, and no cycle changes it. The

@@ -22,7 +22,12 @@
 //   block's experts and whose decode step predicts the next application's;
 // - a draft that passes its rows through to the head: its candidates,
 //   unary scores and first position's probabilities against the fixture's
-//   tables (its token rows through the table's norm, its logits' finish).
+//   tables (its token rows through the table's norm, its logits' finish);
+// - a greedy and a sampled request's decode cycles through such a draft,
+//   unmeasured and under a recalled table of step costs: each cycle's step,
+//   what its choice weighed and the rows its lane verified are the same
+//   where the cycle's draft draws its tree anew, so no lane's rows of a
+//   cycle follow its own draft.
 // What only an uninstrumented run holds (`bitwise`), as shader validation
 // compiles the kernels apart (qwen4_kernels_test.mm):
 // - bit for bit: the prompt run in passes of one application each, a command
@@ -265,6 +270,72 @@ public:
     model::RuntimeInstrumentation::DraftLattice lattice = model::RuntimeInstrumentation::lastDraftLattice(executor, 0, 1);
     executor.end(request.id);
     return lattice;
+  }
+
+  // One lane's points of a runtime's step costs (StepCosts::points), unmeasured.
+  std::vector<model::StepCosts::Point> stepPoints() {
+    model::RuntimeContext context{backend_, model_, *pages_, *states_, operators_};
+    const model::Runtime executor(context);
+    return model::RuntimeInstrumentation::stepPoints(executor, 1);
+  }
+
+  // A decode cycle of one lane as the step costs sized it: the choice of its
+  // step and what the choice weighed (RuntimeInstrumentation::
+  // takeStepChoices), the rows the lane verified as its selector laid them
+  // out, the tokens it emitted, and the target's logits of its rows, which
+  // hold its tree's tokens.
+  struct Cycle final {
+    model::RuntimeInstrumentation::StepChoice choice;
+    uint32_t verified = 0;
+    std::vector<uint32_t> output;
+    std::vector<float> logits;
+  };
+  // A request of the prompt `ids` under `sampling` through `cycles` decode
+  // cycles on a runtime of its own (--verify-rows auto), one lane's step
+  // costs `costs` where given (StepCosts::text, as an earlier start keeps
+  // them) and unmeasured otherwise; where `redrawn` names a cycle (from 0),
+  // that cycle's draft draws its tree at `temperature` with `noise`
+  // (RuntimeInstrumentation::redrawTree).
+  std::vector<Cycle> decodeCycles(std::span<const uint32_t> ids, const SamplingParameters &sampling, uint32_t cycles,
+                                  const std::optional<std::string> &costs, std::optional<uint32_t> redrawn = {},
+                                  float temperature = 1.0F, uint64_t noise = 0) {
+    model::RuntimeContext context{backend_, model_, *pages_, *states_, operators_};
+    context.recallStepCosts = [&](uint32_t lanes) { return lanes == 1 ? costs : std::nullopt; };
+    model::Runtime executor(context);
+    EngineRequest request;
+    request.id = ++id_;
+    request.prompt.assign(ids.begin(), ids.end());
+    request.maxNewTokens = cycles * model::ExecutionLimits::targetVerifyRows + 2;
+    request.flags = RequestIgnoreEndOfSequence;
+    request.sampling = sampling;
+    executor.beginColdRequest(request.modelView(), 0);
+    const auto rows = static_cast<uint32_t>(ids.size());
+    BatchPlan prefill{.kind = WorkKind::Prefill, .items = {{request.id, rows, 0}}, .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item{request.id, 0, rows, pageTable_, 1};
+    item.inputTokens = ids;
+    const std::vector<ModelStepResult> prefilled = executor.prefill(prefill, std::span(&item, 1));
+    require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].firstToken,
+            "the prompt's prefill failed");
+    std::vector<Cycle> result;
+    uint64_t position = rows;
+    static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
+    for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
+      if (redrawn == cycle) model::RuntimeInstrumentation::redrawTree(executor, request.id, temperature, noise);
+      BatchPlan decode{.kind = WorkKind::Decode, .items = {{request.id, 0}}, .decodeStage = DecodeStage::Regular};
+      ModelBatchItem step{request.id, position, 0, pageTable_, 1};
+      const std::vector<ModelStepResult> decoded = executor.decode(decode, std::span(&step, 1));
+      require(decoded.size() == 1 && decoded[0].failure.empty() && !decoded[0].finished,
+              "a decode cycle failed or ended its request");
+      const std::vector<model::RuntimeInstrumentation::StepChoice> choices =
+          model::RuntimeInstrumentation::takeStepChoices(executor);
+      require(choices.size() == 1, "a decode cycle's step was not sized by its step costs");
+      const std::span<const float> logits = model::RuntimeInstrumentation::lastLogits(executor, 0);
+      result.push_back({choices[0], model::RuntimeInstrumentation::lastVerifyRows(executor, 0), decoded[0].outputTokens,
+                        {logits.begin(), logits.end()}});
+      position += decoded[0].outputTokens.size();
+    }
+    executor.end(request.id);
+    return result;
   }
 
   // The prompt in commands of `commands` rows each (their sum the prompt's),
@@ -578,6 +649,116 @@ int runDraftRows(Loaded &loaded) {
   return within ? 0 : 1;
 }
 
+// No lane's rows of a decode cycle follow the cycle's own draft: the step,
+// its rows and lane cap, is chosen before the draft runs, from the lane's
+// chances of its last tree and its host chain (StepCosts.hpp), and a lane
+// takes the step's best rows of its tree. A row whose verifying followed its
+// own draws, or its descendants' estimates, which its draws condition, would
+// leave a sampled lane's tokens off the target's distribution, as a step
+// chosen on the cycle's own trees does, for greedy and sampled lanes alike
+// (VerifyRowsParams). A greedy and a sampled request (seeded) decode from a
+// prompt through a draft that passes its rows through (writePassThroughRoot,
+// whose probabilities differ between tokens, as a zero draft's do not), on
+// runtimes of their own; their runs repeat, and a run whose cycle draws its
+// tree anew (RuntimeInstrumentation::redrawTree: draws of other noise, a
+// greedy lane's in place of its most likely candidates) keeps every earlier
+// cycle and that cycle's choice, what it weighed (its chances and expected
+// tokens, its cost) and the rows its lane verified, while its rows' tokens
+// differ. Under step costs unmeasured, whose step is a draft's block as far
+// as the chances fill it, and under a recalled table of steps whose price
+// rises a tenth a row (from a second a step, above any cycle's wall, so that
+// serving's cycles teach no cost of history), whose choice follows the
+// chances. Runs repeat only where no cycle changes the step costs, as none
+// does (StepCosts.hpp: the points stay as measured, or recalled).
+int runCycleRows(Loaded &loaded) {
+  const model::Inkling2LoopLayout &layout = loaded.fixture.layout;
+  constexpr uint32_t kCycles = 6;
+  const std::filesystem::path root = loaded.root.string() + "-cycle-rows";
+  writePassThroughRoot(loaded.fixture, root, std::vector<uint16_t>(layout.hiddenSize, *model::exactBfloat16(1.0F)));
+  model::LoadedModel model = model::loadModel(loaded.backend, root, loaded.fixture.descriptor(captureIds(1)));
+  Harness harness(loaded.backend, model);
+  const std::span<const uint32_t> ids = std::span(loaded.ids).first(100);
+  // One lane's table: its classes' points (StepCosts::points) priced from
+  // 1000 ms a step and 100 ms a row past its first.
+  std::string table;
+  for (const model::StepCosts::Point &point : harness.stepPoints())
+    table += (table.empty() ? "" : " ") + std::to_string(point.last) + ":" + std::to_string(point.cap) + ":" +
+             std::to_string(1000.0 + 100.0 * (point.last - 1) + (point.cap > model::StepCosts::kNarrowCap));
+  require(!table.empty(), "the fixture's runtime has no step costs to recall");
+  const auto sameChoice = [](const model::RuntimeInstrumentation::StepChoice &a,
+                             const model::RuntimeInstrumentation::StepChoice &b) {
+    return a.lanes == b.lanes && a.rows == b.rows && a.laneCap == b.laneCap && a.chances == b.chances &&
+           a.expected == b.expected && a.cost == b.cost && a.contextCost == b.contextCost && a.floor == b.floor;
+  };
+  const auto describe = [](const Harness::Cycle &cycle) {
+    return std::to_string(cycle.choice.rows) + " rows (cap " + std::to_string(cycle.choice.laneCap) + ", " +
+           std::to_string(cycle.choice.chances) + " chances, " + std::to_string(cycle.choice.expected) +
+           " tokens expected, " + std::to_string(cycle.choice.cost) + " ms), " + std::to_string(cycle.verified) +
+           " verified";
+  };
+  int failures = 0;
+  for (const bool measured : {false, true})
+    for (const bool samples : {false, true}) {
+      const SamplingParameters sampling =
+          samples ? SamplingParameters{.temperature = 0.8F, .topP = 0.95F, .topK = 20, .seed = 4099}
+                  : SamplingParameters{};
+      const std::optional<std::string> costs = measured ? std::optional(table) : std::nullopt;
+      const std::string what =
+          std::string(samples ? "a sampled" : "a greedy") + " lane, step costs " + (measured ? "recalled" : "unmeasured");
+      const std::vector<Harness::Cycle> base = harness.decodeCycles(ids, sampling, kCycles, costs);
+      // Its lane takes every row of its step (its trees hold more), and a
+      // recalled table's choice follows the chances, without k.
+      bool full = true, live = !measured, priced = true;
+      std::string failure;
+      uint32_t redrawnTrees = 0;
+      for (const Harness::Cycle &cycle : base) {
+        full = full && cycle.verified == cycle.choice.rows;
+        live = live || cycle.choice.rows != base.front().choice.rows;
+        priced = priced && (cycle.choice.cost > 0.0) == measured && cycle.choice.contextCost == 0.0;
+      }
+      for (uint32_t redrawn = 0; redrawn < kCycles && failure.empty(); ++redrawn) {
+        const std::vector<Harness::Cycle> other =
+            harness.decodeCycles(ids, sampling, redrawn + 1, costs, redrawn, samples ? sampling.temperature : 1.0F,
+                                 0x5eed0000ULL + redrawn);
+        for (uint32_t cycle = 0; cycle < redrawn && failure.empty(); ++cycle)
+          if (!sameChoice(other[cycle].choice, base[cycle].choice) || other[cycle].verified != base[cycle].verified ||
+              other[cycle].output != base[cycle].output || other[cycle].logits != base[cycle].logits)
+            failure = "its runs did not repeat at cycle " + std::to_string(cycle) +
+                      ", as the check needs (a request alike on runtimes of its own, under step costs no cycle "
+                      "changes)";
+        // A step whose rows, chances and expected tokens agree but whose
+        // price does not was priced by step costs its runs' cycles moved.
+        const Harness::Cycle &a = base[redrawn], &b = other[redrawn];
+        const bool priceAlone = a.choice.lanes == b.choice.lanes && a.choice.rows == b.choice.rows &&
+                                a.choice.laneCap == b.choice.laneCap && a.choice.chances == b.choice.chances &&
+                                a.choice.expected == b.choice.expected && a.choice.floor == b.choice.floor &&
+                                a.verified == b.verified;
+        if (failure.empty() && priceAlone && !sameChoice(a.choice, b.choice))
+          failure = "its runs priced cycle " + std::to_string(redrawn) + "'s step apart (" +
+                    std::to_string(b.choice.cost) + " against " + std::to_string(a.choice.cost) +
+                    " ms), as by step costs that serving's cycles move, where the check needs costs no cycle changes";
+        else if (failure.empty() && (!sameChoice(a.choice, b.choice) || a.verified != b.verified))
+          failure = "cycle " + std::to_string(redrawn) + " took " + describe(b) + " on a tree drawn anew, not the " +
+                    describe(a) + " of its own draws";
+        redrawnTrees += a.logits != b.logits;
+      }
+      const bool within = failure.empty() && full && live && priced && redrawnTrees > 0;
+      std::printf("%s%s: each of %u cycles' step and verified rows the same whatever its own draft drew%s; trees "
+                  "drawn anew %u of %u; steps of %s\n",
+                  within ? "" : "FAIL: ", what.c_str(), kCycles, failure.empty() ? "" : (": " + failure).c_str(),
+                  redrawnTrees, kCycles, [&] {
+                    std::string rows;
+                    for (const Harness::Cycle &cycle : base) rows += (rows.empty() ? "" : ", ") + describe(cycle);
+                    return rows + (full ? "" : " (a lane took fewer rows than its step)") +
+                           (live ? "" : " (one step: the choice did not follow the chances)") +
+                           (priced ? "" : " (not priced by the table it recalled, or priced passes over history)");
+                  }().c_str());
+      failures += !within;
+    }
+  std::filesystem::remove_all(root);
+  return failures;
+}
+
 // The comparisons within bounds.
 int runComparisons(Loaded &loaded) {
   const model::Inkling2LoopLayout &layout = loaded.fixture.layout;
@@ -649,7 +830,7 @@ int runComparisons(Loaded &loaded) {
   std::printf("%sstreamed experts, four lanes: a prefill of four sequences and a decode step of the four ran\n",
               finite ? "" : "FAIL: ");
   failures += !finite;
-  return failures + runDraftRows(loaded);
+  return failures + runDraftRows(loaded) + runCycleRows(loaded);
 }
 
 // What an uninstrumented run holds: the runs that compute the same bits, and

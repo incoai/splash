@@ -80,6 +80,12 @@ public:
   // what its path holds whatever its tree's other rows hold.
   static void replaceTreeTokens(Runtime &runtime, uint64_t requestId,
                                 std::vector<std::pair<uint32_t, uint32_t>> tokens);
+  // The next decode cycle of request `requestId` draws its tree's children
+  // from its draft at `temperature` with `noise` (ops::DraftTreeLane), in
+  // place of its own: other draws of a sampled lane, draws in place of a
+  // greedy lane's most likely candidates. Its verify selects by its own
+  // policy and uniforms. For checking what a cycle's own draft decides.
+  static void redrawTree(Runtime &runtime, uint64_t requestId, float temperature, uint64_t noise);
   // Whether a streamed-expert target's later cycles each plan a draft's
   // block a lane within its store's round, at their floor, whatever class
   // their floor passes the lanes' last chances into (CostLine::choose): for

@@ -733,6 +733,9 @@ struct Runtime::Impl {
   // The tokens a constrained request's next cycle gives rows of its tree,
   // by request (RuntimeInstrumentation::replaceTreeTokens).
   std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> treeTokens;
+  // The temperature and noise a request's next cycle draws its tree at, by
+  // request (RuntimeInstrumentation::redrawTree).
+  std::unordered_map<uint64_t, std::pair<float, uint64_t>> treeDraws;
 #endif
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -2554,6 +2557,13 @@ struct Runtime::Impl {
         tree.temperature = policy.temperature;
         tree.noise = entry.cycleNoise;
       }
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+      if (const auto draws = treeDraws.find(entry.id); draws != treeDraws.end()) {
+        tree.temperature = draws->second.first;
+        tree.noise = draws->second.second;
+        treeDraws.erase(draws);
+      }
+#endif
     }
     const DFlashDraftStep draft = draftModel.step(std::span(cacheLengths).first(lanes),
                                                   std::span(tokens).first(lanes), std::span(trees).first(lanes));
@@ -4833,6 +4843,12 @@ void RuntimeInstrumentation::forceStepRows(Runtime &runtime, std::optional<uint3
 void RuntimeInstrumentation::replaceTreeTokens(Runtime &runtime, uint64_t requestId,
                                                std::vector<std::pair<uint32_t, uint32_t>> tokens) {
   runtime.impl_->treeTokens[requestId] = std::move(tokens);
+}
+
+void RuntimeInstrumentation::redrawTree(Runtime &runtime, uint64_t requestId, float temperature, uint64_t noise) {
+  if (!(temperature > 0.0F) || !std::isfinite(temperature))
+    throw std::invalid_argument("a redrawn tree's temperature is not positive");
+  runtime.impl_->treeDraws[requestId] = {temperature, noise};
 }
 
 void RuntimeInstrumentation::planBlocks(Runtime &runtime, bool enabled) { runtime.impl_->blockPlans = enabled; }
