@@ -122,17 +122,27 @@ inline device const float *message_gate_row(device const float *x, device const 
   return own ? x + row * p.x_stride + p.x_columns[g] : message + row * p.message_stride + p.message_columns[g];
 }
 
-// Phase one: each row's and each message's inverse RMS, as
-// message_gate_prepare's (the same sums, the same order).
+// Phase one: each row's and each message's inverse RMS, from quads: a
+// thread's quads tid + MESSAGE_GATE_THREADS i in order, each quad's squares
+// added in order (a sum of the same terms as message_gate_prepare's in
+// another order: it reads a value a thread at a time).
 __attribute__((noinline)) void message_gate_down_scales(device const float *x, device const float *message,
                                                         constant MessageGateFusedParams &p, uint g, uint first,
                                                         uint count, uint tid, uint lane, uint sg,
                                                         threadgroup MessageGateDownShared &shared) {
+  const uint quads = p.hidden / 4;
   for (uint i = 0; i < 2 * kGroupRows; ++i) {
-    device const float *row = message_gate_row(x, message, p, g, first, count, i / 2, i % 2 == 0);
+    device const float4 *row =
+        reinterpret_cast<device const float4 *>(message_gate_row(x, message, p, g, first, count, i / 2, i % 2 == 0));
     float squares = 0.0f;
     if (i / 2 < count)
-      for (uint d = tid; d < p.hidden; d += kGateThreads) squares += row[d] * row[d];
+      for (uint d = tid; d < quads; d += kGateThreads) {
+        const float4 v = row[d];
+        squares += v.x * v.x;
+        squares += v.y * v.y;
+        squares += v.z * v.z;
+        squares += v.w * v.w;
+      }
     squares = simd_sum(squares);
     if (lane == 0) shared.partials[i * kGateSimdgroups + sg] = squares;
   }
@@ -206,12 +216,13 @@ kernel void message_gate_down(device const float *x [[buffer(0)]], device const 
 }
 
 // What message_gate_apply's phases share: the group's rank values (zero past
-// its rows), a partial a simdgroup of each row's squares, and the arrival of
-// split_arrive_last.
+// its rows), a partial a simdgroup of each row's squares, the arrival of
+// split_arrive_last, and the last slice's inverse RMS of each row.
 struct MessageGateApplyShared {
   float4 lows[kGroupRows * MESSAGE_GATE_MAXIMUM_RANK / 4];
   float partials[kGroupRows * kGateSimdgroups];
   uint arrival;
+  float inverses[kGroupRows];
 };
 
 // Phase one: value d of each row of the group, a thread each: forget and gain
@@ -264,20 +275,29 @@ __attribute__((noinline)) void message_gate_apply_values(device const float *x, 
 }
 
 // Phase two, by the slice that arrives last: each row's squares over the
-// slices in slice order, then the row through the weighted RMS norm into
-// bf16, as message_gate_norm writes it.
+// slices in slice order, by a thread a row, then the group's rows through the
+// weighted RMS norm into bf16, as message_gate_norm writes each value, the
+// threads striding the rows' quads.
 __attribute__((noinline)) void message_gate_apply_norm(device coherent(device) float *values,
                                                        device coherent(device) float *partials,
                                                        device const float *norm, device bfloat *output,
                                                        constant MessageGateFusedParams &p, uint first, uint count,
-                                                       uint slices, uint tid) {
-  for (uint r = 0; r < kGroupRows; ++r) {
-    if (r >= count) break;
+                                                       uint slices, uint tid,
+                                                       threadgroup MessageGateApplyShared &shared) {
+  if (tid < count) {
     float total = 0.0f;
-    for (uint s = 0; s < slices; ++s) total += partials[s * kGroupRows + r];
-    const float inverse = rsqrt(total / p.hidden + kRmsEpsilon);
-    for (uint e = tid; e < p.hidden; e += kGateThreads)
-      output[ulong(first + r) * p.hidden + e] = bfloat((values[ulong(first + r) * p.hidden + e] * inverse) * norm[e]);
+    for (uint s = 0; s < slices; ++s) total += partials[s * kGroupRows + tid];
+    shared.inverses[tid] = rsqrt(total / p.hidden + kRmsEpsilon);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint quads = p.hidden / 4;
+  device coherent(device) float4 *rows =
+      reinterpret_cast<device coherent(device) float4 *>(values + ulong(first) * p.hidden);
+  device bfloat4 *out = reinterpret_cast<device bfloat4 *>(output + ulong(first) * p.hidden);
+  for (uint q = tid; q < count * quads; q += kGateThreads) {
+    const uint r = q / quads, e = 4 * (q % quads);
+    const float4 weights = float4(norm[e], norm[e + 1], norm[e + 2], norm[e + 3]);
+    out[q] = bfloat4((rows[q] * shared.inverses[r]) * weights);
   }
 }
 
@@ -318,7 +338,7 @@ kernel void message_gate_apply(device const float *x [[buffer(0)]], device const
                             group.x, tid, lane, sg, shared);
   if (!split_arrive_last(counter, slices, tid, &shared.arrival)) return;
   message_gate_apply_norm(gateValues, groupPartials, message_gate_pick(g, norm0, norm1, norm2),
-                          message_gate_pick(g, output0, output1, output2), p, first, count, slices, tid);
+                          message_gate_pick(g, output0, output1, output2), p, first, count, slices, tid, shared);
   split_release(counter, tid);
 }
 

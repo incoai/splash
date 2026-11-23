@@ -645,17 +645,18 @@ void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX
 // gate at a time) against calls of at most that many of those rows (a decode
 // step's: the fused kernels, the three gates together), each over views of
 // the same buffers, row by row. Rounding points are the same; what moves is
-// the order of the rank values', forget's, gain's and the norm's sums, and
-// through it a rank value's bf16 rounding by a step now and then, which moves
-// its row's every value by a little of the row's size: a difference counts in
-// bf16 steps of the larger of the two values and their row's root mean
-// square (a value near zero moves by its row's steps, not its own). An M5 Max
-// and an M5 Pro (2026-11-22) measured the same: 191 of 1,382,400 values
-// differ (a share of 1.4e-4), each by one such step at most; bounded at twice
-// those, 2 steps and a share of 2.8e-4. A gate that read another row,
-// message, column, rank value or gate's weights moves values by their row's
-// size, hundreds of steps.
-constexpr double kPathsSteps = 2, kPathsShare = 2.8e-4;
+// the order of the sums: the rows' and messages' squares (the fused kernels
+// add a row's by quads), the rank values', forget's, gain's and the norm's.
+// Through them a normalized input's or a rank value's bf16 rounding moves by
+// a step now and then, which moves its row's every value by a little of the
+// row's size: a difference counts in bf16 steps of the larger of the two
+// values and their row's root mean square (a value near zero moves by its
+// row's steps, not its own). An M5 Max (2026-11-22) measured 2,200 of
+// 1,382,400 values differing (a share of 1.6e-3), each by one such step at
+// most; bounded at twice those, 2 steps and a share of 3.2e-3. A gate that
+// read another row, message, column, rank value or gate's weights moves
+// values by their row's size, hundreds of steps.
+constexpr double kPathsSteps = 2, kPathsShare = 3.2e-3;
 void gatePathsTest(MetalBackend &backend) {
   std::mt19937 rng(37);
   const uint32_t rows = ops::MessageGate::kFusedRows + 72, gates = 3, hidden = GateCase::kHidden;
