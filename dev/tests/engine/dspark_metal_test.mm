@@ -373,6 +373,102 @@ void markov(MetalBackend &backend, uint32_t lanes, bool sampled) {
   std::cout << "  markov " << lanes << (sampled ? " sampled" : " greedy") << ": ok\n";
 }
 
+// A Markov step's lanes do not depend on one another or on how many the call
+// has: lane i of a call of `lanes` lanes gives, bit for bit, what the same
+// lane gives alone in a call of one, whether the buffers hold the call's
+// lanes alone or all of them, and the rows, f_rnn rows and workspace slots
+// past the call's lanes (NaN here) are not read into its results nor
+// written.
+void markovLanes(MetalBackend &backend, uint32_t lanes, bool sampled) {
+  Random random(0x6c616e65 + lanes * 7 + sampled);
+  constexpr uint32_t hidden = 256, vocabulary = 3008, proposed = 2999;
+  constexpr float cap = 30.0F;
+  const uint32_t width = 2 * kRank + 2 * hidden;
+  ops::DSparkMarkovWeights weights{randomBf16(backend, uint64_t{kJoint} * width, random, 0.08F),
+                                   shared(backend, kJoint * 4), randomBf16(backend, uint64_t{vocabulary} * kRank, random),
+                                   randomBf16(backend, uint64_t{vocabulary} * kRank, random, 0.5F),
+                                   shared(backend, vocabulary * 4)};
+  for (uint32_t i = 0; i < kJoint; ++i) at<float>(weights.jointBias)[i] = 0.3F * random.unit();
+  for (uint32_t i = 0; i < vocabulary; ++i) at<float>(weights.foldBias)[i] = random.unit();
+  std::array<ops::DraftTreeLane, kLanes> treeLanes{};
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    treeLanes[lane].anchor = 17 + 101 * lane;
+    treeLanes[lane].temperature = sampled ? 0.7F + 0.1F * lane : 0.0F;
+    treeLanes[lane].noise = 0x1234567890abcdefULL * (lane + 1);
+  }
+  // The rows of each of the kLanes lanes a call may take.
+  std::vector<uint16_t> hiddenRows(uint64_t{kLanes} * kRows * hidden), frnnRows(uint64_t{kLanes} * hidden);
+  std::vector<float> baseRows(uint64_t{kLanes} * kRows * vocabulary);
+  for (uint16_t &value : hiddenRows) value = floatToBf16(random.unit());
+  for (uint16_t &value : frnnRows) value = floatToBf16(random.unit());
+  for (float &value : baseRows) value = 4.0F * random.unit();
+  constexpr uint32_t kUnwritten = 0xfffffffeU;
+  struct Chain {
+    std::vector<uint32_t> candidates;
+    std::vector<float> unary;
+  };
+  // A call whose lane j is lane source[j] of the rows above, over buffers of
+  // `slots` lanes.
+  const auto call = [&](const std::vector<uint32_t> &source, uint32_t slots) {
+    const auto count = static_cast<uint32_t>(source.size());
+    const ops::DSparkMarkovWorkspace workspace = ops::DSpark::markovWorkspace(slots, vocabulary);
+    const uint64_t lattice = uint64_t{slots} * kSteps * kCandidates;
+    ops::DSparkMarkovBuffers buffers{shared(backend, uint64_t{slots} * kRows * hidden * 2),
+                                     shared(backend, uint64_t{slots} * kRows * vocabulary * 4),
+                                     shared(backend, uint64_t{slots} * hidden * 2),
+                                     shared(backend, workspace.jointBytes),
+                                     shared(backend, workspace.stateBytes),
+                                     shared(backend, workspace.previousBytes),
+                                     shared(backend, workspace.logitsBytes),
+                                     shared(backend, workspace.partialValuesBytes),
+                                     shared(backend, workspace.partialIdsBytes),
+                                     shared(backend, lattice * 4),
+                                     shared(backend, lattice * 4)};
+    const float nan = std::nanf("");
+    for (uint32_t slot = 0; slot < slots; ++slot) {
+      const bool used = slot < count;
+      for (uint64_t i = 0; i < uint64_t{kRows} * hidden; ++i)
+        at<uint16_t>(buffers.hidden)[uint64_t{slot} * kRows * hidden + i] =
+            used ? hiddenRows[uint64_t{source[slot]} * kRows * hidden + i] : floatToBf16(nan);
+      for (uint64_t i = 0; i < uint64_t{kRows} * vocabulary; ++i)
+        at<float>(buffers.base)[uint64_t{slot} * kRows * vocabulary + i] = used ? baseRows[uint64_t{source[slot]} * kRows * vocabulary + i] : nan;
+      for (uint64_t i = 0; i < hidden; ++i)
+        at<uint16_t>(buffers.frnn)[uint64_t{slot} * hidden + i] = used ? frnnRows[uint64_t{source[slot]} * hidden + i] : floatToBf16(nan);
+      if (!used) {
+        std::fill_n(at<float>(buffers.joint) + uint64_t{slot} * kJoint, kJoint, nan);
+        std::fill_n(at<float>(buffers.state) + uint64_t{slot} * kRank, kRank, nan);
+        at<uint32_t>(buffers.previous)[slot] = 0xffffffffU;
+      }
+    }
+    std::fill_n(at<uint32_t>(buffers.candidates), lattice, kUnwritten);
+    std::fill_n(at<float>(buffers.unary), lattice, nan);
+    std::array<ops::DraftTreeLane, kLanes> lanesOfCall{};
+    for (uint32_t j = 0; j < count; ++j) lanesOfCall[j] = treeLanes[source[j]];
+    CommandGraph graph;
+    ops::DSpark::addMarkov(graph, weights, buffers, {hidden, vocabulary, proposed, cap}, std::span(lanesOfCall).first(count));
+    run(backend, graph);
+    return Chain{{at<uint32_t>(buffers.candidates), at<uint32_t>(buffers.candidates) + lattice},
+                 {at<float>(buffers.unary), at<float>(buffers.unary) + lattice}};
+  };
+  std::vector<uint32_t> all(lanes);
+  for (uint32_t lane = 0; lane < lanes; ++lane) all[lane] = lane;
+  const Chain padded = call(all, kLanes), exact = call(all, lanes);
+  constexpr uint64_t perLane = uint64_t{kSteps} * kCandidates;
+  const std::string label = "markov lanes " + std::to_string(lanes) + (sampled ? " sampled" : " greedy");
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const Chain alone = call({lane}, 1);
+    for (const Chain *together : {&padded, &exact}) {
+      require(std::memcmp(together->candidates.data() + lane * perLane, alone.candidates.data(), perLane * 4) == 0,
+              label + ": a lane's candidates differ from the same lane alone");
+      require(std::memcmp(together->unary.data() + lane * perLane, alone.unary.data(), perLane * 4) == 0,
+              label + ": a lane's candidate logits differ from the same lane alone");
+    }
+  }
+  for (uint64_t i = lanes * perLane; i < kLanes * perLane; ++i)
+    require(padded.candidates[i] == kUnwritten && std::isnan(padded.unary[i]), label + ": a step wrote past the lanes it has");
+  std::cout << "  " << label << ": ok\n";
+}
+
 // Each lane's last retained row into its f_rnn row, a lane in each binding.
 void frnnCommit(MetalBackend &backend) {
   Random random(5);
@@ -757,6 +853,8 @@ int main(int argc, char **argv) {
       std::cout << "  attention: ok\n";
       for (uint32_t lanes : {1u, 4u})
         for (const bool sampled : {false, true}) markov(backend, lanes, sampled);
+      for (uint32_t lanes : {2u, 3u, 5u, kLanes})
+        for (const bool sampled : {false, true}) markovLanes(backend, lanes, sampled);
       frnnCommit(backend);
       chainTree(backend, false);
       chainTree(backend, true);

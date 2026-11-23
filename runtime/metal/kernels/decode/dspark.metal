@@ -101,7 +101,10 @@ kernel void dspark_markov_joint(device const bfloat *joint [[buffer(0)]],
 // The step's corrected logits of every lane over the tokens it may propose:
 // cap * tanh((base + W2 o + b2) / cap), o = tanh(z's output part), the
 // lane's base logits its draft row step + 1's. A group's simdgroups take a
-// token each in turn, its lanes eight of the token's W2 row each.
+// token each in turn, its lanes eight of the token's W2 row each, which they
+// multiply by the outputs of the step's lanes alone: a step of one lane
+// spent seven eighths of its products on lanes it does not have, 1.4 ms of
+// a 27.9 ms draft and verify cycle (40-core M5 Max).
 kernel void dspark_markov_logits(device const float *z [[buffer(0)]],
                                  device const bfloat *fold_weights [[buffer(1)]],
                                  device const float *fold_bias [[buffer(2)]],
@@ -118,7 +121,7 @@ kernel void dspark_markov_logits(device const float *z [[buffer(0)]],
     outputs[l][thread_index] = l < params.lanes ? precise::tanh(z[l * kJoint + 2 * kRank + thread_index]) : 0.0f;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float o[kLanes][8];
-  for (uint l = 0; l < kLanes; ++l)
+  for (uint l = 0; l < params.lanes; ++l)
     for (uint k = 0; k < 8; ++k)
       o[l][k] = outputs[l][lane * 8 + k];
   const uint share = (params.proposed + groups - 1) / groups;
@@ -129,7 +132,7 @@ kernel void dspark_markov_logits(device const float *z [[buffer(0)]],
     for (uint k = 0; k < 8; ++k)
       w[k] = float(row[k]);
     float sums[kLanes];
-    for (uint l = 0; l < kLanes; ++l) {
+    for (uint l = 0; l < params.lanes; ++l) {
       float sum = 0.0f;
       for (uint k = 0; k < 8; ++k)
         sum += w[k] * o[l][k];
