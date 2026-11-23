@@ -7,12 +7,14 @@
 #include "model/WeightLayout.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cmath>
 #include <limits>
 #include <optional>
 #include <set>
 #include <sstream>
+#include <utility>
 
 namespace splash::model::gguf {
 namespace {
@@ -165,7 +167,7 @@ class Builder {
 public:
   Builder(const GgufFile &file, const QwenTargetDimensions &geometry, Problems &problems, std::string name,
           uint32_t layer, uint32_t type, PlanOptions options = {})
-      : file_(file), geometry_(geometry), problems_(problems),
+      : file_(file), geometry_(geometry), problems_(problems), exactlyMxfp8_(std::move(options.exactlyMxfp8)),
         image_(std::move(name), layer, type, options.streamExperts) {}
 
   // A vector the kernels read as F32 unrounded, as the reference GGUF
@@ -202,20 +204,35 @@ public:
 
   // Rows [N, K] as quantized() repacks them, but of a BF16 or F16 tensor
   // as the Q8_0 rows the reference quantize_row_q8_0_ref writes from its
-  // values, which the writer quantizes (TensorRows::ggufFloatRowBytes).
+  // values, which the writer quantizes (builtRows).
   void quantizedOrQ8_0(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = file_.find(name);
     if (!tensor || !float16Type(tensor->type)) return quantized(name, rows, columns);
     problems_.read(*tensor);
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
     Repack repack = image_.planes(GGUF_FMT_Q80, rows, columns, name);
-    TensorRows source = tensorRows(*tensor, rows, tensor->bytes / rows);
-    source.ggufFloatType = source.type;
-    source.ggufFloatRowBytes = source.rowBytes;
-    source.type = ggml::kQ8_0;
-    source.rowBytes = ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], columns);
-    repack.sources.push_back(std::move(source));
+    repack.sources.push_back(builtRows(*tensor, rows, GGUF_FMT_Q80));
     image_.repack(std::move(repack));
+  }
+
+  // The format of a routed experts' tensor [N, K] and its rows: of a format,
+  // as stored (llama.cpp's NVFP4 as NVFP4's native rows); of BF16 or F16
+  // values (a release's MXFP8 experts that Unsloth's UD-Q8_K_XL widens to
+  // BF16), MXFP8 where they are exactly its values (exactlyMxfp8: lossless,
+  // half the bytes), else as stored where their rows are whole native blocks
+  // of their type, else as the Q8_0 the reference quantization makes of
+  // them, as quantizedOrQ8_0 does.
+  std::pair<uint32_t, TensorRows> expertRows(const GgufTensor &tensor, uint64_t rows, uint64_t columns) {
+    uint32_t format = imageFormat(tensor);
+    if (float16Type(tensor.type)) {
+      const bool mxfp8 = !(columns % ggufColumnUnit(kQuantFormats[GGUF_FMT_MXFP8])) && exactlyMxfp8_ &&
+                         exactlyMxfp8_(file_.source(tensor.file), tensor);
+      if (mxfp8 || columns % ggufColumnUnit(kQuantFormats[format])) {
+        format = mxfp8 ? GGUF_FMT_MXFP8 : GGUF_FMT_Q80;
+        return {format, builtRows(tensor, rows, format)};
+      }
+    }
+    return {format, tensorRows(tensor, rows, ggufRowBytes(kQuantFormats[format], columns))};
   }
 
   // One routed experts' tensor [experts * N, K] (routedExperts).
@@ -223,9 +240,9 @@ public:
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(*tensor);
+    auto [format, source] = expertRows(*tensor, rows, columns);
     Repack repack = image_.expertPlanes(format, rows, columns, name);
-    repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns)));
+    repack.sources.push_back(std::move(source));
     image_.expertRepack(std::move(repack));
   }
 
@@ -246,16 +263,15 @@ public:
     } else if (const GgufTensor *fused = find(fusedName, quantizedType)) {
       if (fused->rows() != 2 * experts * width || fused->columns() != hidden)
         throw GgufError("unexpected shape for " + fusedName);
-      const uint32_t format = imageFormat(*fused);
-      const TensorRows rows = tensorRows(*fused, 2 * experts * width, ggufRowBytes(kQuantFormats[format], hidden));
+      const auto [format, rows] = expertRows(*fused, 2 * experts * width, hidden);
       // Expert e's gate rows are rows 2e width.. of the fused tensor, its up rows the next width.
       for (const uint64_t up : {0, 1}) {
         Repack repack = image_.expertPlanes(format, experts * width, hidden, fusedName);
         for (uint64_t expert = 0; expert < experts; ++expert) {
-          TensorRows expertRows = rows;
-          expertRows.first = (2 * expert + up) * width;
-          expertRows.rows = width;
-          repack.sources.push_back(std::move(expertRows));
+          TensorRows slice = rows;
+          slice.first = (2 * expert + up) * width;
+          slice.rows = width;
+          repack.sources.push_back(std::move(slice));
         }
         image_.expertRepack(std::move(repack));
       }
@@ -526,6 +542,18 @@ private:
     return rows;
   }
 
+  // Rows [0, count) of a BF16 or F16 tensor as the native rows of `format`
+  // the writer builds from its values (TensorRows::ggufFloatRowBytes): Q8_0
+  // as the reference quantization rounds them, or MXFP8 exactly (mxfp8Block).
+  TensorRows builtRows(const GgufTensor &tensor, uint64_t count, uint32_t format) const {
+    TensorRows rows = tensorRows(tensor, count, tensor.bytes / count);
+    rows.ggufFloatType = rows.type;
+    rows.ggufFloatRowBytes = rows.rowBytes;
+    rows.type = kQuantFormats[format].ggml_type;
+    rows.rowBytes = ggufRowBytes(kQuantFormats[format], tensor.columns());
+    return rows;
+  }
+
   // A tensor's rows as the image holds them (tensorRows), rowBytes each,
   // after their descriptor.
   void copiedRows(const GgufTensor &tensor, uint64_t rowBytes) {
@@ -537,6 +565,7 @@ private:
   const GgufFile &file_;
   const QwenTargetDimensions &geometry_;
   Problems &problems_;
+  std::function<bool(const WeightSource &, const GgufTensor &)> exactlyMxfp8_;
   ImageBuilder image_;
 };
 
@@ -847,6 +876,46 @@ std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
 }
 
 uint64_t loadedBytes(const Image &image) { return image.streamedRows ? 0 : image.bytes; }
+
+bool mxfp8Block(std::span<const float, 32> values, std::span<uint8_t, 33> block) noexcept {
+  // A finite float's magnitude bits as significand * 2^exponent, the significand 24 bits wide (float subnormals
+  // normalized). E4M3 holds 1.mmm * 2^e for e of -6 to 8, at most 1.75 * 2^8 (448), and subnormals m * 2^-9.
+  const auto split = [](uint32_t magnitude) {
+    if (magnitude >= 0x00800000) return std::pair{(magnitude & 0x7FFFFF) | 0x800000, int(magnitude >> 23) - 150};
+    const int shift = std::countl_zero(magnitude) - 8;
+    return std::pair{magnitude << shift, -149 - shift};
+  };
+  uint32_t largest = 0;
+  for (const float value : values) largest = std::max(largest, std::bit_cast<uint32_t>(value) & 0x7FFFFFFFU);
+  if (largest >= 0x7F800000) return false;
+  // The exponent s of the scale 2^s: the smallest whose E4M3 range holds the largest magnitude L (448 * 2^s >= L,
+  // so ilogb(L) - 8, or one more past 1.75 * 2^ilogb(L)), at least E8M0's smallest, 2^-127.
+  int scale = -127;
+  if (largest) {
+    const auto [significand, exponent] = split(largest);
+    scale = std::max(scale, exponent + 23 - 8 + (significand > 0xE00000));
+  }
+  block[0] = static_cast<uint8_t>(scale + 127);
+  for (size_t i = 0; i < values.size(); ++i) {
+    const uint32_t bits = std::bit_cast<uint32_t>(values[i]);
+    uint8_t code = 0;
+    if (const uint32_t magnitude = bits & 0x7FFFFFFFU) {
+      const auto [significand, exponent] = split(magnitude);
+      // The value over the scale, significand * 2^(exponent - scale): a normal of exponent e >= -6 whose
+      // significand has three bits past its leading one, or a subnormal of significand >> shift units of 2^-9.
+      if (const int e = exponent + 23 - scale; e >= -6) {
+        if (significand & 0xFFFFF) return false;
+        code = static_cast<uint8_t>((e + 7) << 3 | (significand >> 20 & 7));
+      } else {
+        const int shift = scale - 9 - exponent;
+        if (shift >= 24 || significand & ((1U << shift) - 1)) return false;
+        code = static_cast<uint8_t>(significand >> shift);
+      }
+    }
+    block[1 + i] = static_cast<uint8_t>(bits >> 24 & 0x80) | code;
+  }
+  return true;
+}
 
 uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_t sourceBytes) {
   switch (conversion) {

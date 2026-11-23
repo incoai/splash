@@ -2,6 +2,7 @@
 
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
+#include "model/GgufPreparation.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/SafetensorsImage.hpp"
@@ -88,8 +89,12 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
           const OpenGguf target(findTargetGgufs(directory));
           const GgufTargetPlan plan = ggufTargetPlan(layout);
           return targetWeights(
-              layout, [&](gguf::PlanOptions options) { return plan.images(target.file(), options); }, streams,
-              plan.layerImages, plan.firstMoeLayer);
+              layout,
+              [&](gguf::PlanOptions options) {
+                options.exactlyMxfp8 = exactlyMxfp8;
+                return plan.images(target.file(), options);
+              },
+              streams, plan.layerImages, plan.firstMoeLayer);
         }
         const SafetensorsCheckpoint checkpoint(directory);
         const safetensors::NormStorage norms = safetensors::normStorage(checkpoint, layout);

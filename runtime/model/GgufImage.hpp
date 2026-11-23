@@ -187,11 +187,25 @@ struct Image {
 // routed experts stream (Image::experts) instead of loading with it; with
 // streamTable, the rows of a table the family's GGUF holds after the
 // embedding (Qwen3.8-Flash-Next's PLE n-gram table) stream
-// (Image::streamedRows) instead of loading as its image.
+// (Image::streamedRows) instead of loading as its image. exactlyMxfp8 tells
+// whether a GGUF tensor of BF16 or F16 values in `file` holds MXFP8's values
+// exactly (mxfp8Block), as a release's MXFP8 weights widened do: a start's
+// sizing and loader read them to tell (model/GgufPreparation.hpp
+// exactlyMxfp8), and without it the planner, which reads the header alone,
+// takes no tensor to.
 struct PlanOptions {
   bool streamExperts = false;
   bool streamTable = false;
+  std::function<bool(const WeightSource &file, const GgufTensor &tensor)> exactlyMxfp8{};
 };
+
+// The MXFP8 native block of 32 values (metal/abi/QuantFormat.h: an E8M0
+// exponent e, then 32 E4M3 bytes, each value 2^(e - 127) e4m3) into `block`,
+// when every value is exactly one of the block's: of the smallest exponent
+// whose E4M3 range holds the largest magnitude, but not below E8M0's 2^-127,
+// which holds every value of any MXFP8 block, whatever its own exponent.
+// False, `block` unspecified, when a value is not.
+[[nodiscard]] bool mxfp8Block(std::span<const float, 32> values, std::span<uint8_t, 33> block) noexcept;
 
 // The routed experts each layer's image streams (Image::experts), in layer
 // order; throws unless every layer's do.
@@ -275,8 +289,9 @@ private:
 // and no RoPE scaling) and what the family adds, its arrays included, then
 // each tensor's shape; throws GgufError naming every metadata mismatch, or
 // every missing tensor and every tensor of a type this build cannot load. It
-// reads the header alone: every start plans from the GGUF, and the engine's
-// model check from the installer's copy of its headers before any download.
+// reads the header alone, but what options.exactlyMxfp8 reads of 16-bit
+// experts' values: every start plans from the GGUF, and the engine's model
+// check from the installer's copy of its headers before any download.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                                             const QwenTargetDimensions &geometry, PlanOptions options = {});
 

@@ -200,7 +200,9 @@ for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by
 `VisionPreparation` for a safetensors or GGUF vision tower. `GgufPreparation`
 repacks GGUF blocks ([GGUF targets](models.md#gguf-targets)) and safetensors tensors
 without requantization, but for the Q8_0 of Flash-Next's BF16 or F16
-hyper-connection projections, quantizes the draft's BF16 projections
+hyper-connection projections and of 16-bit float routed experts that neither
+MXFP8 holds exactly nor BF16's blocks tile (16-bit experts MXFP8 holds load as
+it, exactly), quantizes the draft's BF16 projections
 ([Drafts](models.md#drafts)), and computes a safetensors target's GDN decay as
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
 exponential. llama.cpp's NVFP4 rows are rebuilt as NVFP4's native blocks of
@@ -217,7 +219,8 @@ experts without one, which the expert passes multiply their sums by
 
 Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
-BF16 or F16 hyper-connection projections ([GGUF targets](models.md#gguf-targets)), and
+BF16 or F16 hyper-connection projections and of such 16-bit routed experts
+([GGUF targets](models.md#gguf-targets)), and
 in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
 target's quantized shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's

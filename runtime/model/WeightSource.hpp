@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -29,6 +30,10 @@ public:
   [[nodiscard]] int descriptor() const noexcept;
   // The file's size when it was opened.
   [[nodiscard]] uint64_t bytes() const noexcept;
+  // The file as it was opened: its device, inode, size and modification time
+  // (seconds, nanoseconds), which checkUnchanged holds it to; equal for every
+  // source open on the same unchanged file.
+  [[nodiscard]] std::array<int64_t, 5> identity() const noexcept;
   void setDataOffset(uint64_t offset);
   [[nodiscard]] uint64_t dataOffset() const noexcept;
   // Bytes [offset, offset + size) of the tensor data.

@@ -8,13 +8,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace splash::model {
@@ -53,7 +57,7 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 // How readRows reads a tensor's rows: as stored, or as its format's native
 // rows, which it builds from a quantized safetensors tensor's tensors, from
 // a GGUF's NVFP4 rows, or by quantizing a BF16 weight (into af4g64) or a
-// GGUF tensor of BF16 or F16 values (into Q8_0).
+// GGUF tensor of BF16 or F16 values (into Q8_0, or exactly into MXFP8).
 enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16, QuantizedGgufFloat };
 RowReader rowReader(const gguf::TensorRows &rows) {
   if (rows.safetensors.codes) return RowReader::Safetensors;
@@ -258,15 +262,25 @@ void quantizeQ8_0Block(const float *values, uint8_t *block, const std::string &n
     block[2 + i] = static_cast<uint8_t>(static_cast<int8_t>(std::round(values[i] * inverse)));
 }
 
-// Native Q8_0 bytes [column, column + span) of `count` rows of a GGUF tensor
-// of BF16 or F16 values from source row `start` on, back to back, each 32
-// values quantized as quantizeQ8_0Block rounds them. One read per run of rows
+// The MXFP8 native block of 32 values exactly (gguf::mxfp8Block), which the
+// plan took them to be (gguf::PlanOptions::exactlyMxfp8); a value it is not
+// is refused.
+void quantizeMxfp8Block(const float *values, uint8_t *block, const std::string &name) {
+  if (!gguf::mxfp8Block(std::span<const float, 32>(values, 32), std::span<uint8_t, 33>(block, 33)))
+    throw GgufError(name + " holds a value MXFP8 does not hold exactly");
+}
+
+// Native Q8_0 or MXFP8 bytes (the format of rows.type) [column, column +
+// span) of `count` rows of a GGUF tensor of BF16 or F16 values from source
+// row `start` on, back to back, each 32 values built as quantizeQ8_0Block
+// rounds them or as quantizeMxfp8Block holds them. One read per run of rows
 // when they are read whole, else per row.
-void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
-                      uint8_t *to) {
-  const QuantFormat &format = kQuantFormats[GGUF_FMT_Q80];
+void quantizeFloat16Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column,
+                         uint64_t span, uint8_t *to) {
+  const bool mxfp8 = gguf_format_of(rows.type) == GGUF_FMT_MXFP8;
+  const QuantFormat &format = kQuantFormats[mxfp8 ? GGUF_FMT_MXFP8 : GGUF_FMT_Q80];
   if (column % format.block_bytes || span % format.block_bytes)
-    throw GgufError("Q8_0 rows are built by whole blocks: " + rows.name);
+    throw GgufError(std::string(format.name) + " rows are built by whole blocks: " + rows.name);
   const bool float16 = rows.ggufFloatType == ggml::kF16;
   const uint64_t perRead = span == rows.rowBytes ? count : 1, blocks = span / format.block_bytes;
   std::vector<uint8_t> source(perRead * blocks * format.block_elements * 2);
@@ -281,8 +295,8 @@ void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t cou
       values[i] = widenFloat16(bits, float16);
     }
     for (uint64_t b = 0; b < perRead * blocks; ++b)
-      quantizeQ8_0Block(values.data() + b * format.block_elements, to + row * span + b * format.block_bytes,
-                        rows.name);
+      (mxfp8 ? quantizeMxfp8Block : quantizeQ8_0Block)(values.data() + b * format.block_elements,
+                                                        to + row * span + b * format.block_bytes, rows.name);
   }
 }
 
@@ -339,7 +353,7 @@ void readSourceRows(const gguf::TensorRows &rows, uint64_t start, uint64_t run, 
   case RowReader::Safetensors: readSafetensorsRows(rows, start, run, column, span, out); break;
   case RowReader::GgufNvfp4: readGgufNvfp4Rows(rows, start, run, column, span, out); break;
   case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out); break;
-  case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out); break;
+  case RowReader::QuantizedGgufFloat: quantizeFloat16Rows(rows, start, run, column, span, out); break;
   }
 }
 
@@ -653,6 +667,45 @@ void addDecodedChunks(metal::MetalBackend &backend, const metal::MetalBuffer &im
 }
 
 } // namespace
+
+bool exactlyMxfp8(const WeightSource &file, const GgufTensor &tensor) {
+  if (tensor.type != ggml::kBF16 && tensor.type != ggml::kF16)
+    throw GgufError("not a 16-bit float tensor: " + tensor.name);
+  // A start plans its target several times, its sizing's (model/ModelSizing.hpp) and its load's, each from a source
+  // of its own on the same unchanged file (WeightSource::checkUnchanged). So the cache is the process's, a file known
+  // by its identity whatever source holds it, and each tensor's values are read once, the first time a plan asks.
+  static std::mutex mutex;
+  static std::map<std::pair<std::array<int64_t, 5>, uint64_t>, bool> known;
+  const std::pair key{file.identity(), tensor.offset};
+  {
+    const std::lock_guard lock(mutex);
+    if (const auto found = known.find(key); found != known.end()) return found->second;
+  }
+  constexpr uint64_t kBlock = 32, kChunkValues = kChunkReadBytes / 2;
+  const uint64_t values = tensor.elements();
+  if (values % kBlock || tensor.bytes != values * 2) return false;
+  const bool float16 = tensor.type == ggml::kF16;
+  std::atomic<bool> exact = true;
+  parallelFor((values + kChunkValues - 1) / kChunkValues, [&](size_t chunk, unsigned) {
+    if (!exact.load(std::memory_order_relaxed)) return;
+    const uint64_t first = chunk * kChunkValues, count = std::min(kChunkValues, values - first);
+    std::vector<uint8_t> bytes(count * 2);
+    file.readData(tensor.offset + first * 2, bytes);
+    std::array<float, kBlock> block;
+    std::array<uint8_t, kBlock + 1> encoded;
+    for (uint64_t at = 0; at < count && exact.load(std::memory_order_relaxed); at += kBlock) {
+      for (uint64_t i = 0; i < kBlock; ++i) {
+        uint16_t bits;
+        std::memcpy(&bits, bytes.data() + 2 * (at + i), 2);
+        block[i] = widenFloat16(bits, float16);
+      }
+      if (!gguf::mxfp8Block(block, encoded)) exact.store(false, std::memory_order_relaxed);
+    }
+  });
+  const std::lock_guard lock(mutex);
+  known.emplace(key, exact.load());
+  return exact;
+}
 
 void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, uint8_t *to) {
   uint64_t sourceRows = 0;

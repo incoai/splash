@@ -187,7 +187,8 @@ have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
   IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16; a tensor of a format of
   256-value blocks (the K-quants, BF16, F16) whose rows are not whole blocks
-  of it, such as a BF16 expert tensor of 1152 inputs, is refused by name;
+  of it is refused by name, but routed experts of BF16 or F16 values, which
+  load as MXFP8 or Q8_0 (below);
 - token embeddings: any of the linears' formats;
 - norms: F32, BF16 or F16, loaded as the F32 values they hold;
 - the MoE router: F32, BF16 or any of the linears' quantized formats (not
@@ -258,7 +259,9 @@ queries in rows of two tensors of them all (`loop_res_query`, each layer's q
 and FFN rows; `loop_kv_res_query`, its k and v rows). Its configuration is
 derived by those keys (`num_hidden_layers` its weight layers, each layer's
 values its first application's), and the engine plans it as the converter's,
-into the same images (`Inkling2LoopGguf.cpp`). The repository keeps the
+into the same images (`Inkling2LoopGguf.cpp`). All ten of the repository's
+quants load in either layout, from UD-IQ1_S to UD-Q8_K_XL (its BF16 experts
+as MXFP8, below). The repository keeps the
 converter's layout in `Mainline_Support/` with the extension `.gguf_file`,
 which target selection does not read: such a file installs from a local copy
 named `.gguf` ([Local model files](#local-model-files)). An installation of
@@ -294,6 +297,26 @@ its quantized ones (`gguf.require_quantized`), with one message that asks for
 a quantized variant. A whole-BF16 file with its token table quantized is still
 refused; these files pass, and so does a MoE whose routed experts alone are
 quantized. The native loader does not check this.
+
+Routed experts of BF16 or F16 values load as MXFP8 where every 32 of their
+values are exactly an MXFP8 block's (an E8M0 power of two times E4M3 values),
+as a release's MXFP8 experts widened hold them: Inkling 2's last four layers'
+experts in Unsloth's UD-Q8_K_XL, BF16 of the release's MXFP8, whose down
+projections of 1152 inputs BF16's blocks of 256 cannot hold. Lossless, at half
+the bytes; each block takes the smallest exponent that holds its largest
+magnitude, 2^-127 at least (`gguf::mxfp8Block`). Whether a tensor's values are
+MXFP8's needs them, which a start reads once before it sizes and plans the
+target (`exactlyMxfp8`, every value of each 16-bit expert tensor, on a thread
+per core). On an M5 Pro (48 GB), UD-Q8_K_XL's 8.15 GB of them took 1.05 s
+beside the weights' 3.88 s load from a fresh copy of the file, which no cache
+held, and 0.43 s beside 1.93 s from the page cache. Experts of other values
+load as stored where their rows are whole 256-value blocks, else as the Q8_0
+the reference quantization makes of them, as Flash-Next's hyper-connection
+projections do. The engine's model check, of headers alone, plans those
+fallbacks. A Mac that streams the routed experts ([Streamed
+experts](server.md#streamed-experts)) reads such an expert's 16-bit values at
+every load and builds its MXFP8 blocks again: twice the SSD bytes of the MXFP8
+it holds.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
 Qwen3.6-35B-A3B from UD-IQ1_S to UD-Q8_K_XL. llama-quantize's default type

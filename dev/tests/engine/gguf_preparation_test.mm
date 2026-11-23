@@ -20,9 +20,14 @@
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <optional>
+#include <random>
 #include <utility>
 
 using namespace gguf_fixtures;
@@ -380,6 +385,157 @@ void checkQuantizedRouter(MetalBackend &backend, const std::filesystem::path &di
     check(copy && copy->conversion == model::gguf::Conversion::None &&
               slice(image, copy->destination, tensor.data.size()) == tensor.data,
           std::string("prepared ") + fmtName(f) + " router: its native rows as stored");
+  }
+}
+
+// MXFP8's block of 32 values by a search of every E8M0 exponent, the smallest
+// first, for one at which each value is an E4M3 code's (the reference's
+// e4m3); none when no exponent holds them all.
+std::optional<std::array<uint8_t, 33>> searchedMxfp8Block(const float *values) {
+  std::map<float, uint8_t> codes; // each positive finite E4M3 value's code, 0 among them
+  for (uint32_t code = 0; code < 0x7F; ++code) codes.emplace(gguf_reference::e4m3(uint8_t(code)), uint8_t(code));
+  for (int e = 0; e < 255; ++e) {
+    std::array<uint8_t, 33> block{uint8_t(e)};
+    bool held = true;
+    for (uint32_t i = 0; held && i < 32; ++i) {
+      const auto found = codes.find(std::fabs(float(std::ldexp(double(values[i]), 127 - e))));
+      held = found != codes.end() && std::ldexp(double(found->first), e - 127) == std::fabs(double(values[i]));
+      if (held) block[1 + i] = uint8_t(found->second | (std::signbit(values[i]) ? 0x80 : 0));
+    }
+    if (held) return block;
+  }
+  return std::nullopt;
+}
+
+// gguf::mxfp8Block against the search of every exponent: MXFP8 blocks of
+// random codes at each E8M0 exponent whose values a float holds, half of
+// them of small codes (whose largest the smallest exponents hold below
+// E4M3's range); each also with one value given a fifth significant bit,
+// which no exponent holds, and with one value 2^-10 of its exponent's scale;
+// zeros of either sign, and a block with an infinity or a NaN.
+void checkMxfp8Blocks() {
+  std::mt19937 rng(1420);
+  uint32_t blocks = 0, agreed = 0, exact = 0;
+  const auto agree = [&](const std::array<float, 32> &values) {
+    std::array<uint8_t, 33> block{};
+    const bool held = model::gguf::mxfp8Block(values, block);
+    const std::optional<std::array<uint8_t, 33>> searched = searchedMxfp8Block(values.data());
+    ++blocks;
+    exact += held;
+    agreed += held == searched.has_value() && (!held || block == *searched);
+  };
+  for (int e = 0; e < 255; ++e)
+    for (int trial = 0; trial < 4; ++trial) {
+      std::array<float, 32> values;
+      for (float &value : values) {
+        uint8_t code = uint8_t(rng() % 0x7F | (rng() % 2 ? 0x80 : 0));
+        if (trial % 2) code &= 0x8F;
+        value = float(std::ldexp(double(gguf_reference::e4m3(code)), e - 127));
+      }
+      if (!std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); })) continue;
+      agree(values);
+      std::array<float, 32> wider = values, smaller = values;
+      const size_t at = rng() % 32;
+      if (values[at] != 0.0F)
+        wider[at] = float(values[at] + std::ldexp(std::copysign(1.0, values[at]), std::ilogb(values[at]) - 4));
+      smaller[at] = float(std::ldexp(1.0, e - 127 - 10));
+      agree(wider);
+      agree(smaller);
+    }
+  std::array<float, 32> zeros{};
+  for (size_t i = 0; i < zeros.size(); i += 2) zeros[i] = -0.0F;
+  agree(zeros);
+  for (const float special : {INFINITY, NAN}) {
+    std::array<float, 32> values{};
+    values[5] = special;
+    agree(values);
+  }
+  check(agreed == blocks && exact > blocks / 3 && exact < blocks * 2 / 3,
+        "MXFP8 blocks take the exponent and codes a search of every exponent finds, " + std::to_string(exact) +
+            " of " + std::to_string(blocks) + " exact");
+}
+
+// A MoE layer's routed experts of BF16 values, 320 inputs wide but down's 256,
+// as Unsloth's UD-Q8_K_XL widens a release's MXFP8 experts: of MXFP8's values
+// (the reference's MXFP8 rows), each tensor MXFP8 planes of the blocks a
+// search of every exponent finds; of other values, BF16 planes as stored where
+// a tensor's rows are whole 256-value blocks (down) and the reference
+// quantization's Q8_0 where they are not (gate and up). A plan without the
+// loader's look at the values (exactlyMxfp8), as of a header alone, takes the
+// latter for both.
+void checkFloatExperts(MetalBackend &backend, const std::filesystem::path &directory) {
+  SmallTarget target = smallTarget(true);
+  model::QwenTargetDimensions &g = target.geometry;
+  g.hiddenSize = 320;
+  TensorTypes types;
+  for (const char *name : {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ffn_gate_shexp.weight",
+                           "ffn_up_shexp.weight", "ffn_down_shexp.weight", "output.weight", "token_embd.weight"})
+    types[name] = kQ8_0;
+  for (const char *name : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
+    types[name] = *ggufType(BF16);
+  target.tensors = targetTensors(g, types);
+  randomize(target.tensors, 1400);
+  const uint32_t width = g.expertIntermediateSize;
+  const struct Expert {
+    std::string name;
+    uint32_t rows, columns;
+  } experts[] = {{"blk.0.ffn_gate_exps.weight", g.experts * width, g.hiddenSize},
+                 {"blk.0.ffn_up_exps.weight", g.experts * width, g.hiddenSize},
+                 {"blk.0.ffn_down_exps.weight", g.experts * g.hiddenSize, width}};
+  for (const bool mxfp8 : {true, false}) {
+    std::mt19937 rng(1410);
+    std::map<std::string, Packed> expected;
+    for (const Expert &e : experts) {
+      Tensor &tensor = tensorNamed(target.tensors, e.name);
+      std::vector<float> values(uint64_t{e.rows} * e.columns);
+      if (mxfp8) {
+        const std::vector<uint8_t> native = makeNative(MXFP8, e.rows, e.columns, rng);
+        for (uint32_t row = 0; row < e.rows; ++row)
+          rowValues(MXFP8, native.data() + uint64_t{row} * rowBytes(MXFP8, e.columns), e.columns,
+                    values.data() + uint64_t{row} * e.columns);
+        for (size_t i = 0; i < values.size(); ++i) {
+          const uint16_t bits = f2bf(values[i]);
+          std::memcpy(tensor.data.data() + 2 * i, &bits, 2);
+          if (bf2f(bits) != values[i]) throw std::runtime_error("an MXFP8 value no BF16 holds");
+        }
+      } else {
+        tensor.data = fixture(BF16, e.rows, e.columns, uint32_t(rng()));
+        for (size_t i = 0; i < values.size(); ++i) {
+          uint16_t bits;
+          std::memcpy(&bits, tensor.data.data() + 2 * i, 2);
+          values[i] = bf2f(bits);
+        }
+      }
+      std::vector<uint8_t> rows;
+      if (mxfp8) {
+        for (size_t at = 0; at < values.size(); at += 32) {
+          const auto block = searchedMxfp8Block(values.data() + at);
+          if (!block) throw std::runtime_error("no exponent holds an MXFP8 block");
+          rows.insert(rows.end(), block->begin(), block->end());
+        }
+      }
+      const Fmt format = mxfp8 ? MXFP8 : e.columns % 256 ? Q80 : BF16;
+      expected[e.name] = repack(format, mxfp8 ? rows : format == Q80 ? quantizeQ8_0(values) : tensor.data, e.rows,
+                                e.columns, nullptr);
+    }
+    const auto path = directory / (std::string("moe-bf16-experts-") + (mxfp8 ? "mxfp8" : "other") + ".gguf");
+    writeGguf(path, target.tensors, g);
+    model::WeightSource source(path);
+    const model::GgufFile gguf(source);
+    const std::vector<model::gguf::Image> images =
+        model::gguf::planImages(gguf, architecture(g), g, {.exactlyMxfp8 = model::exactlyMxfp8});
+    const std::vector<model::gguf::Image> headerOnly = model::gguf::planImages(gguf, architecture(g), g);
+    const std::vector<uint8_t> image = preparedImages(backend, path, g).front();
+    for (const Expert &e : experts) {
+      const model::gguf::Repack *planes = repackOf(images[0], e.name), *fallback = repackOf(headerOnly[0], e.name);
+      const Fmt format = mxfp8 ? MXFP8 : e.columns % 256 ? Q80 : BF16;
+      const Packed &want = expected[e.name];
+      check(planes && planes->format == format && fallback && fallback->format == (e.columns % 256 ? Q80 : BF16) &&
+                slice(image, planes->plane0, want.w0.size()) == want.w0 &&
+                slice(image, planes->meta, want.meta.size()) == want.meta,
+            std::string("BF16 experts of ") + (mxfp8 ? "MXFP8's" : "other") + " values prepare into " +
+                fmtName(format) + " planes: " + e.name);
+    }
   }
 }
 
@@ -1144,6 +1300,7 @@ int main(int argc, char **argv) {
     const Goldens hashes = goldens(argv[2], @"gguf_images");
     MetalBackend backend(argv[1]);
     checkPipelineOrder();
+    checkMxfp8Blocks();
     // First of the GPU's, so that the peak allocation it checks against is its own.
     checkExecutor(backend, directory.path());
     guarded("a load that fails mid-image", [&] { checkFailedLoad(backend, directory.path()); });
@@ -1155,6 +1312,7 @@ int main(int argc, char **argv) {
               for (const Fmt gate : {BF16, Q80}) checkSixteenBitFloats(backend, directory.path(), gate);
             });
     guarded("preparation of quantized routers", [&] { checkQuantizedRouter(backend, directory.path()); });
+    guarded("preparation of BF16 experts", [&] { checkFloatExperts(backend, directory.path()); });
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });

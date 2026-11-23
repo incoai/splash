@@ -58,7 +58,9 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
                    [planned] { planned->source.checkUnchanged(); }, plan.layerImages, plan.firstMoeLayer,
                    std::move(table), experts),
       planned_(std::move(planned)) {
-  planned_->images = plan.images(planned_->source.file(), planOptions());
+  gguf::PlanOptions options = planOptions();
+  options.exactlyMxfp8 = exactlyMxfp8;
+  planned_->images = plan.images(planned_->source.file(), options);
 }
 
 std::optional<TargetImages::StreamedTable> GgufTargetLoader::streamTable() const {

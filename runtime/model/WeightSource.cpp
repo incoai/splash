@@ -63,6 +63,11 @@ WeightSource::~WeightSource() = default;
 const std::filesystem::path &WeightSource::path() const noexcept { return impl_->path; }
 int WeightSource::descriptor() const noexcept { return impl_->file; }
 uint64_t WeightSource::bytes() const noexcept { return uint64_t(impl_->state.st_size); }
+std::array<int64_t, 5> WeightSource::identity() const noexcept {
+  const struct stat &opened = impl_->state;
+  return {int64_t(opened.st_dev), int64_t(opened.st_ino), int64_t(opened.st_size), opened.st_mtimespec.tv_sec,
+          opened.st_mtimespec.tv_nsec};
+}
 void WeightSource::setDataOffset(uint64_t offset) {
   if (offset > bytes()) throw std::runtime_error("weight source data starts past its end: " + impl_->path.string());
   impl_->dataOffset = offset;
