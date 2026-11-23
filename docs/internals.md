@@ -811,12 +811,13 @@ every projection
   122B, on the 16-core 2048 on Inkling-2-Mini; a class of 2048 rows is the
   prefill of the most rows', which warms it, no chunk of its own repeating
   it), and the int8 passes where they run (from 192, 256 and 308 rows); and
-  Inkling-2-Mini's relative attention after no history, each set of its
-  kernels a class: a split and a reduce up to 128 rows, the direct kernel
-  from 129, over INT8 queries from 225 where INT8 pages take them (Apple10
-  and Apple11), so that a fresh prompt of 129 to 224 tokens creates none
-  while it waits. These need no memory
-  the first did not, and are required as it is. Every other kernel choice a
+  the rows from which Inkling-2-Mini's relative attention after no history
+  runs a kernel no class before them and no chunk of the most rows runs:
+  the direct kernel over bf16 queries, from 129 rows where INT8 pages take
+  INT8 queries (Apple10 and Apple11), so that a fresh prompt of 129 to 224
+  tokens creates none while it waits; the chunk of the most rows runs it
+  over INT8 queries, and elsewhere over the bf16 queries 129 rows take.
+  These need no memory the first did not, and are required as it is. Every other kernel choice a
   chunk's rows make has one threshold (the float tiles, the MoE router's
   tile, the staged norm, the hyper-connection norm's quarters, and the
   Neural Engine split, which takes no class's first chunk), so the chunks of

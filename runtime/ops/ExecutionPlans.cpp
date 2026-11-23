@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -23,19 +24,24 @@ namespace {
 // no history runs over `layout`'s pages, of each layer variant
 // (Inkling2LoopTarget::planRelativeAttention): each dispatch's direct
 // kernel, or its split and reduce.
-std::string relativeKernels(const ExecutionPlans &plans, kv::Layout layout, uint32_t rows) {
+std::set<std::string> relativeKernels(const ExecutionPlans &plans, kv::Layout layout, uint32_t rows) {
   const uint32_t pages = (rows + kv::kPageTokens - 1) / kv::kPageTokens;
   const std::array sequence{PagedAttention::chunkParams(0, rows, pages * kv::kPageTokens, pages)};
-  std::string kernels;
+  std::set<std::string> kernels;
   for (const RelativeAttentionVariant variant :
        {RelativeAttentionVariant{.windowTokens = 0, .positionScaled = true},
         RelativeAttentionVariant{.windowTokens = layout.windowTokens, .positionScaled = false}}) {
     const RelativeAttentionPlan plan =
         RelativeAttention::plan(sequence, layout, plans.calibration().attention, plans.linear().int8Activations(),
                                 RelativeAttention::sequenceWorkspace(layout), variant);
-    for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches())
-      kernels += plan.direct(dispatch) ? plan.directPipeline() + " "
-                                       : plan.splitPipeline() + " " + plan.reducePipeline() + " ";
+    for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches()) {
+      if (plan.direct(dispatch)) {
+        kernels.insert(plan.directPipeline());
+      } else {
+        kernels.insert(plan.splitPipeline());
+        kernels.insert(plan.reducePipeline());
+      }
+    }
   }
   return kernels;
 }
@@ -51,10 +57,16 @@ std::string relativeKernels(const ExecutionPlans &plans, kv::Layout layout, uint
 // history a split and a reduce up to 128 rows, and from 129 the direct
 // kernel, its one split reading the chunk's pages (RelativeAttention::plan),
 // over INT8 queries from 225 rows (8 pages) where INT8 pages take them on
-// Apple10 and Apple11; each set a class. Only a chunk after a short history
-// runs the direct kernel over bf16 queries, which no warmup ran before its
-// 129-row class: a fresh 159-token prompt on the 16-core M5 Pro created
-// relative_attention_q8_direct and its _w1023 while it waited. Every other
+// Apple10 and Apple11. A chunk whose relative attention after no history
+// runs a kernel neither a class before it nor warmup's chunk of the most
+// rows runs starts a class: the direct kernel over bf16 queries, from 129
+// rows, which only a chunk after a short history runs (a fresh 159-token
+// prompt on the 16-core M5 Pro created relative_attention_q8_direct and its
+// _w1023 while it waited, 0.4 ms each from a warm shader cache and 160 ms
+// from a cold one). The chunk of the most rows runs it over INT8 queries
+// and, without them, over bf16 ones, so no class starts at 225 rows (one
+// there took 0.15 s of Inkling-2-Mini's start) nor, where 129 rows' direct
+// kernel is the most rows', at 129. Every other
 // kernel a chunk's rows pick today changes once along them (selectFloatTile,
 // a MoE router's among them, the staged norm, the hyper-connection norm's
 // quarters, and the Neural Engine split, which takes no class's first chunk:
@@ -64,7 +76,11 @@ std::string relativeKernels(const ExecutionPlans &plans, kv::Layout layout, uint
 std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<MoeShape, uint32_t>> moe,
                                                         std::optional<kv::Layout> relativeAttention) const {
   std::vector<uint32_t> first;
-  std::tuple<LinearTile, uint32_t, MoeExpertTile, bool, std::string> last{};
+  std::tuple<LinearTile, uint32_t, MoeExpertTile, bool> last{};
+  // The relative attention's kernels warmup's chunks run after no history:
+  // the most rows' and those of the classes so far.
+  std::set<std::string> warmed;
+  if (relativeAttention) warmed = relativeKernels(*this, *relativeAttention, SPLASH_PREFILL_TOKEN_BUDGET);
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
     const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
     const LinearTile tile = plan.configuration().tile;
@@ -73,10 +89,14 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<
     MoeConfig config{};
     if (moe)
       config = selectMoe(calibration(), linear_.int8Activations(), StepKind::Prefill, moe->first, moe->second, rows);
-    std::tuple key{tile, named ? plan.storageRows() : 0, config.expertTile, config.int8Passes,
-                   relativeAttention ? relativeKernels(*this, *relativeAttention, rows) : std::string()};
-    if (first.empty() || key != last) first.push_back(rows);
-    last = std::move(key);
+    const std::tuple key{tile, named ? plan.storageRows() : 0, config.expertTile, config.int8Passes};
+    const std::set<std::string> kernels =
+        relativeAttention ? relativeKernels(*this, *relativeAttention, rows) : std::set<std::string>();
+    if (first.empty() || key != last || !std::ranges::includes(warmed, kernels)) {
+      first.push_back(rows);
+      warmed.insert(kernels.begin(), kernels.end());
+    }
+    last = key;
   }
   // Warmup's chunk of the most rows (ServingRuntime::requireWarmup) warms the
   // class those rows start: the M5 Pro's 64-row expert passes of the 35B and

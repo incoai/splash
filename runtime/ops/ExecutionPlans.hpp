@@ -38,8 +38,9 @@ public:
   // The fewest rows of each class of prefill chunk whose projections, MoE
   // experts or relative attention run kernels of their own: each staged tile
   // height a chunk takes, the prefill tile, each set of expert passes where
-  // `moe` names a MoE target's blocks' shape and router format, and each set
-  // of kernels the relative attention of a chunk after no history runs where
+  // `moe` names a MoE target's blocks' shape and router format, and the rows
+  // from which the relative attention of a chunk after no history runs a
+  // kernel no class before them and no chunk of the most rows runs, where
   // `relativeAttention` names the KV layout of a target whose layers attend
   // through it (ExecutionPlans.cpp); but not a class the most rows start,
   // whose chunk is warmup's of the most rows. Startup warmup runs a chunk of
