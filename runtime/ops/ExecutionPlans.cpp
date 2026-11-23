@@ -40,6 +40,10 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<
     if (first.empty() || key != last) first.push_back(rows);
     last = key;
   }
+  // Warmup's chunk of the most rows (ServingRuntime::requireWarmup) warms the
+  // class those rows start: the M5 Pro's 64-row expert passes of the 35B and
+  // the 122B, whose second 2,048-row prefill took 0.6 s of the 35B's start.
+  if (first.back() == SPLASH_PREFILL_TOKEN_BUDGET) first.pop_back();
   return first;
 }
 

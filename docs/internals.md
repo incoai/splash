@@ -808,8 +808,9 @@ every projection
   Qwen3.5-122B-A10B, 43 on Flint, 52 on Qwen3.8-Flash-Next), the M5 Pro's
   64-row passes from the rows whose routes average its `wideTileRoutes` an
   expert (from 20 cores 1024 on Inkling-2-Mini and 2048 on the 35B and the
-  122B, on the 16-core 2048 on Inkling-2-Mini), and the int8 passes where
-  they run (from 192, 256 and 308 rows). These need no memory
+  122B, on the 16-core 2048 on Inkling-2-Mini; a class of 2048 rows is the
+  prefill of the most rows', which warms it, no chunk of its own repeating
+  it), and the int8 passes where they run (from 192, 256 and 308 rows). These need no memory
   the first did not, and are required as it is. Every other kernel choice a
   chunk's rows make has one threshold (the float tiles, the MoE router's
   tile, the staged norm, the hyper-connection norm's quarters, and the
@@ -817,7 +818,8 @@ every projection
   one row and of the most take both sides. `kernel-selection` checks that
   every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
   its fifteen devices, and its prefill attention after each history it plans,
-  is one of these chunks'. Each prefill also creates, without running it, the
+  is one of these chunks', and that no class's chunk repeats the most rows'.
+  Each prefill also creates, without running it, the
   draft rebuild a restored lane's first chunk begins with, which no other
   command runs, so a memory-limited restore warmup leaves none of its kernels
   to serving, and what a state captured inside a chunk runs, which no warmup

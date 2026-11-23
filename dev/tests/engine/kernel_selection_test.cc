@@ -1058,14 +1058,19 @@ std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> 
 // and after each of kAttentionHistories,
 // its attention's kernels and whether its block indexer selects its rows'
 // blocks (BlockIndexer::sparse: Flash-Next's prompt past 2,048 tokens, whose
-// kernels a verify does not run). Adds each that is not to `misses`. It
+// kernels a verify does not run). No class's chunk repeats the most rows'.
+// Adds each that is not to `misses`. It
 // checks one matrix shape and the columns of kFloatColumns; the other kernels
 // a chunk's rows pick, the staged norm and the hyper-connection norm's
 // quarters (single thresholds today, whose sides the chunks of one row and of
 // the most take) and those of GDN, the draft and vision, only the backend's
 // count of pipelines created while serving checks.
 void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
-  const auto warmed = [](std::vector<uint32_t> classes) {
+  // Warmup's chunks: each class's and the most rows', which no class's
+  // repeats.
+  const auto warmed = [&](std::vector<uint32_t> classes) {
+    if (!classes.empty() && classes.back() >= SPLASH_PREFILL_TOKEN_BUDGET)
+      misses.push_back(name + ": a prefill class's chunk repeats warmup's chunk of the most rows");
     classes.push_back(SPLASH_PREFILL_TOKEN_BUDGET);
     return classes;
   };
