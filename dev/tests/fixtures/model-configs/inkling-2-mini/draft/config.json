@@ -7,10 +7,8 @@
   "bos_token_id": null,
   "dflash_config": {
     "block_size": 8,
-    "capture_final_norm": true,
     "conv_group_size": 16,
     "conv_kernel_size": 2,
-    "embedding_normalization": "folded_rmsnorm",
     "final_logit_softcapping": 30.0,
     "mask_token_id": 200056,
     "selector_rank": 256,
@@ -21,8 +19,7 @@
       23,
       41,
       48
-    ],
-    "valid_vocab_size": 200058
+    ]
   },
   "dtype": "bfloat16",
   "eos_token_id": null,

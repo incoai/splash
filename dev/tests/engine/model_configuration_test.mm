@@ -1059,12 +1059,15 @@ void testFlint(const std::filesystem::path &fixtures) {
 // its steps run as 48 applications; the release's is its safetensors target's
 // too, its quantization_config Model Optimizer's NVFP4. Its clip is held as
 // an F32, as its header states it; another loop or another layer count is
-// refused by name. Its DFlash2 draft's config, as its release publishes it,
-// reads the rows applications 5, 23 and 41 read and the final norm's, id 48
-// (capture_final_norm), its token rows through the table's norm
-// (embedding_normalization) and its head's finish, the softcap after its
-// selector's edges and the 200,058 tokens, with mask token 200056: each held
-// to the family's by name.
+// refused by name. Its DFlash2 draft reads the rows applications 5, 23 and 41
+// read and the final norm's, id 48, its token rows through the table's norm
+// and its head's finish, the softcap after its selector's edges and the
+// 200,058 tokens, with mask token 200056. Its release's config states the
+// softcap and the mask token and leaves the rest to its target; its preview
+// revisions' (preview-config.json, b1d989ba's) states them too
+// (capture_final_norm, embedding_normalization, valid_vocab_size) and makes
+// the same draft, as it does without any one of them. Each value a config
+// states is held to the family's by name.
 void testInkling2(const std::filesystem::path &fixtures) {
   const SourceModel release{
       R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})",
@@ -1076,6 +1079,14 @@ void testInkling2(const std::filesystem::path &fixtures) {
               layout->weightLayers == 24 && layout->layers == 48 && descriptor.targetKvLayout.attentionLayers == 48 &&
               descriptor.stateLayout.target.auxiliaryBytes == 1'916'928 && descriptor.draft == test::inkling2Draft(),
           "the release's Inkling-2-Mini config made another descriptor");
+  const SourceModel preview{release.record, release.config,
+                            text(fixtures / "inkling-2-mini" / "draft" / "preview-config.json")};
+  require(inspect(preview).draft == descriptor.draft, "the preview's Inkling-2-Mini draft config made another draft");
+  for (const std::string_view stated : {R"("capture_final_norm": true,)",
+                                        R"("embedding_normalization": "folded_rmsnorm",)",
+                                        ",\n    \"valid_vocab_size\": 200058"})
+    require(inspect(preview.with(&SourceModel::draft, stated, "")).draft == descriptor.draft,
+            "an Inkling-2-Mini draft config without " + std::string(stated) + " made another draft");
   struct Refused final {
     std::string_view from, to, error;
   };
@@ -1094,14 +1105,11 @@ void testInkling2(const std::filesystem::path &fixtures) {
             "draft config dflash_config valid_vocab_size mismatch: checkpoint 201024, runtime 200058"},
            {R"("mask_token_id": 200056)", R"("mask_token_id": 200055)",
             "draft config dflash_config mask_token_id mismatch: checkpoint 200055, runtime 200056"}})
-    refuses(release.with(&SourceModel::draft, refused.from, refused.to), refused.error,
+    refuses(preview.with(&SourceModel::draft, refused.from, refused.to), refused.error,
             "an Inkling-2-Mini draft with " + std::string(refused.to) + " was accepted");
   refuses(release.with(&SourceModel::draft, R"("final_logit_softcapping": 30.0,)", ""),
           "draft config dflash_config final_logit_softcapping must be a number",
           "an Inkling-2-Mini draft without its softcap was accepted");
-  refuses(release.with(&SourceModel::draft, R"("embedding_normalization": "folded_rmsnorm",)", ""),
-          "draft config embedding_normalization must be a string",
-          "an Inkling-2-Mini draft that states no embedding normalization was accepted");
   const SourceModel derived = release
                                   .with(&SourceModel::config, R"("qk_l2_clip_threshold": 22.627416997969522)",
                                         R"("qk_l2_clip_threshold": 22.627417)")

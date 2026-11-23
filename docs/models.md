@@ -506,8 +506,15 @@ target's head (`QwenTargetDimensions::logitSoftcap` and `vocabularyTokens`,
 (`final_logit_softcapping`) applies to each candidate's score after the
 selector's edge (`selector_softcap_mode` `after_correction`, the one placement
 the selector runs), before the probabilities its tree and a sampled verify
-read; a config states each where its target's head has one (Inkling 2's:
-200,058 tokens of 201,024 rows, and a softcap of 30).
+read; a config states the softcap where its target's head has one (Inkling
+2's: 30). Three values a config may leave to its target, as
+`incoai/Inkling-2-Mini-DFlash2`'s release leaves them to its serving adapter:
+whether the draft reads the final norm (`capture_final_norm`, which its ids
+say by naming the id past the target's layers), how its own rows are made
+(`embedding_normalization`) and the head's tokens (`valid_vocab_size`,
+Inkling 2's: 200,058 of 201,024 rows). One it states must be the one its
+target makes, and one it leaves out is that one. A draft trained on others
+would only be accepted less: the target verifies every token it proposes.
 A draft's rows after its anchor read the
 target's token table row of the mask token, unless its release ships that
 token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):

@@ -654,7 +654,13 @@ void requireQuantization(NSDictionary *config) {
 // for, and its block at least their rows; its hidden size, vocabulary, mask
 // token, the finish of its logits and how it reads its target the target's;
 // and the target layers it reads (target_layer_ids) some of the target's,
-// ascending. Its layers, intermediate size and rotary base are its own.
+// ascending. Its layers, intermediate size and rotary base are its own. The
+// target's values that say how it reads its target (num_target_layers,
+// target_hidden_reduction, embedding_normalization, capture_final_norm) and
+// the target's tokens (valid_vocab_size) it states or leaves to its target,
+// as Inkling-2-Mini-DFlash2's release leaves three of them to its serving
+// adapter: a config without one takes its target's, and one that states
+// another is refused.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
@@ -717,16 +723,15 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                  reduction, "checkpoint", "draft config dflash_config target_hidden_reduction");
   // Its rows of its own tokens as they were made (embedding_normalization):
   // the token table's rows through their norm where its target's first layer
-  // reads them so (QwenTargetDimensions::draftEmbeddingNorm), which its config
-  // then states, else as stored.
-  if (target.draftEmbeddingNorm || flash[@"embedding_normalization"])
+  // reads them so (QwenTargetDimensions::draftEmbeddingNorm), else as stored.
+  if (flash[@"embedding_normalization"])
     requireEqual(requireString(flash, @"embedding_normalization", "draft config embedding_normalization"),
                  target.draftEmbeddingNorm ? "folded_rmsnorm" : "none", "checkpoint",
                  "draft config dflash_config embedding_normalization");
   // Its head's finish, its target's (QwenTargetDimensions::logitSoftcap and
-  // vocabularyTokens), stated where its target has one: the softcap, which
-  // its selector's scores take after their edges (selector_softcap_mode
-  // after_correction, the one placement the selector runs), and its tokens
+  // vocabularyTokens): the softcap, which its selector's scores take after
+  // their edges (selector_softcap_mode after_correction, the one placement
+  // the selector runs), stated where its target has one; and its tokens
   // (valid_vocab_size).
   if (target.logitSoftcap != 0.0F || flash[@"final_logit_softcapping"]) {
     requireNumbers(flash, "checkpoint", "draft config dflash_config",
@@ -734,12 +739,12 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     requireEqual(requireString(flash, @"selector_softcap_mode", "draft config selector_softcap_mode"),
                  "after_correction", "checkpoint", "draft config dflash_config selector_softcap_mode");
   }
-  if (target.tokens() != target.vocabularySize || flash[@"valid_vocab_size"])
+  if (flash[@"valid_vocab_size"])
     requireNumbers(flash, "checkpoint", "draft config dflash_config", {{"valid_vocab_size", target.tokens()}});
   // The ids of the rows it reads (QwenTargetDimensions::draftReadsLayerInputs):
   // a target layer's output rows, or the rows passed into a layer, the id
-  // past the target's layers its final norm's rows, which its config then
-  // states it reads (capture_final_norm).
+  // past the target's layers its final norm's rows, whether it reads them
+  // (capture_final_norm).
   NSArray *ids = requireArray(flash, @"target_layer_ids", "draft config target_layer_ids");
   std::vector<uint32_t> targetLayers;
   for (id value : ids) {
@@ -749,7 +754,7 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
   const bool finalNorm = !targetLayers.empty() && targetLayers.back() == target.layers;
-  if (finalNorm || flash[@"capture_final_norm"])
+  if (flash[@"capture_final_norm"])
     requireBooleans(flash, "draft config dflash_config", {{"capture_final_norm", finalNorm}});
   const DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
