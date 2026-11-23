@@ -620,19 +620,6 @@ class UpstreamTest(unittest.TestCase):
                 "quantization language_model.model.layers.0.mlp.down_proj is "
                 "affine 4-bit in groups of 256" + formats,
             ),
-            # MLX writes false for a module it leaves unquantized.
-            (
-                "bf16-head",
-                {
-                    "quantization": {
-                        "bits": 4,
-                        "group_size": 64,
-                        "language_model.lm_head": False,
-                    }
-                },
-                "quantization language_model.lm_head is unquantized; Splash loads "
-                "quantized MLX projections",
-            ),
         ):
             with self.subTest(name=name):
                 fake.publish(f"someone/{name}", "b" * 40, target(quantization))
@@ -680,6 +667,12 @@ class UpstreamTest(unittest.TestCase):
             ("q3-g32", {"bits": 3, "group_size": 32, "mode": "affine"}),
             ("mxfp4", {"bits": 4, "group_size": 32, "mode": "mxfp4"}),
             ("nvfp4", {"bits": 4, "group_size": 16, "mode": "nvfp4"}),
+            # MLX writes false for a module it leaves unquantized, which loads
+            # as Q8_0.
+            (
+                "bf16-head",
+                {"bits": 4, "group_size": 64, "language_model.lm_head": False},
+            ),
             (
                 "mixed",
                 {

@@ -80,10 +80,11 @@ struct TensorScale {
 // format's native rows, which the writer builds from a quantized safetensors
 // tensor's tensors (safetensors.codes or safetensors.bfloat16 set), from
 // llama.cpp's NVFP4 rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long
-// from `offset` on) or by quantizing a GGUF tensor of BF16 or F16 values into
-// Q8_0 (ggufFloatRowBytes set: rows of ggufFloatType values that long from
-// `offset` on). An image row is column window `window` of `windows` equal
-// windows of such a row, whole native blocks: its imageRowBytes() bytes from
+// from `offset` on) or by building a tensor of BF16 or F16 values, a GGUF's
+// or a safetensors checkpoint's, into Q8_0 or, exactly, MXFP8
+// (float16RowBytes set: rows of float16Type values that long from `offset`
+// on). An image row is column window `window` of `windows` equal windows of
+// such a row, whole native blocks: its imageRowBytes() bytes from
 // window * imageRowBytes() on (a shared expert's down projection split into
 // slices of the routed experts' width, ops::MoeShape::sharedSlices). One
 // window is the whole row.
@@ -98,8 +99,8 @@ struct TensorRows {
   SafetensorsSource safetensors{};
   TensorScale scale{};
   uint64_t ggufNvfp4RowBytes = 0;
-  uint32_t ggufFloatType = 0;
-  uint64_t ggufFloatRowBytes = 0;
+  uint32_t float16Type = 0;
+  uint64_t float16RowBytes = 0;
   uint64_t first = 0; // the source row of image row 0
   uint32_t windows = 1;
   uint32_t window = 0;
@@ -188,7 +189,8 @@ struct Image {
 // streamTable, the rows of a table the family's GGUF holds after the
 // embedding (Qwen3.8-Flash-Next's PLE n-gram table) stream
 // (Image::streamedRows) instead of loading as its image. exactlyMxfp8 tells
-// whether a GGUF tensor of BF16 or F16 values in `file` holds MXFP8's values
+// whether a tensor of `values` BF16 or F16 values (`type`) at data offset
+// `offset` of `file`, a GGUF's or a checkpoint's, holds MXFP8's values
 // exactly (mxfp8Block), as a release's MXFP8 weights widened do: a start's
 // sizing and loader read them to tell (model/GgufPreparation.hpp
 // exactlyMxfp8), and without it the planner, which reads the header alone,
@@ -196,7 +198,7 @@ struct Image {
 struct PlanOptions {
   bool streamExperts = false;
   bool streamTable = false;
-  std::function<bool(const WeightSource &file, const GgufTensor &tensor)> exactlyMxfp8{};
+  std::function<bool(const WeightSource &file, uint64_t offset, uint64_t values, uint32_t type)> exactlyMxfp8{};
 };
 
 // The MXFP8 native block of 32 values (metal/abi/QuantFormat.h: an E8M0

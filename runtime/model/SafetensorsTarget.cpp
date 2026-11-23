@@ -49,7 +49,9 @@ SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, W
                    std::move(table), experts),
       planned_(std::move(planned)) {
   const safetensors::NormStorage norms = safetensors::normStorage(planned_->checkpoint, geometry);
-  planned_->images = safetensors::planImages(planned_->checkpoint, geometry, norms, planOptions());
+  gguf::PlanOptions options = planOptions();
+  options.exactlyMxfp8 = exactlyMxfp8;
+  planned_->images = safetensors::planImages(planned_->checkpoint, geometry, norms, options);
   float32Norms_ = safetensors::float32Norms(norms, geometry);
 }
 

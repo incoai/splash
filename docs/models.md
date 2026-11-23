@@ -82,14 +82,18 @@ a module its own, as mlx-lm writes it; a module's entry wins, and its mode
 defaults to affine. The engine loads affine 2, 3, 4, 5, 6 or 8 bits in groups
 of 32, 64 or 128, mxfp4 and mxfp8 (4 and 8 bits in groups of 32) and nvfp4 (4
 bits in groups of 16), mixed in any way across modules, and refuses any other
-format, naming the module. Every projection, the experts' too, and the head load only
-quantized (`safetensors::quantizedModules`): an entry `false`, which mlx-lm writes for
-a module it leaves unquantized, is refused for any of them before any weight
-download, naming it, and the loader refuses one the checkpoint holds
-unquantized. The router, the shared-expert gate, GDN alpha and beta and the
-token table may be unquantized. An affine weight is `s * q + z` for its group's
-bf16 `.scales` and `.biases` and its code `q`, packed little-endian in
-`.weight`'s 32-bit words at every width; an mxfp4 weight is an E2M1 code times
+format, naming the module. A projection, an expert or the head the checkpoint
+holds unquantized (an entry `false`, as mlx-lm writes for a module it leaves
+so), in BF16 or F16, loads as Q8_0, quantized from its values by the reference
+GGUF quantization of Q8_0 (`quantize_row_q8_0_ref`), as a GGUF's BF16
+hyper-connection projections do ([GGUF targets](#gguf-targets)): every decode
+cycle reads every projection, and Q8_0 holds a value in little more than half
+the bytes of a 16-bit float. Experts whose 16-bit values are exactly MXFP8's
+load as MXFP8 instead, as a GGUF's do. The router, the shared-expert gate, GDN alpha and
+beta and the token table load unquantized as stored. An affine weight is
+`s * q + z` for its group's bf16 `.scales` and `.biases` and its code `q`,
+packed little-endian in `.weight`'s 32-bit words at every width; an mxfp4
+weight is an E2M1 code times
 its group's power of two, a uint8 scale, which is GGUF's MXFP4; an mxfp8 weight
 is an E4M3 value, a byte of `.weight`, times its group's power of two, the
 same scale; an nvfp4 weight is an E2M1 code times its 16 elements' E4M3 scale,
@@ -123,9 +127,10 @@ NVIDIA's Model Optimizer checkpoints (`quantization_config` with
 `nvidia/Qwen3.6-35B-A3B-NVFP4`, load as safetensors targets beside MLX's. Each
 layer they quantize, by `quantized_layers` or else by `quant_algo` for every
 layer the `ignore` patterns leave, must hold NVFP4 in groups of 16 (`NVFP4`,
-`W4A16_NVFP4`) or FP8 with one scale per tensor (`FP8`), and every projection
-and the head must be such a layer; any other algorithm is refused before any
-weight download, naming the layer. An NVFP4 weight is `g * e4m3 * e2m1`: its
+`W4A16_NVFP4`) or FP8 with one scale per tensor (`FP8`); any other algorithm
+is refused before any weight download, naming the layer, and a projection or
+the head they leave unquantized loads as Q8_0, as an MLX target's does. An
+NVFP4 weight is `g * e4m3 * e2m1`: its
 E2M1 code (two per byte of `.weight`, U8), its 16 elements' E4M3 scale
 (`.weight_scale`, F8_E4M3) and the tensor's FP32 `.weight_scale_2`; an FP8
 weight is `g * e4m3`, its E4M3 value (`.weight`, F8_E4M3) and the tensor's
@@ -149,14 +154,11 @@ llm-compressor's checkpoints (`quantization_config` with `quant_method`
 `unsloth/Qwen3.6-35B-A3B-NVFP4`, load as Model Optimizer's do. Each config
 group's weights must be NVFP4 (`nvfp4-pack-quantized`: float 4-bit by
 `tensor_group` in groups of 16) or FP8 (`float-quantized`: float 8-bit by
-`channel` or `tensor`), symmetric and in their stored column order, and every
-projection and the head, each routed expert's by its own name (the first and
-the last expert's before the download, every expert's when its tensors load),
-must be a group's target that no `ignore` entry names; a target or entry is a
-module's name, a regular expression after `re:` matched from the start of the
-name (at most 512 bytes), or the class `Linear`. Anything else is refused before any weight download,
-naming the group or the module, so checkpoints that keep the head or a
-projection in BF16 (RedHatAI's) are refused. An NVFP4 weight's codes are
+`channel` or `tensor`), symmetric and in their stored column order; anything
+else is refused before any weight download, naming the group. A projection no
+group quantizes, or one an `ignore` entry names, such as the BF16 head of
+RedHatAI's checkpoints, loads as Q8_0, as an MLX target's does. An NVFP4
+weight's codes are
 `.weight_packed`, its `g` the reciprocal of the F32 `.weight_global_scale`;
 an FP8 weight's F32 or BF16 `.weight_scale` is the tensor's `g` or, `[rows,
 1]`, each row's, which that row's meta units hold.

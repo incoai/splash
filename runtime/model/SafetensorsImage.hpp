@@ -7,7 +7,9 @@
 // grouped, as all keep them. Every quantized tensor keeps the format its
 // tensors hold: MLX affine (metal/abi/QuantFormat.h), mxfp4, mxfp8 or nvfp4
 // as MLX infers it, or NVFP4 or FP8 as the other two store them: projections
-// and experts as planes, a quantized token table as native rows. An unquantized
+// and experts as planes, a quantized token table as native rows. A projection
+// or expert of BF16 or F16 weights takes Q8_0's planes, quantized from its
+// values as the reference GGUF quantization of Q8_0 rounds them; an unquantized
 // token table is copied as its bf16 rows. Norms are bf16 as stored, or the
 // F32 1 + w of a w stored 1 below, or widened (float32Norms); the convolution and
 // dt_bias are copied as stored, and the GDN decay is
@@ -95,14 +97,5 @@ enum class NormStorage : uint8_t { Multipliers, BelowMultipliers };
 [[nodiscard]] std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint,
                                                   const QwenTargetDimensions &geometry, NormStorage norms,
                                                   gguf::PlanOptions options = {});
-
-// The modules the images read only quantized, in their order and by `names`:
-// the layers' projections, the routed experts' (as a configuration names
-// them: MLX's stacked tensor per projection, once transformers' mlp.experts) and
-// the shared expert's, and the head. planImages refuses a checkpoint holding
-// one unquantized, and the configuration check one its config.json states
-// unquantized (model/ModelDescriptor.mm). The router, the shared-expert gate,
-// GDN alpha and beta, Flint's sinks and the token table are not among them.
-[[nodiscard]] std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names);
 
 } // namespace splash::model::safetensors

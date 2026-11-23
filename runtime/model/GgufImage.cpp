@@ -226,7 +226,7 @@ public:
     uint32_t format = imageFormat(tensor);
     if (float16Type(tensor.type)) {
       const bool mxfp8 = !(columns % ggufColumnUnit(kQuantFormats[GGUF_FMT_MXFP8])) && exactlyMxfp8_ &&
-                         exactlyMxfp8_(file_.source(tensor.file), tensor);
+                         exactlyMxfp8_(file_.source(tensor.file), tensor.offset, tensor.elements(), tensor.type);
       if (mxfp8 || columns % ggufColumnUnit(kQuantFormats[format])) {
         format = mxfp8 ? GGUF_FMT_MXFP8 : GGUF_FMT_Q80;
         return {format, builtRows(tensor, rows, format)};
@@ -543,12 +543,12 @@ private:
   }
 
   // Rows [0, count) of a BF16 or F16 tensor as the native rows of `format`
-  // the writer builds from its values (TensorRows::ggufFloatRowBytes): Q8_0
+  // the writer builds from its values (TensorRows::float16RowBytes): Q8_0
   // as the reference quantization rounds them, or MXFP8 exactly (mxfp8Block).
   TensorRows builtRows(const GgufTensor &tensor, uint64_t count, uint32_t format) const {
     TensorRows rows = tensorRows(tensor, count, tensor.bytes / count);
-    rows.ggufFloatType = rows.type;
-    rows.ggufFloatRowBytes = rows.rowBytes;
+    rows.float16Type = rows.type;
+    rows.float16RowBytes = rows.rowBytes;
     rows.type = kQuantFormats[format].ggml_type;
     rows.rowBytes = ggufRowBytes(kQuantFormats[format], tensor.columns());
     return rows;
@@ -565,7 +565,7 @@ private:
   const GgufFile &file_;
   const QwenTargetDimensions &geometry_;
   Problems &problems_;
-  std::function<bool(const WeightSource &, const GgufTensor &)> exactlyMxfp8_;
+  std::function<bool(const WeightSource &, uint64_t, uint64_t, uint32_t)> exactlyMxfp8_;
   ImageBuilder image_;
 };
 

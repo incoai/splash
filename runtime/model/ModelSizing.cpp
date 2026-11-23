@@ -100,7 +100,10 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
         const safetensors::NormStorage norms = safetensors::normStorage(checkpoint, layout);
         return targetWeights(
             layout,
-            [&](gguf::PlanOptions options) { return safetensors::planImages(checkpoint, layout, norms, options); },
+            [&](gguf::PlanOptions options) {
+              options.exactlyMxfp8 = exactlyMxfp8;
+              return safetensors::planImages(checkpoint, layout, norms, options);
+            },
             streams, layout.layers, layout.leadingDenseLayers);
       },
       descriptor.target);

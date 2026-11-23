@@ -44,7 +44,7 @@ public:
   Builder(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, ModuleNames names,
           Conversion norms, std::string name, uint32_t layer, uint32_t type, gguf::PlanOptions options = {})
       : checkpoint_(checkpoint), geometry_(geometry), names_(names), norms_(norms),
-        image_(std::move(name), layer, type, options.streamExperts) {}
+        exactlyMxfp8_(std::move(options.exactlyMxfp8)), image_(std::move(name), layer, type, options.streamExperts) {}
 
   // An RMSNorm's weight, which the norm kernels read (ops::NormWeights), as
   // the image holds norms.
@@ -83,7 +83,7 @@ public:
   // (gguf::TensorRows::windows; a shared expert's down projection as slices
   // of the routed experts' width, ops::MoeShape::sharedSlices).
   void projection(const std::string &module, uint64_t rows, uint64_t columns, uint32_t windows = 1) {
-    const TensorRows source = requireQuantized(module, rows, windows * columns);
+    const TensorRows source = projectionRows(module, rows, windows * columns);
     Repack repack = image_.planes(gguf_format_of(source.type), windows * rows, columns, module);
     for (uint32_t window = 0; window < windows; ++window) {
       TensorRows rows = source;
@@ -103,16 +103,15 @@ public:
     const uint64_t count = geometry_.experts;
     if (names_ != ModuleNames::Transformers) {
       const std::string module = mlp + "switch_mlp." + projection;
-      const std::optional<TensorRows> source = quantized(module, rows, columns, count);
-      if (!source) throw WeightStoreError(module + " is unquantized; Splash loads quantized projections");
-      Repack repack = image_.expertPlanes(gguf_format_of(source->type), count * rows, columns, module);
-      repack.sources.push_back(*source);
+      const TensorRows source = projectionRows(module, rows, columns, count);
+      Repack repack = image_.expertPlanes(gguf_format_of(source.type), count * rows, columns, module);
+      repack.sources.push_back(source);
       image_.expertRepack(std::move(repack));
       return;
     }
     std::vector<TensorRows> sources;
     for (uint64_t e = 0; e < count; ++e) {
-      sources.push_back(requireQuantized(mlp + "experts." + std::to_string(e) + "." + projection, rows, columns));
+      sources.push_back(projectionRows(mlp + "experts." + std::to_string(e) + "." + projection, rows, columns));
       if (sources.back().type != sources.front().type)
         throw WeightStoreError(sources.back().name + " is in another format than its layer's first expert");
     }
@@ -277,6 +276,31 @@ private:
     image_.copy(rows(name + ".weight", tensor, ggml::kBF16, 1, tensor.bytes), conversion);
   }
 
+  // The rows a projection's planes take of a module of `experts` [rows,
+  // columns] matrices: its quantization's native rows, or the native rows the
+  // writer builds from its BF16 or F16 weight's values
+  // (gguf::TensorRows::float16RowBytes), as a GGUF's 16-bit tensors build:
+  // experts holding MXFP8's values exactly as MXFP8 (exactlyMxfp8: lossless,
+  // half the bytes, as a release's MXFP8 experts widened to BF16 are), else
+  // the Q8_0 rows the reference GGUF quantization of Q8_0 makes, as for
+  // Qwen3.8-Flash-Next's BF16 hyper-connection projections: every decode
+  // cycle reads a projection whole, and Q8_0 holds a value in little more
+  // than half the bytes of a 16-bit float.
+  TensorRows projectionRows(const std::string &module, uint64_t rows, uint64_t columns, uint64_t experts = 1) const {
+    if (const std::optional<TensorRows> source = quantized(module, rows, columns, experts)) return *source;
+    std::vector<uint64_t> shape{rows, columns};
+    if (experts > 1) shape.insert(shape.begin(), experts);
+    const SourceTensor &weight = require(module + ".weight", {"BF16", "F16"}, shape);
+    const uint32_t float16Type = weight.dtype == "BF16" ? ggml::kBF16 : ggml::kF16;
+    const bool mxfp8 = experts > 1 && !(columns % ggufColumnUnit(kQuantFormats[GGUF_FMT_MXFP8])) && exactlyMxfp8_ &&
+                       exactlyMxfp8_(*weight.file, weight.offset, weight.bytes / 2, float16Type);
+    const QuantFormat &format = kQuantFormats[mxfp8 ? GGUF_FMT_MXFP8 : GGUF_FMT_Q80];
+    TensorRows source = this->rows(module, weight, format.ggml_type, experts * rows, ggufRowBytes(format, columns));
+    source.float16Type = float16Type;
+    source.float16RowBytes = columns * 2;
+    return source;
+  }
+
   // The module's native rows, which must be quantized.
   TensorRows requireQuantized(const std::string &module, uint64_t rows, uint64_t columns) const {
     const std::optional<TensorRows> source = quantized(module, rows, columns);
@@ -400,45 +424,15 @@ private:
   const QwenTargetDimensions &geometry_;
   const ModuleNames names_;
   const Conversion norms_;
+  const std::function<bool(const WeightSource &, uint64_t, uint64_t, uint32_t)> exactlyMxfp8_;
   gguf::ImageBuilder image_;
   std::optional<gguf::StreamedRows> streamedRows_;
 };
 
-// Plans nothing, and names the modules a walk of the images reads only
-// quantized (quantizedModules): the projections, a layer's routed experts
-// (MLX's stacked tensor of each projection, or once transformers' module
-// mlp.experts, which holds them), and the head, which Builder refuses
-// unquantized.
-struct QuantizedModules {
-  explicit QuantizedModules(ModuleNames names) : names(names) {}
-  void norm(const std::string &, uint64_t) {}
-  void gatedNorm(const std::string &, uint64_t) {}
-  void convolution(const std::string &) {}
-  void timeBias(const std::string &) {}
-  void decay(const std::string &) {}
-  void projection(const std::string &module, uint64_t, uint64_t, uint32_t = 1) { modules.push_back(module); }
-  void experts(const std::string &mlp, const std::string &projection, uint64_t, uint64_t) {
-    const std::string module = names != ModuleNames::Transformers ? mlp + "switch_mlp." + projection : mlp + "experts";
-    if (modules.empty() || modules.back() != module) modules.push_back(module);
-  }
-  void expertScales() {}
-  void alphaBeta(const std::string &, const std::string &) {}
-  void router(const std::string &, uint64_t, uint64_t) {}
-  void floatTensor(const std::string &, uint64_t, uint64_t) {}
-  void floatVector(const std::string &, std::vector<uint64_t>) {}
-  void floatValues(const std::string &, uint64_t, uint64_t) {}
-  void nativeRows(const std::string &, uint64_t, uint64_t, uint64_t, uint64_t) {}
-  void shardedTable(const std::string &, uint64_t, bool) {}
-  void embedding(const std::string &) {}
-
-  ModuleNames names;
-  std::vector<std::string> modules;
-};
-
-// The sections of each image, in their order, which a Builder plans and
-// QuantizedModules names, as each family's GGUF walk orders them
-// (GgufImage.cpp): the mixers and FFNs every family's layers hold, then each
-// family's layer and head around them, and the embedding.
+// The sections of each image, in their order, which a Builder plans, as
+// each family's GGUF walk orders them (GgufImage.cpp): the mixers and FFNs
+// every family's layers hold, then each family's layer and head around them,
+// and the embedding.
 //
 // A layer's GDN or attention mixer. The queries' projection holds every
 // query head's queries and, gated (attentionGate), its gate.
@@ -638,14 +632,6 @@ uint32_t mlxFormat(std::string_view mode, uint32_t bits, uint32_t group) noexcep
   if (mode == "mxfp8" && bits == 8 && group == 32) return GGUF_FMT_MXFP8;
   if (mode == "nvfp4" && bits == 4 && group == 16) return GGUF_FMT_NVFP4;
   return GGUF_FMT_COUNT;
-}
-
-std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names) {
-  std::vector<std::string> modules;
-  walkImages(
-      geometry, names, false, [&](std::string, uint32_t, uint32_t) { return QuantizedModules(names); },
-      [&](QuantizedModules &b) { modules.insert(modules.end(), b.modules.begin(), b.modules.end()); });
-  return modules;
 }
 
 } // namespace splash::model::safetensors

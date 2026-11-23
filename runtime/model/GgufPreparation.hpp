@@ -62,10 +62,11 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
 [[nodiscard]] WeightFileRecord imageRecord(const WeightImages &images, std::string_view prefix,
                                            const gguf::Image &plan);
 
-// Whether every 32 values of a GGUF tensor of BF16 or F16 values in `file`
+// Whether every 32 values of a tensor of `values` BF16 or F16 values (ggml
+// type `type`) at data offset `offset` of `file`, a GGUF's or a checkpoint's,
 // are exactly an MXFP8 block's (gguf::mxfp8Block), read on a thread per core
 // the first time a process asks: a start's gguf::PlanOptions::exactlyMxfp8.
-[[nodiscard]] bool exactlyMxfp8(const WeightSource &file, const GgufTensor &tensor);
+[[nodiscard]] bool exactlyMxfp8(const WeightSource &file, uint64_t offset, uint64_t values, uint32_t type);
 
 // Rows [first, first + count) of a repack (its sources' rows in order), whole
 // and back to back into `to`, count * ggufRowBytes(format, columns) bytes:

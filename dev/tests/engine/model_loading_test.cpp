@@ -1,3 +1,4 @@
+#include "GgufFormatReference.hpp"
 #include "TestAdmission.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -8,6 +9,7 @@
 #include "model/SsdReaders.hpp"
 #include "model/GgufImage.hpp"
 #include "model/GgufImageLayout.hpp"
+#include "model/GgufPreparation.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/SafetensorsImage.hpp"
@@ -833,9 +835,10 @@ ModelDescriptor writeBlockModel(const std::filesystem::path &root, const Layout 
 // An MLX target loads as block images: each quantized module in the format of
 // its tensors, GDN alpha and beta of two formats as F32, bf16 norms and
 // grouped GDN value heads, and streamableWeights plans the bytes it loads. A
-// raw checkpoint, whose convolution mlx-lm has not sanitized, is refused, and
-// so is one whose head mlx-lm left unquantized; a bf16 token table loads as its
-// bf16 rows.
+// raw checkpoint, whose convolution mlx-lm has not sanitized, is refused; a
+// head mlx-lm left unquantized, BF16 or F16, loads as the Q8_0 rows the
+// reference GGUF quantization of Q8_0 makes of its values, and a bf16 token
+// table as its bf16 rows.
 void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path &root) {
     const Qwen3_8Layout target = syntheticTarget();
     // Bits and group size by module, every MLX affine bit width and group size among them.
@@ -906,19 +909,47 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
     require(!std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).layers[0].inputNorm.float32,
             "an MLX block target whose q and k norms average 1.1875 did not load its norms as stored");
 
-    // An unquantized module: its weight in bf16, without scales and biases.
-    const auto unquantized = [&](const std::string &module) {
+    // An unquantized module: its weight in `dtype` of the 16-bit values `bits`
+    // (none for zeros), without scales and biases.
+    const auto unquantized = [&](const std::string &module, const std::string &dtype = "BF16",
+                                 const std::vector<uint16_t> &bits = {}) {
         std::vector<splash::test::SyntheticTensor> tensors;
         for (splash::test::SyntheticTensor &tensor : splash::test::mlxTargetTensors(target, bitsAndGroup))
-            if (tensor.name == module + ".weight")
-                tensors.push_back({tensor.name, "BF16", {target.vocabularySize, target.hiddenSize}});
-            else if (tensor.name != module + ".scales" && tensor.name != module + ".biases")
+            if (tensor.name == module + ".weight") {
+                std::vector<uint8_t> data(bits.size() * 2);
+                std::memcpy(data.data(), bits.data(), data.size());
+                tensors.push_back({tensor.name, dtype, {target.vocabularySize, target.hiddenSize}, data});
+            } else if (tensor.name != module + ".scales" && tensor.name != module + ".biases") {
                 tensors.push_back(std::move(tensor));
+            }
         splash::test::writeSyntheticShard(root / "target" / "model.safetensors", tensors);
     };
-    unquantized("language_model.lm_head");
-    rejects([&] { static_cast<void>(loadModel(backend, root, descriptor)); }, "language_model.lm_head is unquantized",
-            "an unquantized language_model.lm_head was accepted");
+    // A head of random values, BF16 then F16, loads as Q8_0: its planned rows are those
+    // gguf_reference::quantizeQ8_0 writes from the values.
+    std::mt19937 rng(11);
+    std::normal_distribution<float> weight(0.0f, 0.02f);
+    for (const bool float16 : {false, true}) {
+        std::vector<uint16_t> bits(uint64_t{target.vocabularySize} * target.hiddenSize);
+        std::vector<float> values(bits.size());
+        for (size_t i = 0; i < bits.size(); ++i) {
+            bits[i] = float16 ? gguf_reference::f2h(weight(rng)) : splash::test::floatToBf16(weight(rng));
+            values[i] = float16 ? gguf_reference::h2f(bits[i]) : gguf_reference::bf2f(bits[i]);
+        }
+        unquantized("language_model.lm_head", float16 ? "F16" : "BF16", bits);
+        const std::string name = std::string("a ") + (float16 ? "F16" : "BF16") + " head";
+        require(segmentFormats(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).logitsProjection) ==
+                    std::vector<uint32_t>{GGUF_FMT_Q80},
+                name + " did not load as Q8_0");
+        const splash::model::SafetensorsCheckpoint checkpoint(root / "target");
+        const std::vector<splash::model::gguf::Image> images = splash::model::safetensors::planImages(
+            checkpoint, target, splash::model::safetensors::normStorage(checkpoint, target));
+        const splash::model::gguf::Repack &head = images[target.layers].repacks.front();
+        std::vector<uint8_t> rows(uint64_t{target.vocabularySize} *
+                                  splash::model::ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], target.hiddenSize));
+        splash::model::readRepackRows(head, 0, target.vocabularySize, rows.data());
+        require(head.format == GGUF_FMT_Q80 && rows == gguf_reference::quantizeQ8_0(values),
+                name + "'s Q8_0 rows are not the reference quantization of its values");
+    }
     // A module the checkpoint lacks altogether is missing, not unquantized.
     std::vector<splash::test::SyntheticTensor> lacking;
     for (splash::test::SyntheticTensor &tensor : splash::test::mlxTargetTensors(target, bitsAndGroup))
@@ -1062,7 +1093,9 @@ void testSyntheticFloatMoeModel(MetalBackend &backend, const std::filesystem::pa
 }
 
 // An MLX MoE target loads as block images: the experts in mixed formats, the
-// routed down projection mxfp4, the 8-bit affine router as its native rows,
+// routed up projection BF16 values MXFP8 holds exactly as MXFP8 (as a GGUF's
+// 16-bit experts load), the routed down projection mxfp4, the 8-bit affine
+// router as its native rows,
 // which the float projection decodes, and the bf16 shared-expert gate as the
 // F32 values the MoE selection reads; streamableWeights plans the bytes it
 // loads.
@@ -1097,6 +1130,22 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
         if (tensor.name.ends_with("shared_expert_gate.weight"))
             tensor = {tensor.name, "BF16", {1, target.hiddenSize}};
     }
+    // The routed up projection a BF16 weight of k / 128 for k of -16..16, which
+    // MXFP8 holds exactly: E4M3 values of at most three mantissa bits under one
+    // power of two a block.
+    std::erase_if(tensors, [](const SyntheticTensor &tensor) {
+        return tensor.name.find("switch_mlp.up_proj.") != std::string::npos;
+    });
+    for (uint32_t layer = 0; layer < target.layers; ++layer) {
+        const uint64_t values = uint64_t{target.experts} * target.expertIntermediateSize * target.hiddenSize;
+        std::vector<uint8_t> bytes(values * 2);
+        for (uint64_t i = 0; i < values; ++i) {
+            const uint16_t bits = splash::test::floatToBf16(float(int64_t((i * 2654435761u + layer) % 33) - 16) / 128.0f);
+            std::memcpy(bytes.data() + 2 * i, &bits, 2);
+        }
+        tensors.push_back({"language_model.model.layers." + std::to_string(layer) + ".mlp.switch_mlp.up_proj.weight",
+                           "BF16", {target.experts, target.expertIntermediateSize, target.hiddenSize}, bytes});
+    }
     const ModelDescriptor descriptor = writeBlockModel(root, target, tensors);
     const uint64_t planned = splash::model::streamableWeights(root, descriptor, {}).loadedBytes;
     const auto model = loadModel(backend, root, descriptor);
@@ -1108,7 +1157,7 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
     for (const auto &layer : weights.layers) {
         const splash::ops::BlockMoeWeights &ffn = layer.ffn;
         require(ffn.gate.routed.formatId == format("switch_mlp.gate_proj") &&
-                    ffn.up.routed.formatId == format("switch_mlp.up_proj") &&
+                    ffn.up.routed.formatId == GGUF_FMT_MXFP8 &&
                     ffn.down.routed.formatId == GGUF_FMT_MXFP4 &&
                     ffn.gate.shared.formatId == format("shared_expert.gate_proj") &&
                     ffn.up.shared.formatId == format("shared_expert.up_proj") &&

@@ -705,9 +705,9 @@ void checkHyperConnections(const std::filesystem::path &directory) {
                         repack->columns == columns && repack->sources.size() == 1 &&
                         repack->sources[0].type == kQ8_0 &&
                         repack->sources[0].rowBytes == gguf_reference::rowBytes(Fmt(GGUF_FMT_Q80), uint32_t(columns)) &&
-                        (stored ? !repack->sources[0].ggufFloatRowBytes
-                                : repack->sources[0].ggufFloatType == tensor.type &&
-                                      repack->sources[0].ggufFloatRowBytes == columns * 2);
+                        (stored ? !repack->sources[0].float16RowBytes
+                                : repack->sources[0].float16Type == tensor.type &&
+                                      repack->sources[0].float16RowBytes == columns * 2);
     if (shaped) model::readRepackRows(*repack, 0, rows, rowsRead.data());
     check(shaped && rowsRead == expected, "planner repacks " + model::ggmlTypeName(tensor.type) + " " + name +
                                               (stored ? " as stored" : " as the reference Q8_0 of its values"));
@@ -1161,8 +1161,8 @@ model::Inkling2LoopLayout inkling2Layout() {
 // scale's values.
 std::vector<uint8_t> sourceBytes(const model::gguf::TensorRows &rows) {
   const uint64_t stored = rows.ggufNvfp4RowBytes ? rows.ggufNvfp4RowBytes
-                          : rows.ggufFloatRowBytes ? rows.ggufFloatRowBytes
-                                                   : rows.rowBytes;
+                          : rows.float16RowBytes ? rows.float16RowBytes
+                                                 : rows.rowBytes;
   std::vector<uint8_t> bytes(rows.rows * stored + rows.scale.bytes);
   rows.file->readData(rows.offset + rows.first * stored, std::span(bytes).first(rows.rows * stored));
   if (rows.scale.bytes)
