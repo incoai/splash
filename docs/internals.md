@@ -725,10 +725,10 @@ The rules:
    (`ops::MoeCalibration::wideTileRoutes`), which dequantize an expert's
    weights once for up to 64 of its rows: from 1024 rows on Inkling-2-Mini,
    at 2048 on Qwen3.6-35B-A3B and Qwen3.5-122B-A10B. A row's result is the
-   same bits on every tile. One plan per
-   step serves every block, so its router follows rule 3 in the format of
-   most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
-   are the step's routes', packed (`ops::MoeScratch`). With int8 activations
+   same bits on every tile. One plan per step serves every block, so its
+   router follows rule 3 in the format of most blocks' routers
+   (`ops::moeRouterFormat`). Every tile's grouped rows are the step's
+   routes', packed (`ops::MoeScratch`). With int8 activations
    on, a prefill chunk whose dense projections run the
    [int8-activation tile](#int8-activation-prefill) runs its experts on int8
    passes too where every block's experts are resident and each projection's
