@@ -129,6 +129,8 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
     for (const kv::ChunkedPrefillParams &chunk : sequences)
       if (chunk.chunk_tokens != sequences.front().chunk_tokens || chunk.chunk_tokens > SPLASH_TARGET_VERIFY_ROWS)
         throw std::invalid_argument("a decode step's lanes share a lane cap of at most a verify block's rows");
+  if (decode && !calibration.cores)
+    throw std::invalid_argument("a decode step's splits fill a device's cores: a calibration of none");
   const AttentionWorkspace slot = workspaceOf(slotRows());
   const uint64_t slots = std::min(capacity.partialsBytes / slot.partialsBytes,
                                   capacity.statisticsBytes / slot.statisticsBytes);
@@ -139,7 +141,7 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
     const uint32_t tiles = kv::attentionTiles(chunk.chunk_tokens);
     const uint64_t pages =
         readPages(uint64_t{chunk.committed_tokens} + chunk.chunk_tokens, variant.windowTokens);
-    const uint32_t splits = decode ? decodeSplits(pages, chunk.chunk_tokens)
+    const uint32_t splits = decode ? decodeSplits(pages, chunk.chunk_tokens, calibration.cores)
                                    : attentionSplits(tiles, pages, variant.windowTokens, calibration.pagesPerSplit);
     splitReads = std::max(splitReads, (pages + splits - 1) / splits);
     plan.sequences_[plan.sequenceCount_++] = {chunk.chunk_tokens, chunk.committed_tokens, 0, splits};
@@ -169,11 +171,18 @@ RelativeAttentionPlan RelativeAttention::lastTiles(const RelativeAttentionPlan &
   return tails;
 }
 
-uint32_t RelativeAttention::decodeSplits(uint64_t pages, uint32_t laneCap) {
-  static_assert(kDecodeTileSplits <= SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS, "a combine of at most its splits");
-  const uint32_t most = kDecodeTileSplits / kv::attentionTiles(laneCap);
-  return static_cast<uint32_t>(
-      std::clamp<uint64_t>((pages + kDecodePagesPerSplit - 1) / kDecodePagesPerSplit, 1, most));
+uint32_t RelativeAttention::decodeMostSplits(uint32_t laneCap, uint32_t cores) {
+  const uint32_t most = laneCap > kv::kAttentionTileRows ? (cores + 8) / 4 : (cores + 16) / 3;
+  return std::clamp<uint32_t>(most, 1, SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS);
+}
+
+uint32_t RelativeAttention::decodeSplits(uint64_t pages, uint32_t laneCap, uint32_t cores) {
+  const uint64_t most = decodeMostSplits(laneCap, cores);
+  const uint64_t fewest = std::clamp<uint64_t>(pages, 1, decodeMostSplits(SPLASH_TARGET_VERIFY_ROWS, cores));
+  const uint64_t splits = std::clamp<uint64_t>((pages * cores + kDecodeCorePages - 1) / kDecodeCorePages,
+                                               std::min(fewest, most), most);
+  const uint64_t perSplit = std::max<uint64_t>((pages + splits - 1) / splits, 1);
+  return static_cast<uint32_t>(std::max<uint64_t>((pages + perSplit - 1) / perSplit, 1));
 }
 
 void RelativeAttention::group(RelativeAttentionPlan &plan) {

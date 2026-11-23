@@ -147,11 +147,11 @@ public:
       (kProjectionWidth + GGUF_TILE_COLUMNS - 1) / GGUF_TILE_COLUMNS * GGUF_TILE_COLUMNS;
   // The single pass's counters (RelativeAttentionWorkspace).
   static constexpr uint64_t kCountersBytes = uint64_t{SPLASH_MAXIMUM_BATCH_WIDTH} * kKvHeads * sizeof(uint32_t);
-  // A decode lane's tile takes a history split per kDecodePagesPerSplit pages
-  // it reads, at most kDecodeTileSplits shared out over the tiles of
-  // kv::kAttentionTileRows rows its block spans (decodeSplits).
-  static constexpr uint32_t kDecodePagesPerSplit = 4;
-  static constexpr uint32_t kDecodeTileSplits = 12;
+  // A decode lane's tile takes a history split per kDecodeCorePages / cores
+  // pages it reads (4 on a 20-core GPU), but one a page up to a verify
+  // block's most, and at most as many as the GPU keeps resident
+  // (decodeSplits).
+  static constexpr uint32_t kDecodeCorePages = 80;
 
   // Whether a layout's pages are those the kernels read and store: kKvHeads
   // heads of kHeadDimension, every page read, values dimension-major.
@@ -187,18 +187,29 @@ public:
   // last row.
   [[nodiscard]] static RelativeAttentionPlan lastTiles(const RelativeAttentionPlan &plan);
   // The history splits of a decode lane's tile of `laneCap` rows that reads
-  // `pages` pages: one per kDecodePagesPerSplit pages, at most
-  // kDecodeTileSplits for a narrow cap's tile and half as many for a verify
-  // block's, whose combine reads twice the rows. Measured on a 20-core M5 Pro
-  // (a lane over 24 layers of distinct K/V, its splits forced, fused time a
-  // layer): a page costs a split about 4 us, and each split more its
-  // combine's reads, so a sliding layer's 33 pages ran fastest in 9 splits at
-  // 1 and 8 rows (34.9 and 41.9 us, the three-dispatch path's 45.0 and 45.9),
-  // a full layer's in 12 from 2,048 to 32,768 tokens (55.9 us at 2,048 and 1
-  // row, 62.9 at 8, against 64.6 and 75.5), and a verify block's in 6 (a
-  // sliding layer's 64.6 us against 78.1). It depends on the lane alone, so
-  // batching never changes a lane's partition.
-  [[nodiscard]] static uint32_t decodeSplits(uint64_t pages, uint32_t laneCap);
+  // `pages` pages on a GPU of `cores` cores: one per kDecodeCorePages / cores
+  // pages, but at least one a page up to a verify block's most, and at most
+  // decodeMostSplits; then as many as the runs of pages that many make
+  // (relative_attention_pages), so that each reads some. A page costs a
+  // split about 4 us, each split more its combine's reads, and past the
+  // threadgroups the GPU keeps resident a split waits for a second wave.
+  // Measured over 24 layers of distinct K/V (one lane, its splits forced, fused
+  // time a layer), a sliding layer's window ran in 9 splits on a 20-core M5 Pro
+  // (34.7 us at 1 row and 41.9 at 8, the three-dispatch path's 44.7 and 45.5)
+  // and 12 on a 32-core M5 Max (28.1 and 34.9; 42.1 and 42.3), a full layer's
+  // 2,048 tokens in 11 runs of 6 pages (54.6 us at 1 row; 68.3) and 13 of 5
+  // (40.0; 55.6), and a short history's few pages a page or two a split (17
+  // pages in 6 runs, 23.8 us at 1 row against 30.7, and in 9, 19.7 against
+  // 29.4). It depends on the lane alone, so batching never changes a lane's
+  // partition.
+  [[nodiscard]] static uint32_t decodeSplits(uint64_t pages, uint32_t laneCap, uint32_t cores);
+  // The most history splits of a decode lane's tile of `laneCap` rows on a GPU
+  // of `cores` cores, the edge of the threadgroups it keeps resident: 12 for
+  // a narrow cap's tile and 7 for a verify block's on a 20-core M5 Pro (13
+  // and 8 took a full layer's 2,048 tokens 20% and 16% more), 16 and 10 on a
+  // 32-core M5 Max (17 took 8,192 tokens 9% more, 11 a verify block's 2,048
+  // 13%), and linearly in the cores between and beyond the two.
+  [[nodiscard]] static uint32_t decodeMostSplits(uint32_t laneCap, uint32_t cores);
 
   // The prepare of a layer's rows, in one dispatch before the attention:
   // each query head's queries, relative states and sink staged in `staging`,

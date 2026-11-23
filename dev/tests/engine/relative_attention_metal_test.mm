@@ -61,6 +61,9 @@ constexpr uint32_t kGateOffset = kQueryHeads * kHeadDimension, kStateOffset = 2 
 constexpr uint32_t kSinkOffset = kStateOffset + kQueryHeads * kStates;
 constexpr uint32_t kPageTokens = kv::kPageTokens;
 constexpr uint32_t kLaneRows = ops::kNarrowLaneRows;
+// The GPU cores a decode step's splits fill (AttentionCalibration::cores):
+// a 20-core M5 Pro's.
+constexpr uint32_t kCores = 20;
 // The layer under test is the second of a pool's two.
 constexpr uint32_t kLayer = 1;
 // A sliding layer's variant and a full layer's.
@@ -161,7 +164,9 @@ struct Case final {
 
   [[nodiscard]] uint32_t page(uint32_t lane, uint32_t token) const { return pages[lane][token / kPageTokens]; }
   [[nodiscard]] ops::AttentionCalibration attention() const {
-    return test::attentionRow(int8Queries ? 1U : ops::kNever);
+    ops::AttentionCalibration row = test::attentionRow(int8Queries ? 1U : ops::kNever);
+    row.cores = kCores;
+    return row;
   }
   [[nodiscard]] double key(uint32_t lane, uint32_t head, uint32_t token, uint32_t dimension) const {
     const uint64_t index = splash_kv_key_element(head, token % kPageTokens, dimension, kHeadDimension);
@@ -402,7 +407,7 @@ uint32_t decodeLaneSplits(const Case &data, const Step &step, uint32_t lane) {
   const uint32_t pages = (data.histories[lane] + step.first + step.rows + kPageTokens - 1) / kPageTokens;
   return RelativeAttention::decodeSplits(
       data.variant.windowTokens ? std::min(pages, kv::windowAttentionPages(data.variant.windowTokens)) : pages,
-      step.rows);
+      step.rows, data.attention().cores);
 }
 
 // A decode step's single pass on a poisoned workspace and zero counters, as
@@ -1022,49 +1027,76 @@ void checkPlans() {
     // lane's splits of its own pages.
     const ops::AttentionWorkspace lanes = RelativeAttention::laneWorkspace(layout);
     for (const uint32_t cap : {kLaneRows, uint32_t{SPLASH_TARGET_VERIFY_ROWS}})
-      for (const auto variant : {kSliding, kFull, ops::RelativeAttentionVariant{}}) {
-        const std::array steps{ops::PagedAttention::chunkParams(5000, cap, kPageTokens, (5000 + cap + 31) / 32),
-                               ops::PagedAttention::chunkParams(70, cap, kPageTokens, (70 + cap + 31) / 32)};
-        const auto decode = [&](uint32_t int8QueriesFromPages) {
-          return RelativeAttention::plan(steps, layout, test::attentionRow(int8QueriesFromPages),
-                                         ops::Int8Activations::On, {2 * lanes.partialsBytes, 2 * lanes.statisticsBytes},
-                                         variant, ops::StepKind::Decode);
-        };
-        const std::string suffix = std::string(cap > kLaneRows ? "_r16" : "") +
-                                   (variant.windowTokens ? "_w1023" : "") + (variant.positionScaled ? "_scaled" : "");
-        const ops::RelativeAttentionPlan plan = decode(ops::kNever);
-        require(plan.decodePipeline() == "relative_attention_" + name + "_decode" + suffix &&
-                    plan.splitPipeline().empty() && plan.reducePipeline().empty() && plan.dispatches().size() == 1,
-                "a decode plan names another kernel");
-        for (size_t s = 0; s < steps.size(); ++s) {
-          const uint32_t pages = (steps[s].committed_tokens + cap + kPageTokens - 1) / kPageTokens;
-          require(plan.sequences()[s].splits ==
-                      RelativeAttention::decodeSplits(
-                          variant.windowTokens ? std::min(pages, kv::windowAttentionPages(kWindow)) : pages, cap),
-                  "a decode lane's splits are not its own pages'");
+      for (const uint32_t cores : {kCores, 32U})
+        for (const auto variant : {kSliding, kFull, ops::RelativeAttentionVariant{}}) {
+          const std::array steps{ops::PagedAttention::chunkParams(5000, cap, kPageTokens, (5000 + cap + 31) / 32),
+                                 ops::PagedAttention::chunkParams(70, cap, kPageTokens, (70 + cap + 31) / 32)};
+          const auto decode = [&](uint32_t int8QueriesFromPages) {
+            ops::AttentionCalibration row = test::attentionRow(int8QueriesFromPages);
+            row.cores = cores;
+            return RelativeAttention::plan(steps, layout, row, ops::Int8Activations::On,
+                                           {2 * lanes.partialsBytes, 2 * lanes.statisticsBytes}, variant,
+                                           ops::StepKind::Decode);
+          };
+          const std::string suffix = std::string(cap > kLaneRows ? "_r16" : "") +
+                                     (variant.windowTokens ? "_w1023" : "") + (variant.positionScaled ? "_scaled" : "");
+          const ops::RelativeAttentionPlan plan = decode(ops::kNever);
+          require(plan.decodePipeline() == "relative_attention_" + name + "_decode" + suffix &&
+                      plan.splitPipeline().empty() && plan.reducePipeline().empty() && plan.dispatches().size() == 1,
+                  "a decode plan names another kernel");
+          for (size_t s = 0; s < steps.size(); ++s) {
+            const uint32_t pages = (steps[s].committed_tokens + cap + kPageTokens - 1) / kPageTokens;
+            require(plan.sequences()[s].splits ==
+                        RelativeAttention::decodeSplits(
+                            variant.windowTokens ? std::min(pages, kv::windowAttentionPages(kWindow)) : pages, cap,
+                            cores),
+                    "a decode lane's splits are not its own pages'");
+          }
+          require(decode(1).decodePipeline() ==
+                      "relative_attention_" + std::string(format == kv::Format::Int8 ? "q8q" : "bf16") + "_decode" +
+                          suffix,
+                  "a decode plan's INT8 queries score INT8 pages alone");
+          rejects([&] { static_cast<void>(RelativeAttention::lastTiles(plan)); }, "one tile each",
+                  "a decode plan's last tiles were planned");
         }
-        require(decode(1).decodePipeline() ==
-                    "relative_attention_" + std::string(format == kv::Format::Int8 ? "q8q" : "bf16") + "_decode" +
-                        suffix,
-                "a decode plan's INT8 queries score INT8 pages alone");
-        rejects([&] { static_cast<void>(RelativeAttention::lastTiles(plan)); }, "one tile each",
-                "a decode plan's last tiles were planned");
-      }
   }
-  // A lane's splits: one per kDecodePagesPerSplit pages, at most
-  // kDecodeTileSplits for a narrow cap's tile and half as many for a verify
-  // block's.
-  constexpr uint32_t perSplit = RelativeAttention::kDecodePagesPerSplit, most = RelativeAttention::kDecodeTileSplits;
+  // A lane's splits: one per kDecodeCorePages / cores pages, but one a page
+  // up to a verify block's most, at most decodeMostSplits, and as many as the
+  // runs of pages they make. On 20 cores (most 12 and 7) 9 pages' 7 splits of
+  // 2 pages make 5 runs, a window's 34 pages take 9 and a full layer's 65 11
+  // runs of 6; on 32 cores (16 and 10) the window 12 runs of 3 and 65 pages
+  // 13 of 5.
   constexpr uint32_t wide = SPLASH_TARGET_VERIFY_ROWS;
-  require(RelativeAttention::decodeSplits(1, kLaneRows) == 1 &&
-              RelativeAttention::decodeSplits(perSplit, kLaneRows) == 1 &&
-              RelativeAttention::decodeSplits(perSplit + 1, kLaneRows) == 2 &&
-              RelativeAttention::decodeSplits(kv::windowAttentionPages(kWindow), kLaneRows) ==
-                  (kv::windowAttentionPages(kWindow) + perSplit - 1) / perSplit &&
-              RelativeAttention::decodeSplits(1u << 20, kLaneRows) == most &&
-              RelativeAttention::decodeSplits(1u << 20, wide) == most / 2 &&
-              RelativeAttention::decodeSplits(perSplit + 1, wide) == 2,
+  const uint32_t window = kv::windowAttentionPages(kWindow);
+  require(RelativeAttention::decodeMostSplits(kLaneRows, 20) == 12 &&
+              RelativeAttention::decodeMostSplits(wide, 20) == 7 &&
+              RelativeAttention::decodeMostSplits(kLaneRows, 32) == 16 &&
+              RelativeAttention::decodeMostSplits(wide, 32) == 10 &&
+              RelativeAttention::decodeMostSplits(kLaneRows, 1000) == SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS,
+          "a decode lane's most splits follow another rule");
+  bool pageEach = true;
+  for (const uint32_t cores : {20U, 32U})
+    for (uint32_t pages = 1; pages <= RelativeAttention::decodeMostSplits(wide, cores); ++pages)
+      pageEach = pageEach && RelativeAttention::decodeSplits(pages, kLaneRows, cores) == pages &&
+                 RelativeAttention::decodeSplits(pages, wide, cores) == pages;
+  require(pageEach && window == 34 && RelativeAttention::decodeSplits(9, kLaneRows, 20) == 5 &&
+              RelativeAttention::decodeSplits(window, kLaneRows, 20) == 9 &&
+              RelativeAttention::decodeSplits(65, kLaneRows, 20) == 11 &&
+              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 20) == 12 &&
+              RelativeAttention::decodeSplits(1u << 20, wide, 20) == 7 &&
+              RelativeAttention::decodeSplits(window, kLaneRows, 32) == 12 &&
+              RelativeAttention::decodeSplits(65, kLaneRows, 32) == 13 &&
+              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 32) == 16 &&
+              RelativeAttention::decodeSplits(1u << 20, wide, 32) == 10,
           "a decode lane's splits follow another rule");
+  rejects(
+      [&] {
+        static_cast<void>(RelativeAttention::plan(lane, layoutOf(kv::Format::Int8), test::attentionRow(1),
+                                                  ops::Int8Activations::On,
+                                                  RelativeAttention::workspace(256, layoutOf(kv::Format::Int8)),
+                                                  kSliding, ops::StepKind::Decode));
+      },
+      "a calibration of none", "a decode step was planned for no device's cores");
   for (const uint32_t cap : {kLaneRows + 1, uint32_t{SPLASH_TARGET_VERIFY_ROWS} + 1})
     rejects(
         [&] {

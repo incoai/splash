@@ -125,6 +125,10 @@ struct AttentionCalibration final {
   // From this many pages each split of the longest tile or lane reads, a
   // dense split over INT8 pages scores INT8 queries (PagedAttention.cpp).
   uint32_t int8QueriesFromPages;
+  // The device's GPU cores (KernelCalibration::cores), which a decode step's
+  // relative attention fills (RelativeAttention::decodeSplits); 0 in a row
+  // no device made.
+  uint32_t cores = 0;
 };
 
 // Every measured constant of kernel selection for one device.
@@ -364,11 +368,14 @@ inline constexpr AttentionCalibration kApple9SmallAttention = [] {
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
   const GpuClass gpu = device.gpuClass();
+  AttentionCalibration attention =
+      gpu != GpuClass::Apple9 ? kApple10Attention
+                              : cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention;
+  attention.cores = cores;
   if (gpu != GpuClass::Apple9)
     return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
-            kApple10DenseTile, kApple10Attention};
-  return {cores, kApple9Projection, kApple9FloatTile, kApple9DenseTile,
-          cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention};
+            kApple10DenseTile, attention};
+  return {cores, kApple9Projection, kApple9FloatTile, kApple9DenseTile, attention};
 }
 
 } // namespace splash::ops
