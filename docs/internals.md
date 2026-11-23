@@ -731,9 +731,11 @@ The rules:
    routes', packed (`ops::MoeScratch`). With int8 activations
    on, a prefill chunk whose dense projections run the
    [int8-activation tile](#int8-activation-prefill) runs its experts on int8
-   passes too where every block's experts are resident and each projection's
-   routed and shared experts share a format the tile takes
-   (`ops::moeInt8Experts`), once its routes average six or more an expert
+   passes too where every block's experts are resident, its routing is one
+   the passes compile (one or two shared slices, SiLU) and each projection's
+   routed and shared experts share af4g64 or af5g64 (`ops::moeInt8Experts`;
+   not Q8_0, which the tile takes for dense projections alone), once its
+   routes average six or more an expert
    (`ops::selectMoe`, `MoeConfig::int8Passes`): from 192 rows on
    Qwen3.6-35B-A3B and Qwen3.5-122B-A10B, 256 on Flint's shape and 308 on
    Qwen3.8-Flash-Next's. Smaller chunks and every decode step (rule 1) keep
@@ -1331,10 +1333,14 @@ quantizes once and runs a GEMM per segment, and an up on its gate's codes bitwis
 `gguf-projection-benchmark` times it as `prefill int8`.
 
 A MoE target's experts run on the same tile in such a chunk where every block's experts are
-resident and each projection's routed and shared experts share af4g64, af5g64 or Q8_0
-(`ops::moeInt8Experts`; Qwen3.6-35B-A3B MLX 4-bit, not Flint's af3g64 nor a set
-with Q8_0 shared experts beside routed experts of another format, as the unsloth GGUFs
-hold them): `gguf_prefill_int8_quantize` rounds the chunk's MoE input rows once,
+resident, its routing is one the passes compile (one or two shared slices and SiLU's activation:
+not Inkling-2-Mini's softcapped one without a shared expert) and each projection's routed and
+shared experts share af4g64 or af5g64 (`ops::moeInt8Experts`, `quant_moe_int8_format`;
+Qwen3.6-35B-A3B MLX 4-bit, not Flint's af3g64 nor a set with Q8_0 shared experts beside routed
+experts of another format, as the unsloth GGUFs hold them). Q8_0 experts keep the staged passes,
+though the tile takes Q8_0 dense projections: no real model has run them on these passes, whose
+rule of six routes an expert below was measured on af4g64. `gguf_prefill_int8_quantize` rounds
+the chunk's MoE input rows once,
 `moe_gather_int8` copies each route's codes and scales into the grouping's tiles, and
 `moe_expert_int8_<format>_<gate|up|down>` (`kernels/shared/moe_int8.metal`) run the tile over them,
 each tile's expert reached as the staged passes reach it, with the SwiGLU intermediate rounded by the

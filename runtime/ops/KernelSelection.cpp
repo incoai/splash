@@ -363,9 +363,15 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
   return *router && router < routers.end() - 1 ? uint32_t(router - routers.begin()) : QuantizedSegment::kFloat32;
 }
 
-bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept {
+bool moeInt8Experts(const MoeShape &shape, std::span<const BlockMoeWeights *const> blocks) noexcept {
+  // moe_int8.metal compiles the passes for a routing of one or two shared
+  // slices (slicesSuffix "" and "_s2") whose gate/up applies SiLU (no
+  // activationSuffix), in the formats quant_moe_int8_format takes.
+  const CompiledMoeRouting *routing = shape.compiledRouting();
+  if (!routing || (routing->sharedSlices != 1 && routing->sharedSlices != 2) || !routing->activationSuffix.empty())
+    return false;
   const auto takes = [](const BlockExpertProjection &p) {
-    return p.routed.formatId == p.shared.formatId && quant_prefill_int8_format(p.routed.formatId);
+    return p.routed.formatId == p.shared.formatId && quant_moe_int8_format(p.routed.formatId);
   };
   return !blocks.empty() && std::ranges::all_of(blocks, [&](const BlockMoeWeights *block) {
     return takes(block->gate) && takes(block->up) && takes(block->down);
@@ -399,7 +405,8 @@ bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept {
 // A chunk's experts run the int8 passes where its dense projections run the
 // int8 prefill tile (int8PrefillPaths: a prefill chunk's, int8 activations
 // on, Apple10 and Apple11; more rows than the decode tiles' 64) and the
-// block's experts take it (MoeShape::int8Experts), once its routes average
+// blocks' experts take the passes (MoeShape::int8Experts: af4g64 or af5g64,
+// not Q8_0, which the dense tile alone takes), once its routes average
 // kInt8PassRoutesPerExpert (6) or more an expert: the quantity that drives
 // the passes' cost, not the chunk's rows. Below it the int8 passes are not
 // shorter in every run, as the int8 tile runs both 16-row fragments of an

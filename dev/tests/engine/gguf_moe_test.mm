@@ -61,6 +61,7 @@
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
+#include "../../../runtime/ops/KernelSelection.hpp"
 #include "../../../runtime/ops/Linear.hpp"
 #include "../../../runtime/ops/MoE.hpp"
 #include "GgufFormatReference.hpp"
@@ -1245,16 +1246,17 @@ void bufferExtents(MetalBackend &backend) {
                         });
 }
 
-// The int8 passes (MoeConfig::int8Passes) of a block whose six projections are one format the int8 tile takes:
-// af4g64, af5g64 and Q8_0 run them, each pass inside the int8 rule's interval, a row's result the same in every chunk
-// (its codes and sums depend on its own inputs alone); af3g64, which the int8 tile does not take, keeps the staged
-// passes, and so does a plan without int8Passes (--activations bf16). As the plans select them, the passes run only
+// The int8 passes (MoeConfig::int8Passes) of a block whose six projections are one format: af4g64 and af5g64, which
+// the passes take (quant_moe_int8_format, and so moeInt8Experts for the block), run them, each pass inside the int8
+// rule's interval, a row's result the same in every chunk (its codes and sums depend on its own inputs alone); af3g64,
+// which the int8 tile does not take, and Q8_0, which it takes for dense projections alone, keep the staged passes,
+// and so does a plan without int8Passes (--activations bf16). As the plans select them, the passes run only
 // where the device's family runs the int8 prefill tile (ProjectionCalibration::prefillInt8: not Apple9, where the
 // tile's int8 fragments do not compute these products); elsewhere every plan keeps the staged passes. The wide
 // fixtures of gguf-moe-e512 and gguf-moe-sigmoid (experts of 640 and 512 on a hidden size of 256) run them too.
 int int8Experts(MetalBackend &backend) {
   int failures = 0;
-  // The int8 passes are compiled for the SiLU routings' shared slices alone.
+  // The int8 passes are compiled for the SiLU routings' shared slices alone (moeInt8Experts).
   if (!kShape.compiledRouting()->activationSuffix.empty()) {
     printf("int8 passes: not compiled for the routing\n");
     return 0;
@@ -1274,7 +1276,12 @@ int int8Experts(MetalBackend &backend) {
   for (const Fmt f : {fmtNamed("af4g64"), fmtNamed("af5g64"), fmtNamed("q80"), fmtNamed("af3g64")}) {
     const Model m = makeModel(backend, kShape, f, false, true);
     std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
-    const bool takes = quant_prefill_int8_format(f);
+    const bool takes = quant_moe_int8_format(f);
+    const splash::ops::BlockMoeWeights *block = &m.weights;
+    if (splash::ops::moeInt8Experts(kShape, {&block, 1}) != takes) {
+      printf("  %s: moeInt8Experts %s the block FAIL\n", fmtName(f), takes ? "refuses" : "takes");
+      ++failures;
+    }
     for (const bool on : {true, false}) {
       const int before = failures;
       Stats stats;

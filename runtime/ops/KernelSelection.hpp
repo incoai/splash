@@ -85,11 +85,13 @@ struct SplitChoice final {
 // every block (QwenTarget.cpp), at the format of most routers' rows, F32 for
 // none.
 [[nodiscard]] uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcept;
-// Whether each projection's routed and shared experts are, in every block, in
-// one format the int8 prefill tile takes: what the weights' files say, before
-// and after they load. Whether the experts stream is the start's choice
+// Whether the int8 expert passes take the blocks of `shape`: a routing they
+// compile (one or two shared slices, SiLU's activation), and each
+// projection's routed and shared experts, in every block, in one format they
+// take (quant_moe_int8_format): what the weights' files say, before and after
+// they load. Whether the experts stream is the start's choice
 // (RuntimeGeometry::from takes it); MoeShape::int8Experts is both.
-[[nodiscard]] bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept;
+[[nodiscard]] bool moeInt8Experts(const MoeShape &shape, std::span<const BlockMoeWeights *const> blocks) noexcept;
 // The routes an expert takes on average from which a chunk's experts run the
 // int8 passes (selectMoe).
 inline constexpr uint32_t kInt8PassRoutesPerExpert = 6;

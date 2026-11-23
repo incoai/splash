@@ -1,6 +1,6 @@
 // The MoE experts' prefill passes on int8 activations (ops/MoE.cpp): the dense prefill's int8 tile
 // (kernels/common/gguf_prefill_int8_tile.h) over the grouping's tiles (kernels/shared/moe.metal), each tile's expert
-// reached as the staged passes reach it (moe_gguf_segment), in af4g64, af5g64 or Q8_0.
+// reached as the staged passes reach it (moe_gguf_segment), in af4g64 or af5g64 (quant_moe_int8_format).
 #include "metal/abi/MoE.h"
 #include "metal/kernels/common/gguf_prefill_int8_tile.h"
 #include "metal/kernels/common/moe_expert_slab.h"
@@ -77,8 +77,6 @@ using MoeExpertInt8Kernel = void(device const char *, device const float2 *, dev
       moe_expert_int8<B, EpNone, Shared, 2>;
 MOE_EXPERT_INT8(4, af4g64, 1, "")
 MOE_EXPERT_INT8(5, af5g64, 1, "")
-MOE_EXPERT_INT8(8, q80, 1, "")
 MOE_EXPERT_INT8(4, af4g64, 2, "_s2")
 MOE_EXPERT_INT8(5, af5g64, 2, "_s2")
-MOE_EXPERT_INT8(8, q80, 2, "_s2")
 #undef MOE_EXPERT_INT8

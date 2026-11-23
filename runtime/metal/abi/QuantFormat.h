@@ -257,6 +257,14 @@ inline constexpr bool quant_decode_int8_format(uint32_t format) { return format 
 inline constexpr bool quant_prefill_int8_format(uint32_t format) {
   return format == GGUF_FMT_AF4G64 || format == GGUF_FMT_AF5G64 || format == GGUF_FMT_Q80;
 }
+// Whether the MoE experts' int8 prefill passes (kernels/shared/moe_int8.metal
+// moe_expert_int8_*) take a format: MLX affine 4 and 5 bits in groups of 64.
+// Not Q8_0, which the dense tile takes: no real model has run Q8_0 experts on
+// these passes, and their six routes an expert (ops::selectMoe) were measured
+// on af4g64.
+inline constexpr bool quant_moe_int8_format(uint32_t format) {
+  return format == GGUF_FMT_AF4G64 || format == GGUF_FMT_AF5G64;
+}
 // The MLX affine format of b bits in groups of g; GGUF_FMT_COUNT when none
 // (QUANT_AFFINE_TYPE holds b and g in a byte each).
 inline constexpr uint32_t quant_affine_format_of(uint32_t bits, uint32_t group) {

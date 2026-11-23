@@ -523,10 +523,11 @@ std::vector<MoeFormatSet> moeFormatSets() {
   sets.push_back({"router-mixed", {{GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, f32},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16}}});
-  // Experts of MLX 4 and 5 bits and of Q8_0 take the int8 prefill passes
-  // where the device's plans run int8 activations (moeInt8Experts); MLX
-  // 3-bit ones (Flint's) and 4-bit experts beside other shared experts keep
-  // the staged passes.
+  // Experts of MLX 4 and 5 bits take the int8 prefill passes where the
+  // device's plans run int8 activations and the family's routing has them
+  // (moeInt8Experts); MLX 3-bit ones (Flint's), Q8_0 ones (which the dense
+  // projections' int8 tile takes) and 4-bit experts beside other shared
+  // experts keep the staged passes.
   for (const uint32_t format : {GGUF_FMT_AF3G64, GGUF_FMT_AF4G64, GGUF_FMT_AF5G64, GGUF_FMT_Q80})
     sets.push_back(
         {formatName(format), std::vector<BlockFormats>(4, {format, format, format, format, GGUF_FMT_AF8G64})});
@@ -535,6 +536,8 @@ std::vector<MoeFormatSet> moeFormatSets() {
   return sets;
 }
 
+// A family's blocks in a set's formats; a block without a shared expert
+// (sharedSlices 0, Inkling-2-Mini's) has no shared segments, as a loaded one.
 std::vector<BlockMoeWeights> moeBlocks(const MoeShape &shape, const MoeFormatSet &set) {
   const uint32_t h = shape.hiddenSize, n = shape.expertIntermediateSize, slots = shape.experts;
   const uint32_t sharedN = n * shape.sharedSlices;
@@ -542,21 +545,49 @@ std::vector<BlockMoeWeights> moeBlocks(const MoeShape &shape, const MoeFormatSet
   for (const BlockFormats &f : set.blocks) {
     BlockMoeWeights block;
     block.router = QuantizedSegment::rows(f.router, shape.experts, h, {});
-    block.gate = {segment(f.gate, slots * n, h), segment(f.shared, sharedN, h)};
-    block.up = {segment(f.up, slots * n, h), segment(f.shared, sharedN, h)};
-    block.down = {segment(f.down, slots * h, n), segment(f.shared, h, sharedN)};
+    block.gate.routed = segment(f.gate, slots * n, h);
+    block.up.routed = segment(f.up, slots * n, h);
+    block.down.routed = segment(f.down, slots * h, n);
+    if (shape.sharedSlices) {
+      block.gate.shared = segment(f.shared, sharedN, h);
+      block.up.shared = segment(f.shared, sharedN, h);
+      block.down.shared = segment(f.shared, h, sharedN);
+    }
     blocks.push_back(std::move(block));
   }
   return blocks;
 }
 
-// The router format of the target's MoE blocks and whether their experts
-// take the int8 prefill passes, as its loaded weights give them
+// The router format of the target's MoE blocks of `shape` and whether their
+// experts take the int8 prefill passes, as its loaded weights give them
 // (QwenTargetGeometry::finish).
-std::pair<uint32_t, bool> routerFormatOf(const std::vector<BlockMoeWeights> &blocks) {
+std::pair<uint32_t, bool> routerFormatOf(const MoeShape &shape, const std::vector<BlockMoeWeights> &blocks) {
   std::vector<const BlockMoeWeights *> pointers;
   for (const BlockMoeWeights &block : blocks) pointers.push_back(&block);
-  return {moeRouterFormat(pointers), moeInt8Experts(pointers)};
+  return {moeRouterFormat(pointers), moeInt8Experts(shape, pointers)};
+}
+
+// moeInt8Experts takes the routings the int8 passes compile alone: a block
+// whose six expert tensors, its shared slots' too, are af4g64 takes them
+// under every MoE family's routing but Inkling-2-Mini's (no shared expert, a
+// softcapped SwiGLU), and a block of Q8_0 under none.
+void int8ExpertRoutings() {
+  model::forEachFamily([&](const auto &family) {
+    if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
+    const MoeShape shape = family.moeBlockShape();
+    const std::string name(family.family);
+    const uint32_t h = shape.hiddenSize, n = shape.expertIntermediateSize, slots = shape.experts;
+    for (const uint32_t format : {GGUF_FMT_AF4G64, GGUF_FMT_Q80}) {
+      BlockMoeWeights block;
+      block.gate = {segment(format, slots * n, h), segment(format, n, h)};
+      block.up = {segment(format, slots * n, h), segment(format, n, h)};
+      block.down = {segment(format, slots * h, n), segment(format, h, n)};
+      const BlockMoeWeights *blocks[] = {&block};
+      const bool takes = format == GGUF_FMT_AF4G64 && name != "Inkling-2-Mini";
+      test::require(moeInt8Experts(shape, blocks) == takes, name + "'s " + formatName(format) + " experts " +
+                                                               (takes ? "miss" : "take") + " the int8 passes");
+    }
+  });
 }
 
 std::string describe(const MoePlan &plan) {
@@ -581,7 +612,7 @@ void moePlans(Golden &golden, const std::string &name, const ExecutionPlans &pla
     const std::string f(family.family);
     for (const MoeFormatSet &set : sets) {
       MoeShape shape = family.moeBlockShape();
-      const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+      const auto [routerFormat, int8Experts] = routerFormatOf(shape, moeBlocks(shape, set));
       shape.int8Experts = int8Experts;
       Group &decode = golden.group(name, "moe-decode", f);
       Group &prefill = golden.group(name, "moe-prefill", f);
@@ -1090,7 +1121,7 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
     if (family.ffnKind == model::QwenFfnKind::SparseMoe) {
       for (const MoeFormatSet &set : moeFormatSets()) {
         MoeShape shape = family.moeBlockShape();
-        const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+        const auto [routerFormat, int8Experts] = routerFormatOf(shape, moeBlocks(shape, set));
         shape.int8Experts = int8Experts;
         const std::vector<uint32_t> chunks = warmed(plans.prefillRowClasses(std::pair{shape, routerFormat}));
         const auto config = [&](uint32_t rows) { return plans.moe(shape, routerFormat, rows, StepKind::Prefill).configuration(); };
@@ -1185,7 +1216,7 @@ void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std
     const std::string f(family.family);
     for (const MoeFormatSet &set : moeFormatSets()) {
       MoeShape shape = family.moeBlockShape();
-      const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+      const auto [routerFormat, int8Experts] = routerFormatOf(shape, moeBlocks(shape, set));
       shape.int8Experts = int8Experts;
       const std::vector<uint32_t> classes = plans.decodeRowClasses(most, std::pair{shape, routerFormat});
       check("moe plan " + f + " " + set.name, classes,
@@ -1360,6 +1391,9 @@ int main(int argc, char **argv) {
     int8ActivationsOff();
     std::cout << "PASS kernel selection: " << computed.groups().size() << " groups of " << std::size(kDevices)
               << " devices match the golden; with int8 activations off every plan is its plan in bf16 activations\n";
+    int8ExpertRoutings();
+    std::cout << "PASS kernel selection: the int8 expert passes take af4g64 experts under the routings they compile "
+                 "alone, Q8_0 ones under none\n";
     std::vector<std::string> misses;
     for (const auto [family, cores] : kDevices)
       for (const Int8Activations int8 : {Int8Activations::On, Int8Activations::Off})

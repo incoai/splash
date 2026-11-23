@@ -24,8 +24,8 @@
 // medians of GPU ms per layer over `rounds` (20) commands.
 //   gguf-moe-benchmark <metallib> int8 [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
 // - prefill chunks of 64 to 2048 rows routed at random, on the staged expert passes and on the int8 passes
-//   (MoeConfig::int8Passes, MLX affine 4- and 5-bit formats and Q8_0, af4g64 throughout by default), with the routes
-//   per expert, the rows each routed expert takes on average and the passes the plan picks.
+//   (MoeConfig::int8Passes, MLX affine 4- and 5-bit formats, af4g64 throughout by default), with the routes per
+//   expert, the rows each routed expert takes on average and the passes the plan picks.
 //   gguf-moe-benchmark <metallib> repack [rounds]
 // - the repack of streamed experts into their slots (moe_expert_load) at 1, 2, 4, 8 and 32 jobs, and of a tensor of
 //   32 experts' rows at model preparation (gguf_repack), in each of Q4_K, Q5_K, Q6_K, Q8_0, Q2_0, IQ2_XXS and af4g64
@@ -499,8 +499,8 @@ int main(int argc, const char *argv[]) {
     if (tiles || int8) args.erase(args.begin() + 2);
     const size_t count = args.size();
     const std::string shapeName = count > 2 ? args[2] : "35b";
-    // The int8 passes take MLX affine 4- and 5-bit and Q8_0 experts alone (quant_prefill_int8_format): int8 runs
-    // af4g64 throughout by default.
+    // The int8 passes take MLX affine 4- and 5-bit experts alone (quant_moe_int8_format): int8 runs af4g64
+    // throughout by default.
     const Fmt mlx = Fmt(GGUF_FMT_AF4G64);
     const Fmt gateUp = count > 4 ? fmtNamed(args[4]) : int8 ? mlx : Q4K,
               down = count > 5 ? fmtNamed(args[5]) : int8 ? mlx : Q5K,

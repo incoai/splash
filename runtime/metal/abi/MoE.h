@@ -198,8 +198,8 @@ static_assert(sizeof(MoeGgufExpertParams) == 32,
 // An int8 expert pass of a prefill chunk (kernels/shared/moe_int8.metal,
 // ops/MoE.cpp): the grouped rows' int8 codes and scales (the dense prefill's
 // rule, per row and 64 inputs, kernels/common/int8_activations.h), a row per
-// route, the scales' row stride, through the af4g64, af5g64 or Q8_0 planes of
-// the tile's expert as MoeGgufExpertParams reaches them.
+// route, the scales' row stride, through the af4g64 or af5g64 planes of the
+// tile's expert as MoeGgufExpertParams reaches them.
 struct MoeInt8ExpertParams {
   uint32_t input_size;
   uint32_t output_size; // per expert

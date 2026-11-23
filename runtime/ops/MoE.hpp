@@ -83,9 +83,9 @@ struct MoeShape final {
   MoeRouter router = MoeRouter::Softmax;
   uint32_t sharedSlices = 1;
   bool sharedGate = true;
-  // Whether every block's experts are resident and in formats the int8
-  // prefill tile takes (moeInt8Experts and RuntimeGeometry::from): its prefill
-  // plans then run the int8 passes and size their scratch
+  // Whether every block's experts are resident and in a routing and formats
+  // the int8 expert passes take (moeInt8Experts and RuntimeGeometry::from):
+  // its prefill plans then run the int8 passes and size their scratch
   // (MoeConfig::int8Passes).
   bool int8Experts = false;
   // A biased selection ranks the experts by sigmoid(score) plus each one's
@@ -406,7 +406,7 @@ struct MoeConfig final {
   // the plan's rows and the router's format (selectFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
   // A resident block's prefill passes on int8 activations where its expert
-  // projections are af4g64, af5g64 or Q8_0 (MoE::addRouted, moe_int8.metal).
+  // projections are af4g64 or af5g64 (MoE::addRouted, moe_int8.metal).
   bool int8Passes = false;
   bool operator==(const MoeConfig &) const = default;
 };
