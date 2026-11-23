@@ -735,10 +735,12 @@ final class AppState {
             && !findingCachedModels
     }
 
-    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses.
+    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses: every
+    /// installation of it, Text only's too, whatever the launch options; one installed with Text
+    /// only alone by that option, as the model alone names no installation then.
     func delete(_ model: String) {
         guard canDelete(model) else { return }
-        installer.remove(model, textOnly: settings(for: model).textOnly)
+        installer.remove(model, textOnly: installed.first { $0.id == model }?.textOnly == true)
     }
 
     /// Asks the Hub whether `model` or its draft has moved on, and installs what has, as its

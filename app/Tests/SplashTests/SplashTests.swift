@@ -1322,6 +1322,31 @@ struct ModelFamilyTests {
         #expect(runtime.preparedFamilies() == ["/models/27B.gguf": "Qwen3.8-27B"])
     }
 
+    /// A model installed with Text only alone, as the app downloads one with it on, is listed by the
+    /// selection link `install/models.py` gives it (`selection_link`, whose name for owner/repo:Q4
+    /// this pins), and its removal names that option; installed without it too, it is listed once,
+    /// and the model alone removes both. A selection of other options than the app's is not listed.
+    @Test func aModelInstalledWithTextOnlyAloneIsListed() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-text-only-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        func record(_ link: String, model: String) throws {
+            let folder = runtime.models.appending(path: link)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try #"{"model": "\#(model)", "family": "Gemma", "files": {}}"#
+                .write(to: folder.appending(path: "model.json"), atomically: true, encoding: .utf8)
+        }
+        #expect(Runtime.textOnlySelection("owner/repo:Q4")
+                == "322f1b99e584a792642a70c0962fdc9f25a7d7d03d3cf5c1a72db5b5dab50d81")
+        try record(".selections/\(Runtime.textOnlySelection("a/b:Q4"))", model: "a/b:Q4")
+        try record(".selections/0123", model: "c/d:Q4")
+        let listed = { runtime.installedModels().map { [$0.id, $0.textOnly ? "text only" : "named"] } }
+        #expect(listed() == [["a/b:Q4", "text only"]])
+        try record("a/b:Q4", model: "a/b:Q4")
+        #expect(listed() == [["a/b:Q4", "named"]])
+        #expect(Array(runtime.removeCommand("a/b:Q4").suffix(3)) == ["--model", "a/b:Q4", "remove"])
+    }
+
     @Test func theRuntimeReportsWhatEachFamilyMakesOfTheOptions() async throws {
         let fake = try FakeRuntime("splash-families", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }

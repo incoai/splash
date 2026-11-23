@@ -75,7 +75,10 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
 A model ID with `--revision`, `--language-only` or `--draft-model` is a
-separate installation from the same ID without them.
+separate installation from the same ID without them. The app downloads and
+updates a model with Text only on as its `--language-only` installation, and
+lists the model installed so alone as it lists one installed without it;
+deleting it in the app removes every installation of the model.
 
 ## MLX targets
 
