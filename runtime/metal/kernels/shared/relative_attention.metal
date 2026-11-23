@@ -10,15 +10,17 @@
 // attention's (kernels/shared/paged_attention.metal), or, a dispatch whose
 // tiles each read their history in one split, the direct kernels, which
 // write their tiles' rows themselves (Direct below); each tile
-// SPLASH_ATTENTION_TILE_ROWS query rows of one KV head, every sequence of a
-// command in one dispatch, its rows its entry of the command's layout. The
-// geometry is Inkling-2-Mini's: 24 query heads over 8 KV heads of 128
-// dimensions, three a group, a tile one part of 24 fused rows. Every kernel
-// here computes in its source's order (no reassociation, the pragma above):
-// the split and a decode step's single pass share the page loop, and the
-// single pass's combine takes the reduce's order, so that it writes the
-// prepare, split and reduce's bits, where with reassociation the compiler
-// arranged the page loop of INT8 queries in the two kernels otherwise.
+// SPLASH_ATTENTION_TILE_ROWS query rows of one KV head (a direct kernel's
+// SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS), every sequence of a command in one
+// dispatch, its rows its entry of the command's layout. The geometry is
+// Inkling-2-Mini's: 24 query heads over 8 KV heads of 128 dimensions, three a
+// group, a tile one part of 24 fused rows. Every kernel here computes in its
+// source's order (no reassociation, the pragma above): the split, the direct
+// kernels and a decode step's single pass share the page loop, and the direct
+// kernels' and the single pass's combines take the reduce's order, so that
+// they write the prepare, split and reduce's bits, where with reassociation
+// the compiler arranged the page loop of INT8 queries in the split and the
+// single pass otherwise.
 
 static_assert(SPLASH_ATTENTION_TILE_PARTS(3u) == 1, "a group of three runs whole tiles");
 
@@ -244,18 +246,17 @@ RELATIVE_ATTENTION_REDUCE(relative_attention_reduce_w1023, 1023)
 // its two paged-attention tiles of the same rows, whose other pages none of a
 // row's keys sit on, so that their probabilities are zero and leave the row's
 // statistics and output as they were. It then writes its rows' output as the
-// reduce does from that
-// one split: a thread a fused row its weight and denominator, each thread the
-// gated outputs of the running output's elements it holds, and, with Table, a
-// simdgroup a span of a fused row's outputs (read back from `hidden`) into the
-// out-projection's Table16 input. The INT8 query codes take the slot of
-// partials at the tile's first_slot plus its tile and KV head. Measured on a
-// 2,048-row chunk's layer (20-core M5 Pro): the reduce and the partials it
-// reads took a sliding layer's attention 10% of its time after 2,048 tokens
-// (4.55 ms against 4.10 without) and a full layer's 1.7% after 8,192; a
-// tile of twice the rows, which reads each page once for both, ran 5-11%
-// faster than two tiles at short histories (0 to 2,048 tokens) and 0.6-4%
-// at 8,192 and 30,720.
+// reduce does from that one split: a thread a fused row its weight and
+// denominator, each thread the gated outputs of the running output's elements
+// it holds, and, with Table, a simdgroup a span of a fused row's outputs (read
+// back from `hidden`) into the out-projection's Table16 input. The INT8 query
+// codes take the slot of partials at the tile's first_slot plus its tile and
+// KV head. Measured on a 2,048-row chunk's layer (20-core M5 Pro): the reduce
+// and the partials it reads took a sliding layer's attention 10% of its time
+// after 2,048 tokens (4.55 ms against 4.10 without) and a full layer's 1.7%
+// after 8,192; a tile of twice the rows, which reads each page once for both,
+// ran 5-11% faster than two tiles at short histories (0 to 2,048 tokens) and
+// 0.6-4% at 8,192 and 30,720.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement, bool Int8Queries,
           bool Table>
 inline void relative_attention_direct_phase(

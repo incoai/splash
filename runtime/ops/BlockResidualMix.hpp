@@ -1,14 +1,14 @@
 #pragma once
 
-// The block residual mix (kernels/shared/block_residual_mix.metal, a decode
-// step's rows; block_residual_mix_rows.metal, a prompt chunk's): learned
-// queries attend over a row's states, the inputs of the blocks before it (its
-// block stack) and its current rows, each RMS-normalized without weights; a
-// query's output is the softmax-weighted sum of the normalized states, in
-// fp32. What reads a mix's output is a weighted RMS norm writing a
-// projection's input (addMixNorm), as after the hyper-connection mix
-// (ops/HyperConnection.hpp), or a message gate (ops/MessageGate.hpp), which
-// reads the fp32 outputs (addMix).
+// The block residual mix (kernels/shared/block_residual_mix.metal, a call of
+// at most BLOCK_RESIDUAL_MIX_QUERY_ROWS rows; block_residual_mix_rows.metal,
+// a call of more): learned queries attend over a row's states, the inputs of
+// the blocks before it (its block stack) and its current rows, each
+// RMS-normalized without weights; a query's output is the softmax-weighted
+// sum of the normalized states, in fp32. What reads a mix's output is a
+// weighted RMS norm writing a projection's input (addMixNorm), as after the
+// hyper-connection mix (ops/HyperConnection.hpp), or a message gate
+// (ops/MessageGate.hpp), which reads the fp32 outputs (addMix).
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/BlockResidualMix.h"

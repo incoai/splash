@@ -7,20 +7,21 @@
 
 using namespace metal;
 
-// Block residual mixes of a prompt chunk's rows (metal/abi/BlockResidualMix.h,
-// BLOCK_RESIDUAL_MIX_QUERY_ROWS): a threadgroup of kRowThreads threads a row,
-// each thread the columns tid + kRowThreads i, in fp32 from the bf16 stack
-// planes and the current rows, bf16 (a layer's input) or fp32 (a residual
-// inside a layer): Current, the instance's element type, the fp32 one
-// suffixed _f32. A row runs in two phases, each a function out of line, which
-// hand over through threadgroup memory alone: the row's states' norms and its
-// queries' weights, each sum reduced by thread 0 into its own parked value,
-// then the outputs from those and the states. No thread keeps an array of
-// them across a barrier: an inlined mix whose threads each held a row's norms
-// and weights through its reductions computed one simdgroup's outputs
-// wrongly, now and then, under shader validation (as moe_gate_up_staged in
-// moe_gguf.metal). A decode step's mixes run block_residual_mix.metal's
-// threadgroup a row and query instead.
+// Block residual mixes of more than BLOCK_RESIDUAL_MIX_QUERY_ROWS rows
+// (metal/abi/BlockResidualMix.h), a prompt chunk's or a decode step's alike:
+// a threadgroup of kRowThreads threads a row, each thread the columns
+// tid + kRowThreads i, in fp32 from the bf16 stack planes and the current
+// rows, bf16 (a layer's input) or fp32 (a residual inside a layer): Current,
+// the instance's element type, the fp32 one suffixed _f32. A row runs in two
+// phases, each a function out of line, which hand over through threadgroup
+// memory alone: the row's states' norms and its queries' weights, each sum
+// reduced by thread 0 into its own parked value, then the outputs from those
+// and the states. No thread keeps an array of them across a barrier: an
+// inlined mix whose threads each held a row's norms and weights through its
+// reductions computed one simdgroup's outputs wrongly, now and then, under
+// shader validation (as moe_gate_up_staged in moe_gguf.metal). A call of at
+// most that many rows, every one-lane decode step's among them, runs
+// block_residual_mix.metal's threadgroup a row and query instead.
 constant constexpr uint kRowThreads = BLOCK_RESIDUAL_MIX_ROW_THREADS;
 constant constexpr uint kRowSimdgroups = kRowThreads / 32;
 constant constexpr uint kRowStates = BLOCK_RESIDUAL_MIX_MAXIMUM_STATES;

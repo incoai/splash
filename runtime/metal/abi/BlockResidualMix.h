@@ -5,10 +5,10 @@
 // attend over a row's states, its block stack and its current rows, each
 // RMS-normalized without weights, and each query's output is the
 // softmax-weighted sum of the normalized states. fp32 on fp32 rows: a call of
-// at most BLOCK_RESIDUAL_MIX_QUERY_ROWS rows (a decode step's) runs a
-// threadgroup of BLOCK_RESIDUAL_MIX_THREADS threads a row and query, a call
-// of more (a prompt chunk's) one of BLOCK_RESIDUAL_MIX_ROW_THREADS a row (the
-// _rows kernels).
+// at most BLOCK_RESIDUAL_MIX_QUERY_ROWS rows, every one-lane decode step's
+// among them, runs a threadgroup of BLOCK_RESIDUAL_MIX_THREADS threads a row
+// and query, a call of more, a prompt chunk's or a decode step's alike, one
+// of BLOCK_RESIDUAL_MIX_ROW_THREADS a row (the _rows kernels).
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #else

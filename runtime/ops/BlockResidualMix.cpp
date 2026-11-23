@@ -13,7 +13,8 @@ namespace splash::ops {
 namespace {
 
 // A call's kernel and grid (metal/abi/BlockResidualMix.h): a threadgroup a
-// row and query for a decode step's rows, a threadgroup a row for more.
+// row and query for at most BLOCK_RESIDUAL_MIX_QUERY_ROWS rows, a threadgroup
+// a row for more.
 struct MixLaunch final {
   const char *suffix;
   metal::DispatchSize groups;

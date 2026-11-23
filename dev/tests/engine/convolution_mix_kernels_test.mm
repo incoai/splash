@@ -1,8 +1,7 @@
 // The short convolution, block residual mix, message gate and logit finish
 // kernels (kernels/shared/short_convolution.metal, block_residual_mix.metal,
 // block_residual_mix_rows.metal, message_gate.metal, logit_finish.metal)
-// through their operators, against
-// fp64 CPU references:
+// through their operators, against fp64 CPU references:
 // - the convolution, static and dynamic taps, each output, over a prompt
 //   chunk's packed sequences from their states, the state after them, a chunk
 //   split in two carrying the state (the same bits as one chunk), states
@@ -10,8 +9,9 @@
 // - a verify block's tree, whose rows tap their paths, the tape, and the
 //   commit of accepted paths of two lanes, rejected rows and all;
 // - the mix of 1, 3 and 4 queries over 1 to 5 states (bf16 stack planes, bf16
-//   or fp32 current rows), plain and through its norms, of a decode step's
-//   rows and of a prompt chunk's;
+//   or fp32 current rows), plain and through its norms, of 5 rows (a
+//   threadgroup a row and query) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a
+//   threadgroup a row);
 // - the message gate through its norm;
 // - the logit finish's softcap and padding rows.
 #include "ChainRows.hpp"
@@ -436,9 +436,9 @@ std::vector<double> mixReference(const MixCase &m, uint32_t row) {
 }
 
 // The mix over bf16 stack planes and bf16 current rows (a layer's input) or
-// fp32 ones (the residual inside a layer), of `rows` rows: a decode step's,
-// a threadgroup a row and query, or more than BLOCK_RESIDUAL_MIX_QUERY_ROWS,
-// a prompt chunk's, a threadgroup a row (the _rows kernels).
+// fp32 ones (the residual inside a layer), of `rows` rows: at most
+// BLOCK_RESIDUAL_MIX_QUERY_ROWS, a threadgroup a row and query, or more, a
+// threadgroup a row (the _rows kernels).
 void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool currentFloat, uint32_t rows) {
   std::mt19937 rng(stack * 10 + queries + (currentFloat ? 100 : 0) + rows * 1000);
   MixCase m;
