@@ -51,6 +51,7 @@ void validate(const BlockMoeWeights &weights, MoeShape shape) {
   }
   if (shape.selectionBias)
     requireBytes(weights.selectionBias, uint64_t{shape.experts} * sizeof(float), "MoE selection bias");
+  requireBytes(weights.expertScales, uint64_t{3} * shape.experts * sizeof(float), "MoE expert scales");
   if (!weights.slots) throw std::invalid_argument("MoE routed experts have no slots");
   requireBytes(weights.slotTable, uint64_t{shape.experts} * sizeof(uint32_t), "MoE slot table");
   if (weights.stream)
@@ -130,7 +131,8 @@ std::array<uint32_t, Count> passFormats(std::array<uint32_t, Count> formats) {
 // (moe_expert_gguf_m<rows>_gate_up[_mixed], whose simdgroups each decode
 // their own pass's formats) from the grouped rows the gather writes into
 // groupedInput to expertIntermediate, then down to expertOutput
-// (moe_expert_gguf_m<rows>_down).
+// (moe_expert_gguf_m<rows>_down), each times its experts' scales
+// (BlockMoeWeights::expertScales).
 void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
                 const metal::MetalBuffer &slots, const MoePlan &plan, const MoeGroupParams &group, uint32_t range) {
   const MoeShape shape = plan.shape();
@@ -164,7 +166,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
             {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
              gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
              up.shared.plane0, up.shared.plane1Slot(), up.shared.meta,
-             scratch.expertIntermediate, slots},
+             scratch.expertIntermediate, slots, weights.expertScales},
             MoeGgufGateUpParams{hidden, intermediate, shape.experts, gate.routed.formatId, gate.shared.formatId,
                                 up.routed.formatId, up.shared.formatId, floorSlots, chunkSlots, range},
             {group.gate_up_columns, tiles, 1}, gateUpGrid, {GGUF_STAGED_THREADS, 1, 1});
@@ -173,7 +175,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   // Down, projection 2 of the routed experts, which it reaches in the chunks.
   graph.add(kernel + "_down" + slices,
             {scratch.expertIntermediate, scratch.tileDescriptors, scratch.tileCount, down.shared.plane0,
-             down.shared.plane1Slot(), down.shared.meta, scratch.expertOutput, slots},
+             down.shared.plane1Slot(), down.shared.meta, scratch.expertOutput, slots, weights.expertScales},
             MoeGgufExpertParams{intermediate, hidden, shape.experts, down.routed.formatId, down.shared.formatId,
                                 floorSlots, chunkSlots, range},
             {group.down_columns, tiles, 1}, downGrid, {GGUF_STAGED_THREADS, 1, 1});
@@ -223,10 +225,11 @@ void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoeP
 // staged gate/up pass rounds them; a thread reads each gate element before
 // it writes the product there), the intermediate quantized into the grouped
 // codes the gate and up passes have read, and down into expertOutput, which
-// the combine reads. The grouped codes and scales hold a row per route, the
-// scales' row stride. Each pass is named by its projection's format, which
-// its routed and shared experts share where the plan has the passes
-// (moeInt8Experts).
+// the combine reads; each pass times its experts' scales
+// (BlockMoeWeights::expertScales). The grouped codes and scales hold a row
+// per route, the scales' row stride. Each pass is named by its projection's
+// format, which its routed and shared experts share where the plan has the
+// passes (moeInt8Experts).
 void addInt8Experts(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
                     const MoePlan &plan) {
   static_assert(uint32_t(MoeExpertTile::M32) <= GGUF_PREFILL_INT8_ROWS,
@@ -246,7 +249,8 @@ void addInt8Experts(metal::CommandGraph &graph, const MoeBuffers &buffers, const
                         const metal::MetalBuffer &output) {
     graph.add(std::string("moe_expert_int8_") + p.routed.name() + "_" + name + slices,
               {scratch.groupedCodes, scratch.groupedScales, scratch.tileDescriptors, scratch.tileCount,
-               p.shared.plane0, p.shared.plane1Slot(), p.shared.meta, output, weights.slotTable},
+               p.shared.plane0, p.shared.plane1Slot(), p.shared.meta, output, weights.slotTable,
+               weights.expertScales},
               MoeInt8ExpertParams{k, n, shape.experts, p.routed.formatId, p.shared.formatId,
                                   weights.chunks.floorSlots(), weights.chunks.chunkSlots(), MOE_TILES_ALL, routes},
               {n / GGUF_TILE_COLUMNS, plan.maximumTiles(), 1}, {GGUF_PREFILL_INT8_THREADS, 1, 1});

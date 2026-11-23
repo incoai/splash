@@ -708,9 +708,10 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       continue;
     }
     // Input, tiles, tile count, gate's and up's shared planes, output, slot
-    // table, parameters and the routed experts' chunks (an address table); a
-    // pass binds one projection's shared planes, its output, the gate and the
-    // slot table, and reaches the same chunks for its projection.
+    // table, expert scales, parameters and the routed experts' chunks (an
+    // address table); a pass binds one projection's shared planes, its
+    // output, the gate, the slot table and the expert scales, and reaches the
+    // same chunks for its projection.
     require(dispatch.pipelineName.starts_with(kMerged), "a gate/up pass is not the GGUF experts'");
     const std::string rows = dispatch.pipelineName.substr(kMerged.size(), merged - kMerged.size());
     for (const bool up : {false, true}) {
@@ -726,6 +727,7 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       pass.buffers.push_back({6, up ? dispatch.buffers[9].buffer : gate});
       pass.buffers.push_back({7, gate});
       pass.buffers.push_back({8, dispatch.buffers[10].buffer});
+      pass.buffers.push_back({9, dispatch.buffers[11].buffer});
       // The pass's own parameters: the passes' sizes, floor and chunk slots, and
       // this pass's formats (its projection is its kernel's).
       MoeGgufGateUpParams both;
@@ -733,8 +735,8 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       const MoeGgufExpertParams &params = passes.emplace_back(MoeGgufExpertParams{
           both.input_size, both.output_size, both.experts, up ? both.up_routed_format : both.gate_routed_format,
           up ? both.up_shared_format : both.gate_shared_format, both.floor_slots, both.chunk_slots, both.tiles});
-      pass.bytes[0] = {9, &params, sizeof(params)};
-      pass.addresses.index = 10;
+      pass.bytes[0] = {10, &params, sizeof(params)};
+      pass.addresses.index = 11;
       pass.threadgroups.x = dispatch.threadgroups.x * GGUF_STAGED_COLUMNS / GGUF_TILE_COLUMNS;
       dispatches.push_back(std::move(pass));
     }
@@ -879,6 +881,11 @@ int compareRepeat(const MoeRun &first, const MoeRun &again, const std::string &l
   return 1;
 }
 
+// A product times a positive scale s, as an expert pass multiplies its fp32 sum by its expert's scale
+// (ops::BlockMoeWeights::expertScales): its value, the magnitudes its error bounds rest on and so the bounds
+// (projectionBound) times s, which also covers the rounding of the multiplication (2^-24 of the value).
+Dot scaled(const Dot &d, double s) { return {d.value * s, d.magnitude * s, d.inputs * s, d.largest}; }
+
 // The error int8 activations add to a projection (MoeConfig::int8Passes): each input codes to within half its
 // group's step, max|x| / 127 over 64 inputs, so a group adds at most half a step times the sum of its |w|.
 double int8ActivationError(const float *x, const float *w, uint32_t K) {
@@ -996,9 +1003,10 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
                   " is wrong");
 
     // Each route: silu(gate) * up from the fp64 products, then down over the
-    // GPU's own intermediate, then the weighted sum over the GPU's outputs. A
-    // shared slice's rows are its slice of the shared expert's (and of its
-    // down projection, the rows of its column window).
+    // GPU's own intermediate, then the weighted sum over the GPU's outputs,
+    // each product times its expert's scale of its projection. A shared
+    // slice's rows are its slice of the shared expert's (and of its down
+    // projection, the rows of its column window).
     std::vector<double> expected(kHidden), magnitude(kHidden);
     for (uint32_t c = 0; c < kHidden; ++c) expected[c] = b.residual[uint64_t{r} * kHidden + c];
     for (uint32_t slot = 0; slot < kRoutes; ++slot) {
@@ -1015,13 +1023,17 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
         }
       std::vector<float> h(kIntermediate);
       for (uint32_t n = 0; n < kIntermediate; ++n) {
-        const Dot &g = gu.gate[n], &u = gu.up[n];
+        const Dot g = scaled(gu.gate[n], m.scale(0, expert)), u = scaled(gu.up[n], m.scale(1, expert));
         const uint64_t weightRow = place * kIntermediate + n;
         const double eg = int8 ? projectionBound(g, false) +
-                                     int8ActivationError(x, (isShared ? m.shared[0] : m.routed[0]).row(weightRow), kHidden)
+                                     m.scale(0, expert) * int8ActivationError(
+                                                              x, (isShared ? m.shared[0] : m.routed[0]).row(weightRow),
+                                                              kHidden)
                                : projectionBound(g, true);
         const double eu = int8 ? projectionBound(u, false) +
-                                     int8ActivationError(x, (isShared ? m.shared[1] : m.routed[1]).row(weightRow), kHidden)
+                                     m.scale(1, expert) * int8ActivationError(
+                                                              x, (isShared ? m.shared[1] : m.routed[1]).row(weightRow),
+                                                              kHidden)
                                : projectionBound(u, true);
         // The activation of bf16(u) and bf16(g) rounded to bf16: the gate
         // factor over the gate's interval (its minimum inside if the interval
@@ -1056,8 +1068,9 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
       for (uint32_t n = 0; n < kHidden; ++n) {
         const uint64_t row = place * kHidden + n;
         const float *w = (isShared ? m.shared[2] : m.routed[2]).row(row);
-        const Dot y = dot(h.data(), w, kIntermediate);
-        const double e = int8 ? projectionBound(y, false) + int8ActivationError(h.data(), w, kIntermediate)
+        const Dot y = scaled(dot(h.data(), w, kIntermediate), m.scale(2, expert));
+        const double e = int8 ? projectionBound(y, false) +
+                                    m.scale(2, expert) * int8ActivationError(h.data(), w, kIntermediate)
                               : projectionBound(y, true);
         const float got = float(down[uint64_t{grouped} * kHidden + n]);
         if (!inside(got, y.value, e))
@@ -1565,9 +1578,9 @@ int nativeRouter(MetalBackend &backend) {
 } // namespace
 
 // The kernels read each routed expert from the slot its table names: the
-// experts in slots permuted by sigma, with each expert's router row moved to
-// match (expert e routes as e' did where sigma(e) = e'), give the identity
-// table's output bit for bit, in decode and in prefill.
+// experts in slots permuted by sigma, with each expert's router row and scales
+// moved to match (expert e routes as e' did where sigma(e) = e'), give the
+// identity table's output bit for bit, in decode and in prefill.
 // A biased routing's bias of `m` for the permuted experts `sigma` names
 // (expert e the model's sigma(e)), as their router rows; none without one.
 template <class Sigma> MetalBuffer permutedBias(MetalBackend &backend, const Model &m, Sigma sigma) {
@@ -1575,6 +1588,15 @@ template <class Sigma> MetalBuffer permutedBias(MetalBackend &backend, const Mod
   std::vector<float> bias(kExperts);
   for (uint32_t expert = 0; expert < kExperts; ++expert) bias[expert] = m.bias[sigma(expert)];
   return moe_fixture::upload(backend, bias.data(), bias.size() * sizeof(float), "permuted-bias");
+}
+// The expert scales of `m` for the permuted experts `sigma` names, as their
+// router rows (ops::BlockMoeWeights::expertScales).
+template <class Sigma> MetalBuffer permutedScales(MetalBackend &backend, const Model &m, Sigma sigma) {
+  std::vector<float> scales(m.scales.size());
+  for (uint32_t z = 0; z < 3; ++z)
+    for (uint32_t expert = 0; expert < kExperts; ++expert)
+      scales[z * kExperts + expert] = float(m.scale(z, sigma(expert)));
+  return moe_fixture::upload(backend, scales.data(), scales.size() * sizeof(float), "permuted-scales");
 }
 
 int permutedSlots(MetalBackend &backend) {
@@ -1592,6 +1614,7 @@ int permutedSlots(MetalBackend &backend) {
   permuted.weights.slotTable = table;
   permuted.weights.router = floatSegment(backend, router, kExperts, kHidden);
   permuted.weights.selectionBias = permutedBias(backend, m, sigma);
+  permuted.weights.expertScales = permutedScales(backend, m, sigma);
   Buffers b;
   b.input = activations(uint64_t{kMaximumRows} * kHidden);
   b.residual = activations(uint64_t{kMaximumRows} * kHidden);
@@ -1662,6 +1685,7 @@ int chunkedSlots(MetalBackend &backend) {
       chunked.slotTable = table;
       chunked.router = floatSegment(backend, router, kExperts, kHidden);
       chunked.selectionBias = permutedBias(backend, m, sigma);
+      chunked.expertScales = permutedScales(backend, m, sigma);
       std::vector<MoePlan> plans;
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         plans.push_back(MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8}));

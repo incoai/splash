@@ -79,10 +79,11 @@ struct MoeExperts final {
                                         const QwenTargetDimensions &target);
 
 // A MoE block of `target`'s sections in image order: its router, its routed
-// experts' gate, up and down (none when they stream), its shared expert's
-// gate, up and down (none at zero slices) and, where the target's has one,
-// its scalar gate, then a biased selection's bias. Block `block` of the store
-// when its experts stream.
+// experts' gate, up and down (none when they stream) and their scales
+// (ops::BlockMoeWeights::expertScales), its shared expert's gate, up and down
+// (none at zero slices) and, where the target's has one, its scalar gate,
+// then a biased selection's bias. Block `block` of the store when its experts
+// stream.
 [[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, const QwenTargetDimensions &target,
                                                 const MoeExperts &experts, uint32_t block);
 

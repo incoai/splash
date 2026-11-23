@@ -209,7 +209,11 @@ exponential. llama.cpp's NVFP4 rows are rebuilt as NVFP4's native blocks of
 which differs from the 256 form only in its meta unit (four scales and `g`,
 two groups wide): every tile reads both through the format list, as it reads
 every format, and the planner chooses the form by a tensor's width
-(`GgufImage.cpp` `imageFormat`).
+(`GgufImage.cpp` `imageFormat`). Every MoE layer's image holds its routed
+experts' scales after them, F32 [3][experts] (`ImageBuilder::expertScales`):
+a GGUF experts tensor's `.scale` as stored, whatever its type, and 1 for
+experts without one, which the expert passes multiply their sums by
+([GGUF targets](models.md#gguf-targets)).
 
 Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's

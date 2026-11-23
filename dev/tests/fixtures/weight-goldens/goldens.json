@@ -37,7 +37,7 @@
       "target/embedding.bin": "6d17df18962f4941a0ce6538aa0092dba1073c78848a62f577a666b81a89e159"
     },
     "moe": {
-      "target/layer-0.bin": "6575ec6e4d2c72f2a3b406d490a95d6e4fec0d79b8b2e9110d4948c442f1f449",
+      "target/layer-0.bin": "68965c070d9ad0cc6b214628e3864a6b9dbb427633c48da51d939ddb1ccd2eee",
       "target/head.bin": "cee4659abb8e830f64dc34ad7ecff5b7627ff3bdc81a299d3dd91ff90a7ebaa1",
       "target/embedding.bin": "86a749f41cab45849eb9a2753025779ef1c58e74842b65290534eff4e29403e9"
     }

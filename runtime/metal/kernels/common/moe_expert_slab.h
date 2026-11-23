@@ -90,3 +90,10 @@ inline MoeGgufSegment moe_gguf_segment(uint expert, uint experts, uint input_siz
   const MoeExpertChunk c = moe_expert_chunk(chunks, floor_slots, chunk_slots, slots[expert], projection);
   return moe_gguf_planes(f, routed_format, c.w0, c.w1, c.meta, ulong(c.local) * output_size, input_size / 32);
 }
+
+// The scale an expert pass multiplies the fp32 sums of projection `projection` (0 gate, 1 up, 2 down) by, before it
+// rounds them: routed expert e's, at e of the projection's row of `scales` (ops::BlockMoeWeights::expertScales, F32
+// [3][experts]); 1 for a shared slice (ids `experts` on).
+inline float moe_expert_scale(device const float *scales, uint expert, uint experts, uint projection) {
+  return expert < experts ? scales[projection * experts + expert] : 1.0f;
+}

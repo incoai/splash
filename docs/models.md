@@ -311,20 +311,30 @@ target's count must be the family's.
 llama.cpp's NVFP4 (type 40, as in `cdiamond/Qwen3.8-27B-iMatrix-NVFP4-MTP-GGUF`)
 is `block_nvfp4`: 64 elements, a UE4M3 scale per 16 (an E4M3 byte whose bit 7
 llama.cpp ignores, reading 0x7F as 0) and E2M1 codes, beside an optional F32
-`.scale` tensor, one value for a projection or one per expert for an experts
-tensor (`_exps`), which llama.cpp multiplies the products by; a `.scale` beside
-a weight of another type is refused, as only NVFP4's rows hold one. An F32
-`.input_scale` beside an NVFP4 weight (NVIDIA's activation scale, as many
-values as `.scale`) plays no part, as in Model Optimizer's targets; beside any
-other weight, or alone, it is refused. It loads as Model Optimizer's NVFP4 does
-([Model Optimizer targets](#model-optimizer-targets)): four blocks make one
-256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
-(1 without one), at 4.625 bits per weight for the file's 4.5. A tensor whose
-rows are not whole 256-element blocks (llama.cpp writes any multiple of 64,
-an expert down projection of 1152 inputs among them) loads in NVFP4's form of
+`.scale` tensor of one value for a projection, which llama.cpp multiplies the
+products by; a `.scale` beside a projection of another type is refused, as
+only NVFP4's rows hold one. An F32 `.input_scale` beside an NVFP4 weight
+(NVIDIA's activation scale, as many values as `.scale`) plays no part, as in
+Model Optimizer's targets; beside any other weight, or alone, it is refused.
+It loads as Model Optimizer's NVFP4 does ([Model Optimizer
+targets](#model-optimizer-targets)): four blocks make one 256-element NVFP4
+block, whose meta unit holds a projection's `.scale` value as its `g` (1
+without one), at 4.625 bits per weight for the file's 4.5. A tensor whose rows
+are not whole 256-element blocks (llama.cpp writes any multiple of 64, an
+expert down projection of 1152 inputs among them) loads in NVFP4's form of
 64-element blocks instead (`nvfp464`): each block's four E4M3 scales and `g`
 make its meta unit, which spans two 32-input groups, at 5 bits per weight;
 every tile that takes the formats' list takes it.
+
+An experts tensor (`_exps`) of any type may carry an F32 `.scale` of one value
+per expert, which llama.cpp multiplies each expert's products by: NVFP4
+releases have one, and Unsloth keeps it beside the experts it quantized from
+NVFP4 to other types (IQ1_S to IQ3_XXS, Q3_K, Q2_0, MXFP4). It loads into the
+layer's expert scales (`ops::BlockMoeWeights::expertScales`, F32 [3][experts]
+after the routed experts in the layer's image, the fused `ffn_gate_up_exps`'s
+for both gate and up, 1 without one), which the expert passes multiply their
+fp32 sums by before rounding them: gate's and up's before the activation,
+down's before the routing weight. An NVFP4 expert's `g` stays 1.
 
 Q2_0 is GGUF tensor type 42, `block_q2_0`, as in the GSQ-RCO GGUFs:
 2-bit codes q worth d (q - 1) with one half d per 64 weights. Its planes are

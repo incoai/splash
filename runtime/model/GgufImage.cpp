@@ -230,12 +230,16 @@ public:
   // `experts` * width rows each, from ffn_gate_exps and ffn_up_exps or
   // the fused ffn_gate_up_exps some GGUFs store instead, each
   // expert's gate rows then its up rows, which the two take expert by expert;
-  // then down, of `experts` * hidden rows, from ffn_down_exps.
+  // then down, of `experts` * hidden rows, from ffn_down_exps; then their
+  // scales (ImageBuilder::expertScales), each experts tensor's .scale (the
+  // fused tensor's for both gate and up).
   void routedExperts(const std::string &prefix, uint64_t experts, uint64_t width, uint64_t hidden) {
-    const std::string fusedName = prefix + "ffn_gate_up_exps.weight";
-    if (!file_.find(fusedName)) {
-      expertTensor(prefix + "ffn_gate_exps.weight", experts * width, hidden);
-      expertTensor(prefix + "ffn_up_exps.weight", experts * width, hidden);
+    const std::string fusedName = prefix + "ffn_gate_up_exps.weight", gateName = prefix + "ffn_gate_exps.weight",
+                      upName = prefix + "ffn_up_exps.weight", downName = prefix + "ffn_down_exps.weight";
+    const bool unfused = !file_.find(fusedName);
+    if (unfused) {
+      expertTensor(gateName, experts * width, hidden);
+      expertTensor(upName, experts * width, hidden);
     } else if (const GgufTensor *fused = find(fusedName, quantizedType)) {
       if (fused->rows() != 2 * experts * width || fused->columns() != hidden)
         throw GgufError("unexpected shape for " + fusedName);
@@ -253,7 +257,21 @@ public:
         image_.expertRepack(std::move(repack));
       }
     }
-    expertTensor(prefix + "ffn_down_exps.weight", experts * hidden, width);
+    expertTensor(downName, experts * hidden, width);
+    image_.expertScales(experts, {expertScale(unfused ? gateName : fusedName, experts),
+                                  expertScale(unfused ? upName : fusedName, experts), expertScale(downName, experts)});
+  }
+
+  // The rows of the F32 .scale of `experts` values beside the experts tensor
+  // `weight`, read, or 1s without one: llama.cpp multiplies each expert's
+  // products by its value, whatever the tensor's type.
+  ImageBuilder::ExpertScales expertScale(const std::string &weight, uint64_t experts) {
+    const GgufTensor *scale = file_.find(weight.substr(0, weight.size() - 7) + ".scale"); // past ".weight"
+    if (!scale) return std::vector<float>(experts, 1.0F);
+    problems_.read(*scale);
+    if (scale->type != ggml::kF32 || scale->elements() != experts)
+      throw GgufError(scale->name + " must hold one F32 value per expert for " + weight);
+    return tensorRows(*scale, 1, scale->bytes);
   }
 
   // A layer's shared expert of `slices` slices of `width`, which the grouped
@@ -437,15 +455,16 @@ private:
 
   // Rows [0, count) of `tensor` as the image holds them, rowBytes each: as
   // stored, or, of llama.cpp's NVFP4, NVFP4's native rows, which the writer
-  // builds from its block_nvfp4 rows and the g of its .scale tensor. llama.cpp
-  // multiplies a projection's products by its .scale, of one value, or an
-  // expert's by its value of an experts tensor's (_exps), one per expert;
-  // only NVFP4's native rows hold such a scale, so only theirs is read and a
-  // .scale beside any other tensor is refused as unused. An NVFP4 weight may
-  // also carry an .input_scale of as many values, the activation scale of
-  // NVIDIA's W4A4: a weights-only decode (ours, as llama.cpp's) never reads
-  // it, so it is held to that count and recorded as read, unused; beside any
-  // other tensor, or alone, it is refused as unused too.
+  // builds from its block_nvfp4 rows and the g of a projection's .scale
+  // tensor. llama.cpp multiplies a projection's products by its .scale, of
+  // one value, and an expert's by its value of an experts tensor's (_exps),
+  // one per expert: the experts' are their block's whatever their type
+  // (expertScale), and of a projection's only NVFP4's native rows hold one,
+  // so a .scale beside any other projection is refused as unused. An NVFP4
+  // weight may also carry an .input_scale of as many values, the activation
+  // scale of NVIDIA's W4A4: a weights-only decode (ours, as llama.cpp's)
+  // never reads it, so it is held to that count and recorded as read,
+  // unused; beside any other tensor, or alone, it is refused as unused too.
   TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) const {
     if (tensor.type != ggml::kNVFP4) {
       if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
@@ -461,7 +480,8 @@ private:
     TensorRows rows{tensor.name, format.ggml_type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     rows.ggufNvfp4RowBytes = sourceRowBytes;
     const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
-    const uint64_t values = stem.ends_with("_exps") ? geometry_.experts : 1;
+    const bool experts = stem.ends_with("_exps");
+    const uint64_t values = experts ? geometry_.experts : 1;
     // The weight's F32 tensor stem + suffix of `values` values, read, or
     // nullptr without one.
     const auto sidecar = [&](const char *suffix) -> const GgufTensor * {
@@ -473,8 +493,8 @@ private:
       problems_.read(*found);
       return found;
     };
-    if (const GgufTensor *scale = sidecar(".scale"))
-      rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count / values};
+    if (const GgufTensor *scale = experts ? nullptr : sidecar(".scale"))
+      rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count};
     sidecar(".input_scale");
     return rows;
   }
@@ -903,6 +923,24 @@ void ImageBuilder::expertRepack(Repack repack) {
   if (expertProjections_ == projections.size())
     throw GgufError("a layer has more than three routed expert tensors: " + image_.name);
   projections[expertProjections_++] = std::move(repack);
+}
+
+void ImageBuilder::expertScales(uint64_t experts, const std::array<ExpertScales, 3> &scales) {
+  const uint64_t rowBytes = experts * sizeof(float);
+  uint64_t destination = section(scales.size() * rowBytes);
+  for (const ExpertScales &scale : scales) {
+    if (const auto *rows = std::get_if<TensorRows>(&scale)) {
+      if (rows->rows * rows->rowBytes != rowBytes)
+        throw GgufError("expert scales do not hold one value per expert: " + rows->name);
+      copyAt(destination, *rows, Conversion::None);
+    } else {
+      const std::vector<float> &values = std::get<std::vector<float>>(scale);
+      if (values.size() != experts) throw GgufError("expert scales do not hold one value per expert");
+      const auto *bytes = reinterpret_cast<const uint8_t *>(values.data());
+      image_.fills.push_back({destination, {bytes, bytes + rowBytes}});
+    }
+    destination += rowBytes;
+  }
 }
 
 Image ImageBuilder::finish() {

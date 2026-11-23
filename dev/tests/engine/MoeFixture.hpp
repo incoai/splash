@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -106,17 +107,25 @@ inline splash::metal::MetalBuffer bfloatBuffer(splash::metal::MetalBackend &back
 // A block of `shape`: its router, shared expert scalar gate (none without
 // shape.sharedGate), routed experts' and shared expert's gate, up and down,
 // the shared expert's shape.sharedSlices slices in the order the kernels read
-// them (ops::BlockExpertProjection), their weights with expert e in slot e of
-// one chunk of the routed segments (ops::residentExpertChunks), and the
-// formats of the six projections.
+// them (ops::BlockExpertProjection), the routed experts' scales of their
+// products, their weights with expert e in slot e of one chunk of the routed
+// segments (ops::residentExpertChunks), and the formats of the six
+// projections.
 struct Model {
   splash::ops::MoeShape shape;
   Tensor router, sharedGate;
   std::array<Tensor, 3> routed;   // gate, up, down: experts * N rows
   std::array<Tensor, 3> shared;   // sharedSlices * N rows
   std::vector<float> bias;        // a biased selection's, one an expert
+  std::vector<float> scales;      // [3][experts] (ops::BlockMoeWeights::expertScales)
   splash::ops::BlockMoeWeights weights;
   std::array<gguf_reference::Fmt, 6> formats{};
+
+  // Routed expert e's scale of projection z's products (0 gate, 1 up, 2
+  // down); 1 for a shared slice (an id from shape.experts on).
+  [[nodiscard]] double scale(uint32_t z, uint32_t e) const {
+    return e < shape.experts ? scales[uint64_t{z} * shape.experts + e] : 1.0;
+  }
 };
 
 // The first format from id i on, cyclically, in rows of K values: one whose
@@ -157,6 +166,11 @@ inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::
   gguf.gate = {m.routed[0].segment, m.shared[0].segment};
   gguf.up = {m.routed[1].segment, m.shared[1].segment};
   gguf.down = {m.routed[2].segment, m.shared[2].segment};
+  // Each expert's scales from 1/4 to 4, as a GGUF's per-expert .scale beside
+  // experts of any format multiplies their products.
+  std::uniform_real_distribution<float> octaves(-2.0f, 2.0f);
+  for (uint32_t i = 0; i < 3 * shape.experts; ++i) m.scales.push_back(std::exp2(octaves(rng)));
+  gguf.expertScales = upload(backend, m.scales.data(), m.scales.size() * sizeof(float), "moe-expert-scales");
   // Biases of the scale of the sigmoids' differences, so that they reorder
   // some of the top k.
   if (shape.selectionBias) {

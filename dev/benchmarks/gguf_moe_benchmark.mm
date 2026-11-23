@@ -106,10 +106,12 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
   // An ungated block's weights carry no scalar gate.
   const QuantizedSegment sharedGateSegment =
       shape.sharedGate ? floatSegment(backend, sharedGate, 1, H) : QuantizedSegment{};
+  const std::vector<float> scales(3 * E, 1.0f);
   BlockMoeWeights gguf{routerSegment, sharedGateSegment,
                        {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
                        {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
                        {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
+                       upload(backend, scales.data(), scales.size() * sizeof(float), "moe-expert-scales"),
                        splash::model::residentExpertSlots(backend, E), E};
   gguf.chunks = splash::ops::residentExpertChunks(gguf);
   const std::array<const BlockMoeWeights *, 1> blocks{&gguf};

@@ -1024,10 +1024,11 @@ void checkFloatSources(MetalBackend &backend, const std::filesystem::path &direc
 // llama.cpp's NVFP4 (ggml type 40) prepares into NVFP4's native rows: a
 // token table of block_nvfp4 whose scales take every byte reads as llama.cpp
 // reads it (blockNvfp4Values), and projections made from reference native
-// rows (blockNvfp4Rows) prepare into those rows' planes with their .scale's g:
-// a dense FFN projection and the GDN's grouped qkv rows with one value, the
-// MoE's gate experts with one per expert. A .scale of another count, or
-// beside a weight of another type, is refused.
+// rows (blockNvfp4Rows) prepare into those rows' planes with their .scale's g
+// (a dense FFN projection and the GDN's grouped qkv rows, one value each),
+// the MoE's gate experts with a g of 1 and their .scale, one value per
+// expert, in the layer's expert scales beside 1s for up and down. A .scale of
+// another count, or beside a projection of another type, is refused.
 void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &directory) {
   std::mt19937 rng(41);
   struct Converted final {
@@ -1062,7 +1063,9 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
       c.native = makeNative(NVFP4, c.rows, c.columns, rng);
       std::vector<float> scales(c.scales);
       for (float &scale : scales) scale = std::uniform_real_distribution<float>(0.5f, 2.0f)(rng);
-      setTensorScales(c.native, NVFP4, c.columns, [&](uint32_t r) { return scales[r / (c.rows / c.scales)]; });
+      // A projection's rows hold its .scale as g; an experts tensor's hold 1 (its .scale is the layer's).
+      setTensorScales(c.native, NVFP4, c.columns,
+                      [&](uint32_t r) { return moe ? 1.0F : scales[r / (c.rows / c.scales)]; });
       Tensor &tensor = tensorNamed(target.tensors, c.name);
       tensor.type = model::ggml::kNVFP4;
       tensor.data = blockNvfp4Rows(c.native);
@@ -1087,7 +1090,19 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
       check(planes && planes->format == GGUF_FMT_NVFP4 &&
                 slice(prepared[0], planes->plane0, expected.w0.size()) == expected.w0 &&
                 slice(prepared[0], planes->meta, expected.meta.size()) == expected.meta,
-            "llama.cpp NVFP4 " + c.name + " prepares into the planes of its NVFP4 rows, its .scale as g");
+            "llama.cpp NVFP4 " + c.name + " prepares into the planes of its NVFP4 rows" +
+                (moe ? ", g 1" : ", its .scale as g"));
+    }
+    if (moe) {
+      // Gate's scales, then up's and down's 1s.
+      const std::string scale = "blk.0.ffn_gate_exps.scale";
+      const model::gguf::Copy *copy = copyOf(images[0], scale);
+      std::vector<uint8_t> expected = target.data(scale);
+      const std::vector<float> ones(2 * g.experts, 1.0F);
+      expected.insert(expected.end(), reinterpret_cast<const uint8_t *>(ones.data()),
+                      reinterpret_cast<const uint8_t *>(ones.data() + ones.size()));
+      check(copy && slice(prepared[0], copy->destination, expected.size()) == expected,
+            "llama.cpp NVFP4 experts' .scale prepares into the layer's expert scales, 1s for the others");
     }
     if (!moe) {
       const model::gguf::Copy *copy = copyOf(images.back(), "token_embd.weight");
@@ -1109,11 +1124,11 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
                                                         : " must hold one F32 value for ")) != std::string::npos,
           "a .scale tensor of another count than its weight's is refused: " + scale);
     if (moe) continue;
-    // A .scale beside a weight of another type, which llama.cpp would apply.
+    // A .scale beside a projection of another type, which llama.cpp would apply.
     std::vector<Tensor> beside = target.tensors;
     beside.push_back({"blk.0.ffn_gate.scale", {1}, 0, std::vector<uint8_t>{0x00, 0x00, 0x80, 0x3F}});
     check(refusal(path, beside, g).find("ffn_gate.scale (unused) in 1 layer") != std::string::npos,
-          "a .scale tensor beside a weight of another type than NVFP4 is refused");
+          "a .scale tensor beside a projection of another type than NVFP4 is refused");
   }
 }
 

@@ -85,6 +85,8 @@ ops::BlockMoeWeights readMoeBlock(WeightFile &file, const QwenTargetDimensions &
     ffn.slots = experts.experts;
     ffn.chunks = ops::residentExpertChunks(ffn);
   }
+  ffn.expertScales = file.section(
+      checkedMultiply<WeightStoreError>(3 * target.experts, kFloat32Bytes, "expert scale bytes"), "expert-scales");
   if (target.sharedExpertSlices) {
     ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
     ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");

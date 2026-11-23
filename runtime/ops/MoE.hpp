@@ -243,13 +243,18 @@ class MoeExpertStream;
 // passes beside the load read (MoeScratch::expertSlots), and the passes after
 // the load read loadSlotTable, the slot of each expert it routed, which its
 // host step writes: no GPU work reads a line of either table while the step
-// runs (metal::EventStep::beside).
+// runs (metal::EventStep::beside). expertScales, F32 [3][experts], holds each
+// routed expert's scale of its gate, up and down products, which the expert
+// passes multiply their fp32 sums by before rounding them (the gate's and up's
+// before the activation): a GGUF's per-expert .scale beside an experts tensor
+// of any format, 1 where the source holds none.
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
   BlockExpertProjection gate;
   BlockExpertProjection up;
   BlockExpertProjection down;
+  metal::MetalBuffer expertScales;
   metal::MetalBuffer slotTable;
   uint32_t slots = 0;
   const MoeExpertStream *stream = nullptr;

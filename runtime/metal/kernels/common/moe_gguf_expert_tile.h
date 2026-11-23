@@ -30,20 +30,22 @@ __attribute__((noinline)) void moe_expert_column(uint format, device bfloat *x, 
 // at one or two rows, where the staged tile's padded matmul steps bound it. store(o, v) writes the output element o of
 // the fp32 sum v, which it rounds to bf16 first: a partial staged tile hands it the sum it parked as bf16. `formats`
 // switches to the formats the pass decodes (moe_gguf.metal's moe_formats, every format for gguf-moe's reference).
-// Without `column_tiles` every tile runs the staged tile (moe_gguf.metal's kMoeColumnTiles).
+// Without `column_tiles` every tile runs the staged tile (moe_gguf.metal's kMoeColumnTiles). Each sum is its
+// expert's scale of the projection (moe_expert_scale) times the products'.
 template <ushort Rows, uint Shared, uint Projection, class Store, class Formats = any_quant_format>
 inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles,
                                  device const uint *tile_count, device uchar *sw0, device uchar *sw1,
-                                 device uchar *smeta, device const uint *slots, constant MoeGgufExpertParams &p,
-                                 constant ulong *chunks, uint2 group, uint simd_lane, uint simd_group,
-                                 threadgroup half *stage, threadgroup half2 *tl, Store store,
-                                 Formats formats = Formats(), bool column_tiles = true) {
+                                 device uchar *smeta, device const uint *slots, device const float *expert_scales,
+                                 constant MoeGgufExpertParams &p, constant ulong *chunks, uint2 group,
+                                 uint simd_lane, uint simd_group, threadgroup half *stage, threadgroup half2 *tl,
+                                 Store store, Formats formats = Formats(), bool column_tiles = true) {
   const uint t = moe_first_tile(tile_count, p.tiles) + group.y;
   if (t >= moe_end_tile(tile_count, p.tiles)) return;
   const MoeTileDescriptor tile = tiles[t];
   const MoeGgufSegment s =
       moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
                                slots, chunks, p.floor_slots, p.chunk_slots, Projection, sw0, sw1, smeta);
+  const float scale = moe_expert_scale(expert_scales, tile.expert, p.experts, Projection);
   device bfloat *x = input + ulong(tile.first_row) * p.input_size;
   const ulong out = ulong(tile.first_row) * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
@@ -51,7 +53,8 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
     float sums[GGUF_COLUMN_ROWS];
     moe_expert_column(s.format, x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, tl,
                       simd_group * 32 + simd_lane, sums, formats);
-    for (uint row = 0; row < tile.rows; ++row) store(out + ulong(row) * p.output_size + origin + simd_lane, sums[row]);
+    for (uint row = 0; row < tile.rows; ++row)
+      store(out + ulong(row) * p.output_size + origin + simd_lane, sums[row] * scale);
     return;
   }
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
@@ -69,14 +72,16 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
     // 17% more time, and parking every tile 2%.
     if (tile.rows == R) {
       gguf_elements(acc, [&](uint row, uint column, float v) {
-        store(out + ulong(row) * p.output_size + origin + column, v);
+        store(out + ulong(row) * p.output_size + origin + column, v * scale);
       });
       return;
     }
     static_assert(R * GGUF_STAGED_COLUMNS * sizeof(bfloat) <= kStagedSimdgroupStage * sizeof(half),
                   "the sums fit a stage");
     threadgroup bfloat *park = reinterpret_cast<threadgroup bfloat *>(my);
-    gguf_elements(acc, [&](uint row, uint column, float v) { park[row * GGUF_STAGED_COLUMNS + column] = bfloat(v); });
+    gguf_elements(acc, [&](uint row, uint column, float v) {
+      park[row * GGUF_STAGED_COLUMNS + column] = bfloat(v * scale);
+    });
     simdgroup_barrier(mem_flags::mem_threadgroup);
     for (uint row = 0; row < tile.rows; ++row)
       store(out + ulong(row) * p.output_size + origin + simd_lane, float(park[row * GGUF_STAGED_COLUMNS + simd_lane]));

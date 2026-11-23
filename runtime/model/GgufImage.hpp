@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "model/GgufFile.hpp"
@@ -62,8 +63,10 @@ struct SafetensorsSource {
 // rowsPerValue rows, or their reciprocals. Model Optimizer's weight_scale_2 or
 // per-tensor fp8 weight_scale holds the tensor's g, compressed-tensors'
 // weight_global_scale its 1 / g and its per-channel fp8 weight_scale each
-// row's g [rows, 1], and a llama.cpp NVFP4 projection's .scale its g or
-// each expert's. Without one (rowsPerValue 0), as in MLX's nvfp4, g is 1.
+// row's g [rows, 1], and a llama.cpp NVFP4 projection's .scale its g (an
+// experts tensor's are its layer's expert scales,
+// ImageBuilder::expertScales). Without one (rowsPerValue 0), as in MLX's
+// nvfp4, g is 1.
 struct TensorScale {
   const WeightSource *file = nullptr;
   uint64_t offset = 0, bytes = 0;
@@ -239,6 +242,13 @@ public:
   // expertRepack() keeps in Image::experts.
   [[nodiscard]] Repack expertPlanes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name);
   void expertRepack(Repack repack);
+  // A MoE layer's expert scales after its routed experts
+  // (ops::BlockMoeWeights::expertScales): a section of F32 [3][experts], the
+  // scales of the experts' gate, up and down products, row z the `experts`
+  // F32 values of scales[z]: rows copied as stored (a GGUF's .scale), or
+  // values a plan gives (1s where a file holds none).
+  using ExpertScales = std::variant<TensorRows, std::vector<float>>;
+  void expertScales(uint64_t experts, const std::array<ExpertScales, 3> &scales);
   [[nodiscard]] Image finish();
 
 private:
@@ -297,7 +307,7 @@ private:
 // with zero rows to a whole tile; Router, a MoE router [rows, columns] as
 // stored; RoutedExperts, the routed experts of the layer whose tensors' names
 // begin with `name`, `rows` experts `columns` wide over the geometry's
-// hiddenSize.
+// hiddenSize, and their scales (ImageBuilder::expertScales).
 struct Section final {
   enum class Kind : uint8_t { Norm, Values, Quantized, FloatTensor, SmallProjection, Router, RoutedExperts };
   Kind kind;

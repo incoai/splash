@@ -35,15 +35,17 @@ kernel void moe_gather_int8(device const char *codes [[buffer(0)]], device const
 
 // An expert pass of the grouping's tiles: threadgroup (x, y) computes column tile x of tile moe_first_tile + y with
 // its expert's weights, the tile's rows (at most GGUF_PREFILL_INT8_ROWS, the grouping's tile_rows) as the dense tile's
-// one row tile. The up pass (EpUpWithGate) multiplies by the gate the gate pass wrote to `output`, each element in
-// place: the thread that writes an element has read its gate there.
+// one row tile, its sums times its expert's scale of the projection (moe_expert_scale). The up pass (EpUpWithGate)
+// multiplies by the gate the gate pass wrote to `output`, each element in place: the thread that writes an element
+// has read its gate there.
 template <int BITS, GgufEpilogue Ep, uint Shared, uint Projection>
 kernel void moe_expert_int8(device const char *codes [[buffer(0)]], device const float2 *scales [[buffer(1)]],
                             device const MoeTileDescriptor *tiles [[buffer(2)]],
                             device const uint *tile_count [[buffer(3)]], device uchar *sw0 [[buffer(4)]],
                             device uchar *sw1 [[buffer(5)]], device uchar *smeta [[buffer(6)]],
                             device bfloat *output [[buffer(7)]], device const uint *slots [[buffer(8)]],
-                            constant MoeInt8ExpertParams &p [[buffer(9)]], constant ulong *chunks [[buffer(10)]],
+                            device const float *expert_scales [[buffer(9)]],
+                            constant MoeInt8ExpertParams &p [[buffer(10)]], constant ulong *chunks [[buffer(11)]],
                             uint2 group [[threadgroup_position_in_grid]],
                             ushort lane [[thread_index_in_simdgroup]],
                             ushort simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -57,13 +59,14 @@ kernel void moe_expert_int8(device const char *codes [[buffer(0)]], device const
   prefill_int8_tile<BITS, Ep>(codes + ulong(tile.first_row) * p.input_size, scales + tile.first_row, s.w0, s.w1,
                               s.meta, output + out, output + out,
                               {p.input_size, tile.rows, p.routes, p.output_size, 0, p.input_size},
-                              uint2(group.x, 0), lane, simd_group);
+                              uint2(group.x, 0), lane, simd_group,
+                              moe_expert_scale(expert_scales, tile.expert, p.experts, Projection));
 }
 
 using MoeExpertInt8Kernel = void(device const char *, device const float2 *, device const MoeTileDescriptor *,
                                  device const uint *, device uchar *, device uchar *, device uchar *, device bfloat *,
-                                 device const uint *, constant MoeInt8ExpertParams &, constant ulong *, uint2, ushort,
-                                 ushort);
+                                 device const uint *, device const float *, constant MoeInt8ExpertParams &,
+                                 constant ulong *, uint2, ushort, ushort);
 // moe_expert_int8_<format>_<pass><slices suffix>: the gate (plain), up (times the gate's SiLU) and down passes.
 #define MOE_EXPERT_INT8(B, f, Shared, suffix)                                                                         \
   template [[host_name("moe_expert_int8_" #f "_gate" suffix)]] kernel MoeExpertInt8Kernel                            \

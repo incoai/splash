@@ -121,6 +121,12 @@ public:
     image_.expertRepack(std::move(repack));
   }
 
+  // The routed experts' scales (gguf::ImageBuilder::expertScales): 1s.
+  void expertScales() {
+    const std::vector<float> ones(geometry_.experts, 1.0F);
+    image_.expertScales(geometry_.experts, {ones, ones, ones});
+  }
+
   // beta (value heads rows) | alpha (value heads rows): one tensor of their
   // shared format padded with zero rows to whole plane tiles, or else one F32
   // tensor.
@@ -410,6 +416,7 @@ struct QuantizedModules {
     const std::string module = names != ModuleNames::Transformers ? mlp + "switch_mlp." + projection : mlp + "experts";
     if (modules.empty() || modules.back() != module) modules.push_back(module);
   }
+  void expertScales() {}
   void alphaBeta(const std::string &, const std::string &) {}
   void router(const std::string &, uint64_t, uint64_t) {}
   void floatTensor(const std::string &, uint64_t, uint64_t) {}
@@ -454,10 +461,10 @@ template <class Walk> void mixer(Walk &b, const QwenTargetDimensions &g, const s
 }
 
 // Layer `index`'s dense FFN or sparse MoE: a MoE layer's router, routed
-// experts and shared expert of its slices (QwenTargetDimensions::
-// sharedExpertSlices: gate and up of slices * width rows, down as slices
-// column windows of width inputs) and, where its blocks have one, the shared
-// expert's scalar gate; a dense layer's SwiGLU.
+// experts and their scales, shared expert of its slices
+// (QwenTargetDimensions::sharedExpertSlices: gate and up of slices * width
+// rows, down as slices column windows of width inputs) and, where its blocks
+// have one, the shared expert's scalar gate; a dense layer's SwiGLU.
 template <class Walk> void ffn(Walk &b, const QwenTargetDimensions &g, const std::string &prefix, uint32_t index) {
   const std::string mlp = prefix + "mlp.";
   if (g.isMoeLayer(index)) {
@@ -466,6 +473,7 @@ template <class Walk> void ffn(Walk &b, const QwenTargetDimensions &g, const std
     b.experts(mlp, "gate_proj", width, g.hiddenSize);
     b.experts(mlp, "up_proj", width, g.hiddenSize);
     b.experts(mlp, "down_proj", g.hiddenSize, width);
+    b.expertScales();
     b.projection(mlp + "shared_expert.gate_proj", shared, g.hiddenSize);
     b.projection(mlp + "shared_expert.up_proj", shared, g.hiddenSize);
     b.projection(mlp + "shared_expert.down_proj", g.hiddenSize, width, g.sharedExpertSlices);

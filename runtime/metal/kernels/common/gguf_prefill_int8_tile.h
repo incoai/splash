@@ -33,12 +33,12 @@ inline uint prefill_int8_fifth(uint b) {
 }
 
 // A tile of GGUF_PREFILL_INT8_SIMDGROUPS simdgroups, each 32 rows (two 16-row fragments) by 32 columns, at (column
-// tile, row tile) `tile`.
+// tile, row tile) `tile`, its sums times `scale` (an expert pass's expert scale, moe_int8.metal) before the epilogue.
 template <int BITS, GgufEpilogue Ep>
 inline void prefill_int8_tile(device const char *codes, device const float2 *scales, device const uchar *w0,
                               device const uchar *w1, device const uchar *meta, device bfloat *output,
                               device const bfloat *aux, PrefillInt8Shape p, uint2 tile, ushort lane,
-                              ushort simd_group) {
+                              ushort simd_group, float scale = 1.0f) {
   using namespace mpp::tensor_ops;
   constexpr int BM = kInt8RowFrags * kInt8FragM, BN = GGUF_TILE_COLUMNS;
   static_assert(BN == kInt8FragN * GGUF_PREFILL_INT8_SIMDGROUPS, "the simdgroups cover the column tile");
@@ -138,6 +138,6 @@ inline void prefill_int8_tile(device const char *codes, device const float2 *sca
       const int m = m_base + i * kInt8FragM + ((e & 7) >> 2) * 8;
       if (m >= M) continue;
       const ulong o = ulong(m) * p.out_stride + p.out_offset + n_run + (e & 3) + 16 * (e >> 3);
-      output[o] = gguf_epilogue<Ep>(cf[i][e], aux, o);
+      output[o] = gguf_epilogue<Ep>(cf[i][e] * scale, aux, o);
     }
 }

@@ -19,6 +19,8 @@
 #include <unistd.h>
 
 #include <bit>
+#include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -112,6 +114,29 @@ bool grouped(const model::gguf::RowOrder &order, uint64_t from, uint32_t headRow
 bool asStored(const model::gguf::Copy *copy, const test_gguf::Bytes &data) {
   return copy && copy->conversion == model::gguf::Conversion::None && copy->source.order.from == UINT64_MAX &&
          copy->source.rows * copy->source.rowBytes == data.size();
+}
+
+// The rows of a MoE layer's expert scales (gguf::ImageBuilder::expertScales),
+// gate's, up's and down's: the .scale tensor each copies as stored, or "1" for
+// a row of 1s; none unless the image holds three such rows of `experts`
+// values back to back.
+std::vector<std::string> expertScaleRows(const model::gguf::Image &image, uint64_t experts) {
+  const uint64_t rowBytes = experts * sizeof(float);
+  std::map<uint64_t, std::string> rows;
+  for (const model::gguf::Copy &copy : image.copies)
+    if (copy.source.name.ends_with(".scale") && copy.conversion == model::gguf::Conversion::None &&
+        copy.source.rows * copy.source.rowBytes == rowBytes)
+      rows[copy.destination] = copy.source.name;
+  const std::vector<float> ones(experts, 1.0F);
+  for (const model::gguf::Fill &fill : image.fills)
+    if (fill.bytes.size() == rowBytes && !std::memcmp(fill.bytes.data(), ones.data(), rowBytes))
+      rows[fill.offset] = "1";
+  std::vector<std::string> names;
+  for (const auto &[offset, name] : rows) {
+    if (offset != rows.begin()->first + names.size() * rowBytes) return {};
+    names.push_back(name);
+  }
+  return names.size() == 3 ? names : std::vector<std::string>{};
 }
 
 void checkDense(const std::filesystem::path &directory) {
@@ -1131,11 +1156,12 @@ model::Inkling2LoopLayout inkling2Layout() {
 // Inkling-2-Mini's GGUF plans an image per weight layer (not per
 // application), then the head's and the embedding's: each layer's queries,
 // gate and relative scores beside its BF16 sink projection as stored, a full
-// layer's BF16 tap projections, a loop layer's F32 gates as stored, its NVFP4
-// experts each read with its expert's scale, and the experts that stream its
-// layers'. Its metadata names each mismatch (a head count of a layer, the
-// loop's passes, the tokens) and its tensors a missing sink projection and a
-// shared expert no section reads.
+// layer's BF16 tap projections, a loop layer's F32 gates as stored, its
+// experts and their scales (each experts tensor's .scale, NVFP4's not in its
+// rows' g, or 1s without one, also beside experts of other formats), and the
+// experts that stream its layers'. Its metadata names each mismatch (a head
+// count of a layer, the loop's passes, the tokens) and its tensors a missing
+// sink projection and a shared expert no section reads.
 void checkInkling2(const std::filesystem::path &directory) {
   const model::Inkling2LoopLayout g = inkling2Layout();
   std::vector<Tensor> tensors = inkling2Tensors(g, 1200);
@@ -1175,15 +1201,35 @@ void checkInkling2(const std::filesystem::path &directory) {
     const auto *down = repackOf(image, p + "ffn_down_exps.weight");
     // NVFP4 experts with a scale per expert but in the last block, whose are Q5_K and Q8_0.
     const bool nvfp4 = layer + g.blockResidualPeriod < g.weightLayers;
+    const std::string gateUp = p + "ffn_gate_up_exps.scale", downScale = p + "ffn_down_exps.scale";
     check(gate && down && gate->sources.size() == g.experts &&
               gate->format == (nvfp4 ? GGUF_FMT_NVFP4 : GGUF_FMT_Q5K) &&
-              down->format == (nvfp4 ? GGUF_FMT_NVFP4 : GGUF_FMT_Q80) &&
-              (!nvfp4 || (gate->sources.front().scale.rowsPerValue == 2 * g.expertIntermediateSize &&
-                          down->sources.front().scale.rowsPerValue == g.hiddenSize)),
-          "planner reads " + which + "experts, NVFP4 with one scale per expert of the fused gate/up and of down");
+              down->format == (nvfp4 ? GGUF_FMT_NVFP4 : GGUF_FMT_Q80) && !gate->sources.front().scale.rowsPerValue &&
+              !down->sources.front().scale.rowsPerValue &&
+              expertScaleRows(image, g.experts) ==
+                  (nvfp4 ? std::vector<std::string>{gateUp, gateUp, downScale} : std::vector<std::string>(3, "1")),
+          "planner reads " + which + "experts and their scales, the fused gate/up's for gate and up, 1s without");
   }
   const Plan streamed = planned(inkling2Metadata(g), tensors, {.streamExperts = true});
-  check(!streamed.error && streamsExperts(plan, streamed), "planner streams the experts of every weight layer");
+  check(!streamed.error && streamsExperts(plan, streamed) &&
+            expertScaleRows(streamed.images[0], g.experts) == expertScaleRows(plan.images[0], g.experts),
+        "planner streams the experts of every weight layer, their scales in its image");
+  // A .scale beside experts of any format, as Unsloth keeps beside the experts it quantized from NVFP4 to others.
+  {
+    std::vector<Tensor> scaled = tensors;
+    const std::string p = "blk." + std::to_string(g.weightLayers - 1) + ".";
+    for (const char *experts : {"ffn_gate_up_exps", "ffn_down_exps"}) {
+      Tensor scale = tensorNamed(tensors, "blk.0." + std::string(experts) + ".scale");
+      scale.name = p + experts + ".scale";
+      scaled.push_back(std::move(scale));
+    }
+    const Plan quantized = planned(inkling2Metadata(g), scaled);
+    check(!quantized.error &&
+              expertScaleRows(quantized.images[g.weightLayers - 1], g.experts) ==
+                  std::vector<std::string>{p + "ffn_gate_up_exps.scale", p + "ffn_gate_up_exps.scale",
+                                           p + "ffn_down_exps.scale"},
+          "planner reads the scales of Q5_K and Q8_0 experts" + (quantized.error ? ": " + *quantized.error : ""));
+  }
   // Experts 320 wide: the down projection's NVFP4 rows are not whole 256-element blocks, and take NVFP4's form of
   // 64-element blocks; the gate and up, of 256 inputs, NVFP4's own.
   {
