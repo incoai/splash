@@ -589,8 +589,16 @@ void requireInkling2Layout(const Inkling2LoopLayout &layout);
 
 // The projections its layers dispatch beyond their mixers' fused queries and
 // outputs, which qwenTargetGeometry takes as any mixer's (includeMixer):
-// keys, values, a full layer's taps and a loop layer's gates.
+// keys, values, both side by side (keyValueProjection), a full layer's taps
+// and a loop layer's gates.
 void includeFamilyProjections(QwenTargetGeometry &geometry, const Inkling2LoopWeights &weights);
+
+// A sliding layer's key and value projections side by side, keys then values
+// (ops::Projection::sideBySide: one dispatch where the tiles fuse them, each
+// the bits of its own projection's plan), which a decode step runs where one
+// row feeds both (Inkling2LoopTarget::addAttention); none for a full layer,
+// whose k and v inputs are its own norms', or for tensors of two formats.
+[[nodiscard]] std::optional<ops::Projection> keyValueProjection(const Inkling2LoopLayerWeights &layer);
 
 // The family's target (model/Inkling2LoopTarget.hpp), whose prefill commands
 // run up to `prefillChunks` chunks, and the step scratch a target of its

@@ -444,7 +444,16 @@ decode step's MoE combine also runs the FFN's convolution along the lanes'
 trees, in the combine's dispatch, a lane's rows a threadgroup's, which pass
 their combined values through threadgroup memory
 (`ops::MoeCombineConvolution`): the bits the combine and the convolution
-write apart. Its draft reads it as its producer captured it
+write apart. A decode step projects the keys and values of one row (a
+sliding layer's, but where messages gate its inputs apart) as one projection
+of the two tensors side by side (`keyValueProjection`,
+`ops::Projection::sideBySide`), on one tensor's own plan, so each tensor's
+columns are the bits of its own projection, in one dispatch from one prepared
+input; and it convolves every layer's keys and values in one dispatch
+(`ops::ShortConvolution::addConvolutionPair`), each the bits of its own
+dispatch, a pair from one projection's rows reading them as views
+(`ShortConvBuffers::inputStride`, `inputColumn`). Its draft reads it as its
+producer captured it
 (`QwenTargetDimensions`'s `draftReadsLayerInputs`): the target captures, at
 an id the draft reads, the rows passed into that application, its block
 residual's partial sum before it, and at id 48 the final norm's rows the
@@ -951,7 +960,12 @@ Apple10 and Apple11 the [int8-activation tile](#int8-activation-prefill) where i
 weights). A fused projection's staged plan runs its segments in one dispatch: a dispatch costs
 about 0.045 ms however narrow, and at 8 to 32 rows one dispatch takes 16-56% less time than one
 per segment on the 32-core M5 Max and 3-11% less on the 10-core M4 for the 27B attention and 35B
-GDN inputs.
+GDN inputs. A projection of tensors side by side (`Projection::sideBySide`: two or three
+projections of one input, each one tensor of one shape and format) takes the plan one of them
+takes alone, over all their columns (`ProjectionShape::planOutputs`, which the arena bound and
+the storage rows also follow): every tile runs a fused projection's segments at one configuration
+each as its own projection would (gguf-projection), so each tensor's columns are the bits of its
+own plan, in one dispatch where the tile fuses them.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`WaveLaw`, `runtime/ops/KernelSelection.cpp`), for decode steps and short

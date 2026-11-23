@@ -131,6 +131,9 @@ private:
   const Inkling2LoopWeights &weights_;
   Inkling2LoopSchedule schedule_;
   Inkling2LoopSteps steps_;
+  // Each weight layer's key and value projections side by side
+  // (keyValueProjection), which a decode step runs where one row feeds both.
+  std::vector<std::optional<ops::Projection>> keyValues_;
 };
 
 } // namespace splash::model

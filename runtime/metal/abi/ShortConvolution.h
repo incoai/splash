@@ -56,9 +56,14 @@
 // of state_stride columns, the convolution's from state_column), which the
 // commit reads. heads: 0 for static taps, else the dynamic taps' heads, whose
 // rows are dynamic_stride values apart (a projection's rows, whole tiles).
-// residual: whether a sum output adds a residual (none adds zero). The commit
-// takes `channels` as the state matrix's columns, every one of which it
-// writes.
+// residual: whether a sum output adds a residual (none adds zero). The input
+// rows are input_stride values apart, the convolution's channels from column
+// input_column of each (a view of a wider projection's rows). A pair
+// (short_convolution_pair: a verify step's two convolutions of one shape in
+// one dispatch, plain) runs a second convolution of its own buffers, its
+// input's channels from column pair_input_column, its state's and the tape's
+// from pair_state_column. The commit takes `channels` as the state matrix's
+// columns, every one of which it writes.
 struct ShortConvolutionParams {
   uint32_t rows;
   uint32_t channels;
@@ -76,7 +81,11 @@ struct ShortConvolutionParams {
   uint32_t dynamic_stride;
   uint32_t capture_sequences[SHORT_CONVOLUTION_CAPTURES];
   uint32_t capture_rows[SHORT_CONVOLUTION_CAPTURES];
+  uint32_t input_stride;
+  uint32_t input_column;
+  uint32_t pair_input_column;
+  uint32_t pair_state_column;
 };
 
-static_assert(sizeof(ShortConvolutionParams) == 88,
-              "short convolution parameters are 88 bytes on both sides");
+static_assert(sizeof(ShortConvolutionParams) == 104,
+              "short convolution parameters are 104 bytes on both sides");

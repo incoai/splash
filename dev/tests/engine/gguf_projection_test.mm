@@ -12,6 +12,9 @@
 //   16-row tile the 8-row tile's;
 // - both on the staged tile's spread walk too (LinearConfig::spread), over partitions from 72 steps down to 9, an odd
 //   count, whose tiles' walks wrap past the partition's end;
+// - side by side: two tensors of one format as one projection (Projection::sideBySide) on the production plans of a
+//   decode step's rows on Apple9's, Apple10's and Apple11's rows, each its tensors' own configuration and each
+//   tensor's columns bit for bit its own projection's;
 // - gate/up: each format's gate with the next format the tile takes as up, and in one pass
 //   (LinearConfig::oneGateUpPass) bitwise the two passes at the same K split, one lane on the 16-row tile too;
 // - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 64
@@ -59,6 +62,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <set>
 #include <span>
@@ -734,6 +738,61 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
           " format triples, K " + std::to_string(K) + ", 1-4 lanes, S 1-" + std::to_string(mostSplits) +
           " within fp64 and equal to each segment's projection" +
           (tile == LinearTile::GgufStaged ? ", one lane on the 16-row tile equal to the 8-row tile" : ""));
+}
+
+// Two tensors of one format, [1024, 2304] each (Inkling-2-Mini's keys and values), side by side as one projection
+// (Projection::sideBySide) on the production plans of a decode step of 1, 2 and 8 to 128 rows on Apple9's row (10
+// cores), Apple10's (the 16- and 20-core M5 Pro) and Apple11's (the 12-core M6): each plan the configuration of its
+// tensors' own plans, and each tensor's columns bit for bit its own plan's output.
+void sideBySidePlans(MetalBackend &backend) {
+  constexpr uint32_t N = 1024, K = 2304;
+  const std::vector<float> x = activations(Inputs::Dense, kMaximumStagedRows, K);
+  std::set<std::string> tiles;
+  for (const Fmt f : {Q80, Q4K}) {
+    const Tensor a = tensor(backend, f, N, K), b = tensor(backend, f, N, K);
+    const Projection keys = projection({&a}, N), values = projection({&b}, N);
+    const std::array<const Projection *, 2> parts{&keys, &values};
+    const std::optional<Projection> both = Projection::sideBySide(parts);
+    if (!both || both->outputSize != 2 * N || both->planOutputs() != N || both->shape().planOutputs != N) {
+      fail(std::string(fmtName(f)) + ": two tensors of one format are not one projection side by side");
+      continue;
+    }
+    for (const auto &[family, cores] : {std::pair{9u, 10u}, std::pair{10u, 16u}, std::pair{10u, 20u},
+                                        std::pair{11u, 12u}}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = cores;
+      const Linear linear(device, Int8Activations::On, StepKind::Decode);
+      for (const uint32_t rows : {1u, 2u, 8u, 16u, 24u, 32u, 48u, 64u, 96u, 128u}) {
+        const LinearPlan plan = linear.plan(*both, rows);
+        const std::string label = std::string(fmtName(f)) + " side by side, family " + std::to_string(family) + ", " +
+                                  std::to_string(cores) + " cores, " + std::to_string(rows) + " rows";
+        const std::vector<uint16_t> input = storageRows(x, K, rows, plan.storageRows());
+        const Outcome out = run(backend, linear, plan, *both, nullptr, input, {}, kPoisonNaN, 2 * N, label);
+        tiles.insert(std::to_string(unsigned(plan.configuration().tile)) + "/" +
+                     std::to_string(plan.configuration().splits));
+        uint32_t offset = 0;
+        for (const Projection *part : parts) {
+          const LinearPlan own = linear.plan(*part, rows);
+          if (own.configuration() != plan.configuration() || own.storageRows() != plan.storageRows()) {
+            fail(label + ": not its tensors' own configuration");
+            break;
+          }
+          const Outcome alone = run(backend, linear, own, *part, nullptr, input, {}, kPoisonNaN, N, label + " alone");
+          for (uint32_t r = 0; r < rows; ++r)
+            if (!std::equal(alone.output.begin() + uint64_t{r} * N, alone.output.begin() + uint64_t{r + 1} * N,
+                            out.output.begin() + uint64_t{r} * 2 * N + offset)) {
+              fail(label + ": a tensor's columns differ from its own projection's");
+              break;
+            }
+          offset += N;
+        }
+      }
+    }
+  }
+  section("side by side: Q8_0 and Q4_K [1024 | 1024, 2304] on the production decode plans of 1-128 rows, Apple9 (10 "
+          "cores), Apple10 (16, 20) and Apple11 (12), " + std::to_string(tiles.size()) +
+          " tile and split configurations, each its tensors' own and each tensor's columns bitwise its own plan's");
 }
 
 // Gate/up on one tile for the gate of each format it takes with the up of the next one ([256, 1024]), so that every
@@ -2097,6 +2156,7 @@ int main(int argc, char **argv) {
       decodeTile(backend, linear, LinearTile::GgufStaged, true, decodeInputs(true), tileFormats(LinearTile::GgufStaged));
       columnTile(backend, linear);
       fusedDecode(backend, linear, LinearTile::GgufStaged, true);
+      sideBySidePlans(backend);
       for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
       decodeInt8(backend, linear);

@@ -9,7 +9,8 @@
 // a decode step's rows along their paths of each lane's tree, whose commit
 // writes the state after the path the lane accepts. A verify step's
 // convolution of a MoE block's combined rows runs in the combine's dispatch
-// (addCombineConvolution).
+// (addCombineConvolution), and its two convolutions of one shape in one
+// dispatch (addConvolutionPair).
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/MoE.h"
@@ -41,8 +42,10 @@ enum class ShortConvOutput : uint8_t {
   RoundedSum = SHORT_CONVOLUTION_OUTPUT_ROUNDED_SUM,
 };
 
-// A convolution's rows: its input, bf16 [rows][channels], as the projection
-// writes it; its static taps, F32 [channels][SHORT_CONVOLUTION_TAPS] as a
+// A convolution's rows: its input, bf16 rows of inputStride values (0: the
+// channels) as a projection writes them, the convolution's channels from
+// column inputColumn of each (a projection's of several tensors side by side
+// holds several convolutions' inputs); its static taps, F32 [channels][SHORT_CONVOLUTION_TAPS] as a
 // GGUF stores them, a conv1d weight's order (column TAPS - 1 - k weighs the
 // input k rows back, the last the row itself); a dynamic convolution's
 // per-row taps by lag (tap k of a head the input k rows back), bf16
@@ -57,6 +60,8 @@ struct ShortConvBuffers final {
   uint32_t dynamicStride = 0;
   metal::MetalBuffer residual;
   metal::MetalBuffer output;
+  uint32_t inputStride = 0;
+  uint32_t inputColumn = 0;
 };
 
 // A convolution's place in a lane's state matrix, SHORT_CONVOLUTION_STATE_ROWS
@@ -112,6 +117,15 @@ struct ShortConvolution final {
                              metal::MetalBuffer layout, const LayoutRows &rows,
                              std::span<const ShortConvCapture> captures = {}, metal::MetalBuffer tree = {},
                              metal::MetalBuffer tape = {});
+  // A verify step's two convolutions of one shape (addConvolution's with
+  // `tree` and `tape`), Plain, in one dispatch (short_convolution_pair), each
+  // with its own buffers and its state's columns (`states`, of one stride),
+  // the bits of its own dispatch: a decode step's keys and values. Their
+  // inputs' rows are of one stride; their dynamic taps', where dynamic, too.
+  static void addConvolutionPair(metal::CommandGraph &graph, std::span<const ShortConvBuffers, 2> buffers,
+                                 ShortConvShape shape, std::span<const ShortConvState, 2> states,
+                                 std::span<const metal::MetalBuffer> stateIn, metal::MetalBuffer layout,
+                                 const LayoutRows &rows, metal::MetalBuffer tree, metal::MetalBuffer tape);
   // A verify step's convolution (addConvolution's with `tree` and `tape`) of
   // static taps, RoundedSum, whose input is the rows a MoE block's combine
   // sums (`combine`, its rows the step's), in one dispatch

@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -77,6 +79,9 @@ struct ProjectionShape final {
   // (quant_decode_int8_format), of which it has one at least: rotated, a
   // decode plan may run them (UnitFormats::decodeInt8Takes).
   bool decodeInt8Formats = false;
+  // The output columns its plans are selected for, those of one of the
+  // tensors side by side it holds (Projection::sideBySide); 0 for its own.
+  uint32_t planOutputs = 0;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -191,9 +196,30 @@ public:
       weights += n;
       bytes += n * s.format().block_bytes / s.format().block_elements;
     }
-    return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, classes.formatClass(),
-            weights ? uint32_t(128 * bytes / weights) : 0, weights && prefillInt8Formats, weights && decodeInt8Formats};
+    return {outputSize,
+            inputSize,
+            static_cast<bool>(rotation),
+            registerFormats,
+            classes.formatClass(),
+            weights ? uint32_t(128 * bytes / weights) : 0,
+            weights && prefillInt8Formats,
+            weights && decodeInt8Formats,
+            planOutputs_};
   }
+
+  // Two or three projections of one input, each one unrotated tensor of one
+  // shape and format, as one projection of their outputs side by side in
+  // order, whose plans are those of one of them alone (planOutputs,
+  // Linear::plan): every tile runs a fused projection's segments at one
+  // configuration, each the bits of its own projection's on it
+  // (gguf-projection), so each segment computes the bits of its tensor's own
+  // plan, in one dispatch where the tiles fuse them. None for tensors of
+  // other shapes or formats. Inkling-2-Mini's key and value projections of
+  // one row run so (Inkling2LoopTarget).
+  [[nodiscard]] static std::optional<Projection> sideBySide(std::span<const Projection *const> projections);
+  // The output columns its plans are selected for: one tensor's of a
+  // projection side by side, 0 for its own.
+  [[nodiscard]] uint32_t planOutputs() const noexcept { return planOutputs_; }
 
   // Rows [first, first + count) of a projection's weights.
   struct RowRange final {
@@ -227,6 +253,7 @@ public:
 private:
   BlockWeights weights_;
   uint32_t planeInputs_ = 0;
+  uint32_t planOutputs_ = 0;
 };
 
 // A token table's rows as stored, gathered, never multiplied (Embedding.cpp):

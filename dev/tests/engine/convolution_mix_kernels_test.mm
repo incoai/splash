@@ -8,6 +8,11 @@
 //   captured inside the sequences by the convolution's dispatches;
 // - a verify block's tree, whose rows tap their paths, the tape, and the
 //   commit of accepted paths of two lanes, rejected rows and all;
+// - a verify step's two convolutions in one dispatch
+//   (ShortConvolution::addConvolutionPair), the keys and values of rows of
+//   their own or of one projection's rows of both, bit for bit each one's own
+//   dispatch (`bitwise`, uninstrumented), the tape too, and each of those
+//   reading a view of the wider rows the bits of its own rows';
 // - a verify step's convolution in its MoE combine's dispatch
 //   (ShortConvolution::addCombineConvolution, kernels/shared/moe.metal), bit
 //   for bit as moe_combine and then the convolution of its rows (`bitwise`,
@@ -403,6 +408,105 @@ void convTreeTest(MetalBackend &backend, ops::ShortConvShape shape) {
     }
     check(okCommit, scope + ": the commit of the paths to row " + std::to_string(leaf) + " and " +
                         std::to_string(kept) + " chain rows, every column");
+  }
+}
+
+// A verify step's keys and values in one dispatch
+// (ShortConvolution::addConvolutionPair) against each one's own dispatch over
+// the tree of convTreeTest, of their own inputs (`oneProjection` false) or of
+// one projection's rows of both, keys then values (a view of the wider rows
+// each, ShortConvBuffers::inputStride and inputColumn), their states'
+// columns side by side in one matrix: uninstrumented (`exact`) each output
+// bit for bit, under shader validation, which compiles the kernels apart,
+// within a bf16 step; the tape exactly, its other columns untouched. Each
+// convolution alone of a view of the wider rows writes the bits of its own
+// rows'.
+void convPairTest(MetalBackend &backend, ops::ShortConvShape shape, bool oneProjection, bool exact) {
+  std::mt19937 rng(31 + shape.dynamicHeads + (oneProjection ? 1 : 0));
+  const std::array<uint32_t, 8> parents{0, 0, 1, 2, 3, 1, 5, 0};
+  const std::array<ops::LaneRows, 2> lanes{{{0, 8}, {8, 3}}};
+  const uint32_t rows = 11, channels = shape.channels, stride = 2 * channels + 384;
+  const std::array<ops::ShortConvState, 2> states{ops::ShortConvState{128, stride},
+                                                  ops::ShortConvState{128 + channels, stride}};
+  const ConvCase keys = convCase(rng, shape, states[0], rows, 2), values = convCase(rng, shape, states[1], rows, 2);
+  std::vector<ops::TreeRow> tree(rows);
+  for (uint32_t r = 0; r < 8; ++r)
+    tree[r] = r ? ops::TreeRow{tree[parents[r]].ancestors | 1u << r, static_cast<uint16_t>(parents[r]),
+                               static_cast<uint16_t>(tree[parents[r]].depth + 1)}
+                : splash::test::chainRow(0);
+  for (uint32_t r = 0; r < 3; ++r) tree[8 + r] = splash::test::chainRow(r);
+  const std::string scope = std::string("short convolution pair (") + (shape.dynamic() ? "dynamic" : "static") +
+                            (oneProjection ? ", one projection's rows" : ", rows of their own") + ")";
+  // The lanes' state matrices: the keys' states at their columns, the values'
+  // at theirs.
+  std::vector<MetalBuffer> in;
+  for (uint32_t l = 0; l < 2; ++l) {
+    std::vector<float> matrix = keys.states[l];
+    for (uint32_t j = 0; j < kStateRows; ++j)
+      for (uint32_t ch = 0; ch < channels; ++ch) {
+        const size_t at = size_t{j} * stride + states[1].column + ch;
+        matrix[at] = values.states[l][at];
+      }
+    in.push_back(upload(backend, bf16s(matrix)));
+  }
+  // One projection's rows of both, keys then values.
+  std::vector<float> both;
+  for (uint32_t r = 0; r < rows; ++r)
+    for (const ConvCase *c : {&keys, &values})
+      both.insert(both.end(), c->input.begin() + size_t{r} * channels, c->input.begin() + size_t{r + 1} * channels);
+  const MetalBuffer layout = laneRowsOf(backend, lanes), treeRows = upload(backend, tree),
+                    wide = upload(backend, bf16s(both));
+  const auto buffersOf = [&](const ConvCase &c, uint32_t column) {
+    ops::ShortConvBuffers buffers{upload(backend, bf16s(c.input)), upload(backend, c.taps),
+                                  shape.dynamic() ? upload(backend, bf16s(c.dynamic)) : MetalBuffer{}, kDynamicStride,
+                                  {}, scratch(backend, size_t{rows} * channels * 2)};
+    if (oneProjection) buffers.input = wide, buffers.inputStride = 2 * channels, buffers.inputColumn = column;
+    return buffers;
+  };
+  // Each alone, of rows of its own, then both in one dispatch.
+  const std::array<ops::ShortConvBuffers, 2> pair{buffersOf(keys, 0), buffersOf(values, channels)};
+  std::array<ops::ShortConvBuffers, 2> alone = pair;
+  for (size_t i = 0; i < alone.size(); ++i) {
+    alone[i].input = upload(backend, bf16s(i ? values.input : keys.input));
+    alone[i].inputStride = alone[i].inputColumn = 0;
+    alone[i].output = scratch(backend, size_t{rows} * channels * 2);
+  }
+  const MetalBuffer aloneTape = upload(backend, std::vector<uint16_t>(size_t{rows} * stride, 0)),
+                    pairTape = upload(backend, std::vector<uint16_t>(size_t{rows} * stride, 0));
+  CommandGraph graph;
+  for (size_t i = 0; i < alone.size(); ++i)
+    ops::ShortConvolution::addConvolution(graph, alone[i], shape, ops::ShortConvOutput::Plain, in, {}, states[i],
+                                          layout, {2, rows, 8}, {}, treeRows, aloneTape);
+  ops::ShortConvolution::addConvolutionPair(graph, pair, shape, states, in, layout, {2, rows, 8}, treeRows, pairTape);
+  run(backend, graph);
+  const size_t values16 = size_t{rows} * channels;
+  bool same = true, close = true;
+  for (size_t i = 0; i < pair.size(); ++i) {
+    const auto want = download<uint16_t>(alone[i].output, values16), got = download<uint16_t>(pair[i].output, values16);
+    same &= want == got;
+    for (size_t v = 0; v < values16; ++v) close &= closeBf16(f32(got[v]), f32(want[v]), 0);
+  }
+  check(exact ? same : close, scope + (exact ? ": each output bit for bit its own dispatch's"
+                                             : ": each output within a bf16 step of its own dispatch's"));
+  check(download<uint16_t>(aloneTape, size_t{rows} * stride) == download<uint16_t>(pairTape, size_t{rows} * stride),
+        scope + ": the tape its own dispatches', its other columns untouched");
+  // A convolution of a view of the wider rows against one of its own rows.
+  if (oneProjection) {
+    const MetalBuffer viewTape = upload(backend, std::vector<uint16_t>(size_t{rows} * stride, 0));
+    std::array<ops::ShortConvBuffers, 2> views = pair;
+    CommandGraph viewGraph;
+    for (size_t i = 0; i < views.size(); ++i) {
+      views[i].output = scratch(backend, size_t{rows} * channels * 2);
+      ops::ShortConvolution::addConvolution(viewGraph, views[i], shape, ops::ShortConvOutput::Plain, in, {}, states[i],
+                                            layout, {2, rows, 8}, {}, treeRows, viewTape);
+    }
+    run(backend, viewGraph);
+    bool viewSame = true;
+    for (size_t i = 0; i < views.size(); ++i)
+      viewSame &= download<uint16_t>(views[i].output, values16) == download<uint16_t>(alone[i].output, values16);
+    check(viewSame && download<uint16_t>(viewTape, size_t{rows} * stride) ==
+                          download<uint16_t>(aloneTape, size_t{rows} * stride),
+          scope + ": a convolution of a view of the wider rows the bits of its own rows'");
   }
 }
 
@@ -888,9 +992,11 @@ int main(int argc, const char *argv[]) {
       if (argc != 2 && !bitwise) throw std::runtime_error("usage: convolution-mix-kernels METALLIB [bitwise]");
       MetalBackend backend(argv[1]);
       if (bitwise) {
-        // Uninstrumented: the combine's convolution alone, exact.
+        // Uninstrumented: the combine's convolution and the pair's alone, exact.
         if (std::getenv("MTL_SHADER_VALIDATION")) throw std::runtime_error("bitwise runs without shader validation");
         combineConvolutionTest(backend, true);
+        for (const ops::ShortConvShape shape : {ops::ShortConvShape{1024, 0}, ops::ShortConvShape{1024, 8}})
+          for (const bool oneProjection : {false, true}) convPairTest(backend, shape, oneProjection, true);
         std::cout << (failures ? "convolution and mix kernel bitwise tests FAILED\n"
                                : "convolution and mix kernel bitwise tests PASS\n");
         return failures ? 1 : 0;
@@ -902,6 +1008,11 @@ int main(int argc, const char *argv[]) {
         convTreeTest(backend, shape);
       }
       combineConvolutionTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
+      // A sliding layer's keys and values (static taps) and a full layer's
+      // (dynamic).
+      for (const ops::ShortConvShape shape : {ops::ShortConvShape{1024, 0}, ops::ShortConvShape{1024, 8}})
+        for (const bool oneProjection : {false, true})
+          convPairTest(backend, shape, oneProjection, !std::getenv("MTL_SHADER_VALIDATION"));
       for (const bool currentFloat : {false, true}) {
         for (const uint32_t queries : {1u, 3u, 4u})
           for (uint32_t stack = 1; stack <= 4; ++stack)

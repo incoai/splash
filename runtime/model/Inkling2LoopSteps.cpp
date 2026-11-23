@@ -77,10 +77,12 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
       {&Inkling2LoopScratch::gateCounters, 0, ops::MessageGate::kCountersBytes, false},
       {&Inkling2LoopScratch::zeros, bytesFor<uint16_t>(hidden), 0, false},
   };
-  // A decode step's convolution inputs of every application, which its
-  // commit reads after the last (ops::ShortConvolution::addCommit), and its
-  // relative attention's counters (ops::RelativeAttention::addDecode).
+  // A decode step's key and value projections of one row side by side, its
+  // convolution inputs of every application, which its commit reads after
+  // the last (ops::ShortConvolution::addCommit), and its relative attention's
+  // counters (ops::RelativeAttention::addDecode).
   if (decode) {
+    result.push_back({&Inkling2LoopScratch::keyValues, bytesFor<uint16_t>(2 * kv), 0, false});
     result.push_back({&Inkling2LoopScratch::tape, bytesFor<uint16_t>(schedule.stateColumns()), 0, false});
     result.push_back({&Inkling2LoopScratch::attentionCounters, 0, ops::RelativeAttention::kCountersBytes, false});
   } else {

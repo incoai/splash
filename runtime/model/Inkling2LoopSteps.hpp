@@ -24,8 +24,10 @@ namespace splash::model {
 // mixes' outputs, up to three queries a row (fp32, [rows][3][hiddenSize]),
 // and the messages, four a row (fp32, [rows][4][hiddenSize]); the k and v
 // inputs (the q input is buffers.normalized); the key and value projections
-// and their convolved rows (kvWidth each) and a full layer's dynamic taps of
-// each (KV heads x taps a row); a prompt chunk's relative states and row
+// and their convolved rows (kvWidth each), a decode step's of one row side by
+// side (2 kvWidth, keys then values: model/Inkling2Loop.hpp
+// keyValueProjection), and a full layer's dynamic taps of each (KV heads x
+// taps a row); a prompt chunk's relative states and row
 // sinks the attention's projection stages for its split (fp32, in the
 // queries' staged rows); a message gate's concatenated norms (2 hiddenSize),
 // low rank (loopGateRank, three gates' in a row) and forget and gain rows
@@ -46,6 +48,7 @@ struct Inkling2LoopScratch final {
   metal::MetalBuffer valueInput;
   metal::MetalBuffer keys;
   metal::MetalBuffer values;
+  metal::MetalBuffer keyValues;
   metal::MetalBuffer keyTaps;
   metal::MetalBuffer valueTaps;
   metal::MetalBuffer convolvedKeys;

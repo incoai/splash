@@ -43,6 +43,12 @@ float divisor(ShortConvShape shape) {
   return static_cast<float>(std::sqrt(static_cast<double>((shape.dynamic() ? 2 : 1) * kTaps + 1)));
 }
 
+// The values a row of the convolution's input holds: its own stride, or its
+// channels.
+uint32_t inputStride(const ShortConvBuffers &buffers, ShortConvShape shape) {
+  return buffers.inputStride ? buffers.inputStride : shape.channels;
+}
+
 ShortConvolutionParams convolutionParams(ShortConvShape shape, uint32_t rows, ShortConvState state) {
   ShortConvolutionParams p{};
   p.rows = rows;
@@ -51,6 +57,7 @@ ShortConvolutionParams convolutionParams(ShortConvShape shape, uint32_t rows, Sh
   p.state_stride = state.stride;
   p.state_column = state.column;
   p.divisor = divisor(shape);
+  p.input_stride = shape.channels;
   return p;
 }
 
@@ -60,6 +67,39 @@ uint64_t bfloat16Rows(uint32_t rows, uint32_t width) { return uint64_t{rows} * w
 uint64_t floatRows(uint32_t rows, uint32_t width) { return uint64_t{rows} * width * sizeof(float); }
 uint64_t stateExtent(ShortConvShape shape, ShortConvState state) {
   return rowBytes(kStateRows, state.stride, uint64_t{state.column} + shape.channels, sizeof(uint16_t));
+}
+
+// Throws unless the buffers hold a convolution's `rows` rows written as
+// `output` asks: its input's channels within its rows, a residual where the
+// output adds one, the dynamic taps of a dynamic shape.
+void requireBuffers(const ShortConvBuffers &buffers, ShortConvShape shape, ShortConvOutput output, uint32_t rows) {
+  const bool sum = output == ShortConvOutput::Sum, residual = static_cast<bool>(buffers.residual);
+  const uint32_t stride = inputStride(buffers, shape);
+  if (uint64_t{buffers.inputColumn} + shape.channels > stride || (output == ShortConvOutput::Plain && residual) ||
+      (output == ShortConvOutput::RoundedSum && !residual) ||
+      (shape.dynamic() && buffers.dynamicStride < shape.dynamicHeads * kTaps))
+    throw std::invalid_argument("invalid short convolution");
+  requireBytes(buffers.input, rowBytes(rows, stride, uint64_t{buffers.inputColumn} + shape.channels, sizeof(uint16_t)),
+               "short convolution input");
+  requireBytes(buffers.taps, uint64_t{shape.channels} * kTaps * sizeof(float), "short convolution taps");
+  if (shape.dynamic())
+    requireBytes(buffers.dynamicTaps,
+                 rowBytes(rows, buffers.dynamicStride, shape.dynamicHeads * kTaps, sizeof(uint16_t)),
+                 "short convolution dynamic taps");
+  if (residual)
+    requireBytes(buffers.residual, sum ? bfloat16Rows(rows, shape.channels) : floatRows(rows, shape.channels),
+                 "short convolution residual");
+  requireBytes(buffers.output, sum ? floatRows(rows, shape.channels) : bfloat16Rows(rows, shape.channels),
+               "short convolution output");
+}
+
+// Throws unless a verify step's tree rows and tape hold its rows, the tape
+// the state's columns.
+void requireTape(metal::MetalBuffer tree, metal::MetalBuffer tape, ShortConvShape shape, ShortConvState state,
+                 uint32_t rows) {
+  requireBytes(tree, uint64_t{rows} * sizeof(SplashTreeRow), "short convolution tree rows");
+  requireBytes(tape, rowBytes(rows, state.stride, uint64_t{state.column} + shape.channels, sizeof(uint16_t)),
+               "short convolution tape");
 }
 
 } // namespace
@@ -80,35 +120,19 @@ void ShortConvolution::addConvolution(metal::CommandGraph &graph, const ShortCon
   // tape; captures are a prompt's.
   requireLayoutRows(rows, inTree ? 32 : std::numeric_limits<uint32_t>::max());
   if (stateIn.size() != rows.sequences || (writeState && stateOut.size() != rows.sequences) ||
-      (inTree && (writeState || !captures.empty())) || inTree != static_cast<bool>(tape) ||
-      (output == ShortConvOutput::Plain && residual) || (output == ShortConvOutput::RoundedSum && !residual) ||
-      (shape.dynamic() && buffers.dynamicStride < shape.dynamicHeads * kTaps))
+      (inTree && (writeState || !captures.empty())) || inTree != static_cast<bool>(tape))
     throw std::invalid_argument("invalid short convolution");
   for (const ShortConvCapture &capture : captures)
     if (capture.sequence >= rows.sequences || !capture.row)
       throw std::invalid_argument("invalid short convolution capture");
   requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "short convolution layout");
-  requireBytes(buffers.input, bfloat16Rows(rows.rows, shape.channels), "short convolution input");
-  requireBytes(buffers.taps, uint64_t{shape.channels} * kTaps * sizeof(float), "short convolution taps");
-  if (shape.dynamic())
-    requireBytes(buffers.dynamicTaps,
-                 rowBytes(rows.rows, buffers.dynamicStride, shape.dynamicHeads * kTaps, sizeof(uint16_t)),
-                 "short convolution dynamic taps");
-  if (residual)
-    requireBytes(buffers.residual, sum ? bfloat16Rows(rows.rows, shape.channels) : floatRows(rows.rows, shape.channels),
-                 "short convolution residual");
-  requireBytes(buffers.output, sum ? floatRows(rows.rows, shape.channels) : bfloat16Rows(rows.rows, shape.channels),
-               "short convolution output");
+  requireBuffers(buffers, shape, output, rows.rows);
   for (const metal::MetalBuffer &s : stateIn) requireBytes(s, stateExtent(shape, state), "short convolution state");
   for (const metal::MetalBuffer &s : stateOut)
     requireBytes(s, stateExtent(shape, state), "short convolution next state");
   for (const ShortConvCapture &capture : captures)
     requireBytes(capture.state, stateExtent(shape, state), "short convolution captured state");
-  if (inTree) {
-    requireBytes(tree, uint64_t{rows.rows} * sizeof(SplashTreeRow), "short convolution tree rows");
-    requireBytes(tape, rowBytes(rows.rows, state.stride, uint64_t{state.column} + shape.channels, sizeof(uint16_t)),
-                 "short convolution tape");
-  }
+  if (inTree) requireTape(tree, tape, shape, state, rows.rows);
   ShortConvolutionParams p = convolutionParams(shape, rows.rows, state);
   p.output = static_cast<uint32_t>(output);
   p.residual = residual ? 1u : 0u;
@@ -116,6 +140,8 @@ void ShortConvolution::addConvolution(metal::CommandGraph &graph, const ShortCon
   p.tree = inTree ? 1u : 0u;
   p.sequences = rows.sequences;
   p.dynamic_stride = buffers.dynamicStride;
+  p.input_stride = inputStride(buffers, shape);
+  p.input_column = buffers.inputColumn;
   const auto in = laneBindings(stateIn), out = laneBindings(writeState ? stateOut : stateIn);
   // The buffers a dispatch does not touch bind another of its buffers: the
   // dynamic taps and the tree the static taps, the residual, the tape and
@@ -144,6 +170,46 @@ void ShortConvolution::addConvolution(metal::CommandGraph &graph, const ShortCon
               p, {rows.bound + stateRows, groups(shape.channels), rows.sequences}, {kThreads, 1, 1});
     first += count;
   } while (first < captures.size());
+}
+
+void ShortConvolution::addConvolutionPair(metal::CommandGraph &graph, std::span<const ShortConvBuffers, 2> buffers,
+                                          ShortConvShape shape, std::span<const ShortConvState, 2> states,
+                                          std::span<const metal::MetalBuffer> stateIn, metal::MetalBuffer layout,
+                                          const LayoutRows &rows, metal::MetalBuffer tree, metal::MetalBuffer tape) {
+  requireShape(shape);
+  // A verify block's rows, along its paths, into the tape (addConvolution).
+  requireLayoutRows(rows, 32);
+  const ShortConvBuffers &first = buffers[0], &second = buffers[1];
+  if (stateIn.size() != rows.sequences || !tree || !tape || states[0].stride != states[1].stride ||
+      inputStride(first, shape) != inputStride(second, shape) ||
+      (shape.dynamic() && first.dynamicStride != second.dynamicStride))
+    throw std::invalid_argument("invalid short convolution pair");
+  requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "short convolution layout");
+  for (size_t index = 0; index < buffers.size(); ++index) {
+    requireState(shape, states[index]);
+    requireBuffers(buffers[index], shape, ShortConvOutput::Plain, rows.rows);
+    for (const metal::MetalBuffer &s : stateIn)
+      requireBytes(s, stateExtent(shape, states[index]), "short convolution state");
+    requireTape(tree, tape, shape, states[index], rows.rows);
+  }
+  ShortConvolutionParams p = convolutionParams(shape, rows.rows, states[0]);
+  p.output = SHORT_CONVOLUTION_OUTPUT_PLAIN;
+  p.tree = 1;
+  p.sequences = rows.sequences;
+  p.dynamic_stride = first.dynamicStride;
+  p.input_stride = inputStride(first, shape);
+  p.input_column = first.inputColumn;
+  p.pair_input_column = second.inputColumn;
+  p.pair_state_column = states[1].column;
+  const auto in = laneBindings(stateIn);
+  // A static shape binds each convolution's taps in its dynamic taps' slot,
+  // which it does not read.
+  graph.add("short_convolution_pair",
+            {first.input, second.input, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], first.taps,
+             second.taps, shape.dynamic() ? first.dynamicTaps : first.taps,
+             shape.dynamic() ? second.dynamicTaps : second.taps, first.output, second.output, std::move(layout),
+             std::move(tree), std::move(tape)},
+            p, {rows.bound, 2 * groups(shape.channels), rows.sequences}, {kThreads, 1, 1});
 }
 
 void ShortConvolution::addCombineConvolution(metal::CommandGraph &graph, const ShortConvCombine &combine,

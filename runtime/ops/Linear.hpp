@@ -351,7 +351,9 @@ public:
   [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
-  // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
+  // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`. A
+  // projection of tensors side by side (Projection::sideBySide) takes the configuration one of them alone takes at
+  // the workload's rows, over all their columns.
   [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection,
                                 const Projection *gate = nullptr) const;
   // The projection's plan of `rows` rows (its input() the layout its
@@ -414,8 +416,10 @@ private:
                                                                       uint32_t splits);
   // The scratch of every tile a decode plan of the workload may take, the
   // register tile's and the int8 decode tiles' where they take the unit
-  // (decodeConfigurations).
-  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, const UnitFormats &unit) const;
+  // (decodeConfigurations), those of planOutputs columns' workload for a
+  // projection side by side (ProjectionShape::planOutputs).
+  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, const UnitFormats &unit,
+                                                        uint32_t planOutputs) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
                const Projection *gate) const;

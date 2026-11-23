@@ -192,6 +192,7 @@ void includeFamilyProjections(QwenTargetGeometry &geometry, const Inkling2LoopWe
   for (const Inkling2LoopLayerWeights &layer : weights.layers) {
     geometry.include(layer.mixer.key);
     geometry.include(layer.mixer.value);
+    if (const std::optional<ops::Projection> keyValues = keyValueProjection(layer)) geometry.include(*keyValues);
     if (const auto *full = std::get_if<Inkling2LoopFullInputs>(&layer.inputs)) {
       geometry.include(full->keyTaps);
       geometry.include(full->valueTaps);
@@ -203,6 +204,12 @@ void includeFamilyProjections(QwenTargetGeometry &geometry, const Inkling2LoopWe
         geometry.include(gate.gain);
       }
   }
+}
+
+std::optional<ops::Projection> keyValueProjection(const Inkling2LoopLayerWeights &layer) {
+  if (!std::holds_alternative<Inkling2LoopSlidingInputs>(layer.inputs)) return std::nullopt;
+  const std::array<const ops::Projection *, 2> both{&layer.mixer.key, &layer.mixer.value};
+  return ops::Projection::sideBySide(both);
 }
 
 SparseRowStoreOptions streamedTableRows(const Inkling2LoopLayout &) { return {}; }

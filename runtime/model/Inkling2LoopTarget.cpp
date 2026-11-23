@@ -53,6 +53,7 @@ Inkling2LoopTarget::Inkling2LoopTarget(const Inkling2LoopWeights &weights, const
   // Its draft's captures and rows are those its producer trained it on: the
   // rows passed into its applications and its normed token rows.
   requireDraftRows(true, true);
+  for (const Inkling2LoopLayerWeights &layer : weights_.layers) keyValues_.push_back(keyValueProjection(layer));
 }
 
 QwenTargetScratchBytes Inkling2LoopTarget::allocatedScratchBytes() const noexcept { return steps_.allocatedBytes(); }
@@ -252,45 +253,59 @@ void Inkling2LoopTarget::addGates(const PrefillStep &step, uint32_t application,
 // A prompt sequence's history through the command's reads of spilled K/V
 // (QwenTarget::addPrefillMixer), attended by the prepare, split and reduce; a
 // decode lane's from its pages, which this target's dense layout never
-// spills, in the decode step's single pass.
+// spills, in the decode step's single pass. A decode step projects the keys
+// and values of one row (a sliding layer's but where messages gate its inputs
+// apart) side by side as one projection (keyValueProjection), each the bits
+// of its own, one dispatch and one prepared input for both, and convolves
+// them in one dispatch (ops::ShortConvolution::addConvolutionPair), each the
+// bits of its own dispatch.
 void Inkling2LoopTarget::addAttention(PrefillStep &step, uint32_t application,
                                       const std::array<metal::MetalBuffer, 3> &inputs) const {
-  const Inkling2LoopAttentionWeights &mixer = weights_.layers[schedule_.weightLayer(application)].mixer;
+  const uint32_t weightLayer = schedule_.weightLayer(application);
+  const Inkling2LoopAttentionWeights &mixer = weights_.layers[weightLayer].mixer;
   const QwenTargetPrefillBuffers &b = step.buffers;
   const Inkling2LoopScratch &s = step.scratch;
   const ops::Linear &linear = this->linear(step);
   const bool full = schedule_.full(application);
-  const uint32_t rows = step.rows, kvLayer = step.attentionLayer++;
+  const uint32_t rows = step.rows, kvLayer = step.attentionLayer++, kvWidth = schedule_.shape.kvWidth;
   linear.addProjection(step.graph, inputs[0], mixer.inputProjection, b.fullPacked, rows, b.linearScratch);
-  linear.addProjection(step.graph, inputs[1], mixer.key, s.keys, rows, b.linearScratch);
-  linear.addProjection(step.graph, inputs[2], mixer.value, s.values, rows, b.linearScratch);
-  const ops::ShortConvShape kv{.channels = schedule_.shape.kvWidth,
-                               .dynamicHeads = full ? geometry_.attentionKvHeads : 0};
-  metal::MetalBuffer keyTaps, valueTaps;
-  uint32_t tapsStride = 0;
+  ops::ShortConvBuffers keys{.input = s.keys, .taps = mixer.keyConvolution, .output = s.convolvedKeys};
+  ops::ShortConvBuffers values{.input = s.values, .taps = mixer.valueConvolution, .output = s.convolvedValues};
+  const std::optional<ops::Projection> &keyValues = keyValues_[weightLayer];
+  if (step.decode && keyValues && inputs[1].sameView(inputs[2])) {
+    linear.addProjection(step.graph, inputs[1], *keyValues, s.keyValues, rows, b.linearScratch);
+    keys.input = values.input = s.keyValues;
+    keys.inputStride = values.inputStride = 2 * kvWidth;
+    values.inputColumn = kvWidth;
+  } else {
+    linear.addProjection(step.graph, inputs[1], mixer.key, s.keys, rows, b.linearScratch);
+    linear.addProjection(step.graph, inputs[2], mixer.value, s.values, rows, b.linearScratch);
+  }
+  const ops::ShortConvShape kv{.channels = kvWidth, .dynamicHeads = full ? geometry_.attentionKvHeads : 0};
   if (full) {
-    const auto &taps = std::get<Inkling2LoopFullInputs>(weights_.layers[schedule_.weightLayer(application)].inputs);
+    const auto &taps = std::get<Inkling2LoopFullInputs>(weights_.layers[weightLayer].inputs);
     linear.addProjection(step.graph, inputs[1], taps.keyTaps, s.keyTaps, rows, b.linearScratch);
     linear.addProjection(step.graph, inputs[2], taps.valueTaps, s.valueTaps, rows, b.linearScratch);
-    keyTaps = s.keyTaps;
-    valueTaps = s.valueTaps;
+    keys.dynamicTaps = s.keyTaps;
+    values.dynamicTaps = s.valueTaps;
     // The taps projections' rows, whole tiles wide (Inkling2LoopFullInputs).
-    tapsStride = taps.keyTaps.outputSize;
+    keys.dynamicStride = values.dynamicStride = taps.keyTaps.outputSize;
   }
-  addConvolution(step, application, Inkling2LoopConvolution::Key,
-                 {.input = s.keys,
-                  .taps = mixer.keyConvolution,
-                  .dynamicTaps = keyTaps,
-                  .dynamicStride = tapsStride,
-                  .output = s.convolvedKeys},
-                 kv, ops::ShortConvOutput::Plain);
-  addConvolution(step, application, Inkling2LoopConvolution::Value,
-                 {.input = s.values,
-                  .taps = mixer.valueConvolution,
-                  .dynamicTaps = valueTaps,
-                  .dynamicStride = tapsStride,
-                  .output = s.convolvedValues},
-                 kv, ops::ShortConvOutput::Plain);
+  if (const QwenTargetDecodeBuffers *d = step.decode) {
+    std::vector<metal::MetalBuffer> stateIn;
+    for (const QwenTargetPrefillSequence &sequence : step.sequences) stateIn.push_back(sequence.auxiliaryIn);
+    const std::array<ops::ShortConvBuffers, 2> both{keys, values};
+    const std::array<ops::ShortConvState, 2> states{
+        ops::ShortConvState{.column = schedule_.convolutionColumn(application, Inkling2LoopConvolution::Key),
+                            .stride = schedule_.stateColumns()},
+        ops::ShortConvState{.column = schedule_.convolutionColumn(application, Inkling2LoopConvolution::Value),
+                            .stride = schedule_.stateColumns()}};
+    ops::ShortConvolution::addConvolutionPair(step.graph, both, kv, states, stateIn, b.laneRows, step.layoutRows,
+                                              d->tree, s.tape);
+  } else {
+    addConvolution(step, application, Inkling2LoopConvolution::Key, keys, kv, ops::ShortConvOutput::Plain);
+    addConvolution(step, application, Inkling2LoopConvolution::Value, values, kv, ops::ShortConvOutput::Plain);
+  }
 
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
   const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());

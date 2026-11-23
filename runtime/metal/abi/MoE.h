@@ -316,5 +316,5 @@ struct MoeCombineConvolutionParams {
   struct ShortConvolutionParams convolution;
 };
 
-static_assert(sizeof(MoeCombineConvolutionParams) == 100,
-              "MoE combine convolution parameters are 100 bytes on both sides");
+static_assert(sizeof(MoeCombineConvolutionParams) == 116,
+              "MoE combine convolution parameters are 116 bytes on both sides");
