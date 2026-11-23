@@ -84,29 +84,8 @@ __attribute__((noinline)) void mix_row_weights(BlockResidualMixRow<Current> mix,
       mix_row_reduce(dot, shared.partials + (kRowStates + q * kRowStates + s) * kRowSimdgroups,
                      &shared.weights[q * kRowStates + s], tid, lane, sg, [](float total) { return total; });
     }
-  if (tid == 0)
-    for (uint q = 0; q < p.queries; ++q) {
-      threadgroup float *weights = shared.weights + q * kRowStates;
-      float maximum = -INFINITY;
-      for (uint s = 0; s < states; ++s) maximum = max(maximum, weights[s] * p.scale);
-      float total = 0.0f;
-      for (uint s = 0; s < states; ++s) {
-        weights[s] = exp(weights[s] * p.scale - maximum);
-        total += weights[s];
-      }
-      for (uint s = 0; s < states; ++s) weights[s] /= total;
-    }
+  if (tid == 0) block_residual_mix_softmax(shared.weights, p.queries, kRowStates, states, p);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-
-// Query q's output at column d: the weighted sum of the normalized states,
-// from the parked norms and weights.
-template <class Current>
-inline float mix_row_output(BlockResidualMixRow<Current> mix, uint q, uint d, threadgroup const MixRowShared &shared) {
-  float sum = 0.0f;
-  for (uint s = 0; s < mix.states(); ++s)
-    sum += shared.weights[q * kRowStates + s] * (mix.state(s, d) * shared.inverse[s]);
-  return sum;
 }
 
 // Phase two of block_residual_mix_rows: each query's output as fp32 rows.
@@ -116,7 +95,7 @@ __attribute__((noinline)) void mix_row_outputs(BlockResidualMixRow<Current> mix,
                                                threadgroup const MixRowShared &shared) {
   for (uint q = 0; q < p.queries; ++q)
     for (uint d = tid; d < p.hidden; d += kRowThreads)
-      output[(ulong(row) * p.queries + q) * p.hidden + d] = mix_row_output(mix, q, d, shared);
+      output[(ulong(row) * p.queries + q) * p.hidden + d] = block_residual_mix_output(mix, q, d, shared);
 }
 
 // Phase two of block_residual_mix_norm_rows: each query's output's inverse
@@ -131,7 +110,7 @@ __attribute__((noinline)) void mix_row_norm_outputs(BlockResidualMixRow<Current>
   for (uint q = 0; q < p.queries; ++q) {
     float squares = 0.0f;
     for (uint d = tid; d < p.hidden; d += kRowThreads) {
-      const float o = mix_row_output(mix, q, d, shared);
+      const float o = block_residual_mix_output(mix, q, d, shared);
       squares += o * o;
     }
     mix_row_reduce(squares, shared.partials + (kRowStates + kRowQueries * kRowStates + q) * kRowSimdgroups,
@@ -143,7 +122,8 @@ __attribute__((noinline)) void mix_row_norm_outputs(BlockResidualMixRow<Current>
   for (uint q = 0; q < p.queries; ++q) {
     const float inverse = shared.output_inverse[q];
     for (uint d = tid; d < p.hidden; d += kRowThreads)
-      outputs[q][ulong(row) * p.hidden + d] = bfloat((mix_row_output(mix, q, d, shared) * inverse) * norms[q][d]);
+      outputs[q][ulong(row) * p.hidden + d] =
+          bfloat((block_residual_mix_output(mix, q, d, shared) * inverse) * norms[q][d]);
   }
 }
 

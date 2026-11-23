@@ -101,28 +101,8 @@ __attribute__((noinline)) void block_residual_mix_weights(BlockResidualMixRow<Cu
   }
   block_residual_mix_reduce(dots, states, shared.partials + kStates * kMixSimdgroups, shared.weights, tid, lane, sg,
                             [](float total) { return total; });
-  if (tid == 0) {
-    threadgroup float *weights = shared.weights;
-    float maximum = -INFINITY;
-    for (uint s = 0; s < states; ++s) maximum = max(maximum, weights[s] * p.scale);
-    float total = 0.0f;
-    for (uint s = 0; s < states; ++s) {
-      weights[s] = exp(weights[s] * p.scale - maximum);
-      total += weights[s];
-    }
-    for (uint s = 0; s < states; ++s) weights[s] /= total;
-  }
+  if (tid == 0) block_residual_mix_softmax(shared.weights, 1, kStates, states, p);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-
-// The query's output at column d: the weighted sum of the normalized states,
-// from the parked norms and weights.
-template <class Current>
-inline float block_residual_mix_output(BlockResidualMixRow<Current> mix, uint d,
-                                       threadgroup const BlockResidualMixShared &shared) {
-  float sum = 0.0f;
-  for (uint s = 0; s < mix.states(); ++s) sum += shared.weights[s] * (mix.state(s, d) * shared.inverse[s]);
-  return sum;
 }
 
 // Phase three of block_residual_mix: the query's output as fp32 rows.
@@ -130,7 +110,7 @@ template <class Current>
 __attribute__((noinline)) void block_residual_mix_outputs(BlockResidualMixRow<Current> mix, device float *output,
                                                           constant BlockResidualMixParams &p, uint tid,
                                                           threadgroup const BlockResidualMixShared &shared) {
-  for (uint d = tid; d < p.hidden; d += kMixThreads) output[d] = block_residual_mix_output(mix, d, shared);
+  for (uint d = tid; d < p.hidden; d += kMixThreads) output[d] = block_residual_mix_output(mix, 0, d, shared);
 }
 
 // Phase three of block_residual_mix_norm: the query's output's inverse RMS,
@@ -143,14 +123,14 @@ __attribute__((noinline)) void block_residual_mix_norm_outputs(BlockResidualMixR
                                                                threadgroup BlockResidualMixShared &shared) {
   float squares[1] = {0.0f};
   for (uint d = tid; d < p.hidden; d += kMixThreads) {
-    const float o = block_residual_mix_output(mix, d, shared);
+    const float o = block_residual_mix_output(mix, 0, d, shared);
     squares[0] += o * o;
   }
   block_residual_mix_reduce(squares, 1, shared.partials + 2 * kStates * kMixSimdgroups, &shared.output_inverse, tid,
                             lane, sg, [&](float total) { return rsqrt(total / p.hidden + kRmsEpsilon); });
   const float inverse = shared.output_inverse;
   for (uint d = tid; d < p.hidden; d += kMixThreads)
-    output[d] = bfloat((block_residual_mix_output(mix, d, shared) * inverse) * norm[d]);
+    output[d] = bfloat((block_residual_mix_output(mix, 0, d, shared) * inverse) * norm[d]);
 }
 
 // Each query's output as fp32 rows [rows][queries][hidden]: the message
