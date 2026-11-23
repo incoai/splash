@@ -190,10 +190,10 @@ static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, 
       if (j == 0) for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];   // the scales and g
       break;
     }
-    case GGUF_FMT_FP8: {   // {g, E4M3 values[256]}
-      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = blk[QUANT_FP8_VALUES + 32 * j + e];
+    case GGUF_FMT_FP8: case GGUF_FMT_MXFP8: {   // the meta unit (FP8's g, MXFP8's e), then E4M3 values[256 or 32]
+      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = blk[f.meta_bytes + 32 * j + e];
       gguf_store_bits(lo, 8, out0);
-      if (j == 0) for (uint i = 0; i < QUANT_FP8_VALUES; ++i) meta[i] = blk[i];   // g
+      if (j == 0) for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
       break;
     }
     case GGUF_FMT_BF16: case GGUF_FMT_F16: {   // 256 values, element e of group j value 32 j + e; no scale: g = 1
@@ -232,7 +232,7 @@ static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, 
   }
 }
 
-// Group g of row n of an MLX affine or MXFP4 tensor of G groups a row in format fmt, from its planes as stored
+// Group g of row n of an MLX affine, MXFP4 or MXFP8 tensor of G groups a row in format fmt, from its planes as stored
 // (model/GgufPreparation.hpp storedPlanes): its codes, scales and biases from `codes`, `scales` and `biases` on,
 // `bytes[p]` a row of each, into its planes as gguf_repack_group writes those of the native block that
 // readSafetensorsRows (model/GgufPreparation.cpp) builds of them, bit for bit.
@@ -250,8 +250,14 @@ static inline void gguf_repack_stored_group(device const uchar *codes, device co
     gguf_repack_affine_codes(codes, fmt, j, o.out0, o.out1);
     biases += ulong(n) * bytes[2] + ulong(b) * scaleBytes;
     if (j == 0) for (uint i = 0; i < 2; ++i) { o.meta[i] = scales[i]; o.meta[2 + i] = biases[i]; }
-  } else {   // MXFP4
-    gguf_repack_nibbles(codes, 0, o.out0);
+  } else {   // MXFP4's codes or MXFP8's E4M3 values, and the group's exponent
+    if (fmt == GGUF_FMT_MXFP8) {
+      uchar values[32];
+      for (uint e = 0; e < 32; ++e) values[quant_slot(e)] = codes[e];
+      gguf_store_bits(values, 8, o.out0);
+    } else {
+      gguf_repack_nibbles(codes, 0, o.out0);
+    }
     o.meta[0] = scales[0];
   }
 }

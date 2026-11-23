@@ -42,8 +42,9 @@ struct RowOrder {
 // A quantized safetensors tensor's codes and scales, and an affine one's
 // biases, which the writer interleaves into the native rows of its format
 // (metal/abi/QuantFormat.h): per group an affine tensor's bf16 scale, its
-// bias and its codes, or an mxfp4 tensor's block_mxfp4, its E8M0 scale and
-// codes (GGUF_FMT_MXFP4); per 256 elements an nvfp4 tensor's E4M3 scales, its
+// bias and its codes, an mxfp4 tensor's block_mxfp4, its E8M0 scale and
+// codes (GGUF_FMT_MXFP4), or an mxfp8 tensor's E8M0 scale and E4M3 values;
+// per 256 elements an nvfp4 tensor's E4M3 scales, its
 // row's tensor scale (TensorScale) and codes, or an fp8 tensor's row's tensor
 // scale and E4M3 values. Or a BF16 weight, which the writer quantizes into
 // native af4g64 rows as MLX's affine quantization rounds it (a DFlash2
@@ -53,7 +54,7 @@ struct SafetensorsSource {
   const SourceTensor *bfloat16 = nullptr;
 };
 // Whether a quantized safetensors tensor may be in a format: MLX affine,
-// mxfp4, nvfp4 or fp8.
+// mxfp4, mxfp8, nvfp4 or fp8.
 [[nodiscard]] constexpr bool safetensorsFormat(uint32_t format) {
   return quant_loader_format(format) || format == GGUF_FMT_MXFP4;
 }

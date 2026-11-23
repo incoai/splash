@@ -868,8 +868,8 @@ void checkMlxSources(MetalBackend &backend, const std::filesystem::path &directo
                 windowHolds(windowStep.meta, windowed.meta),
             name + ": planes of its two column windows");
     }
-    // A streamed expert's load reads an affine or mxfp4 tensor's planes as
-    // the checkpoint stores them (storedPlanes), and builds an nvfp4 one's
+    // A streamed expert's load reads an affine, mxfp4 or mxfp8 tensor's planes
+    // as the checkpoint stores them (storedPlanes), and builds an nvfp4 one's
     // native rows; a permuted tensor's rows are built too.
     model::gguf::Repack exact = step;
     exact.rows = rows;

@@ -112,7 +112,8 @@ StoredBlock storedBlock(uint32_t id, const QuantFormat &format) {
 // the low nibble of byte j % 16 when j < 16, else in its high nibble (MLX
 // packs element j at bits 4 j of the row); an nvfp4 tensor's 16 E4M3 scales,
 // its row's tensor scale and its codes as stored; an fp8 tensor's row's tensor
-// scale and its E4M3 values (metal/abi/QuantFormat.h).
+// scale and its E4M3 values; an mxfp8 tensor's exponent and its E4M3 values
+// (metal/abi/QuantFormat.h).
 void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
                  uint8_t *to) {
   const QuantFormat &format = nativeFormat(rows);
@@ -147,6 +148,9 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
       } else if (id == GGUF_FMT_FP8) {
         std::memcpy(out, &scale, 4);
         std::memcpy(out + QUANT_FP8_VALUES, in, codes);
+      } else if (id == GGUF_FMT_MXFP8) {
+        out[0] = scales[b];
+        std::memcpy(out + 1, in, codes);
       } else {
         out[0] = scales[b];
         for (uint64_t j = 0; j < 16; ++j)
@@ -685,7 +689,8 @@ std::optional<std::array<PlaneRows, 3>> storedPlanes(const gguf::Repack &repack)
   if (repack.sources.size() != 1) return std::nullopt;
   const gguf::TensorRows &rows = repack.sources.front();
   const uint32_t id = gguf_format_of(rows.type);
-  if (rowReader(rows) != RowReader::Safetensors || !(quant_affine_format(id) || id == GGUF_FMT_MXFP4) ||
+  if (rowReader(rows) != RowReader::Safetensors ||
+      !(quant_affine_format(id) || id == GGUF_FMT_MXFP4 || id == GGUF_FMT_MXFP8) ||
       rows.order.from != UINT64_MAX ||
       rows.windows != 1 || rows.rows != repack.rows ||
       rows.rowBytes != ggufRowBytes(kQuantFormats[repack.format], repack.columns))

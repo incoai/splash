@@ -80,9 +80,9 @@ separate installation from the same ID without them.
 An MLX target's `quantization` gives a mode, bits and group size, and may give
 a module its own, as mlx-lm writes it; a module's entry wins, and its mode
 defaults to affine. The engine loads affine 2, 3, 4, 5, 6 or 8 bits in groups
-of 32, 64 or 128, mxfp4 (4 bits in groups of 32) and nvfp4 (4 bits in groups
-of 16), mixed in any way across modules, and refuses any other format, naming
-the module (mxfp8). Every projection, the experts' too, and the head load only
+of 32, 64 or 128, mxfp4 and mxfp8 (4 and 8 bits in groups of 32) and nvfp4 (4
+bits in groups of 16), mixed in any way across modules, and refuses any other
+format, naming the module. Every projection, the experts' too, and the head load only
 quantized (`safetensors::quantizedModules`): an entry `false`, which mlx-lm writes for
 a module it leaves unquantized, is refused for any of them before any weight
 download, naming it, and the loader refuses one the checkpoint holds
@@ -90,15 +90,16 @@ unquantized. The router, the shared-expert gate, GDN alpha and beta and the
 token table may be unquantized. An affine weight is `s * q + z` for its group's
 bf16 `.scales` and `.biases` and its code `q`, packed little-endian in
 `.weight`'s 32-bit words at every width; an mxfp4 weight is an E2M1 code times
-its group's power of two, a uint8 scale, which is GGUF's MXFP4; an nvfp4 weight
-is an E2M1 code times its 16 elements' E4M3 scale, a uint8, which is NVFP4
-with a tensor scale of 1.
+its group's power of two, a uint8 scale, which is GGUF's MXFP4; an mxfp8 weight
+is an E4M3 value, a byte of `.weight`, times its group's power of two, the
+same scale; an nvfp4 weight is an E2M1 code times its 16 elements' E4M3 scale,
+a uint8, which is NVFP4 with a tensor scale of 1.
 
 An MLX target loads into the `MDGG0001` images a GGUF target's do
 (`SafetensorsTargetLoader`, [Weight loading](internals.md#weight-loading)):
 each quantized tensor in the format mlx-lm infers from its tensors, an affine
-`af<bits>g<group>` format of `runtime/metal/abi/QuantFormat.h`, MXFP4 or
-NVFP4, at the checkpoint's bits per weight (NVFP4's at 4.625, its tensor scale
+`af<bits>g<group>` format of `runtime/metal/abi/QuantFormat.h`, MXFP4, MXFP8
+or NVFP4, at the checkpoint's bits per weight (NVFP4's at 4.625, its tensor scale
 stored once per 256 weights); projections and experts as block planes, a
 quantized token table as native rows and an unquantized one as its bf16 rows.
 The MoE router keeps its format too, a quantized one as native rows, an

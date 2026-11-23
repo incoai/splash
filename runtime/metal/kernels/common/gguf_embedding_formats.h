@@ -6,7 +6,7 @@
 
 // The stored block of every format (ops::StoredRows), one struct per format:
 // a row is hidden / Weights blocks of Bytes bytes, each laid out as the format's
-// ggml block_* (an MLX affine, nvfp4 or fp8 tensor: the loader's block of
+// ggml block_* (an MLX affine, nvfp4, fp8 or mxfp8 tensor: the loader's block of
 // metal/abi/QuantFormat.h) at the byte offsets its struct names, and decode is
 // element dim's fp32 value, which the token gathers round once to bf16 and
 // load-time widening writes as F32 (kernels/shared/embedding.metal). Every
@@ -309,6 +309,15 @@ struct GgufEmbedFP8 {
     return float(quant_e4m3_pair(block[Values + dim % Weights]).x) * (256.0f * as_type<float>(gguf_u32(block, G)));
   }
 };
+// The loader's mxfp8 block: uchar e | uchar values[32], E4M3 values under the group's E8M0 exponent e; value =
+// (e4m3 / 2^8) 2^(e - 119), as the projections' coefficient scales it (quant_mxfp8_scale).
+struct GgufEmbedMXFP8 {
+  enum : uint { Weights = 32, Bytes = 33, E = 0, Values = 1 };
+  __attribute__((always_inline)) static float decode(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    return float(quant_e4m3_pair(block[Values + dim % Weights]).x) * quant_mxfp8_scale(block[E]);
+  }
+};
 // MLX affine {bf16 s, bf16 z, codes}: element l of the group is code l of the codes' little-endian bit string of
 // Bits-bit codes; value = s * code + z, fused as the projections compute it.
 template <uint Bits, uint Group> struct GgufEmbedAffine {
@@ -386,7 +395,7 @@ GGUF_EMBED_AFFINE(8)
   X(pq20, GgufEmbedPQ20) X(q20, GgufEmbedQ20) X(iq4nl, GgufEmbedIQ4NL) X(iq4xs, GgufEmbedIQ4XS)                    \
   X(iq3s, GgufEmbedIQ3S) X(iq3xxs, GgufEmbedIQ3XXS) X(iq2xxs, GgufEmbedIQ2XXS) X(iq2xs, GgufEmbedIQ2XS)            \
   X(iq2s, GgufEmbedIQ2S) X(iq1s, GgufEmbedIQ1S) X(iq1m, GgufEmbedIQ1M) X(mxfp4, GgufEmbedMXFP4)                    \
-  X(nvfp4, GgufEmbedNVFP4) X(nvfp464, GgufEmbedNVFP464) X(fp8, GgufEmbedFP8)                                     \
+  X(nvfp4, GgufEmbedNVFP4) X(nvfp464, GgufEmbedNVFP464) X(fp8, GgufEmbedFP8) X(mxfp8, GgufEmbedMXFP8)              \
   X(af2g32, GgufEmbedAF2G32) X(af2g64, GgufEmbedAF2G64) X(af2g128, GgufEmbedAF2G128)                               \
   X(af3g32, GgufEmbedAF3G32) X(af3g64, GgufEmbedAF3G64) X(af3g128, GgufEmbedAF3G128)                               \
   X(af4g32, GgufEmbedAF4G32) X(af4g64, GgufEmbedAF4G64) X(af4g128, GgufEmbedAF4G128)                               \

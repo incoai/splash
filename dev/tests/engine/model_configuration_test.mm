@@ -325,12 +325,12 @@ SourceModel withQuantizationConfig(const SourceModel &model, std::string_view qu
 }
 
 // An MLX target's quantization is MLX's own object: the object and each
-// module's own entry name affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64
-// or 128, mxfp4 or nvfp4; an entry is affine unless it names its mode, and
+// module's own entry name affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or
+// 128, mxfp4, mxfp8 or nvfp4; an entry is affine unless it names its mode, and
 // takes its mode's default bits and group size (affine 4 and 64, mxfp4 4 and
-// 32, nvfp4 4 and 16) when it omits them, as MLX loads it. The entry false,
-// which MLX writes for a module it leaves unquantized, is refused for a
-// projection and the head, and accepted for the router, the shared-expert
+// 32, mxfp8 8 and 32, nvfp4 4 and 16) when it omits them, as MLX loads it. The
+// entry false, which MLX writes for a module it leaves unquantized, is refused
+// for a projection and the head, and accepted for the router, the shared-expert
 // gate, GDN alpha and beta and the token table. A Model Optimizer target's is
 // its quantization_config: NVFP4 in groups of 16 or per-tensor FP8 for each
 // layer it quantizes, every projection and the head among them. So is a
@@ -382,8 +382,9 @@ void testQuantization(const std::filesystem::path &fixtures) {
            {moe, affine, mxfp4},
            // An entry of only its bits takes affine's group of 64.
            {moe, router, R"("bits": 8)"},
-           // An entry of only its mode: mxfp4, 4-bit in groups of 32.
+           // An entry of only its mode: mxfp4, 4-bit in groups of 32, or mxfp8, 8-bit in groups of 32.
            {moe, router, R"("mode": "mxfp4")"},
+           {moe, router, R"("mode": "mxfp8")"},
            // Modules the images also read unquantized (as F32).
            {moe, routerEntry, R"("language_model.model.layers.0.mlp.gate": false)"},
            {moe, sharedGateEntry, R"("language_model.model.layers.0.mlp.shared_expert_gate": false)"},
@@ -402,11 +403,12 @@ void testQuantization(const std::filesystem::path &fixtures) {
            // MLX's own object, not the quantization_config a transformers
            // checkpoint (GPTQ, AWQ, ...) states.
            {dense, R"("quantization": {)", R"("unused": {)",
-            "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, mxfp4 "
-            "or nvfp4), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF"},
+            "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, mxfp4, "
+            "mxfp8 or nvfp4), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported "
+            "GGUF"},
            {dense, R"("bits": 4)", R"("bits": 7)",
             "quantization is affine 7-bit in groups of 64; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in "
-            "groups of 32, 64 or 128, or as mxfp4 or nvfp4"},
+            "groups of 32, 64 or 128, or as mxfp4, mxfp8 or nvfp4"},
            {dense, R"("group_size": 64)", R"("group_size": 16)", "quantization is affine 4-bit in groups of 16"},
            // A group past a byte is no format (4 bits in groups of 320 are not af5g64).
            {dense, R"("group_size": 64)", R"("group_size": 320)", "quantization is affine 4-bit in groups of 320"},

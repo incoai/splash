@@ -290,8 +290,9 @@ private:
   // weight is a missing source tensor. MLX's format is the one
   // MLX infers from codes [experts, rows, columns * bits / 32] (U32) and
   // scales [experts, rows, columns / group size]: bf16 with bf16 biases
-  // (affine), uint8 E8M0 exponents (mxfp4, 4 bits in groups of 32) or uint8
-  // E4M3 scales (nvfp4, 4 bits in groups of 16). Model Optimizer's and
+  // (affine), uint8 E8M0 exponents (mxfp4, 4 bits in groups of 32, or mxfp8,
+  // 8 bits in groups of 32) or uint8 E4M3 scales (nvfp4, 4 bits in groups of
+  // 16). Model Optimizer's and
   // compressed-tensors' (floatQuantized) is the one their tensor types state.
   std::optional<TensorRows> quantized(const std::string &module, uint64_t rows, uint64_t columns,
                                       uint64_t experts = 1) const {
@@ -310,9 +311,13 @@ private:
       throw WeightStoreError("source tensor type or shape does not match: " + module);
     const uint64_t group = columns / scales->shape.back(), bits = codes.shape.back() * 32 / columns;
     // The mode MLX infers from the scales: bf16 affine's, uint8 nvfp4's in
-    // groups of 16 and mxfp4's otherwise.
+    // groups of 16, mxfp8's of 8 bits and mxfp4's otherwise.
     const bool affine = scales->dtype == "BF16";
-    const std::string_view mode = affine ? "affine" : scales->dtype != "U8" ? "" : group == 16 ? "nvfp4" : "mxfp4";
+    const std::string_view mode = affine                  ? "affine"
+                                  : scales->dtype != "U8" ? ""
+                                  : group == 16           ? "nvfp4"
+                                  : bits == 8             ? "mxfp8"
+                                                          : "mxfp4";
     const uint32_t format = mlxFormat(mode, uint32_t(bits), uint32_t(group));
     const SourceTensor *biases = affine ? &require(module + ".biases", {"BF16"}, scales->shape) : nullptr;
     if (format == GGUF_FMT_COUNT)
@@ -630,6 +635,7 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
 uint32_t mlxFormat(std::string_view mode, uint32_t bits, uint32_t group) noexcept {
   if (mode == "affine") return quant_affine_format_of(bits, group);
   if (mode == "mxfp4" && bits == 4 && group == 32) return GGUF_FMT_MXFP4;
+  if (mode == "mxfp8" && bits == 8 && group == 32) return GGUF_FMT_MXFP8;
   if (mode == "nvfp4" && bits == 4 && group == 16) return GGUF_FMT_NVFP4;
   return GGUF_FMT_COUNT;
 }

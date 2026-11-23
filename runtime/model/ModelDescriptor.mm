@@ -542,17 +542,17 @@ uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
 // (metal/abi/QuantFormat.h), as MLX loads it: an entry's mode is MLX's default,
 // affine, unless it names another. The object states its bits and group size; a
 // module's entry that omits either takes its mode's default, as MLX's
-// to_quantized does: affine 4 bits in groups of 64, mxfp4 4 bits in groups of
-// 32, nvfp4 4 bits in groups of 16. The images read each module's format from
-// its tensors, as MLX does (model/SafetensorsImage.hpp). An entry that is not
-// an object, false as MLX writes for a module it leaves unquantized, is refused
-// for a module the images read only quantized (safetensors::quantizedModules:
-// each projection and the head), so before any weight download; any other
-// module's, such as the router's, the shared-expert gate's, GDN alpha's and
-// beta's or the token table's, which the images read unquantized too, is
-// accepted. A config does not say which names its checkpoint's tensors take
-// (safetensors::moduleNames reads them from the tensors), so a module is
-// looked up by mlx-vlm's names and by mlx-lm's.
+// to_quantized does: affine 4 bits in groups of 64, mxfp4 4 bits and mxfp8 8
+// bits in groups of 32, nvfp4 4 bits in groups of 16. The images read each
+// module's format from its tensors, as MLX does (model/SafetensorsImage.hpp).
+// An entry that is not an object, false as MLX writes for a module it leaves
+// unquantized, is refused for a module the images read only quantized
+// (safetensors::quantizedModules: each projection and the head), so before any
+// weight download; any other module's, such as the router's, the shared-expert
+// gate's, GDN alpha's and beta's or the token table's, which the images read
+// unquantized too, is accepted. A config does not say which names its
+// checkpoint's tensors take (safetensors::moduleNames reads them from the
+// tensors), so a module is looked up by mlx-vlm's names and by mlx-lm's.
 void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry) {
   const auto require = [](NSDictionary *entry, const std::string &label, bool module) {
     NSString *mode = entry[@"mode"] ?: @"affine";
@@ -561,7 +561,8 @@ void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensio
     const auto number = [&](NSString *key, uint32_t modeDefault) {
       return module && !entry[key] ? modeDefault : requireWhole(entry[key], label + " " + key.UTF8String);
     };
-    const uint32_t bits = number(@"bits", 4), group = number(@"group_size", affine ? 64 : nvfp4 ? 16 : 32);
+    const uint32_t bits = number(@"bits", [mode isEqual:@"mxfp8"] ? 8 : 4),
+                   group = number(@"group_size", affine ? 64 : nvfp4 ? 16 : 32);
     if (safetensors::mlxFormat(mode.UTF8String ?: "", bits, group) == GGUF_FMT_COUNT)
       throw std::invalid_argument(label + " is " + mode.UTF8String + " " + std::to_string(bits) +
                                   "-bit in groups of " + std::to_string(group) + "; MLX weights load as " +

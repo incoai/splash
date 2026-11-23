@@ -52,9 +52,9 @@ inline constexpr uint32_t kQ8_0 = ggmlType("Q8_0"), kQ3_K = ggmlType("Q3_K"), kQ
 inline int failures = 0;
 
 // One tensor of the MLX quantization fixture (dev/tests/fixtures/mlx-quantization), which
-// dev/tools/mlx_quantization_fixture.py writes with MLX: its mode (affine, mxfp4 or nvfp4), bits, group size and
-// shape, MLX's packed codes, scales (bf16, or mxfp4's E8M0 and nvfp4's E4M3 bytes) and an affine tensor's bf16
-// biases, and MLX's reading of it, an affine tensor's codes and the fp32 values.
+// dev/tools/mlx_quantization_fixture.py writes with MLX: its mode (affine, mxfp4, nvfp4 or mxfp8), bits, group size
+// and shape, MLX's packed codes, scales (bf16, or mxfp4's and mxfp8's E8M0 and nvfp4's E4M3 bytes) and an affine
+// tensor's bf16 biases, and MLX's reading of it, an affine tensor's codes and the fp32 values.
 struct MlxTensor {
   std::string mode;
   uint32_t bits = 0, group = 0, rows = 0, columns = 0;
@@ -62,8 +62,10 @@ struct MlxTensor {
   [[nodiscard]] bool affine() const { return mode == "affine"; }
   // Its format (metal/abi/QuantFormat.h).
   [[nodiscard]] Fmt format() const {
-    return affine() ? Fmt(quant_affine_format_of(bits, group))
-                    : mode == "nvfp4" ? gguf_reference::NVFP4 : gguf_reference::MXFP4;
+    return affine()          ? Fmt(quant_affine_format_of(bits, group))
+           : mode == "nvfp4" ? gguf_reference::NVFP4
+           : mode == "mxfp8" ? gguf_reference::MXFP8
+                             : gguf_reference::MXFP4;
   }
   [[nodiscard]] std::vector<uint8_t> native() const {
     return gguf_reference::mlxNative(format(), rows, columns, weight, scales, biases);

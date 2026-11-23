@@ -547,12 +547,12 @@ class UpstreamTest(unittest.TestCase):
         fake = fake_hub(self, self.cache)
         required = (
             r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 bits "
-            r"in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 or FP8 checkpoint "
-            r"of Model Optimizer or compressed-tensors, or a supported GGUF"
+            r"in groups of 32, 64 or 128, mxfp4, mxfp8 or nvfp4\), an NVFP4 or FP8 "
+            r"checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF"
         )
         formats = (
             r"; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, "
-            "64 or 128, or as mxfp4 or nvfp4"
+            "64 or 128, or as mxfp4, mxfp8 or nvfp4"
         )
         for name, quantization, refusal in (
             # A transformers quantization_config alone is another method.
@@ -741,9 +741,9 @@ class UpstreamTest(unittest.TestCase):
                 "Qwen/Qwen3.8-27B",
                 transformers_release,
                 r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 "
-                r"bits in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 or FP8 "
-                r"checkpoint of Model Optimizer or compressed-tensors, or a supported "
-                r"GGUF",
+                r"bits in groups of 32, 64 or 128, mxfp4, mxfp8 or nvfp4\), an NVFP4 or "
+                r"FP8 checkpoint of Model Optimizer or compressed-tensors, or a "
+                r"supported GGUF",
             ),
             (
                 "mlx-community/Qwen3.5-4B-MLX-4bit",
