@@ -1,6 +1,7 @@
 #pragma once
 
-// The block residual mix (kernels/shared/block_residual_mix.metal): learned
+// The block residual mix (kernels/shared/block_residual_mix.metal, a decode
+// step's rows; block_residual_mix_rows.metal, a prompt chunk's): learned
 // queries attend over a row's states, the inputs of the blocks before it (its
 // block stack) and its current rows, each RMS-normalized without weights; a
 // query's output is the softmax-weighted sum of the normalized states, in

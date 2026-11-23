@@ -1,6 +1,7 @@
 // The short convolution, block residual mix, message gate and logit finish
 // kernels (kernels/shared/short_convolution.metal, block_residual_mix.metal,
-// message_gate.metal, logit_finish.metal) through their operators, against
+// block_residual_mix_rows.metal, message_gate.metal, logit_finish.metal)
+// through their operators, against
 // fp64 CPU references:
 // - the convolution, static and dynamic taps, each output, over a prompt
 //   chunk's packed sequences from their states, the state after them, a chunk
@@ -9,7 +10,8 @@
 // - a verify block's tree, whose rows tap their paths, the tape, and the
 //   commit of accepted paths of two lanes, rejected rows and all;
 // - the mix of 1, 3 and 4 queries over 1 to 5 states (bf16 stack planes, bf16
-//   or fp32 current rows), plain and through its norms;
+//   or fp32 current rows), plain and through its norms, of a decode step's
+//   rows and of a prompt chunk's;
 // - the message gate through its norm;
 // - the logit finish's softcap and padding rows.
 #include "ChainRows.hpp"
@@ -434,15 +436,17 @@ std::vector<double> mixReference(const MixCase &m, uint32_t row) {
 }
 
 // The mix over bf16 stack planes and bf16 current rows (a layer's input) or
-// fp32 ones (the residual inside a layer).
-void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool currentFloat) {
-  std::mt19937 rng(stack * 10 + queries + (currentFloat ? 100 : 0));
+// fp32 ones (the residual inside a layer), of `rows` rows: a decode step's,
+// a threadgroup a row and query, or more than BLOCK_RESIDUAL_MIX_QUERY_ROWS,
+// a prompt chunk's, a threadgroup a row (the _rows kernels).
+void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool currentFloat, uint32_t rows) {
+  std::mt19937 rng(stack * 10 + queries + (currentFloat ? 100 : 0) + rows * 1000);
   MixCase m;
   m.hidden = 2304;
   m.stack = stack;
   m.queries = queries;
-  m.rows = 5;
-  m.planeRows = 8;
+  m.rows = rows;
+  m.planeRows = rows + 3;
   // States of different scales, as a stack's blocks are, and queries large
   // enough that the softmax does not flatten.
   m.stackRows = randoms(rng, size_t{m.planeRows} * stack * m.hidden, 1.0f);
@@ -454,7 +458,8 @@ void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool curre
   m.queryValues = randoms(rng, size_t{queries} * m.hidden, 0.2f);
   const std::string scope = "block residual mix of " + std::to_string(queries) + " queries over " +
                             std::to_string(stack + 1) + " states, " + (currentFloat ? "fp32" : "bf16") +
-                            " current rows";
+                            " current rows, " + std::to_string(rows) + " rows (a threadgroup a " +
+                            (rows <= BLOCK_RESIDUAL_MIX_QUERY_ROWS ? "row and query)" : "row)");
   const ops::BlockResidualStates states{stack ? upload(backend, bf16s(m.stackRows)) : MetalBuffer{}, m.planeRows,
                                         currentFloat ? upload(backend, m.current) : upload(backend, bf16s(m.current)),
                                         currentFloat};
@@ -743,8 +748,10 @@ int main(int argc, const char *argv[]) {
       }
       for (const bool currentFloat : {false, true}) {
         for (const uint32_t queries : {1u, 3u, 4u})
-          for (uint32_t stack = 1; stack <= 4; ++stack) mixTest(backend, stack, queries, currentFloat);
-        mixTest(backend, 0, 1, currentFloat);
+          for (uint32_t stack = 1; stack <= 4; ++stack)
+            for (const uint32_t rows : {5u, BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3})
+              mixTest(backend, stack, queries, currentFloat, rows);
+        for (const uint32_t rows : {5u, BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3}) mixTest(backend, 0, 1, currentFloat, rows);
       }
       for (const uint32_t rows : {6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1}) {
         gateTest(backend, rows, 1, true);

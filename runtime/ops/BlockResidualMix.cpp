@@ -12,7 +12,18 @@
 namespace splash::ops {
 namespace {
 
-constexpr uint32_t kThreads = BLOCK_RESIDUAL_MIX_THREADS;
+// A call's kernel and grid (metal/abi/BlockResidualMix.h): a threadgroup a
+// row and query for a decode step's rows, a threadgroup a row for more.
+struct MixLaunch final {
+  const char *suffix;
+  metal::DispatchSize groups;
+  metal::DispatchSize threads;
+};
+MixLaunch launch(BlockResidualShape shape, uint32_t rows) {
+  if (rows <= BLOCK_RESIDUAL_MIX_QUERY_ROWS)
+    return {"", {rows, shape.queries, 1}, {BLOCK_RESIDUAL_MIX_THREADS, 1, 1}};
+  return {"_rows", {rows, 1, 1}, {BLOCK_RESIDUAL_MIX_ROW_THREADS, 1, 1}};
+}
 
 // States and queries the kernels hold, and planes that hold the rows.
 void requireShape(BlockResidualShape shape, const BlockResidualStates &states, uint32_t rows) {
@@ -41,9 +52,9 @@ metal::MetalBuffer stackBinding(const BlockResidualStates &states, BlockResidual
   return shape.stack ? states.stack : states.current;
 }
 
-// The instance for the current rows' type.
-std::string instance(const char *name, const BlockResidualStates &states) {
-  return std::string(name) + (states.currentFloat ? "_f32" : "");
+// The instance of the launch's shape for the current rows' type.
+std::string instance(const char *name, const MixLaunch &launch, const BlockResidualStates &states) {
+  return std::string(name) + launch.suffix + (states.currentFloat ? "_f32" : "");
 }
 
 } // namespace
@@ -55,9 +66,10 @@ void BlockResidualMix::addMix(metal::CommandGraph &graph, const BlockResidualSta
   requireStates(states, shape, rows);
   requireBytes(queries, uint64_t{shape.queries} * shape.hidden * sizeof(float), "block residual mix queries");
   requireBytes(output, uint64_t{rows} * shape.queries * shape.hidden * sizeof(float), "block residual mix output");
-  graph.add(instance("block_residual_mix", states),
+  const MixLaunch mix = launch(shape, rows);
+  graph.add(instance("block_residual_mix", mix, states),
             {stackBinding(states, shape), states.current, std::move(queries), std::move(output)},
-            mixParams(states, shape, rows), {rows, shape.queries, 1}, {kThreads, 1, 1});
+            mixParams(states, shape, rows), mix.groups, mix.threads);
 }
 
 PreparedInput BlockResidualMix::addMixNorm(metal::CommandGraph &graph, const BlockResidualStates &states,
@@ -84,8 +96,9 @@ PreparedInput BlockResidualMix::addMixNorm(metal::CommandGraph &graph, const Blo
     requireBytes(out, uint64_t{rows} * shape.hidden * sizeof(uint16_t), "block residual mix normalized");
     bindings.push_back(out);
   }
-  graph.add(instance("block_residual_mix_norm", states), std::move(bindings), mixParams(states, shape, rows),
-            {rows, shape.queries, 1}, {kThreads, 1, 1});
+  const MixLaunch mix = launch(shape, rows);
+  graph.add(instance("block_residual_mix_norm", mix, states), std::move(bindings), mixParams(states, shape, rows),
+            mix.groups, mix.threads);
   return {};
 }
 
