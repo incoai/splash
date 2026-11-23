@@ -51,6 +51,7 @@ struct Profile {
   const char *qkv, *qkvLora;            // ops::qkv, ops::qkvGate (int8 QKV GEMM; with a LoRA)
   const char *residual, *residualLora;  // ops::gatedResidual: out, to_out_linear (no LoRA) and fc2
   const char *fc1, *fc1Lora;            // ops::fc1SwiGlu
+  Tile fc1LoraTile;                     // fc1Lora's tile: ops::fc1SwiGlu with a LoRA is dispatched with it instead
   const char *loraDown, *loraDownHalf;  // ops::loraDown (int8 rows), ops::loraDownHalf (fp16 rows)
   // ... with qkFixTileRows
   const char *qkfixQkv, *qkfixQkvLora;  // ops::qkfixQkv
@@ -109,6 +110,7 @@ inline constexpr Profile kM5{
     .residualLora = "dit_gated_residual_lora_post",
     .fc1 = "dit_fc1_swiglu",
     .fc1Lora = "dit_fc1_swiglu_lora_post",
+    .fc1LoraTile = {H3_LINEAR_TM, H3_LINEAR_TN, H3_LINEAR_NSG},
     .loraDown = "dit_lora_down",
     .loraDownHalf = "dit_lora_down_f16",
     .qkfixQkv = "dit_qkfix_qkv",
@@ -143,8 +145,25 @@ inline constexpr Profile kM5{
     .previewTile64 = {32, 64, 2},
     .previewTileOut = {32, 16, 1},
 };
+// M6 (Apple11): kM5's row but for fc1 + SwiGLU with a LoRA, at 32 x 128 x 4 without tile swizzle. Every other
+// kernel, tile and constant is kM5's.
+inline constexpr Profile kM6 = [] {
+  Profile row = kM5;
+  row.name = "m6";
+  row.appleGpuFamily = 11;
+  row.fc1Lora = "dit_fc1_swiglu_lora_post_32x128x4_gm0";
+  row.fc1LoraTile = {H3_FC1_LORA32_TM, H3_LINEAR_TN, H3_FC1_LORA32_NSG};
+  return row;
+}();
 // Every row, by family ascending.
-inline constexpr const Profile *kProfiles[] = {&kM5};
+inline constexpr const Profile *kProfiles[] = {&kM5, &kM6};
+// fc1Lora's LoRA tile reads T rows [m0, m0 + tm) of T, whose rows are padded to 64 (ops::loraUp), and the _post
+// kernels compute H3_LINEAR_TN columns per tile.
+static_assert([] {
+  for (const Profile *p : kProfiles)
+    if (64 % p->fc1LoraTile.tm != 0 || p->fc1LoraTile.tn != H3_LINEAR_TN) return false;
+  return true;
+}());
 
 // The row of a device: the highest at or below its Apple GPU family. Throws std::invalid_argument for a family below
 // every row's.

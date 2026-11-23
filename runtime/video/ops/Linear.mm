@@ -19,11 +19,14 @@ void rowChunks(const device::Profile &profile, int32_t rows, Body &&body) {
     body(r0, std::min(profile.maxRowsPerDispatch, rows - r0));
 }
 
-metal::DispatchSize gemmGrid(const device::Profile &profile, int32_t N, int32_t rows) {
-  const device::Tile t = profile.linearTile;
+metal::DispatchSize gemmGrid(device::Tile t, int32_t N, int32_t rows) {
   return size3((N + t.tn - 1) / t.tn, (rows + t.tm - 1) / t.tm, 1);
 }
-metal::DispatchSize gemmThreads(const device::Profile &profile) { return size3(profile.linearTile.nsg * 32, 1, 1); }
+metal::DispatchSize gemmGrid(const device::Profile &profile, int32_t N, int32_t rows) {
+  return gemmGrid(profile.linearTile, N, rows);
+}
+metal::DispatchSize gemmThreads(device::Tile t) { return size3(t.nsg * 32, 1, 1); }
+metal::DispatchSize gemmThreads(const device::Profile &profile) { return gemmThreads(profile.linearTile); }
 
 // The up-projection's parameters of a row chunk of m rows; T's view of the chunk at r0.
 LoraUpParams loraUp(const LoraBinding &lora, int32_t m, int32_t segN) {
@@ -170,6 +173,7 @@ void fc1SwiGlu(Encoder &e, const device::Profile &profile, ProducerOut in, int32
                BufferView weightScale, BufferView hidden, const LoraBinding &lora) {
   if (lora) loraDown(e, profile, in, rows, D, lora);
   e.pipeline(lora ? profile.fc1Lora : profile.fc1);
+  const device::Tile tile = lora ? profile.fc1LoraTile : profile.linearTile;  // the pipeline's
   rowChunks(profile, rows, [&](int32_t r0, int32_t m) {
     const SwiGluParams p{m, D, F};
     e.bind(in.q + size_t(r0) * D, 0);
@@ -183,7 +187,7 @@ void fc1SwiGlu(Encoder &e, const device::Profile &profile, ProducerOut in, int32
       e.bind(lora.b, 7);
       e.bytes(loraUp(lora, m, 2 * F), 8);
     }
-    e.dispatch(gemmGrid(profile, F, m), gemmThreads(profile));
+    e.dispatch(gemmGrid(tile, F, m), gemmThreads(tile));
   });
 }
 

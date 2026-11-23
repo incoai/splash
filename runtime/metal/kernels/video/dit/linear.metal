@@ -516,3 +516,10 @@ dit_fc1_swiglu_lora_post<H3_LINEAR_TM, H3_LINEAR_TN, H3_LINEAR_NSG, 4>(device in
                                                                       device bfloat *, constant SwiGluParams &,
                                                                       device const half *, device const bfloat *,
                                                                       constant LoraUpParams &, uint2, uint2);
+// A second instance at 32 x 128 x 4 with no tile swizzle (the M6's, video/metal/DeviceProfile.hpp kM6). Its LoRA
+// tile reads T rows [m0, m0 + TM) of the 64-row padded T.
+static_assert(64 % H3_FC1_LORA32_TM == 0, "dit_fc1_swiglu_lora_post tile");
+template [[host_name("dit_fc1_swiglu_lora_post_32x128x4_gm0")]] [[kernel]] void
+dit_fc1_swiglu_lora_post<H3_FC1_LORA32_TM, H3_LINEAR_TN, H3_FC1_LORA32_NSG, 0>(
+    device int8_t *, device int8_t *, device const float *, device const float *, device bfloat *,
+    constant SwiGluParams &, device const half *, device const bfloat *, constant LoraUpParams &, uint2, uint2);

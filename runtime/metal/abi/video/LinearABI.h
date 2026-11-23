@@ -8,6 +8,10 @@
 #define H3_LINEAR_TM 64
 #define H3_LINEAR_TN 128
 #define H3_LINEAR_NSG 4
+// The second tile of dit_fc1_swiglu_lora_post (host name dit_fc1_swiglu_lora_post_32x128x4_gm0): TM x H3_LINEAR_TN,
+// execution_simdgroups<NSG>, no tile swizzle. TM divides 64 (the LoRA T rows are padded to 64).
+#define H3_FC1_LORA32_TM 32
+#define H3_FC1_LORA32_NSG 4
 // Producers: a thread holds 8 channels of G 128-groups (threads per row = 16 * K / 128 / G).
 #define H3_PRODUCER_GROUPS_HIDDEN 3  // K = 5376 -> 224 threads
 #define H3_PRODUCER_GROUPS_FFN 8     // K = 14336 -> 224 threads
