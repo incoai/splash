@@ -90,7 +90,7 @@ AttentionWorkspace RelativeAttentionPlan::workspace() const noexcept {
 }
 
 metal::DispatchSize RelativeAttentionPlan::splitGroups(const Dispatch &dispatch) const noexcept {
-  return {layout.kvHeads, dispatch.tiles, dispatch.splits};
+  return {layout.kvHeads, step == StepKind::Decode ? dispatch.sequences : dispatch.tiles, dispatch.splits};
 }
 
 metal::DispatchSize RelativeAttentionPlan::reduceGroups(const Dispatch &dispatch) const noexcept {
@@ -118,35 +118,50 @@ AttentionWorkspace RelativeAttention::workspace(uint32_t slots, kv::Layout layou
 RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefillParams> sequences,
                                               kv::Layout layout, const AttentionCalibration &calibration,
                                               Int8Activations int8Activations, AttentionWorkspace capacity,
-                                              RelativeAttentionVariant variant) {
+                                              RelativeAttentionVariant variant, StepKind step) {
   requireLayout(layout);
   requireVariant(variant);
   static_cast<void>(commandRows(sequences, layout));
+  const bool decode = step == StepKind::Decode;
+  // A decode step's lanes share the step's lane cap, at most a verify
+  // block's rows: one tile of the single pass each.
+  if (decode)
+    for (const kv::ChunkedPrefillParams &chunk : sequences)
+      if (chunk.chunk_tokens != sequences.front().chunk_tokens || chunk.chunk_tokens > SPLASH_TARGET_VERIFY_ROWS)
+        throw std::invalid_argument("a decode step's lanes share a lane cap of at most a verify block's rows");
   const AttentionWorkspace slot = workspaceOf(slotRows());
   const uint64_t slots = std::min(capacity.partialsBytes / slot.partialsBytes,
                                   capacity.statisticsBytes / slot.statisticsBytes);
-  RelativeAttentionPlan plan(layout,
+  RelativeAttentionPlan plan(layout, step,
                              static_cast<uint32_t>(std::min<uint64_t>(slots, std::numeric_limits<uint32_t>::max())));
   uint64_t splitReads = 0;
   for (const kv::ChunkedPrefillParams &chunk : sequences) {
     const uint32_t tiles = kv::attentionTiles(chunk.chunk_tokens);
     const uint64_t pages =
         readPages(uint64_t{chunk.committed_tokens} + chunk.chunk_tokens, variant.windowTokens);
-    const uint32_t splits = attentionSplits(tiles, pages, variant.windowTokens, calibration.pagesPerSplit);
+    const uint32_t splits = decode ? decodeSplits(pages, chunk.chunk_tokens)
+                                   : attentionSplits(tiles, pages, variant.windowTokens, calibration.pagesPerSplit);
     splitReads = std::max(splitReads, (pages + splits - 1) / splits);
     plan.sequences_[plan.sequenceCount_++] = {chunk.chunk_tokens, chunk.committed_tokens, 0, splits};
   }
   const std::string window = variant.windowTokens ? "_w" + std::to_string(variant.windowTokens) : "";
   const bool int8Queries = int8Activations == Int8Activations::On && layout.format == kv::Format::Int8 &&
                            splitReads >= calibration.int8QueriesFromPages;
-  plan.splitPipeline_ = "relative_attention_" + (int8Queries ? std::string("q8q") : kernelFormat(layout)) +
-                        "_split" + window;
-  plan.reducePipeline_ = "relative_attention_reduce" + window;
+  const std::string format = int8Queries ? std::string("q8q") : kernelFormat(layout);
+  if (decode) {
+    plan.decodePipeline_ = "relative_attention_" + format + "_decode" +
+                           (sequences.front().chunk_tokens > kv::kAttentionTileRows ? "_r16" : "") + window +
+                           (variant.positionScaled ? "_scaled" : "");
+  } else {
+    plan.splitPipeline_ = "relative_attention_" + format + "_split" + window;
+    plan.reducePipeline_ = "relative_attention_reduce" + window;
+  }
   group(plan);
   return plan;
 }
 
 RelativeAttentionPlan RelativeAttention::lastTiles(const RelativeAttentionPlan &plan) {
+  if (plan.step == StepKind::Decode) throw std::invalid_argument("a decode step's lanes are one tile each");
   RelativeAttentionPlan tails = plan;
   for (RelativeAttentionPlan::Sequence &sequence : std::span(tails.sequences_).first(tails.sequenceCount_))
     sequence.firstTile = kv::attentionTiles(sequence.rows) - 1;
@@ -154,9 +169,16 @@ RelativeAttentionPlan RelativeAttention::lastTiles(const RelativeAttentionPlan &
   return tails;
 }
 
+uint32_t RelativeAttention::decodeSplits(uint64_t pages, uint32_t laneCap) {
+  static_assert(kDecodeTileSplits <= SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS, "a combine of at most its splits");
+  const uint32_t most = kDecodeTileSplits / kv::attentionTiles(laneCap);
+  return static_cast<uint32_t>(
+      std::clamp<uint64_t>((pages + kDecodePagesPerSplit - 1) / kDecodePagesPerSplit, 1, most));
+}
+
 void RelativeAttention::group(RelativeAttentionPlan &plan) {
   plan.dispatchCount_ = groupDispatches(std::span(plan.sequences_).first(plan.sequenceCount_), plan.workspaceSlots,
-                                        plan.dispatches_);
+                                        plan.dispatches_, plan.step == StepKind::Decode ? 2 : 1);
 }
 
 void RelativeAttention::addProjection(metal::CommandGraph &graph, const RelativeAttentionRows &layerRows,
@@ -298,6 +320,81 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
       }
       slot = encode(run, layer, slot);
     }
+  }
+  return table ? PreparedInput{output.hidden, output.input} : PreparedInput{};
+}
+
+PreparedInput RelativeAttention::addDecode(metal::CommandGraph &graph, const RelativeAttentionPlan &plan,
+                                           const RelativeAttentionRows &layerRows,
+                                           const RelativeAttentionWeights &weights, SplashKvLayer layer,
+                                           std::span<const metal::MetalBuffer> pageTables,
+                                           std::span<const kv::ChunkedPrefillParams> sequences,
+                                           const AttentionRows &rows, const RelativeAttentionWorkspace &workspace,
+                                           const AttentionOutputRows &output) {
+  if (plan.step != StepKind::Decode) throw std::invalid_argument("a single pass takes a decode step's plan");
+  const CommandRows command = commandRows(sequences, plan.layout);
+  const std::span<const RelativeAttentionPlan::Sequence> planned = plan.sequences();
+  if (planned.size() != sequences.size() || pageTables.size() != sequences.size())
+    throw std::invalid_argument("attention sequences do not match the plan");
+  for (size_t s = 0; s < sequences.size(); ++s) {
+    if (sequences[s].chunk_tokens != planned[s].rows || sequences[s].committed_tokens != planned[s].historyTokens)
+      throw std::invalid_argument("attention sequences do not match the plan");
+    requirePageTable(pageTables[s], sequences[s]);
+  }
+  requireRows(rows, command, sequences.size());
+  const uint64_t kvBytes = uint64_t{rows.rows} * kKvHeads * kHeadDimension * 2;
+  requireBytes(layerRows.projection, rowBytes(rows.rows, kProjectionStride, kProjectionWidth, 2),
+               "attention projection rows");
+  requireBytes(layerRows.keys, kvBytes, "attention keys");
+  requireBytes(layerRows.values, kvBytes, "attention values");
+  requireBytes(weights.queryScale, uint64_t{kQueryHeads} * kHeadDimension * sizeof(float), "attention query scale");
+  requireBytes(weights.relativeScale, uint64_t{kQueryHeads} * kStates * sizeof(float), "attention relative scale");
+  requireBytes(weights.bias, uint64_t{SPLASH_RELATIVE_ATTENTION_EXTENT} * kStates * sizeof(float),
+               "attention relative bias");
+  const bool last = output.output == AttentionOutput::Last, table = output.input != LinearInput::Plain;
+  const uint32_t width = kQueryHeads * kHeadDimension;
+  const uint32_t outputRows = last ? static_cast<uint32_t>(sequences.size()) : rows.rows;
+  requireBytes(output.hidden, uint64_t{outputRows} * width * 2, "attention hidden");
+  if (table) requireTableScratch(output.scratch, output.input, width, outputRows);
+  const AttentionWorkspace needed = plan.workspace();
+  requireBytes(workspace.partials, needed.partialsBytes, "attention partials");
+  requireBytes(workspace.statistics, needed.statisticsBytes, "attention statistics");
+  requireBytes(workspace.counters, kCountersBytes, "attention counters");
+  for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches()) {
+    kv::AttentionParams params{.sequences = dispatch.sequences,
+                               .first_sequence = dispatch.sequence[0],
+                               .rows = rows.rows,
+                               .tiles = dispatch.tiles,
+                               .trees = rows.tree ? 1U : 0U,
+                               .last_rows = last ? 1U : 0U,
+                               .kv = layer,
+                               .sequence = {}};
+    std::array<metal::MetalBuffer, kMaximumSequences> tables;
+    // Each sequence's splits take a slot of partials and one of staging.
+    uint32_t slot = 0;
+    for (uint32_t d = 0; d < dispatch.sequences; ++d) {
+      const uint32_t s = dispatch.sequence[d];
+      if (s != dispatch.sequence[0] + d) throw std::logic_error("an attention dispatch's sequences are not in order");
+      SplashAttentionSequence &entry = params.sequence[d];
+      entry = sequenceRows(sequences[s], command, s, 0);
+      entry.split_count = planned[s].splits;
+      entry.first_tile = d;
+      entry.first_slot = slot;
+      slot += 2 * kv::attentionTiles(planned[s].rows) * kKvHeads * planned[s].splits;
+      tables[d] = pageTables[s];
+    }
+    const auto bound = laneBindings(std::span(tables).first(dispatch.sequences));
+    std::vector<metal::MetalBuffer> bindings{layerRows.projection, layerRows.keys,       layerRows.values,
+                                             weights.queryScale,   weights.relativeScale, weights.bias,
+                                             workspace.partials,   workspace.statistics,  workspace.counters,
+                                             output.hidden,        table ? output.scratch.input : output.hidden,
+                                             table ? output.scratch.sums : output.hidden};
+    bindings.insert(bindings.end(), bound.begin(), bound.end());
+    // Without tree rows the single pass binds another buffer of the dispatch
+    // for them, of which it reads nothing.
+    bindings.insert(bindings.end(), {rows.tree ? rows.tree : layerRows.projection, rows.layout});
+    graph.add(plan.decodePipeline() + tableSuffix(output.input), std::move(bindings), params,
+              plan.splitGroups(dispatch));
   }
   return table ? PreparedInput{output.hidden, output.input} : PreparedInput{};
 }

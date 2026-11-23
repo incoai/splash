@@ -333,47 +333,66 @@ inline void relative_attention_page(
         thread_index);
 }
 
-// splash_paged_attention_tile with the bias: the tile's fused rows' relative
-// states (`states`, staged as their queries) and the layer's bias table
-// (`table`). Its softmax lanes load their rows' states and positions once;
-// the pages from the first that holds a key within the extent of the tile's
-// first row's position (a tree's anchor's, as its window's) take the bias,
-// the pages below it, past every row's extent, none.
+// The pages a tile's history split `split` of `splits` reads, as the split,
+// the reduce and the single pass derive them: the balanced partition of the
+// pages from its window's first (splash_attention_first_page, from its first
+// row's position or a tree's anchor's) to its last row's, the split's run
+// [begin, end), empty past the pages, and the runs that hold pages
+// (`written`), whose partials a combine reads.
+struct RelativeAttentionPages {
+  uint begin;
+  uint end;
+  uint written;
+};
+
+template <uint Window>
+inline RelativeAttentionPages relative_attention_pages(uint first_position, uint active_rows, bool tree, uint anchor,
+                                                       uint splits, uint split) {
+  const uint pages = splash_attention_pages(first_position + active_rows);
+  uint first_page = 0;
+  if constexpr (Window != 0)
+    first_page = splash_attention_first_page<Window>(splash_attention_window_position(tree, anchor, first_position));
+  const uint per_split = splash_attention_pages_per_split(pages - first_page, splits);
+  const uint begin = first_page + split * per_split;
+  return {begin, min(pages, begin + per_split), (pages - first_page + per_split - 1) / per_split};
+}
+
+// splash_paged_attention_tile with the bias, over a split's nonempty run of
+// pages (relative_attention_pages): the tile's fused rows' relative states
+// (`states`, staged as their queries) and the layer's bias table (`table`).
+// Its softmax lanes load their rows' states and positions once; the pages
+// from the first that holds a key within the extent of the tile's first row's
+// position (a tree's anchor's, as its window's) take the bias, the pages
+// below it, past every row's extent, none. Int8Queries writes the tile's
+// query codes to `query_codes` (M x HeadDim bytes the threadgroup owns).
+// Then `store` stores the running output of the tile's fused rows (an
+// M x HeadDim cooperative tensor, its argument, every element of which
+// running_full says is valid) and their statistics, which row_max and row_sum
+// hold.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          uint Window, typename CacheElement, bool Int8Queries>
-inline void relative_paged_attention_tile(
-    device bfloat *tile_queries, device const float *states, device const float *table,
-    device const SplashKvPage *page_table,
-    SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
-    uint split, device float *partials, device float *statistics, ulong slot,
+          uint Window, typename CacheElement, bool Int8Queries, class Store>
+inline void relative_attention_page_loop(
+    device bfloat *tile_queries, device int8_t *query_codes, device const float *states,
+    device const float *table, device const SplashKvPage *page_table,
+    SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, RelativeAttentionPages run,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
-    SplashAttentionTree tree, uint thread_index) {
+    SplashAttentionTree tree, uint thread_index, Store store) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr ushort N = SplashKvPageTokens;
   constexpr ushort D = HeadDim;
   constexpr uint States = SPLASH_RELATIVE_ATTENTION_STATES;
   const bool in_tree = tree.rows != nullptr;
-  uint visible_tokens = committed_tokens + active_rows;
-  uint pages = splash_attention_pages(visible_tokens);
-  uint first_page = 0;
-  if constexpr (Window != 0)
-    first_page = splash_attention_first_page<Window>(
-        splash_attention_window_position(in_tree, tree.anchor, committed_tokens));
-  uint per_split = splash_attention_pages_per_split(pages - first_page, splits);
-  uint page_begin = first_page + split * per_split;
-  if (page_begin >= pages)
-    return;
-  uint page_end = min(pages, page_begin + per_split);
+  const uint visible_tokens = committed_tokens + active_rows;
   static_assert(Quantized || !Int8Queries, "INT8 queries take INT8 keys");
   using QueryElement = conditional_t<Int8Queries, int8_t, bfloat>;
   using Score = conditional_t<Int8Queries, int, float>;
   device QueryElement *queries;
   float score_scale = splash_attention_scale<HeadDim>();
   if constexpr (Int8Queries) {
-    queries = reinterpret_cast<device int8_t *>(partials + slot * M * D);
+    queries = query_codes;
     score_scale *= splash_attention_query_codes<M, HeadDim>(tile_queries, queries, thread_index);
   } else {
     queries = tile_queries;
@@ -446,7 +465,7 @@ inline void relative_paged_attention_tile(
 
   const SplashAttentionWholePages whole =
       splash_attention_whole_pages<Window>(committed_tokens, active_rows, in_tree, tree.anchor);
-  for (uint page = page_begin; page < page_end; ++page) {
+  for (uint page = run.begin; page < run.end; ++page) {
     const SplashKvPageTensors<CacheElement> tensors =
         addressing.page(page_table[page]);
     uint token_start = page * N;
@@ -486,13 +505,7 @@ inline void relative_paged_attention_tile(
     pv.run(p0, vs, running);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  auto target = tensor(partials + slot * M * D, dextents<int, 2>{D, M},
-                       array<int, 2>{1, D});
-  running.store(target.slice<D, M>(0, 0));
-  if (thread_index < M) {
-    statistics[(slot * M + thread_index) * 2] = row_max[thread_index];
-    statistics[(slot * M + thread_index) * 2 + 1] = row_sum[thread_index];
-  }
+  store(running, running_full);
 }
 
 // ---- Reduce ---------------------------------------------------------------
@@ -562,4 +575,209 @@ inline void relative_attention_output_row(bfloat value, device const bfloat *pro
                               output % 8, dimension % 32, pairs[2 * dimension], pairs[2 * dimension + 1]);
     }
   }
+}
+
+// ---- Single pass ----------------------------------------------------------
+
+// A decode step's attention of a layer in one dispatch (ops::RelativeAttention
+// ::addDecode, relative_attention_decode_phase): each threadgroup of a lane's
+// tile prepares what its split reads itself, then runs the split's page loop,
+// and the split that finishes last combines the tile's splits as the reduce
+// does. These compute every value as the prepare and the reduce do, in the same
+// order, a simdgroup a head where they spread a head over a threadgroup: lane l
+// holds elements l + 32 i of a head, whose squares it adds a block of 32 at a
+// time (simd_sum, the prepare's per-simdgroup partial), block after block.
+
+// The prepare of a query head's row (relative_attention_prepare_phase's query
+// threadgroup) by one simdgroup: its queries, scaled, clipped and rounded,
+// and, PositionScaled, scaled by the log scale of the row's `position` and
+// rounded again, to `queries` (HeadDim bf16), and its relative states to
+// `states` (F32, the first States lanes'), from the row's projection row
+// `row` (RelativeAttentionRow).
+template <uint QHeads, uint HeadDim, bool PositionScaled>
+inline void relative_attention_stage_head(device const bfloat *row, device const float *query_scale,
+                                          device const float *relative_scale, uint head, uint position,
+                                          device bfloat *queries, device float *states, uint lane) {
+#pragma clang fp reassociate(off)
+  using Row = RelativeAttentionRow<QHeads, HeadDim>;
+  constexpr uint Blocks = HeadDim / 32, States = Row::States;
+  float element[Blocks];
+  float squares = 0.0f;
+#pragma unroll
+  for (uint i = 0; i < Blocks; ++i) {
+    const uint dimension = head * HeadDim + 32 * i + lane;
+    element[i] = float(row[dimension]) * query_scale[dimension];
+    squares += simd_sum(element[i] * element[i]);
+  }
+  const float clip = relative_attention_clip(squares, SPLASH_RELATIVE_ATTENTION_QK_CLIP);
+  float log_scale = 1.0f;
+  if constexpr (PositionScaled)
+    log_scale = relative_attention_log_scale(position);
+#pragma unroll
+  for (uint i = 0; i < Blocks; ++i) {
+    bfloat result = bfloat(element[i] * clip);
+    if constexpr (PositionScaled)
+      result = bfloat(float(result) * log_scale);
+    queries[32 * i + lane] = result;
+  }
+  const float state =
+      lane < States ? float(row[Row::StateOffset + head * States + lane]) * relative_scale[head * States + lane]
+                    : 0.0f;
+  bfloat clipped =
+      bfloat(state * relative_attention_clip(simd_sum(state * state), SPLASH_RELATIVE_ATTENTION_STATE_CLIP));
+  if constexpr (PositionScaled)
+    clipped = bfloat(float(clipped) * log_scale);
+  if (lane < States)
+    states[lane] = float(clipped);
+}
+
+// The prepare of a K head's row and its V head's (relative_attention_prepare_
+// phase's K threadgroup) by one simdgroup: the key clipped and the value
+// normalized, each rounded to bf16, from the row's convolved K and V heads at
+// `element` of `keys` and `values`, stored in slot `token` of the page entry
+// `page` as splash_store_kv_slot stores them (INT8 codes at the row's largest
+// magnitude of each, and their scales).
+template <uint KHeads, uint HeadDim, typename CacheElement>
+inline void relative_attention_store_head(device const bfloat *keys, device const bfloat *values, ulong element,
+                                          SplashKvPage page, SplashKvLayer kv, uint head, uint token, uint lane) {
+#pragma clang fp reassociate(off)
+  constexpr uint Blocks = HeadDim / 32;
+  float key[Blocks], value[Blocks];
+  float key_squares = 0.0f, value_squares = 0.0f;
+#pragma unroll
+  for (uint i = 0; i < Blocks; ++i) {
+    key[i] = float(keys[element + 32 * i + lane]);
+    value[i] = float(values[element + 32 * i + lane]);
+    key_squares += simd_sum(key[i] * key[i]);
+    value_squares += simd_sum(value[i] * value[i]);
+  }
+  const float clip = relative_attention_clip(key_squares, SPLASH_RELATIVE_ATTENTION_QK_CLIP);
+  const float inverse = rsqrt(value_squares / HeadDim + kRmsEpsilon);
+  bfloat clipped[Blocks], normalized[Blocks];
+#pragma unroll
+  for (uint i = 0; i < Blocks; ++i) {
+    clipped[i] = bfloat(key[i] * clip);
+    normalized[i] = bfloat(value[i] * inverse);
+  }
+  const SplashKvPageTensors<CacheElement> slab = SplashKvAddressing<KHeads, HeadDim, CacheElement>(kv, head).page(page);
+  if constexpr (is_same<CacheElement, bfloat>::value) {
+#pragma unroll
+    for (uint i = 0; i < Blocks; ++i) {
+      slab.keys[splash_kv_key_index<KHeads, HeadDim>(0, 0, token, 32 * i + lane)] = clipped[i];
+      slab.values[splash_kv_value_index<KHeads, HeadDim>(0, 0, token, 32 * i + lane)] = normalized[i];
+    }
+  } else {
+    float2 maximum = 0.0f;
+#pragma unroll
+    for (uint i = 0; i < Blocks; ++i)
+      maximum = max(maximum, abs(float2(float(clipped[i]), float(normalized[i]))));
+    maximum = float2(simd_max(maximum.x), simd_max(maximum.y));
+#pragma unroll
+    for (uint i = 0; i < Blocks; ++i) {
+      slab.keys[splash_kv_key_index<KHeads, HeadDim>(0, 0, token, 32 * i + lane)] =
+          splash_store_code(float(clipped[i]), maximum.x);
+      slab.values[splash_kv_value_index<KHeads, HeadDim>(0, 0, token, 32 * i + lane)] =
+          splash_store_code(float(normalized[i]), maximum.y);
+    }
+    if (lane == 0) {
+      const ulong scale_index = splash_q8_scale_index<KHeads>(0, 0, token);
+      slab.key_scales[scale_index] = maximum.x == 0.0f ? 0.0f : maximum.x / 127.0f;
+      slab.value_scales[scale_index] = maximum.y == 0.0f ? 0.0f : maximum.y / 127.0f;
+    }
+  }
+}
+
+// relative_attention_combine_splits of a tile's fused rows by the split that
+// arrives last, in two phases over the published splits' partials and
+// statistics (split_reduce.h), read coherently. First a thread a fused row:
+// its maximum over its splits' and its sink, each split's weight into
+// `weights` ([fused row][split]) and its denominator, the splits' in their
+// order and then the sink's, into `denominators`. Then, past a barrier, a
+// simdgroup a fused row, a lane each four of its dimensions: their
+// numerators, the splits' in their order, whose loads a lane issues
+// CombineSplits splits at a time before it adds them, and their quotients,
+// as the reduce's. A simdgroup that combined two dimensions of a row at a
+// time, its lanes holding the splits' weights, had waited on each split's
+// load of each of its six rows of an 8-row tile in turn: a verify step's
+// layer took 10% longer (8 rows) and 12% (16), a 1-row step's 6% less
+// (20-core M5 Pro).
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim>
+inline void relative_attention_combine_weights(device coherent(device) const float *statistics, uint written,
+                                               ulong head_slot, uint fused_row, float sink, threadgroup float *weights,
+                                               threadgroup float *denominators) {
+  constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
+  float maximum = sink;
+  for (uint split = 0; split < written; ++split)
+    maximum = max(maximum, statistics[((head_slot + split) * M + fused_row) * 2]);
+  float denominator = 0.0f;
+  for (uint split = 0; split < written; ++split) {
+    const ulong stat = ((head_slot + split) * M + fused_row) * 2;
+    const float weight = fast::exp(statistics[stat] - maximum);
+    weights[fused_row * written + split] = weight;
+    denominator += weight * statistics[stat + 1];
+  }
+  denominators[fused_row] = denominator + fast::exp(sink - maximum);
+}
+
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim>
+inline float4 relative_attention_combine_row(device coherent(device) const float *partials, uint written,
+                                             ulong head_slot, uint fused_row, uint dimension,
+                                             threadgroup const float *weights, float denominator) {
+  constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
+  constexpr uint D = HeadDim;
+  constexpr uint CombineSplits = 4;
+  float4 numerator = 0.0f;
+  for (uint first = 0; first < written; first += CombineSplits) {
+    float4 partial[CombineSplits];
+#pragma unroll
+    for (uint i = 0; i < CombineSplits; ++i)
+      partial[i] = first + i < written ? *reinterpret_cast<device coherent(device) const float4 *>(
+                                             partials + ((head_slot + first + i) * M + fused_row) * D + dimension)
+                                       : float4(0.0f);
+#pragma unroll
+    for (uint i = 0; i < CombineSplits && first + i < written; ++i) {
+      const float weight = weights[fused_row * written + first + i];
+      numerator.x += weight * partial[i].x;
+      numerator.y += weight * partial[i].y;
+      numerator.z += weight * partial[i].z;
+      numerator.w += weight * partial[i].w;
+    }
+  }
+  return denominator > 0.0f ? float4(numerator.x / denominator, numerator.y / denominator,
+                                     numerator.z / denominator, numerator.w / denominator)
+                            : float4(0.0f);
+}
+
+// relative_attention_output_row of a fused row's four dimensions from
+// `dimension` on, a lane of the row's simdgroup each: their values (the
+// combine's quotients) rounded, times the sigmoids of their gates, at the
+// row's output place `place` of `hidden` and, with Table, of the
+// out-projection's Table16 input, which the simdgroup writes a span of 64 at
+// a time, lane l the span's elements 2l and 2l + 1, from the lanes that hold
+// them.
+template <uint QHeads, uint HeadDim, bool Table>
+inline void relative_attention_output_quad(float4 value, device const bfloat *projection, device bfloat *hidden,
+                                           device bfloat *table, device float *sums, SplashAttentionOutput place,
+                                           uint query_head, uint dimension, uint lane) {
+  using Row = RelativeAttentionRow<QHeads, HeadDim>;
+  constexpr uint Width = QHeads * HeadDim;
+  static_assert(HeadDim == 128, "a lane's four dimensions of a simdgroup's row");
+  if (!place.writes)
+    return;
+  const bfloat4 gates = *reinterpret_cast<device const bfloat4 *>(projection + place.packed * Row::Stride +
+                                                                   Row::GateOffset + query_head * HeadDim + dimension);
+  const bfloat4 element(bfloat(float(bfloat(value.x)) * splash_sigmoid(float(gates.x))),
+                        bfloat(float(bfloat(value.y)) * splash_sigmoid(float(gates.y))),
+                        bfloat(float(bfloat(value.z)) * splash_sigmoid(float(gates.z))),
+                        bfloat(float(bfloat(value.w)) * splash_sigmoid(float(gates.w))));
+  *reinterpret_cast<device bfloat4 *>(hidden + place.output * Width + query_head * HeadDim + dimension) = element;
+  if constexpr (Table)
+#pragma unroll
+    for (uint span = 0; span < 2; ++span) {
+      const bfloat4 held = as_type<bfloat4>(simd_shuffle(as_type<uint2>(element), ushort(span * 16 + lane / 2)));
+      gguf_sg::Table16::write(table + place.output / 8 * Width * 8,
+                              sums + place.output / 8 * gguf_sg::Table16::sums_per_tile(Width), Width,
+                              (query_head * HeadDim) / 64 + span, place.output % 8, lane,
+                              lane % 2 ? held.z : held.x, lane % 2 ? held.w : held.y);
+    }
 }

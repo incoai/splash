@@ -84,7 +84,7 @@ void Inkling2LoopTarget::planRelativeAttention(PrefillStep &step) const {
   const auto plan = [&](ops::RelativeAttentionVariant variant) {
     return ops::RelativeAttention::plan(step.attentionSequences(), geometry_.kvLayout,
                                         operators_.calibration().attention, linear.int8Activations(), workspace,
-                                        variant);
+                                        variant, step.decode ? ops::StepKind::Decode : ops::StepKind::Prefill);
   };
   // The full layers scale their queries and relative states by their rows'
   // positions; the sliding ones read their window.
@@ -249,8 +249,9 @@ void Inkling2LoopTarget::addGates(const PrefillStep &step, uint32_t application,
 }
 
 // A prompt sequence's history through the command's reads of spilled K/V
-// (QwenTarget::addPrefillMixer); a decode lane's from its pages, which this
-// target's dense layout never spills.
+// (QwenTarget::addPrefillMixer), attended by the prepare, split and reduce; a
+// decode lane's from its pages, which this target's dense layout never
+// spills, in the decode step's single pass.
 void Inkling2LoopTarget::addAttention(PrefillStep &step, uint32_t application,
                                       const std::array<metal::MetalBuffer, 3> &inputs) const {
   const Inkling2LoopAttentionWeights &mixer = weights_.layers[schedule_.weightLayer(application)].mixer;
@@ -293,34 +294,39 @@ void Inkling2LoopTarget::addAttention(PrefillStep &step, uint32_t application,
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
   const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
   const ops::AttentionRows attentionRows{b.laneRows, rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
+  const ops::RelativeAttentionRows layerRows{b.fullPacked, s.convolvedKeys, s.convolvedValues};
   const ops::RelativeAttentionWeights weights{mixer.queryScale, mixer.relativeScale, mixer.relativeBias};
-  const ops::RelativeAttentionStaging staging{b.fullQueries, s.relativeStates, s.rowSinks};
   const ops::RelativeAttentionPlan &plan = full ? *step.fullAttention : *step.slidingAttention;
-  ops::RelativeAttention::addProjection(step.graph, {b.fullPacked, s.convolvedKeys, s.convolvedValues}, weights,
-                                        staging, step.kvLayers[kvLayer], pageTables, sequences, attentionRows,
-                                        geometry_.kvLayout,
-                                        {.windowTokens = full ? 0 : geometry_.kvLayout.windowTokens,
-                                         .positionScaled = full});
-  std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
-  for (size_t index = 0; index < step.sequences.size(); ++index) {
-    const QwenTargetPrefillSequence &sequence = step.sequences[index];
-    if (step.decode) {
-      if (step.spilled.active()) throw std::logic_error("an Inkling-2-Mini decode step over spilled K/V");
-      histories[index] = {step.kvLayers[kvLayer], pageTables[index], {}};
-      continue;
-    }
-    const uint32_t firstPage = sequence.chunk.committed_tokens / kv::kPageTokens;
-    const PrefillKv history =
-        step.spilled.prefill(step.graph, kvLayer, sequence.lane, firstPage,
-                             kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
-                             {sequence.pageTable, step.kvLayers[kvLayer]});
-    histories[index] = {history.kv, history.table, {}};
-  }
   const ops::LinearPlan outputPlan = linear.plan(mixer.outputProjection, rows);
-  const ops::PreparedInput gated = ops::RelativeAttention::addAttention(
-      step.graph, plan, staging, weights, b.attentionPartials, b.attentionStatistics, sequences,
-      std::span(histories).first(sequences.size()), attentionRows,
-      {b.fullPacked, b.attentionHidden, ops::AttentionOutput::Every, b.linearScratch, outputPlan.input()});
+  const ops::AttentionOutputRows output{b.fullPacked, b.attentionHidden, ops::AttentionOutput::Every,
+                                        b.linearScratch, outputPlan.input()};
+  ops::PreparedInput gated;
+  if (step.decode) {
+    if (step.spilled.active()) throw std::logic_error("an Inkling-2-Mini decode step over spilled K/V");
+    gated = ops::RelativeAttention::addDecode(step.graph, plan, layerRows, weights, step.kvLayers[kvLayer], pageTables,
+                                              sequences, attentionRows,
+                                              {b.attentionPartials, b.attentionStatistics, s.attentionCounters},
+                                              output);
+  } else {
+    const ops::RelativeAttentionStaging staging{b.fullQueries, s.relativeStates, s.rowSinks};
+    ops::RelativeAttention::addProjection(step.graph, layerRows, weights, staging, step.kvLayers[kvLayer], pageTables,
+                                          sequences, attentionRows, geometry_.kvLayout,
+                                          {.windowTokens = full ? 0 : geometry_.kvLayout.windowTokens,
+                                           .positionScaled = full});
+    std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
+    for (size_t index = 0; index < step.sequences.size(); ++index) {
+      const QwenTargetPrefillSequence &sequence = step.sequences[index];
+      const uint32_t firstPage = sequence.chunk.committed_tokens / kv::kPageTokens;
+      const PrefillKv history =
+          step.spilled.prefill(step.graph, kvLayer, sequence.lane, firstPage,
+                               kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
+                               {sequence.pageTable, step.kvLayers[kvLayer]});
+      histories[index] = {history.kv, history.table, {}};
+    }
+    gated = ops::RelativeAttention::addAttention(step.graph, plan, staging, weights, b.attentionPartials,
+                                                 b.attentionStatistics, sequences,
+                                                 std::span(histories).first(sequences.size()), attentionRows, output);
+  }
   linear.add(step.graph,
              {.input = b.attentionHidden, .output = b.attentionOutput, .scratch = b.linearScratch, .prepared = gated},
              mixer.outputProjection, outputPlan);

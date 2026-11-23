@@ -164,12 +164,13 @@ public:
       if (!name.empty()) names_.try_emplace(name, where);
   }
   // A relative attention plan's (ops::RelativeAttention) split and reduce
-  // kernels, and a layer's prepare of a variant and the path commit of its
-  // pages.
+  // kernels, or a decode plan's single pass, plain and writing the
+  // out-projection's table; and a layer's prepare of a variant and the path
+  // commit of its pages.
   void attention(const std::string &where, const RelativeAttentionPlan &plan) {
-    for (const std::string &name : {plan.splitPipeline(), plan.reducePipeline(),
-                                    plan.reducePipeline() + tableSuffix(LinearInput::Table16)})
-      names_.try_emplace(name, where);
+    const std::string &output = plan.step == StepKind::Decode ? plan.decodePipeline() : plan.reducePipeline();
+    for (const std::string &name : {plan.splitPipeline(), output, output + tableSuffix(LinearInput::Table16)})
+      if (!name.empty()) names_.try_emplace(name, where);
   }
   void relativePrepare(const std::string &where, kv::Layout layout, RelativeAttentionVariant variant) {
     encode(where, true, [&](metal::CommandGraph &graph) {
@@ -620,12 +621,15 @@ std::string describe(const AttentionPlan &plan) {
 }
 
 std::string describe(const RelativeAttentionPlan &plan) {
-  std::string line = plan.splitPipeline() + " " + plan.reducePipeline() + " splits ";
+  const bool decode = plan.step == StepKind::Decode;
+  std::string line =
+      (decode ? plan.decodePipeline() : plan.splitPipeline() + " " + plan.reducePipeline()) + " splits ";
   for (const RelativeAttentionPlan::Sequence &sequence : plan.sequences())
     line += std::to_string(sequence.splits) + (&sequence == &plan.sequences().back() ? "" : ",");
   for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches())
     line += " [" + std::to_string(dispatch.sequences) + " tiles " + std::to_string(dispatch.tiles) + " groups " +
-            describe(plan.splitGroups(dispatch)) + " " + describe(plan.reduceGroups(dispatch)) + "]";
+            describe(plan.splitGroups(dispatch)) + (decode ? "" : " " + describe(plan.reduceGroups(dispatch))) +
+            "]";
   return line + " workspace " + describe(plan.workspace());
 }
 
@@ -657,7 +661,8 @@ constexpr uint32_t kAttentionRows[] = {1, 7, 8, 64, 255, 256, 300, 512, 1024, 20
 constexpr uint32_t kAttentionHistories[] = {0, 1, 511, 2047, 4096, 32768, 65536, 131072, 262144};
 
 // The relative attention (ops::RelativeAttention) plans of a layout it
-// stores, as chunkPlan's and stepPlan's.
+// stores, as chunkPlan's and stepPlan's: a decode step's of lanes of
+// `laneCap` rows.
 RelativeAttentionPlan relativeChunkPlan(const ExecutionPlans &plans, uint32_t rows, uint32_t history,
                                         const kv::Layout &layout, RelativeAttentionVariant v) {
   const std::array sequence{sequenceOf(history, rows)};
@@ -665,13 +670,13 @@ RelativeAttentionPlan relativeChunkPlan(const ExecutionPlans &plans, uint32_t ro
                                  RelativeAttention::sequenceWorkspace(layout), v);
 }
 RelativeAttentionPlan relativeStepPlan(const ExecutionPlans &plans, std::span<const uint32_t> histories,
-                                       const kv::Layout &layout, RelativeAttentionVariant v) {
+                                       uint32_t laneCap, const kv::Layout &layout, RelativeAttentionVariant v) {
   std::vector<kv::ChunkedPrefillParams> lanes;
-  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, SPLASH_DRAFT_QUERY_ROWS));
+  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, laneCap));
   const AttentionWorkspace lane = RelativeAttention::laneWorkspace(layout);
   return RelativeAttention::plan(lanes, layout, plans.calibration().attention, plans.linear().int8Activations(),
-                                 {lane.partialsBytes * histories.size(), lane.statisticsBytes * histories.size()},
-                                 v);
+                                 {lane.partialsBytes * histories.size(), lane.statisticsBytes * histories.size()}, v,
+                                 StepKind::Decode);
 }
 
 // Whether a family's layers attend through relative attention, and the
@@ -763,8 +768,10 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
 // The relative attention (ops::RelativeAttention) of each family whose
 // layers attend through it, in the groups attentionPlans fills for the shared
 // attention's families, at the same rows, histories and lanes: a prompt
-// chunk's plans and a verify step's of each window it attends, in INT8 and
-// BF16 pages, its workspaces, and with a library its pipelines, its layers'
+// chunk's plans and a decode step's single pass, of lanes of the narrow cap
+// and of a verify block's rows, of each window it attends (the whole
+// history's position-scaled, as its layers attend it), in INT8 and BF16
+// pages, its workspaces, and with a library its pipelines, its layers'
 // prepare, plain and position-scaled, and its pages' path commit.
 void relativeAttentionPlans(Golden &golden, const std::string &name, const ExecutionPlans &plans,
                             Pipelines *library) {
@@ -780,7 +787,7 @@ void relativeAttentionPlans(Golden &golden, const std::string &name, const Execu
       layout.format = format;
       const std::string fmt = format == kv::Format::Int8 ? "int8" : "bf16";
       for (const uint32_t window : relativeWindows(family)) {
-        const RelativeAttentionVariant v{.windowTokens = window};
+        const RelativeAttentionVariant v{.windowTokens = window, .positionScaled = !window};
         const std::string variant = fmt + " relative window " + std::to_string(window);
         const auto planned = [&](const std::string &line, const auto &plan) {
           return line + ": " + attempt([&] {
@@ -793,13 +800,15 @@ void relativeAttentionPlans(Golden &golden, const std::string &name, const Execu
           for (const uint32_t history : kAttentionHistories)
             prefill.add(planned(variant + " rows " + std::to_string(rows) + " history " + std::to_string(history),
                                 [&] { return relativeChunkPlan(plans, rows, history, layout, v); }));
-        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
-          for (const uint32_t history : kAttentionHistories) {
-            const std::vector<uint32_t> each = verifyHistories(lanes, history);
-            (lanes <= SPLASH_DEFAULT_LANES ? verify : verifyWide)
-                .add(planned(variant + " lanes " + std::to_string(lanes) + " history " + std::to_string(history),
-                             [&] { return relativeStepPlan(plans, each, layout, v); }));
-          }
+        for (const uint32_t cap : {uint32_t{SPLASH_DRAFT_QUERY_ROWS}, uint32_t{SPLASH_TARGET_VERIFY_ROWS}})
+          for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+            for (const uint32_t history : kAttentionHistories) {
+              const std::vector<uint32_t> each = verifyHistories(lanes, history);
+              (lanes <= SPLASH_DEFAULT_LANES ? verify : verifyWide)
+                  .add(planned(variant + " rows " + std::to_string(cap) + " lanes " + std::to_string(lanes) +
+                                   " history " + std::to_string(history),
+                               [&] { return relativeStepPlan(plans, each, cap, layout, v); }));
+            }
         if (library)
           for (const bool scaled : {false, true})
             library->relativePrepare(name + " " + f + " " + variant + (scaled ? " scaled" : "") + " prepare", layout,

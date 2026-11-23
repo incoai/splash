@@ -33,7 +33,10 @@
 // log scale) or a window of the 1023 keys before it. Each case runs the
 // production encoders: the prepare, against fp64 of its rows, and the
 // attention, against fp64 of what the prepare staged and the K/V the pages
-// hold.
+// hold; a decode step's single pass, against fp64 of the K/V it stores and
+// of its rows over the K/V the pages hold from what the prepare stages (the
+// bits it stages itself), and bit for bit against the prepare, split and
+// reduce at its splits.
 
 namespace {
 
@@ -281,12 +284,15 @@ struct Tree final {
 // The rows of a command: rows [first, first + rows) of each lane's, `stride`
 // rows a KV head staged, each lane's rows after the one before it, or with
 // trees each lane's block of rows as a tree; their inputs, staging and output
-// rows.
+// rows. A lane's layout entry may hold fewer rows than its bound (laneRows,
+// as a decode step's proposer writes them): the rest of its packed rows are
+// in no lane.
 struct Step final {
   uint32_t first;
   uint32_t rows;
   uint32_t stride;
   std::vector<Tree> trees;
+  std::vector<uint32_t> laneRows;
   ops::RelativeAttentionRows inputs;
   ops::RelativeAttentionStaging staging;
   metal::MetalBuffer output, layout, tree;
@@ -312,9 +318,10 @@ std::vector<kv::ChunkedPrefillParams> sequencesOf(const Case &data, const Step &
 }
 
 Step makeStep(metal::MetalBackend &backend, const Case &data, uint32_t first, uint32_t rows, uint32_t stride,
-              std::vector<Tree> trees = {}) {
+              std::vector<Tree> trees = {}, std::vector<uint32_t> laneRows = {}) {
   const uint64_t packed = uint64_t{data.lanes} * rows;
-  Step step{first, rows, stride, std::move(trees), {}, {}, {}, {}, {}};
+  if (laneRows.empty()) laneRows.assign(data.lanes, rows);
+  Step step{first, rows, stride, std::move(trees), std::move(laneRows), {}, {}, {}, {}, {}};
   step.inputs = {poisoned(backend, packed * kStride * 2), zeroed(backend, packed * kKvHeads * kHeadDimension * 2),
                  zeroed(backend, packed * kKvHeads * kHeadDimension * 2)};
   const ops::RelativeAttentionStagingBytes bytes =
@@ -324,7 +331,7 @@ Step makeStep(metal::MetalBackend &backend, const Case &data, uint32_t first, ui
   step.layout = zeroed(backend, uint64_t{data.lanes} * sizeof(SplashLaneRows));
   if (!step.trees.empty()) step.tree = zeroed(backend, packed * sizeof(SplashTreeRow));
   for (uint32_t lane = 0; lane < data.lanes; ++lane) {
-    contents<SplashLaneRows>(step.layout)[lane] = {lane * rows, rows};
+    contents<SplashLaneRows>(step.layout)[lane] = {lane * rows, step.laneRows[lane]};
     for (uint32_t row = 0; row < rows; ++row) {
       const uint64_t at = uint64_t{lane} * rows + row;
       for (uint32_t column = 0; column < kWidth; ++column)
@@ -382,6 +389,46 @@ void run(metal::MetalBackend &backend, const Case &data, const Step &step, const
   static_cast<void>(backend.submitCommandAsync(dispatches).wait());
 }
 
+// A decode step's plan of a case's lanes, with the runtime's lane workspaces.
+ops::RelativeAttentionPlan decodePlanOf(const Case &data, const Step &step) {
+  const ops::AttentionWorkspace lane = RelativeAttention::laneWorkspace(data.layout);
+  return RelativeAttention::plan(sequencesOf(data, step), data.layout, data.attention(), ops::Int8Activations::On,
+                                 {lane.partialsBytes * data.lanes, lane.statisticsBytes * data.lanes}, data.variant,
+                                 ops::StepKind::Decode);
+}
+
+// A lane's single-pass splits: decodeSplits of the pages its tile reads.
+uint32_t decodeLaneSplits(const Case &data, const Step &step, uint32_t lane) {
+  const uint32_t pages = (data.histories[lane] + step.first + step.rows + kPageTokens - 1) / kPageTokens;
+  return RelativeAttention::decodeSplits(
+      data.variant.windowTokens ? std::min(pages, kv::windowAttentionPages(data.variant.windowTokens)) : pages,
+      step.rows);
+}
+
+// A decode step's single pass on a poisoned workspace and zero counters, as
+// the runtime encodes it: one dispatch of the plan's kernel, which leaves
+// its counters zero.
+void runDecode(metal::MetalBackend &backend, const Case &data, const Step &step,
+               const ops::RelativeAttentionPlan &plan) {
+  const ops::AttentionWorkspace bytes = plan.workspace();
+  const ops::RelativeAttentionWorkspace workspace{poisoned(backend, bytes.partialsBytes),
+                                                  poisoned(backend, bytes.statisticsBytes),
+                                                  zeroed(backend, RelativeAttention::kCountersBytes)};
+  metal::CommandGraph graph;
+  RelativeAttention::addDecode(graph, plan, step.inputs, data.weights, data.layer,
+                               std::span(data.tables).first(data.lanes), sequencesOf(data, step),
+                               {step.layout, data.lanes * step.rows, step.tree}, workspace,
+                               {step.inputs.projection, step.output});
+  require(graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == plan.decodePipeline(),
+          "a single pass runs another kernel than its plan's");
+  for (uint32_t lane = 0; lane < data.lanes; ++lane)
+    require(plan.sequences()[lane].splits == decodeLaneSplits(data, step, lane), "a lane's splits are not its own");
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  const auto *counters = contents<uint32_t>(workspace.counters);
+  require(std::all_of(counters, counters + RelativeAttention::kCountersBytes / 4, [](uint32_t c) { return !c; }),
+          "a single pass left a counter it arrived at");
+}
+
 // ---- The prepare -----------------------------------------------------------
 
 // Within `ulps` bf16 steps of `expected` (the prepare rounds once, or twice
@@ -396,7 +443,7 @@ void near(double actual, double expected, double ulps, const std::string &what) 
 void checkPrepare(const Case &data, const Step &step, const std::string &what) {
   const double rounding = data.variant.positionScaled ? 2.01 : 1.01;
   for (uint32_t lane = 0; lane < data.lanes; ++lane)
-    for (uint32_t row = 0; row < step.rows; ++row) {
+    for (uint32_t row = 0; row < step.laneRows[lane]; ++row) {
       const uint32_t absolute = step.first + row;
       const uint32_t position = data.histories[lane] + step.depth(lane, row);
       const double scale = data.variant.positionScaled ? logScale(position) : 1.0;
@@ -587,8 +634,8 @@ double checkOutput(const Case &data, const Step &step, const std::string &what) 
     // Every key a checked row attends: from the first row's window (a tree's
     // anchor's) to the step's last row's slot.
     const uint32_t position = data.histories[lane] + step.first;
-    const StoredKv kv = stored(data, lane, windowStart(data.variant, position), position + step.rows);
-    for (const uint32_t row : checkedRows(position, step.rows))
+    const StoredKv kv = stored(data, lane, windowStart(data.variant, position), position + step.laneRows[lane]);
+    for (const uint32_t row : checkedRows(position, step.laneRows[lane]))
       for (uint32_t head = 0; head < kQueryHeads; ++head) {
         const Reference expected = reference(data, step, kv, lane, row, head);
         for (uint32_t d = 0; d < kHeadDimension; ++d) {
@@ -660,11 +707,26 @@ void checkVerify(metal::MetalBackend &backend, kv::Format format, bool int8Queri
   std::cout << what << ": largest error " << checkOutput(data, step, what) << " of its bound PASS\n";
 }
 
-// A verify of lanes whose blocks of two tiles' rows are trees: a chain, a
+// Lanes' blocks of `rows` rows as trees, lane by lane in turn: a chain, a
 // branch off the third row that runs through the second tile, two children a
 // row, and a random tree, so that a row's ancestors sit at the slots of rows
 // other than their depths and its bias takes their depths' distances, and its
 // log scale its depth's position.
+std::vector<Tree> treesOf(uint32_t lanes, uint32_t rows) {
+  std::vector<Tree> trees(lanes);
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t row = 0; row < rows; ++row) {
+      const uint32_t back = std::min(row, 1 + uint32_t((unit(seedOf(8, lane, row, 0)) + 1) * 2) % 4);
+      trees[lane].parent.push_back(!row            ? 0
+                                   : lane % 4 == 0 ? row - 1
+                                   : lane % 4 == 1 ? (row == 8 ? 2 : row - 1)
+                                   : lane % 4 == 2 ? (row - 1) / 2
+                                                   : row - back);
+    }
+  return trees;
+}
+
+// A verify of lanes whose blocks of two tiles' rows are trees (treesOf).
 void checkTreeVerify(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
                      ops::RelativeAttentionVariant variant, std::span<const uint32_t> histories) {
   constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
@@ -673,17 +735,7 @@ void checkTreeVerify(metal::MetalBackend &backend, kv::Format format, bool int8Q
   std::copy(histories.begin(), histories.end(), lanes.begin());
   const auto count = uint32_t(histories.size());
   const Case data = makeCase(backend, format, int8Queries, variant, count, kRows, lanes);
-  std::vector<Tree> trees(count);
-  for (uint32_t lane = 0; lane < count; ++lane)
-    for (uint32_t row = 0; row < kRows; ++row) {
-      const uint32_t back = std::min(row, 1 + uint32_t((unit(seedOf(8, lane, row, 0)) + 1) * 2) % 4);
-      trees[lane].parent.push_back(!row            ? 0
-                                   : lane % 4 == 0 ? row - 1
-                                   : lane % 4 == 1 ? (row == 8 ? 2 : row - 1)
-                                   : lane % 4 == 2 ? (row - 1) / 2
-                                                   : row - back);
-    }
-  const Step step = makeStep(backend, data, 0, kRows, kPageTokens, trees);
+  const Step step = makeStep(backend, data, 0, kRows, kPageTokens, treesOf(count, kRows));
   run(backend, data, step, planOf(data, step));
   const std::string what = describe(data, "tree verify");
   checkPrepare(data, step, what);
@@ -729,6 +781,183 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
             << " splits PASS\n";
 }
 
+// ---- The single pass -------------------------------------------------------
+
+// Every byte of each lane's block rows' K/V in their pages, which `poison`
+// overwrites: NaN values (BF16), or codes of -1 and NaN scales (INT8).
+std::vector<std::byte> blockKv(const Case &data, const Step &step, bool poison) {
+  std::vector<std::byte> bytes;
+  const auto visit = [&](std::byte *at, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+      bytes.push_back(at[i]);
+      if (poison) at[i] = i % 2 && data.layout.format == kv::Format::BFloat16 ? std::byte{0x7f} : std::byte{0xff};
+    }
+  };
+  const size_t element = data.layout.format == kv::Format::BFloat16 ? 2 : 1;
+  for (uint32_t lane = 0; lane < data.lanes; ++lane)
+    for (uint32_t row = 0; row < step.laneRows[lane]; ++row) {
+      const uint32_t token = data.histories[lane] + step.first + row, page = data.page(lane, token);
+      const uint32_t place = token % kPageTokens;
+      const std::array<std::span<std::byte>, 4> spans = data.pool.layerSpans(page, kLayer);
+      for (uint32_t head = 0; head < kKvHeads; ++head) {
+        for (uint32_t d = 0; d < kHeadDimension; ++d) {
+          visit(spans[SPLASH_KV_KEYS].data() + splash_kv_key_element(head, place, d, kHeadDimension) * element,
+                element);
+          visit(spans[SPLASH_KV_VALUES].data() + data.pool.valueElement(head, place, d) * element, element);
+        }
+        if (data.layout.format == kv::Format::Int8)
+          for (const uint32_t tensor : {SPLASH_KV_KEY_SCALES, SPLASH_KV_VALUE_SCALES})
+            visit(spans[tensor].data() + splash_kv_scale_element(head, place) * sizeof(float), sizeof(float));
+      }
+    }
+  return bytes;
+}
+
+// A step's prepare alone, which stages what the reference reads (a single
+// pass stages the same bits in its own slots: checkDecodeBits), then its
+// block rows' K/V poisoned, which the single pass must store again.
+void runPrepare(metal::MetalBackend &backend, const Case &data, const Step &step) {
+  metal::CommandGraph graph;
+  RelativeAttention::addProjection(graph, step.inputs, data.weights, step.staging, data.layer,
+                                   std::span(data.tables).first(data.lanes), sequencesOf(data, step),
+                                   {step.layout, data.lanes * step.rows, step.tree}, data.layout, data.variant);
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  static_cast<void>(blockKv(data, step, true));
+}
+
+// A decode step's single pass (RelativeAttention::addDecode) over lanes of
+// `bound` rows a lane (the step's lane cap), each holding laneRows of them as
+// a decode step's proposer chooses, chains or trees (treesOf), after the
+// prepare (runPrepare): the prepare's staging, the single pass's stores and
+// every checked row against fp64, and no row past a lane's rows written.
+void checkDecode(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
+                 ops::RelativeAttentionVariant variant, std::span<const uint32_t> histories, uint32_t bound,
+                 std::span<const uint32_t> laneRows, bool trees) {
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> lanes{};
+  std::copy(histories.begin(), histories.end(), lanes.begin());
+  const auto count = uint32_t(histories.size());
+  const Case data = makeCase(backend, format, int8Queries, variant, count, bound, lanes);
+  const Step step = makeStep(backend, data, 0, bound, kPageTokens, trees ? treesOf(count, bound) : std::vector<Tree>{},
+                             std::vector<uint32_t>(laneRows.begin(), laneRows.end()));
+  runPrepare(backend, data, step);
+  runDecode(backend, data, step, decodePlanOf(data, step));
+  std::string what = describe(data, trees ? "tree decode" : "decode") + " rows";
+  for (const uint32_t rows : laneRows) what += " " + std::to_string(rows);
+  what += " of " + std::to_string(bound);
+  checkPrepare(data, step, what);
+  const double largest = checkOutput(data, step, what);
+  for (uint32_t lane = 0; lane < count; ++lane)
+    for (uint32_t row = step.laneRows[lane]; row < bound; ++row)
+      for (uint32_t head = 0; head < kQueryHeads; ++head)
+        for (uint32_t d = 0; d < kHeadDimension; ++d)
+          require(!contents<uint16_t>(step.output)[step.outputIndex(lane, head, row, d)],
+                  what + ": a row past its lane's rows was written");
+  std::cout << what << ": largest error " << largest << " of its bound PASS\n";
+}
+
+// A lane's block run by the prepare, split and reduce at the single pass's
+// splits, as checkSplitCounts encodes them: the split of the same queries'
+// format (INT8 codes where the plan scores them).
+void runMultiPass(metal::MetalBackend &backend, const Case &data, const Step &step,
+                  const ops::RelativeAttentionPlan &decode) {
+  const std::vector<kv::ChunkedPrefillParams> sequences = sequencesOf(data, step);
+  const ops::AttentionRows rows{step.layout, step.rows, step.tree};
+  const uint32_t splits = decode.sequences()[0].splits;
+  const ops::AttentionWorkspace workspace = RelativeAttention::workspace(kv::kAttentionMaximumSplits, data.layout);
+  const metal::MetalBuffer partials = poisoned(backend, workspace.partialsBytes);
+  const metal::MetalBuffer statistics = poisoned(backend, workspace.statisticsBytes);
+  SplashAttentionParams params{.sequences = 1, .first_sequence = 0, .rows = step.rows, .tiles = 1,
+                               .trees = step.tree ? 1U : 0U, .last_rows = 0, .kv = data.layer, .sequence = {}};
+  params.sequence[0] = {.committed_tokens = sequences[0].committed_tokens, .row_bound = step.rows, .layout_row = 0,
+                        .stage_row = 0, .chunk_stride = step.stride,
+                        .page_table_entries = sequences[0].page_table_entries, .split_count = splits,
+                        .first_tile = 0, .first_slot = 0, .block_stride = 0, .block_list = 0};
+  const std::string window = data.variant.windowTokens ? "_w1023" : "";
+  const std::string format = decode.decodePipeline().starts_with("relative_attention_q8q") ? "q8q"
+                             : data.layout.format == kv::Format::Int8                      ? "q8"
+                                                                                           : "bf16";
+  metal::CommandGraph graph;
+  RelativeAttention::addProjection(graph, step.inputs, data.weights, step.staging, data.layer,
+                                   std::span(data.tables).first(1), sequences, rows, data.layout, data.variant);
+  std::vector<metal::MetalBuffer> split{step.staging.queries, partials, statistics};
+  split.insert(split.end(), data.tables.begin(), data.tables.end());
+  split.insert(split.end(), {step.tree ? step.tree : partials, step.layout, step.staging.states, data.weights.bias});
+  graph.add("relative_attention_" + format + "_split" + window, std::move(split), params, {kKvHeads, 1, splits});
+  graph.add("relative_attention_reduce" + window,
+            {partials, statistics, step.inputs.projection, step.output, step.output, step.output, step.layout,
+             step.staging.sinks},
+            params, {kKvHeads, kLaneRows * kGroup, 1}, {kHeadDimension, 1, 1});
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+}
+
+// The single pass computes the prepare, split and reduce's bits: a lane of
+// the narrow cap's rows (one tile of 24 fused rows either way), run by both
+// at the single pass's splits, stores the same K/V and writes the same
+// output, the single pass over its block rows' poisoned slots.
+void checkDecodeBits(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
+                     ops::RelativeAttentionVariant variant, uint32_t history, uint32_t rows, bool trees) {
+  const Case data = makeCase(backend, format, int8Queries, variant, 1, kLaneRows, {history, 0, 0, 0});
+  const Step step = makeStep(backend, data, 0, kLaneRows, kPageTokens,
+                             trees ? treesOf(1, kLaneRows) : std::vector<Tree>{}, {rows});
+  const ops::RelativeAttentionPlan plan = decodePlanOf(data, step);
+  runMultiPass(backend, data, step, plan);
+  const std::vector<std::byte> stores = blockKv(data, step, true);
+  const auto *output = contents<uint16_t>(step.output);
+  const std::vector<uint16_t> attended(output, output + step.output.sizeBytes() / 2);
+  std::memset(step.output.contents(), 0, step.output.sizeBytes());
+  runDecode(backend, data, step, plan);
+  const std::string what = describe(data, trees ? "tree decode" : "decode") + " rows " + std::to_string(rows);
+  require(blockKv(data, step, false) == stores, what + ": the single pass stored other K/V bits than the prepare");
+  require(std::equal(attended.begin(), attended.end(), output),
+          what + ": the single pass wrote other bits than the split and reduce at its splits");
+  std::cout << what << " at " << plan.sequences()[0].splits
+            << " splits: the prepare, split and reduce's bits PASS\n";
+}
+
+// The single pass's splits partition the same pages for any count, so each
+// count up to SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS gives the reference: a
+// lane of `bound` rows of each count, encoded as addDecode encodes it with
+// the count set, which leaves its counters zero.
+void checkDecodeSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
+                            ops::RelativeAttentionVariant variant, uint32_t history, uint32_t bound) {
+  constexpr uint32_t kSplits = SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS;
+  const Case data = makeCase(backend, format, int8Queries, variant, 1, bound, {history, 0, 0, 0});
+  const Step step = makeStep(backend, data, 0, bound, kPageTokens, treesOf(1, bound));
+  const ops::RelativeAttentionPlan plan = decodePlanOf(data, step);
+  const ops::AttentionWorkspace workspace =
+      RelativeAttention::workspace(2 * kv::attentionTiles(bound) * kSplits, data.layout);
+  const metal::MetalBuffer partials = poisoned(backend, workspace.partialsBytes);
+  const metal::MetalBuffer statistics = poisoned(backend, workspace.statisticsBytes);
+  const metal::MetalBuffer counters = zeroed(backend, RelativeAttention::kCountersBytes);
+  const kv::ChunkedPrefillParams sequence = sequencesOf(data, step)[0];
+  runPrepare(backend, data, step);
+  for (uint32_t splits = 1; splits <= kSplits; ++splits) {
+    std::memset(step.output.contents(), 0xff, step.output.sizeBytes());
+    SplashAttentionParams params{.sequences = 1, .first_sequence = 0, .rows = bound,
+                                 .tiles = kv::attentionTiles(bound), .trees = 1, .last_rows = 0, .kv = data.layer,
+                                 .sequence = {}};
+    params.sequence[0] = {.committed_tokens = sequence.committed_tokens, .row_bound = bound, .layout_row = 0,
+                          .stage_row = 0, .chunk_stride = kPageTokens,
+                          .page_table_entries = sequence.page_table_entries, .split_count = splits,
+                          .first_tile = 0, .first_slot = 0, .block_stride = 0, .block_list = 0};
+    std::vector<metal::MetalBuffer> bindings{step.inputs.projection, step.inputs.keys, step.inputs.values,
+                                             data.weights.queryScale, data.weights.relativeScale, data.weights.bias,
+                                             partials, statistics, counters, step.output, step.output, step.output};
+    bindings.insert(bindings.end(), data.tables.begin(), data.tables.end());
+    bindings.insert(bindings.end(), {step.tree, step.layout});
+    metal::CommandGraph graph;
+    graph.add(plan.decodePipeline(), std::move(bindings), params, {kKvHeads, 1, splits});
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const std::string what = describe(data, "tree decode") + " of " + std::to_string(splits) + " splits";
+    checkOutput(data, step, what);
+    const auto *left = contents<uint32_t>(counters);
+    require(std::all_of(left, left + RelativeAttention::kCountersBytes / 4, [](uint32_t c) { return !c; }),
+            what + ": a counter left nonzero");
+  }
+  std::cout << "split counts: " << describe(data, "tree decode") << " rows " << bound << " of 1-" << kSplits
+            << " splits PASS\n";
+}
+
 // Where every row's window holds its whole history, the window changes
 // nothing: the windowed kernels' outputs are the whole history's bit for bit
 // (both unscaled), at the same split partition.
@@ -746,6 +975,18 @@ void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format, b
   require(outputs(kSliding, true, kWithin.size(), kLaneRows, kWithin) ==
               outputs(whole, true, kWithin.size(), kLaneRows, kWithin),
           "a windowed verify inside its window differs from the whole history's");
+  // A decode step's single pass of a batch of lanes of a verify block's
+  // rows, as trees.
+  const auto decoded = [&](ops::RelativeAttentionVariant variant) {
+    const Case data = makeCase(backend, format, int8Queries, variant, kWithin.size(), SPLASH_TARGET_VERIFY_ROWS,
+                               kWithin);
+    const Step step = makeStep(backend, data, 0, SPLASH_TARGET_VERIFY_ROWS, kPageTokens,
+                               treesOf(kWithin.size(), SPLASH_TARGET_VERIFY_ROWS));
+    runDecode(backend, data, step, decodePlanOf(data, step));
+    const auto *begin = contents<uint16_t>(step.output);
+    return std::vector<uint16_t>(begin, begin + step.output.sizeBytes() / 2);
+  };
+  require(decoded(kSliding) == decoded(whole), "a windowed decode inside its window differs from the whole history's");
   require(outputs(kSliding, false, 1, 600, {0, 0, 0, 0}) == outputs(whole, false, 1, 600, {0, 0, 0, 0}) &&
               outputs(kSliding, false, 1, 24, {900, 0, 0, 0}) == outputs(whole, false, 1, 24, {900, 0, 0, 0}),
           "a windowed prefill inside its window differs from the whole history's");
@@ -776,7 +1017,65 @@ void checkPlans() {
       const ops::RelativeAttentionPlan last = RelativeAttention::lastTiles(plan);
       require(last.sequences()[0].firstTile + 1 == kv::attentionTiles(300), "the last tiles are not the last");
     }
+    // A decode step's single pass: the kernel of its lane cap (_r16 past the
+    // narrow cap's rows), window, position scale and queries' format, and a
+    // lane's splits of its own pages.
+    const ops::AttentionWorkspace lanes = RelativeAttention::laneWorkspace(layout);
+    for (const uint32_t cap : {kLaneRows, uint32_t{SPLASH_TARGET_VERIFY_ROWS}})
+      for (const auto variant : {kSliding, kFull, ops::RelativeAttentionVariant{}}) {
+        const std::array steps{ops::PagedAttention::chunkParams(5000, cap, kPageTokens, (5000 + cap + 31) / 32),
+                               ops::PagedAttention::chunkParams(70, cap, kPageTokens, (70 + cap + 31) / 32)};
+        const auto decode = [&](uint32_t int8QueriesFromPages) {
+          return RelativeAttention::plan(steps, layout, test::attentionRow(int8QueriesFromPages),
+                                         ops::Int8Activations::On, {2 * lanes.partialsBytes, 2 * lanes.statisticsBytes},
+                                         variant, ops::StepKind::Decode);
+        };
+        const std::string suffix = std::string(cap > kLaneRows ? "_r16" : "") +
+                                   (variant.windowTokens ? "_w1023" : "") + (variant.positionScaled ? "_scaled" : "");
+        const ops::RelativeAttentionPlan plan = decode(ops::kNever);
+        require(plan.decodePipeline() == "relative_attention_" + name + "_decode" + suffix &&
+                    plan.splitPipeline().empty() && plan.reducePipeline().empty() && plan.dispatches().size() == 1,
+                "a decode plan names another kernel");
+        for (size_t s = 0; s < steps.size(); ++s) {
+          const uint32_t pages = (steps[s].committed_tokens + cap + kPageTokens - 1) / kPageTokens;
+          require(plan.sequences()[s].splits ==
+                      RelativeAttention::decodeSplits(
+                          variant.windowTokens ? std::min(pages, kv::windowAttentionPages(kWindow)) : pages, cap),
+                  "a decode lane's splits are not its own pages'");
+        }
+        require(decode(1).decodePipeline() ==
+                    "relative_attention_" + std::string(format == kv::Format::Int8 ? "q8q" : "bf16") + "_decode" +
+                        suffix,
+                "a decode plan's INT8 queries score INT8 pages alone");
+        rejects([&] { static_cast<void>(RelativeAttention::lastTiles(plan)); }, "one tile each",
+                "a decode plan's last tiles were planned");
+      }
   }
+  // A lane's splits: one per kDecodePagesPerSplit pages, at most
+  // kDecodeTileSplits for a narrow cap's tile and half as many for a verify
+  // block's.
+  constexpr uint32_t perSplit = RelativeAttention::kDecodePagesPerSplit, most = RelativeAttention::kDecodeTileSplits;
+  constexpr uint32_t wide = SPLASH_TARGET_VERIFY_ROWS;
+  require(RelativeAttention::decodeSplits(1, kLaneRows) == 1 &&
+              RelativeAttention::decodeSplits(perSplit, kLaneRows) == 1 &&
+              RelativeAttention::decodeSplits(perSplit + 1, kLaneRows) == 2 &&
+              RelativeAttention::decodeSplits(kv::windowAttentionPages(kWindow), kLaneRows) ==
+                  (kv::windowAttentionPages(kWindow) + perSplit - 1) / perSplit &&
+              RelativeAttention::decodeSplits(1u << 20, kLaneRows) == most &&
+              RelativeAttention::decodeSplits(1u << 20, wide) == most / 2 &&
+              RelativeAttention::decodeSplits(perSplit + 1, wide) == 2,
+          "a decode lane's splits follow another rule");
+  for (const uint32_t cap : {kLaneRows + 1, uint32_t{SPLASH_TARGET_VERIFY_ROWS} + 1})
+    rejects(
+        [&] {
+          const std::array steps{ops::PagedAttention::chunkParams(5000, kLaneRows, kPageTokens, 158),
+                                 ops::PagedAttention::chunkParams(70, cap, kPageTokens, 4)};
+          static_cast<void>(RelativeAttention::plan(
+              cap > SPLASH_TARGET_VERIFY_ROWS ? std::span(steps).last(1) : std::span(steps), layoutOf(kv::Format::Int8),
+              test::attentionRow(1), ops::Int8Activations::On,
+              RelativeAttention::workspace(256, layoutOf(kv::Format::Int8)), kSliding, ops::StepKind::Decode));
+        },
+        "share a lane cap", "a decode step of lanes of other caps, or past a verify block, was planned");
   kv::Layout wider = layoutOf(kv::Format::Int8);
   wider.kvHeads = 4;
   rejects([&] { static_cast<void>(RelativeAttention::workspace(1, wider)); }, "no relative attention kernel",
@@ -824,6 +1123,35 @@ int main(int argc, char **argv) {
           checkVerify(backend, format, int8Queries, variant, std::span(kHistories).first(lanes));
         checkTreeVerify(backend, format, int8Queries, variant, std::array<uint32_t, 4>{3, 1015, 2000, 8190});
         checkSplitCounts(backend, format, int8Queries, variant, 4103);
+      }
+      // Decode steps' single pass, at the same histories: chains of one to
+      // four lanes of the narrow cap's rows, and of a row a lane (a cycle
+      // without a draft); trees of the narrow cap and of a verify block's
+      // rows, whole and of fewer rows on the device; a batch of eight
+      // lanes; each split count; and the prepare, split and reduce's bits.
+      for (const auto variant : {kSliding, kFull}) {
+        constexpr std::array<uint32_t, 4> kHistories{0, 1020, 1031, 9000};
+        constexpr std::array<uint32_t, 4> kTrees{3, 1015, 2000, 8190};
+        constexpr std::array<uint32_t, 8> kWide{0, 1020, 1031, 9000, 3, 1015, 2000, 8190};
+        constexpr std::array<uint32_t, 8> kEight{8, 8, 8, 8, 8, 8, 8, 8}, kOne{1, 1, 1, 1, 1, 1, 1, 1};
+        constexpr std::array<uint32_t, 8> kSixteen{16, 16, 16, 16, 16, 16, 16, 16};
+        for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+          checkDecode(backend, format, int8Queries, variant, std::span(kHistories).first(lanes), kLaneRows,
+                      std::span(kEight).first(lanes), false);
+        checkDecode(backend, format, int8Queries, variant, kHistories, kLaneRows, std::span(kOne).first(4), false);
+        checkDecode(backend, format, int8Queries, variant, kTrees, kLaneRows, std::array<uint32_t, 4>{8, 1, 5, 3},
+                    true);
+        checkDecode(backend, format, int8Queries, variant, kTrees, SPLASH_TARGET_VERIFY_ROWS,
+                    std::span(kSixteen).first(4), true);
+        checkDecode(backend, format, int8Queries, variant, kTrees, SPLASH_TARGET_VERIFY_ROWS,
+                    std::array<uint32_t, 4>{9, 1, 16, 12}, true);
+        checkDecode(backend, format, int8Queries, variant, kWide, kLaneRows, kEight, true);
+        for (const uint32_t cap : {kLaneRows, uint32_t{SPLASH_TARGET_VERIFY_ROWS}})
+          checkDecodeSplitCounts(backend, format, int8Queries, variant, 4103, cap);
+        checkDecodeBits(backend, format, int8Queries, variant, 1031, kLaneRows, false);
+        checkDecodeBits(backend, format, int8Queries, variant, 2000, 1, false);
+        checkDecodeBits(backend, format, int8Queries, variant, 8190, 5, true);
+        checkDecodeBits(backend, format, int8Queries, variant, 3, kLaneRows, true);
       }
       checkWindowWithinHistory(backend, format, int8Queries);
     }

@@ -27,3 +27,8 @@
 #define SPLASH_RELATIVE_ATTENTION_CLIP_EPSILON 1e-6f
 #define SPLASH_RELATIVE_ATTENTION_LOG_SCALE_ALPHA 0.1f
 #define SPLASH_RELATIVE_ATTENTION_LOG_SCALE_FLOOR 8192.0f
+
+// A decode step's single pass (ops::RelativeAttention::addDecode) splits each
+// lane's history into at most SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS runs:
+// the run that finishes last combines them, a simdgroup lane each.
+#define SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS 32u

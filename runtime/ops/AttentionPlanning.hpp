@@ -89,14 +89,16 @@ inline CommandRows commandRows(std::span<const kv::ChunkedPrefillParams> sequenc
 
 // Gathers a plan's sequences (in row order) into `dispatches` while their
 // tiles' splits fit `workspaceSlots` tile splits, so that no sequence's
-// partition depends on another's; returns the dispatches.
+// partition depends on another's; returns the dispatches. Each split of a
+// tile takes `splitSlots` slots (a relative attention single pass's two).
 inline uint32_t groupDispatches(std::span<const AttentionPlan::Sequence> sequences, uint32_t workspaceSlots,
-                                std::array<AttentionPlan::Dispatch, SPLASH_MAXIMUM_BATCH_WIDTH> &dispatches) {
+                                std::array<AttentionPlan::Dispatch, SPLASH_MAXIMUM_BATCH_WIDTH> &dispatches,
+                                uint32_t splitSlots = 1) {
   uint32_t count = 0;
   for (uint32_t s = 0; s < sequences.size(); ++s) {
     const AttentionPlan::Sequence &sequence = sequences[s];
     const uint32_t tiles = kv::attentionTiles(sequence.rows) - sequence.firstTile;
-    const uint32_t slots = tiles * sequence.splits;
+    const uint32_t slots = tiles * sequence.splits * splitSlots;
     if (slots > workspaceSlots)
       throw std::invalid_argument("the attention workspace holds no sequence's splits");
     // A sequence that does not fit the last dispatch starts the next.

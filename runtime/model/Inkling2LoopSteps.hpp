@@ -25,16 +25,17 @@ namespace splash::model {
 // and the messages, four a row (fp32, [rows][4][hiddenSize]); the k and v
 // inputs (the q input is buffers.normalized); the key and value projections
 // and their convolved rows (kvWidth each) and a full layer's dynamic taps of
-// each (KV heads x taps a row); the relative states and row sinks the
-// attention's projection stages for its split (fp32, in the queries' staged
-// rows); a message gate's concatenated norms (2 hiddenSize), low rank
-// (loopGateRank, three gates' in a row) and forget and gain rows (fp32; a
-// decode step's forget rows three fused gates' gated rows), and the fused
-// gates' counters (ops::MessageGate::kCountersBytes, zero between calls);
-// zero rows, which the MoE adds its weighted sum to
+// each (KV heads x taps a row); a prompt chunk's relative states and row
+// sinks the attention's projection stages for its split (fp32, in the
+// queries' staged rows); a message gate's concatenated norms (2 hiddenSize),
+// low rank (loopGateRank, three gates' in a row) and forget and gain rows
+// (fp32; a decode step's forget rows three fused gates' gated rows), and the
+// fused gates' counters (ops::MessageGate::kCountersBytes, zero between
+// calls); zero rows, which the MoE adds its weighted sum to
 // (ops::MoeBuffers::residual); and a decode step's
 // convolution inputs of every application, rows of stateColumns() values,
-// which its commit reads.
+// which its commit reads, and its relative attention's counters
+// (ops::RelativeAttention::kCountersBytes, zero between layers).
 struct Inkling2LoopScratch final {
   metal::MetalBuffer stack;
   metal::MetalBuffer previous;
@@ -58,6 +59,7 @@ struct Inkling2LoopScratch final {
   metal::MetalBuffer gateCounters;
   metal::MetalBuffer zeros;
   metal::MetalBuffer tape;
+  metal::MetalBuffer attentionCounters;
   // The rows each plane of `stack` and `previous` holds.
   uint32_t planeRows = 0;
 };

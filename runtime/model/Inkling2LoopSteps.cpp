@@ -40,10 +40,11 @@ struct Tensor final {
   bool carried;
 };
 
-// A prefill chunk's or a decode step's tensors. The attention stages its
-// relative states and row sinks in the queries' staged rows: a step's rows
-// and, each sequence's rows taking whole KV blocks, the rest of a block per
-// lane (RuntimeArenas.cpp targetTensorBytes).
+// A prefill chunk's or a decode step's tensors. A prompt chunk's attention
+// stages its relative states and row sinks in the queries' staged rows: a
+// step's rows and, each sequence's rows taking whole KV blocks, the rest of a
+// block per lane (RuntimeArenas.cpp targetTensorBytes); a decode step's
+// prepares them in its single pass.
 std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape &shape, bool decode) {
   const Inkling2LoopSchedule schedule(shape);
   const uint64_t hidden = g.hiddenSize, kv = shape.kvWidth;
@@ -69,10 +70,6 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
       {&Inkling2LoopScratch::valueTaps, bytesFor<uint16_t>(taps), 0, false},
       {&Inkling2LoopScratch::convolvedKeys, bytesFor<uint16_t>(kv), 0, false},
       {&Inkling2LoopScratch::convolvedValues, bytesFor<uint16_t>(kv), 0, false},
-      {&Inkling2LoopScratch::relativeStates, bytesFor<float>(relative), bytesFor<float>(stagedLaneRows * relative),
-       false},
-      {&Inkling2LoopScratch::rowSinks, bytesFor<float>(g.attentionQueryHeads),
-       bytesFor<float>(stagedLaneRows * g.attentionQueryHeads), false},
       {&Inkling2LoopScratch::gateConcat, bytesFor<uint16_t>(2 * hidden), 0, false},
       {&Inkling2LoopScratch::gateLow, bytesFor<uint16_t>(kMixerQueries * shape.gateRank), 0, false},
       {&Inkling2LoopScratch::gateForget, bytesFor<float>((decode ? kMixerQueries : 1) * hidden), 0, false},
@@ -81,8 +78,17 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
       {&Inkling2LoopScratch::zeros, bytesFor<uint16_t>(hidden), 0, false},
   };
   // A decode step's convolution inputs of every application, which its
-  // commit reads after the last (ops::ShortConvolution::addCommit).
-  if (decode) result.push_back({&Inkling2LoopScratch::tape, bytesFor<uint16_t>(schedule.stateColumns()), 0, false});
+  // commit reads after the last (ops::ShortConvolution::addCommit), and its
+  // relative attention's counters (ops::RelativeAttention::addDecode).
+  if (decode) {
+    result.push_back({&Inkling2LoopScratch::tape, bytesFor<uint16_t>(schedule.stateColumns()), 0, false});
+    result.push_back({&Inkling2LoopScratch::attentionCounters, 0, ops::RelativeAttention::kCountersBytes, false});
+  } else {
+    result.push_back({&Inkling2LoopScratch::relativeStates, bytesFor<float>(relative),
+                      bytesFor<float>(stagedLaneRows * relative), false});
+    result.push_back({&Inkling2LoopScratch::rowSinks, bytesFor<float>(g.attentionQueryHeads),
+                      bytesFor<float>(stagedLaneRows * g.attentionQueryHeads), false});
+  }
   return result;
 }
 
@@ -135,12 +141,14 @@ Inkling2LoopSteps::Inkling2LoopSteps(const QwenTargetGeometry &geometry, const I
   prefill_ = backend_.allocateBuffer(prefillBytes, metal::BufferStorage::Shared, "inkling2-prefill-scratch");
   decode_ = backend_.allocateBuffer(decodeBytes, metal::BufferStorage::Shared, "inkling2-decode-scratch");
   // The rows the MoE adds its weighted sum to, which nothing writes, and the
-  // fused gate's counters, which each gate leaves zero.
+  // fused gate's counters and a decode step's attention's, which each gate
+  // and each layer's attention leaves zero.
   for (const Inkling2LoopScratch &scratch : {prefillScratch(0), verifyScratch()})
     for (const metal::MetalBuffer &zeros : {scratch.zeros, scratch.gateCounters})
       std::memset(zeros.contents(), 0, zeros.sizeBytes());
+  const metal::MetalBuffer attentionCounters = verifyScratch().attentionCounters;
+  std::memset(attentionCounters.contents(), 0, attentionCounters.sizeBytes());
   requireStaging(prefillScratch(0), geometry_, kChunkRows);
-  requireStaging(verifyScratch(), geometry_, ExecutionLimits::stepRows(geometry_.lanes));
 }
 
 QwenTargetScratchBytes Inkling2LoopSteps::scratchBytes(const QwenTargetGeometry &geometry,
