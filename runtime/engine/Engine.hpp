@@ -521,6 +521,8 @@ private:
     // to render its own reply back, so its end keeps that reply's last state
     // (Cache::keepReply).
     bool rendersReplies = false;
+    // The earlier reply's state its start resumed from, superseded at its end.
+    uint64_t resumedFrom = 0;
     // The block of the prompt's replay boundary, where the conversation's
     // next turn resumes: its state is in use from the moment the request
     // reaches, reuses or restores it until the request ends, suspended or not.

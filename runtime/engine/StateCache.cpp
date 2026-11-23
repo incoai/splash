@@ -246,6 +246,39 @@ void StateCache::keepReply(StateCheckpoint checkpoint) noexcept {
   reindex(checkpoint.kvBlock, found->second);
 }
 
+void StateCache::supersede(uint64_t kvBlock, bool opportunistic) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end())
+    return;
+  Entry &entry = found->second;
+  if (entry.invalid || entry.checkpoint || entry.pins || !entry.ram || inUse(kvBlock) || persisting(kvBlock))
+    return;
+  entry.checkpoint = true;
+  entry.reply = opportunistic ? Reply::Opportunistic : Reply::None;
+  ++checkpointEntries_;
+  checkpointBytes_ += entry.ram->bytes();
+  if (entry.disk)
+    labelDisk(kvBlock, entry);
+  reindex(kvBlock, entry);
+}
+
+bool StateCache::dropDisposable(uint64_t keep) noexcept {
+  // A write frees the RAM copy once it starts (reclaim): one at a time.
+  for (const bool writes : {false, true})
+    for (std::optional<CacheEvictionCandidate> next = checkpointCandidate(); next; next = checkpointCandidate(next)) {
+      const uint64_t kvBlock = next->id;
+      const auto found = entries_.find(kvBlock);
+      if (kvBlock == keep || found == entries_.end() || inUse(kvBlock) || found->second.disk ||
+          reclaimWrites(kvBlock) != writes)
+        continue;
+      if ((writes ? reclaim(kvBlock) : erase(kvBlock, false)).evicted)
+        return true;
+      if (writes)
+        return false;
+    }
+  return false;
+}
+
 bool StateCache::checkpointPinned(StateCheckpoint checkpoint) const noexcept {
   const auto found = entries_.find(checkpoint.kvBlock);
   return found != entries_.end() && found->second.checkpoint &&

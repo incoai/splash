@@ -1146,7 +1146,10 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     // the lane needs, in whichever tier holds it: a promotion that found no
     // cache slot leaves it on disk. Other restored progress points, the end of
     // a resumed lane's generated history among them, retain their rolling
-    // lifetime.
+    // lifetime. A start after an earlier reply's state supersedes it at its
+    // end; a shared prefix's state stays as it is.
+    if (!resuming && resumeBoundary != promptReplayBoundary(active) && cache_.heldReply(lookup.state->kvBlock()))
+      active.resumedFrom = lookup.state->kvBlock();
     if (resumeBoundary == promptReplayBoundary(active)) {
       if (active.latestCheckpoint) {
         if (cache_.reuseStoredState(active.latestCheckpoint.kvBlock))
@@ -2222,6 +2225,13 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
   if (!keepContinuation && active.rendersReplies &&
       active.exactTokens.size() >= promptReplayBoundary(active) + WriteBehind::kMinimumTokens)
     cache_.keepReply(active.latestCheckpoint);
+  // The earlier reply's state its start resumed from is superseded by this
+  // turn's, which the next turn resumes from: a reclaim drops it unwritten.
+  // Kept ordinary, superseded states filled the cache until no reply was
+  // captured, and agent turns resumed after their reply 25% of the time, not
+  // 90%.
+  if (!keepContinuation && active.resumedFrom)
+    cache_.supersedeState(std::exchange(active.resumedFrom, 0), true);
   if (passCommand_.holds(id))
     settleEnded(passCommand_.yield());
   discardPendingStateBoundaries(active);
@@ -2248,7 +2258,14 @@ void Engine::release(Request &active) {
   }
   // Every end comes here; this request's use of its replay point ends,
   // after endRequest, so that the point is stamped newer than its KV tail.
+  const uint64_t replay = active.replayPoint.block();
   active.replayPoint.reset();
+  // So is its replay point once its reply's state is captured past it, in a
+  // conversation that renders replies back; a reclaim still writes it, the
+  // fallback where a reply is too short to keep.
+  if (active.rendersReplies && active.latestCheckpoint && active.latestCheckpoint.kvBlock != replay &&
+      cache_.stateResident(active.latestCheckpoint.kvBlock))
+    cache_.supersedeState(replay, false);
 }
 
 void Engine::sweepTerminal(double now) {

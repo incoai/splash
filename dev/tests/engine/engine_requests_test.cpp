@@ -1135,6 +1135,55 @@ void testRepliesAreKeptOnceAConversationRendersThemBack() {
           "a reclaim wrote the state of a reply too short to be worth a write");
 }
 
+// An agent's turns each render the 70-token reply before them back while the
+// state buffers hold four states, with and without an SSD tier: each turn's
+// states supersede the one it resumed from, so its reply's capture finds
+// room and the next turn resumes at the reply's last page.
+void testAgentTurnsResumeAfterTheirReplyWithTheStateCacheFull() {
+  for (const bool tier : {false, true}) {
+    test::EngineHarness h({.pages = 512});
+    Executor &executor = h.model;
+    executor.decodeFinishes = false;
+    if (tier) {
+      executor.offloadTier = std::make_shared<OffloadControl>();
+      executor.offloadTier->ready = true;
+    }
+    *executor.evictedStateBytes = 4 * test::State().bytes();
+    executor.reservationRoom = [&] {
+      if (*executor.evictedStateBytes < test::State().bytes())
+        return false;
+      *executor.evictedStateBytes -= test::State().bytes();
+      return true;
+    };
+    double now = 1;
+    std::vector<uint32_t> prompt(97);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    for (uint64_t turn = 1; turn <= 12; ++turn) {
+      h.engine.submit(conversationTurn(turn, prompt, 70));
+      tickUntil(h, now, [&] { return idle(h.engine); }, "the turn did not complete");
+      const auto reply = static_cast<uint32_t>(prompt.size() - 41) / KvCache::pageTokens * KvCache::pageTokens;
+      require(turn == 1 || h.events.starts.back() == reply,
+              "a turn did not resume at the reply's last page once the state cache was full");
+      prompt = nextTurn(prompt, 70);
+    }
+  }
+}
+
+// Agent turns whose KV reaches the wall end as any turn does.
+void testAgentTurnsEndAtTheWall() {
+  test::EngineHarness h({.pages = 128, .extentPages = 1});
+  h.storage.budgetPages = 26;
+  double now = 1;
+  fillToTheWall(h, now);
+  std::vector<uint32_t> prompt(97);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  for (uint64_t turn = 2; turn <= 12; ++turn) {
+    h.engine.submit(conversationTurn(turn, prompt, 70));
+    tickUntil(h, now, [&] { return idle(h.engine); }, "the turn did not complete");
+    prompt = nextTurn(prompt, 70);
+  }
+}
+
 // A capture at a page that holds a checkpoint already reuses it as it is: a
 // retry of turn 2 of a conversation whose replies are kept (2,100 tokens
 // each, rendered back) reaches turn 2's kept state at 4,320 again, and a
@@ -2522,6 +2571,9 @@ std::span<const test::TestCase> requestsTests() {
       {"testReplyCheckpointsAreNotWrittenAtTheWall", testReplyCheckpointsAreNotWrittenAtTheWall},
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},
       {"testRepliesAreKeptOnceAConversationRendersThemBack", testRepliesAreKeptOnceAConversationRendersThemBack},
+      {"testAgentTurnsResumeAfterTheirReplyWithTheStateCacheFull",
+       testAgentTurnsResumeAfterTheirReplyWithTheStateCacheFull},
+      {"testAgentTurnsEndAtTheWall", testAgentTurnsEndAtTheWall},
       {"testReplyCaptureReusesACheckpointAsItIs", testReplyCaptureReusesACheckpointAsItIs},
       {"testRetryLeavesAnOpportunisticReplyOpportunistic", testRetryLeavesAnOpportunisticReplyOpportunistic},
       {"testEndedReplyCheckpointIsDroppedAtTheWall", testEndedReplyCheckpointIsDroppedAtTheWall},

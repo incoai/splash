@@ -809,6 +809,9 @@ public:
   // A reply's state, opportunistic or kept (StateCache::markReply).
   void markReply(StateCheckpoint checkpoint) noexcept { states_.markReply(checkpoint); }
   void keepReply(StateCheckpoint checkpoint) noexcept { states_.keepReply(checkpoint); }
+  void supersedeState(uint64_t kvBlock, bool opportunistic) noexcept { states_.supersede(kvBlock, opportunistic); }
+  bool dropDisposableState(uint64_t keep) noexcept { return states_.dropDisposable(keep); }
+  [[nodiscard]] bool heldReply(uint64_t kvBlock) const { return kv_.heldReply(kvBlock); }
   // This exact disposable publication is pinned: retireCheckpointState
   // refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {

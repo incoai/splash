@@ -63,6 +63,7 @@ public:
   ~StateUse() noexcept;
 
   void reset() noexcept;
+  [[nodiscard]] uint64_t block() const noexcept { return kvBlock_; }
 
 private:
   friend class StateCache;
@@ -185,6 +186,13 @@ public:
   // back. A reuse by another publication, or a use, ends either.
   void markReply(StateCheckpoint checkpoint) noexcept;
   void keepReply(StateCheckpoint checkpoint) noexcept;
+  // An ordinary state a later state of its conversation superseded becomes a
+  // checkpoint, opportunistic or one a reclaim writes; one in use, pinned or
+  // on disk alone stays as it is.
+  void supersede(uint64_t kvBlock, bool opportunistic) noexcept;
+  // Frees the RAM of the least recently used disposable checkpoint but
+  // `keep`'s: one that needs no write, else the oldest whose write it starts.
+  bool dropDisposable(uint64_t keep) noexcept;
   // The matching checkpoint is pinned: retireCheckpointState refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept;
   // An unfinished request's conversation resumes from the state at this

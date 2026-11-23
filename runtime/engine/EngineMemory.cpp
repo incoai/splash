@@ -799,13 +799,17 @@ void Engine::reserveReplyCapture(Request &active, std::vector<StateCapture> &sta
   if (page - held > std::min(model::ExecutionLimits::targetVerifyRows, output))
     return;
   std::shared_ptr<StateReservation> buffers;
-  static_cast<void>(allocate(
-      [&] {
-        metal::AllocationFailure refusal = metal::AllocationFailure::None;
-        buffers = model_.reserveState(active.request.id, page, refusal);
-        return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
-      },
-      stateClaim(active, StateClass::Checkpoint, supersedes), Refusal::SettledOnce));
+  // Refused, it frees one disposable checkpoint, never the lane's own, and
+  // asks once more: nothing else, so a lane at the wall keeps its growth.
+  for (bool first = true; !buffers && (first || cache_.dropDisposableState(active.latestCheckpoint.kvBlock));
+       first = false)
+    static_cast<void>(allocate(
+        [&] {
+          metal::AllocationFailure refusal = metal::AllocationFailure::None;
+          buffers = model_.reserveState(active.request.id, page, refusal);
+          return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
+        },
+        stateClaim(active, StateClass::Checkpoint, supersedes), Refusal::SettledOnce));
   if (buffers) {
     states.push_back({page, std::move(buffers)});
     captures.push_back({page});
