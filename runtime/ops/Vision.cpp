@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <unistd.h>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -99,12 +98,11 @@ void requireWeights(const VisionWeights &model) {
 
 } // namespace
 
-// As Metal allocates the arena: whole pages, as arenaBytes counts them.
+// Whole pages, each tower's the sum of its tensors' (alignUp), so the arena
+// Metal allocates is as large (arenaBytes).
 uint64_t ImageEncoder::scratchBytes(const VisionLayout &layout, uint32_t maximumPatches) {
-  const uint64_t bytes = layout.tower == VisionTower::Inkling ? InklingVision::scratchBytes(layout, maximumPatches)
-                                                              : Vision::scratchBytes(layout, maximumPatches);
-  const uint64_t page = static_cast<uint64_t>(getpagesize());
-  return (bytes + page - 1) / page * page;
+  return layout.tower == VisionTower::Inkling ? InklingVision::scratchBytes(layout, maximumPatches)
+                                              : Vision::scratchBytes(layout, maximumPatches);
 }
 
 std::shared_ptr<ImageEncoder> ImageEncoder::make(metal::MetalBackend &backend, const VisionWeights &model,

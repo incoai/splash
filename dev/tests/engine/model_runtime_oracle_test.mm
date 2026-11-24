@@ -1,5 +1,6 @@
 #include "AwakeClock.hpp"
 #include "ChainRows.hpp"
+#include "Checked.hpp"
 #include "LinearNumerics.hpp"
 #include "PenaltyReference.hpp"
 #include "StateCodecReference.hpp"
@@ -1025,6 +1026,15 @@ uint64_t imageAllocationBytes(metal::MetalBackend &backend, const model::LoadedM
          embeddingAllocationBytes(backend, model, span);
 }
 
+// The bytes a start claims for an image nothing holds yet, before it
+// allocates them: its pixels' and its embedding rows', each in whole pages
+// (16 KiB), so that a budget one byte under a start's claims refuses it.
+uint64_t imageClaimBytes(const model::LoadedModel &model, const ImageSpan &span) {
+  return alignUp(span.pixelBytes(imagePatchPixels)) +
+         alignUp(uint64_t{span.grid().mergedTokens()} * model.vision.tensors.layout.outputHiddenSize *
+                 sizeof(uint16_t));
+}
+
 struct AllocationFault final {
   int remaining = -1;
   bool throwAfterAllocation = false;
@@ -1051,10 +1061,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
     const uint64_t attemptBytes =
         ops::ImageEncoder::scratchBytes(model.vision.tensors.layout,
                                         span.gridHeight * span.gridWidth) +
-        span.pixelBytes(imagePatchPixels) +
-        uint64_t{span.grid().mergedTokens()} *
-            model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t) +
-        states.layout().laneBytes();
+        imageClaimBytes(model, span) + states.layout().laneBytes();
     fault.remainingBytes = attemptBytes - 1;
     const StateAdmission denied = executor.begin(image.modelView());
     const uint64_t unspent = fault.remainingBytes;
@@ -3592,11 +3599,6 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const uint64_t laneBytes = states.layout().laneBytes();
-  const auto imageBytes = [&](const ImageSpan &span) {
-    return span.pixelBytes(imagePatchPixels) +
-           uint64_t{span.grid().mergedTokens()} *
-               model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t);
-  };
   std::vector<uint32_t> prompt(128);
   for (uint32_t index = 0; index < prompt.size(); ++index)
     prompt[index] = 1 + index;
@@ -3618,7 +3620,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   EngineRequest fresh = imageRequest(118, {16, 16, 8, 8, 193, 479});
   const uint64_t arenaBytes = executor.telemetry().visionArenaBytes;
   {
-    fault.remainingBytes = laneBytes + imageBytes(fresh.images.front()) - 1;
+    fault.remainingBytes = laneBytes + imageClaimBytes(model, fresh.images.front()) - 1;
     const StateAdmission refused = executor.begin(fresh.modelView());
     fault = {};
     require(!refused.granted() && refused.held &&

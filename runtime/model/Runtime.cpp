@@ -4,6 +4,7 @@
 #include "model/RuntimeInstrumentation.hpp"
 #endif
 #include "AwakeClock.hpp"
+#include "Checked.hpp"
 #include "StderrLine.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
@@ -51,7 +52,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <unistd.h>
 
 namespace splash::model {
 namespace {
@@ -926,8 +926,9 @@ struct Runtime::Impl {
   // Keeps encoded rows for reuse as the most recently used, dropping the
   // least recently used while the rows kept for reuse exceed the cache's
   // bytes. Rows count as Metal allocates them (MetalBuffer::allocatedBytes),
-  // as the memory a reclaim frees: an image whose patches are no whole pages
-  // (Inkling 2's 20-pixel ones) takes more than its values.
+  // as the memory a reclaim frees: an image's rows are whole pages only at
+  // some token counts (every 32 tokens of Inkling-2-Mini's 2304 values), and
+  // take more than their values at the others.
   void retain(const std::shared_ptr<ImageRows> &rows) {
     if (rows->cached) {
       embeddingCache.splice(embeddingCache.begin(), embeddingCache, *rows->cached);
@@ -1138,8 +1139,7 @@ struct Runtime::Impl {
         rows->key = imageKey(span);
         imageRows.insert_or_assign(rows->key, rows);
         // As Metal allocates them, whole pages, as the image cache counts them.
-        const uint64_t page = static_cast<uint64_t>(getpagesize());
-        for (const uint64_t buffer : {pixelBytes(span), embeddingBytes(span)}) bytes += (buffer + page - 1) / page * page;
+        bytes += alignUp(pixelBytes(span)) + alignUp(embeddingBytes(span));
       } else if (rows->embeddings && std::ranges::find(shared, rows) == shared.end()) {
         shared.push_back(rows);
       }
@@ -1193,28 +1193,16 @@ struct Runtime::Impl {
     });
   }
 
-  // The runs of an item's rows, from row `rowBegin` of its chunk on, that
-  // hold an image's rows (addImageRows), which a target whose embedding rows
-  // are normed leaves as they are (QwenTargetPrefillSequence::imageRows).
-  static std::vector<QwenTargetImageRows> imageRowRuns(const Request &entry, const ModelBatchItem &item,
-                                                       uint32_t rowBegin) {
-    std::vector<QwenTargetImageRows> runs;
-    const uint64_t chunkBegin = item.logicalPosition, chunkEnd = chunkBegin + item.tokenCount;
-    for (const ImageState &image : entry.images) {
-      const uint64_t begin = std::max<uint64_t>(chunkBegin, image.span.offset);
-      const uint64_t end = std::min<uint64_t>(chunkEnd, image.span.end());
-      if (begin < end)
-        runs.push_back({rowBegin + static_cast<uint32_t>(begin - chunkBegin), static_cast<uint32_t>(end - begin)});
-    }
-    return runs;
-  }
-
   // Encodes in `encodes` every image whose rows first appear in this chunk
   // and overwrites the chunk's placeholder embedding rows, the item's from
   // row `rowBegin` of `hidden` on, with the image rows. Text-only requests
-  // add no dispatches.
-  void addImageRows(CommandGraph &graph, CommandGraph &encodes, Request &entry, const ModelBatchItem &item,
-                    const MetalBuffer &hidden, uint32_t rowBegin) {
+  // add no dispatches. Returns the runs of the chunk's rows it wrote, which a
+  // target whose embedding rows are normed leaves as they are
+  // (QwenTargetPrefillSequence::imageRows).
+  std::vector<QwenTargetImageRows> addImageRows(CommandGraph &graph, CommandGraph &encodes, Request &entry,
+                                                const ModelBatchItem &item, const MetalBuffer &hidden,
+                                                uint32_t rowBegin) {
+    std::vector<QwenTargetImageRows> runs;
     const uint64_t chunkBegin = item.logicalPosition;
     const uint64_t chunkEnd = chunkBegin + item.tokenCount;
     for (ImageState &image : entry.images) {
@@ -1233,12 +1221,13 @@ struct Runtime::Impl {
         ++counters.imageEncodes;
       }
       const uint32_t width = model.vision.tensors.layout.outputHiddenSize;
-      ops::RowCopy::add(
-          graph, rows.embeddings,
-          {static_cast<uint32_t>(begin - image.span.offset), width, 0}, hidden,
-          {rowBegin + static_cast<uint32_t>(begin - chunkBegin), width, 0},
-          static_cast<uint32_t>(end - begin), width);
+      const QwenTargetImageRows run{rowBegin + static_cast<uint32_t>(begin - chunkBegin),
+                                    static_cast<uint32_t>(end - begin)};
+      ops::RowCopy::add(graph, rows.embeddings, {static_cast<uint32_t>(begin - image.span.offset), width, 0}, hidden,
+                        {run.begin, width, 0}, run.rows, width);
+      runs.push_back(run);
     }
+    return runs;
   }
 
   // The request's next 64 random bits: splitmix64 of its seed and counter.
@@ -2319,7 +2308,7 @@ struct Runtime::Impl {
     // Each part's states inside its rows, in their reservations' cells.
     std::vector<std::vector<QwenTargetStateCapture>> inside;
     inside.reserve(uint64_t{chunks.size()} * kLaneCount);
-    // Each part's rows of images.
+    // Each part's rows of images, which a pass that begins the layers writes.
     std::vector<std::vector<QwenTargetImageRows>> imageRuns;
     imageRuns.reserve(uint64_t{chunks.size()} * kLaneCount);
     std::vector<QwenTargetPrefillChunk> modelChunks;
@@ -2339,7 +2328,9 @@ struct Runtime::Impl {
       for (uint32_t s = 0; s < chunk.sequences.size(); ++s) {
         const PrefillSequence &sequence = chunk.sequences[s];
         const ModelBatchItem &part = sequence.part;
-        if (begins) addImageRows(graph, encodes, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
+        std::vector<QwenTargetImageRows> &imageRows = imageRuns.emplace_back();
+        if (begins)
+          imageRows = addImageRows(graph, encodes, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
         const GdnParityBuffers &in = *from[sequence.lane], &out = *written[c][s];
         from[sequence.lane] = &out;
         QwenTargetPrefillSequence &destination = sequences[c].emplace_back();
@@ -2357,7 +2348,7 @@ struct Runtime::Impl {
         destination.recurrentOut = out.recurrentLayers;
         destination.auxiliaryIn = in.auxiliary;
         destination.auxiliaryOut = out.auxiliary;
-        destination.imageRows = imageRuns.emplace_back(imageRowRuns(*sequence.entry, part, sequence.rowBegin));
+        destination.imageRows = imageRows;
         // A state at the part's end takes the codes of the state the part
         // writes, and the convolution rows and auxiliary state of the cell
         // it writes them to (above, or sealStates).
