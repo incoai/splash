@@ -362,6 +362,9 @@ struct Section final {
   uint64_t rows = 0;
   uint64_t columns = 0;
   std::vector<Rows> gathered{};
+  // A FloatTensor whose BF16 rows widen to F32: a message gate whose call
+  // mixes BF16 and other formats, which the fused kernels take in one.
+  bool widened = false;
 };
 
 // The images of a target whose family lists its images' tensors: its

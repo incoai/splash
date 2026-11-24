@@ -401,14 +401,17 @@ public:
   // F32 or BF16 rows as stored, or another type's (a GGUF that quantizes
   // them, as AtomicChat's Q8_0 gates) as the F32 values the GPU decodes them
   // to, as the format's gather does.
-  void floatTensor(const std::string &name, uint64_t rows, uint64_t columns) {
+  // widened, a BF16 one's widen to F32 exactly.
+  void floatTensor(const std::string &name, uint64_t rows, uint64_t columns, bool widened = false) {
     const GgufTensor *tensor = find(name, floatTensorType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
       throw GgufError("expected a [" + std::to_string(rows) + ", " + std::to_string(columns) + "] tensor: " + name);
-    if (floatProjectionType(tensor->type)) return copiedRows(*tensor, storedRowBytes(*tensor));
+    const bool widen = widened && tensor->type == ggml::kBF16;
+    if (floatProjectionType(tensor->type) && !widen) return copiedRows(*tensor, storedRowBytes(*tensor));
     image_.descriptor(ggml::kF32, rows, columns, {}, {rows * columns * sizeof(float), 0, 0}, name);
-    image_.copy(tensorRows(*tensor, rows, storedRowBytes(*tensor)), Conversion::DequantizeToFloat32);
+    image_.copy(tensorRows(*tensor, rows, storedRowBytes(*tensor)),
+                widen ? Conversion::WidenToFloat32 : Conversion::DequantizeToFloat32);
   }
 
   // A projection [rows, columns] of fewer rows than a plane tile holds: F32
@@ -835,7 +838,7 @@ void addSection(Builder &b, const QwenTargetDimensions &g, const Section &sectio
     return section.gathered.empty() ? b.floatValues(section.name, section.rows)
                                     : b.gatheredValues(section.gathered, section.rows);
   case Section::Kind::Quantized: return b.quantized(section.name, section.rows, section.columns);
-  case Section::Kind::FloatTensor: return b.floatTensor(section.name, section.rows, section.columns);
+  case Section::Kind::FloatTensor: return b.floatTensor(section.name, section.rows, section.columns, section.widened);
   case Section::Kind::SmallProjection: return b.smallProjection(section.name, section.rows, section.columns);
   case Section::Kind::Router: return b.router(section.name, section.rows, section.columns);
   case Section::Kind::RoutedExperts: return b.routedExperts(section.name, section.rows, section.columns, g.hiddenSize);

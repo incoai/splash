@@ -1434,6 +1434,8 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
   };
   // Each gate's BF16 bytes, by the release's name and the GGUF's.
   std::map<std::string, std::vector<uint8_t>> bfloatGates;
+  // Each gate's down projection's BF16 bytes, by the GGUF's name.
+  std::map<std::string, std::vector<uint8_t>> bfloatDowns;
   std::vector<float> crossQueries(2 * loops * hidden), crossKvQueries(2 * loops * hidden), messageQueries;
   for (uint32_t layer = 0; layer < g.weightLayers; ++layer) {
     const std::string l = std::to_string(layer), gp = "blk." + l + ".";
@@ -1677,6 +1679,7 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
         }
         gguf.push_back({converted, {columns, rows}, model::ggml::kF32, bytes});
         bfloatGates[release] = bfloatGates[converted] = bfloat;
+        if (index == 0) bfloatDowns[converted] = bfloat;
       }
       const std::vector<float> downT = transposed(projections[0], rank, 2 * hidden, false),
                                forgetT = transposed(projections[1], hidden, rank, false),
@@ -1807,6 +1810,21 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
     keeps = keptConverted[image] == kept[image] ||
             (image < g.weightLayers && image + g.blockResidualPeriod >= g.weightLayers);
   check(keeps, "an Inkling-2-Mini checkpoint of BF16 gates keeps them, as its GGUF does");
+
+  // A GGUF whose calls of gates mix BF16 and other formats, as kaitchup's
+  // dondon quants keep some BF16 beside Q8_0 ones: its BF16 gates widen to
+  // F32, exactly, so it writes the F32 GGUF's images.
+  std::vector<Tensor> mixedGguf = gguf;
+  for (Tensor &tensor : mixedGguf)
+    if (const auto found = bfloatDowns.find(tensor.name); found != bfloatDowns.end()) {
+      tensor.type = model::ggml::kBF16;
+      tensor.data = found->second;
+    }
+  const auto mixedPath = directory / "inkling2-mixed-gates.gguf";
+  splash::test::writeFile(mixedPath, test_gguf::file(inkling2Metadata(g), mixedGguf));
+  model::WeightSource mixedSource(mixedPath);
+  check(written(model::ggufTargetPlan(g).images(model::GgufFile(mixedSource), {})) == converted,
+        "an Inkling-2-Mini GGUF whose gates mix BF16 and F32 widens them to its F32 GGUF's images");
 }
 
 } // namespace

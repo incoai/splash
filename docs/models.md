@@ -269,7 +269,11 @@ have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
   projections, Inkling 2's message gates and sink projections): F32 or BF16
   as stored, or any of the linears' formats, loaded as the F32 values it
   holds (AtomicChat's Q8_0 and Q4_K/Q5_0 gates, the sink projections of
-  lmstudio-community's and ggml-org's files in their queries' format);
+  lmstudio-community's and ggml-org's files in their queries' format); a
+  call of Inkling 2's message gates that mixes BF16 with another format, as
+  kaitchup's smallest quants keep some gates BF16 beside Q8_0 ones, has its
+  BF16 gates widened to F32, exactly, as a checkpoint's are
+  ([Inkling 2's checkpoints](#inkling-2s-checkpoints));
 - the GDN convolution, decay and time-step bias: F32;
 - GDN alpha and beta: each any of the linears' formats or F32. Two of one
   quantized type other than BF16 and F16 load as one segment of the GDN input
