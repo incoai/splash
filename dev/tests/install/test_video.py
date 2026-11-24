@@ -311,6 +311,87 @@ class VideoModelTest(unittest.TestCase):
             with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
                 self.assertEqual(upstream.prepare(chosen), upstream.UNREACHABLE)
 
+    def test_a_first_installation_without_the_hub_reads_its_sources_cache(self):
+        """With neither the Hub nor an installation, the sources' Hub cache
+        snapshots at their pins key the entry as their listings do (the key
+        of test_each_variant_keeps_the_key_and_manifest_it_was_installed_with);
+        a snapshot without a file the conversion reads is refused."""
+        for repo, files in SOURCES.items():
+            build = functools.partial(tree, files=files)
+            cached_snapshot(self.cache, repo, COMMITS[repo], build)
+        refs = self.cache / hub.folder_name(H3.release) / "refs"
+        refs.mkdir()
+        (refs / "main").write_text(COMMITS[H3.release])
+        branch = self.cache / hub.folder_name(VDN) / "snapshots" / COMMITS[VDN] / BRANCH
+        blob = os.readlink(branch)
+        branch.unlink()
+        with (
+            mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True),
+            mock.patch("huggingface_hub.HfApi", side_effect=AssertionError("network")),
+        ):
+            with self.assertRaisesRegex(
+                models.ModelError, f"{VDN} is missing files MiniMax-H3 needs: {BRANCH}$"
+            ):
+                self.install()
+            branch.symlink_to(blob)
+            link, _ = self.install()
+        self.assertEqual(
+            assembly.verify(link)["video"]["key"],
+            "6a813d51d9ab9cbec15813c249507eaafa465ba0f7d40104a7dc09211c3f3c87",
+        )
+
+    def test_a_conversion_settles_its_preview_decoder_first(self):
+        """The preview decoder's unit alone may need the network, so it runs
+        before the others: where it cannot be had, no other unit has run."""
+        ran = []
+
+        def unit(name, refused=False):
+            def run(_):
+                ran.append(name)
+                if refused:
+                    raise models.ModelError("cannot read TAEH3")
+                return {}
+
+            return conversion.Unit(name, (name,), run)
+
+        units = [
+            unit("block 0"),
+            unit(video.PREVIEW_UNIT, refused=True),
+            unit("manifest"),
+        ]
+        with (
+            tempfile.TemporaryDirectory() as stage,
+            mock.patch.object(h3, "units", return_value=units),
+            mock.patch.object(video, "_listed", lambda repo: repo),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(models.ModelError, "cannot read TAEH3"),
+        ):
+            video._convert(Path(stage), H3.variants["vdn-8"], None, None, "model")
+        self.assertEqual(ran, [video.PREVIEW_UNIT])
+
+    def test_an_installation_the_disk_has_no_room_for_is_refused_first(self):
+        """Before its first download: the files to download, the encoder's
+        trimmed shards and the entry, on one volume here."""
+        fake = self.hub()
+        remote = {repo: fake.remote / repo / COMMITS[repo] for repo in SOURCES}
+        downloads = [(H3.release, "LICENSE"), (H3.release, "FL2VA/tokenizer/tokenizer.json"),
+                     (H3.encoder, "config.json"), (H3.encoder, "model-00001-of-00003.safetensors")]  # fmt: skip
+        trimmed = tensors(remote[H3.encoder] / "model-00002-of-00003.safetensors")
+        needed = sum((remote[r] / n).stat().st_size for r, n in downloads) + sum(
+            len(data) for n, (_, _, data) in trimmed.items() if video.encoder_reads(n)
+        )
+        with (
+            mock.patch.dict(video.ENTRY_BYTES, {"vdn-8": 10**6}),
+            mock.patch.object(hub, "_available_bytes", lambda path: needed + 10**6 - 1),
+            self.assertRaises(models.ModelError) as refused,
+        ):
+            self.install()
+        self.assertEqual(
+            (refused.exception.kind, refused.exception.details["needed"]),
+            ("disk", needed + 10**6),
+        )
+        self.assertEqual(fake.downloads, [])
+
     def test_an_interrupted_conversion_resumes_at_its_first_unit_not_written(self):
         self.hub()
         self.fail = {"vdn-w8-block00.safetensors"}

@@ -200,7 +200,7 @@ def _call(port, path, data=None, content_type=None, method=None, timeout=30):
         raise OSError(f"the server's answer broke off: {error!r}") from None
 
 
-def _ensure_runtime():
+def _ensure_runtime(video=False):
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
@@ -218,15 +218,17 @@ def _ensure_runtime():
                 ).returncode:
                     raise LauncherError("source build failed")
     # The engine refuses an unsupported Mac only once the model is prepared;
-    # its own check refuses it before tens of GB are downloaded.
+    # its own check refuses it before tens of GB are downloaded, with the
+    # video engine's rule too for a video model (video).
+    check = ["device-check", "video"] if video else ["device-check"]
     try:
-        model_artifacts.run_engine(["device-check"], "device check")
+        model_artifacts.run_engine(check, "device check")
     except model_artifacts.ModelError as error:
         raise LauncherError(str(error), serve_record.DEVICE) from None
 
 
 def _ensure_installed(selection, spec=None):
-    _ensure_runtime()
+    _ensure_runtime(video=selection.repo_id == families.H3.release)
     command = [
         str(paths.PYTHON),
         str(ROOT / "install/models.py"),

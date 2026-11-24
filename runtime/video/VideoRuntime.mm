@@ -363,6 +363,12 @@ bool servesVideo(const std::filesystem::path &modelRoot) {
   }
 }
 
+std::optional<std::string> deviceRefusal() {
+  if (metal::probeDeviceCapabilities().appleGpuFamily < 10)
+    return "the video engine runs on an Apple10 GPU (M5) or later";
+  return std::nullopt;
+}
+
 int tabulateAdaLn(const std::filesystem::path &metallib, int argc, char **argv) {
   int32_t steps = 0;
   const std::string_view stepsText = argc == 6 ? argv[5] : "";
@@ -394,8 +400,8 @@ int serve(const std::filesystem::path &metallib, const std::filesystem::path &mo
   using Kind = protocol::StartFailureKind;
   Kind kind = Kind::Device;
   try {
-    if (metal::probeDeviceCapabilities().appleGpuFamily < 10)
-      throw std::runtime_error("the video engine runs on an Apple10 GPU (M5) or later");
+    if (const std::optional<std::string> refusal = deviceRefusal())
+      throw std::runtime_error(*refusal);
     kind = Kind::Internal;
     backend = std::make_unique<metal::MetalBackend>(metallib.string());
     ops::checkRegisterLayout(*backend);

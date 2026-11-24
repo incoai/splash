@@ -129,6 +129,8 @@ class FastH3InstallTest(unittest.TestCase):
             ),
             # The fake sources' commits are the ones pinned.
             mock.patch.dict(H3.revisions, COMMITS | {PIKA: "6" * 40}),
+            # The real entries' bytes, which the fake sources' are not.
+            mock.patch.dict(video.ENTRY_BYTES, clear=True),
         ):
             self.enterContext(patch)
         self.fake = FakeHub(self, self.cache)

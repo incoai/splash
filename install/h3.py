@@ -44,7 +44,7 @@ import numpy as np
 
 from . import conversion, models
 from .families import H3
-from .video import RECIPE
+from .video import PREVIEW_UNIT, RECIPE, content_id
 
 # Each variant's OpenVDN stage, and whether its turbo adapter applies.
 STAGES = {
@@ -62,6 +62,15 @@ TAEH3 = "safetensors/taeh3.safetensors"
 TAEH3_SHA256 = "4fd022bfcab08772fe0536b17ea1a3bbb5625be11e397868d1c5d891863d4c13"
 # The sources a conversion reads besides the release's and OpenVDN's commits.
 PINNED = {TAEH3_REPO: TAEH3_COMMIT}
+# The preview decoder preview() converts from that TAEH3, by its files'
+# SHA-256: a converted entry that holds them was converted from the same
+# file, so a conversion copies them (converted_preview) and reads no TAEH3.
+# A change to what preview() writes must change these two with it: with
+# stale ones a conversion would copy an older entry's decoder.
+PREVIEW_SHA256 = {
+    "preview/taeh3_dec_f16.bin": "fc9d6241a14e495894db74c62acdb042acfd15e68cf19836339b3d605b4d7b2b",
+    "preview/manifest.json": "7b82c1d916c426b5fcddd2d01fb2d9670831a7e959f402ce6b54540dfe1e5e5b",
+}
 BLOCKS = 50
 # The recipe's QKFIX blocks, whose q / k / v run in fp16: FL2VA's blocks of
 # QK gain above QKFIX_GAIN, which its manifest checks (check_qkfix).
@@ -1058,8 +1067,9 @@ def preview(tensors):
 # ---------------------------------------------------------------- units
 def inputs(variant, release, vdn):
     """The files the variant's conversion reads, REPO/NAME -> the content ID
-    the Hub reports (an LFS file's SHA-256, else its Git blob ID), and
-    TAEH3's SHA-256; release and vdn as the Hub listed them."""
+    the Hub reports (an LFS file's SHA-256, else its Git blob ID;
+    video.content_id), and TAEH3's SHA-256; release and vdn as the Hub
+    listed them, or as their Hub cache snapshots hold them."""
     stage, turbo = STAGES[variant]
     names = {
         release: [n for n in release.files if n.startswith(TRANSFORMER)
@@ -1071,12 +1081,30 @@ def inputs(variant, release, vdn):
     }  # fmt: skip
     files = {f"{TAEH3_REPO}/{TAEH3}": TAEH3_SHA256}
     for repo, wanted in names.items():
-        if missing := sorted(n for n in wanted if n not in repo.sizes):
+        if missing := sorted(n for n in wanted if n not in repo.files):
             raise models.ModelError(
                 f"{repo.name} is missing files MiniMax-H3 needs: {', '.join(missing)}"
             )
-        files |= {f"{repo.name}/{n}": repo.sizes[n][1] for n in sorted(wanted)}
+        files |= {f"{repo.name}/{n}": content_id(repo, n) for n in sorted(wanted)}
     return files
+
+
+def converted_preview(entries):
+    """The preview decoder's files (PREVIEW_SHA256), name -> bytes, from a
+    converted entry in the folder entries that holds them, else None: TAEH3
+    is not on the Hub, so the Hub cache never holds it, and an installation
+    this Mac already has stands in for the network."""
+    for entry in sorted(entries.iterdir()):
+        try:
+            files = {name: (entry / name).read_bytes() for name in PREVIEW_SHA256}
+        except OSError:
+            continue
+        if all(
+            hashlib.sha256(files[name]).hexdigest() == digest
+            for name, digest in PREVIEW_SHA256.items()
+        ):
+            return files
+    return None
 
 
 def taeh3():
@@ -1089,7 +1117,10 @@ def taeh3():
             httpx.get(url, follow_redirects=True, timeout=60).raise_for_status().content
         )
     except httpx.HTTPError as error:
-        raise models.ModelError(f"cannot read {url}: {error}") from error
+        raise models.ModelError(
+            f"cannot read {url}: {error}. TAEH3 is not on the Hub, and no "
+            "installation on this Mac holds its converted preview decoder"
+        ) from error
     if hashlib.sha256(data).hexdigest() != TAEH3_SHA256:
         raise models.ModelError(f"{url} is not the TAEH3 this release converts")
     length = int.from_bytes(data[:8], "little")
@@ -1194,7 +1225,8 @@ def decoders(stage, release):
         U("audio VAE decoder", audio_files,
           writes(audio_files, lambda t: audio(t, models.read_json(release.file(AUDIO_VAE + "config.json")))),
           single(audio_vae)),
-        U("TAEH3 preview decoder", preview_files, lambda _: dict(zip(preview_files, preview(taeh3())))),
+        U(PREVIEW_UNIT, preview_files,
+          lambda _: converted_preview(stage.parent) or dict(zip(preview_files, preview(taeh3())))),
     ]  # fmt: skip
 
 

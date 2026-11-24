@@ -53,6 +53,7 @@ import numpy as np
 
 from . import conversion, h3, hub, models
 from .families import H3
+from .video import content_id
 
 RECIPE = "h3-w8a8-fasth3-v1"
 # Each variant's repository the recipe reads with the release.
@@ -866,12 +867,15 @@ def _student_4():
 
 
 def _require_base(release):
-    """The release's FL2VA transformer shards must be the bundle's base's."""
+    """The release's FL2VA transformer shards must be the bundle's base's,
+    by their content IDs (a commit's listing, or its Hub cache snapshot)."""
     if release.revision == LORA_BASE:
         return
     base = hub.Repository.resolve(release.name, LORA_BASE)
     for name in _transformer_files(release, h3.TRANSFORMER, ".index.json"):
-        if base.sizes.get(name) != release.sizes.get(name):
+        if name not in base.files or (
+            content_id(base, name) != content_id(release, name)
+        ):
             raise models.ModelError(
                 f"{release.name}'s {name} is not the one at {LORA_BASE[:12]}, which "
                 f"{LORA_4} applies to"
@@ -891,8 +895,9 @@ def _checkpoint(spec, companion):
 
 def inputs(variant, release, companion, spec=None):
     """The files the variant's conversion reads, REPO/NAME -> the content ID
-    the Hub reports, and TAEH3's SHA-256; release and companion as the Hub
-    listed them, spec the variant's (families.Variant.spec), if any."""
+    the Hub reports (video.content_id), and TAEH3's SHA-256; release and
+    companion as the Hub listed them, or as their Hub cache snapshots hold
+    them, spec the variant's (families.Variant.spec), if any."""
     decoders = [
         f"{d}{n}"
         for d in (h3.VIDEO_VAE, h3.AUDIO_VAE)
@@ -916,11 +921,11 @@ def inputs(variant, release, companion, spec=None):
                  companion: [LORA_FILE], _student_4(): list(CONTRACT)}  # fmt: skip
     files = {f"{h3.TAEH3_REPO}/{h3.TAEH3}": h3.TAEH3_SHA256}
     for repo, wanted in names.items():
-        if missing := sorted(n for n in wanted if n not in repo.sizes):
+        if missing := sorted(n for n in wanted if n not in repo.files):
             raise models.ModelError(
                 f"{repo.name} is missing files FastH3 needs: {', '.join(missing)}"
             )
-        files |= {f"{repo.name}/{n}": repo.sizes[n][1] for n in sorted(wanted)}
+        files |= {f"{repo.name}/{n}": content_id(repo, n) for n in sorted(wanted)}
     return files
 
 

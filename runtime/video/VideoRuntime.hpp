@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace splash::video {
@@ -54,6 +55,10 @@ private:
 
 // Whether the assembly at modelRoot holds a video model: its model.json's target_format.
 [[nodiscard]] bool servesVideo(const std::filesystem::path &modelRoot);
+
+// The video engine's device rule, beside the engine's own (metal::DeviceCapabilities): its refusal of this Mac, or
+// none on an Apple10 GPU (M5) or later. serve applies it as it starts, and `device-check video` before any download.
+[[nodiscard]] std::optional<std::string> deviceRefusal();
 
 // The engine process on an Apple10 GPU (M5) or later, of the stages `compose` makes on its backend: serves until the
 // client ends the stream or a stop signal. The process's exit status (engine::NativeProcessExit).

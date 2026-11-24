@@ -162,7 +162,7 @@ void printUsage(std::string_view executable) {
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " vision-check mlx-affine|gguf safetensors|gguf CONFIG ROOT");
-  writeStderrLine("       " + command + " device-check");
+  writeStderrLine("       " + command + " device-check [video]");
   writeStderrLine("       " + command + " families");
 }
 
@@ -452,12 +452,16 @@ int serveNative(int argc, char **argv) {
   return static_cast<int>(exit);
 }
 
-// The engine's device rule, which the launcher runs before any download:
-// serve-native applies it only once the model is prepared.
-int checkDevice(int argc) {
-  if (argc != 2)
-    throw engine::UsageError("device-check takes no arguments");
-  const auto message = metal::probeDeviceCapabilities().validationMessage();
+// The engine's device rule, which the launcher runs before any download, and
+// with `video` the video engine's after it (video::deviceRefusal):
+// serve-native applies them only once the model is prepared.
+int checkDevice(int argc, char **argv) {
+  const bool videoModel = argc == 3 && std::string_view(argv[2]) == "video";
+  if (argc != 2 && !videoModel)
+    throw engine::UsageError("device-check takes no arguments, or video");
+  auto message = metal::probeDeviceCapabilities().validationMessage();
+  if (!message && videoModel)
+    message = video::deviceRefusal();
   if (!message)
     return 0;
   writeStderrLine("error: " + *message);
@@ -524,7 +528,7 @@ int main(int argc, char **argv) {
     try {
       const std::string_view command = argc > 1 ? argv[1] : "";
       if (command == "device-check")
-        return splash::checkDevice(argc);
+        return splash::checkDevice(argc, argv);
       if (command == "model-check")
         return splash::checkModel(argc, argv);
       if (command == "vision-check")

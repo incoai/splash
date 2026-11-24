@@ -1939,6 +1939,42 @@ class LauncherTests(unittest.TestCase):
                     # Preparation, which downloads, runs only on a supported Mac.
                     self.assertEqual(prepared.exists(), refusal is None)
 
+    def test_a_mac_below_the_video_engines_gpu_is_refused_before_any_download(self):
+        """A selection of MiniMax-H3 runs the video engine's device rule with
+        the engine's own, so a Mac below Apple10 is refused before its
+        installer starts."""
+        reason = "the video engine runs on an Apple10 GPU (M5) or later"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary, python, prepared = root / "splash", root / "python", root / "ran"
+            python.write_text(f"#!/bin/sh\ntouch '{prepared}'\n")
+            python.chmod(0o755)
+            # An Apple9 GPU: the engine's rule passes, the video engine's not.
+            binary.write_text(
+                '#!/bin/sh\ntest "$*" = device-check && exit 0\n'
+                'test "$*" = "device-check video" || exit 2\n'
+                f"echo 'error: {reason}' >&2; exit 70\n"
+            )
+            binary.chmod(0o755)
+            with (
+                mock.patch.object(launcher.paths, "PACKAGED", True),
+                mock.patch.object(launcher.paths, "BINARY", binary),
+                mock.patch.object(launcher.paths, "PYTHON", python),
+            ):
+                launcher._ensure_installed(selection(root))
+                self.assertTrue(prepared.exists())
+                prepared.unlink()
+                video = launcher.model_artifacts.Selection.of(
+                    root, f"{H3.release}:vdn-8"
+                )
+                with self.assertRaises(launcher.LauncherError) as refused:
+                    launcher._ensure_installed(video)
+            self.assertEqual(
+                (str(refused.exception), refused.exception.kind),
+                (reason, serve_record.DEVICE),
+            )
+            self.assertFalse(prepared.exists())
+
     def test_failed_download_never_executes_server(self):
         with (
             tempfile.TemporaryDirectory() as temporary,
@@ -2125,7 +2161,7 @@ class LauncherTests(unittest.TestCase):
                 "launcher.RUNTIME_DIR = root / 'runtime'\n"
                 "launcher.paths.MODELS = root / 'models'\n"
                 "launcher.paths.PYTHON = Path(sys.argv[3])\n"
-                "launcher._ensure_runtime = lambda: None\n"
+                "launcher._ensure_runtime = lambda video=False: None\n"
                 "raise SystemExit(launcher.main(\n"
                 "    ['serve', '--model', 'test/model', '--offline', '--port', sys.argv[2]]\n"
                 "))\n"

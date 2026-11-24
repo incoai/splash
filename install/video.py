@@ -83,6 +83,19 @@ RECIPE = "h3-w8a8-vdn-v1"
 # adaLN and final layer included), and adaLN tables of the time embedder in
 # exact fp32 (every variant; splash video-adaln).
 REVISION = 2
+# The bytes of a variant's entry, the sum of its files.json as the build
+# machine converted it: a recipe names the files its units write, not their
+# sizes. A fasth3.py conversion's scratch, the video VAE decoder's parts
+# (h3.decoders), is discarded before its blocks are written, and what stays in
+# .adaln/ until its tables are written is its timesteps' rows, so its entry is
+# its peak. The other variants' entries are not measured, and not counted:
+# h3.py's (vdn-8, vdn-50) holds FL2VA's adaLN bases in scratch as well
+# (h3.units).
+ENTRY_BYTES = {"pika-6": 28_453_911_486, "pika-ref2va-6": 28_925_536_341}
+# The recipes' unit that converts the preview decoder (h3.decoders), which
+# alone still needs the network with every source in the Hub cache: TAEH3 is
+# on GitHub (h3.taeh3). _convert runs it first.
+PREVIEW_UNIT = "TAEH3 preview decoder"
 
 
 def is_source(files):
@@ -309,7 +322,7 @@ def encoder_package(repo, recorded=None):
             f"{repo.name}@{repo.revision} lacks tensors the engine reads: "
             + ", ".join(f"{group}*" for group in missing)
         )
-    content = {f"{repo.name}/{n}": _content_id(repo, n) for n in (*linked, *trimmed)}
+    content = {f"{repo.name}/{n}": content_id(repo, n) for n in (*linked, *trimmed)}
     key = conversion.key(content, H3.encoder_package, f"layers-{H3.encoder_layers}")
     return EncoderPackage(key, tuple(linked), trimmed, tuple(omitted), sources)
 
@@ -323,9 +336,11 @@ def _encoder_group(name):
     return next(prefix for prefix in _ENCODER_WHOLE if name.startswith(prefix))
 
 
-def _content_id(repo, name):
-    """A shard's content ID: the one the Hub lists, else its Hub cache
-    blob's name (assembly.file_record's digest)."""
+def content_id(repo, name):
+    """A file's content ID, which a derived entry's key names: the one the
+    Hub lists, else its Hub cache blob's name (assembly.file_record's
+    digest), the same ID, so that a source read from its cached snapshot
+    keys the entry its listing would."""
     if repo.sizes.get(name, (None, None))[1]:
         return repo.sizes[name][1]
     return assembly.digest(repo.file(name))
@@ -633,7 +648,9 @@ def prepare(selection, target, installed):
             for repo in (target, companion, encoder)
         )
         recipe = _recipe(variant)
-        if target.sizes and companion.sizes:
+        # Listed by the Hub, or else read from their Hub cache snapshots,
+        # whose blobs the same content IDs name (content_id).
+        if target.files and companion.files:
             inputs = recipe.inputs(variant.dit, target, companion, **_spec(variant))
             key = conversion.key(
                 inputs, recipe_identity(recipe), variant.dit, variant.spec
@@ -656,12 +673,17 @@ def prepare(selection, target, installed):
             for repo, c in recipe.pinned(variant.dit, **_spec(variant)).items()
         ]
         companions = [companion.identity(), *pinned]
+        root = selection.models_root
+        fetched = [
+            (hub.folder(repo.name) / "blobs", sum(n for n, _ in repo.missing(wanted)))
+            for repo, wanted in ((target, names), (encoder, package.downloads))
+        ]
+        _require_installation_room(root, key, name, fetched, package)
         downloaded = target.download(names)
         files = _links(
             {path: downloaded[n] for n, path in names.items()},
             encoder.download(package.downloads),
         )
-        root = selection.models_root
         previous = installed and selection.link.resolve()
         with contextlib.ExitStack() as held:
             stage = None
@@ -700,14 +722,49 @@ def prepare(selection, target, installed):
     return upstream.UP_TO_DATE if published == previous else upstream.UPDATED
 
 
+def _require_installation_room(root, key, name, downloads, package):
+    """Refuse, before its first download, an installation whose disks have
+    no room for what follows (hub._require_room, of kind "disk"): downloads,
+    each repository's blobs folder in the Hub cache with the bytes still to
+    download into it, and on the models root's volume the entry key of the
+    variant name (ENTRY_BYTES), less what an interrupted conversion wrote of
+    it, and the text encoder's trimmed shards; added up where folders share
+    a volume. The conversion reads its sources by ranges, save the few JSON
+    files it reads whole into the Hub cache (indexes, configs, adapter
+    specs, contracts), which are not counted."""
+    converted = 0
+    if not assembly.is_converted(root, key):
+        stage = root / assembly.CONVERTED / f"{models.ENTRY_STAGING}{key}"
+        written = sum(p.stat().st_size for p in stage.rglob("*") if p.is_file())
+        converted += max(0, ENTRY_BYTES.get(name, 0) - written)
+    if package.sources and not assembly.is_converted(root, package.key):
+        # The tensors _trimmed copies; their headers and the index are not
+        # counted.
+        converted += sum(
+            end - begin
+            for shard, kept in package.trimmed.items()
+            for begin, end in (
+                package.sources[shard].tensors[t]["data_offsets"] for t in kept
+            )
+        )
+    needs = {}
+    for path, size in (*downloads, (root / assembly.CONVERTED / key, converted)):
+        volume = os.stat(next(p for p in (path, *path.parents) if p.exists())).st_dev
+        needs.setdefault(volume, [path, 0])[1] += size
+    for path, size in needs.values():
+        if size:
+            hub._require_room(path, size)
+
+
 def _convert(stage, variant, release, companion, model):
     """Convert the variant's images into the staging folder stage, from the
     sources at their commits, resuming what an interrupted conversion
-    wrote."""
+    wrote; the preview decoder first (PREVIEW_UNIT), so that a Mac that can
+    neither copy it nor read TAEH3 is refused before the long units, not
+    after them."""
     print(
         f"Converting {model} into the engine's images as it reads MiniMax's "
-        f"release and {variant.companion} (about 83 GB); an interrupted "
-        "conversion resumes.",
+        f"release and {variant.companion}; an interrupted conversion resumes.",
         flush=True,
     )
     units = _recipe(variant).units(
@@ -720,6 +777,7 @@ def _convert(stage, variant, release, companion, model):
         ),
         **_spec(variant),
     )
+    units.sort(key=lambda unit: unit.name != PREVIEW_UNIT)
     conversion.convert(stage, units, model)
 
 
