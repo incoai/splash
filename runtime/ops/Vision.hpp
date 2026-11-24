@@ -20,8 +20,8 @@ enum class VisionTower : uint8_t { Qwen, Inkling };
 
 // A vision tower's geometry. The defaults are Qwen3.5's 27 blocks;
 // outputHiddenSize, the width of the text model its merger projects into, is
-// each family's, stated beside its target (Qwen3_8.hpp, Qwen3_6Moe.hpp), and
-// a family's layout names its tower (QwenHybridLayout::visionTower).
+// each family's, its target's hidden size (visionLayout), and a family's
+// layout names its tower (QwenHybridLayout::visionTower).
 // paddedPatchDimension is the patch embedding's input width as its image
 // stores it, padded with zero columns to whole GEMM chunks of 128.
 struct VisionLayout final {

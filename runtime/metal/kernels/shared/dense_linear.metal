@@ -123,8 +123,8 @@ kernel void name(                                                             \
 
 // dense_linear_m<TileM>n<TileN>s<Simdgroups> and its epilogues, on the tiles
 // ops/DenseLinear.cpp picks. The residual rows, a tower's residual stream,
-// stay fp32: rounded to bf16 at each of the vision tower's 55 updates, they
-// carried most of its drift from the fp32 reference.
+// stay fp32: rounded to bf16 at each of Qwen3.5's vision tower's 55 updates,
+// they carried most of its drift from the fp32 reference.
 #define DENSE_LINEAR_TILE(tile, tile_m, tile_n, simdgroups)                   \
 DENSE_LINEAR_KERNEL(dense_linear_##tile, tile_m, tile_n, simdgroups,          \
                     DenseNone, bfloat)                                        \

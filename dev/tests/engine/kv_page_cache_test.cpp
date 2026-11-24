@@ -62,14 +62,16 @@ void testImageIdentityKeysBlocks() {
   // A span of the whole grid (no own size: Qwen's) keeps the identity 1.7.2
   // gave it, which persistent caches key their blocks by; an image's own
   // size, where its grid pads past it (Inkling 2's), keys its blocks too, as
-  // the image cache keys it.
+  // the image cache keys it: its height and its width each, here inside the
+  // 160 pixels of the grid's eight 20-pixel patches.
   require(redIdentity == BlockIdentity{0xc60913e5f84283c3ULL, 0x56e7824f2a3d7489ULL},
           "a span of the whole grid changed its identity");
-  const std::array<ImageSpan, 1> redPadded{ImageSpan{8, 16, 8, 8, 0x1111, 0x2222, 300, 200}};
-  const std::array<ImageSpan, 1> redNarrower{ImageSpan{8, 16, 8, 8, 0x1111, 0x2222, 300, 180}};
-  require(blockImageIdentity(0, 32, redPadded) != redIdentity &&
-              blockImageIdentity(0, 32, redPadded) != blockImageIdentity(0, 32, redNarrower),
-          "image identity ignores the image's own size");
+  const auto ofSize = [](uint32_t height, uint32_t width) {
+    return blockImageIdentity(0, 32, std::array<ImageSpan, 1>{ImageSpan{8, 16, 8, 8, 0x1111, 0x2222, height, width}});
+  };
+  require(ofSize(150, 140) != redIdentity, "image identity ignores the image's own size");
+  require(ofSize(150, 140) != ofSize(150, 130), "image identity ignores the image's own width");
+  require(ofSize(150, 140) != ofSize(145, 140), "image identity ignores the image's own height");
 
   const auto tokens = page(248056);
   auto redBlock = cache.insert(0, tokens, acquired.pages[0], redIdentity);

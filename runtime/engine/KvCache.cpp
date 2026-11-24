@@ -47,7 +47,7 @@ BlockIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
       lo = mix(lo, value);
       hi = mix(hi, ~value);
     }
-    // The image's own size, where its grid pads past it (as ImageKey keys it).
+    // The image's own size, where its grid pads past it, as the model's image cache keys it.
     if (const uint64_t content = (uint64_t{span.contentHeight} << 32) | span.contentWidth)
       lo = mix(lo, content), hi = mix(hi, ~content);
     identity = {lo, hi};

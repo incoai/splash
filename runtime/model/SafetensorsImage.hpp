@@ -130,11 +130,12 @@ using SectionSources = std::function<std::vector<SectionSource>(const gguf::Sect
 // transposed one's); Quantized the planes of a quantized or BF16 module's
 // rows (projection rows, Q8_0 for BF16); FloatTensor a tensor's or an
 // unquantized module's F32 or BF16 rows as stored (a widened source's as F32),
-// a quantized module's F32 values or a transposed tensor's; SmallProjection a float module's rows as
-// stored or a quantized one's planes padded to whole tiles; Router a module's
-// rows as stored, a quantized one's native rows; RoutedExperts the planes of
-// three modules' experts and their expert scales; the token table a quantized
-// module's native rows or its bf16 rows. The checkpoint outlives them.
+// a quantized module's F32 values or a transposed tensor's; SmallProjection a
+// float module's rows as stored or a quantized one's planes padded to whole
+// tiles; Router a module's rows as stored, a quantized one's native rows;
+// RoutedExperts the planes of three modules' experts and their expert scales;
+// the token table a quantized module's native rows or its bf16 rows. The
+// checkpoint outlives them.
 [[nodiscard]] std::vector<gguf::Image>
 planTargetImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, uint32_t layerImages,
                  gguf::PlanOptions options, const std::function<std::vector<gguf::Section>(uint32_t)> &layer,
