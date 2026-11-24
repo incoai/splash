@@ -1308,9 +1308,10 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
 // bias and router (the relative bias and a full layer's static taps stored
 // transposed, the taps last first); F32 queries, router bias and message
 // gates of BF16 values (mlx-vlm's down projections BF16, a call of both
-// formats as mlx-community's conversions hold them); NVFP4 experts with each expert's amax over a denominator of 2688
-// (MLX's global_scale the amax, mlx-lm's weight_scale_2 the quotient), MXFP8
-// ones in the last block. Each checkpoint holds them as its converter does:
+// formats as mlx-community's conversions hold them); NVFP4 experts with each
+// expert's amax over a denominator of 2688 (MLX's global_scale the amax,
+// mlx-lm's weight_scale_2 the quotient), MXFP8 ones in the last block. Each
+// checkpoint holds them as its converter does:
 // its convolutions' shapes, oMLX's fused projections and its message gates
 // packed and transposed, the experts' gate and up interleaved a row each
 // (mlx-lm's apart), the release's message queries in two lists of every loop
@@ -1811,9 +1812,9 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
             (image < g.weightLayers && image + g.blockResidualPeriod >= g.weightLayers);
   check(keeps, "an Inkling-2-Mini checkpoint of BF16 gates keeps them, as its GGUF does");
 
-  // A GGUF whose calls of gates mix BF16 and other formats, as kaitchup's
-  // dondon quants keep some BF16 beside Q8_0 ones: its BF16 gates widen to
-  // F32, exactly, so it writes the F32 GGUF's images.
+  // A GGUF whose calls of gates mix BF16 and other formats, as some quantized
+  // GGUFs keep BF16 gates beside Q8_0 ones: its BF16 gates widen to F32,
+  // exactly, so it writes the F32 GGUF's images.
   std::vector<Tensor> mixedGguf = gguf;
   for (Tensor &tensor : mixedGguf)
     if (const auto found = bfloatDowns.find(tensor.name); found != bfloatDowns.end()) {

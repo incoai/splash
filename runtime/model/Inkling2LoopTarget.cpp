@@ -55,19 +55,19 @@ Inkling2LoopTarget::Inkling2LoopTarget(const Inkling2LoopWeights &weights, const
   // Its draft's captures and rows are those its producer trained it on: the
   // rows passed into its applications and its normed token rows.
   requireDraftRows(true, true);
-  // A loop layer's calls of message gates, its q, k and v gates and its FFN
-  // gate, take the fused kernels (ops::MessageGate), checked here rather than
-  // by a step's first call.
+  // A loop layer's calls of message gates (kInkling2LoopGateCalls), its q, k
+  // and v gates and its FFN gate, take the fused kernels (ops::MessageGate),
+  // checked here rather than by a step's first call.
   for (size_t index = 0; index < weights_.layers.size(); ++index) {
     const Inkling2LoopLayerWeights &layer = weights_.layers[index];
     if (!layer.messages) continue;
-    const std::array<ops::MessageGateWeights, 3> mixer{gateWeights(layer.messages->gates[0]),
-                                                       gateWeights(layer.messages->gates[1]),
-                                                       gateWeights(layer.messages->gates[2])};
-    const std::array<ops::MessageGateWeights, 1> ffn{gateWeights(layer.messages->gates[3])};
+    const auto &stored = layer.messages->gates;
+    const std::array<ops::MessageGateWeights, 4> gates{gateWeights(stored[0]), gateWeights(stored[1]),
+                                                       gateWeights(stored[2]), gateWeights(stored[3])};
     try {
-      ops::MessageGate::requireWeights(mixer, geometry_.hiddenSize);
-      ops::MessageGate::requireWeights(ffn, geometry_.hiddenSize);
+      for (const Inkling2LoopGateCall &call : kInkling2LoopGateCalls)
+        ops::MessageGate::requireWeights(std::span(gates).subspan(call.first, call.end - call.first),
+                                         geometry_.hiddenSize);
     } catch (const std::invalid_argument &error) {
       throw std::invalid_argument("Inkling-2-Mini layer " + std::to_string(index) + ": " + error.what());
     }

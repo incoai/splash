@@ -274,7 +274,7 @@ struct Inkling2LoopLayout final : QwenHybridLayout {
   static constexpr std::string_view modelType = "inkling2_loop_text";
   static constexpr std::string_view ggufArchitecture = "inkling2_loop";
   // Its vision tower (ops::kInklingVisionLayout), from its GGUF's inkling2v
-  // mmproj (model/InklingVision.hpp).
+  // mmproj or a checkpoint's tensors (model/InklingVision.hpp).
   static constexpr ops::VisionTower visionTower = ops::VisionTower::Inkling;
   // Its layers attend through relative attention (ops::RelativeAttention),
   // not the shared attention, in two variants: a full layer's over its whole
@@ -505,6 +505,25 @@ struct Inkling2LoopMessageWeights final {
   metal::MetalBuffer queries;
   std::array<Inkling2LoopGateWeights, 4> gates;
 };
+
+// A call of fused message gates (ops::MessageGate), gates [first, end) of a
+// loop layer's (Inkling2LoopMessageWeights::gates): the kernels take a call's
+// weights in one format, so a source that stores them in two is planned with
+// the call's BF16 rows widened to F32.
+struct Inkling2LoopGateCall final {
+  uint32_t first = 0;
+  uint32_t end = 0;
+};
+// A loop layer's two calls: its mixer's, the gates of its q, k and v inputs,
+// and its FFN's one.
+inline constexpr std::array<Inkling2LoopGateCall, 2> kInkling2LoopGateCalls{{{0, 3}, {3, 4}}};
+static_assert(kInkling2LoopGateCalls[0].first == 0 && kInkling2LoopGateCalls[0].end == kInkling2LoopGateCalls[1].first &&
+                  kInkling2LoopGateCalls[1].end == std::tuple_size_v<decltype(Inkling2LoopMessageWeights::gates)>,
+              "a loop layer's calls take its gates in order, each once");
+// The call a loop layer's gate `gate` is of.
+[[nodiscard]] constexpr Inkling2LoopGateCall inkling2LoopGateCall(size_t gate) noexcept {
+  return kInkling2LoopGateCalls[gate < kInkling2LoopGateCalls[0].end ? 0 : 1];
+}
 
 // A sliding layer's one norm of its mixer's input (attn_norm), which its q,
 // k and v inputs each take (one row but where messages gate them apart).

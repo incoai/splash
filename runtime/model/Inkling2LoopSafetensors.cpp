@@ -198,10 +198,11 @@ std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint,
   // windows of its rows of loop_gain_forget; the others' tensors, by the
   // release's names (which mlx-lm's earlier conversions keep) or mlx-vlm's
   // and mlx-lm's. The fused kernels take a call's gates in one format
-  // (ops::MessageGate): the mixer's q, k and v gates, or the FFN's. A call
-  // whose projections mix BF16 and F32 (mlx-community's conversions keep a
-  // gate's forget and gain F32 and its down projection BF16) takes its BF16
-  // rows widened to F32, exactly; one of a single format keeps it.
+  // (ops::MessageGate): the mixer's q, k and v gates, or the FFN's
+  // (kInkling2LoopGateCalls). A call whose projections mix BF16 and F32
+  // (mlx-community's conversions keep a gate's forget and gain F32 and its
+  // down projection BF16) takes its BF16 rows widened to F32, exactly; one of
+  // a single format keeps it.
   const auto controller = [&](size_t gate, size_t projection) {
     return p + "controllers." + std::string(kControllers[gate]) + "." + std::string(kGateProjections[projection]) +
            "_weight";
@@ -213,7 +214,8 @@ std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint,
   };
   const auto mixedCall = [&](size_t gate) {
     bool bfloat16 = false, float32 = false;
-    for (size_t other = gate == 3 ? 3 : 0; other < (gate == 3 ? 4 : 3); ++other)
+    const Inkling2LoopGateCall call = inkling2LoopGateCall(gate);
+    for (size_t other = call.first; other < call.end; ++other)
       for (size_t projection = 0; projection < kGateProjections.size(); ++projection)
         if (const SourceTensor *tensor = checkpoint.find(gateTensor(other, projection))) {
           bfloat16 = bfloat16 || tensor->dtype == "BF16";

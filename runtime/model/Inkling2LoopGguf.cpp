@@ -157,13 +157,13 @@ void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout, con
 // (F32, or a quantized gate's F32 values), by the names of the file's layout.
 // The small F32 tensors as stored.
 // Whether a loop layer's call of message gates, its q, k and v gates or its
-// FFN gate, mixes formats as its image would store them, BF16 as stored and
-// any other as F32: the fused kernels take a call's gates in one format, so
-// such a call's BF16 gates widen to F32, exactly (kaitchup's dondon GGUFs
-// keep some BF16 beside Q8_0 ones).
-bool mixedCall(const GgufFile &file, const std::string &layer, const GgufLayout &gguf, bool ffn) {
+// FFN gate (kInkling2LoopGateCalls), mixes formats as its image would store
+// them, BF16 as stored and any other as F32: the fused kernels take a call's
+// gates in one format, so such a call's BF16 gates widen to F32, exactly (some
+// quantized GGUFs keep BF16 gates beside Q8_0 ones).
+bool mixedCall(const GgufFile &file, const std::string &layer, const GgufLayout &gguf, Inkling2LoopGateCall call) {
   bool bfloat16 = false, other = false;
-  for (size_t gate = ffn ? 3 : 0; gate < (ffn ? 4 : 3); ++gate)
+  for (size_t gate = call.first; gate < call.end; ++gate)
     for (const char *projection : {"down", "forget", "gain"})
       if (const GgufTensor *tensor = file.find(layer + std::string(gguf.gates[gate]) + projection + ".weight"))
         (tensor->type == ggml::kBF16 ? bfloat16 : other) = true;
@@ -210,14 +210,14 @@ std::vector<gguf::Section> layerImage(const Inkling2LoopLayout &layout, const Gg
   add(Kind::Values, "ffn_post_conv.weight", hidden * taps);
   if (!layout.schedule().isLoopLayer(index)) return sections;
   sections.push_back(messageQueries(layout, gguf, index));
-  const bool mixer = file && mixedCall(*file, p, gguf, false), ffn = file && mixedCall(*file, p, gguf, true);
   for (size_t gate = 0; gate < gguf.gates.size(); ++gate) {
     const std::string stem(gguf.gates[gate]);
+    const bool widened = file && mixedCall(*file, p, gguf, inkling2LoopGateCall(gate));
     const size_t first = sections.size();
     add(Kind::FloatTensor, stem + "down.weight", layout.loopGateRank, 2 * hidden);
     add(Kind::FloatTensor, stem + "forget.weight", hidden, layout.loopGateRank);
     add(Kind::FloatTensor, stem + "gain.weight", hidden, layout.loopGateRank);
-    for (size_t at = first; at < sections.size(); ++at) sections[at].widened = gate == 3 ? ffn : mixer;
+    for (size_t at = first; at < sections.size(); ++at) sections[at].widened = widened;
   }
   return sections;
 }
