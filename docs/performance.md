@@ -77,6 +77,12 @@ Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:
 | --- | ---: | ---: |
 | `Qwen3.8-27B-GGUF:UD-IQ3_XXS` | 43.5 tok/s | 53,241 tokens (81,913 with `--language-only`) |
 | `Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL` | 145 tok/s | 256K tokens |
+| `Inkling-2-Mini-GGUF:UD-IQ3_XXS` | 68–75 tok/s | 160,785 tokens |
+
+Inkling-2-Mini's row is two 256-token answers to a code prompt, with its
+vision tower loaded and its experts, 10.2 GiB, all in memory; prose answers
+decoded at 56 to 59 tokens a second, and a 2,890-token prompt prefilled in
+2.5 s.
 
 The context column reports capacity, not the prompt length of the decode
 measurement. The SSD cache, on by default, sets its state staging aside within
