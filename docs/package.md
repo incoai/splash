@@ -130,7 +130,11 @@ the user adds with `splash serve --model local/NAME
 name, with the `--mmproj` and `--draft-model` their row's menu chooses, and at
 launch it runs `install/cached.py`. Since it starts models `--offline`, an
 installed model's menu checks it for updates, which `prepare` installs, and
-deletes it with `install/models.py remove`. While a model runs, the Server
+deletes it with `install/models.py remove`. The Server offers that check as
+Update for an installation that serves text only though its family serves
+images and its record gives no reason (`vision_unavailable`), as an
+Inkling-2-Mini installation from 1.7.2 does: only a start that reaches the Hub
+takes its tower in ([Vision](models.md#vision)). While a model runs, the Server
 shows its context limit, from `/v1/models`, and its `/status`, asked every 2 s,
 or every 10 s while neither the window nor the menu bar's panel is open: requests,
 answering and prompt speed, time to first token, the tokens generated, read and
