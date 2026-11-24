@@ -4,9 +4,10 @@ check the exact-BF16 rule, that invalid sources fail naming what is wrong, and
 that a padded section written after another keeps its padding zero. Then the
 same for a tiny Inkling tower: an inkling2v mmproj whose matrices include Q8_0
 ones, each value rounded to the nearest BF16, and the release's and
-transformers' checkpoints, whose patch embedding orders a patch's values
-[row, column, channel], each with its q, k and v stacked, its class token's
-two rows and its zero biases."""
+transformers' checkpoints and the two that rename the release's model.visual.
+vision_tower., whose patch embedding orders a patch's values [row, column,
+channel], each with its q, k and v stacked, its class token's two rows and
+its zero biases."""
 
 import json
 import math
@@ -271,6 +272,20 @@ INKLING_NAMES = {
         "ls1": "lambda_1",
         "ls2": "lambda_2",
     },
+}
+# Either with the release's model.visual. renamed vision_tower.: oMLX's keep
+# the backbone's names; thoddnn's nvfp4 conversion gives it transformers'
+# instead, beside the release's position embedding and projector.
+INKLING_NAMES["omlx"] = INKLING_NAMES["release"] | {
+    "tower": "vision_tower.backbone.",
+    "mm.1.weight": "/vision_tower.proj_in.weight",
+    "mm.2.weight": "/vision_tower.proj_out.weight",
+}
+INKLING_NAMES["nvfp4"] = INKLING_NAMES["transformers"] | {
+    "tower": "vision_tower.",
+    "v.position_embd.weight": "embeddings.position_embedding",
+    "mm.1.weight": "/vision_tower.proj_in.weight",
+    "mm.2.weight": "/vision_tower.proj_out.weight",
 }
 for names in INKLING_NAMES.values():
     names |= {f"attn_{p}": f"self_attn.{p}_proj." for p in "qkv"}
@@ -618,7 +633,7 @@ def main():
             "Vision layouts from MLX, transformers and GGUF, exact BF16 conversion, "
             "rejected sources and zero padding, and Inkling's tower from an mmproj "
             "with Q8_0 matrices and from its release's and transformers' "
-            "checkpoints PASS"
+            "checkpoints and oMLX's and an nvfp4 conversion's under vision_tower. PASS"
         )
 
 

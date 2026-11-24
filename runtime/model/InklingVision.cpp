@@ -9,6 +9,7 @@
 #include <cmath>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -120,20 +121,48 @@ std::vector<uint64_t> tensorShape(const Section &s, uint32_t parts, uint32_t pat
   return {s.columns, rows};
 }
 
-// The name a safetensors checkpoint gives the tower's tensor its mmproj names
-// `gguf`: transformers' Inkling2VisionModel's, under model.vision_tower. (an
-// MLX conversion's, a fine-tune transformers saved), or the release's own,
-// under model.visual.backbone. with its projector's two matrices
-// model.visual.proj_in and proj_out.
-std::string checkpointName(const std::string &gguf, bool release) {
-  const std::string tower = release ? "model.visual.backbone." : "model.vision_tower.";
+// How a safetensors checkpoint names the tower's tensors: transformers'
+// Inkling2VisionModel's under model.vision_tower. (an MLX conversion's, a
+// fine-tune transformers saved), the release's own, its backbone under
+// model.visual.backbone. beside its projector's two matrices
+// model.visual.proj_in and proj_out, or either with the release's
+// model.visual. renamed vision_tower. (oMLX's keep the backbone's names;
+// thoddnn's nvfp4 conversion gives it transformers' instead, without its
+// backbone. and merger).
+struct CheckpointNames {
+  std::string_view tower;     // the backbone's prefix
+  std::string_view projector; // proj_in's and proj_out's, or empty for the merger's
+  bool release;               // the release's block names (ln_1, ls_1.gamma, mlp.c_fc)
+  bool positionWeight;        // position_embedding.weight, not position_embedding
+  std::string_view owner;     // the prefix of every tensor of the tower's
+};
+constexpr CheckpointNames kCheckpointNames[] = {
+    {"model.vision_tower.", "", false, true, "model.vision_tower."},
+    {"model.visual.backbone.", "model.visual.", true, false, "model.visual."},
+    {"vision_tower.backbone.", "vision_tower.", true, false, "vision_tower."},
+    {"vision_tower.", "vision_tower.", false, false, "vision_tower."},
+};
+
+// The names of the checkpoint's tower: those whose patch embedding it holds,
+// else transformers', which a refusal then names.
+const CheckpointNames &checkpointNames(const SafetensorsCheckpoint &checkpoint) {
+  for (const CheckpointNames &names : kCheckpointNames)
+    if (checkpoint.find(std::string(names.tower) + "embeddings.patch_embedding.weight")) return names;
+  return kCheckpointNames[0];
+}
+
+// The name the checkpoint gives the tower's tensor its mmproj names `gguf`.
+std::string checkpointName(const std::string &gguf, const CheckpointNames &names) {
+  const bool release = names.release;
+  const std::string tower(names.tower), projector(names.projector);
   const std::string embeddings = tower + "embeddings.";
   if (gguf == "v.patch_embd.weight") return embeddings + "patch_embedding.weight";
-  if (gguf == "v.position_embd.weight") return embeddings + (release ? "position_embedding" : "position_embedding.weight");
+  if (gguf == "v.position_embd.weight")
+    return embeddings + (names.positionWeight ? "position_embedding.weight" : "position_embedding");
   if (gguf == "v.class_embd") return embeddings + "class_embedding";
   if (gguf == "v.class_position_embd.weight") return embeddings + "cls_position_embedding";
-  if (gguf == "mm.1.weight") return release ? "model.visual.proj_in.weight" : tower + "merger.linear_1.weight";
-  if (gguf == "mm.2.weight") return release ? "model.visual.proj_out.weight" : tower + "merger.linear_2.weight";
+  if (gguf == "mm.1.weight") return projector.empty() ? tower + "merger.linear_1.weight" : projector + "proj_in.weight";
+  if (gguf == "mm.2.weight") return projector.empty() ? tower + "merger.linear_2.weight" : projector + "proj_out.weight";
   const auto suffix = gguf.substr(gguf.rfind('.'));  // .weight or .bias
   const auto stem = gguf.substr(0, gguf.size() - suffix.size());
   if (stem == "v.pre_ln") return tower + (release ? "ln_pre" : "pre_layernorm") + suffix;
@@ -208,7 +237,7 @@ void bindInklingMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Pl
 }
 
 void bindInklingCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLayout &layout, Plan &plan) {
-  const bool release = checkpoint.find("model.visual.backbone.embeddings.patch_embedding.weight") != nullptr;
+  const CheckpointNames &names = checkpointNames(checkpoint);
   const std::vector<Planned> planned = sections(layout);
   if (planned.size() != plan.sections.size()) throw std::logic_error("Inkling vision plan mismatch");
   std::set<std::string, std::less<>> used;
@@ -217,7 +246,7 @@ void bindInklingCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::V
     const std::vector<std::string> &tensors = planned[index].tensors;
     const auto shape = checkpointShape(s, static_cast<uint32_t>(std::max<size_t>(tensors.size(), 1)));
     for (const std::string &gguf : tensors) {
-      const std::string name = checkpointName(gguf, release);
+      const std::string name = checkpointName(gguf, names);
       // A quantized module keeps its scales beside the packed weight.
       const auto stem = name.substr(0, name.rfind('.'));
       for (const auto &scales : {stem + ".scales", stem + ".weight_scale"})
@@ -239,7 +268,7 @@ void bindInklingCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::V
   // Every tensor of the tower's is one it binds, as an mmproj's is: a bias
   // or a layer the tower does not take would change what it computes.
   std::string unused;
-  for (const std::string &name : checkpoint.names(release ? "model.visual." : "model.vision_tower."))
+  for (const std::string &name : checkpoint.names(names.owner))
     if (!used.contains(name)) unused += (unused.empty() ? "" : ", ") + name;
   if (!unused.empty()) throw WeightStoreError("checkpoint tensors the vision tower does not use: " + unused);
 }

@@ -772,7 +772,8 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
 // a Qwen tower over RGB patches of two frames, without deepstack layers; or
 // Inkling's (inkling2_vision, in transformers' names as its config.json
 // states them: its patches' side and merge as native_patch_size and
-// adapter_merge_size, its MLP as a ratio of its width), over RGB patches of
+// adapter_merge_size or patch_size and spatial_merge_size, its MLP as a
+// ratio of its width), over RGB patches of
 // one frame into a projector without biases, of the exact GELU transformers'
 // default activation is.
 void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
@@ -787,10 +788,19 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                     {"mlp_ratio", double(layout.intermediateSize) / layout.hiddenSize},
                     {"text_hidden_size", layout.outputHiddenSize},
                     {"projection_hidden_dim", layout.mergedHiddenSize},
-                    {"native_patch_size", layout.patchSize},
-                    {"adapter_merge_size", layout.spatialMerge},
                     {"posemb_grid_size", layout.positionGridSide},
                     {"layer_norm_eps", SPLASH_INKLING_VISION_NORM_EPSILON}});
+    // Its patches' side and merge, which transformers stores as patch_size
+    // and spatial_merge_size, the release's names its aliases: either, or
+    // both alike.
+    for (const ExpectedNumber alias : {ExpectedNumber("native_patch_size", layout.patchSize),
+                                       ExpectedNumber("adapter_merge_size", layout.spatialMerge)}) {
+      const char *stored = alias.key == std::string_view("native_patch_size") ? "patch_size" : "spatial_merge_size";
+      if (vision[@(stored)])
+        requireNumbers(vision, sourceName(source), "vision config", {{stored, alias.value}});
+      if (vision[@(alias.key)] || !vision[@(stored)])
+        requireNumbers(vision, sourceName(source), "vision config", {alias});
+    }
     requireBooleans(vision, "vision config", {{"projector_bias", false}});
     if (vision[@"hidden_act"])
       requireEqual(requireString(vision, @"hidden_act", "vision config hidden_act"), "gelu", sourceName(source),

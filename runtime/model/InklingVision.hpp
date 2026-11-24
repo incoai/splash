@@ -37,7 +37,8 @@ void bindInklingMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, vi
 
 // Binds every section of plan to its unquantized tensors in a safetensors
 // checkpoint of the model: transformers' names (model.vision_tower., as an
-// MLX conversion keeps them) or the release's (model.visual.).
+// MLX conversion keeps them), the release's (model.visual.), or either under
+// vision_tower. in model.visual.'s place (oMLX's, thoddnn's nvfp4).
 void bindInklingCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLayout &layout,
                            vision::Plan &plan);
 
