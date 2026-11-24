@@ -1119,7 +1119,14 @@ class NativeBackend:
                     "effort": job.reasoning.effort,
                     "enable_thinking": job.reasoning.enable_thinking,
                     "template_effort": job.reasoning.template,
-                    "thinking": job.thinking,
+                    # Whether the generation prompt opened the reasoning, where
+                    # the prompt decides it; None where the model opens its own
+                    # (ChatFormat.prompt_switches_reasoning: Inkling 2's, Flint's).
+                    "thinking": (
+                        job.thinking
+                        if job.chat_format.prompt_switches_reasoning
+                        else None
+                    ),
                 }
             self._log(record)
             job.events.put(("start", None))

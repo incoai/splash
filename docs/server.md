@@ -1309,7 +1309,9 @@ the template renders over the others, followed by `(chat_template_kwargs)`;
 its `enable_thinking` when it set one that counted; and whether it thinks, as in
 `Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`,
 `effort low (chat_template_kwargs) · thinking on`
-or, under `--reasoning-effort none`, `effort high → none · thinking off`.
+or, under `--reasoning-effort none`, `effort high → none · thinking off`. A
+model that opens its own reasoning, as Inkling 2 and Flint do, decides whether
+it thinks, and the line names the effort alone.
 
 A Chat or Messages request's `chat_template_kwargs` are passed to the template
 as variables and outrank the effort, and in Messages `thinking`, so
