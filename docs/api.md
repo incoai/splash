@@ -615,7 +615,8 @@ hold up to 32 MiB and 33,554,432 pixels, with an aspect ratio up to 200:1, and
 is resized to at most `--max-image-pixels` (4,194,304 by default). Inkling 2
 takes an image of any aspect ratio at its own size, padded to whole 40-pixel
 tokens, and resizes only one of more patches than that cap's
-(`--max-image-pixels` / 256, 4,096 tokens at the default)
+(`--max-image-pixels` / 256 patches, 16,384 at the default, which make 4,096
+tokens)
 ([Vision](models.md#vision)); `/v1/models` states the 200:1 every model
 takes. A request
 carries at most 64 images, PDF pages included.

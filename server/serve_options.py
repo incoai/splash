@@ -826,8 +826,9 @@ SERVE_OPTIONS = (
             default=images.MAX_PIXELS,
             metavar="PIXELS",
             help=f"maximum resized pixels per image, {images.MIN_PIXELS}–"
-            f"{images.MAX_PIXELS} (default: {images.MAX_PIXELS}); bounds the "
-            "vision scratch one image needs",
+            f"{images.MAX_PIXELS} (default: {images.MAX_PIXELS}), and for "
+            "Inkling-2-Mini as many of its 20-pixel patches (pixels / 256); "
+            "bounds the vision scratch one image needs",
         ),
         engine=EngineArgument(
             "--max-image-patches", text=lambda pixels: str(images.max_patches(pixels))
