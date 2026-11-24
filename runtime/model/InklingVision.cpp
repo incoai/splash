@@ -126,9 +126,9 @@ std::vector<uint64_t> tensorShape(const Section &s, uint32_t parts, uint32_t pat
 // fine-tune transformers saved), the release's own, its backbone under
 // model.visual.backbone. beside its projector's two matrices
 // model.visual.proj_in and proj_out, or either with the release's
-// model.visual. renamed vision_tower. (oMLX's keep the backbone's names;
-// thoddnn's nvfp4 conversion gives it transformers' instead, without its
-// backbone. and merger).
+// model.visual. renamed vision_tower. (oMLX's keep the backbone's names; an
+// nvfp4 conversion gives it transformers' instead, without its backbone. and
+// merger).
 struct CheckpointNames {
   std::string_view tower;     // the backbone's prefix
   std::string_view projector; // proj_in's and proj_out's, or empty for the merger's
@@ -219,11 +219,16 @@ void bindInklingMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Pl
       const GgufTensor &t = gguf.require(name);
       if (t.dims != shape) throw WeightStoreError("vision tensor shape mismatch: " + name);
       const std::string dtype = ggmlTypeName(t.type);
-      // A Q8_0 matrix's rows are whole blocks of 32.
-      if ((dtype != "BF16" && dtype != "F16" && dtype != "F32" && dtype != "Q8_0") ||
-          (dtype == "Q8_0" && s.columns % 32))
-        throw WeightStoreError("vision tensor " + name + " in " + gguf.source().path().string() + " is " + dtype +
-                               "; preparation reads BF16, F16, F32 or Q8_0");
+      const auto refusal = [&](const std::string &reads) {
+        return WeightStoreError("vision tensor " + name + " in " + gguf.source().path().string() + " is " + dtype +
+                                "; preparation reads " + reads);
+      };
+      if (dtype != "BF16" && dtype != "F16" && dtype != "F32" && dtype != "Q8_0")
+        throw refusal("BF16, F16, F32 or Q8_0");
+      // A Q8_0 block holds 32 values of a row and the writer converts whole
+      // blocks, so a row is whole blocks: not a vector's, of one value each.
+      if (dtype == "Q8_0" && s.columns % 32)
+        throw refusal("Q8_0 only in a matrix's rows of whole blocks of 32 values");
       used.insert(name);
       s.inputs.push_back({name, {&gguf.source(), dtype, t.dims, t.offset, t.bytes}});
     }

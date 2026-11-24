@@ -274,8 +274,8 @@ INKLING_NAMES = {
     },
 }
 # Either with the release's model.visual. renamed vision_tower.: oMLX's keep
-# the backbone's names; thoddnn's nvfp4 conversion gives it transformers'
-# instead, beside the release's position embedding and projector.
+# the backbone's names; an nvfp4 conversion gives it transformers' instead,
+# beside the release's position embedding and projector.
 INKLING_NAMES["omlx"] = INKLING_NAMES["release"] | {
     "tower": "vision_tower.backbone.",
     "mm.1.weight": "/vision_tower.proj_in.weight",
@@ -320,11 +320,11 @@ def inkling_fixture(root, source="gguf", shift=0, case=None):
         # Exact in every float dtype, as the Qwen fixture's.
         return [((i * 7 + index * 11) % 255 - 127) / 64 for i in range(count)]
 
-    def tensor(name, rows, columns, quantizable=True):
+    def tensor(name, rows, columns):
         """The GGUF tensor `name` of rows x columns and its values."""
         index = len(tensors)
         vector = rows == 1 or columns == 1
-        quantizable = quantized and quantizable and not vector and columns % 32 == 0
+        quantizable = quantized and not vector and columns % 32 == 0
         dtype = dtypes[(index + shift) % (4 if quantizable else 3)]
         shape = [rows * columns] if vector else [columns, rows]
         if name == "v.patch_embd.weight":
@@ -501,7 +501,7 @@ def check_inkling(binary, root):
         ("gguf", "projector"): ("unsupported vision GGUF architecture",),
         ("gguf", "unused"): ("v.post_ln.weight", "{}", "does not use"),
         ("gguf", "shape"): ("v.blk.1.attn_k.weight", "shape"),
-        ("gguf", "q8-bias"): ("v.blk.0.attn_out.bias", "{}", "Q8_0"),
+        ("gguf", "q8-bias"): ("v.blk.0.attn_out.bias", "{}", "blocks of 32"),
     }
     for source in INKLING_NAMES:
         key = inkling_name(source, "v.blk.1.attn_k.weight")
