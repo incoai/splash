@@ -2,6 +2,9 @@ import contextlib
 import hashlib
 import io
 import json
+import os
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -390,6 +393,49 @@ class EngineLifetimeTest(VideoServerTest):
         self.assertEqual([process.poll() for process in processes], [0, 0, 0])
         self.assertFalse(app.videos.engine.alive())
         self.assertEqual(app.videos.status()["engine"], "idle")
+
+    def test_a_job_keeps_the_mac_awake_until_it_ends_unless_idle_sleep_is_allowed(self):
+        app = self.serve(step_seconds=0.05)
+        popen, started = subprocess.Popen, []
+
+        def recorded(command, **options):
+            started.append((command, popen(command, **options)))
+            return started[-1][1]
+
+        self.enterContext(mock.patch.object(videos.subprocess, "Popen", recorded))
+        # awake, as --allow-idle-sleep leaves it unset (server.main).
+        for awake in (True, False):
+            with self.subTest(awake=awake):
+                started.clear()
+                app.videos.engine.awake = awake
+                video = self.client.videos.create(prompt="a cat")
+                video = self.client.videos.poll(video.id, poll_interval_ms=20)
+                self.assertEqual(video.status, "completed")
+                held = [(c, p) for c, p in started if c[0] == "/usr/bin/caffeinate"]
+                if not awake:
+                    self.assertEqual(held, [])
+                    continue
+                ((command, caffeinate),) = held
+                self.assertEqual(
+                    command, ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())]
+                )
+                # Held from before the engine's start until the job ended,
+                # which ended it.
+                self.assertIs(started[0][1], caffeinate)
+                self.assertEqual(caffeinate.poll(), -signal.SIGTERM)
+
+        # A caffeinate that cannot start costs the job its assertion only.
+        def refused(command, **options):
+            if command[0] == "/usr/bin/caffeinate":
+                raise OSError("no fork")
+            return popen(command, **options)
+
+        app.videos.engine.awake = True
+        with mock.patch.object(videos.subprocess, "Popen", refused):
+            for _ in range(2):
+                video = self.client.videos.create(prompt="a cat")
+                video = self.client.videos.poll(video.id, poll_interval_ms=20)
+                self.assertEqual(video.status, "completed")
 
     def test_a_failed_job_leaves_no_engine(self):
         processes = self.started()

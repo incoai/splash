@@ -8,7 +8,7 @@ from unittest import mock
 
 import numpy as np
 
-from install.families import H3
+from install.families import H3, PYAV
 from server import references as refs
 from server import video_protocol as wire
 from server import videos
@@ -174,7 +174,8 @@ class PyAVTest(unittest.TestCase):
         image = file("image/png", png(32, 32))
         message = (
             "video and audio references need PyAV, which Splash does not ship; install it with: "
-            f"{shlex.quote(sys.executable)} -m pip install av==19.0.2"
+            f"{shlex.quote(sys.executable)} -m pip install av==19.0.2 (again after each "
+            "Splash upgrade, which brings its own Python)"
         )
         with mock.patch.dict(sys.modules, {"av": None}):
             for files in (
@@ -194,7 +195,7 @@ class PyAVTest(unittest.TestCase):
 
     def test_the_pin_is_the_development_requirement(self):
         pins = (Path(__file__).parents[2] / "requirements.txt").read_text().splitlines()
-        self.assertIn(refs.PYAV, pins)
+        self.assertIn(PYAV, pins)
 
 
 class RequestTest(unittest.TestCase):

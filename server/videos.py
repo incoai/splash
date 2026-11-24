@@ -312,7 +312,9 @@ def parse_request(fields, names, variants=H3.variants):
     if _takes_references(row) and not referenced:
         raise APIError(
             400,
-            f"the {variant} variant takes references: one image or video at least",
+            f"the {variant} variant takes references: one image or video at least; "
+            "a request from the prompt or from keyframes takes the "
+            f"{H3.default_variant} variant",
         )
     steps = _integer(fields, "steps", 0, 1000)
     if steps not in (0, row.steps):
@@ -633,11 +635,15 @@ class Job:
 
 class VideoEngine:
     """The video engine process on its own stream (video_protocol): started
-    for a job and closed once it ends, until shut_down."""
+    for a job and closed once it ends, until shut_down. With awake, the Mac
+    is kept from idle sleep while it runs a job (VideoService._run), as a
+    language model's engine keeps it while it serves a request unless
+    --allow-idle-sleep (runtime/main.mm IdleSleepAssertion)."""
 
-    def __init__(self, command, startup_timeout):
+    def __init__(self, command, startup_timeout, awake=False):
         self.command = command
         self.startup_timeout = startup_timeout
+        self.awake = awake
         self.process = None
         self.parser = None
         self.pending = b""
@@ -980,6 +986,18 @@ class VideoService:
 
     def _run(self, job):
         """Run job on an engine started for it, which exits once it ends."""
+        caffeinate = None
+        if self.engine.awake:
+            # The language engine's assertion (PreventUserIdleSystemSleep),
+            # held from the engine's start until it has stopped or, should
+            # this process die first, until it exits (-w). A job runs
+            # without it rather than fail, or stop the queue, for it.
+            try:
+                caffeinate = subprocess.Popen(
+                    ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())]
+                )
+            except OSError as error:
+                print_status(f"Warning · {job.id} runs without keep-awake: {error}")
         try:
             try:
                 self.engine.start()
@@ -990,6 +1008,9 @@ class VideoService:
                 )
             finally:
                 self.engine.close()
+                if caffeinate is not None:
+                    caffeinate.terminate()
+                    caffeinate.wait()
         except VideoFailed as error:
             self._finish(job, None, {"code": error.code, "message": str(error)})
         except OSError as error:
@@ -1079,16 +1100,17 @@ class VideoApp:
         self.videos = VideoService(engine, tokenizer, self.names, variants=variants)
 
     @classmethod
-    def start(cls, model, names, model_root, binary, startup_timeout):
+    def start(cls, model, names, model_root, binary, startup_timeout, awake):
         """The app of the assembly at model_root, its tokenizer loaded and
-        the limits its engine announces read (VideoService)."""
+        the limits its engine announces read (VideoService); awake keeps the
+        Mac from idle sleep while a job runs (VideoEngine)."""
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_root / "tokenizer", local_files_only=True, trust_remote_code=False
         )
         engine = VideoEngine(
-            [str(binary), "serve-native", str(model_root)], startup_timeout
+            [str(binary), "serve-native", str(model_root)], startup_timeout, awake
         )
         return cls(model, names, engine, tokenizer, installed_variants(model_root))
 

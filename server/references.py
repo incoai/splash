@@ -28,13 +28,12 @@ from __future__ import annotations
 import io
 import math
 import mimetypes
-import shlex
 import sys
 from dataclasses import dataclass
 
 import numpy as np
 
-from install.families import H3
+from install.families import H3, pyav_missing
 
 from .errors import APIError
 
@@ -47,10 +46,6 @@ AUDIO_TYPES = (
     "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave",
     "audio/mp4", "audio/m4a", "audio/x-m4a", "audio/aac", "audio/x-aac", "audio/aacp",
 )  # fmt: skip
-# PyAV, which decodes video and audio references: the release leaves it out
-# (its wheels bundle FFmpeg), so the user installs this pin into the
-# environment Splash runs in (dev/requirements.txt holds the same).
-PYAV = "av==19.0.2"
 
 
 @dataclass(frozen=True)
@@ -147,11 +142,7 @@ def pyav():
     try:
         import av
     except ModuleNotFoundError as error:
-        raise APIError(
-            400,
-            "video and audio references need PyAV, which Splash does not ship;"
-            f" install it with: {shlex.quote(sys.executable)} -m pip install {PYAV}",
-        ) from error
+        raise APIError(400, pyav_missing(sys.executable)) from error
     return av
 
 

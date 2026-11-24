@@ -8,6 +8,7 @@ import errno
 import fcntl
 import http.client
 import json
+import mimetypes
 import os
 import re
 import signal
@@ -713,20 +714,48 @@ def _generate_on_server(args, served, request, port=None):
         _status(f"Video · {job['id']} · {running}")
         started = time.monotonic()
         preview, shown, silent = args.out.with_suffix(".preview.mp4"), None, None
+        # What the job waits for before its first phase, as last said, and
+        # the time and progress its denoising was first seen at, which the
+        # time left is estimated from.
+        waiting, denoising = None, None
         while job["status"] not in ("completed", "failed"):
             time.sleep(POLL_SECONDS)
             try:
                 job = json.loads(_call(port, f"/v1/videos/{job['id']}"))
+                if job["status"] == "queued":
+                    # The jobs before it that have not finished: the server
+                    # runs them in their order of arrival.
+                    older = f"/v1/videos?order=desc&after={job['id']}&limit=100"
+                    ahead = sum(
+                        other["status"] in ("queued", "in_progress")
+                        for other in json.loads(_call(port, older))["data"]
+                    )
             except (OSError, ValueError):
                 silent = silent or time.monotonic()
                 if time.monotonic() - silent > SILENCE_SECONDS:
                     raise LauncherError(f"it stopped answering during {job['id']}")
                 continue
             silent = None
+            if job["status"] == "queued":
+                state = f"queued · {ahead} ahead"
+            elif job["status"] == "in_progress" and not job["phase"]:
+                state = "starting the engine"
+            else:
+                state = None
+            if state is not None and state != waiting:
+                waiting = state
+                _status(f"Video · {state}")
             if job["phase"] and (job["phase"], job["progress"]) != shown:
                 shown = job["phase"], job["progress"]
-                elapsed = time.monotonic() - started
-                _status(f"Video · {shown[0]} · {shown[1]}% · {elapsed:.0f} s")
+                now = time.monotonic()
+                line = f"Video · {shown[0]} · {shown[1]}% · {now - started:.0f} s"
+                if denoising is None:
+                    if shown[0] == "denoise":
+                        denoising = now, shown[1]
+                elif shown[1] > denoising[1]:
+                    rate = (shown[1] - denoising[1]) / (now - denoising[0])
+                    line += f" · ~{(100 - shown[1]) / rate:.0f} s left"
+                _status(line)
             if args.preview and job["preview"] and preview:
                 content = f"/v1/videos/{job['id']}/content?variant=preview"
                 _write_whole(preview, _call(port, content))
@@ -832,8 +861,9 @@ def _refuse_before_install(args, selection):
     """LauncherError for what MiniMax-H3's server would refuse only once the
     model is installed and loaded: a prompt, a seed, a length or a canvas
     outside the server's rules (videos.parse_request, clip_seconds and
-    canvas, in the words of their refusals), and references for an
-    installation that holds or would install a variant without them.
+    canvas, in the words of their refusals), references for an
+    installation that holds or would install a variant without them, and a
+    video or audio reference where the server's Python has no PyAV.
     Another model passes, to be refused once installed."""
     H3 = families.H3
     if selection.repo_id != H3.release:
@@ -880,6 +910,31 @@ def _refuse_before_install(args, selection):
             f"--reference takes the {reference} variant, which {args.model} does not "
             f"hold: --model {H3.release}:{reference}"
         )
+    # The server's Python decodes a video or an audio reference with PyAV,
+    # which the release leaves out (server/references.py pyav). A source
+    # checkout's environment that does not exist yet is the server's to
+    # check.
+    if (
+        not all(map(_image, args.reference))
+        and paths.PYTHON.exists()
+        and subprocess.run(
+            [str(paths.PYTHON), "-P", "-c", "import av"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+    ):
+        raise LauncherError(families.pyav_missing(paths.PYTHON))
+
+
+def _image(path):
+    """Whether a --reference is an image as the server finds its type
+    (references.content_type): by a file's leading bytes, else by its name,
+    a pipe's by its name alone, which only the upload may read."""
+    if path.is_file():
+        with path.open("rb") as file:
+            if file.read(8).startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")):
+                return True
+    return mimetypes.guess_type(path.name)[0] in ("image/png", "image/jpeg")
 
 
 def _holds_video_model(link):

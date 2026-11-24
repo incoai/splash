@@ -24,7 +24,7 @@ from dev.tests.server_fixtures import (
     server_arguments,
 )
 from install import launcher
-from install.families import H3
+from install.families import H3, pyav_missing
 from server import serve_options, serve_record, videos
 from server import server as api
 
@@ -1620,6 +1620,29 @@ class LauncherTests(unittest.TestCase):
                     self.assertTrue(accepted)
                 except launcher.LauncherError:
                     self.assertFalse(accepted)
+
+    def test_generate_refuses_a_video_reference_without_pyav_before_installing(self):
+        # The server's Python, whose `import av` fails: a video reference is
+        # refused before anything is installed, an image alone is not.
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        python = directory / "python"
+        python.write_text("#!/bin/sh\nexit 1\n")
+        python.chmod(0o755)
+        self.enterContext(mock.patch.object(launcher.paths, "PYTHON", python))
+        cat, street = directory / "cat.png", directory / "street.bin"
+        cat.touch()
+        street.write_bytes(b"\0\0\0\x18ftypisom")
+        model = f"{MODEL}:pika-ref2va-6"
+        selection = launcher.model_artifacts.Selection.of(directory, model)
+        args = launcher.argparse.Namespace(
+            prompt="a cat", seed=None, seconds=None, size=None, model=model
+        )
+        args.reference = [cat, street]
+        with self.assertRaises(launcher.LauncherError) as refused:
+            launcher._refuse_before_install(args, selection)
+        self.assertEqual(str(refused.exception), pyav_missing(python))
+        args.reference = [cat]
+        launcher._refuse_before_install(args, selection)
 
     def test_install_installs_as_serve_does_and_starts_nothing(self):
         model = "MiniMaxAI/MiniMax-H3:my-finetune"

@@ -56,8 +56,9 @@ uses, pinned to its version) decodes a video's rgb24 frames for at most 16 s
 at its average rate and resamples a soundtrack or an audio clip to 32 kHz
 stereo; PIL decodes an image (RGB, no EXIF rotation). Reference video and
 audio need PyAV, which Splash does not ship; install it with
-`<python> -m pip install av==19.0.2`, `<python>` the interpreter Splash runs
-(without it such a request is a 400 naming that command). A video goes onto the
+`<python> -m pip install av==19.0.2`, `<python>` the interpreter Splash runs,
+and again after each upgrade, as each release brings its own Python (without
+it such a request is a 400 naming that command). A video goes onto the
 24 fps grid (each frame held until the next one's slot), is truncated to the
 clip's frame count and LANCZOS-resized to the canvas its own aspect ratio
 resolves to on the clip's tier (480p: short edge 480 within 832 x 480 pixels;
@@ -88,7 +89,13 @@ starts, for the limits its `VideoReady` announces, against which `POST`
 checks a request, and stops it; a job whose engine announces other limits
 fails (`video_engine_changed`). `/ready` is 200 from the server's start until
 it stops; `/status` reports `videos.engine` `running` while a job's engine
-runs, else `idle`. The mp4s and previews of finished jobs stay in a 4 GB
+runs, else `idle`. While a job's engine runs, `caffeinate -i` keeps the Mac
+from idle sleep, as a language model's engine keeps it awake while it serves
+a request; `--allow-idle-sleep` lets it sleep. Of the other `splash serve`
+options the server acts on the network and access ones, `--served-model-name`,
+`--max-request-size` and `--queue-size`; it ignores those that set how a
+language model is served, and names any given in one warning as it starts.
+The mp4s and previews of finished jobs stay in a 4 GB
 store, the oldest evicted first.
 
 `splash generate --model MiniMaxAI/MiniMax-H3 --prompt ... --out clip.mp4`
@@ -105,7 +112,9 @@ itself once `generate` has exited. Its flags are the `POST` fields
 `--last-frame` the image files of `input_reference` and `last_frame`,
 `--reference FILE`, repeated in presentation order, the files of `references`
 (each one's kind from its leading bytes, else its extension); progress goes to
-stderr, `--preview` writes `clip.preview.mp4` once decoded, the mp4s replace
+stderr (the jobs queued ahead, the engine's start, each phase's percent and,
+from the denoising's second reading, an estimate of the time left from the
+rate so far), `--preview` writes `clip.preview.mp4` once decoded, the mp4s replace
 files of their names, and Ctrl+C deletes the job, which cancels it at its next
 DiT block or decode clip. A request needs its
 variant's installation: references need
@@ -115,8 +124,9 @@ from (a last frame without a first, keyframes with references, an input that
 is missing or a directory, more than 12 references, an `--out` that is a
 directory or in none, references and a named variant that do not fit), and
 before installing MiniMax-H3, with status 1, an empty `--prompt`, a `--seed`,
-`--seconds` or `--size` the server refuses and references for an installation
-without that variant; once installed, a language model. A refused or failed clip exits 1, a
+`--seconds` or `--size` the server refuses, references for an installation
+without that variant and a video or audio reference without PyAV in the
+Python the server runs on; once installed, a language model. A refused or failed clip exits 1, a
 stopped one 130 (Ctrl+C) or 143 (SIGTERM).
 
 ## Video canvases

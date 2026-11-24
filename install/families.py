@@ -16,6 +16,7 @@ models of these families, each only the options it can use (option_report):
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -373,6 +374,24 @@ H3 = VideoFamily(
     max_references=12,
     min_video_frames=22,
 )
+
+# PyAV, which decodes MiniMax-H3's video and audio references
+# (server/references.py): the release leaves it out (its wheels bundle
+# FFmpeg), so the user installs this pin into the Python Splash runs on
+# (dev/requirements.txt holds the same).
+PYAV = "av==19.0.2"
+
+
+def pyav_missing(python):
+    """The refusal of a video or audio reference where `python`, the
+    interpreter Splash runs on, has no PyAV: the command that installs it.
+    Each release runs a Python of its own (paths.PYTHON), which an upgrade
+    replaces without it."""
+    return (
+        "video and audio references need PyAV, which Splash does not ship; "
+        f"install it with: {shlex.quote(str(python))} -m pip install {PYAV} "
+        "(again after each Splash upgrade, which brings its own Python)"
+    )
 
 
 # The fact a model's family must have for an option of the launcher's own,

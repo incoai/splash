@@ -1311,6 +1311,15 @@ class ListenError(Exception):
     """The HTTP server cannot listen at its address."""
 
 
+# The shared options a video model's server acts on (main): its HTTP
+# server's, its names, and whether its engine keeps the Mac awake.
+VIDEO_OPTIONS = frozenset((
+    "--host", "--allowed-host", "--allowed-origin", "--api-key", "--no-webui",
+    "--max-request-size", "--queue-size", "--served-model-name",
+    "--allow-idle-sleep",
+))  # fmt: skip
+
+
 class OptionError(Exception):
     """An option the served model's family cannot follow."""
 
@@ -1383,7 +1392,20 @@ def main():
         if videos.serves(Path(args.model_root)):
             # A video model's server serves /v1/videos alone (videos.py),
             # holding its assembly as below, and is ready, as below, once its
-            # engine is.
+            # engine is. Of the shared options it acts on VIDEO_OPTIONS
+            # alone; the others set how a language model is served, and one
+            # warning names those given.
+            if ignored := [
+                option.flag
+                for option in serve_options.SERVE_OPTIONS
+                if option.flag not in VIDEO_OPTIONS
+                and getattr(args, option.dest) != option.default()
+            ]:
+                print_status(
+                    f"Warning · {', '.join(ignored)} set how a language model is "
+                    f"served: {args.model}'s server ignores them",
+                    error=True,
+                )
             model_root, held = assembly.hold(Path(args.model_root))
             video = server.app = videos.VideoApp.start(
                 args.model,
@@ -1391,6 +1413,7 @@ def main():
                 model_root,
                 args.binary,
                 videos.START_SECONDS,
+                not args.allow_idle_sleep,
             )
             server.RequestHandlerClass = videos.handler(FrontendHandler)
             server.server_activate()
