@@ -81,7 +81,7 @@ not supported: the installer refuses a GGUF whose projections and experts are
 all BF16, F16 or F32.
 [Prism ML Ternary Bonsai 2](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
 is also supported in PQ2_0 (7.2 GB), including vision. Inkling-2-Mini also loads
-from its release, `thinkingmachines/Inkling-2-Mini` (text only). Pass
+from its release, `thinkingmachines/Inkling-2-Mini`. Pass
 `OWNER/REPO:VARIANT` to `--model`, as in the quick start. MLX targets can be
 affine 2–8-bit, including mixed precision, mxfp4, mxfp8 or nvfp4. NVIDIA's and
 unsloth's NVFP4 checkpoints and NVFP4 GGUFs also load. Smaller Qwen3.8-27B and

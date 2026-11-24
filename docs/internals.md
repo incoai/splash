@@ -188,7 +188,7 @@ the Hub's listing too. The installer never rewrites upstream files.
 
 Every start writes a model's target, draft and vision tensors into weight
 images in memory, in the layouts the kernels read: any vision tower in the
-BF16 layout of the vision operator, and the target, safetensors or GGUF, and
+BF16 layout of its tower's encoder, and the target, safetensors or GGUF, and
 the DFlash2 draft in the `MDGG0001` layout of the GGUF kernels ([MLX
 targets](models.md#mlx-targets)). Each source adapter is a loader, which validates the
 source's metadata and plans its images, and a writer:
@@ -231,7 +231,8 @@ quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
 BF16 or F16 hyper-connection projections and of such 16-bit routed experts
 ([GGUF targets](models.md#gguf-targets)) and of a safetensors target's BF16 or
 F16 projections, in the F32 quotient of an expert's global scale a checkpoint
-holds as one (as llama.cpp's converter computes Inkling 2's `.scale`), and
+holds as one (as llama.cpp's converter computes Inkling 2's `.scale`),
+in the BF16 values of an Inkling projector's Q8_0 matrices ([Vision](models.md#vision)), and
 in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
 target's quantized shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
