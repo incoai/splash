@@ -658,10 +658,11 @@ class FakeOutput:
 
 
 class FakeInput:
-    def __init__(self, process):
+    def __init__(self, process, patch=16):
         self._process = process
         self._condition = threading.Condition()
-        self._reader = native_peer.ClientFrameReader()
+        # The served tower's patch side, which the frames do not state.
+        self._reader = native_peer.ClientFrameReader(patch)
         self._closed = False
         self.records = []
         self._read_fd, self._write_fd = os.pipe()

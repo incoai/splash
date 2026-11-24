@@ -79,6 +79,11 @@ class ModelFamily:
     # last, whose values preparation rounds to BF16.
     image_format: ImageFormat = QWEN_IMAGES
     projectors: tuple[str, ...] = ("BF16", "F32", "F16")
+    # Whether a source whose tower the installer refuses serves text, with
+    # the refusal noted, rather than being refused: Inkling 2's, many of whose
+    # conversions hold no tower, and which 1.7.2 served as text only. Another
+    # family's such source asks for --language-only.
+    text_fallback: bool = False
 
 
 FAMILIES = (
@@ -109,6 +114,7 @@ FAMILIES = (
         INKLING2_SAMPLING,
         image_format=INKLING_IMAGES,
         projectors=("BF16", "F32", "F16", "Q8_0"),
+        text_fallback=True,
     ),
 )
 

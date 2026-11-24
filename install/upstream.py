@@ -15,12 +15,14 @@ new commit cannot be installed. local.py does the same from local files.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
 import tempfile
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import assembly, families, gguf, hub, models
@@ -77,6 +79,9 @@ class Target:
     # serves (the layout in assembly.py). A GGUF's configuration and tokenizer
     # are derived from it at installation instead.
     files: dict[str, str]
+    # Why a text target serves no images: the refusal of its tower, for a
+    # family that serves text instead (ModelFamily.text_fallback).
+    vision_note: str | None = None
 
 
 def root_ggufs(files):
@@ -369,16 +374,40 @@ def inspect_target(repo, variant, language_only, scratch):
     configuration is checked first, then its vision tower and the tower's
     configuration, so a model Splash cannot serve is refused for that,
     whatever its tower; a refusal of the tower alone names --language-only."""
-    try:
+
+    def inspect(text_only):
+        # Each inspection writes into a scratch directory of its own.
+        into = Path(tempfile.mkdtemp(dir=scratch))
         if variant is not None or not any(
             n.endswith(".safetensors") for n in repo.files
         ):
-            return _gguf_target(repo, variant, language_only, scratch)
-        return mlx_target(repo, language_only)
+            return _gguf_target(repo, variant, text_only, into)
+        return mlx_target(repo, text_only)
+
+    try:
+        return with_text_fallback(inspect, language_only)
     except models.VisionError as error:
         raise models.VisionError(
             f"{error}; use --language-only to serve text only"
         ) from None
+
+
+def with_text_fallback(inspect, language_only):
+    """inspect(language_only)'s target, but where its tower is refused, for a
+    family that serves text instead (ModelFamily.text_fallback), its text
+    target, the refusal its vision_note; another family's refusal stands."""
+    try:
+        return inspect(language_only)
+    except models.VisionError as error:
+        if language_only:
+            raise
+        refusal = error
+    # Its text configuration passed before its tower was refused.
+    with contextlib.redirect_stdout(io.StringIO()):
+        text = inspect(True)
+    if not text.family.text_fallback:
+        raise refusal
+    return replace(text, vision_note=str(refusal))
 
 
 def _gguf_target(repo, variant, language_only, scratch):
@@ -718,24 +747,29 @@ def _start_installed(selection, target, installed):
     # installation links hold none. Until then, and for a repository whose
     # tower Splash cannot serve, it serves text only.
     tower = _lacks_tower(selection, installed)
-    if tower and _answered(target):
-        print(f"Updating {selection.model}: it serves images now.", flush=True)
-        took = []
-
-        def take_tower():
+    if tower:
+        # The Hub's listing of the commit, which a commit revision resolves
+        # without: one request, which a listing without a tower Splash serves
+        # is not asked again for (vision_unavailable).
+        listed = target
+        if not _answered(listed) and not target.unreachable_reason:
+            with suppress(models.ModelError, OSError):
+                listed = hub.Repository.resolve(selection.repo_id, target.revision)
+        if _answered(listed) and listed.paths is None:
+            print(
+                f"Updating {selection.model}: its family serves images now.",
+                flush=True,
+            )
             try:
-                _install(selection, target, installed, draft)
-            except models.VisionError as error:
-                print(f"{selection.model} serves text only: {error}.", flush=True)
-            else:
-                took.append(True)
-
-        if not _keeping_installation(
-            selection, installed, "take in its vision tower", take_tower
-        ):
-            return KEPT
-        if took:
-            return UPDATED if answered else UNREACHABLE
+                _install(selection, listed, installed, draft)
+                return UPDATED if answered else UNREACHABLE
+            except (models.ModelError, OSError) as error:
+                # A projector that cannot download, say: it serves text, and
+                # what else changed is assembled from the snapshots it links.
+                models.warn(
+                    f"{selection.model} serves text only for now; cannot take in "
+                    f"its vision tower: {error}"
+                )
     if changes:
         print(f"Updating {selection.model}: {'; '.join(changes)}.", flush=True)
         if not _keeping_installation(
@@ -748,6 +782,7 @@ def _start_installed(selection, target, installed):
                 installed,
                 draft,
                 language_only=selection.language_only or tower,
+                keep_tower=tower,
             ),
         ):
             return KEPT
@@ -767,21 +802,24 @@ def _start_installed(selection, target, installed):
         installed,
         draft,
         language_only=selection.language_only or tower,
+        keep_tower=tower,
     )
     return UPDATED if answered else UNREACHABLE
 
 
 def _lacks_tower(selection, installed):
     """Whether installed, a verified assembly of selection, serves text only
-    though its family serves images and the selection asks for them: one
-    assembled while its family served text only (Inkling-2-Mini's before
-    1.7.3)."""
+    though its family serves images and the selection asks for them, and the
+    Hub's listing of its commit was not found without a tower Splash serves
+    (vision_unavailable): one assembled while its family served text only
+    (Inkling-2-Mini's before 1.7.3), or from the Hub cache."""
     family = installed and families.named(installed["family"])
     return bool(
         family
         and family.vision
         and not selection.language_only
         and installed["vision_format"] == "none"
+        and "vision_unavailable" not in installed
     )
 
 
@@ -803,21 +841,11 @@ def _install_commit(selection, target, installed):
         )
     if installed is None:
         _install(selection, target, None)
-        return UPDATED if _answered(target) else UNREACHABLE
-
-    def install():
-        try:
-            _install(selection, target, installed)
-        except models.VisionError as error:
-            # An installation that served text only goes on so where the
-            # commit's tower cannot serve (_lacks_tower).
-            if not _lacks_tower(selection, installed):
-                raise
-            print(f"{selection.model} serves text only: {error}.", flush=True)
-            _install(selection, target, installed, language_only=True)
-
-    if not _keeping_installation(
-        selection, installed, f"install {selection.repo_id}@{target.revision}", install
+    elif not _keeping_installation(
+        selection,
+        installed,
+        f"install {selection.repo_id}@{target.revision}",
+        lambda: _install(selection, target, installed),
     ):
         return KEPT
     return UPDATED if _answered(target) else UNREACHABLE
@@ -854,12 +882,16 @@ def _retain_installed(selection):
     return None
 
 
-def _install(selection, repo, installed, draft=None, *, language_only=None):
-    """Assemble repo's target and its draft, and publish the assembly at the
-    selection link. draft is the draft's repository as this start resolved
-    it, or None to resolve it here, asking the Hub only when it answered for
-    repo. language_only, when given, takes the selection's place: an
-    installation that serves text only is assembled again so."""
+def _install(
+    selection, repo, installed, draft=None, *, language_only=None, keep_tower=False
+):
+    """Assemble repo's target and its draft, publish the assembly at the
+    selection link, and return the target. draft is the draft's repository as
+    this start resolved it, or None to resolve it here, asking the Hub only
+    when it answered for repo. language_only, when given, takes the
+    selection's place: an installation that serves text only is assembled
+    again so, and with keep_tower one that another start gave its tower since
+    is kept (publish)."""
     # Every Hub request (header reads, downloads) happens here.
     with (
         hub.as_model_errors(f"cannot install {selection.model}"),
@@ -877,6 +909,8 @@ def _install(selection, repo, installed, draft=None, *, language_only=None):
         following = sum(size for size, _ in repo.missing(names))
         draft, files = _draft(target, installed, draft, following)
         vision = "disabled" if target.vision_format == "none" else "enabled"
+        if target.vision_note:
+            vision += f" ({target.vision_note})"
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
             f"draft {draft.name}; vision {vision}.",
@@ -889,13 +923,17 @@ def _install(selection, repo, installed, draft=None, *, language_only=None):
         selection.link,
         assembly_record(selection.model, target, repo, draft),
         files,
+        keep_tower=keep_tower,
     )
+    return target
 
 
 def assembly_record(model, target, repo, draft):
     """The record of model's assembly of target, inspected in repo, and the
-    draft repository draft, but for the files it links (publish)."""
-    return {
+    draft repository draft, but for the files it links (publish). A text
+    target of the Hub's listing of its commit (paths None: not the Hub
+    cache's) records why it serves no images."""
+    record = {
         "version": 1,
         "model": model,
         "family": target.family.name,
@@ -903,9 +941,12 @@ def assembly_record(model, target, repo, draft):
         "vision_format": target.vision_format,
         "sources": {"target": repo.identity(), "draft": draft.identity()},
     }
+    if target.vision_note and repo.paths is None:
+        record["vision_unavailable"] = target.vision_note
+    return record
 
 
-def publish(models_root, link, record, files):
+def publish(models_root, link, record, files, *, keep_tower=False):
     """Publish the assembly of record and files (assembly path -> source
     file) at link, a selection link under models_root, and return it. A file
     the assembly it replaces records, unchanged since, is not read again for
@@ -919,6 +960,15 @@ def publish(models_root, link, record, files):
     with models.installation_lock(models_root):
         # The record of the assembly the link names, which this one replaces.
         previous = assembly.recorded(link)
+        # A text-only assembly of the commit another start gave its tower
+        # since this one read it replaces nothing (keep_tower).
+        if (
+            keep_tower
+            and previous
+            and previous["vision_format"] != "none"
+            and previous["sources"]["target"] == record["sources"]["target"]
+        ):
+            return link.resolve()
         # A file changed since its record was taken is read again.
         records = {
             path: assembly.file_record(path, entry) for path, entry in records.items()

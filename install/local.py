@@ -152,11 +152,19 @@ def _inspect(target, mmproj, language_only, scratch):
                     "target keeps its vision tower in its checkpoint"
                 )
             try:
-                return repo, upstream.mlx_target(repo, language_only)
+                inspected = upstream.with_text_fallback(
+                    lambda text_only: upstream.mlx_target(repo, text_only),
+                    language_only,
+                )
             except models.VisionError as error:
                 raise models.VisionError(
                     f"{error}; pass language_only=True to serve text only"
                 ) from None
+            if inspected.vision_note:
+                print(
+                    f"{target} serves text only: {inspected.vision_note}.", flush=True
+                )
+            return repo, inspected
         directory, names = target, _gguf_in(repo.files)
     elif target.is_file():
         if not target.name.endswith(".gguf"):

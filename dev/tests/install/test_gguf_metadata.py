@@ -36,6 +36,8 @@ from install import assembly, families, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
+FAMILIES = families.FAMILIES  # as defined, whatever a test patches
+
 
 class GgufMetadataTests(unittest.TestCase):
     def setUp(self):
@@ -730,21 +732,35 @@ class GgufMetadataTests(unittest.TestCase):
             )
         self.assertEqual(fake.downloads, [])
 
-    def install_while_its_family_served_text_only(self, fake):
+    def install_while_its_family_served_text_only(self, fake, revision=None):
         """A selection that asks for images, installed by a release in which
         its target's family served text only (Inkling-2-Mini's before
-        1.7.3), with the requests and downloads it made forgotten."""
-        chosen = selection(self.root, GGUF_REPO + ":Q4_K_M", language_only=False)
-        text_only = tuple(
-            dataclasses.replace(family, vision=False) if family == MOE else family
-            for family in families.FAMILIES
+        1.7.3), with the requests and downloads it made forgotten; from here
+        on the family serves images, falling back to text as Inkling 2's
+        does (ModelFamily.text_fallback)."""
+        chosen = selection(
+            self.root, GGUF_REPO + ":Q4_K_M", language_only=False, revision=revision
         )
-        with mock.patch.object(families, "FAMILIES", text_only):
-            self.prepare(chosen)
+        self.as_family(vision=False)
+        self.prepare(chosen)
         self.assertEqual(assembly.verify(chosen.link)["vision_format"], "none")
         self.assertNotIn(f"{GGUF_REPO}/mmproj-F32.gguf", fake.downloads)
+        self.as_family(text_fallback=True)
         fake.requests.clear(), fake.downloads.clear()
         return chosen
+
+    def as_family(self, **changes):
+        """The test's family (MOE) with changes to its own definition, in
+        place of any made before, until the test ends."""
+        patched = tuple(
+            dataclasses.replace(family, **changes)
+            if family.name == MOE.name
+            else family
+            for family in FAMILIES
+        )
+        patcher = mock.patch.object(families, "FAMILIES", patched)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @staticmethod
     def prepare_warned(chosen):
@@ -760,7 +776,8 @@ class GgufMetadataTests(unittest.TestCase):
         fake = self.gguf_repository()
         chosen = self.install_while_its_family_served_text_only(fake)
         output, warnings = self.prepare_warned(chosen)
-        self.assertIn("it serves images now", output)
+        self.assertIn("its family serves images now", output)
+        self.assertIn("vision enabled", output)
         self.assertEqual(warnings, "")
         # The projector alone downloads; the installed GGUF is linked again.
         self.assertEqual(fake.downloads, [f"{GGUF_REPO}/mmproj-F32.gguf"])
@@ -768,6 +785,17 @@ class GgufMetadataTests(unittest.TestCase):
         output, warnings = self.prepare_warned(chosen)
         self.assertIn("is already installed", output)
         self.assertEqual(warnings, "")
+
+    def test_a_pinned_commit_takes_its_tower_in_too(self):
+        # A commit revision resolves without the Hub; the tower needs its
+        # listing, which one request gets.
+        fake = self.gguf_repository()
+        chosen = self.install_while_its_family_served_text_only(fake, "a" * 40)
+        output, warnings = self.prepare_warned(chosen)
+        self.assertIn("vision enabled", output)
+        self.assertEqual(warnings, "")
+        self.assertEqual(fake.downloads, [f"{GGUF_REPO}/mmproj-F32.gguf"])
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "gguf")
 
     def test_offline_an_installation_without_its_tower_serves_text_quietly(self):
         fake = self.gguf_repository()
@@ -784,23 +812,98 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertIn("the GGUF metadata adapter changed", output)
         self.assertEqual(warnings + rebuilt, "")
         self.assertEqual(fake.downloads, [])
-        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "none")
+        record = assembly.verify(chosen.link)
+        self.assertEqual(record["vision_format"], "none")
+        # The cache held no projector: the Hub is asked again once it answers.
+        self.assertNotIn("vision_unavailable", record)
+        output, _ = self.prepare_warned(chosen)
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "gguf")
 
     def test_a_repository_without_a_projector_goes_on_serving_text(self):
         fake = self.gguf_repository(vision=False)
         chosen = self.install_while_its_family_served_text_only(fake)
-        for start in range(2):
-            with self.subTest(start=start):
-                output, warnings = self.prepare_warned(chosen)
-                self.assertIn(
-                    f"{GGUF_REPO}:Q4_K_M serves text only: the GGUF repository has "
-                    "no BF16, F32, F16 vision projector",
-                    output,
-                )
-                self.assertIn("is already installed", output)
-                self.assertEqual(warnings, "")
-                self.assertEqual(fake.downloads, [])
-                self.assertEqual(assembly.verify(chosen.link)["vision_format"], "none")
+        output, warnings = self.prepare_warned(chosen)
+        self.assertIn(
+            "vision disabled (the GGUF repository has no BF16, F32, F16 vision "
+            "projector",
+            output,
+        )
+        self.assertEqual(warnings, "")
+        record = assembly.verify(chosen.link)
+        self.assertEqual(record["vision_format"], "none")
+        self.assertIn(
+            "no BF16, F32, F16 vision projector", record["vision_unavailable"]
+        )
+        # Its commit's listing had none: later starts ask nothing more.
+        fake.requests.clear()
+        output, warnings = self.prepare_warned(chosen)
+        self.assertIn("is already installed", output)
+        self.assertNotIn("serves images now", output)
+        self.assertEqual((warnings, fake.downloads), ("", []))
+        self.assertEqual(len(fake.requests), 2)  # the target's and the draft's
+
+    def test_a_fresh_installation_without_a_projector_serves_text(self):
+        # Of a family that falls back to text: online, the listing's lack is
+        # recorded; from the Hub cache alone, it is not, and the Hub is asked
+        # once it answers.
+        fake = self.gguf_repository(vision=False)
+        self.as_family(text_fallback=True)
+        chosen = selection(self.root, GGUF_REPO + ":Q4_K_M", language_only=False)
+        output, warnings = self.prepare_warned(chosen)
+        record = assembly.verify(chosen.link)
+        self.assertEqual((record["vision_format"], warnings), ("none", ""))
+        self.assertIn("vision_unavailable", record)
+        self.assertIn("vision disabled (the GGUF repository has no", output)
+        pinned = selection(
+            self.root, GGUF_REPO + ":Q4_K_M", language_only=False, revision="a" * 40
+        )
+        # Another family's such source is refused, naming --language-only.
+        self.as_family(text_fallback=False)
+        with self.assertRaisesRegex(models.VisionError, "use --language-only"):
+            self.prepare(pinned)
+        self.as_family(text_fallback=True)
+        fake.downloads.clear()
+        with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
+            output, warnings = self.prepare_warned(pinned)
+        self.assertIn("from the Hub cache", output)
+        self.assertIn("vision disabled (the GGUF repository has no", output)
+        record = assembly.verify(pinned.link)
+        self.assertEqual((record["vision_format"], warnings), ("none", ""))
+        self.assertNotIn("vision_unavailable", record)
+        self.assertEqual(fake.downloads, [])
+
+    def test_a_tower_that_cannot_download_leaves_the_rest_of_an_update(self):
+        fake = self.gguf_repository()
+        chosen = self.install_while_its_family_served_text_only(fake)
+        installed = assembly.verify(chosen.link)["metadata"]
+        adapter = self.root / "gguf.py"
+        adapter.write_text("a new adapter\n")
+        fake.download_failure = OSError(28, "No space left on device")
+        with mock.patch.object(gguf, "__file__", str(adapter)):
+            output, warnings = self.prepare_warned(chosen)
+        self.assertIn("cannot take in its vision tower", warnings)
+        self.assertIn("the GGUF metadata adapter changed", output)
+        record = assembly.verify(chosen.link)
+        self.assertEqual(record["vision_format"], "none")
+        self.assertNotEqual(record["metadata"], installed)
+
+    def test_a_text_reassembly_keeps_a_tower_another_start_took_in(self):
+        # Two starts read the text installation; one takes the tower in, then
+        # the other, offline, assembles its commit again text only.
+        fake = self.gguf_repository()
+        chosen = self.install_while_its_family_served_text_only(fake)
+        stale = assembly.verify(chosen.link)
+        self.prepare_warned(chosen)
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "gguf")
+        with contextlib.redirect_stdout(io.StringIO()):
+            upstream._install(
+                chosen,
+                assembly.source(stale, "target"),
+                stale,
+                language_only=True,
+                keep_tower=True,
+            )
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "gguf")
 
     def test_a_new_metadata_adapter_rebuilds_the_metadata_locally(self):
         self.rebuild_metadata_with_a_new_adapter(offline=False)

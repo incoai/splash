@@ -2,6 +2,7 @@ import contextlib
 import fcntl
 import io
 import json
+import re
 import tempfile
 import unicodedata
 import unittest
@@ -278,35 +279,53 @@ class LocalModelTest(unittest.TestCase):
             json.dumps({"image_processor": processor})
         )
         self.prepare(target, draft)
+
+        def served(why=None):
+            """The vision format target is prepared with, saying why it serves
+            text only where it does."""
+            with (
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                contextlib.redirect_stderr(io.StringIO()) as warnings,
+            ):
+                prepared = local.prepare_local_model(
+                    target, draft, models_dir=self.models
+                )
+            self.assertEqual(warnings.getvalue(), "")
+            if why is not None:
+                self.assertRegex(
+                    output.getvalue(),
+                    f"{re.escape(str(target))} serves text only: {why}",
+                )
+            else:
+                self.assertNotIn("serves text only", output.getvalue())
+            return assembly.verify(prepared)["vision_format"]
+
+        # A tower the encoder does not take: Inkling 2, which 1.7.2 served as
+        # text only, serves text, saying why (ModelFamily.text_fallback).
         (target / "processor_config.json").write_text(
             json.dumps(
                 {"image_processor": processor | {"size": {"height": 32, "width": 32}}}
             )
         )
-        with self.assertRaisesRegex(
-            models.VisionError,
-            "unsupported vision preprocessing configuration; pass "
-            "language_only=True to serve text only",
-        ):
-            self.prepare(target, draft)
+        self.assertEqual(
+            served("unsupported vision preprocessing configuration"), "none"
+        )
         # Its RoPE: a config may state transformers' axial one over 10,000,
         # which the encoder runs, and no other base.
         (target / "processor_config.json").write_text(
             json.dumps({"image_processor": processor})
         )
         config = json.loads((target / "config.json").read_text())
-        for theta in (10_000.0, 20_000.0):
+        for theta, vision in ((20_000.0, "none"), (10_000.0, "safetensors")):
             config["vision_config"]["rope_parameters"] = {
                 "rope_type": "axial",
                 "rope_theta": theta,
             }
             (target / "config.json").write_text(json.dumps(config))
             with self.subTest(theta=theta):
-                if theta == 10_000.0:
-                    self.prepare(target, draft)
-                    continue
-                with self.assertRaisesRegex(models.VisionError, "rope_theta"):
-                    self.prepare(target, draft)
+                self.assertEqual(
+                    served(".*rope_theta" if vision == "none" else None), vision
+                )
 
     def test_an_mlx_target_serves_images_with_its_own_tower(self):
         shards = {
