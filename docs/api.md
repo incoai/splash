@@ -614,11 +614,10 @@ URL to fetch returns 400. JPEG, PNG, WebP and GIF decode. An image file may
 hold up to 32 MiB and 33,554,432 pixels, with an aspect ratio up to 200:1, and
 is resized to at most `--max-image-pixels` (4,194,304 by default). Inkling 2
 takes an image of any aspect ratio at its own size, padded to whole 40-pixel
-tokens, and resizes only one of more patches than that cap's
-(`--max-image-pixels` / 256 patches, 16,384 at the default, which make 4,096
-tokens)
-([Vision](models.md#vision)); `/v1/models` states the 200:1 every model
-takes. A request
+tokens, and resizes only an image of more patches than the cap gives
+(`--max-image-pixels` / 256: 16,384 patches at the default, which make 4,096
+tokens) ([Vision](models.md#vision)); `/v1/models` reports
+`limits.image_aspect` 200 for every model, Inkling 2 included. A request
 carries at most 64 images, PDF pages included.
 
 PDFs arrive inline too: Chat `file` parts with `file_data`, Responses
@@ -635,8 +634,10 @@ system's libraries and fonts and Splash's runtime, and to write nothing, reach
 no network and start no program.
 
 A model serving without vision refuses both with 400: one served with
-`--language-only`, one of a family without a vision tower such as Flint, or a
-GGUF served without a projector ([vision](models.md#vision)).
+`--language-only`, one of a family without a vision tower such as Flint, a
+GGUF served without a projector, or an Inkling 2 installation that serves text
+because its source has no tower Splash serves or it has not taken its tower in
+yet ([vision](models.md#vision)).
 
 ## Responses state
 

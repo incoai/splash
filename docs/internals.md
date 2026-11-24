@@ -157,14 +157,19 @@ beside what it ships.
   this release changed the GGUF metadata adapter, from the snapshots it links
   (`assembly.source`), wherever `HF_HUB_CACHE` points now; if the new draft
   cannot be fetched or is not the family's ([Drafts](models.md#drafts)), the
-  installed one is kept.
+  installed one is kept. One that serves text only though its family serves
+  images, and has not recorded why (`upstream._lacks_tower`: Inkling-2-Mini's
+  from 1.7.2), is assembled again from the Hub's listing of its commit, to
+  take its tower in ([Vision](models.md#vision)).
 - A new commit: only changed files are downloaded, and the new assembly
   replaces the installed one atomically once published.
 - No answer, or a new commit that cannot be installed: the installed assembly
   starts, with one line naming the Hub's reason or, on stderr, the
   installation attempt that failed.
 - A 40-hex `--revision`, or `--offline`: a verified installation starts
-  without a request.
+  without a request, but for one that lacks its family's tower and has not
+  recorded why: under a 40-hex `--revision` its start asks for that commit's
+  listing (`upstream._start_installed`).
 
 A missing assembly, or one that no longer verifies, is built again. Without the
 Hub it is built from a cached snapshot, of the commit the `--revision` names,

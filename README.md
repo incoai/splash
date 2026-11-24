@@ -57,8 +57,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Reasoning follows the model default. For the Qwen families,
 `"reasoning_effort": "none"` turns it off in Chat, and Anthropic Messages
-requests reason only when they set `thinking`; Inkling-2-Mini, told the effort,
-and Flint decide for themselves.
+requests reason only when they set `thinking`; Inkling-2-Mini, which is told
+the effort, and Flint decide for themselves whether to reason.
 [Reasoning settings](docs/server.md#default-reasoning-effort) ·
 [Tool calls](docs/api.md#tool-calls) ·
 [API details](docs/api.md)

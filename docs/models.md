@@ -22,8 +22,9 @@ family's draft is chosen.
 A GGUF that holds most of its values unquantized is refused first
 (`gguf.require_quantized`, [GGUF targets](#gguf-targets)), and a model the
 engine refuses with its reason; no weight file is downloaded for either. An MLX
-target's tensor shapes, and an MLX vision tower's weights, which must not be
-quantized (`VisionLoader.cpp`), are checked only when the model loads.
+target's tensor shapes are checked only when the model loads; an MLX vision
+tower's weights, which must not be quantized (`VisionLoader.cpp`), once its
+files have downloaded ([Vision](#vision)) and at every load.
 `families.FAMILIES` names the draft trained for each family; repository names
 and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
@@ -222,13 +223,13 @@ release keeps its loop layers' message queries in two lists of every loop
 layer's (`middle_cycle_cross_pass_queries`, its q and FFN rows, and
 `_kv_queries`, its k and v rows), its block mix queries in lists of every
 layer's (`attn_res.attn_queries`, `mlp_queries`). A loop layer's message
-gates load as stored, F32 or BF16, but where a call of them (its q, k and v
-gates, or its FFN gate), which the fused kernels take in one format, mixes the
-two: mlx-vlm's conversions keep a gate's down projection BF16 and its forget
-and gain F32, and such a call's BF16 rows are widened to F32, exactly (28 MB
-for `mlx-community/Inkling-2-Mini-4bit`'s). Its MTP head is not loaded; its
-vision tower is ([Vision](#vision)). Where a checkpoint and a GGUF hold the
-same values, the images are the same bytes (`gguf-preparation`).
+gates load as stored, F32 or BF16. The fused kernels take a call's gates (its
+q, k and v gates, or its FFN gate) in one format, so a call that mixes the
+two has its BF16 rows widened to F32, exactly: mlx-vlm's conversions keep a
+gate's down projection BF16 and its forget and gain F32 (28 MB more for
+`mlx-community/Inkling-2-Mini-4bit`). A checkpoint's MTP head is not loaded;
+its vision tower is ([Vision](#vision)). Where a checkpoint and a GGUF hold
+the same values, the images are the same bytes (`gguf-preparation`).
 
 ## GGUF targets
 
@@ -338,8 +339,10 @@ as MXFP8, below). The repository keeps the
 converter's layout in `Mainline_Support/` with the extension `.gguf_file`,
 which target selection does not read: such a file installs from a local copy
 named `.gguf` ([Local model files](#local-model-files)). An installation of
-one holds its draft, `incoai/Inkling-2-Mini-DFlash2` ([Drafts](#drafts)), and
-its vision tower, the repository's `inkling2v` projector ([Vision](#vision)). Its decode captures a reply's state at
+one of the repository's quants holds its draft,
+`incoai/Inkling-2-Mini-DFlash2` ([Drafts](#drafts)), and its vision tower, the
+repository's `inkling2v` projector ([Vision](#vision)); a local copy takes a
+projector with `--mmproj`. Inkling 2's decode captures a reply's state at
 each page as the Qwen families' does, its convolutions' state folded at the
 page ([Replay points and
 checkpoints](internals.md#replay-points-and-checkpoints)), so a conversation's
@@ -792,14 +795,14 @@ embedding orders a patch's values by row, column and channel, which
 preparation reorders to the image's channels first, so each source writes the
 same image, byte for byte, from the same BF16 values. A Q8_0 matrix is the one
 tensor preparation rounds: each value, its block's F16 scale times its int8
-quant, becomes the nearest BF16, as a GPU product of BF16 operands would round
-it as it read it (`model/InklingVision.hpp` lays out its image). Its processor
-is transformers' `Inkling2ImageProcessor`, whose one configuration is its
-class's defaults (a token of 40 x 40 pixels, mean and deviation 0.5): an MLX
-conversion, which saves none, is installed with them. Its `vision_config` may
-state its patches' side and merge as the release does (`native_patch_size`,
-`adapter_merge_size`) or as transformers saves them (`patch_size`,
-`spatial_merge_size`).
+quant, becomes the nearest BF16, ties to even, the precision the tower's
+kernels read every weight in (`model/InklingVision.hpp` lays out its image).
+Its processor is transformers' `Inkling2ImageProcessor`, whose one
+configuration is its class's defaults (a token of 40 x 40 pixels, mean and
+deviation 0.5): an MLX conversion, which saves none, is installed with them.
+Its `vision_config` may state its patches' side and merge as the release does
+(`native_patch_size`, `adapter_merge_size`) or as transformers saves them
+(`patch_size`, `spatial_merge_size`).
 
 Inkling 2's images are not resized but padded right and bottom to whole tokens
 of 40 x 40 pixels, four 20-pixel patches merged 2 x 2: an image of H x W pixels
@@ -833,7 +836,7 @@ Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
 F32, all of them BF16-exact, and loads byte-identical to the MLX tower.
 Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
 use are rejected. The installer has the engine prepare a tower once its files
-are downloaded, as every start prepares it (the engine's `vision-check`, about
+are downloaded, as every start prepares it (the engine's `vision-check`, under
 a second and the image's memory): a tower it refuses, of names it does not
 bind or of a weight that is not exactly a BF16, which headers do not show, is
 refused at installation, naming `--language-only`, not at every start.
@@ -1170,18 +1173,21 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
 
 The files are checked as a download is, by the engine's `model-check` on their
 metadata and a GGUF's headers ([Upstream model
-loading](#upstream-model-loading)). When Splash cannot serve them without a
+loading](#upstream-model-loading)) and its `vision-check` on a vision tower's
+weights ([Vision](#vision)). When Splash cannot serve them without a
 download (a missing file or split part, an unsupported format, a draft of
 another model), a `ModelError` names the file and the reason. The directory
 returned is an assembly of links to the files ([Installation](internals.md#installation)),
 which never changes. Preparing the same files again returns it, reading only
-their metadata, sizes and times; the first preparation reads each file
-outside the Hugging Face cache once, for its digest. Once a file changes, or
-a download moves the draft's default branch, preparing again returns another
-directory: restart the server on it. The server holds the directory it
-serves until it exits; one that no preparation returns any more is removed
-only once no server holds it. The server takes the installation lock of
-`models_dir` to hold it when it starts, so it needs write access there.
+their metadata, sizes and times and a vision tower's weights, which the engine
+prepares at every preparation, in under a second; the first preparation reads
+each file outside the Hugging Face cache once, for its digest. Once a file
+changes, or a download moves the draft's default branch, preparing again
+returns another directory: restart the server on it. The server holds the
+directory it serves until it exits; one that no preparation returns any more
+is removed only once no server holds it. The server takes the installation
+lock of `models_dir` to hold it when it starts, so it needs write access
+there.
 
 `prepare_local_model` and `ModelError` keep their names, parameters,
 defaults, results and errors across the releases of one major version; a
