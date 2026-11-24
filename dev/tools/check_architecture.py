@@ -257,8 +257,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # released. 31,104 adds 1 for an image's patch side, which the protocol takes
 # from the model's tower (Inkling 2's 20 pixels, Qwen's 16). 31,107 adds 3 for
 # an image span's own height and width, which Inkling 2's encoder pads past as
-# its reference does, and the span's layout in the frame.
-ENGINE_LINE_BUDGET = 31_107
+# its reference does, and the span's layout in the frame. 31,110 adds 3 for
+# that size in a KV block's identity, as the image cache keys it.
+ENGINE_LINE_BUDGET = 31_110
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

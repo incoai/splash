@@ -36,8 +36,8 @@ BlockIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
       break;
     if (span.end() <= blockBegin)
       continue;
-    // Two independently seeded chains fold the content digest, the grid, and
-    // the block's alignment inside the span into 128 bits.
+    // Two independently seeded chains fold the content digest, the grid, the
+    // block's alignment inside the span and any own size into 128 bits.
     uint64_t lo = identity.lo ? identity.lo : 0x243f6a8885a308d3ULL;
     uint64_t hi = identity.hi ? identity.hi : 0x13198a2e03707344ULL;
     for (uint64_t value :
@@ -47,6 +47,9 @@ BlockIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
       lo = mix(lo, value);
       hi = mix(hi, ~value);
     }
+    // The image's own size, where its grid pads past it (as ImageKey keys it).
+    if (const uint64_t content = (uint64_t{span.contentHeight} << 32) | span.contentWidth)
+      lo = mix(lo, content), hi = mix(hi, ~content);
     identity = {lo, hi};
   }
   return identity;
