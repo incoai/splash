@@ -124,29 +124,48 @@ std::vector<uint32_t> pageRange(uint32_t first, uint32_t count) {
 // producing tokens instead of a stop token right after prefill. The user text
 // repeats one sentence, "Write a detailed, multi-paragraph essay about the
 // history of the Roman Empire. ", until the prompt reaches the requested
-// length, and the answer follows an empty think block. Its tokens are the
-// target's tokenizer's: the Qwen families' (one tokenizer) or Flint's.
+// length. Each family uses its own tokenizer and assistant prefix.
 struct ChatTokens final {
   std::vector<uint32_t> userHeader;
   std::vector<uint32_t> sentence;
+  std::vector<uint32_t> counting;
   std::vector<uint32_t> assistantHeader;
 };
 const ChatTokens kQwenChat{
     // <|im_start|>user\n
     .userHeader = {248045, 846, 198},
     .sentence = {7734, 264, 11346, 11, 7072, 12, 26829, 8627, 883, 279, 3712, 314, 279, 12386, 19825, 13, 220},
+    .counting = {2427, 38453, 494, 220, 16, 11, 4237, 1754, 1324, 321, 1141, 6163, 803, 383, 264, 491, 1500, 13,
+                 14569, 2980, 488, 5372, 220, 17, 15, 15, 13},
     // <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
     .assistantHeader = {248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271}};
 const ChatTokens kFlintChat{
     // <|user|>
     .userHeader = {150003},
     .sentence = {7421, 260, 7426, 11, 4519, 12, 41088, 6369, 762, 269, 3476, 297, 269, 10831, 18381, 13, 220},
+    .counting = {3201, 29915, 497, 220, 16, 11, 3758, 1218, 1067, 299, 869, 5095, 1060, 358, 260, 618, 1507, 13,
+                 27110, 2843, 361, 4495, 220, 905, 13},
     // <|assistant|><think></think>
     .assistantHeader = {150004, 150006, 150007}};
 
+const ChatTokens kInklingChat{
+    // <|message_user|><|content_text|>
+    .userHeader = {200000, 200004},
+    .sentence = {3711, 149878, 156285, 11, 151517, 12, 89276, 158248, 150081, 149876, 151698,
+                 149879, 149876, 156316, 182189, 13, 220},
+    .counting = {2635, 187399, 149920, 220, 16, 11, 152979, 150154, 150107, 149880, 150114, 152692, 150231, 149894,
+                 149878, 150046, 150264, 13, 188959, 151319, 149941, 155939, 220, 68058, 13},
+    // <|end_message|><|message_model|><|content_text|>
+    .assistantHeader = {200010, 200001, 200004}};
+
+const ChatTokens &chatTokens(const model::ModelDescriptor &descriptor) {
+  if (std::holds_alternative<model::Inkling2LoopLayout>(descriptor.target))
+    return kInklingChat;
+  return std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintChat : kQwenChat;
+}
+
 std::vector<uint32_t> chatPrompt(const model::ModelDescriptor &descriptor, uint32_t tokens) {
-  const ChatTokens &chat =
-      std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintChat : kQwenChat;
+  const ChatTokens &chat = chatTokens(descriptor);
   if (tokens < chat.userHeader.size() + chat.assistantHeader.size() + 1)
     throw std::invalid_argument("prompt is too short for a chat request");
   std::vector<uint32_t> prompt = chat.userHeader;
@@ -162,12 +181,11 @@ std::vector<uint32_t> chatPrompt(const model::ModelDescriptor &descriptor, uint3
 // thinking: an answer of near-certain chains, where a lookup has nothing to
 // copy at first.
 std::vector<uint32_t> countingPrompt(const model::ModelDescriptor &descriptor) {
-  if (std::holds_alternative<model::FlintLayout>(descriptor.target))
-    return {150003, 3201, 29915, 497, 220, 16, 11, 3758, 1218, 1067, 299, 869, 5095, 1060, 358,
-            260, 618, 1507, 13, 27110, 2843, 361, 4495, 220, 905, 13, 150004, 150006, 150007};
-  return {248045, 846, 198, 2427, 38453, 494, 220, 16, 11, 4237, 1754, 1324, 321, 1141,
-          6163, 803, 383, 264, 491, 1500, 13, 14569, 2980, 488, 5372, 220, 17, 15,
-          15, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271};
+  const ChatTokens &chat = chatTokens(descriptor);
+  std::vector<uint32_t> prompt = chat.userHeader;
+  prompt.insert(prompt.end(), chat.counting.begin(), chat.counting.end());
+  prompt.insert(prompt.end(), chat.assistantHeader.begin(), chat.assistantHeader.end());
+  return prompt;
 }
 
 uint32_t parseCount(std::string_view text, std::string_view label) {
@@ -639,7 +657,7 @@ int main(int argc, char **argv) {
       // Under a thinking budget a Qwen answer thinks: a prompt's empty
       // thinking block stays open, and the budget's end is "\n\n</think>".
       if (thinkingTokens) {
-        if (std::holds_alternative<model::FlintLayout>(model.descriptor.target))
+        if (&chatTokens(model.descriptor) != &kQwenChat)
           throw std::invalid_argument("--thinking-budget takes a Qwen target");
         constexpr uint32_t kThinkEnd = 248069, kBlankLines = 271;
         if (prompt.size() >= 2 && prompt[prompt.size() - 2] == kThinkEnd && prompt.back() == kBlankLines)
