@@ -621,7 +621,13 @@ tokens, and resizes only an image of more patches than the cap gives
 (`--max-image-pixels` / 256: 16,384 patches at the default, which make 4,096
 tokens) ([Vision](models.md#vision)); `/v1/models` reports
 `limits.image_aspect` 200 for every model, Inkling 2 included. A request
-carries at most 64 images, PDF pages included.
+carries at most 64 images, PDF pages included. A Messages request of more
+image blocks is refused naming the oldest, as Anthropic's API names a block
+(`messages.2.content.0.image: requests support at most 64 images`): Claude
+Code, which keeps up to 100 images in a conversation, takes an image out and
+sends the request again, at one refused request for each round that brings an
+image past the 64th. It answers from the new image, then keeps the first 64
+and a note in place of the later one.
 
 PDFs arrive inline too: Chat `file` parts with `file_data`, Responses
 `input_file` items and Messages `document` blocks with a base64

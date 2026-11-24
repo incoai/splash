@@ -768,6 +768,84 @@ class ImageRequestTest(HarnessTestCase):
             runtime.requests[1].frame.image_spans, runtime.requests[0].frame.image_spans
         )
 
+    def test_a_messages_request_of_too_many_images_names_its_oldest(self):
+        # 65 images, the oldest in a tool result as Claude Code's Read sends
+        # one: the refusal names that block, which Claude Code then replaces
+        # with a note. 64 are taken, as before.
+        runtime = FakeRuntime(Plan([[4]]))
+        harness = self.harness(
+            runtime, tokenizer=ImagePadTokenizer(), max_context=65536
+        )
+        media_type, _, data = png_data_url((30, 200, 30)).partition(";base64,")
+        image = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type.removeprefix("data:"),
+                "data": data,
+            },
+        }
+
+        def body(images):
+            return anthropic_body(
+                messages=[
+                    {"role": "user", "content": "screenshot it"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "screenshot",
+                                "input": {},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": [{"type": "text", "text": "ok"}, image],
+                            },
+                            {"type": "text", "text": "and these"},
+                            *[image] * (images - 1),
+                        ],
+                    },
+                ]
+            )
+
+        for path in ("/v1/messages", "/v1/messages/count_tokens"):
+            with self.subTest(path=path):
+                status, _, refused = harness.request("POST", path, body(65))
+                self.assertEqual(status, 400, refused)
+                self.assertEqual(
+                    json.loads(refused)["error"]["message"],
+                    "messages.2.content.0.tool_result.content.1.image: "
+                    "requests support at most 64 images",
+                )
+        self.assertEqual(runtime.requests, [])
+        status, _, taken = harness.request("POST", "/v1/messages", body(64))
+        self.assertEqual(status, 200, taken)
+        self.assertEqual(len(runtime.requests[0].frame.image_spans), 64)
+        # The oldest in a user's own content.
+        plain = anthropic_body(
+            messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "yes"},
+                {"role": "user", "content": [{"type": "text", "text": "these"}, image]},
+                {"role": "assistant", "content": "seen"},
+                {"role": "user", "content": [image] * 64},
+            ]
+        )
+        status, _, refused = harness.request("POST", "/v1/messages", plain)
+        self.assertEqual(status, 400, refused)
+        self.assertEqual(
+            json.loads(refused)["error"]["message"],
+            "messages.2.content.1.image: requests support at most 64 images",
+        )
+
     def test_tool_results_carry_images_like_user_content(self):
         runtime = FakeRuntime(Plan([[4]]), Plan([[4]]))
         harness = self.harness(runtime, tokenizer=ImagePadTokenizer())

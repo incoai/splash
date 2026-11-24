@@ -9,6 +9,7 @@ from ..documents import document_parts
 from ..errors import APIError, ContextLengthError, ErrorDialect
 from ..metrics import timings_dict
 from ..output import BlockSequencer
+from ..protocol import MAX_IMAGE_SPANS
 from ..tool_schema import TAG_NAME_RULE, is_tag_name
 
 
@@ -222,6 +223,15 @@ def _chat(body, thinking_resolver):
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
+    # More images than a request holds: the refusal names the oldest, as
+    # Anthropic's API names a block it refuses. Claude Code replaces the block
+    # named with a note and sends the request again; the count alone ended
+    # its session, as every later request holds the same images.
+    images = _image_paths(messages)
+    if len(images) > MAX_IMAGE_SPANS:
+        raise APIError(
+            400, f"{images[0]}: requests support at most {MAX_IMAGE_SPANS} images"
+        )
     system = body.get("system")
     system_text = None if system is None else _system_text(system, "system")
     translated = [
@@ -246,6 +256,26 @@ def _chat(body, thinking_resolver):
         chat.update(_tool_choice(body["tool_choice"]))
     chat = {key: value for key, value in chat.items() if value is not None}
     return chat, omitted
+
+
+def _image_paths(messages):
+    """Where each image block of messages lies, in their order, as Anthropic's
+    API names a block in an error: messages.I.content.J.image, or in a tool
+    result's content, messages.I.content.J.tool_result.content.K.image."""
+    paths = []
+    for i, message in enumerate(messages):
+        content = message.get("content") if isinstance(message, dict) else None
+        for j, block in enumerate(content if isinstance(content, list) else ()):
+            kind = block.get("type") if isinstance(block, dict) else None
+            if kind == "image":
+                paths.append(f"messages.{i}.content.{j}.image")
+            elif kind == "tool_result" and isinstance(block.get("content"), list):
+                paths += [
+                    f"messages.{i}.content.{j}.tool_result.content.{k}.image"
+                    for k, inner in enumerate(block["content"])
+                    if isinstance(inner, dict) and inner.get("type") == "image"
+                ]
+    return paths
 
 
 def _response_format(body, output_config):
