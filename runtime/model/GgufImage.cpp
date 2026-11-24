@@ -7,12 +7,14 @@
 #include "model/WeightLayout.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cmath>
 #include <limits>
 #include <optional>
 #include <set>
 #include <sstream>
+#include <utility>
 
 namespace splash::model::gguf {
 namespace {
@@ -39,6 +41,14 @@ static_assert([] {
 // NVFP4's for llama.cpp's NVFP4, whose block_nvfp4 rows the writer builds
 // NVFP4's native rows from (TensorRows::ggufNvfp4RowBytes).
 uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVFP4 : gguf_format_of(type); }
+// The format whose native rows hold `tensor`: its type's (imageFormat), but
+// NVFP4's form of 64-element blocks for an NVFP4 tensor whose rows are not
+// whole 256-element ones (llama.cpp's NVFP4 blocks are 64 elements).
+uint32_t imageFormat(const GgufTensor &tensor) {
+  const uint32_t format = imageFormat(tensor.type);
+  return format == GGUF_FMT_NVFP4 && tensor.columns() % kQuantFormats[format].block_elements ? GGUF_FMT_NVFP464
+                                                                                             : format;
+}
 
 // A type of a format, BF16 and F16 among them: repacked into the planes
 // projections multiply, or rows as stored (storedRowBytes), which the
@@ -65,16 +75,22 @@ bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml
 // for llama.cpp's NVFP4 (Builder::tensorRows); 0 for a width that holds none.
 uint64_t storedRowBytes(const GgufTensor &tensor) {
   return floatType(tensor.type) ? tensor.columns() * sizeof(float)
-                                : quant_stored_row_bytes(imageFormat(tensor.type), tensor.columns());
+                                : quant_stored_row_bytes(imageFormat(tensor), tensor.columns());
 }
 
 // A MoE router, which the float projection runs in fp32 as stored (router):
 // a float projection's type, or a quantized one but F16, whose native rows it
 // decodes.
 bool routerType(uint32_t type) { return floatProjectionType(type) || (quantizedType(type) && type != ggml::kF16); }
+// A projection of fewer rows than a plane tile (smallProjection): a float
+// projection's type, or a quantized one.
+bool smallProjectionType(uint32_t type) { return floatProjectionType(type) || quantizedType(type); }
 // A tensor of F32 rows (floatRows): F32, or BF16 or Q8_0, which widen or
 // decode to it.
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
+// A tensor the float projection runs (floatTensor): a float projection's
+// type, or any of a format, which decodes to F32.
+bool floatTensorType(uint32_t type) { return floatProjectionType(type) || quantizedType(type); }
 
 // A repack of a [rows, columns] tensor in format, of no image section yet;
 // throws unless the shape is whole plane tiles.
@@ -151,7 +167,7 @@ class Builder {
 public:
   Builder(const GgufFile &file, const QwenTargetDimensions &geometry, Problems &problems, std::string name,
           uint32_t layer, uint32_t type, PlanOptions options = {})
-      : file_(file), geometry_(geometry), problems_(problems),
+      : file_(file), geometry_(geometry), problems_(problems), exactlyMxfp8_(std::move(options.exactlyMxfp8)),
         image_(std::move(name), layer, type, options.streamExperts) {}
 
   // A vector the kernels read as F32 unrounded, as the reference GGUF
@@ -175,7 +191,7 @@ public:
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != windows * columns)
       throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(tensor->type);
+    const uint32_t format = imageFormat(*tensor);
     Repack repack = image_.planes(format, windows * rows, columns, name);
     for (uint32_t window = 0; window < windows; ++window) {
       TensorRows source = tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], windows * columns), order);
@@ -188,20 +204,35 @@ public:
 
   // Rows [N, K] as quantized() repacks them, but of a BF16 or F16 tensor
   // as the Q8_0 rows the reference quantize_row_q8_0_ref writes from its
-  // values, which the writer quantizes (TensorRows::ggufFloatRowBytes).
+  // values, which the writer quantizes (builtRows).
   void quantizedOrQ8_0(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = file_.find(name);
     if (!tensor || !float16Type(tensor->type)) return quantized(name, rows, columns);
     problems_.read(*tensor);
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
     Repack repack = image_.planes(GGUF_FMT_Q80, rows, columns, name);
-    TensorRows source = tensorRows(*tensor, rows, tensor->bytes / rows);
-    source.ggufFloatType = source.type;
-    source.ggufFloatRowBytes = source.rowBytes;
-    source.type = ggml::kQ8_0;
-    source.rowBytes = ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], columns);
-    repack.sources.push_back(std::move(source));
+    repack.sources.push_back(builtRows(*tensor, rows, GGUF_FMT_Q80));
     image_.repack(std::move(repack));
+  }
+
+  // The format of a routed experts' tensor [N, K] and its rows: of a format,
+  // as stored (llama.cpp's NVFP4 as NVFP4's native rows); of BF16 or F16
+  // values (a release's MXFP8 experts that Unsloth's UD-Q8_K_XL widens to
+  // BF16), MXFP8 where they are exactly its values (exactlyMxfp8: lossless,
+  // half the bytes), else as stored where their rows are whole native blocks
+  // of their type, else as the Q8_0 the reference quantization makes of
+  // them, as quantizedOrQ8_0 does.
+  std::pair<uint32_t, TensorRows> expertRows(const GgufTensor &tensor, uint64_t rows, uint64_t columns) {
+    uint32_t format = imageFormat(tensor);
+    if (float16Type(tensor.type)) {
+      const bool mxfp8 = !(columns % ggufColumnUnit(kQuantFormats[GGUF_FMT_MXFP8])) && exactlyMxfp8_ &&
+                         exactlyMxfp8_(file_.source(tensor.file), tensor.offset, tensor.elements(), tensor.type);
+      if (mxfp8 || columns % ggufColumnUnit(kQuantFormats[format])) {
+        format = mxfp8 ? GGUF_FMT_MXFP8 : GGUF_FMT_Q80;
+        return {format, builtRows(tensor, rows, format)};
+      }
+    }
+    return {format, tensorRows(tensor, rows, ggufRowBytes(kQuantFormats[format], columns))};
   }
 
   // One routed experts' tensor [experts * N, K] (routedExperts).
@@ -209,9 +240,9 @@ public:
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(tensor->type);
+    auto [format, source] = expertRows(*tensor, rows, columns);
     Repack repack = image_.expertPlanes(format, rows, columns, name);
-    repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns)));
+    repack.sources.push_back(std::move(source));
     image_.expertRepack(std::move(repack));
   }
 
@@ -219,30 +250,47 @@ public:
   // `experts` * width rows each, from ffn_gate_exps and ffn_up_exps or
   // the fused ffn_gate_up_exps some GGUFs store instead, each
   // expert's gate rows then its up rows, which the two take expert by expert;
-  // then down, of `experts` * hidden rows, from ffn_down_exps.
+  // then down, of `experts` * hidden rows, from ffn_down_exps; then their
+  // scales (ImageBuilder::expertScales), each experts tensor's .scale (the
+  // fused tensor's for both gate and up).
   void routedExperts(const std::string &prefix, uint64_t experts, uint64_t width, uint64_t hidden) {
-    const std::string fusedName = prefix + "ffn_gate_up_exps.weight";
-    if (!file_.find(fusedName)) {
-      expertTensor(prefix + "ffn_gate_exps.weight", experts * width, hidden);
-      expertTensor(prefix + "ffn_up_exps.weight", experts * width, hidden);
+    const std::string fusedName = prefix + "ffn_gate_up_exps.weight", gateName = prefix + "ffn_gate_exps.weight",
+                      upName = prefix + "ffn_up_exps.weight", downName = prefix + "ffn_down_exps.weight";
+    const bool unfused = !file_.find(fusedName);
+    if (unfused) {
+      expertTensor(gateName, experts * width, hidden);
+      expertTensor(upName, experts * width, hidden);
     } else if (const GgufTensor *fused = find(fusedName, quantizedType)) {
       if (fused->rows() != 2 * experts * width || fused->columns() != hidden)
         throw GgufError("unexpected shape for " + fusedName);
-      const uint32_t format = imageFormat(fused->type);
-      const TensorRows rows = tensorRows(*fused, 2 * experts * width, ggufRowBytes(kQuantFormats[format], hidden));
+      const auto [format, rows] = expertRows(*fused, 2 * experts * width, hidden);
       // Expert e's gate rows are rows 2e width.. of the fused tensor, its up rows the next width.
       for (const uint64_t up : {0, 1}) {
         Repack repack = image_.expertPlanes(format, experts * width, hidden, fusedName);
         for (uint64_t expert = 0; expert < experts; ++expert) {
-          TensorRows expertRows = rows;
-          expertRows.first = (2 * expert + up) * width;
-          expertRows.rows = width;
-          repack.sources.push_back(std::move(expertRows));
+          TensorRows slice = rows;
+          slice.first = (2 * expert + up) * width;
+          slice.rows = width;
+          repack.sources.push_back(std::move(slice));
         }
         image_.expertRepack(std::move(repack));
       }
     }
-    expertTensor(prefix + "ffn_down_exps.weight", experts * hidden, width);
+    expertTensor(downName, experts * hidden, width);
+    image_.expertScales(experts, {expertScale(unfused ? gateName : fusedName, experts),
+                                  expertScale(unfused ? upName : fusedName, experts), expertScale(downName, experts)});
+  }
+
+  // The rows of the F32 .scale of `experts` values beside the experts tensor
+  // `weight`, read, or 1s without one: llama.cpp multiplies each expert's
+  // products by its value, whatever the tensor's type.
+  ImageBuilder::ExpertScales expertScale(const std::string &weight, uint64_t experts) {
+    const GgufTensor *scale = file_.find(weight.substr(0, weight.size() - 7) + ".scale"); // past ".weight"
+    if (!scale) return std::vector<float>(experts, 1.0F);
+    problems_.read(*scale);
+    if (scale->type != ggml::kF32 || scale->elements() != experts)
+      throw GgufError(scale->name + " must hold one F32 value per expert for " + weight);
+    return tensorRows(*scale, 1, scale->bytes);
   }
 
   // A layer's shared expert of `slices` slices of `width`, which the grouped
@@ -289,7 +337,7 @@ public:
       }
       return;
     }
-    const uint32_t format = imageFormat(beta->type);
+    const uint32_t format = imageFormat(*beta);
     const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], hidden);
     Repack repack = image_.planes(format, tiledRows(2ull * heads), hidden, alphaName);
     for (const GgufTensor *t : {beta, alpha}) repack.sources.push_back(tensorRows(*t, heads, rowBytes, grouped(0, 1)));
@@ -319,6 +367,26 @@ public:
     if (const GgufTensor *tensor = floatVector(name, elements)) image_.copy(tensorRows(*tensor, 1, tensor->bytes));
   }
 
+  // `elements` F32 values gathered from rows of F32 tensors (Section::gathered).
+  void gatheredValues(const std::vector<Section::Rows> &parts, uint64_t elements) {
+    std::vector<TensorRows> sources;
+    uint64_t values = 0;
+    for (const Section::Rows &part : parts) {
+      const GgufTensor *tensor = find(part.tensor, floatType);
+      if (!tensor) continue;
+      if (!part.count || part.count > tensor->rows() || part.first > tensor->rows() - part.count)
+        throw GgufError("unexpected shape for " + part.tensor);
+      TensorRows rows = tensorRows(*tensor, tensor->rows(), tensor->columns() * sizeof(float));
+      rows.first = part.first;
+      rows.rows = part.count;
+      values += part.count * tensor->columns();
+      sources.push_back(std::move(rows));
+    }
+    if (sources.size() < parts.size()) return;
+    if (values != elements) throw GgufError("unexpected shape for " + parts.front().tensor);
+    image_.gather(sources);
+  }
+
   // Token rows as stored, gathered by the embedding kernel.
   void embeddingRows(const std::string &name) {
     const GgufTensor *tensor = find(name, quantizedType);
@@ -328,15 +396,34 @@ public:
     copiedRows(*tensor, storedRowBytes(*tensor));
   }
 
-  // An F32 or BF16 tensor [rows, columns] as stored, which the float
-  // projection runs in fp32 (the QSA indexer's projections).
+  // A tensor [rows, columns] the float projection runs in fp32 (the QSA
+  // indexer's projections, Inkling 2's message gates and sink projections):
+  // F32 or BF16 rows as stored, or another type's (a GGUF that quantizes
+  // them, as AtomicChat's Q8_0 gates) as the F32 values the GPU decodes them
+  // to, as the format's gather does.
   void floatTensor(const std::string &name, uint64_t rows, uint64_t columns) {
-    const GgufTensor *tensor = find(name, floatProjectionType);
+    const GgufTensor *tensor = find(name, floatTensorType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
-      throw GgufError("expected an F32 or BF16 [" + std::to_string(rows) + ", " + std::to_string(columns) +
-                      "] tensor: " + name);
-    copiedRows(*tensor, storedRowBytes(*tensor));
+      throw GgufError("expected a [" + std::to_string(rows) + ", " + std::to_string(columns) + "] tensor: " + name);
+    if (floatProjectionType(tensor->type)) return copiedRows(*tensor, storedRowBytes(*tensor));
+    image_.descriptor(ggml::kF32, rows, columns, {}, {rows * columns * sizeof(float), 0, 0}, name);
+    image_.copy(tensorRows(*tensor, rows, storedRowBytes(*tensor)), Conversion::DequantizeToFloat32);
+  }
+
+  // A projection [rows, columns] of fewer rows than a plane tile holds: F32
+  // or BF16 rows as stored, which the float projection runs in fp32 at any
+  // rows that are whole 8-column tiles of its kernels, or a quantized tensor
+  // repacked into whole plane tiles, its rows past `rows` zero.
+  void smallProjection(const std::string &name, uint64_t rows, uint64_t columns) {
+    const GgufTensor *tensor = find(name, smallProjectionType);
+    if (!tensor) return;
+    if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
+    if (floatProjectionType(tensor->type)) return copiedRows(*tensor, storedRowBytes(*tensor));
+    const uint32_t format = imageFormat(*tensor);
+    Repack repack = image_.planes(format, tiledRows(rows), columns, name);
+    repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns)));
+    image_.repack(std::move(repack));
   }
 
   // The MoE router [rows, columns] as stored, which the float projection runs
@@ -411,31 +498,33 @@ private:
 
   // Rows [0, count) of `tensor` as the image holds them, rowBytes each: as
   // stored, or, of llama.cpp's NVFP4, NVFP4's native rows, which the writer
-  // builds from its block_nvfp4 rows and the g of its .scale tensor. llama.cpp
-  // multiplies a projection's products by its .scale, of one value, or an
-  // expert's by its value of an experts tensor's (_exps), one per expert;
-  // only NVFP4's native rows hold such a scale, so only theirs is read and a
-  // .scale beside any other tensor is refused as unused. An NVFP4 weight may
-  // also carry an .input_scale of as many values, the activation scale of
-  // NVIDIA's W4A4: a weights-only decode (ours, as llama.cpp's) never reads
-  // it, so it is held to that count and recorded as read, unused; beside any
-  // other tensor, or alone, it is refused as unused too.
+  // builds from its block_nvfp4 rows and the g of a projection's .scale
+  // tensor. llama.cpp multiplies a projection's products by its .scale, of
+  // one value, and an expert's by its value of an experts tensor's (_exps),
+  // one per expert: the experts' are their block's whatever their type
+  // (expertScale), and of a projection's only NVFP4's native rows hold one,
+  // so a .scale beside any other projection is refused as unused. An NVFP4
+  // weight may also carry an .input_scale of as many values, the activation
+  // scale of NVIDIA's W4A4: a weights-only decode (ours, as llama.cpp's)
+  // never reads it, so it is held to that count and recorded as read,
+  // unused; beside any other tensor, or alone, it is refused as unused too.
   TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) const {
     if (tensor.type != ggml::kNVFP4) {
       if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
       return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     }
-    const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
+    const QuantFormat &format = kQuantFormats[imageFormat(tensor)];
     const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
     const uint64_t sourceRowBytes =
         rowBytes / format.block_bytes * (format.block_elements / blocks.blockElements) * blocks.blockBytes;
     if (!count || rowBytes % format.block_bytes || count * sourceRowBytes != tensor.bytes)
       throw GgufError(tensor.name + "'s rows are not whole nvfp4 blocks of " + std::to_string(format.block_elements) +
                       " elements");
-    TensorRows rows{tensor.name, QUANT_NVFP4_TYPE, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
+    TensorRows rows{tensor.name, format.ggml_type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     rows.ggufNvfp4RowBytes = sourceRowBytes;
     const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
-    const uint64_t values = stem.ends_with("_exps") ? geometry_.experts : 1;
+    const bool experts = stem.ends_with("_exps");
+    const uint64_t values = experts ? geometry_.experts : 1;
     // The weight's F32 tensor stem + suffix of `values` values, read, or
     // nullptr without one.
     const auto sidecar = [&](const char *suffix) -> const GgufTensor * {
@@ -447,9 +536,21 @@ private:
       problems_.read(*found);
       return found;
     };
-    if (const GgufTensor *scale = sidecar(".scale"))
-      rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count / values};
+    if (const GgufTensor *scale = experts ? nullptr : sidecar(".scale"))
+      rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count};
     sidecar(".input_scale");
+    return rows;
+  }
+
+  // Rows [0, count) of a BF16 or F16 tensor as the native rows of `format`
+  // the writer builds from its values (TensorRows::float16RowBytes): Q8_0
+  // as the reference quantization rounds them, or MXFP8 exactly (mxfp8Block).
+  TensorRows builtRows(const GgufTensor &tensor, uint64_t count, uint32_t format) const {
+    TensorRows rows = tensorRows(tensor, count, tensor.bytes / count);
+    rows.float16Type = rows.type;
+    rows.float16RowBytes = rows.rowBytes;
+    rows.type = kQuantFormats[format].ggml_type;
+    rows.rowBytes = ggufRowBytes(kQuantFormats[format], tensor.columns());
     return rows;
   }
 
@@ -464,6 +565,7 @@ private:
   const GgufFile &file_;
   const QwenTargetDimensions &geometry_;
   Problems &problems_;
+  std::function<bool(const WeightSource &, uint64_t, uint64_t, uint32_t)> exactlyMxfp8_;
   ImageBuilder image_;
 };
 
@@ -687,30 +789,57 @@ template <class Use> decltype(auto) withFamily(std::string_view architecture, Us
   return use(HybridGguf{});
 }
 
-// The images of a target from a GGUF of Family (planImages).
-template <class Family>
-std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options) {
+// The images of a target of `layerImages` layer images, each of which
+// `layer` plans, then the head's, which `head` begins before the head, and the
+// embedding's, then those `tables` adds (planImages, planTargetImages).
+template <class Layer, class Head, class Tables>
+std::vector<Image> targetImages(const GgufFile &file, const QwenTargetDimensions &g, uint32_t layerImages,
+                                PlanOptions options, const Layer &layer, const Head &head, const Tables &tables) {
   Problems problems;
   std::vector<Image> images;
-  for (uint32_t index = 0; index < g.layers; ++index) {
-    Builder layer(file, g, problems, "layer-" + std::to_string(index) + ".bin", index,
+  for (uint32_t index = 0; index < layerImages; ++index) {
+    Builder image(file, g, problems, "layer-" + std::to_string(index) + ".bin", index,
                   g.isFullAttentionLayer(index) ? 1u : 0u, options);
-    Family::layer(layer, g, index);
-    images.push_back(layer.finish());
+    layer(image, index);
+    images.push_back(image.finish());
   }
-  Builder head(file, g, problems, "head.bin", g.layers, 2);
-  Family::head(head, g);
-  head.quantized("output.weight", g.vocabularySize, g.hiddenSize);
-  images.push_back(head.finish());
+  Builder headImage(file, g, problems, "head.bin", layerImages, 2);
+  head(headImage);
+  headImage.quantized("output.weight", g.vocabularySize, g.hiddenSize);
+  images.push_back(headImage.finish());
   Builder embedding(file, g, problems, "embedding.bin", g.vocabularySize, g.hiddenSize);
   embedding.embeddingRows("token_embd.weight");
   images.push_back(embedding.finish());
-  Family::tables(file, g, options, problems, images);
+  tables(problems, images);
   const GgufMetadata &metadata = file.metadata();
-  problems.addUnread(file, g.layers,
+  problems.addUnread(file, layerImages,
                      metadata.unsignedValue(metadata.architecture() + ".nextn_predict_layers").value_or(0));
   if (!problems.empty()) throw GgufError("GGUF tensors this build cannot load: " + problems.text());
   return images;
+}
+
+// The images of a target from a GGUF of Family (planImages).
+template <class Family>
+std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options) {
+  return targetImages(
+      file, g, g.layers, options, [&](Builder &b, uint32_t index) { Family::layer(b, g, index); },
+      [&](Builder &b) { Family::head(b, g); },
+      [&](Problems &problems, std::vector<Image> &images) { Family::tables(file, g, options, problems, images); });
+}
+
+// Adds `section` to the image `b` plans (Section::Kind).
+void addSection(Builder &b, const QwenTargetDimensions &g, const Section &section) {
+  switch (section.kind) {
+  case Section::Kind::Norm: return b.floatNorm(section.name, section.rows);
+  case Section::Kind::Values:
+    return section.gathered.empty() ? b.floatValues(section.name, section.rows)
+                                    : b.gatheredValues(section.gathered, section.rows);
+  case Section::Kind::Quantized: return b.quantized(section.name, section.rows, section.columns);
+  case Section::Kind::FloatTensor: return b.floatTensor(section.name, section.rows, section.columns);
+  case Section::Kind::SmallProjection: return b.smallProjection(section.name, section.rows, section.columns);
+  case Section::Kind::Router: return b.router(section.name, section.rows, section.columns);
+  case Section::Kind::RoutedExperts: return b.routedExperts(section.name, section.rows, section.columns, g.hiddenSize);
+  }
 }
 
 // A rotated GGUF (GgufRotation) must name exactly what the loader rotates:
@@ -748,10 +877,51 @@ std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
 
 uint64_t loadedBytes(const Image &image) { return image.streamedRows ? 0 : image.bytes; }
 
+bool mxfp8Block(std::span<const float, 32> values, std::span<uint8_t, 33> block) noexcept {
+  // A finite float's magnitude bits as significand * 2^exponent, the significand 24 bits wide (float subnormals
+  // normalized). E4M3 holds 1.mmm * 2^e for e of -6 to 8, at most 1.75 * 2^8 (448), and subnormals m * 2^-9.
+  const auto split = [](uint32_t magnitude) {
+    if (magnitude >= 0x00800000) return std::pair{(magnitude & 0x7FFFFF) | 0x800000, int(magnitude >> 23) - 150};
+    const int shift = std::countl_zero(magnitude) - 8;
+    return std::pair{magnitude << shift, -149 - shift};
+  };
+  uint32_t largest = 0;
+  for (const float value : values) largest = std::max(largest, std::bit_cast<uint32_t>(value) & 0x7FFFFFFFU);
+  if (largest >= 0x7F800000) return false;
+  // The exponent s of the scale 2^s: the smallest whose E4M3 range holds the largest magnitude L (448 * 2^s >= L,
+  // so ilogb(L) - 8, or one more past 1.75 * 2^ilogb(L)), at least E8M0's smallest, 2^-127.
+  int scale = -127;
+  if (largest) {
+    const auto [significand, exponent] = split(largest);
+    scale = std::max(scale, exponent + 23 - 8 + (significand > 0xE00000));
+  }
+  block[0] = static_cast<uint8_t>(scale + 127);
+  for (size_t i = 0; i < values.size(); ++i) {
+    const uint32_t bits = std::bit_cast<uint32_t>(values[i]);
+    uint8_t code = 0;
+    if (const uint32_t magnitude = bits & 0x7FFFFFFFU) {
+      const auto [significand, exponent] = split(magnitude);
+      // The value over the scale, significand * 2^(exponent - scale): a normal of exponent e >= -6 whose
+      // significand has three bits past its leading one, or a subnormal of significand >> shift units of 2^-9.
+      if (const int e = exponent + 23 - scale; e >= -6) {
+        if (significand & 0xFFFFF) return false;
+        code = static_cast<uint8_t>((e + 7) << 3 | (significand >> 20 & 7));
+      } else {
+        const int shift = scale - 9 - exponent;
+        if (shift >= 24 || significand & ((1U << shift) - 1)) return false;
+        code = static_cast<uint8_t>(significand >> shift);
+      }
+    }
+    block[1 + i] = static_cast<uint8_t>(bits >> 24 & 0x80) | code;
+  }
+  return true;
+}
+
 uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_t sourceBytes) {
   switch (conversion) {
   case Conversion::NarrowToBfloat16: return sourceBytes / 2;
   case Conversion::WidenToFloat32: case Conversion::CenteredNorm: return sourceBytes * 2;
+  case Conversion::TransposeToFloat32: return source.type == ggml::kBF16 ? sourceBytes * 2 : sourceBytes;
   case Conversion::Decay: return source.type == ggml::kBF16 ? sourceBytes * 2 : sourceBytes;
   case Conversion::DequantizeToFloat32: {
     const uint64_t columns = decodedColumns(source);
@@ -795,12 +965,22 @@ uint64_t ImageBuilder::section(uint64_t bytes) {
 }
 
 void ImageBuilder::copy(TensorRows source, Conversion conversion) {
-  const uint64_t bytes = convertedBytes(source, conversion, source.rows * source.rowBytes);
+  const uint64_t bytes = convertedBytes(source, conversion, source.rows * source.imageRowBytes());
   copyAt(section(bytes), std::move(source), conversion);
 }
 
 void ImageBuilder::copyAt(uint64_t destination, TensorRows source, Conversion conversion) {
   image_.copies.push_back({destination, std::move(source), conversion});
+}
+
+void ImageBuilder::gather(const std::vector<TensorRows> &sources, Conversion conversion) {
+  uint64_t bytes = 0;
+  for (const TensorRows &source : sources) bytes += convertedBytes(source, conversion, source.rows * source.rowBytes);
+  uint64_t destination = section(bytes);
+  for (const TensorRows &source : sources) {
+    copyAt(destination, source, conversion);
+    destination += convertedBytes(source, conversion, source.rows * source.rowBytes);
+  }
 }
 
 void ImageBuilder::descriptor(uint32_t type, uint64_t rows, uint64_t columns, const QuantFormat &format,
@@ -854,6 +1034,24 @@ void ImageBuilder::expertRepack(Repack repack) {
   projections[expertProjections_++] = std::move(repack);
 }
 
+void ImageBuilder::expertScales(uint64_t experts, const std::array<ExpertScales, 3> &scales) {
+  const uint64_t rowBytes = experts * sizeof(float);
+  uint64_t destination = section(scales.size() * rowBytes);
+  for (const ExpertScales &scale : scales) {
+    if (const auto *rows = std::get_if<TensorRows>(&scale)) {
+      if (rows->rows * rows->rowBytes != rowBytes)
+        throw GgufError("expert scales do not hold one value per expert: " + rows->name);
+      copyAt(destination, *rows, Conversion::None);
+    } else {
+      const std::vector<float> &values = std::get<std::vector<float>>(scale);
+      if (values.size() != experts) throw GgufError("expert scales do not hold one value per expert");
+      const auto *bytes = reinterpret_cast<const uint8_t *>(values.data());
+      image_.fills.push_back({destination, {bytes, bytes + rowBytes}});
+    }
+    destination += rowBytes;
+  }
+}
+
 Image ImageBuilder::finish() {
   image_.bytes = alignWeightOffset(cursor_);
   image_.residentBytes = alignWeightOffset(residentCursor_);
@@ -870,31 +1068,10 @@ namespace {
 void requireMetadata(const GgufFile &file, std::string_view architecture, const QwenTargetDimensions &geometry) {
   const GgufMetadata &metadata = file.metadata();
   const std::string arch(architecture);
-  if (metadata.architecture() != arch)
-    throw GgufError("GGUF architecture is " + metadata.architecture() + ", but the model's target is " + arch);
-  std::string mismatched;
-  const auto expect = [&](const char *key, uint64_t value) {
-    const std::optional<uint64_t> found = metadata.unsignedValue(arch + "." + key);
-    if (found != value)
-      mismatched += (mismatched.empty() ? "" : ", ") + std::string(key) + " " +
-                    (found ? std::to_string(*found) : "missing") + " (expected " + std::to_string(value) + ")";
-  };
-  // A float equal to value up to its F32 rounding.
-  const auto expectFloat = [&](const char *key, double value) {
-    const std::optional<double> found = metadata.floatValue(arch + "." + key);
-    if (found && std::abs(*found - value) <= value * 1e-6) return;
-    std::ostringstream text;
-    text << (mismatched.empty() ? "" : ", ") << key << ' ';
-    if (found) text << *found;
-    else text << "missing";
-    text << " (expected " << value << ')';
-    mismatched += text.str();
-  };
-  // An array, named alone, that `matches` takes.
-  const auto expectArray = [&](const char *key, const auto &matches) {
-    const std::optional<std::span<const double>> values = file.numericArray(arch + "." + key);
-    if (!values || !matches(*values)) mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
-  };
+  MetadataCheck check(file, architecture);
+  const auto expect = [&](const char *key, uint64_t value) { check.expect(key, value); };
+  const auto expectFloat = [&](const char *key, double value) { check.expectFloat(key, value); };
+  const auto expectArray = [&](const char *key, const auto &matches) { check.expectArray(key, matches); };
   expect("block_count", geometry.layers + metadata.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
   expect("embedding_length", geometry.hiddenSize);
   expect("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);
@@ -909,7 +1086,7 @@ void requireMetadata(const GgufFile &file, std::string_view architecture, const 
   expectFloat("rope.freq_base", geometry.rotaryTheta);
   expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
   if (const auto scaling = metadata.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
-    mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
+    check.mismatch("rope.scaling.type " + *scaling + " (expected none)");
   if (geometry.gdnLayerCount()) {
     expect("full_attention_interval", geometry.fullAttentionPeriod);
     expect("ssm.conv_kernel", kGdnConvolutionTaps);
@@ -928,10 +1105,48 @@ void requireMetadata(const GgufFile &file, std::string_view architecture, const 
   } else {
     expect("feed_forward_length", geometry.intermediateSize);
   }
-  if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+  check.finish();
 }
 
 } // namespace
+
+MetadataCheck::MetadataCheck(const GgufFile &file, std::string_view architecture)
+    : file_(file), prefix_(std::string(architecture) + ".") {
+  const std::string found = file.metadata().architecture();
+  if (found != architecture)
+    throw GgufError("GGUF architecture is " + found + ", but the model's target is " + std::string(architecture));
+}
+
+void MetadataCheck::mismatch(const std::string &text) { mismatched_ += (mismatched_.empty() ? "" : ", ") + text; }
+
+void MetadataCheck::expect(std::string_view key, uint64_t value) {
+  const std::optional<uint64_t> found = file_.metadata().unsignedValue(prefix_ + std::string(key));
+  if (found != value)
+    mismatch(std::string(key) + " " + (found ? std::to_string(*found) : "missing") + " (expected " +
+             std::to_string(value) + ")");
+}
+
+// A float equal to value up to its F32 rounding.
+void MetadataCheck::expectFloat(std::string_view key, double value) {
+  const std::optional<double> found = file_.metadata().floatValue(prefix_ + std::string(key));
+  if (found && std::abs(*found - value) <= value * 1e-6) return;
+  std::ostringstream text;
+  text << key << ' ';
+  if (found) text << *found;
+  else text << "missing";
+  text << " (expected " << value << ')';
+  mismatch(text.str());
+}
+
+// An array, named alone, that `matches` takes.
+void MetadataCheck::expectArray(std::string_view key, const std::function<bool(std::span<const double>)> &matches) {
+  const std::optional<std::span<const double>> values = file_.numericArray(prefix_ + std::string(key));
+  if (!values || !matches(*values)) mismatch(std::string(key));
+}
+
+void MetadataCheck::finish() const {
+  if (!mismatched_.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched_);
+}
 
 std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                               const QwenTargetDimensions &geometry, PlanOptions options) {
@@ -940,6 +1155,17 @@ std::vector<Image> planImages(const GgufFile &file, std::string_view architectur
       architecture, [&](auto family) { return familyImages<decltype(family)>(file, geometry, options); });
   if (file.rotation()) requireRotation(file, geometry, images);
   return images;
+}
+
+std::vector<Image> planTargetImages(const GgufFile &file, const QwenTargetDimensions &geometry, uint32_t layerImages,
+                                    PlanOptions options, const std::function<std::vector<Section>(uint32_t)> &layer,
+                                    const std::vector<Section> &head) {
+  const auto add = [&](Builder &b, const std::vector<Section> &sections) {
+    for (const Section &section : sections) addSection(b, geometry, section);
+  };
+  return targetImages(
+      file, geometry, layerImages, options, [&](Builder &b, uint32_t index) { add(b, layer(index)); },
+      [&](Builder &b) { add(b, head); }, [](Problems &, std::vector<Image> &) {});
 }
 
 StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t columns) {

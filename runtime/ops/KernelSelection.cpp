@@ -85,16 +85,19 @@ uint64_t stagedTime(uint64_t groups, uint32_t steps, uint32_t splits, uint32_t r
 
 // The wave law's split of `rows` rows (a gate/up pair's two tensors when it
 // may run in one pass), and passes, of least time; ties keep fewer
-// partitions, then one pass. The law tells the pass modes apart only where a
-// last wave falls below its floor (the 27B pair's 17 one-pass threadgroups per
-// core on a 32-core M5 Max: the 17th runs a second wave alone, 333 us against
-// 245 in two passes). Elsewhere it ties, and one pass takes up to 22% less
-// time in 133 of the 152 tied cases measured. Below
+// partitions, then one pass. A `wide` unit's tile saturates from
+// law.wideSaturating threadgroups per core. The law tells the pass modes
+// apart only where a last wave falls below its floor (the 27B pair's 17
+// one-pass threadgroups per core on a 32-core M5 Max: the 17th runs a second
+// wave alone, 333 us against 245 in two passes). Elsewhere it ties, and one
+// pass takes up to 22% less time in 133 of the 152 tied cases measured. Below
 // ProjectionCalibration::onePassFromCores a pair runs two passes whatever the
 // law.
 SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16, uint32_t cores,
-                       Passes passes) {
+                       Passes passes, bool wide) {
   const uint32_t tileRows = stagedTileRows(rows);
+  StagedOccupancy tile = law.tile;
+  if (wide) tile.saturating = law.wideSaturating;
   SplitChoice best;
   uint64_t least = UINT64_MAX;
   for (uint32_t splits = 1; splits <= law.maximumSplits && (k / 32) % splits == 0 &&
@@ -109,7 +112,7 @@ SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows
     if (passes != Passes::One) {
       // A pair's two passes take twice one tensor's time.
       const uint64_t time =
-          (passes == Passes::Either ? 2 : 1) * stagedTime(tiles, steps, splits, tileRows, bits16, cores, law.tile);
+          (passes == Passes::Either ? 2 : 1) * stagedTime(tiles, steps, splits, tileRows, bits16, cores, tile);
       if (time < least) least = time, best = {splits, false};
     }
   }
@@ -284,7 +287,8 @@ UnitFormats unitFormats(const ProjectionShape &shape) noexcept {
 SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16, uint32_t cores,
                       Passes passes) noexcept {
   if (const TierLaw *tiers = std::get_if<TierLaw>(&law)) return {tierSplits(n, k, cores, tiers->tiers), false};
-  return waveSplits(std::get<WaveLaw>(law), n, k, rows, bits16 ? bits16 : kMostWeightBits16, cores, passes);
+  const WaveLaw &wave = std::get<WaveLaw>(law);
+  return waveSplits(wave, n, k, rows, bits16 ? bits16 : kMostWeightBits16, cores, passes, bits16 >= wave.wideBits16);
 }
 
 // The configuration in bf16 activations (bf16Projection), then with int8
@@ -292,9 +296,10 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // holds runs the int8 prefill tile, unsplit, where its work takes the int8
 // prefill paths and the tile takes the unit (1.13-2.4x less time than the bf16
 // tiles over the 27B's shapes at 65-2048 rows on a 32-core M5 Max, a 16-core
-// M5 Pro and a 12-core M6), and a staged plan runs the int8 decode tiles
-// where they take the unit and its plan (decodeInt8), at the plan's storage
-// rows, splits and passes.
+// M5 Pro and a 12-core M6; with Q8_0 units on it, Inkling-2-Mini's and
+// Qwen3.6-35B-A3B's GGUF prefills 0.4-4.1% less on a 20-core M5 Pro), and a staged
+// plan runs the int8 decode tiles where they take the unit and its plan
+// (decodeInt8), at the plan's storage rows, splits and passes.
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations, StepKind step,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   LinearConfig config = bf16Projection(calibration, step, w, unit, pairTensors);
@@ -308,9 +313,11 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
 // The plan of the shape's flags; where the register tile may run (it runs a
 // unit of FourBitsOrMore), a unit of other formats or one it does not take
 // stages, of the most bits per weight, whose partials weigh least against the
-// weights: the most K partitions of each pass mode, since the law's split
-// never falls with the bits per weight and never rises with the rows (a
-// split's partials grow with its rows alone, the same in either pass mode);
+// weights, at the tile's floor, which a wide unit's lowers: the most K
+// partitions of each pass mode, since at one floor the law's split never
+// falls with the bits per weight, never falls as the floor rises and never
+// rises with the rows (a split's partials grow with its rows alone, the same
+// in either pass mode);
 // and a gate/up pair of one format in one pass where it may and the one-pass
 // tile holds its rows. With int8 activations on, a unit the int8 decode tiles
 // take also has each staged configuration's int8 form where decodeInt8 takes
@@ -356,9 +363,15 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
   return *router && router < routers.end() - 1 ? uint32_t(router - routers.begin()) : QuantizedSegment::kFloat32;
 }
 
-bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept {
+bool moeInt8Experts(const MoeShape &shape, std::span<const BlockMoeWeights *const> blocks) noexcept {
+  // moe_int8.metal compiles the passes for a routing of one or two shared
+  // slices (slicesSuffix "" and "_s2") whose gate/up applies SiLU (no
+  // activationSuffix), in the formats quant_moe_int8_format takes.
+  const CompiledMoeRouting *routing = shape.compiledRouting();
+  if (!routing || (routing->sharedSlices != 1 && routing->sharedSlices != 2) || !routing->activationSuffix.empty())
+    return false;
   const auto takes = [](const BlockExpertProjection &p) {
-    return p.routed.formatId == p.shared.formatId && quant_prefill_int8_format(p.routed.formatId);
+    return p.routed.formatId == p.shared.formatId && quant_moe_int8_format(p.routed.formatId);
   };
   return !blocks.empty() && std::ranges::all_of(blocks, [&](const BlockMoeWeights *block) {
     return takes(block->gate) && takes(block->up) && takes(block->down);
@@ -379,10 +392,24 @@ bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept {
 // step's routes (MoeScratch). The router's float tile follows
 // selectFloatTile by its rows' format.
 //
+// A prefill chunk on the staged passes whose routes average
+// MoeCalibration::wideTileRoutes or more an expert (on the M5 Pro 64 from 20
+// cores and 128 on the 16-core, never elsewhere: KernelCalibration.hpp) runs
+// 64-row tiles, which stream an expert's weights once for up to 64 of its
+// rows, their tiles running 8-, 16-, 32- or 64-row matmuls by their live
+// rows; a row's bits are the same on every tile. From 20 cores Inkling-2-Mini
+// (8 of 128) takes them from 1024 rows, the 35B and the 122B (8 of 256) at
+// 2048; on the 16-core Inkling-2-Mini at 2048 alone. Flint and Flash-Next
+// never do (a 2048-row chunk averages 48 and 40 routes an expert), and
+// Flint's routing, of two shared slices, has no 64-row passes (MoePlan
+// refuses them). The int8 passes, whose tile holds 32 rows
+// (GGUF_PREFILL_INT8_ROWS), keep 32-row tiles.
+//
 // A chunk's experts run the int8 passes where its dense projections run the
 // int8 prefill tile (int8PrefillPaths: a prefill chunk's, int8 activations
 // on, Apple10 and Apple11; more rows than the decode tiles' 64) and the
-// block's experts take it (MoeShape::int8Experts), once its routes average
+// blocks' experts take the passes (MoeShape::int8Experts: af4g64 or af5g64,
+// not Q8_0, which the dense tile alone takes), once its routes average
 // kInt8PassRoutesPerExpert (6) or more an expert: the quantity that drives
 // the passes' cost, not the chunk's rows. Below it the int8 passes are not
 // shorter in every run, as the int8 tile runs both 16-row fragments of an
@@ -401,10 +428,14 @@ MoeConfig selectMoe(const KernelCalibration &calibration, Int8Activations int8Ac
                     const MoeShape &shape, uint32_t routerFormat, uint32_t rows) noexcept {
   const uint64_t routes = uint64_t{rows} * shape.expertsPerToken;
   MoeConfig config;
-  config.expertTile = routes > shape.experts ? MoeExpertTile::M32 : MoeExpertTile::M8;
   config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, routerFormat);
   config.int8Passes = shape.int8Experts && int8PrefillPaths(calibration, int8Activations, step) &&
                       rows > kMaximumDecodeTileRows && routes >= uint64_t{kInt8PassRoutesPerExpert} * shape.experts;
+  config.expertTile = routes <= shape.experts ? MoeExpertTile::M8
+                      : step == StepKind::Prefill && !config.int8Passes &&
+                              routes >= uint64_t{calibration.moe.wideTileRoutes} * shape.experts
+                          ? MoeExpertTile::M64
+                          : MoeExpertTile::M32;
   return config;
 }
 

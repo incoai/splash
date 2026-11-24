@@ -62,6 +62,12 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
 [[nodiscard]] WeightFileRecord imageRecord(const WeightImages &images, std::string_view prefix,
                                            const gguf::Image &plan);
 
+// Whether every 32 values of a tensor of `values` BF16 or F16 values (ggml
+// type `type`) at data offset `offset` of `file`, a GGUF's or a checkpoint's,
+// are exactly an MXFP8 block's (gguf::mxfp8Block), read on a thread per core
+// the first time a process asks: a start's gguf::PlanOptions::exactlyMxfp8.
+[[nodiscard]] bool exactlyMxfp8(const WeightSource &file, uint64_t offset, uint64_t values, uint32_t type);
+
 // Rows [first, first + count) of a repack (its sources' rows in order), whole
 // and back to back into `to`, count * ggufRowBytes(format, columns) bytes:
 // the native rows the GPU repacks into those rows' planes. A streamed
@@ -87,11 +93,11 @@ struct PlaneRows final {
   uint64_t offset = 0;
   uint64_t rowBytes = 0;
 };
-// The planes of a repack whose one source is an MLX affine or mxfp4 tensor
-// of all its rows in order, from which the GPU builds the native blocks it
-// repacks (moe_expert_load): an affine tensor's codes, scales and biases, an
-// mxfp4 tensor's codes and scales. None for any other repack, whose native
-// rows readRepackRows builds.
+// The planes of a repack whose one source is an MLX affine, mxfp4 or mxfp8
+// tensor of all its rows in order, from which the GPU builds the native
+// blocks it repacks (moe_expert_load): an affine tensor's codes, scales and
+// biases, an mxfp4 or mxfp8 tensor's codes and scales. None for any other
+// repack, whose native rows readRepackRows builds.
 [[nodiscard]] std::optional<std::array<PlaneRows, 3>> storedPlanes(const gguf::Repack &repack);
 
 } // namespace splash::model

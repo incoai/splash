@@ -2301,12 +2301,98 @@ void testACompletionBurstIsCopiedWithoutDelayingDecode() {
   harness.runUntilIdle();
 }
 
+// The state at a prompt's head, which the engine keeps a draft window past where the request resumes, is copied
+// behind its request by a persistent tier beside its replay point, though the conversation went on from it, as new
+// conversations start from it; a temporary tier queues the replay point alone.
+void testKeptHeadsAreWrittenBehind() {
+  for (const bool persistent : {true, false}) {
+    test::TestKvStorage storage{1024, 4096, 4};
+    KvPool pool{storage, 0};
+    test::TestKvTier tier(persistent);
+    tier.transferLimit = 64;
+    tier.capacity = 512;
+    engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+    Executor executor;
+    executor.keptTier = std::make_shared<OffloadControl>();
+    executor.keptTier->ready = true;
+    Events events;
+    const EngineConfig config = test::engineConfig({.maxContext = 102400});
+    engine::Engine engine(config, cache, executor, events);
+    guardReleases(storage, engine);
+    EngineRequest headed = request(1, std::vector<uint32_t>(6000, 7));
+    headed.headTokens = 3000;
+    engine.submit(std::move(headed));
+    double now = 1;
+    tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+    require(engine.snapshot().writeBehind.waiting == (persistent ? 2u : 1u),
+            persistent ? "a persistent tier did not queue the head beside the replay point"
+                       : "a temporary tier queued the head");
+    if (!persistent)
+      continue;
+    now += WriteBehind::kDelayMilliseconds;
+    tickBesideALaneAhead(engine, tier, now, [&] { return engine.snapshot().writeBehind.durable == 2; });
+    require(engine.snapshot().writeBehind.durable == 2 && !engine.snapshot().writeBehind.unneeded,
+            "the head was not written behind its request");
+  }
+}
+
+// The block of the state `length` tokens into `tokens`, or 0.
+uint64_t stateAtDepth(engine::Cache &cache, const std::vector<uint32_t> &tokens, uint32_t length) {
+  std::vector<uint32_t> probe(tokens.begin(), tokens.begin() + length);
+  probe.push_back(9);
+  const engine::CacheLookup lookup = cache.lookup(probe, {});
+  return lookup.resumeBoundary() == length ? lookup.state->kvBlock() : 0;
+}
+
+// The checkpoint a head's state keeps below it (Engine::keepsCheckpoint) is a checkpoint still: a persistent tier
+// copies the head and the replay point behind their request, two of the test's 64-byte states, and leaves the
+// checkpoint in RAM alone.
+void testAHeadsKeptCheckpointIsNotWrittenBehind() {
+  test::TestKvStorage storage{1024, 4096, 4};
+  KvPool pool{storage, 0};
+  test::TestKvTier tier(true);
+  tier.transferLimit = 64;
+  tier.capacity = 1024;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  executor.keptTier = std::make_shared<OffloadControl>();
+  executor.keptTier->ready = true;
+  Events events;
+  const EngineConfig config = test::engineConfig({.maxContext = 102400});
+  engine::Engine engine(config, cache, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(14000, 7);
+  EngineRequest headed = request(1, prompt);
+  headed.headTokens = 13000;
+  engine.submit(std::move(headed));
+  double now = 1;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+  const uint32_t head = 13000 / engine::KvCache::pageTokens * engine::KvCache::pageTokens;
+  uint32_t kept = 0;
+  for (uint32_t depth = head - engine::KvCache::pageTokens; depth > 0 && !kept; depth -= engine::KvCache::pageTokens)
+    if (stateAtDepth(cache, prompt, depth))
+      kept = depth;
+  require(kept != 0 && cache.checkpointState(stateAtDepth(cache, prompt, kept)),
+          "fixture: the head's state kept no checkpoint below it");
+  require(engine.snapshot().writeBehind.waiting == 2, "write-behind did not queue the head and the replay point alone");
+  now += WriteBehind::kDelayMilliseconds;
+  tickBesideALaneAhead(engine, tier, now, [&] { return engine.snapshot().writeBehind.durable == 2; });
+  const StateCacheSnapshot states = cache.snapshot().stateCache;
+  require(engine.snapshot().writeBehind.durable == 2 && states.diskBytes == 2 * 64,
+          "write-behind did not copy the head and the replay point alone (" + std::to_string(states.diskBytes) +
+              " bytes on disk)");
+  require(cache.stateResident(stateAtDepth(cache, prompt, kept)) && states.checkpointEntries == 1,
+          "the head's kept checkpoint left RAM");
+}
+
 } // namespace
 
 std::span<const test::TestCase> diskTests() {
   static constexpr test::TestCase kTests[] = {
       {"testAPendingRefusalHoldsItsClaimForTheWaitLimit", testAPendingRefusalHoldsItsClaimForTheWaitLimit},
       {"testARetryPastTheWaitLimitHoldsNothing", testARetryPastTheWaitLimitHoldsNothing},
+      {"testKeptHeadsAreWrittenBehind", testKeptHeadsAreWrittenBehind},
+      {"testAHeadsKeptCheckpointIsNotWrittenBehind", testAHeadsKeptCheckpointIsNotWrittenBehind},
       {"testAStartQueuedBetweenRefusalsHoldsFromTheFirst", testAStartQueuedBetweenRefusalsHoldsFromTheFirst},
       {"testDiskKvPrefixIsRestoredBeforeTheLaneRuns", testDiskKvPrefixIsRestoredBeforeTheLaneRuns},
       {"testSkipCacheCandidateIsNotProbed", testSkipCacheCandidateIsNotProbed},

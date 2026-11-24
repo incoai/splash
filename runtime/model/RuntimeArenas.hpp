@@ -72,6 +72,9 @@ struct RuntimeGeometry final {
   bool streamedExperts = false;
   // The step scratch the target keeps itself beside the arenas.
   QwenTargetScratchBytes targetScratch{};
+  // The target's layout, whose family sizes what its own operators take
+  // (qwenTargetAttentionWorkspace).
+  TargetLayout layout{};
 
   // The geometry of `model` as it loaded, or with `parts` streaming
   // whatever streams of it as it loaded (plannedRuntimeMemory). Only a
@@ -141,6 +144,7 @@ struct RuntimeGeometry final {
       throw std::invalid_argument("invalid model runtime geometry");
     }
     // Sized from the geometry, once it is valid.
+    result.layout = descriptor.target;
     result.targetScratch = std::visit(
         [&](const auto &layout) {
           return qwenTargetScratchBytes(layout, result.target, result.prefillChunks, parts.tableRowBytes);
@@ -480,15 +484,16 @@ public:
     if (chunks_ > 1) groupCell_ = groupCellBuffers(backend, get(PrefillTensor::GroupCell), geometry.target.stateLayout);
     if (cursor != bytes_)
       throw std::logic_error("prefill arena mismatch");
+    // A target without RoPE has no table of its pairs; its draft's rotates.
     auto *target = static_cast<float *>(
         get(PrefillTensor::TargetInverseFrequencies).contents());
     auto *draft = static_cast<float *>(
         get(PrefillTensor::DraftInverseFrequencies).contents());
-    if (!target || !draft)
+    if ((geometry.target.rotaryPairs && !target) || !draft)
       throw std::logic_error("RoPE frequencies are not CPU-visible");
-    rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
-                             geometry.target.ropeScaling,
-                             {target, geometry.target.rotaryPairs});
+    if (geometry.target.rotaryPairs)
+      rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
+                               geometry.target.ropeScaling, {target, geometry.target.rotaryPairs});
     for (uint32_t dim = 0; dim < geometry.draftRotaryPairs(); ++dim) {
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
                             -static_cast<float>(dim) / geometry.draftRotaryPairs());

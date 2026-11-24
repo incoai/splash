@@ -106,9 +106,10 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 // responsible for choosing device-specific Metal pipelines and compute tiles.
 struct QwenTargetGeometry final : QwenTargetDimensions {
   QwenTargetGeometry() = default;
-  // A target of `dimensions` whose DFlash2 draft reads the output rows of
-  // `captureLayers` (DFlashDraftLayout::targetLayerIds); more than the
-  // geometry holds leave it invalid.
+  // A target of `dimensions` whose DFlash2 draft reads the rows of
+  // `captureLayers` (DFlashDraftLayout::targetLayerIds), as the dimensions'
+  // draftReadsLayerInputs names them; more than the geometry holds leave it
+  // invalid.
   QwenTargetGeometry(const QwenTargetDimensions &dimensions, std::span<const uint32_t> captureLayers)
       : QwenTargetDimensions(dimensions), captureLayerCount(static_cast<uint32_t>(captureLayers.size())) {
     if (captureLayerCount <= captureLayerValues.size())
@@ -124,8 +125,8 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // The format of the sparse MoE blocks' routers, which their plans follow
   // (ops::moeRouterFormat).
   uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
-  // Whether the blocks' experts take the int8 prefill passes: their formats
-  // (ops::moeInt8Experts), and resident (RuntimeGeometry::from).
+  // Whether the blocks' experts take the int8 prefill passes: their routing
+  // and formats (ops::moeInt8Experts), and resident (RuntimeGeometry::from).
   bool moeInt8Experts = false;
   // The blocks' shape as their plans take it.
   [[nodiscard]] ops::MoeShape moeShape() const noexcept {
@@ -133,7 +134,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     shape.int8Experts = moeInt8Experts;
     return shape;
   }
-  // The layers whose output rows the DFlash2 draft reads, ascending.
+  // The target layer ids whose rows the DFlash2 draft reads, ascending.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   // The target's KV layout in the format the runtime stores KV in, and its
@@ -174,7 +175,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   captureLayers() const noexcept {
     return {captureLayerValues.data(), captureLayerCount};
   }
-  // The capture slot of `layer`, whose output the draft reads.
+  // The capture slot of target layer id `layer`, whose rows the draft reads.
   [[nodiscard]] constexpr std::optional<uint32_t> captureSlot(uint32_t layer) const noexcept {
     const auto layers = captureLayers();
     const auto found = std::find(layers.begin(), layers.end(), layer);
@@ -192,7 +193,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   }
   // The layout itself was checked by requireQwenLayout when the target
   // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
-  // of its layers, ascending. A target without GDN layers has no GDN shape.
+  // of its layers, ascending, or its head's rows past them where it reads
+  // layer inputs (draftReadableLayers). A target without GDN layers has no
+  // GDN shape.
   // The projection lists hold every projection the weights dispatch, which
   // each have sizes; a target with dense FFNs, a MoE target's leading layers
   // too, holds their gate and up projections.
@@ -205,7 +208,8 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     const auto captured = [&] {
       if (!captureLayerCount || captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
       const auto ids = captureLayers();
-      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
+      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() &&
+             ids.back() < draftReadableLayers();
     };
     const bool dense = intermediateSize && sized(gateUpProjections);
     return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
@@ -387,18 +391,24 @@ struct QwenTargetCommitBuffers final {
   uint32_t indexLayerBytes = 0;
 };
 
-// The GDN state after the first rows of the path a lane accepted of its
-// verify, folded into a cached state's cell from the verify's tape
-// (addStateFold): the lane's retained rows (the path, a row mask of its
-// block, as acceptance wrote it), the cell the verify wrote, which holds the
-// state before its rows, the lanes' decode tapes and the offset of the
-// verify's slot in them, and the cached cell, which takes the state's codes.
+// The state after the first rows of the path a lane accepted of its verify,
+// folded into a cached state's cell (addStateFold): the lane's retained rows
+// (the path, a row mask of its block, as acceptance wrote it) and its rows of
+// the step as the device holds them (SplashLaneRows); for the GDN state, the
+// cell the verify wrote, which holds the state before its rows, the lanes'
+// decode tapes and the offset of the verify's slot in them; for a family's
+// auxiliary state, the lane's before the step, which its commit reads
+// (QwenTargetCommitBuffers::auxiliaryIn); and the cached cell, which takes
+// the GDN state's codes, and its auxiliary state.
 struct QwenTargetFoldBuffers final {
   metal::MetalBuffer retainedRows;
+  metal::MetalBuffer laneRows;
   metal::MetalBuffer state;
   metal::MetalBuffer gdnTape;
   uint64_t stepSlot = 0;
+  metal::MetalBuffer auxiliaryIn;
   metal::MetalBuffer fold;
+  metal::MetalBuffer foldAuxiliary;
 };
 
 // The bytes of a target's own step scratch beside the runtime's arenas, a
@@ -534,6 +544,12 @@ public:
   virtual void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
+  // The rows a DFlash2 draft reads of `rows` tokens of its own (its anchor and
+  // mask rows): the token table's rows (addEmbedding), but a family's whose
+  // first layer reads them through a norm of their own, which normalizes them
+  // alike (QwenTargetDimensions::draftEmbeddingNorm).
+  virtual void addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                                 metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a decode step (`step`, whose lanes' rows
   // the layout places, QwenTargetCommitBuffers::laneRows): in the step's
   // command after its forward, or for constrained decoding in the next
@@ -542,14 +558,31 @@ public:
   // computed of its rows. None for a target without auxiliary state.
   virtual void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
                               const ops::StepRows &step) const;
-  // After a verify's acceptance, the GDN state after its first `rows` rows of
-  // one lane, which the lane's next step would hold had the lane retained
-  // exactly those, as a cached state stores it (its convolution rows and its
-  // recurrent state's codes, ops::GDN::addFold), when the lane retained that
-  // many. None for a target without GDN layers; a target with auxiliary
-  // state, which its commit writes after every retained row, captures no
-  // state in decode (Model::capturesInDecode).
-  void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const;
+  // Whether addStateFold gives the whole state a lane holds at a boundary
+  // inside a verify's retained rows, so that decode captures states
+  // (Model::capturesInDecode): the GDN state's fold, and a family's own of
+  // its auxiliary state (Inkling-2-Mini's convolutions). A family whose
+  // commit alone writes its auxiliary state, after every retained row
+  // (Qwen3.8-Flash-Next's PLE history and its indexer's pending keys),
+  // folds none.
+  [[nodiscard]] virtual bool foldsState() const noexcept;
+  // After a verify's acceptance in a step of `step`, the state after its
+  // first `rows` rows of one lane, which the lane's next step would hold had
+  // the lane retained exactly those, as a cached state stores it: the GDN
+  // state's convolution rows and its recurrent state's codes
+  // (ops::GDN::addFold), and a folding family's auxiliary state, when the
+  // lane retained that many. The GDN's is none for a target without GDN
+  // layers; a target that folds no state (foldsState) captures none in
+  // decode.
+  virtual void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows,
+                            const ops::StepRows &step) const;
+  // The commit of each lane's accepted path's K/V after a decode step, in
+  // every attention layer (ops::PagedAttention::addPathCommit, whose
+  // arguments these are): the shared attention's, or a family's that stores
+  // its K/V through its own operator.
+  virtual void addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+                               std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
+                               uint32_t laneRows, const metal::MetalBuffer &paths) const;
   // The table rows a lane's rows of the last step read (`rows`, its rows of
   // the step), each row's in order, for tests
   // (RuntimeInstrumentation::lastTableRows); none for a target that reads no
@@ -578,7 +611,7 @@ protected:
     std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pageTables{};
     // The sequences' attention plan, which every attention layer runs, and
     // with a sliding window (kv::Layout::windowTokens) their windowed plan,
-    // which the sliding layers run instead.
+    // which the sliding layers run instead (planAttention).
     std::optional<ops::AttentionPlan> attention{};
     std::optional<ops::AttentionPlan> windowedAttention{};
     std::optional<ops::MoePlan> moe{};
@@ -681,6 +714,22 @@ protected:
     }
     return outputs;
   }
+  // Throws unless the shared attention (ops::PagedAttention) compiles the
+  // geometry's heads, KV layout, output gate and RoPE: the check of a target
+  // whose layers attend through it (addPrefillMixer).
+  void requireSharedAttention() const;
+  // Throws unless the family's drafts read what the target captures and
+  // embeds for them (QwenTargetDimensions::draftReadsLayerInputs and
+  // draftEmbeddingNorm): the rows passed into its layers or their outputs
+  // (`inputs`), and its token rows through their norm or as stored
+  // (`normedTokens`).
+  void requireDraftRows(bool inputs, bool normedTokens) const;
+  // The shared attention's plans of a step's sequences, which every attention
+  // layer of a target that attends through it runs, and with a sliding window
+  // (kv::Layout::windowTokens) the windowed plan its sliding layers run
+  // (PrefillStep::attention, windowedAttention): each such target plans each
+  // of its steps after prefillSteps.
+  void planAttention(PrefillStep &step) const;
   // Throws unless a family's `layers` match the geometry's layers and its
   // attention layers.
   template <class Layer> void requireLayers(std::span<const Layer> layers) const {
@@ -722,7 +771,8 @@ protected:
   // The vocabulary head of `rows` rows of `input` into fp32 logits on
   // `linear`, its command's plans as every other projection's (a decode
   // step's linear(step), a batch of first tokens' operators_.linear()), and
-  // the layout its producer writes (`prepared` describes it). A step of more
+  // the layout its producer writes (`prepared` describes it), then the
+  // head's finish where it has one (QwenTargetDimensions::logitFinish). A step of more
   // rows than one decode tile holds (more than four lanes) runs it in passes
   // of at most ops::kMaximumDecodeTileRows rows, each reading the weights
   // again: on a 12-core M6 the 27B's Q6_K head took 19.1 ms at 128 rows in
@@ -752,6 +802,12 @@ protected:
   // Copies a step's read rows of its output work, rows 0.. of `compact`, to
   // their rows of `output`; nothing when it outputs every row.
   void addReadRows(const PrefillStep &step, const metal::MetalBuffer &compact, const metal::MetalBuffer &output) const;
+  // The draft's capture of `rows`, a step's rows of target layer id `id`
+  // (the layer's output, or the rows passed into it where the family's
+  // drafts read layer inputs, QwenTargetDimensions::draftReadsLayerInputs),
+  // when the draft reads the id: a decode step's every row, a prompt chunk's
+  // those its sequences' captures name (forEachPrefillCapture).
+  void addDraftCapture(const PrefillStep &step, uint32_t id, metal::MetalBuffer rows) const;
   // Each of a prefill step's captures of layer `index`'s output rows, when
   // the draft reads the layer: capture(slot, source row, destination row,
   // rows) of the captured hidden rows' slot `slot`.
@@ -800,6 +856,19 @@ template <class Layout>
 [[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const Layout &, const QwenTargetGeometry &, uint32_t,
                                                             uint64_t) {
   return {};
+}
+// The attention workspace a target of its layout's steps take: a prompt
+// chunk's sequence's (StepKind::Prefill) or a decode lane's (StepKind::Decode)
+// partials and statistics, those of the shared attention
+// (ops::PagedAttention), which a family whose attention is its own sizes by
+// its own operator instead.
+template <class Layout>
+[[nodiscard]] ops::AttentionWorkspace qwenTargetAttentionWorkspace(const Layout &, const ops::ExecutionPlans &operators,
+                                                                   const QwenTargetGeometry &geometry,
+                                                                   ops::StepKind step) {
+  return step == ops::StepKind::Decode
+             ? operators.laneAttentionWorkspace(geometry.attentionQueryHeads, geometry.kvLayout)
+             : operators.sequenceAttentionWorkspace(geometry.attentionQueryHeads, geometry.kvLayout);
 }
 
 } // namespace splash::model

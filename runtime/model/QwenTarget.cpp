@@ -6,6 +6,7 @@
 #include "model/WeightStore.hpp"
 #include "ops/AneFfn.hpp"
 #include "ops/Embedding.hpp"
+#include "ops/LogitFinish.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/RowCopy.hpp"
@@ -41,7 +42,7 @@ void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPr
 void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moeBlocks,
                                 const ops::Projection &logits) {
   moeRouterFormat = ops::moeRouterFormat(moeBlocks);
-  moeInt8Experts = ops::moeInt8Experts(moeBlocks);
+  moeInt8Experts = ops::moeInt8Experts(moeBlockShape(), moeBlocks);
   prefillProjections = decodeProjections;
   include(logits);
   // The draft's head over its subset of the vocabulary: a view of the head's
@@ -69,9 +70,17 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
     : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
   if (!geometry_.valid()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
+}
+
+void QwenTarget::requireSharedAttention() const {
   if (!ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
                                      geometry_.rotaryPairs))
     throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
+}
+
+void QwenTarget::requireDraftRows(bool inputs, bool normedTokens) const {
+  if (geometry_.draftReadsLayerInputs != inputs || geometry_.draftEmbeddingNorm != normedTokens)
+    throw std::invalid_argument("the target captures and embeds other rows than its family's drafts read");
 }
 
 QwenTarget::~QwenTarget() = default;
@@ -98,6 +107,11 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                       rows);
 }
 
+void QwenTarget::addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer hidden,
+                                   uint32_t rows) const {
+  addEmbedding(graph, std::move(tokens), std::move(hidden), rows);
+}
+
 void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers buffers,
                                 const ops::StepRows &step) const {
   if (!step.lanes || step.lanes > ExecutionLimits::maximumBatchWidth)
@@ -108,9 +122,12 @@ void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers b
         throw std::invalid_argument("Qwen state commit lane without its auxiliary state");
 }
 
-void QwenTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const {
-  if (geometry_.stateLayout.auxiliaryBytes)
-    throw std::logic_error("a target with auxiliary state folds no state in decode");
+bool QwenTarget::foldsState() const noexcept { return !geometry_.stateLayout.auxiliaryBytes; }
+
+void QwenTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows,
+                              const ops::StepRows &) const {
+  if (!foldsState())
+    throw std::logic_error("a target that folds no state captures none in decode");
   if (!geometry_.stateLayout.layers)
     return;
   ops::GDN::addFold(graph,
@@ -168,18 +185,27 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     step.chunks[index] = sequence.chunk;
     step.pageTables[index] = sequence.pageTable;
   }
-  const ops::AttentionWorkspace workspace{chunk.buffers.attentionPartials.sizeBytes(),
-                                          chunk.buffers.attentionStatistics.sizeBytes()};
-  step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                              geometry_.kvLayout, workspace));
-  if (const uint32_t window = geometry_.kvLayout.windowTokens)
-    step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                                        geometry_.kvLayout, workspace, {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moe(geometry_.moeShape(), geometry_.moeRouterFormat, chunk.rows,
                               chunk.decode ? ops::StepKind::Decode : ops::StepKind::Prefill);
   step.aneFfn = aneFfn;
   return step;
+}
+
+void QwenTarget::planAttention(PrefillStep &step) const {
+  const ops::AttentionWorkspace workspace{step.buffers.attentionPartials.sizeBytes(),
+                                          step.buffers.attentionStatistics.sizeBytes()};
+  step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
+                                              geometry_.kvLayout, workspace));
+  if (const uint32_t window = geometry_.kvLayout.windowTokens)
+    step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
+                                                        geometry_.kvLayout, workspace, {.windowTokens = window}));
+}
+
+void QwenTarget::addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+                                 std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
+                                 uint32_t laneRows, const metal::MetalBuffer &paths) const {
+  ops::PagedAttention::addPathCommit(graph, layout, extentPages, pageTables, committed, laneRows, paths);
 }
 
 void QwenTarget::planOutputRows(PrefillStep &step, uint32_t index) const {
@@ -406,21 +432,23 @@ void QwenTarget::addHead(metal::CommandGraph &graph, const ops::Linear &linear, 
                          ops::PreparedInput prepared) const {
   const ops::Projection &head = vocabularyProjection();
   if (rows <= ops::kMaximumDecodeTileRows) {
-    linear.add(graph, {.input = std::move(input), .output = std::move(logits), .scratch = scratch, .prepared = prepared},
-               head, linear.plan(head, rows));
-    return;
+    linear.add(graph, {.input = std::move(input), .output = logits, .scratch = scratch, .prepared = prepared}, head,
+               linear.plan(head, rows));
+  } else {
+    // Each pass's views hold its plan's storage rows, which a step's row
+    // tensors hold (decodeStorageRows): the first 64 rows and the tile of the
+    // rest, at most 96 rows at five and six lanes and 128 at seven and eight.
+    for (uint32_t first = 0; first < rows; first += ops::kMaximumDecodeTileRows) {
+      const ops::LinearPlan plan = linear.plan(head, std::min(rows - first, ops::kMaximumDecodeTileRows));
+      linear.add(graph,
+                 {.input = rowsOf<uint16_t>(input, first, plan.storageRows(), geometry_.hiddenSize),
+                  .output = rowsOf<float>(logits, first, plan.storageRows(), geometry_.vocabularySize),
+                  .scratch = scratch},
+                 head, plan);
+    }
   }
-  // Each pass's views hold its plan's storage rows, which a step's row
-  // tensors hold (decodeStorageRows): the first 64 rows and the tile of the
-  // rest, at most 96 rows at five and six lanes and 128 at seven and eight.
-  for (uint32_t first = 0; first < rows; first += ops::kMaximumDecodeTileRows) {
-    const ops::LinearPlan plan = linear.plan(head, std::min(rows - first, ops::kMaximumDecodeTileRows));
-    linear.add(graph,
-               {.input = rowsOf<uint16_t>(input, first, plan.storageRows(), geometry_.hiddenSize),
-                .output = rowsOf<float>(logits, first, plan.storageRows(), geometry_.vocabularySize),
-                .scratch = scratch},
-               head, plan);
-  }
+  if (geometry_.finishesLogits())
+    ops::LogitFinish::add(graph, std::move(logits), geometry_.vocabularySize, rows, geometry_.logitFinish());
 }
 
 void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output,
@@ -431,6 +459,17 @@ void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::Me
     throw std::logic_error("Qwen target capture slot past the captured hidden rows");
   ops::RowCopy::add(graph, std::move(output), {sourceRow, width, 0}, std::move(captured),
                     {destinationRow, capturedWidth, slot * width}, rows, width);
+}
+
+void QwenTarget::addDraftCapture(const PrefillStep &step, uint32_t id, metal::MetalBuffer rows) const {
+  if (step.decode) {
+    if (const auto slot = geometry_.captureSlot(id))
+      addCapture(step.graph, *slot, rows, 0, step.decode->capturedTargetHidden, 0, step.rows);
+    return;
+  }
+  forEachPrefillCapture(step, id, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t count) {
+    addCapture(step.graph, slot, rows, source, step.buffers.captured, destination, count);
+  });
 }
 
 namespace {
@@ -456,13 +495,19 @@ public:
   Qwen3_5Target(const QwenTargetWeights<Layout, Layer> &weights, const QwenTargetGeometry &geometry,
                 metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
       : QwenTarget(weights, geometry, backend, operators), weights_(weights) {
+    static_assert(Layout{}.relativeAttention().empty(), "the layout states the attention its target's layers run");
     requireLayers(std::span<const Layer>(weights.layers));
+    requireSharedAttention();
+    // Its layers' outputs, which their loop captures, and its stored token
+    // rows (addDraftEmbedding).
+    requireDraftRows(false, false);
   }
 
   std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph, std::span<const QwenTargetPrefillChunk> chunks,
                                              const kv::PageStorage &kv, SpilledKvReads &spilled,
                                              QwenPrefillLayers layers, ops::AneFfn *aneFfn) override {
     std::vector<PrefillStep> steps = prefillSteps(graph, chunks, kv, spilled, layers, aneFfn);
+    for (PrefillStep &step : steps) planAttention(step);
     return addPrefillLayers(std::span(steps), *this, layers);
   }
 
@@ -505,15 +550,8 @@ private:
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
     addReadRows(step, b.hidden[index & 1], b.hidden[(index & 1) ^ 1]);
-    // The draft reads a decode step's every row of the layers it captures.
-    if (step.decode) {
-      if (const auto slot = geometry_.captureSlot(index))
-        addCapture(step.graph, *slot, b.hidden[(index & 1) ^ 1], 0, step.decode->capturedTargetHidden, 0, step.rows);
-      return;
-    }
-    forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
-      addCapture(step.graph, slot, b.hidden[(index & 1) ^ 1], source, b.captured, destination, rows);
-    });
+    // The draft reads its layers' output rows.
+    addDraftCapture(step, index, b.hidden[(index & 1) ^ 1]);
   }
   // A decode step's head reads every row's final norm.
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const {

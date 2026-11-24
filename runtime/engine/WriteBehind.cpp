@@ -4,8 +4,9 @@ namespace splash::engine {
 
 WriteBehind::WriteBehind(Cache &cache) : cache_(cache), copying_(cache.persistent()) {}
 
-void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
-  if (!cache_.kvTierWritable() || tokens < kMinimumTokens || queued_.contains(block))
+void WriteBehind::published(uint64_t block, uint32_t tokens, double now, bool head) {
+  head = head && cache_.persistent();
+  if (!cache_.kvTierWritable() || (tokens < kMinimumTokens && !head) || queued_.contains(block))
     return;
   // While copies wait for demand, the queue keeps only the points their
   // conversations still resume from.
@@ -19,7 +20,7 @@ void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
       return true;
     });
   queued_.insert(block);
-  waiting_.push_back({block, now + kDelayMilliseconds});
+  waiting_.push_back({block, now + kDelayMilliseconds, head});
 }
 
 bool WriteBehind::settle(PersistStatus status) {
@@ -91,7 +92,7 @@ bool WriteBehind::step(double now, bool claimWaiting, const std::function<bool()
       stopped_ = Stop::Covered;
       break;
     }
-    if (!settle(cache_.persist(point->block))) {
+    if (!settle(cache_.persist(point->block, point->head))) {
       stopped_ = Stop::Stalled;
       break;
     }
@@ -107,10 +108,10 @@ bool WriteBehind::flush() {
     return true;
   cache_.liftDiskWriteBudget();
   while (!waiting_.empty()) {
-    const uint64_t block = waiting_.back().block;
-    if (!settle(cache_.persist(block)))
+    const Point &point = waiting_.back();
+    if (!settle(cache_.persist(point.block, point.head)))
       return false;
-    queued_.erase(block);
+    queued_.erase(point.block);
     waiting_.pop_back();
   }
   return true;

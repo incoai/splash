@@ -200,20 +200,47 @@ for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by
 `VisionPreparation` for a safetensors or GGUF vision tower. `GgufPreparation`
 repacks GGUF blocks ([GGUF targets](models.md#gguf-targets)) and safetensors tensors
 without requantization, but for the Q8_0 of Flash-Next's BF16 or F16
-hyper-connection projections, quantizes the draft's BF16 projections
+hyper-connection projections, of 16-bit float routed experts that neither
+MXFP8 holds exactly nor BF16's blocks tile (16-bit experts MXFP8 holds load as
+it, exactly) and of a safetensors target's BF16 or F16 projections ([MLX
+targets](models.md#mlx-targets)), quantizes the draft's BF16 projections
 ([Drafts](models.md#drafts)), and computes a safetensors target's GDN decay as
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
-exponential.
+exponential. llama.cpp's NVFP4 rows are rebuilt as NVFP4's native blocks of
+256 elements, or, for a tensor whose rows are not whole 256-element blocks
+(llama.cpp's are 64), as NVFP4's own form of 64-element blocks (`nvfp464`),
+which differs from the 256 form only in its meta unit (four scales and `g`,
+two groups wide): every tile reads both through the format list, as it reads
+every format, and the planner chooses the form by a tensor's width
+(`GgufImage.cpp` `imageFormat`). Every MoE layer's image holds its routed
+experts' scales after them, F32 [3][experts] (`ImageBuilder::expertScales`):
+a GGUF experts tensor's `.scale` as stored, whatever its type, and 1 for
+experts without one, which the expert passes multiply their sums by
+([GGUF targets](models.md#gguf-targets)); a checkpoint's, planned as values
+(`ImageBuilder::ExpertScales`), its experts' global scales: Inkling 2's
+release's amax over its denominator, MLX's `global_scale` over 6 × 448 or
+`weight_scale_2` as stored ([Inkling 2's
+checkpoints](models.md#inkling-2s-checkpoints)). A checkpoint's matrix the
+image holds transposed (Inkling 2's static taps and relative bias, oMLX's
+packed message gates) is written as its transpose's F32 values
+(`Conversion::TransposeToFloat32`), its stored rows taken in reverse where it
+keeps them last first (`RowOrder::reversed`).
 
 Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
-BF16 or F16 hyper-connection projections ([GGUF targets](models.md#gguf-targets)), and
+BF16 or F16 hyper-connection projections and of such 16-bit routed experts
+([GGUF targets](models.md#gguf-targets)) and of a safetensors target's BF16 or
+F16 projections, in the F32 quotient of an expert's global scale a checkpoint
+holds as one (as llama.cpp's converter computes Inkling 2's `.scale`), and
 in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
 target's quantized shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](models.md#mlx-targets)) or a Model Optimizer or compressed-tensors
 target's in NVFP4 or FP8, and a GGUF's quantized alpha or beta beside one of
-another type, which the GPU decodes as GGML does. In the second conversion, a
+another type and its quantized tensors of a float projection (Inkling 2's
+message gates, which its fused gate kernels read as F32 rows, and its sink
+projections), which the GPU decodes as GGML does.
+In the second conversion, a
 Model Optimizer or compressed-tensors target's RMSNorm weight `w`, stored 1
 below the weight the norm multiplies by, loads as
 the F32 `1 + w` ([Model Optimizer targets](models.md#model-optimizer-targets)), which
@@ -275,7 +302,16 @@ and plans the `MDGG0001` layout. A Flint GGUF's family keys hold its window,
 leading dense layers, shared expert's slices, sigmoid router and normalized,
 unscaled routing weights (`expert_weights_scale` 1) and its two layer
 patterns to the family's, and a router bias (`ffn_exp_probs_b`), which its
-blocks would not add, is refused.
+blocks would not add, is refused. A family whose layer images are not one for
+each layer the runtime runs plans through its own `ggufTargetPlan`
+(`GgufTarget.hpp`): the count of its layer images, its metadata checked key by
+key (`gguf::MetadataCheck`, which the shared check is written with), and the
+sections each image holds, which the shared planner lays out
+(`gguf::planTargetImages`, `gguf::Section`); a section of F32 values may
+gather them from rows of tensors that every layer's share
+(`Section::gathered`, one copy a part, `ImageBuilder::gather`). Inkling 2's
+(`Inkling2LoopGguf.cpp`) plans its 24 weight layers, which its steps run as 48
+applications.
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and
@@ -400,7 +436,33 @@ layers' FFN is dense and the others' a MoE of a sigmoid router and an ungated
 shared expert of two slices; its norms are plain, as its GGUFs store them. Its
 layer images (`GgufImage.cpp`, `FlintGguf`) hold its input norm, attention,
 sinks, the norm before its FFN and its FFN, which `loadFlintWeights` reads with
-the Qwen readers.
+the Qwen readers. Inkling 2 (`Inkling2Loop.hpp`) states the shared dimensions
+as the layers its steps run, one per layer application, every one attending,
+and keeps its weight layers, its loop's schedule (`Inkling2LoopSchedule`) and
+its own values in its layout; its own loader reads a layer image a weight
+layer, and its target (`Inkling2LoopTarget.hpp`) runs its own operators; a
+decode step's MoE combine also runs the FFN's convolution along the lanes'
+trees, in the combine's dispatch, a lane's rows a threadgroup's, which pass
+their combined values through threadgroup memory
+(`ops::MoeCombineConvolution`): the bits the combine and the convolution
+write apart. A decode step projects the keys and values of one row (a
+sliding layer's, but where messages gate its inputs apart) as one projection
+of the two tensors side by side (`keyValueProjection`,
+`ops::Projection::sideBySide`), on one tensor's own plan, so each tensor's
+columns are the bits of its own projection, in one dispatch from one prepared
+input where its tile fuses them (the column and register tiles, and the staged
+tile of one row group); and it convolves every layer's keys and values in one dispatch
+(`ops::ShortConvolution::addConvolutionPair`), each the bits of its own
+dispatch, a pair from one projection's rows reading them as views
+(`ShortConvBuffers::inputStride`, `inputColumn`). Its draft reads it as its
+producer captured it
+(`QwenTargetDimensions`'s `draftReadsLayerInputs`): the target captures, at
+an id the draft reads, the rows passed into that application, its block
+residual's partial sum before it, and at id 48 the final norm's rows the
+head reads; its draft's own rows are the token table's through the table's
+norm (`draftEmbeddingNorm`, `QwenTarget::addDraftEmbedding`); and the
+draft's logits take the head's finish, no padding row and the softcap after
+the selector's edges (`logitSoftcap`, `vocabularyTokens`, `DFlashDraft`).
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
@@ -632,7 +694,8 @@ The rules:
    one column of a GEMV in registers over those rows alone (the MoE expert
    tiles' column tile, `kernels/common/gguf_column_tile.h`), eight simdgroups
    of a threadgroup splitting K and adding their parts in order, a gate/up
-   pair of one format in one pass; on the M5 Max a [2048 x 6144] af4g64
+   pair of one format in one pass, a fused projection's segments in one
+   dispatch, each column as its own tensor's; on the M5 Max a [2048 x 6144] af4g64
    projection at one row takes 18.4 us on the column tile and 28 us on the
    staged tile. Otherwise the register tile runs where it takes every
    quantized segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the
@@ -667,15 +730,28 @@ The rules:
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
 4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
    while a step's routes average at most one row per expert (a decode step's
-   of up to 32 rows of every family) and 32-row tiles beyond. One plan per
-   step serves every block, so its router follows rule 3 in the format of
-   most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
-   are the step's routes', packed (`ops::MoeScratch`). With int8 activations
+   of up to 32 rows of every family) and 32-row tiles beyond. On the M5 Pro
+   (Apple10, 16 to 31 cores) a prefill chunk on the staged passes whose
+   routes average `ops::MoeCalibration::wideTileRoutes` or more an expert
+   runs 64-row tiles, which dequantize an expert's weights once for up to 64
+   of its rows. From 20 cores that is 64 routes: from 1024 rows on
+   Inkling-2-Mini, at 2048 on Qwen3.6-35B-A3B and Qwen3.5-122B-A10B; never
+   on Flint (48 at 2048 rows), whose routing of two shared slices has no
+   64-row passes (`ops::MoePlan` refuses them). The 16-core takes 128,
+   where 64-row tiles took the 35B's prefill 1.5-2.5% longer and Inkling's
+   1024- and 1536-row chunks no shorter: at 2048 rows on Inkling-2-Mini
+   alone. A row's result is the same bits on every tile. One
+   plan per step serves every block, so its router follows rule 3 in the
+   format of most blocks' routers
+   (`ops::moeRouterFormat`). Every tile's grouped rows are the step's
+   routes', packed (`ops::MoeScratch`). With int8 activations
    on, a prefill chunk whose dense projections run the
    [int8-activation tile](#int8-activation-prefill) runs its experts on int8
-   passes too where every block's experts are resident and each projection's
-   routed and shared experts share a format the tile takes
-   (`ops::moeInt8Experts`), once its routes average six or more an expert
+   passes too where every block's experts are resident, its routing is one
+   the passes compile (one or two shared slices, SiLU) and each projection's
+   routed and shared experts share af4g64 or af5g64 (`ops::moeInt8Experts`;
+   not Q8_0, which the tile takes for dense projections alone), once its
+   routes average six or more an expert
    (`ops::selectMoe`, `MoeConfig::int8Passes`): from 192 rows on
    Qwen3.6-35B-A3B and Qwen3.5-122B-A10B, 256 on Flint's shape and 308 on
    Qwen3.8-Flash-Next's. Smaller chunks and every decode step (rule 1) keep
@@ -727,22 +803,38 @@ every projection
 (`ServingRuntime::requireWarmup`):
 
 - a prefill of the most rows, 2048, and one of each class of chunk whose
-  projections run kernels of their own, of its fewest rows
+  projections or attention run kernels of their own, of its fewest rows
   (`ExecutionPlans::prefillRowClasses`): each decode tile and height a chunk
   takes, from 1 (the column tile), 3, 9, 17, 25, 33 and 49 rows, and the
-  prefill tile, from 65 rows; and a MoE target's expert passes
+  prefill tile, from 65 rows; a MoE target's expert passes
   (`ops::selectMoe`), each a class: the 32-row staged passes from the rows
   whose routes outnumber its experts (33 on Qwen3.6-35B-A3B and
-  Qwen3.5-122B-A10B, 43 on Flint, 52 on Qwen3.8-Flash-Next), and the int8
-  passes where they run (from 192, 256 and 308 rows). These need no memory
-  the first did not, and are required as it is. Every other kernel choice a
+  Qwen3.5-122B-A10B, 43 on Flint, 52 on Qwen3.8-Flash-Next), the M5 Pro's
+  64-row passes from the rows whose routes average its `wideTileRoutes` an
+  expert (from 20 cores 1024 on Inkling-2-Mini and 2048 on the 35B and the
+  122B, on the 16-core 2048 on Inkling-2-Mini; a class of 2048 rows is the
+  prefill of the most rows', which warms it, no chunk of its own repeating
+  it), and the int8 passes where they run (from 192, 256 and 308 rows); and
+  the rows from which Inkling-2-Mini's relative attention after no history,
+  in each variant its layout states (a layout's `relativeAttention`), runs a
+  kernel no class before them and no chunk of the most rows runs:
+  the direct kernel over bf16 queries, from 129 rows where INT8 pages take
+  INT8 queries (Apple10 and Apple11), so that a fresh prompt of 129 to 224
+  tokens creates none while it waits; the chunk of the most rows runs it
+  over INT8 queries, and elsewhere over the bf16 queries 129 rows take.
+  These need no memory the first did not, and are required as it is. Every other kernel choice a
   chunk's rows make has one threshold (the float tiles, the MoE router's
-  tile, the staged norm, the hyper-connection norm's quarters, and the
-  Neural Engine split, which takes no class's first chunk), so the chunks of
-  one row and of the most take both sides. `kernel-selection` checks that
+  tile, the staged norm, the hyper-connection norm's quarters, the block
+  residual mix's kernel of a threadgroup a row from 65 rows, Inkling-2-Mini's
+  message gates' `message_gate_rows` from 129 rows, where 128 and fewer run a
+  decode step's three fused kernels, and the Neural Engine split, which takes
+  no class's first chunk), so the chunks of one row and of the most take both
+  sides. `kernel-selection` checks that
   every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
-  its fifteen devices, and its prefill attention after each history it plans,
-  is one of these chunks'. Each prefill also creates, without running it, the
+  its fifteen devices, and the kernels its prefill attention runs after each
+  history it plans, are these chunks', and that no class's chunk repeats the
+  most rows'. Each prefill also creates, without running them, its chunk's
+  kernels after the longest history the target serves, the
   draft rebuild a restored lane's first chunk begins with, which no other
   command runs, so a memory-limited restore warmup leaves none of its kernels
   to serving, and what a state captured inside a chunk runs, which no warmup
@@ -885,7 +977,12 @@ Apple10 and Apple11 the [int8-activation tile](#int8-activation-prefill) where i
 weights). A fused projection's staged plan runs its segments in one dispatch: a dispatch costs
 about 0.045 ms however narrow, and at 8 to 32 rows one dispatch takes 16-56% less time than one
 per segment on the 32-core M5 Max and 3-11% less on the 10-core M4 for the 27B attention and 35B
-GDN inputs.
+GDN inputs. A projection of tensors side by side (`Projection::sideBySide`: two or three
+projections of one input, each one tensor of one shape and format) takes the plan one of them
+takes alone, over all their columns (`ProjectionShape::planOutputs`, which the arena bound and
+the storage rows also follow): every tile runs a fused projection's segments at one configuration
+each as its own projection would (gguf-projection), so each tensor's columns are the bits of its
+own plan, in one dispatch where the tile fuses them.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`WaveLaw`, `runtime/ops/KernelSelection.cpp`), for decode steps and short
@@ -914,7 +1011,14 @@ per height sped no Mac without slowing some model. The floors are fitted, not me
 search over every measured case's fastest split gave 6 and 10 for `saturating` (a lone chain
 measures 5.4 and 9 threadgroups' bytes) and 2 and 3 for `following` (one threadgroup per core
 past a full wave measures 2.7-3.5 of the tile's and 6-8.5 of the pair's); they stand in for what
-the law leaves out. Floors at the measured trailing waves take as much time in total on the
+the law leaves out. From 32 cores (`kApple10LargeProjection`) a unit of 6.25 bits per weight or
+more (Q6_K, Q8_0, MLX 6- and 8-bit, FP8), whose threadgroups each stream that many more bytes a
+step, saturates from four (`WaveLaw::wideSaturating`): on the 32-core M5 Max (macOS 27.0) four
+took up to 36% less time than six on every such projection of the 35B, the 27B and
+Inkling-2-Mini measured at 8 to 64 rows where their splits differ, and nowhere more, while
+narrower formats took up to 19% more at four and the 12-core M6 25% more on a Q8_0 projection at
+56 and 64 rows, so both keep six.
+Floors at the measured trailing waves take as much time in total on the
 sweeps but leave more cases slower. The law's totals on the sweeps (1.1%, 1.6% and 0.05% less
 time than the earlier rules on the M5 Max, the M5 Pro and the M6) are in-sample, the fit's own
 records; the ABBA decode runs and a 16-core emulation are the only out-of-sample checks, and the
@@ -970,7 +1074,7 @@ slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select
 (`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
 (`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`); the softmax router's one gated slice is the
 unsuffixed instances. The grouping packs the tiles' rows, a grouped row per route, each tile's after
-the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16- or 32-row matmul reads past
+the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16-, 32- or 64-row matmul reads past
 its live rows into the next tile's, or past the last tile into the `tileRows - 1` rows the scratch
 holds past the routes', and stores its live rows alone.
 The expert passes launch the live tiles alone: the grouping kernel writes each
@@ -1066,7 +1170,8 @@ up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
 experts' gate and up in one pass `moe_expert_gguf_m<rows>_gate_up` and their down pass
 `moe_expert_gguf_m<rows>_down`; the fused projections run
-`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and in prefill chunks
+`gguf_column_fused` on the column tile, `gguf_decode_fused_m<rows>` and
+`gguf_decode_sg_fused_l<lanes>` in decode and in prefill chunks
 of up to 64 rows, and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that
 format's segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
 `gguf_prefill_int8_<format>_a` per segment). A `gguf_decode_fused_m<rows>` pipeline decodes
@@ -1107,15 +1212,18 @@ split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, w
 row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
 products of their codes, lanes and pass modes bitwise, a non-finite input's row alone not
 finite, and a plan of one or two rows on the column tile in every format and in fused
-triples within the bound, the rows past its own unread and unwritten; and
+triples within the bound, a fused triple's segments bitwise each one's projection alone, the
+rows past its own unread and unwritten; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
-plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
-against fp64, bitwise against the full grids and two gate/up passes, a decode step routing its
-lanes' rows alone, no row of no lane, and with the experts in
+plan, the staged 8-, 32- and 64-row tiles, in every format as each routed and shared expert tensor,
+against fp64, bitwise against the full grids and two gate/up passes, every row of the 64-row tiles
+bitwise its row of the 32-row tiles (also over four whole 64-row tiles an expert), a decode step
+routing its lanes' rows alone, no row of no lane, and with the experts in
 permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
 bitwise as in one chunk, and refuses floor and elastic chunks one unit short, a malformed chunk list
 or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts
-and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
+and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices, on
+8- and 32-row tiles alone;
 and `expert-store`, streamed experts at four shapes bitwise against the resident ones, in loads
 of every kind, through a release and a restore, in a floor and three smaller elastic chunks,
 beside a size of one block, which the store reads whole into its floor
@@ -1135,15 +1243,16 @@ the walks spread also in one, `pair` and `pair16`) and every K split, and marks 
 pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
 `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
 chunk of `R` rows (more than 32), for `R` up to 64 the staged 64-row tile at every K split, and for
-`af4g64` and `af5g64` the int8-activation tile (`prefill int8`) and its GEMM alone on codes the
+`af4g64`, `af5g64` and `q80` the int8-activation tile (`prefill int8`) and its GEMM alone on codes the
 scratch holds (`int8 codes`, as a SwiGLU's up runs on its gate's); the formats `float-bf16` and
 `float-f32`, and `float-<format>` for a quantized format's native rows (such as `float-af8g64`),
 time the float projection (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles
 instead, marking `selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B
-shape, or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
-device's plans; `GGUF_MOE_ARGS='repack'` times the repack of streamed experts into their slots
-(`moe_expert_load`, 1 to 32 jobs) and of tensors into an image (`gguf_repack`) in the streamed
-formats, each plane checked bytewise against the reference repack.
+shape, or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), or at
+any other (`'HxIxExK'`), on the device's plans, each decode step also as the GB/s its layer and its
+expert passes alone stream its distinct experts at; `GGUF_MOE_ARGS='repack'` times the repack of
+streamed experts into their slots (`moe_expert_load`, 1 to 32 jobs) and of tensors into an image
+(`gguf_repack`) in the streamed formats, each plane checked bytewise against the reference repack.
 
 Target attention runs once a layer for every sequence of a command, a decode step's lanes as a
 prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k projection
@@ -1194,7 +1303,7 @@ history without.
 
 On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill chunk past one
 staged tile (more than 64 rows) of a projection whose quantized segments are all MLX affine 4- or
-5-bit in groups of 64 (`af4g64`, `af5g64`) runs `LinearTile::GgufPrefillInt8`
+5-bit in groups of 64 (`af4g64`, `af5g64`) or Q8_0 runs `LinearTile::GgufPrefillInt8`
 (`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
 (`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never),
 with int8 activations on. With them off (`--activations bf16`) every chunk runs the bf16 tiles,
@@ -1204,14 +1313,20 @@ group of each row as int8 codes with its own scale, by the int8-activation rule
 (`LinearInput::PrefillInt8`) rather than quantizing the same rows again; the GEMM
 (`gguf_prefill_int8_<format>_<e>`, one dispatch per segment) feeds the weights' 4- or 5-bit codes
 straight from the planes into int8 `matmul2d` fragments and folds each
-group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. The weights stay
+group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. Q8_0's codes are int8
+already: its tile runs a 64-input group as two pairs of fragment steps, each pair one 32-input group
+of the weights, and folds `(sa d) sum(qa q)` per 32-group with that group's `d`. It reads the codes
+the affine tiles read, in another schedule (a lane's two steps of a 32-group take one uint2 of each
+weight column's plane record), so a fused projection of affine and Q8_0 segments (a checkpoint's
+BF16 projections, loaded as Q8_0, beside its MLX ones) and a SwiGLU of the two still quantize their
+rows once. The weights stay
 exact; only the activations round, per row and group, so an outlier channel costs only its own 64
 inputs. A group holding an infinity or a NaN, which its codes alone would round to finite values,
 takes NaN scales, so that its row's outputs are not finite, as the bf16 tile's are: a lane whose
 state went bad still fails alone. A row's prefill results therefore depend on whether its chunk,
 with the rows of the lanes prefilling beside it, has more than 64 rows, but not on its neighbours'
 values: a prefill's last layer runs its read rows alone on the chunk's tile and keeps their bits. A
-tile is two simdgroups of 32 rows by 32 columns for both formats, and threadgroups take 16 row tiles
+tile is two simdgroups of 32 rows by 32 columns for every format, and threadgroups take 16 row tiles
 down each column tile before the next (`GGUF_PREFILL_INT8_WALK`), so a column tile's weights stream
 once per 16 row tiles: walking every column tile of a row tile first left the M6's 2048-row down
 projections at 0.95-1.12x the bf16 tile's speed. The GEMM's grid is 16 threadgroups wide and takes
@@ -1220,33 +1335,48 @@ whatever the segment's column count; a grid of column tiles by row tiles kept th
 column tiles were a multiple of 16 (M6, 2048 rows: 260 column tiles took 29% longer than 256, on the
 16-wide grid 1.7%, as their columns). Over the 27B's projection shapes in `af4g64` and
 `af5g64` at 65-2048 rows the tile takes 1.13-2.4x less time than the bf16 tile on a 32-core M5 Max,
-a 16-core M5 Pro and a 12-core M6. The quantizer stores each 32-input group's codes in the GEMM's
+a 16-core M5 Pro and a 12-core M6. With its Q8_0 projections on the tile, Inkling-2-Mini
+UD-Q4_K_M prefills 1.3% faster at 512 tokens, 0.4% at 4K and 1.5% at 32K, and Qwen3.6-35B-A3B
+UD-Q4_K_M 3.8% at 512 and 4.1% at 4K (fused GPU time, 20-core M5 Pro, three alternating pairs).
+The quantizer stores each 32-input group's codes in the GEMM's
 fragment order (`prefill_int8_position`): the four inputs a lane takes in a fragment step, in the
 planes' slot order, are one word. The codes and scales are the prefill arena's
 `LinearTable` and `LinearSums`, sized for a full chunk of the target's widest projection whose
 formats the tile takes (`ProjectionShape::prefillInt8Formats`; 40 MB on Qwen3.8-27B MLX 4-bit, its
-down projection) wherever the family runs the tile; a GGUF target's arena holds none. The tile also
+down projection) wherever the family runs the tile; a GGUF target's, for its widest Q8_0 projection
+(9 MiB on Qwen3.6-35B-A3B GGUF, its 4096-input GDN and attention outputs; 7 MiB on Inkling-2-Mini,
+its attention output). The tile also
 takes the Neural Engine split's leading-input view. A DFlash2 draft, prepared `af4g64` whatever the
 target's format, prefills on the bf16 tiles (`ExecutionPlans::draftLinear`): its prefill gains
 nothing from the tile, while its context projection, the widest a prefill runs (25,600 inputs on
 the 27B), would set the tile's scratch, 38 MB on Qwen3.6-35B-A3B GGUF, enough at `--max-memory 24G`
 to stream the routed experts its plan otherwise holds whole. Over 24 real 1K-8K prefixes the
-next-token KL against bf16 prefill on the GPU alone is
-2.2e-3 on Qwen3.8-27B MLX 4-bit (median 3.6e-4) and 2.3e-3 on Qwen3.6-35B-A3B MLX 4-bit, the most
-likely token unchanged at every prefix. At default flags on a 20-core M5 Pro, where the 27B's Neural
-Engine split takes 10 of 34 units, it is 9.4e-4, against 1.1e-3 for the bf16 tiles with the split at
-its own 15 units; both change the most likely token at the same one prefix of 24. Time to the first
-token falls by a quarter at 2K and 10K tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B
-(16-core M5 Pro). `gguf-projection` checks that the tile computes the products of the inputs so
-rounded within the bf16 tile's error, also with an outlier input per row, and bounds the RMS error
-it adds over the bf16 tile on dense inputs at 1%, that a fused projection quantizes once and runs a
-GEMM per segment, and an up on its gate's codes bitwise its own run; `gguf-projection-benchmark`
-times it as `prefill int8`.
+next-token KL against bf16 prefill on the GPU alone is 2.2e-3 on Qwen3.8-27B MLX 4-bit (median
+3.6e-4) and 2.3e-3 on Qwen3.6-35B-A3B MLX 4-bit, the most likely token unchanged at every prefix. At
+default flags on a 20-core M5 Pro, where the 27B's Neural Engine split takes 10 of 34 units, it is
+9.4e-4, against 1.1e-3 for the bf16 tiles with the split at its own 15 units; both change the most
+likely token at the same one prefix of 24. Time to the first token falls by a quarter at 2K and 10K
+tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B (16-core M5 Pro). Teacher-forced over
+256 positions after a 4K- and a 32K-token prefill, the Q8_0 projections' int8 prefill keeps the bf16
+prefill's most likely token at 93-94% of Qwen3.6-35B-A3B UD-Q4_K_M's positions (mean KL 1.6e-2 and
+2.1e-2) and 92-95% of Inkling-2-Mini UD-Q4_K_M's (mean KL 0.14 and 0.29, median under 7e-4), the
+true ids' NLL within 0.04 either way. For Inkling-2-Mini that mean KL is about 1.6-1.9x what its
+INT8 attention queries alone give at the same positions (0.087 and 0.154: the build without the Q8_0
+tile, `--activations auto` against `bf16`). `gguf-projection` checks that the tile computes the
+products of the inputs so rounded within the bf16 tile's error, also with an outlier input per row,
+and bounds the RMS error it adds over the bf16 tile on dense inputs at 1%, that a fused projection
+quantizes once and runs a GEMM per segment, and an up on its gate's codes bitwise its own run;
+`gguf-projection-benchmark` times it as `prefill int8`.
 
 A MoE target's experts run on the same tile in such a chunk where every block's experts are
-resident and each projection's routed and shared experts share af4g64 or af5g64
-(`ops::moeInt8Experts`; Qwen3.6-35B-A3B MLX 4-bit, not Flint's af3g64 nor a set
-with Q8_0 shared experts): `gguf_prefill_int8_quantize` rounds the chunk's MoE input rows once,
+resident, its routing is one the passes compile (one or two shared slices and SiLU's activation:
+not Inkling-2-Mini's softcapped one without a shared expert) and each projection's routed and
+shared experts share af4g64 or af5g64 (`ops::moeInt8Experts`, `quant_moe_int8_format`;
+Qwen3.6-35B-A3B MLX 4-bit, not Flint's af3g64 nor a set with Q8_0 shared experts beside routed
+experts of another format, as the unsloth GGUFs hold them). Q8_0 experts keep the staged passes,
+though the tile takes Q8_0 dense projections: no real model has run them on these passes, whose
+rule of six routes an expert below was measured on af4g64. `gguf_prefill_int8_quantize` rounds
+the chunk's MoE input rows once,
 `moe_gather_int8` copies each route's codes and scales into the grouping's tiles, and
 `moe_expert_int8_<format>_<gate|up|down>` (`kernels/shared/moe_int8.metal`) run the tile over them,
 each tile's expert reached as the staged passes reach it, with the SwiGLU intermediate rounded by the
@@ -2515,6 +2645,15 @@ the 35B's). A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before.
 
+A Background request still in the engine 10 s after its first tick runs as
+Normal (`Engine::age`): in admission, prefill and decode order and in what its
+claims may take, as work that outlasts a title or a summary is a run the user
+asked for, which strict priority starved behind attended work for minutes. It
+still yields memory and its lane as Background (`Engine::yieldsAs`): it ranks
+below attended work, a Normal start refused memory suspends it, and suspended it
+holds no new Normal start back; once suspended it goes back to Background and
+ages again from then, so it does not decode beside the start it gave way to.
+
 ### Expert store and regrowth
 
 A run that can spill gets memory back from its KV instead, while each chunk
@@ -2552,17 +2691,18 @@ in use, which only the claims [above](#memory-rules) may take.
 A prefill command captures the state of each boundary it reaches, in buffers
 reserved before it runs. A junction or a checkpoint retires its lane's
 checkpoint once published, and a checkpoint the same command would capture before it is not captured at all; the prompt's
-replay point keeps the lane's checkpoint cached. Until a state retires it, that
+replay point and the head's state (below) keep the lane's checkpoint cached,
+and a command captures one before them. Until a state retires it, that
 checkpoint is the lane's recovery point, which a command that is cancelled,
 expires or fails leaves to a retry, so no state takes its buffers, or room a
 reclaim could make of it, before its command. Refused the pool and an admission
 while its lane holds a checkpoint no reader pins, a state ends its command at
 its boundary and is taken from the lane once the command has completed: a
 junction or a checkpoint in that checkpoint's buffers, which it takes first,
-the replay point in them only when refused again. A checkpoint only on disk
-gives no buffers, and stays until the state is published. A checkpoint whose
-predecessor a reader pins ends its command too, and is published only once the
-pin has gone. Refused, the replay point, a claim of its request in service that
+the replay point and the head's state in them only when refused again. A
+checkpoint only on disk gives no buffers, and stays until the state is
+published. A checkpoint whose predecessor a reader pins ends its command too,
+and is published only once the pin has gone. Refused, the replay point, a claim of its request in service that
 can wait and reaches what is in use, takes what its row allows in the fixed
 order (a cache the model rebuilds or a chunk of the store among them), waits
 for memory on its way back, the copy of uncopied cache it starts included,
@@ -2602,8 +2742,9 @@ keeps it, and a retry resumes there. One only on the SSD retires when that
 state lands.
 The last stays cached once the replay point is published: a later request that
 shares the prompt up to it, such as another conversation with the same long
-system prompt, resumes there instead of from the start. It stays only if the
-replay state fits beside it; refused memory, the replay state takes its buffers
+system prompt, resumes there instead of from the start. So does the last one
+below a prompt's head once the head's state is published (below). It stays only
+if that state fits beside it; refused memory, the state takes its buffers
 rather than another lane's checkpoint. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
 SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
@@ -2617,8 +2758,33 @@ another message (`head_tokens` in the request frame), gets an ordinary state at
 its end on first prefill when it lies at least a draft window past where the
 request resumes, as a junction must save that much. It is kept and evicted as
 any ordinary state, so the next conversation sharing the head resumes there,
-from RAM or, once a reclaim has written it, from the SSD, instead of
-prefilling the head again.
+from RAM or from the SSD, instead of prefilling the head again. A persistent
+SSD cache copies it ahead as it copies a replay point, though its conversation
+went on from it (`WriteBehind::published`'s head, `Cache::persist`), so that a
+restart or a crash leaves it on the SSD; only a reclaim had written it there,
+and after a restart the next conversation prefilled the head again where none
+had, 17.3 s for a 9.7K-token head on Qwen3.8-27B. It costs one state's write a
+distinct head, 4.4 MiB for Inkling-2-Mini, 19.6 MiB for Qwen3.6-35B-A3B and
+46.9 MiB for Qwen3.8-27B, beside the head's KV, which the replay point's copy
+writes too.
+Only a conversation whose prompt matches the head up to that page shares it,
+and an agent's head ends in text of its own: its system prompt's environment
+block (the working directory, the git status) comes after the tools. So the
+head's state keeps the lane's last prefill checkpoint below it cached, as the
+replay point keeps the one below it: a conversation whose head first differs
+inside the head's last page, or a new session in another directory, resumes at
+that checkpoint instead of from the start. It lies at most the checkpoints'
+spacing, 4096 tokens, below the head's state, or less than 6144 where the
+prompt's replay point lies within a prefill chunk past the multiple of 4096
+below the head, which then holds no checkpoint; a head whose state lies at 4096
+tokens or below keeps none, as a cold prefill plans its first checkpoint at
+4096. It costs one more cached state a head, 4.4 MiB for Inkling-2-Mini, 19.6
+MiB for Qwen3.6-35B-A3B and 46.9 MiB for Qwen3.8-27B, and no KV: its blocks are
+the head's. It stays a checkpoint, which reclaim takes first (and, with the SSD
+cache, writes to the SSD), as the replay point's is: no lane uses it once the
+head's state is published, and it serves only a conversation whose head ends
+differently, where the ordinary states that reclaim takes after it, the head's
+among them, serve every conversation that shares their whole prefix.
 
 A cached state holds a cached cell of the target's GDN state and the draft's
 context window, not the draft's rings. The cached cell
@@ -2676,7 +2842,14 @@ cell and the codec after it would move 470 MiB), and the state's window is a
 copy of the lane's plus those rows' context; the completion seals the state only
 where the lane retained those rows. Both writes are one function of the runtime
 (`encodeDecodeCaptures`), which names the rows a lane retained: the path of its
-rows its acceptance wrote, whose first rows before the page both take. Each such state is a rolling
+rows its acceptance wrote, whose first rows before the page both take. A
+target captures in decode where its fold gives the whole state at the page
+(`QwenTarget::foldsState`): Inkling-2-Mini's state is its convolutions' input
+rows alone, which its commit writes after the retained rows from the inputs
+its verify left on its own tape, and its fold is that dispatch over the
+path's first rows into the state's auxiliary state
+(`ops::ShortConvolution::addFold`), bit for bit what the commit writes where
+the lane retained exactly those rows. Each such state is a rolling
 checkpoint of the reply that retires the one before it, which a preempted lane
 resumes from once its KV holds a token past it, and the last, once the request
 ends, is the reply's state: the point a next request whose prompt renders the
@@ -2684,7 +2857,19 @@ reply back token for token resumes from, that of a reply cancelled or ended by a
 stop sequence too, as far as the prompt renders it back. The prompt's replay
 point stays the point its conversation resumes from, the one reclaim keeps as
 the resume point and the SSD cache copies ahead, which a retry or a next prompt
-that renders the reply otherwise resumes from.
+that renders the reply otherwise resumes from. Resumed from a reply's
+state, a next turn holds the reply's rows as its decode computed them, not as
+a prefill of its prompt would: a GDN target's decode runs the recurrence a
+row at a time where a prefill scans the rows in chunks, which leaves the
+state a little off a prefill's, in its codes and in the running format
+alike. Against a cold prefill of a 309-token next turn, its next token's
+distribution lay at KL 3.0e-3 on Qwen3.6-35B-A3B UD-Q4_K_M through its codes
+(6.4e-3 in the running format, 5.8e-5 from a bf16 state) and 1.0e-5 on
+Qwen3.8-27B UD-Q4_K_M (16-core M5 Pro), where a state a prefill captured lies
+within the release logits check's noise floor (1.2e-3) and Inkling-2-Mini's,
+whose decode leaves no recurrence in its state, at 1e-6 to 7e-6.
+model-runtime-oracle's reply_state_cold holds a GDN target's to twice the
+largest of these, 1.3e-2, and every other state to 1.2e-3.
 
 A reply's state is opportunistic (`StateCache::markReply`): reclaim takes it
 among the units that free for nothing, a checkpoint first in the cache's order,
@@ -2706,18 +2891,24 @@ not leaves its reply's opportunistic again. Only a reply that holds at least
 `WriteBehind::kMinimumTokens` past its prompt's replay point is kept, as a
 shorter one recomputes faster than its state writes: kept, the 384-token
 replies of 12 agent conversations at a 27 GB limit wrote 24% more to the SSD
-to save 2.4% of their prefill. A suspended lane's checkpoints
-stay opportunistic: once they went, the lane replays its reply from its prompt's
-replay point, as one that captured none. A decoding lane's latest state retires
+to save 2.4% of their prefill. A suspended lane whose reply holds as much
+keeps its reply's newest state the same way, whatever its client: the point it
+resumes from, which a reclaim meanwhile writes, once, and which its next capture
+after the resume retires. A shorter reply's checkpoints stay opportunistic: once
+they went, the lane replays its reply from its prompt's replay point, as one
+that captured none. A lane suspended right after the cycle that captured the
+page its KV ends at resumes below that state whichever it keeps, as a resume
+replays a token at least. A decoding lane's latest state retires
 only once the next is published, beside which its cycle holds that next state's
 reservation, so once the lanes end the pool holds those reservations' cached
 cells beside the lanes' cells (`state.idle_cached_cells` 2 beside
 `idle_gdn_cells` 8 after four lanes' 300-token replies at a 22 GB limit, where
 1.6.2 leaves 8 cells), which a claim takes first (step 1 above). A target
-whose state commit writes auxiliary state after its retained rows
-(Qwen3.8-Flash-Next) captures none in decode (`Model::capturesInDecode`), and
-its decode writes the rings alone. A target without GDN layers keeps no GDN
-state: its cells have no bytes, every lane and state shares one empty cell
+whose state commit alone writes auxiliary state after its retained rows
+(Qwen3.8-Flash-Next's PLE history and its indexer's pending keys) folds none
+and captures none in decode (`Model::capturesInDecode`), and its decode writes
+the rings alone. A target without GDN layers or auxiliary state keeps no
+state in its cells: they have no bytes, every lane and state shares one empty cell
 that holds no memory, so a lane holds the draft's rings and window and a
 cached state the window alone, and `state.idle_gdn_cells` and
 `idle_cached_cells` stay 0.
@@ -3091,7 +3282,9 @@ Restore points get their copies ahead of need (`WriteBehind`,
 `Cache::persist`), so that a reclaim later frees a cached conversation at once
 rather than waiting for its writes: an ordinary state published or reused at
 least 2048 tokens deep, 10 s after its publication, unless an ordinary state on
-its only branch below supersedes it by then, its conversation having gone on.
+its only branch below supersedes it by then, its conversation having gone on;
+a persistent tier copies a head's state while it stays ordinary, as new
+conversations start from it whether or not its own went on.
 Its state is written from its own buffers, which stay in RAM, out of every
 eviction order until the write lands, and then the pages of its chain that have
 no copy, root first, at most a quarter of the KV writes in flight

@@ -29,9 +29,10 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
-`runtime/model/`) is an architecture, whose code its families share, and each
-family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp`,
+`Inkling2Loop.hpp` in `runtime/model/`) is an architecture, whose code its
+families share, and each family is a value of it in one list,
+`model::kFamilies` (`ModelDescriptor.hpp`):
 another size of an architecture is one more value there, built by the
 constructor from a `QwenHybridLayout` its layout type gains with its second
 family (as `Qwen3_6MoeLayout`'s builds `kQwen3_5_122BLayout`), its draft in
@@ -46,6 +47,26 @@ reads only for a model type whose configs are flat (a layout type's
 Flint's values key by key (its widths, router, window, `layer_types`,
 `no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
 `rope_theta` and the rest where it states them).
+Inkling 2's layout states the dimensions the shared runtime runs on as the
+layers a step runs, one per layer application (48: its 24 weight layers, the
+loop's twelve three times), and keeps its weight layers, its loop and the
+mapping of an application to its weight layer in its own members
+(`Inkling2LoopSchedule`); its layers attend through relative attention, not
+the shared attention, in the two variants its layout states, a full layer's
+and a sliding layer's (a layout's `relativeAttention`, none for a family of
+the shared attention): its target plans them, the start warms their kernels
+and the kernel tests take them from it, and the tests' shared-attention
+shapes leave it out. It is served up to Splash's serving ceiling,
+1,010,000 tokens, below its own window of 1,048,576. It loads from a GGUF or
+from its release's checkpoint or an MLX conversion of it ([Inkling 2's
+checkpoints](#inkling-2s-checkpoints)); its configuration, under
+`text_config`, is held to its values key by key (its weight layers, its own
+window at `model_max_length`,
+`unpadded_vocab_size`, `local_layer_ids`, `loop_config`, its experts' width;
+the relative bias, clips, softcaps, routing and the rest where it states
+them), its clip and log-scaling alpha as F32 values. Its vocabulary keeps
+no mask token: its draft reads its last unused special token,
+`<|unused_200056|>` ([Drafts](#drafts)).
 An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.
@@ -57,32 +78,46 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
 A model ID with `--revision`, `--language-only` or `--draft-model` is a
-separate installation from the same ID without them.
+separate installation from the same ID without them. The app downloads and
+updates a model with Text only on as its `--language-only` installation, and
+lists the model installed so alone as it lists one installed without it;
+deleting it in the app removes every installation of the model.
 
 ## MLX targets
 
 An MLX target's `quantization` gives a mode, bits and group size, and may give
 a module its own, as mlx-lm writes it; a module's entry wins, and its mode
 defaults to affine. The engine loads affine 2, 3, 4, 5, 6 or 8 bits in groups
-of 32, 64 or 128, mxfp4 (4 bits in groups of 32) and nvfp4 (4 bits in groups
-of 16), mixed in any way across modules, and refuses any other format, naming
-the module (mxfp8). Every projection, the experts' too, and the head load only
-quantized (`safetensors::quantizedModules`): an entry `false`, which mlx-lm writes for
-a module it leaves unquantized, is refused for any of them before any weight
-download, naming it, and the loader refuses one the checkpoint holds
-unquantized. The router, the shared-expert gate, GDN alpha and beta and the
-token table may be unquantized. An affine weight is `s * q + z` for its group's
-bf16 `.scales` and `.biases` and its code `q`, packed little-endian in
-`.weight`'s 32-bit words at every width; an mxfp4 weight is an E2M1 code times
-its group's power of two, a uint8 scale, which is GGUF's MXFP4; an nvfp4 weight
-is an E2M1 code times its 16 elements' E4M3 scale, a uint8, which is NVFP4
-with a tensor scale of 1.
+of 32, 64 or 128, mxfp4 and mxfp8 (4 and 8 bits in groups of 32) and nvfp4 (4
+bits in groups of 16), mixed in any way across modules, and refuses any other
+format, naming the module. A projection, an expert or the head the checkpoint
+holds unquantized (an entry `false`, as mlx-lm writes for a module it leaves
+so), in BF16 or F16, loads as Q8_0, quantized from its values by the reference
+GGUF quantization of Q8_0 (`quantize_row_q8_0_ref`), as a GGUF's BF16
+hyper-connection projections do ([GGUF targets](#gguf-targets)): every decode
+cycle reads every projection, and Q8_0 holds a value in little more than half
+the bytes of a 16-bit float. Experts whose 16-bit values are exactly MXFP8's
+load as MXFP8 instead, as a GGUF's do. The router, the shared-expert gate, GDN alpha and
+beta and the token table load unquantized as stored. An affine weight is
+`s * q + z` for its group's bf16 `.scales` and `.biases` and its code `q`,
+packed little-endian in `.weight`'s 32-bit words at every width; an mxfp4
+weight is an E2M1 code times
+its group's power of two, a uint8 scale, which is GGUF's MXFP4; an mxfp8 weight
+is an E4M3 value, a byte of `.weight`, times its group's power of two, the
+same scale; an nvfp4 weight is an E2M1 code times its 16 elements' E4M3 scale,
+a uint8, and the global scale its module holds where its converter kept
+NVIDIA's (MLX's `global_scale` over the 6 × 448 MLX's dequantization divides
+it by, or Model Optimizer's `weight_scale_2`), which is NVFP4 with that tensor
+scale, 1 without one, in every family's checkpoints; an experts module holds
+one per expert, its experts' scales. Rows of a
+multiple of 64 inputs but not of 256 take NVFP4's 64-element form, as a
+GGUF's do ([GGUF targets](#gguf-targets)).
 
 An MLX target loads into the `MDGG0001` images a GGUF target's do
 (`SafetensorsTargetLoader`, [Weight loading](internals.md#weight-loading)):
 each quantized tensor in the format mlx-lm infers from its tensors, an affine
-`af<bits>g<group>` format of `runtime/metal/abi/QuantFormat.h`, MXFP4 or
-NVFP4, at the checkpoint's bits per weight (NVFP4's at 4.625, its tensor scale
+`af<bits>g<group>` format of `runtime/metal/abi/QuantFormat.h`, MXFP4, MXFP8
+or NVFP4, at the checkpoint's bits per weight (NVFP4's at 4.625, its tensor scale
 stored once per 256 weights); projections and experts as block planes, a
 quantized token table as native rows and an unquantized one as its bf16 rows.
 The MoE router keeps its format too, a quantized one as native rows, an
@@ -95,9 +130,13 @@ MLX's grouped order. A checkpoint's names are mlx-vlm's (`language_model.model.*
 as the Qwen releases') or mlx-lm's (`model.*` and `lm_head`, as
 `mlx-community/flint-mixed-3-4bit`'s), told apart by where its token table is,
 and each family's tensors are read in the order its GGUF images hold them
-(`safetensors::planImages`): Flint's sinks (`self_attn.softmax_offset`) widen
-to the F32 its GGUF holds, its leading layers' FFN is dense and its shared
-expert, two routed experts wide and ungated, runs as two slices.
+(`safetensors::planImages`), Inkling 2's by the sections its GGUF plan lays
+out ([Inkling 2's checkpoints](#inkling-2s-checkpoints)). One planner serves
+both, as `GgufImage.cpp`'s does a GGUF: the families' walks and Inkling 2's
+sections plan through the same Builder's primitives (`SafetensorsImage.cpp`).
+Flint's sinks (`self_attn.softmax_offset`) widen to the F32 its GGUF holds, its
+leading layers' FFN is dense and its shared expert, two routed experts wide and
+ungated, runs as two slices.
 
 ## Model Optimizer targets
 
@@ -106,9 +145,10 @@ NVIDIA's Model Optimizer checkpoints (`quantization_config` with
 `nvidia/Qwen3.6-35B-A3B-NVFP4`, load as safetensors targets beside MLX's. Each
 layer they quantize, by `quantized_layers` or else by `quant_algo` for every
 layer the `ignore` patterns leave, must hold NVFP4 in groups of 16 (`NVFP4`,
-`W4A16_NVFP4`) or FP8 with one scale per tensor (`FP8`), and every projection
-and the head must be such a layer; any other algorithm is refused before any
-weight download, naming the layer. An NVFP4 weight is `g * e4m3 * e2m1`: its
+`W4A16_NVFP4`) or FP8 with one scale per tensor (`FP8`); any other algorithm
+is refused before any weight download, naming the layer, and a projection or
+the head they leave unquantized loads as Q8_0, as an MLX target's does. An
+NVFP4 weight is `g * e4m3 * e2m1`: its
 E2M1 code (two per byte of `.weight`, U8), its 16 elements' E4M3 scale
 (`.weight_scale`, F8_E4M3) and the tensor's FP32 `.weight_scale_2`; an FP8
 weight is `g * e4m3`, its E4M3 value (`.weight`, F8_E4M3) and the tensor's
@@ -132,17 +172,58 @@ llm-compressor's checkpoints (`quantization_config` with `quant_method`
 `unsloth/Qwen3.6-35B-A3B-NVFP4`, load as Model Optimizer's do. Each config
 group's weights must be NVFP4 (`nvfp4-pack-quantized`: float 4-bit by
 `tensor_group` in groups of 16) or FP8 (`float-quantized`: float 8-bit by
-`channel` or `tensor`), symmetric and in their stored column order, and every
-projection and the head, each routed expert's by its own name (the first and
-the last expert's before the download, every expert's when its tensors load),
-must be a group's target that no `ignore` entry names; a target or entry is a
-module's name, a regular expression after `re:` matched from the start of the
-name (at most 512 bytes), or the class `Linear`. Anything else is refused before any weight download,
-naming the group or the module, so checkpoints that keep the head or a
-projection in BF16 (RedHatAI's) are refused. An NVFP4 weight's codes are
+`channel` or `tensor`), symmetric and in their stored column order; anything
+else is refused before any weight download, naming the group. A projection no
+group quantizes, or one an `ignore` entry names, such as the BF16 head of
+RedHatAI's checkpoints, loads as Q8_0, as an MLX target's does. An NVFP4
+weight's codes are
 `.weight_packed`, its `g` the reciprocal of the F32 `.weight_global_scale`;
 an FP8 weight's F32 or BF16 `.weight_scale` is the tensor's `g` or, `[rows,
 1]`, each row's, which that row's meta units hold.
+
+## Inkling 2's checkpoints
+
+Inkling 2's release (`thinkingmachines/Inkling-2-Mini`, `model.llm.*`) and its
+MLX conversions load into the images of its GGUFs
+(`Inkling2LoopSafetensors.cpp`): each section its GGUF plan lays out
+(`Inkling2LoopSections.hpp`) is read from the tensors a checkpoint names for
+it, by the release's names or by those of its converters, which are aliases of
+them: oMLX's (`model.*`, a sliding layer's queries, keys, values, relative
+scores, gate and sinks fused into one `in_proj`, a full layer's queries,
+relative scores, gate and sinks into its `q_proj` and its taps' projections
+into its `k_proj` and `v_proj`, a loop layer's message gates transposed in two
+tensors), mlx-vlm's (`model.language_model.*`) and mlx-lm's
+(`language_model.model.*`, its experts' gate and up apart), told apart by the
+token table's name. The release's routed experts are NVFP4 in layers 0-19, U8
+codes and F8_E4M3 scales per 16 (`<module>_weight`, `_weight_scale`), each
+expert's global scale its F32 `_weight_amax` over the
+`_weight_outer_scale_denominator` (2688, `hf_quant_config.json`'s
+`amax_denominator`), as llama.cpp's converter divides them into its GGUFs'
+`.scale`, and MXFP8 in layers 20-23, F8_E4M3 values with a U8 E8M0 exponent per
+32; their gate and up rows are interleaved, a row each, which the planner
+takes as two windows of each row pair (oMLX's `w13` and mlx-vlm's
+`gate_up_proj` keep them so). A conversion keeps those codes: nvfp4 experts with
+MLX's `global_scale` (the release's amax) or mlx-lm's `weight_scale_2` (its
+quotient), mxfp8 ones as they are ([MLX targets](#mlx-targets)). The release's
+attention projections and head are BF16 and load as Q8_0, as an MLX target's
+unquantized projections do, its token table as its bf16 rows, its routers as
+their BF16 rows. With those projections on bf16 activations, as
+`--activations bf16` runs them, its logits, teacher-forced over 1,933
+positions of five prompts, are within a mean KL of 0.0024 nats of those of its
+BF16 projections (UD-Q4_K_M's are as near), pick the same top-1 at 98.7% of
+positions, and keep each prompt's NLL of the greedy continuation within 0.004
+(0.1838 pooled, BF16's 0.1847). On M5 and later Macs, by default, a prefill
+chunk of more than 64 rows runs those Q8_0 projections on int8 activations,
+which adds its own error ([int8-activation
+prefill](internals.md#int8-activation-prefill)). A full layer's static
+convolution taps (`static_w`) and the relative bias
+(`rel_logits_proj.proj`) are stored transposed, the taps last first, and the
+release keeps its loop layers' message queries in two lists of every loop
+layer's (`middle_cycle_cross_pass_queries`, its q and FFN rows, and
+`_kv_queries`, its k and v rows), its block mix queries in lists of every
+layer's (`attn_res.attn_queries`, `mlp_queries`). Its MTP head and vision
+tower are not loaded. Where a checkpoint and a GGUF hold the same values, the
+images are the same bytes (`gguf-preparation`).
 
 ## GGUF targets
 
@@ -168,7 +249,10 @@ have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
-  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
+  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16; a tensor of a format of
+  256-value blocks (the K-quants, BF16, F16) whose rows are not whole blocks
+  of it is refused by name, but routed experts of BF16 or F16 values, which
+  load as MXFP8 or Q8_0 (below);
 - token embeddings: any of the linears' formats;
 - norms: F32, BF16 or F16, loaded as the F32 values they hold;
 - the MoE router: F32, BF16 or any of the linears' quantized formats (not
@@ -176,6 +260,11 @@ have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
   native rows (as an MLX target's quantized router loads);
 - the shared-expert scalar gate: F32, BF16 or Q8_0, loaded as the F32 values
   it holds;
+- the projections a family runs in fp32 (Qwen3.8-Flash-Next's QSA indexer
+  projections, Inkling 2's message gates and sink projections): F32 or BF16
+  as stored, or any of the linears' formats, loaded as the F32 values it
+  holds (AtomicChat's Q8_0 and Q4_K/Q5_0 gates, the sink projections of
+  lmstudio-community's and ggml-org's files in their queries' format);
 - the GDN convolution, decay and time-step bias: F32;
 - GDN alpha and beta: each any of the linears' formats or F32. Two of one
   quantized type other than BF16 and F16 load as one segment of the GDN input
@@ -204,6 +293,50 @@ token, one of them its EOS; the engine's check holds each to the family's,
 and the header's layer patterns to them. The token table must be of a format:
 RecursiveSI's int4 GGUF, whose table is F32, is refused before its download.
 
+Inkling 2's GGUFs (`inkling2_loop`) state their head counts once per layer,
+which every layer must share. Their derived configuration holds the text model
+under `text_config`, as Inkling 2's config.json does, with the keys of that
+`text_config` the header states (`gguf.inkling2_text_config`): every size, the
+vocabulary padded to the token table's rows (`vocab_size`) and its tokens
+(`unpadded_vocab_size`, which must be the tokenizer's), the relative bias
+(`d_rel` from `attention.relative_length`, `rel_extent`), the full layers'
+log scaling, the clips, `local_layer_ids` from
+`attention.sliding_window_pattern` with the window and heads of those layers,
+`sconv_kernel_size` from `shortconv.l_cache`, `n_layers_per_attn_res_block`
+from `attn_res.block_size`, the logits' and the experts' softcaps
+(`mlp_gate_softcap` and `mlp_up_softcap` from `activation.situ_beta` and
+`situ_linear_beta`), the experts each token takes, their width and
+`route_scale` from `expert_weights_scale`, and `loop_config` from the `loop`
+keys; besides those, the sizes every family's configuration states
+(`max_position_embeddings`, `num_experts`) and `eos_token_id`, which the
+release states beside `text_config`. A float is the shortest decimal of the
+header's float32 (`1e-06`), as the release writes it.
+Unsloth's own layout of the same tensors (`inkling2`, the root files of
+`unsloth/Inkling-2-Mini-GGUF`, which `--model
+unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M` selects) states its layer counts, head
+counts and sliding layers per layer application (48: the loop's layers once a
+pass), its loop by `loop.core_start`, `loop.core_end` and `num_loops`, with no
+`loop.varying`; it names a loop layer's message gates by the input they gate
+(`loop_attn_`, `loop_k_`, `loop_v_` and `loop_mlp_` for llama.cpp's
+`loop_q_ctrl_` to `loop_ffn_ctrl_`) and keeps every loop layer's message
+queries in rows of two tensors of them all (`loop_res_query`, each layer's q
+and FFN rows; `loop_kv_res_query`, its k and v rows). Its configuration is
+derived by those keys (`num_hidden_layers` its weight layers, each layer's
+values its first application's), and the engine plans it as the converter's,
+into the same images (`Inkling2LoopGguf.cpp`). All ten of the repository's
+quants load in either layout, from UD-IQ1_S to UD-Q8_K_XL (its BF16 experts
+as MXFP8, below). The repository keeps the
+converter's layout in `Mainline_Support/` with the extension `.gguf_file`,
+which target selection does not read: such a file installs from a local copy
+named `.gguf` ([Local model files](#local-model-files)). An installation of
+one holds its draft, `incoai/Inkling-2-Mini-DFlash2` ([Drafts](#drafts)), and
+serves text only ([Vision](#vision)). Its decode captures a reply's state at
+each page as the Qwen families' does, its convolutions' state folded at the
+page ([Replay points and
+checkpoints](internals.md#replay-points-and-checkpoints)), so a conversation's
+next turn whose prompt renders the reply back resumes at the reply's last page
+instead of prefilling the reply again.
+
 A split GGUF is the parts of one name, `NAME-0000K-of-0000N.gguf`: every part
 from 1 to N must be present, at the root or in its folder, and a folder that
 mixes the parts of several names is refused (`upstream.split_order`, and
@@ -228,6 +361,26 @@ its quantized ones (`gguf.require_quantized`), with one message that asks for
 a quantized variant. A whole-BF16 file with its token table quantized is still
 refused; these files pass, and so does a MoE whose routed experts alone are
 quantized. The native loader does not check this.
+
+Routed experts of BF16 or F16 values load as MXFP8 where every 32 of their
+values are exactly an MXFP8 block's (an E8M0 power of two times E4M3 values),
+as a release's MXFP8 experts widened hold them: Inkling 2's last four layers'
+experts in Unsloth's UD-Q8_K_XL, BF16 of the release's MXFP8, whose down
+projections of 1152 inputs BF16's blocks of 256 cannot hold. Lossless, at half
+the bytes; each block takes the smallest exponent that holds its largest
+magnitude, 2^-127 at least (`gguf::mxfp8Block`). Whether a tensor's values are
+MXFP8's needs them, which a start reads once before it sizes and plans the
+target (`exactlyMxfp8`, every value of each 16-bit expert tensor, on a thread
+per core). On an M5 Pro (48 GB), UD-Q8_K_XL's 8.15 GB of them took 1.05 s
+beside the weights' 3.88 s load from a fresh copy of the file, which no cache
+held, and 0.43 s beside 1.93 s from the page cache. Experts of other values
+load as stored where their rows are whole 256-value blocks, else as the Q8_0
+the reference quantization makes of them, as Flash-Next's hyper-connection
+projections do. The engine's model check, of headers alone, plans those
+fallbacks. A Mac that streams the routed experts ([Streamed
+experts](server.md#streamed-experts)) reads such an expert's 16-bit values at
+every load and builds its MXFP8 blocks again: twice the SSD bytes of the MXFP8
+it holds.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
 Qwen3.6-35B-A3B from UD-IQ1_S to UD-Q8_K_XL. llama-quantize's default type
@@ -264,15 +417,30 @@ target's count must be the family's.
 llama.cpp's NVFP4 (type 40, as in `cdiamond/Qwen3.8-27B-iMatrix-NVFP4-MTP-GGUF`)
 is `block_nvfp4`: 64 elements, a UE4M3 scale per 16 (an E4M3 byte whose bit 7
 llama.cpp ignores, reading 0x7F as 0) and E2M1 codes, beside an optional F32
-`.scale` tensor, one value for a projection or one per expert for an experts
-tensor (`_exps`), which llama.cpp multiplies the products by; a `.scale` beside
-a weight of another type is refused, as only NVFP4's rows hold one. An F32
-`.input_scale` beside an NVFP4 weight (NVIDIA's activation scale, as many
-values as `.scale`) plays no part, as in Model Optimizer's targets; beside any
-other weight, or alone, it is refused. It loads as Model Optimizer's NVFP4 does
-([Model Optimizer targets](#model-optimizer-targets)): four blocks make one
-256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
-(1 without one), at 4.625 bits per weight for the file's 4.5.
+`.scale` tensor of one value for a projection, which llama.cpp multiplies the
+products by; a `.scale` beside a projection of another type is refused, as
+only NVFP4's rows hold one. An F32 `.input_scale` beside an NVFP4 weight
+(NVIDIA's activation scale, as many values as `.scale`) plays no part, as in
+Model Optimizer's targets; beside any other weight, or alone, it is refused.
+It loads as Model Optimizer's NVFP4 does ([Model Optimizer
+targets](#model-optimizer-targets)): four blocks make one 256-element NVFP4
+block, whose meta unit holds a projection's `.scale` value as its `g` (1
+without one), at 4.625 bits per weight for the file's 4.5. A tensor whose rows
+are not whole 256-element blocks (llama.cpp writes any multiple of 64, an
+expert down projection of 1152 inputs among them) loads in NVFP4's form of
+64-element blocks instead (`nvfp464`): each block's four E4M3 scales and `g`
+make its meta unit, which spans two 32-input groups, at 5 bits per weight;
+every tile that takes the formats' list takes it.
+
+An experts tensor (`_exps`) of any type may carry an F32 `.scale` of one value
+per expert, which llama.cpp multiplies each expert's products by: NVFP4
+releases have one, and Unsloth keeps it beside the experts it quantized from
+NVFP4 to other types (IQ1_S to IQ3_XXS, Q3_K, Q2_0, MXFP4). It loads into the
+layer's expert scales (`ops::BlockMoeWeights::expertScales`, F32 [3][experts]
+after the routed experts in the layer's image, the fused `ffn_gate_up_exps`'s
+for both gate and up, 1 without one), which the expert passes multiply their
+fp32 sums by before rounding them: gate's and up's before the activation,
+down's before the routing weight. An NVFP4 expert's `g` stays 1.
 
 Q2_0 is GGUF tensor type 42, `block_q2_0`, as in the GSQ-RCO GGUFs:
 2-bit codes q worth d (q - 1) with one half d per 64 weights. Its planes are
@@ -315,7 +483,7 @@ configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads.
 
 A draft's `config.json` states its layers, intermediate size, rotary base and
-the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
+the target layers whose rows it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
 its reserved special tokens, 150019 to 150143, as its
@@ -325,7 +493,37 @@ its reserved special tokens, 150019 to 150143, as its
 those the kernels are built for, and its block at least their 8 rows, of which a
 cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
 `readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
-whole 16-channel convolution groups. A draft's rows after its anchor read the
+whole 16-channel convolution groups. How a draft reads its target is its
+target's family's, as its drafts' producer captured it
+(`QwenTargetDimensions`): at each id the rows that target layer writes, or, for
+a family whose drafts read layer inputs (`draftReadsLayerInputs`), the rows
+passed into the layer, as the layer before wrote them, and at the id past its
+layers the final norm's rows the head reads
+(`dflash_config.capture_final_norm`); and its own rows, its anchor's and its
+mask's, are the token table's rows as the target's first layer reads them,
+through the table's norm where the family's input takes one (`draftEmbeddingNorm`,
+`embedding_normalization` `folded_rmsnorm`). Inkling 2's drafts read layer
+inputs, as its producer captures its block residual's partial sum before each
+layer application, with no shift by one: its draft's ids 5, 23 and 41 read the
+rows passed into those applications, the outputs of applications 4, 22 and 40
+(not the mixes of the block residual their norms read), and 48 its final
+norm's; their own rows take its table's norm. Its logits take the finish of its
+target's head (`QwenTargetDimensions::logitSoftcap` and `vocabularyTokens`,
+`DFlashDraft`): no padding row past the head's tokens is a candidate
+(`dflash_config.valid_vocab_size`), and the head's softcap
+(`final_logit_softcapping`) applies to each candidate's score after the
+selector's edge (`selector_softcap_mode` `after_correction`, the one placement
+the selector runs), before the probabilities its tree and a sampled verify
+read; a config states the softcap where its target's head has one (Inkling
+2's: 30). Three values a config may leave to its target, as
+`incoai/Inkling-2-Mini-DFlash2`'s release leaves them to its serving adapter:
+whether the draft reads the final norm (`capture_final_norm`, which its ids
+say by naming the id past the target's layers), how its own rows are made
+(`embedding_normalization`) and the head's tokens (`valid_vocab_size`,
+Inkling 2's: 200,058 of 201,024 rows). One it states must be the one its
+target makes, and one it leaves out is that one. A draft trained on others
+would only be accepted less: the target verifies every token it proposes.
+A draft's rows after its anchor read the
 target's token table row of the mask token, unless its release ships that
 token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
 `mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.
@@ -352,9 +550,15 @@ last chain's path that its draft joined), and a table of what a step costs
 by its class: the steps whose kernels are the same (`ops::ExecutionPlans::
 decodeRowClasses`: a projection's tile and staged height, a float tile, a MoE
 target's expert tile), priced by a step of the class's last rows, up to
-sixteen rows a lane. The start measures the table on the Mac before it serves
-(in the decode warmups, three passes over a step of each class at each lane
-count, each step's median wall time: a first start's decode warmups of
+sixteen rows a lane. Nothing the step weighs comes from the cycle's own
+draft: a row verified for its own draws, or for its descendants' estimates,
+which its draws condition, would leave a sampled lane's tokens off the
+target's distribution (`VerifyRowsParams`). `inkling2-target` checks it on
+greedy and sampled lanes: a cycle whose draft draws its tree anew takes the
+same step and its lane verifies the same rows. The start measures the table
+on the Mac before it serves (in the decode warmups, three passes over a step
+of each class at each lane count, each step's median wall time: a first
+start's decode warmups of
 Qwen3.8-27B on a 48 GB M5 Pro take 11.1 s, a later start's 1.0 s), later
 starts of the same build, models and formats on the Mac read it back from
 beside the Neural Engine's calibrations instead, and no cycle changes it. The
@@ -500,10 +704,10 @@ different text from run to run, even alone on an idle server
 cycle verifies a draft's block a lane whatever output its lanes have left, which caps only what they
 retain, so that an answer under a lower output limit starts the one under a higher. The speculation counts ([Output limits and
 streaming](api.md#output-limits-and-streaming)) count the proposals a cycle verified.
-The target writes the outputs of the layers the draft reads for each row it
-reads; Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams,
-as the streams' mean, summed in fp32 and stored as bf16, as the draft was
-trained on it. `dflash_config.target_hidden_reduction` states that reduction
+The target writes the rows of the layers the draft reads, as its family names
+them, for each row it reads; Qwen3.8-Flash-Next's, whose layers carry four
+hyper-connection streams, as the streams' mean, summed in fp32 and stored as
+bf16, as the draft was trained on it. `dflash_config.target_hidden_reduction` states that reduction
 (`stream_mean` for a hyper-connected target, `none` for another); a config
 without it takes its target's, and one that names another is refused. Native
 loading validates the configuration against the target again and loads the draft
@@ -516,7 +720,10 @@ target's projections run on.
 
 The draft's logits are its target's vocabulary head's, which a cycle runs twice,
 for the draft's proposals and for the target's verify; the draft's pass reads
-only the head's rows of the tokens it may propose (`DFlashDraft`). The Qwen
+the head's rows of the tokens it may propose (`DFlashDraft`), a padded head's
+rows past its tokens too, which its logits leave out (Inkling 2's 966: its
+200,058 tokens end inside a 64-row tile of the head, and the last tile's 58
+tokens hold its chat format's message tags, which its drafts propose). The Qwen
 families' vocabulary of 248,320 holds English and code first, Chinese from
 95,726 to 148,274, then its other scripts, and its chat, tool and thinking
 tokens from 248,044: a step's draft proposes from its first 148,288 tokens and
@@ -556,8 +763,9 @@ BF16. The processor configuration (MLX `preprocessor_config.json`, or the
 releases save it; the GGUF's `clip.vision` metadata) must describe the one
 preprocessing Splash implements (`server/images.py`); it is checked before any
 weight download and not installed. The models of a family without a vision
-tower (Flint; `vision` in `install/families.py`) serve text only: their
-installation reads no projector, with or without `--language-only`.
+tower (Flint; `vision` in `install/families.py`), or whose tower Splash does
+not serve yet (Inkling 2), serve text only: their installation reads no
+projector, with or without `--language-only`.
 
 Both sources are written into one image, which the one BF16 vision operator
 reads: BF16 tensors are
@@ -599,8 +807,10 @@ ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
 come from that file; the supported profiles supply the pre-tokenization
 algorithms: `gpt2/qwen35` NFC and Qwen's split, `gpt2/flint` Flint's three
 splits (digits in runs of up to three, runs of Han and kana, then o200k's
-pattern) without a normalizer, each before byte-level BPE, as the release's
-own tokenizer.json has them. Unknown profiles, malformed metadata
+pattern) without a normalizer, `gpt2/inkling2` o200k's pattern alone without a
+normalizer, its BPE taking a piece its vocabulary holds whole as that token
+before any merge (`ignore_merges`), each before byte-level BPE, as the
+release's own tokenizer.json has them. Unknown profiles, malformed metadata
 and automatic BOS/EOS insertion are rejected, with no cross-repository
 fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
 Model geometry is translated from the same metadata, subtracting any declared
@@ -757,20 +967,55 @@ format of the family its installation found, which the assembly records:
   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
   each tag a token; `<|end_of_text|>`, `<|user|>`, `<|observation|>` and
   `<|developer|>` stop.
+- Inkling 2's (`INKLING2`): the template appends no generation prompt, and the
+  model opens each of its messages itself, `<|message_model|>`, a content kind
+  and its text, closed by `<|end_message|>`: reasoning in
+  `<|content_thinking|>` blocks, which may come again after text, the answer in
+  `<|content_text|>` blocks (a `<|content_tool_error|>` or
+  `<|content_invoke_tool_text|>` block is the answer's too), every tag a
+  special token; calls are a JSON object in the model's message named for the
+  function (`INKLING2_JSON`),
+  `<|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}<|end_message|>`;
+  `<|content_model_end_sampling|>` stops.
 
 A format holds the model's vocabulary and the engine's stop tokens, which are
-its target layout's; the tokens of `</think>`, of `<think>` where the model
-opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
+its target layout's; the tags that open and close its reasoning (`<think>` and
+`</think>` for Qwen and Flint), with their tokens where the model opens its
+reasoning itself, and those that frame its answer's text where it has any,
+each frame and its close the format's visible tags alone, which grammars
+write as their tokens (a format whose frames hold other text is refused where
+it is defined);
+the call syntax, with the tags a call opens and closes with and the token of
+its opening, its arguments either tags around each argument or one JSON
+object, after a header that names the function, whose keys for the name and
+the arguments the syntax states (`"name"` and `"args"` for Inkling 2; a syntax
+that lays a call out otherwise is refused where it is defined); whether the
+model opens its own message; the special tokens decoding
+keeps in the text it reads (`visible_tags`: Inkling 2's tags, every other
+special token, its stop token among them, decoding to nothing); and the
 special token after which prompt tokenization reuses a cached prompt's tokens,
-`<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
-as the format has it, and that it can keep its added tokens out of a request's
-text ([tokenizer and chat templates](#tokenizer-and-chat-templates)). Grammars
-write reasoning and calls as the format lays
+`<|im_end|>`, `<|assistant|>` or `<|end_message|>`. Startup checks that the
+tokenizer encodes each as the format has it, and that it can keep its added
+tokens out of a request's text ([tokenizer and chat
+templates](#tokenizer-and-chat-templates)). Grammars write reasoning and calls
+as the format lays
 them out: Flint's optional think block may come before any constrained output,
 and its tags, which the grammar compiler takes as tokens rather than text, are
 written as their tokens. A model that opens its reasoning itself closes it
 before a call, so a `<tool_call>` inside its think block is reasoning, as
-Flint's own parser reads it.
+Flint's own parser reads it. A call of JSON arguments streams them as the
+model writes them, after the object's name, and its grammar writes them to
+the tool's schema as JSON; where the format frames the answer's text, a
+grammar's text and JSON answer are written in that frame.
+
+Inkling 2's template renders as shipped, and tells the model the request's
+effort in a system message before the first message that is not one
+(`Thinking effort level: 0.9` unless the request names one; none and
+`enable_thinking: false` render 0): `/v1/models` lists its efforts, and
+`--reasoning-effort` sets every request's. A thinking budget caps only
+reasoning the generation prompt opens, so it caps nothing here, as for Flint.
+Reasoning the model writes after text stays where it is in Messages and
+Responses, and joins the rest in Chat Completions' `reasoning_content`.
 
 Flint's template renders as shipped: its roles, the tools block it adds before
 the first message that is not a system message, each assistant turn's

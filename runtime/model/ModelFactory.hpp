@@ -32,7 +32,8 @@ class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights>;
+using TargetWeights =
+    std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights, Inkling2LoopWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its

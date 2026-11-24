@@ -3,7 +3,8 @@
 //
 //   teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS [--window END:ROWS...]
 //                  [--kv-format int8|bf16] [--state-format fp32|bf16] [--activations auto|bf16]
-//                  [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]
+//                  [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes] [--draft yes]
+//                  [--captured-rows FILE]
 //
 // TOKENS holds little-endian uint32 token ids, read as they are: no BOS, no
 // chat template. For each window a cold request prefills ids [0, END - ROWS)
@@ -17,11 +18,26 @@
 // id p + 1: the row of the prefill's final position, then the verify rows,
 // which RuntimeInstrumentation::lastLogits reads after each command. With
 // --captures yes, OUTPUT-END.captures.f32 receives, of a window whose prefill
-// is one command, the output rows of the target layers the model's draft
-// reads (its target_layer_ids) at positions 0 .. END - ROWS - 1, as the draft
-// captures them (RuntimeInstrumentation::lastCapturedRows), in fp32: a row
-// per position of each layer's hidden values in the draft's layer order,
-// which a reference's residuals after those layers compare with.
+// is one command, the rows of the target layers the model's draft reads (its
+// target_layer_ids: each layer's output rows, or the rows passed into each
+// and past them the final norm's where the family's drafts read layer inputs,
+// QwenTargetDimensions::draftReadsLayerInputs) at positions
+// 0 .. END - ROWS - 1, as the draft captures them
+// (RuntimeInstrumentation::lastCapturedRows), in fp32: a row per position of
+// each layer's hidden values in the draft's layer order, which a reference's
+// residuals compare with. With --draft yes, OUTPUT-END.draft.json receives
+// the draft's lattice of the window's first decode cycle
+// (RuntimeInstrumentation::lastDraftLattice): its anchor, the first forced
+// id, at position END - ROWS, after its context of the positions before,
+// each proposal position's candidates, their unary scores and the edges to
+// them from the position before's candidates, and the first position's
+// probabilities after the anchor, which a reference draft fed the same
+// context rows (--captures yes) and ids compares with. With --captured-rows
+// FILE, each window's draft reads FILE's rows at positions 0 .. END - ROWS -
+// 1 in place of those its target captured
+// (RuntimeInstrumentation::replaceCapturedRows): fp32 rows laid out as
+// --captures yes writes them, each value a bf16, such as a reference's
+// captured rows, so that Splash's draft and the reference's read the same.
 
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Types.hpp"
@@ -46,8 +62,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -138,9 +156,31 @@ void require(bool condition, const std::string &message) {
     throw std::runtime_error(message);
 }
 
+// The draft's lattice of the last decode cycle of lane 0, alone in its step,
+// as JSON arrays in its order (RuntimeInstrumentation::DraftLattice).
+void writeDraftLattice(const model::Runtime &executor, const std::string &path, uint32_t position, uint32_t anchor) {
+  const model::RuntimeInstrumentation::DraftLattice lattice =
+      model::RuntimeInstrumentation::lastDraftLattice(executor, 0, 1);
+  std::ofstream file(path);
+  file << std::setprecision(9) << "{\"position\": " << position << ", \"anchor\": " << anchor;
+  const auto list = [&](const char *name, const auto &values) {
+    file << ", \"" << name << "\": [";
+    for (size_t index = 0; index < values.size(); ++index)
+      file << (index ? ", " : "") << values[index];
+    file << ']';
+  };
+  list("candidates", lattice.candidates);
+  list("unary", lattice.unary);
+  list("edges", lattice.edges);
+  list("first", lattice.first);
+  file << "}\n";
+  require(static_cast<bool>(file), "cannot write " + path);
+}
+
 // One window on state lane 0, which the request leaves free.
 void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Window window, uint64_t id,
-               std::span<const uint32_t> pages, uint32_t vocabulary, const std::string &output, uint32_t captureWidth) {
+               std::span<const uint32_t> pages, uint32_t vocabulary, const std::string &output, uint32_t captureWidth,
+               bool draft) {
   const uint32_t start = window.end - window.rows;
   const std::span<const uint32_t> prompt = tokens.first(start);
   const std::span<const uint32_t> forced = tokens.subspan(start, window.rows + 1);
@@ -199,6 +239,9 @@ void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Windo
     require(emitted.size() == kRows && results[0].outputTokensWithoutKv == 0 &&
                 std::ranges::equal(emitted, tokens.subspan(position, kRows)),
             "decode cycle " + std::to_string(cycle) + " did not retain the forced ids");
+    if (draft && !cycle)
+      writeDraftLattice(executor, output + "-" + std::to_string(window.end) + ".draft.json", position,
+                        tokens[position]);
     const std::span<const float> rows = model::RuntimeInstrumentation::lastLogits(executor, 0);
     for (uint32_t row = 0; row < kRows; ++row)
       logits.put(1 + cycle * kRows + row, rows.subspan(uint64_t{row} * vocabulary, vocabulary),
@@ -224,11 +267,13 @@ int main(int argc, char **argv) {
       if (argc < 5) {
         std::cerr << "usage: teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS "
                      "[--window END:ROWS...] [--kv-format int8|bf16] [--state-format fp32|bf16] "
-                     "[--activations auto|bf16] [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]\n";
+                     "[--activations auto|bf16] [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes] "
+                     "[--draft yes] [--captured-rows FILE]\n";
         return 2;
       }
       std::vector<Window> windows;
-      bool captures = false;
+      bool captures = false, draft = false;
+      std::string capturedRows;
       ops::Int8Activations int8Activations = ops::Int8Activations::On;
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -240,10 +285,12 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[index + 1]);
         if (option == "--window")
           windows.push_back(parseWindow(value));
-        else if (option == "--captures") {
+        else if (option == "--captured-rows")
+          capturedRows = value;
+        else if (option == "--captures" || option == "--draft") {
           if (value != "yes")
-            throw std::invalid_argument("--captures takes yes");
-          captures = true;
+            throw std::invalid_argument(std::string(option) + " takes yes");
+          (option == "--captures" ? captures : draft) = true;
         }
         else if (option == "--kv-format") {
           if (value != "int8" && value != "bf16")
@@ -306,9 +353,29 @@ int main(int argc, char **argv) {
       std::printf("device %s, %s KV, %s state, %zu ids\n", backend.capabilities().deviceName.c_str(),
                   format == kv::Format::Int8 ? "int8" : "bf16", std::string(ops::formatName(stateFormat)).c_str(),
                   tokens.size());
+      // The rows its draft reads in place of its target's, as bf16.
+      const uint32_t rowWidth = model.draft.layout.targetHiddenSize();
+      std::vector<uint16_t> replacedRows;
+      if (!capturedRows.empty()) {
+        std::ifstream file(capturedRows, std::ios::binary | std::ios::ate);
+        const auto bytes = static_cast<uint64_t>(file.tellg());
+        require(file && bytes % (uint64_t{rowWidth} * sizeof(float)) == 0,
+                "--captured-rows is not whole rows of " + std::to_string(rowWidth) + " fp32 values");
+        std::vector<float> values(bytes / sizeof(float));
+        file.seekg(0);
+        file.read(reinterpret_cast<char *>(values.data()), static_cast<std::streamsize>(bytes));
+        require(static_cast<bool>(file), "cannot read " + capturedRows);
+        replacedRows.resize(values.size());
+        for (size_t index = 0; index < values.size(); ++index) {
+          const std::optional<uint16_t> bits = model::exactBfloat16(values[index]);
+          require(bits.has_value(), "--captured-rows holds a value that is not a bf16");
+          replacedRows[index] = *bits;
+        }
+      }
+      model::RuntimeInstrumentation::replaceCapturedRows(executor, replacedRows);
       for (size_t index = 0; index < windows.size(); ++index)
         runWindow(executor, tokens, windows[index], index + 1, pageTable, vocabulary, argv[4],
-                  captures ? model.draft.layout.targetHiddenSize() : 0);
+                  captures ? rowWidth : 0, draft);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "teacher-logits: " << error.what() << '\n';

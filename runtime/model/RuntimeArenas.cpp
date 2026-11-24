@@ -58,6 +58,18 @@ std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeomet
   return result;
 }
 
+namespace {
+
+// The attention workspace of a step of `kind` of the target's family.
+ops::AttentionWorkspace attentionWorkspace(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators,
+                                           ops::StepKind kind) {
+  return std::visit(
+      [&](const auto &layout) { return qwenTargetAttentionWorkspace(layout, operators, geometry.target, kind); },
+      geometry.layout);
+}
+
+} // namespace
+
 TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
   const QwenTargetGeometry &target = geometry.target;
   TargetRows shape{.rows = kPrefillRows,
@@ -66,7 +78,7 @@ TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::Executi
                    .lanes = geometry.target.lanes,
                    // Any one sequence's splits: a chunk's sequences share the
                    // workspace in turn where they do not fit together.
-                   .attention = operators.sequenceAttentionWorkspace(target.attentionQueryHeads, target.kvLayout),
+                   .attention = attentionWorkspace(geometry, operators, ops::StepKind::Prefill),
                    .moe = {}};
   if (target.ffnKind == QwenFfnKind::SparseMoe)
     shape.moe = operators.moeWorkspace(target.moeShape(), target.moeRouterFormat, kPrefillRows, ops::StepKind::Prefill);
@@ -78,7 +90,7 @@ TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::Executio
   // Every lane's tiles at the most splits, so a step's lanes attend in one
   // dispatch whatever their histories, and the MoE plan of every step of up
   // to its most rows.
-  const ops::AttentionWorkspace lane = operators.laneAttentionWorkspace(target.attentionQueryHeads, target.kvLayout);
+  const ops::AttentionWorkspace lane = attentionWorkspace(geometry, operators, ops::StepKind::Decode);
   TargetRows shape{.rows = decodeStorageRows(geometry.target.lanes),
                    .chunks = 1,
                    .chunkRows = decodeStorageRows(geometry.target.lanes),

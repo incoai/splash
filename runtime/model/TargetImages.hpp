@@ -67,13 +67,14 @@ protected:
   // unwritten since they were planned. With a table store
   // (table.cacheBytes), the rows of a table the family adds stream instead
   // of loading; with expert memory (experts.memoryBytes), a MoE target's
-  // routed experts.
+  // routed experts. The images begin with `layerImages` layer images, the
+  // first MoE layer's `firstMoeLayer`.
   TargetImages(metal::MetalBackend &backend, WeightImages &images, std::shared_ptr<std::vector<gguf::Image>> planned,
-               std::function<void()> checkUnchanged, const QwenTargetDimensions &geometry,
+               std::function<void()> checkUnchanged, uint32_t layerImages, uint32_t firstMoeLayer,
                SparseRowStoreOptions table, ExpertStoreOptions experts)
       : backend_(backend), weightImages_(images), images_(std::move(planned)),
-        checkUnchanged_(std::move(checkUnchanged)), layers_(geometry.layers),
-        firstMoeLayer_(geometry.leadingDenseLayers), table_(std::move(table)), experts_(experts) {}
+        checkUnchanged_(std::move(checkUnchanged)), layers_(layerImages), firstMoeLayer_(firstMoeLayer),
+        table_(std::move(table)), experts_(experts) {}
   ~TargetImages() = default;
 
   // What the planner takes: whether experts and a table stream.

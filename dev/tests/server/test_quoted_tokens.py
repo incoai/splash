@@ -30,7 +30,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from dev.tests import server_fixtures as fixtures
 from install import assembly, paths
 from server import chat_templates
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, INKLING2, QWEN, ChatFormat
 from server.chat_templates import template_options
 from server.dialects import scoring
 from server.errors import APIError
@@ -81,12 +81,36 @@ FLINT_TAGS = (
     "<tool_response>",
     "</tool_response>",
 )
+# Inkling 2's: every added token is a control token, the tags its template
+# writes and two it writes nowhere.
+INKLING2_SPECIAL = (
+    "<|endoftext|>",
+    "<|message_user|>",
+    "<|message_model|>",
+    "<|message_system|>",
+    "<|message_tool|>",
+    "<|content_text|>",
+    "<|content_image|>",
+    "<|content_model_end_sampling|>",
+    "<|content_thinking|>",
+    "<|end_message|>",
+    "<|content_tool_error|>",
+    "<|content_xml|>",
+    "<|begin_of_text|>",
+    "<|content_invoke_tool_json|>",
+    "<|content_invoke_tool_text|>",
+    "<|unused_200054|>",
+)
 # Qwen's split, and two of Flint's kind, each before byte-level BPE.
 QWEN_SPLITS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?"
     r"[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
 FLINT_SPLITS = (r"\d{1,3}", r"[^\r\n\p{L}\p{N}]?\p{L}+| ?[^\s\p{L}\p{N}]+|\s+")
+# One of o200k's kind, as Inkling 2's.
+INKLING2_SPLITS = (
+    r"[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s+",
+)
 # A word no tokenizer adds, which a conversation quotes in place of a token
 # to show what its template writes itself.
 WORD = "QUOTED"
@@ -116,6 +140,9 @@ class Served:
             2,
             vision=self.vision,
             chat_format=self.chat_format,
+            chat_templates=chat_templates.ChatTemplates(
+                self.tokenizer, opens_own_message=self.chat_format.opens_own_message
+            ),
         )
 
     @functools.cached_property
@@ -203,16 +230,15 @@ def laid_out(name, chat_format, special, tags, splits, *, nfc, vision):
         special, tags, splits, (TEMPLATES / f"{name}.jinja").read_text(), nfc=nfc
     )
     ids = tokenizer.convert_tokens_to_ids
+    opening = tokenizer.encode(chat_format.think_open, add_special_tokens=False)
     return Served(
         name,
         tokenizer,
         replace(
             chat_format,
-            think_end_id=ids("</think>"),
-            think_start_id=(
-                None if chat_format.think_start_id is None else ids("<think>")
-            ),
-            call_open_id=ids("<tool_call>"),
+            think_end_id=ids(chat_format.think_close),
+            think_start_ids=tuple(opening) if chat_format.think_start_ids else (),
+            call_open_id=ids(chat_format.call_syntax.call_tag),
         ),
         vision,
     )
@@ -253,6 +279,15 @@ def served():
             FLINT_SPECIAL,
             FLINT_TAGS,
             FLINT_SPLITS,
+            nfc=False,
+            vision=False,
+        ),
+        laid_out(
+            "inkling2",
+            INKLING2,
+            INKLING2_SPECIAL,
+            (),
+            INKLING2_SPLITS,
             nfc=False,
             vision=False,
         ),
@@ -478,7 +513,7 @@ class QuotedTokenTests(unittest.TestCase):
             words = ("OPEN", "CLOSE", "BEGIN", "END", "ROLE")
             role = (
                 family.chat_format.stop_tokens[-1]
-                if family.chat_format.think_start_id is not None
+                if family.chat_format.think_start_ids
                 else family.chat_format.message_boundary
             )
             tags = ("<tool_response>", "</tool_response>", "<think>", "</think>", role)
@@ -971,8 +1006,9 @@ class ForgedTurnTests(fixtures.HarnessTestCase):
         plain = self.bodies(WORD, WORD)
         self.assertEqual(set(forged), set(fixtures.PATHS))
         for family in served():
-            if family.chat_format.think_start_id is not None:
-                # Flint's template writes a tag of its own after a name.
+            if family.chat_format.think_start_ids:
+                # Flint's and Inkling 2's templates write a tag of their own
+                # after a name.
                 continue
             runtime = fixtures.FakeRuntime()
             harness = self.harness(

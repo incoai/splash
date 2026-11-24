@@ -94,6 +94,13 @@ void testWindows() {
       if (flint.windowed(later) == flint.windowed(layer))
         require(flint.region(later) > region, "a class of layers is out of layer order");
   }
+  // A looped target's 48 layers (one per layer application) over 8 KV heads of 128, each sixth from layer 5
+  // attending every key and the other 40 windowed over the 1023 keys before a row's: its 8 full layers' regions
+  // first, in layer order, then the windowed ones'; a Slim page holds the 8.
+  constexpr Layout looped{48, 8, 128, Format::Int8, 0, false, 1023, 0x7DF7DF7DF7DFull};
+  static_assert(looped.valid() && looped.regions(PageForm::Slim) == 8 && looped.regions(PageForm::Full) == 48);
+  static_assert(looped.region(5) == 0 && looped.region(11) == 1 && looped.region(47) == 7 && looped.region(0) == 8 &&
+                looped.region(4) == 12 && looped.region(6) == 13 && looped.region(46) == 47);
   for (const Layout layout :
        {Layout{16, 4, 256}, Layout{12, 2, 256, Format::Int8, 128, true, 0, 0, Reads::SelectedBlocks}})
     for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer)

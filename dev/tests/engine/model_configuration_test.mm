@@ -291,6 +291,12 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
             R"("selector_top_k": 16, "target_hidden_reduction": "stream_mean")",
             "draft config dflash_config target_hidden_reduction mismatch: checkpoint stream_mean, runtime none"},
            {&SourceModel::draft, R"("is_causal": false)", R"("is_causal": 0)", "draft config is_causal must be false"},
+           {&SourceModel::draft, R"("num_target_layers": 64)", R"("num_target_layers": 65)",
+            "draft config num_target_layers mismatch: checkpoint 65, runtime 64"},
+           {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 16, "output_multiplier": 2.0)",
+            "draft config dflash_config output_multiplier mismatch: checkpoint 2, runtime 1"},
+           {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 16, "input_embedding_scale": 0.5)",
+            "draft config dflash_config input_embedding_scale mismatch: checkpoint 0.5, runtime 1"},
        })
     refuses(source.with(refused.file, refused.from, refused.to), refused.error,
             "an upstream config was accepted with " + std::string(refused.to));
@@ -319,18 +325,16 @@ SourceModel withQuantizationConfig(const SourceModel &model, std::string_view qu
 }
 
 // An MLX target's quantization is MLX's own object: the object and each
-// module's own entry name affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64
-// or 128, mxfp4 or nvfp4; an entry is affine unless it names its mode, and
+// module's own entry name affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or
+// 128, mxfp4, mxfp8 or nvfp4; an entry is affine unless it names its mode, and
 // takes its mode's default bits and group size (affine 4 and 64, mxfp4 4 and
-// 32, nvfp4 4 and 16) when it omits them, as MLX loads it. The entry false,
-// which MLX writes for a module it leaves unquantized, is refused for a
-// projection and the head, and accepted for the router, the shared-expert
-// gate, GDN alpha and beta and the token table. A Model Optimizer target's is
-// its quantization_config: NVFP4 in groups of 16 or per-tensor FP8 for each
-// layer it quantizes, every projection and the head among them. So is a
-// compressed-tensors target's: each config group NVFP4 or FP8 per channel or
-// tensor, every projection and the head a group's target that no ignore entry
-// names. A GGUF target has none (above).
+// 32, mxfp8 8 and 32, nvfp4 4 and 16) when it omits them, as MLX loads it. The
+// entry false, which MLX writes for a module it leaves unquantized, is
+// accepted for every module: the images load a projection or the head left so
+// as Q8_0 (model/SafetensorsImage.hpp). A Model Optimizer target's is its
+// quantization_config: NVFP4 in groups of 16 or per-tensor FP8 for each layer
+// it quantizes. So is a compressed-tensors target's: each config group NVFP4
+// or FP8 per channel or tensor. A GGUF target has none (above).
 void testQuantization(const std::filesystem::path &fixtures) {
   const SourceModel dense = mlxModel(fixtures, "qwen3.8-27b");
   const SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b");
@@ -376,8 +380,9 @@ void testQuantization(const std::filesystem::path &fixtures) {
            {moe, affine, mxfp4},
            // An entry of only its bits takes affine's group of 64.
            {moe, router, R"("bits": 8)"},
-           // An entry of only its mode: mxfp4, 4-bit in groups of 32.
+           // An entry of only its mode: mxfp4, 4-bit in groups of 32, or mxfp8, 8-bit in groups of 32.
            {moe, router, R"("mode": "mxfp4")"},
+           {moe, router, R"("mode": "mxfp8")"},
            // Modules the images also read unquantized (as F32).
            {moe, routerEntry, R"("language_model.model.layers.0.mlp.gate": false)"},
            {moe, sharedGateEntry, R"("language_model.model.layers.0.mlp.shared_expert_gate": false)"},
@@ -396,11 +401,12 @@ void testQuantization(const std::filesystem::path &fixtures) {
            // MLX's own object, not the quantization_config a transformers
            // checkpoint (GPTQ, AWQ, ...) states.
            {dense, R"("quantization": {)", R"("unused": {)",
-            "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, mxfp4 "
-            "or nvfp4), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF"},
+            "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, mxfp4, "
+            "mxfp8 or nvfp4), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported "
+            "GGUF"},
            {dense, R"("bits": 4)", R"("bits": 7)",
             "quantization is affine 7-bit in groups of 64; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in "
-            "groups of 32, 64 or 128, or as mxfp4 or nvfp4"},
+            "groups of 32, 64 or 128, or as mxfp4, mxfp8 or nvfp4"},
            {dense, R"("group_size": 64)", R"("group_size": 16)", "quantization is affine 4-bit in groups of 16"},
            // A group past a byte is no format (4 bits in groups of 320 are not af5g64).
            {dense, R"("group_size": 64)", R"("group_size": 320)", "quantization is affine 4-bit in groups of 320"},
@@ -411,8 +417,8 @@ void testQuantization(const std::filesystem::path &fixtures) {
        })
     refuses(refused.model.with(&SourceModel::config, refused.from, refused.to), refused.error,
             "an MLX quantization was accepted with " + std::string(refused.to));
-  // A module the images read only quantized, left unquantized: a projection
-  // of each kind and the head.
+  // A projection of each kind and the head left unquantized, which the images
+  // load as Q8_0.
   struct Unquantized final {
     const SourceModel &model;
     std::string module;
@@ -428,16 +434,13 @@ void testQuantization(const std::filesystem::path &fixtures) {
            {moe, "language_model.model.layers.0.mlp.switch_mlp.down_proj"},
            {moe, "language_model.model.layers.0.mlp.shared_expert.gate_proj"},
        })
-    refuses(unquantized.model.with(&SourceModel::config, object,
-                                   std::string(object) + "\"" + unquantized.module + "\": false,"),
-            "quantization " + unquantized.module +
-                " is unquantized; Splash loads quantized MLX projections",
-            "an unquantized " + unquantized.module + " was accepted");
+    static_cast<void>(inspect(unquantized.model.with(&SourceModel::config, object,
+                                                     std::string(object) + "\"" + unquantized.module + "\": false,")));
   // Model Optimizer, as NVIDIA's releases state it: NVFP4 or FP8 for every
   // layer its ignore patterns leave, or each layer's own by quantized_layers,
-  // a MoE layer's routed experts the one layer mlp.experts. Another algorithm
-  // or group size, and a projection, the head or an expert's projection left
-  // out of the layers or named by an ignore pattern, are refused.
+  // a MoE layer's routed experts the one layer mlp.experts; a projection, the
+  // head or an expert's projection left out of the layers or named by an
+  // ignore pattern loads as Q8_0. Another algorithm or group size is refused.
   const auto modelOptimizer = [&](const SourceModel &model, std::string_view quantization) {
     return withQuantizationConfig(model, R"({"quant_method": "modelopt", )" + std::string(quantization) + "}");
   };
@@ -465,6 +468,11 @@ void testQuantization(const std::filesystem::path &fixtures) {
            {dense, R"("quant_algo": "FP8")"},
            {moe, moeLayers("")},
            {moe, R"("quant_algo": "NVFP4", "ignore": ["mtp*", "*mlp.gate", "*shared_expert_gate"])"},
+           // Projections left unquantized.
+           {dense, R"("quant_algo": "NVFP4", "ignore": ["*.self_attn.q_proj"])"},
+           {dense, R"("quant_algo": "MIXED_PRECISION", "quantized_layers": {"lm_head": {"quant_algo": "NVFP4"}})"},
+           {moe, moeLayers("model.language_model.layers.0.mlp.experts")},
+           {moe, R"("quant_algo": "NVFP4", "ignore": ["*.experts.*.down_proj"])"},
        })
     static_cast<void>(inspect(modelOptimizer(model, accepted)));
   struct RefusedModelOptimizer final {
@@ -476,26 +484,17 @@ void testQuantization(const std::filesystem::path &fixtures) {
            {dense, R"("quant_algo": "W4A8_AWQ")",
             "quantization_config is W4A8_AWQ; Model Optimizer weights load as NVFP4, W4A16_NVFP4 or FP8"},
            {dense, R"("quant_algo": "NVFP4", "group_size": 32)", "quantization_config is NVFP4 in groups of 32"},
-           {dense, R"("quant_algo": "NVFP4", "ignore": ["*.self_attn.q_proj"])",
-            "quantization_config leaves model.language_model.layers.3.self_attn.q_proj unquantized"},
-           {dense, R"("quant_algo": "MIXED_PRECISION", "quantized_layers": {"lm_head": {"quant_algo": "NVFP4"}})",
-            "quantization_config leaves model.language_model.layers.0.linear_attn.in_proj_qkv unquantized"},
            {dense, R"("quant_algo": "MIXED_PRECISION", "quantized_layers": {"lm_head": {"quant_algo": "INT4_AWQ"}})",
             "quantization_config quantized_layers lm_head is INT4_AWQ"},
-           {moe, moeLayers("model.language_model.layers.0.mlp.experts"),
-            "quantization_config leaves model.language_model.layers.0.mlp.experts unquantized"},
-           {moe, R"("quant_algo": "NVFP4", "ignore": ["*.experts.*.down_proj"])",
-            "quantization_config leaves model.language_model.layers.0.mlp.experts.0.down_proj unquantized"},
        })
     refuses(modelOptimizer(refused.model, refused.quantization), refused.error,
             "a Model Optimizer quantization was accepted with " + refused.quantization.substr(0, 200));
   // compressed-tensors, as unsloth's NVFP4 releases state it: FP8 per channel
   // for the attention and GDN projections and the head, NVFP4 for the FFN and
   // the experts, the last layers' experts FP8; or every projection NVFP4 by
-  // class. A group of another format, ordered by activation groups or with a
-  // target that is no regular expression, a pattern past 512 bytes or too
-  // complex to match, and a projection (the first's or the last expert's) no
-  // group targets or an ignore entry names, are refused.
+  // class; a projection no group targets or an ignore entry names loads as
+  // Q8_0. A group of another format or ordered by activation groups is
+  // refused.
   const auto compressedTensors = [&](const SourceModel &model, std::string_view groups, std::string_view ignore) {
     return withQuantizationConfig(
         model,
@@ -520,18 +519,19 @@ void testQuantization(const std::filesystem::path &fixtures) {
   static_cast<void>(inspect(compressedTensors(dense, fp8Group + ", " + ffn, ignore)));
   static_cast<void>(inspect(compressedTensors(moe, fp8Group + ", " + ffn, ignore)));
   static_cast<void>(inspect(compressedTensors(dense, nvfp4Group(R"(["Linear"])"), "[]")));
+  // Projections left unquantized: the head, and the experts' down projections.
+  static_cast<void>(inspect(compressedTensors(dense, fp8Group + ", " + ffn, R"(["lm_head"])")));
+  static_cast<void>(inspect(compressedTensors(
+      moe,
+      fp8Group + ", " +
+          nvfp4Group(R"(["re:.*mlp\\.experts\\.\\d+\\.(gate|up)_proj$", "re:.*shared_expert\\.(gate|up|down)_proj$"])"),
+      ignore)));
   struct RefusedGroups final {
     const SourceModel &model;
     std::string groups, ignore;
     std::string_view error;
   };
   for (const RefusedGroups &refused : std::initializer_list<RefusedGroups>{
-           {dense, fp8Group + ", " + ffn, R"(["lm_head"])", "quantization_config leaves lm_head unquantized"},
-           {moe,
-            fp8Group + ", " +
-                nvfp4Group(R"(["re:.*mlp\\.experts\\.\\d+\\.(gate|up)_proj$", )"
-                           R"("re:.*shared_expert\\.(gate|up|down)_proj$"])"),
-            ignore, "quantization_config leaves model.language_model.layers.0.mlp.experts.0.down_proj unquantized"},
            {dense,
             R"("group_1": {"format": "pack-quantized", "targets": ["Linear"], )"
             R"("weights": {"num_bits": 4, "type": "int", )"
@@ -544,16 +544,6 @@ void testQuantization(const std::filesystem::path &fixtures) {
             "groups of 32"},
            {dense, nvfp4Group(R"(["Linear"])", R"("group_size": 16, "actorder": "group")"), "[]",
             "quantization_config config_groups group_1 is asymmetric or ordered by activation groups"},
-           {dense, nvfp4Group(R"(["re:(lm_head"])"), "[]",
-            "quantization_config config_groups group_1 targets entry re:(lm_head is not a regular expression Splash "
-            "reads"},
-           {moe, fp8Group + ", " + ffn, R"(["re:.*mlp\\.experts\\.255\\.down_proj$"])",
-            "quantization_config leaves model.language_model.layers.0.mlp.experts.255.down_proj unquantized"},
-           {dense, nvfp4Group(R"(["Linear"])"), R"(["re:)" + std::string(600, 'x') + R"("])",
-            "quantization_config ignore entry exceeds 512 bytes"},
-           {dense, nvfp4Group(R"(["Linear"])"), R"(["re:(.+)+x$"])",
-            "quantization_config ignore holds a regular expression too complex to match "
-            "model.language_model.layers.0.linear_attn.in_proj_qkv"},
        })
     refuses(compressedTensors(refused.model, refused.groups, refused.ignore), refused.error,
             "a compressed-tensors quantization was accepted with " + refused.groups);
@@ -1044,6 +1034,14 @@ void testFlint(const std::filesystem::path &fixtures) {
             "text config tie_word_embeddings must be false"}})
     refuses(flint.with(&SourceModel::config, refused.from, refused.to), refused.error,
             "a Flint config with " + std::string(refused.to) + " was accepted");
+  // A family whose head takes no finish, whose drafts read its layers'
+  // outputs and its token table's rows as stored, refuses a draft trained
+  // otherwise.
+  for (const std::string_view stated :
+       {R"("final_logit_softcapping": 30.0,)", R"("valid_vocab_size": 150000,)", R"("capture_final_norm": true,)",
+        R"("embedding_normalization": "folded_rmsnorm",)"})
+    refuses(flint.with(&SourceModel::draft, R"("block_size": 8,)", R"("block_size": 8, )" + std::string(stated)),
+            "draft config dflash_config", "a Flint draft with " + std::string(stated) + " was accepted");
   // A flat config is read only for a family whose configs are flat, and
   // Flint's only flat.
   refuses(flint.with(&SourceModel::config, R"("model_type": "flint")", R"("model_type": "qwen3_5_moe_text")"),
@@ -1052,6 +1050,87 @@ void testFlint(const std::filesystem::path &fixtures) {
   nested.config = R"({"model_type":"flint_vl","text_config":)" + flint.config + "}";
   refuses(nested, "no supported model has this architecture (text model type flint)",
           "a Flint config under text_config was accepted");
+}
+
+// Inkling-2-Mini's config, nested in text_config: its release's config.json
+// and the one the installer derives from its GGUF (the release's keys the
+// header holds, and max_position_embeddings, num_experts and eos_token_id in
+// text_config), each a GGUF target of its family's layout: 24 weight layers
+// its steps run as 48 applications; the release's is its safetensors target's
+// too, its quantization_config Model Optimizer's NVFP4. Its clip is held as
+// an F32, as its header states it; another loop or another layer count is
+// refused by name. Its DFlash2 draft reads the rows applications 5, 23 and 41
+// read and the final norm's, id 48, its token rows through the table's norm
+// and its head's finish, the softcap after its selector's edges and the
+// 200,058 tokens, with mask token 200056. Its release's config states the
+// softcap and the mask token and leaves the rest to its target; its preview
+// revisions' (preview-config.json, b1d989ba's) states them too
+// (capture_final_norm, embedding_normalization, valid_vocab_size) and makes
+// the same draft, as it does without any one of them. Each value a config
+// states is held to the family's by name.
+void testInkling2(const std::filesystem::path &fixtures) {
+  const SourceModel release{
+      R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})",
+      text(fixtures / "inkling-2-mini" / "config.json"), text(fixtures / "inkling-2-mini" / "draft" / "config.json")};
+  const model::ModelDescriptor descriptor = inspect(release);
+  const auto *layout = std::get_if<model::Inkling2LoopLayout>(&descriptor.target);
+  require(layout && *layout == model::Inkling2LoopLayout{} && descriptor.family() == "Inkling-2-Mini" &&
+              descriptor.targetSource == model::TargetSource::Gguf && descriptor.valid() &&
+              layout->weightLayers == 24 && layout->layers == 48 && descriptor.targetKvLayout.attentionLayers == 48 &&
+              descriptor.stateLayout.target.auxiliaryBytes == 1'916'928 && descriptor.draft == test::inkling2Draft(),
+          "the release's Inkling-2-Mini config made another descriptor");
+  const SourceModel preview{release.record, release.config,
+                            text(fixtures / "inkling-2-mini" / "draft" / "preview-config.json")};
+  require(inspect(preview).draft == descriptor.draft, "the preview's Inkling-2-Mini draft config made another draft");
+  for (const std::string_view stated : {R"("capture_final_norm": true,)",
+                                        R"("embedding_normalization": "folded_rmsnorm",)",
+                                        ",\n    \"valid_vocab_size\": 200058"})
+    require(inspect(preview.with(&SourceModel::draft, stated, "")).draft == descriptor.draft,
+            "an Inkling-2-Mini draft config without " + std::string(stated) + " made another draft");
+  struct Refused final {
+    std::string_view from, to, error;
+  };
+  for (const Refused &refused : std::initializer_list<Refused>{
+           {R"("capture_final_norm": true)", R"("capture_final_norm": false)",
+            "draft config dflash_config capture_final_norm must be true"},
+           {"41,\n      48\n", "41\n", "draft config dflash_config capture_final_norm must be false"},
+           {"48\n", "49\n", "draft config target_layer_ids names a layer past the target's"},
+           {R"("embedding_normalization": "folded_rmsnorm")", R"("embedding_normalization": "none")",
+            "draft config dflash_config embedding_normalization mismatch: checkpoint none, runtime folded_rmsnorm"},
+           {R"("final_logit_softcapping": 30.0)", R"("final_logit_softcapping": 50.0)",
+            "draft config dflash_config final_logit_softcapping mismatch: checkpoint 50, runtime 30"},
+           {R"("selector_softcap_mode": "after_correction")", R"("selector_softcap_mode": "before_correction")",
+            "draft config dflash_config selector_softcap_mode mismatch"},
+           {R"("valid_vocab_size": 200058)", R"("valid_vocab_size": 201024)",
+            "draft config dflash_config valid_vocab_size mismatch: checkpoint 201024, runtime 200058"},
+           {R"("mask_token_id": 200056)", R"("mask_token_id": 200055)",
+            "draft config dflash_config mask_token_id mismatch: checkpoint 200055, runtime 200056"}})
+    refuses(preview.with(&SourceModel::draft, refused.from, refused.to), refused.error,
+            "an Inkling-2-Mini draft with " + std::string(refused.to) + " was accepted");
+  refuses(release.with(&SourceModel::draft, R"("final_logit_softcapping": 30.0,)", ""),
+          "draft config dflash_config final_logit_softcapping must be a number",
+          "an Inkling-2-Mini draft without its softcap was accepted");
+  const SourceModel derived = release
+                                  .with(&SourceModel::config, R"("qk_l2_clip_threshold": 22.627416997969522)",
+                                        R"("qk_l2_clip_threshold": 22.627417)")
+                                  .with(&SourceModel::config, R"("model_max_length": 1048576,)",
+                                        R"("model_max_length": 1048576, "max_position_embeddings": 1048576,)"
+                                        R"( "num_experts": 128, "eos_token_id": 200006,)");
+  require(inspect(derived).target == descriptor.target, "the derived Inkling-2-Mini config made another descriptor");
+  refuses(derived.with(&SourceModel::config, R"("num_experts": 128, "eos_token_id": 200006)",
+                       R"("num_experts": 128, "eos_token_id": 200007)"),
+          "text config eos_token_id mismatch", "another stop token was accepted");
+  refuses(release.with(&SourceModel::config, R"("qk_l2_clip_threshold": 22.627416997969522)",
+                       R"("qk_l2_clip_threshold": 22.7)"),
+          "text config qk_l2_clip_threshold mismatch", "another query clip was accepted");
+  refuses(release.with(&SourceModel::config, R"("core_end": 18)", R"("core_end": 12)"),
+          "text config loop_config core_end mismatch", "another loop was accepted");
+  refuses(release.with(&SourceModel::config, R"("num_hidden_layers": 24)", R"("num_hidden_layers": 48)"),
+          "text config num_hidden_layers", "its applications as its layers were accepted");
+  const model::ModelDescriptor checkpoint = inspect(release.with(&SourceModel::record, R"("gguf")", R"("mlx-affine")"));
+  require(checkpoint.target == descriptor.target && checkpoint.targetSource == model::TargetSource::Safetensors &&
+              checkpoint.valid(),
+          "the release's Inkling-2-Mini config made another descriptor as a safetensors target");
 }
 
 int main(int argc, char **argv) {
@@ -1066,8 +1145,9 @@ int main(int argc, char **argv) {
     testConfigurationCheck(argv[1]);
     testYarn(argv[1]);
     testFlint(argv[1]);
+    testInkling2(argv[1]);
     std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
-                 "experts, the installer's check, YaRN, Flint PASS\n";
+                 "experts, the installer's check, YaRN, Flint, Inkling-2-Mini PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

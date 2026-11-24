@@ -47,20 +47,20 @@ std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &
 }
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
-                                   const std::vector<std::filesystem::path> &paths, std::string_view architecture,
-                                   const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
-                                   ExpertStoreOptions experts)
-    : GgufTargetLoader(backend, images, std::make_shared<Planned>(paths), architecture, geometry, std::move(table),
-                       experts) {}
+                                   const std::vector<std::filesystem::path> &paths, const GgufTargetPlan &plan,
+                                   SparseRowStoreOptions table, ExpertStoreOptions experts)
+    : GgufTargetLoader(backend, images, std::make_shared<Planned>(paths), plan, std::move(table), experts) {}
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
-                                   std::shared_ptr<Planned> planned, std::string_view architecture,
-                                   const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
-                                   ExpertStoreOptions experts)
+                                   std::shared_ptr<Planned> planned, const GgufTargetPlan &plan,
+                                   SparseRowStoreOptions table, ExpertStoreOptions experts)
     : TargetImages(backend, images, std::shared_ptr<std::vector<gguf::Image>>(planned, &planned->images),
-                   [planned] { planned->source.checkUnchanged(); }, geometry, std::move(table), experts),
+                   [planned] { planned->source.checkUnchanged(); }, plan.layerImages, plan.firstMoeLayer,
+                   std::move(table), experts),
       planned_(std::move(planned)) {
-  planned_->images = gguf::planImages(planned_->source.file(), architecture, geometry, planOptions());
+  gguf::PlanOptions options = planOptions();
+  options.exactlyMxfp8 = exactlyMxfp8;
+  planned_->images = plan.images(planned_->source.file(), options);
 }
 
 std::optional<TargetImages::StreamedTable> GgufTargetLoader::streamTable() const {

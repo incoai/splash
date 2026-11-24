@@ -91,7 +91,7 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // (Apple9), over an activation table, all the plan's rows in one threadgroup,
 // up to kMaximumRegisterRows, optional K splits.
 // GgufPrefillInt8: a prefill chunk's plans past one row group of MLX affine
-// 4- and 5-bit g64 weights (quant_prefill_int8_format) in int8 activations, quantized per row
+// 4- and 5-bit g64 and Q8_0 weights (quant_prefill_int8_format) in int8 activations, quantized per row
 // and 64-input group into the scratch table, against the weights' exact codes
 // (kernels/prefill/gguf_prefill_int8.metal); not exact, unsplit, the prefill
 // tile's storage rows.
@@ -351,7 +351,9 @@ public:
   [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
-  // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
+  // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`. A
+  // projection of tensors side by side (Projection::sideBySide) takes the configuration one of them alone takes at
+  // the workload's rows, over all their columns.
   [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection,
                                 const Projection *gate = nullptr) const;
   // The projection's plan of `rows` rows (its input() the layout its
@@ -414,8 +416,10 @@ private:
                                                                       uint32_t splits);
   // The scratch of every tile a decode plan of the workload may take, the
   // register tile's and the int8 decode tiles' where they take the unit
-  // (decodeConfigurations).
-  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, const UnitFormats &unit) const;
+  // (decodeConfigurations), those of planOutputs columns' workload for a
+  // projection side by side (ProjectionShape::planOutputs).
+  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, const UnitFormats &unit,
+                                                        uint32_t planOutputs) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
                const Projection *gate) const;

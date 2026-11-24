@@ -8,6 +8,7 @@
 // Keep the source order of float operations, which Metal's default fast math lets the compiler reassociate. Set
 // before the includes, so it also holds for the shared format and reduction code compiled here.
 #pragma clang fp reassociate(off)
+#include "metal/kernels/common/gguf_segments.h"
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -210,25 +211,11 @@ QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
 #undef GGUF_DECODE_GATE_UP_FORMAT
 #undef GGUF_DECODE_GATE_UP
 
-// Fused projections (qkv|z|ab, q|k|v): up to three column segments of any formats in one dispatch, so the small
-// segments do not run as dispatches of their own. The threadgroup's tile picks its segment, and the segment's format
-// picks the decode; every segment takes the same K splits, and its tiles walk as its projection alone would, from the
-// step staged_first_step gives the tile's index within the segment. The fused and prefill kernels stay plain kernels:
-// as template instantiations (weak_odr) the compiler infers fewer parameter attributes and inlines differently.
-#define GGUF_SEGMENT(i, w0, w1, m) device uchar *w0 [[buffer(i)]], device uchar *w1 [[buffer(i + 1)]], device uchar *m [[buffer(i + 2)]]
-#define GGUF_SEGMENTS GGUF_SEGMENT(1, w0a, w1a, ma), GGUF_SEGMENT(4, w0b, w1b, mb), GGUF_SEGMENT(7, w0c, w1c, mc)
-// The segment s of column tile `tile` among the segments' tiles (cols, 0 past the last) and the tile's index `local`
-// within it; GGUF_SEGMENT_PLANE the segment's `plane` of x##a, x##b and x##c; GGUF_SEGMENT_OF both, with the
-// segment's planes w0, w1 and meta.
-#define GGUF_SEGMENT_INDEX(tile, cols)                                                                             \
-  const uint t0 = (cols)[0] / GGUF_TILE_COLUMNS, t1 = t0 + (cols)[1] / GGUF_TILE_COLUMNS;                          \
-  const uint s = (tile) < t0 ? 0 : (tile) < t1 ? 1 : 2, local = (tile) - (s == 0 ? 0 : s == 1 ? t0 : t1)
-#define GGUF_SEGMENT_PLANE(plane, x) device uchar *plane = s == 0 ? x##a : s == 1 ? x##b : x##c
-#define GGUF_SEGMENT_OF(tile, cols)                                                                                \
-  GGUF_SEGMENT_INDEX(tile, cols);                                                                                  \
-  GGUF_SEGMENT_PLANE(w0, w0);                                                                                      \
-  GGUF_SEGMENT_PLANE(w1, w1);                                                                                      \
-  GGUF_SEGMENT_PLANE(meta, m)
+// Fused projections (kernels/common/gguf_segments.h) on the staged tile: the threadgroup's column tile picks its
+// segment, and the segment's format picks the decode; every segment takes the same K splits, and its tiles walk as its
+// projection alone would, from the step staged_first_step gives the tile's index within the segment. The fused and
+// prefill kernels stay plain kernels: as template instantiations (weak_odr) the compiler infers fewer parameter
+// attributes and inlines differently.
 // A fused pipeline decodes its dispatch's segment formats alone, function constants 0-2 (ops::Linear: each once, the
 // last repeated past them): the GPU compiler builds a staged loop for each format a pipeline decodes, and a cold
 // 16-row fused pipeline took 18 s to build with all 44 on the 16-core M5 Pro, 0.5 s with three.
@@ -254,7 +241,7 @@ struct fused_formats {
                                      uint simd_lane [[thread_index_in_simdgroup]],                                \
                                      uint simd_group [[simdgroup_index_in_threadgroup]]) {                        \
     threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries]; threadgroup uint arrival; \
-    GGUF_SEGMENT_OF(group.x, p.cols);                                                                             \
+    GGUF_SEGMENT_OF(group.x, p.cols, GGUF_TILE_COLUMNS);                                                           \
     const uint per = p.input_size / GGUF_STAGED_STEP / p.splits;                                                  \
     const uint sb = group.y * per, se = sb + per;                                                                 \
     const uint origin = local * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin; \
@@ -290,7 +277,7 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
                                    device bfloat *output [[buffer(10)]],                                          \
                                    constant GgufPrefillSegmentsParams &p [[buffer(11)]], GGUF_PREFILL_THREAD) {    \
     GGUF_PREFILL_TABLES(F);                                                                                        \
-    GGUF_SEGMENT_OF(group.y, p.cols);                                                                              \
+    GGUF_SEGMENT_OF(group.y, p.cols, GGUF_TILE_COLUMNS);                                                           \
     const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
     gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>(input + ulong(first) * p.input_size, w0, w1, meta,                        \
                                          output + ulong(first) * p.out_stride, p.input_size,                       \
@@ -499,7 +486,7 @@ kernel void gguf_decode_int8_fused(device char *input [[buffer(0)]], GGUF_SEGMEN
     partials += group_rows * p.splits * p.out_stride;
     counters += group.z * (p.out_stride / GGUF_TILE_COLUMNS);
   }
-  GGUF_SEGMENT_OF(group.x, p.cols);
+  GGUF_SEGMENT_OF(group.x, p.cols, GGUF_TILE_COLUMNS);
   const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
              origin = local * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin;
   auto sums = gguf_int8_destination<Rows, float>(input, p.input_size, stages[simd_group]);

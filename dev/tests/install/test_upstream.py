@@ -24,6 +24,7 @@ from dev.tests.installer_fixtures import (
     DRAFT_COMMIT,
     FLINT,
     GGUF_CONFIGS,
+    INKLING,
     MODEL,
     MOE,
     PROCESSOR,
@@ -80,7 +81,7 @@ class UpstreamTest(unittest.TestCase):
 
     def test_family_is_identified_by_architecture_not_name(self):
         # The engine's check (its model-check command), with and without the
-        # draft, of each family an MLX checkpoint serves.
+        # draft, of each family's MLX checkpoint (Inkling 2's release's).
         for family in families.FAMILIES:
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
@@ -91,11 +92,12 @@ class UpstreamTest(unittest.TestCase):
                     family,
                 )
 
-        # Qwen3.8-Flash-Next and Flint load from a GGUF too: the config the
-        # installer derives from it and its header name the family, with and
-        # without its draft (Flint's flat config, its release's keys, and a
-        # test draft naming one of its reserved tokens as its mask), and
-        # another family's draft is refused.
+        # Qwen3.8-Flash-Next, Flint and Inkling 2 load from a GGUF too: the
+        # config the installer derives from it and its header name the
+        # family, with and without its draft (Flint's flat config, its
+        # release's keys, and a test draft naming one of its reserved tokens
+        # as its mask; Inkling 2's release draft), and another family's draft
+        # is refused.
         def headers(family):
             directory = self.root / family.name / "target"
             directory.mkdir(parents=True, exist_ok=True)
@@ -118,6 +120,26 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
+        # Inkling 2's GGUF in Unsloth's own layout (the root files of
+        # unsloth/Inkling-2-Mini-GGUF) names its family too.
+        unsloth = self.root / "inkling2" / "target"
+        unsloth.mkdir(parents=True)
+        write_target(
+            unsloth / "model.gguf",
+            fixture(family=INKLING, metadata="gguf-metadata-inkling2.json"),
+            tensor_table(INKLING, "gguf-tensors-inkling2.json"),
+        )
+        configs = CONFIGS / INKLING.name.lower()
+        self.assertIs(
+            upstream.check_model(
+                "gguf",
+                "none",
+                configs / "config.json",
+                gguf_headers=unsloth,
+                draft=configs / "draft" / "config.json",
+            ),
+            INKLING,
+        )
         flash = families.named("Qwen3.8-Flash-Next")
         configs = CONFIGS / flash.name.lower()
         gguf_check = headers(flash)
@@ -522,12 +544,12 @@ class UpstreamTest(unittest.TestCase):
         fake = fake_hub(self, self.cache)
         required = (
             r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 bits "
-            r"in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 or FP8 checkpoint "
-            r"of Model Optimizer or compressed-tensors, or a supported GGUF"
+            r"in groups of 32, 64 or 128, mxfp4, mxfp8 or nvfp4\), an NVFP4 or FP8 "
+            r"checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF"
         )
         formats = (
             r"; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, "
-            "64 or 128, or as mxfp4 or nvfp4"
+            "64 or 128, or as mxfp4, mxfp8 or nvfp4"
         )
         for name, quantization, refusal in (
             # A transformers quantization_config alone is another method.
@@ -595,19 +617,6 @@ class UpstreamTest(unittest.TestCase):
                 "quantization language_model.model.layers.0.mlp.down_proj is "
                 "affine 4-bit in groups of 256" + formats,
             ),
-            # MLX writes false for a module it leaves unquantized.
-            (
-                "bf16-head",
-                {
-                    "quantization": {
-                        "bits": 4,
-                        "group_size": 64,
-                        "language_model.lm_head": False,
-                    }
-                },
-                "quantization language_model.lm_head is unquantized; Splash loads "
-                "quantized MLX projections",
-            ),
         ):
             with self.subTest(name=name):
                 fake.publish(f"someone/{name}", "b" * 40, target(quantization))
@@ -655,6 +664,12 @@ class UpstreamTest(unittest.TestCase):
             ("q3-g32", {"bits": 3, "group_size": 32, "mode": "affine"}),
             ("mxfp4", {"bits": 4, "group_size": 32, "mode": "mxfp4"}),
             ("nvfp4", {"bits": 4, "group_size": 16, "mode": "nvfp4"}),
+            # MLX writes false for a module it leaves unquantized, which loads
+            # as Q8_0.
+            (
+                "bf16-head",
+                {"bits": 4, "group_size": 64, "language_model.lm_head": False},
+            ),
             (
                 "mixed",
                 {
@@ -716,9 +731,9 @@ class UpstreamTest(unittest.TestCase):
                 "Qwen/Qwen3.8-27B",
                 transformers_release,
                 r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 "
-                r"bits in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 or FP8 "
-                r"checkpoint of Model Optimizer or compressed-tensors, or a supported "
-                r"GGUF",
+                r"bits in groups of 32, 64 or 128, mxfp4, mxfp8 or nvfp4\), an NVFP4 or "
+                r"FP8 checkpoint of Model Optimizer or compressed-tensors, or a "
+                r"supported GGUF",
             ),
             (
                 "mlx-community/Qwen3.5-4B-MLX-4bit",

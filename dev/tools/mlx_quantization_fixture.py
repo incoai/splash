@@ -2,8 +2,8 @@
 """Writes the MLX quantization fixture that pins the MLX formats of the GGUF
 CPU reference and of weight preparation to MLX
 (dev/tests/engine/gguf_reference_test.mm, gguf_preparation_test.mm): for each
-affine bit width and group size Splash loads, and for mxfp4 and nvfp4, MLX's
-quantization of two rows of 256 random bf16 weights (mlx.core.quantize) and
+affine bit width and group size Splash loads, and for mxfp4, nvfp4 and mxfp8,
+MLX's quantization of two rows of 256 random bf16 weights (mlx.core.quantize) and
 MLX's own reading of it: the codes (an affine quantization dequantized with
 unit scales and zero biases, which is exact) and the fp32 values.
 
@@ -78,6 +78,7 @@ def main():
     # nvfp4's E4M3 scales: subnormal for a model's weights (MLX's nvfp4 has no
     # tensor scale to lift them), normal for the second row's.
     formats.append(entry("nvfp4", 4, 16, 9, mx.array([[0.02], [4.0]])))
+    formats.append(entry("mxfp8", 8, 32, 11))
     args.output.write_text(
         json.dumps({"mlx": mx.__version__, "formats": formats}, indent=1) + "\n"
     )

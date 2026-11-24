@@ -45,7 +45,12 @@ Completions, text completions, Responses and Messages share these fields:
 - `priority`: `foreground`, `normal` (the default) or `background`. A request
   waits while one of a higher priority runs, and when lanes or memory run short
   a higher priority suspends a running request of a lower one
-  ([admission and eviction](internals.md#admission-and-eviction)).
+  ([admission and eviction](internals.md#admission-and-eviction)). A
+  `background` request still waiting or running 10 s after its arrival runs as
+  `normal`, so attended work cannot hold it back for long, but it still yields
+  memory and its lane as `background`: a `normal` start that the lanes or
+  memory cannot hold beside it suspends it, and it then waits as `background`
+  for another 10 s.
 - `timeout`: the seconds a request may take from its arrival; it can only
   shorten `--request-timeout`. A request that runs out returns 504
   `request_timeout`.
@@ -295,17 +300,17 @@ matmul, so a row's result also depends on the rows decoded or prefilled beside
 it. On M5 and later Macs with `--activations auto`, the default, attention
 over INT8 KV scores INT8 queries where its splits read 8 pages or more, which
 follows the chunk's rows and history and, in verify, the batch's longest lane;
-a target's MLX 4- or 5-bit projection rounds its prefill rows to int8 when their
-chunk, with the rows prefilled beside them, has more than 64 rows; and a rotated
-PQ2_0 projection decodes in int8 activations on plans of 16 rows or more, though
-not on a lone lane's split plans of 8 rows, which keep bf16. Concurrent requests
-change the batch and the chunking, and chunk boundaries also come from the
-cached boundary a request resumes from, from a boundary another request waits to
-resume from, and from one whose state, or the KV past it, memory could not hold.
-With `--state-format bf16` the state is also rounded at each state a chunk
-captures (a replay point, junction or checkpoint). So under `--verify-rows
-all` a greedy or seeded request repeats its output when it runs alone with the
-same cached prefixes; alongside other
+a target's MLX 4- or 5-bit or Q8_0 projection rounds its prefill rows to int8
+when their chunk, with the rows prefilled beside them, has more than 64 rows;
+and a rotated PQ2_0 projection decodes in int8 activations on plans of 16 rows
+or more, though not on a lone lane's split plans of 8 rows, which keep bf16.
+Concurrent requests change the batch and the chunking, and chunk boundaries also
+come from the cached boundary a request resumes from, from a boundary another
+request waits to resume from, and from one whose state, or the KV past it,
+memory could not hold. With `--state-format bf16` the state is also rounded at
+each state a chunk captures (a replay point, junction or checkpoint). So under
+`--verify-rows all` a greedy or seeded request repeats its output when it runs
+alone with the same cached prefixes; alongside other
 requests, or with other prefixes cached, it can differ. A request's own repeat
 is such a case: served from the prefix cache, it computes only the rows past the
 state its first run cached, so its output can differ from that run's, which
@@ -787,7 +792,7 @@ fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
-| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn, and under `--reasoning-effort`, where the server sets every request's effort |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families; `false` for Flint, whose model decides each turn, for Inkling 2, whose model is told the effort but opens its reasoning itself and still reasons at `none`, and under `--reasoning-effort`, where the server sets every request's effort |
 | `reasoning_effort` | The effort `--reasoning-effort` gives every request, whatever it asks; `null` without the option |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row, and the server is exiting ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |

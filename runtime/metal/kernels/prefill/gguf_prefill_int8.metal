@@ -1,17 +1,24 @@
-// Int8-activation prefill GEMMs for MLX affine 4- and 5-bit weights in groups of 64 (af4g64, af5g64)
+// Int8-activation prefill GEMMs for MLX affine 4- and 5-bit weights in groups of 64 (af4g64, af5g64) and for Q8_0
 // (ops::LinearTile::GgufPrefillInt8). Each 64-input group g of a chunk row is quantized to int8 codes qa with its own
-// scale sa_g, and with w = s * q + z per weight group:
+// scale sa_g, and with w = s * q + z per affine weight group:
 //
 //   y[m][n] = sum_g ( (sa_g[m] s_g[n]) sum_{k in g} qa[m][k] q[n][k]  +  z_g[n] (sa_g[m] sum_{k in g} qa[m][k]) )
 //
-// The weights' codes feed int8 16x32x16 matmul2d fragments straight from the planes; each group's int32 sums fold
-// into fp32 once. The weights are exact; only the activations round, per row and group.
+// and with w = d * q per Q8_0 32-group h of g (its codes int8 already):
+//
+//   y[m][n] = sum_g sa_g[m] sum_{h < 2} d_{g,h}[n] sum_{k in h} qa[m][k] q[n][k]
+//
+// The weights' codes feed int8 16x32x16 matmul2d fragments straight from the planes; each group's int32 sums (each
+// Q8_0 32-group's) fold into fp32 once. The weights are exact; only the activations round, per row and group.
 //
 // The fragment schedule and the activations' slot order are adapted from oMLX's oQ A8 kernel (Apache-2.0 notice in
 // THIRD_PARTY_NOTICES): in fragment step t (0-3) of a group, lane column x (coord.x / 4) supplies inputs
 // 16x + 4t .. 16x + 4t + 3, 32-group x >> 1, chunk 2 (x & 1) + (t >> 1) of the planes (each weight column's 16 codes
 // of the lane are one uint2 of its 4-bit plane), nibbles (word >> 4 (t & 1)) & 0x0f0f0f0f: chunk slots {0, 4, 1, 5}
-// or {2, 6, 3, 7} (metal/abi/QuantFormat.h). The quantizer writes each 32-group in that order.
+// or {2, 6, 3, 7} (metal/abi/QuantFormat.h). The quantizer writes each 32-group in that order. Q8_0's tile reads the
+// same codes in another schedule, so that a fused projection of both quantizes its rows once: steps 2h and 2h + 1
+// take 32-group h alone, lane column x the inputs at 32h + 8x + 4 (t & 1) .. +3, chunk x of the 32-group's plane
+// record (one uint2 of its bytes, chunk slots {0, 4, 1, 5} from it in the even step, {2, 6, 3, 7} in the odd one).
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/gguf_prefill_int8_tile.h"
 #include "metal/kernels/common/gguf_tile.h"
@@ -90,5 +97,6 @@ inline uint2 prefill_int8_walk(uint at, uint2 grid) {
   GGUF_PREFILL_INT8_KERNEL(B, f, g, EpUpWithGate)
 GGUF_PREFILL_INT8_FORMAT(4, af4g64)
 GGUF_PREFILL_INT8_FORMAT(5, af5g64)
+GGUF_PREFILL_INT8_FORMAT(8, q80)
 #undef GGUF_PREFILL_INT8_FORMAT
 #undef GGUF_PREFILL_INT8_KERNEL

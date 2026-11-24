@@ -80,11 +80,12 @@ void checkQ8_0Quantization(void *ggml, const Goldens &hashes) {
 // Each fixture tensor as the loader's native rows of its format (mlxNative)
 // against MLX's own reading of it: an affine tensor's codes and the fp32
 // values, bit for bit but for mxfp4's and nvfp4's zero code 8, which MLX reads as -0 and
-// GGML's table, as +0.
+// GGML's table, as +0 (and for mxfp8's E4M3 -0, which MLX's fp8 conversion reads as -0
+// and the kernels' halves as -0 too: compared by value).
 void checkMlx(const char *path) {
   const std::vector<MlxTensor> tensors = mlxFixture(path);
-  check(tensors.size() == GGUF_FMT_AF8G128 - GGUF_FMT_AF2G32 + 3,
-        "MLX fixture holds every MLX affine format, mxfp4 and nvfp4");
+  check(tensors.size() == GGUF_FMT_AF8G128 - GGUF_FMT_AF2G32 + 4,
+        "MLX fixture holds every MLX affine format, mxfp4, nvfp4 and mxfp8");
   for (const MlxTensor &tensor : tensors) {
     const Fmt f = tensor.format();
     const uint32_t rows = tensor.rows, K = tensor.columns;

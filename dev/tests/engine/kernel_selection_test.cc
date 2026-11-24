@@ -29,6 +29,7 @@
 #include "ops/ExecutionPlans.hpp"
 #include "ops/KernelSelection.hpp"
 #include "ops/LaneRows.hpp"
+#include "ops/RelativeAttention.hpp"
 
 #include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
@@ -161,6 +162,28 @@ public:
     for (const std::string &name : {plan.splitPipeline(), plan.splitPipeline(true), plan.reducePipeline(),
                                     plan.reducePipeline() + tableSuffix(LinearInput::Table16)})
       if (!name.empty()) names_.try_emplace(name, where);
+  }
+  // A relative attention plan's (ops::RelativeAttention) split and reduce
+  // kernels, or a decode plan's single pass, those that write rows plain and
+  // writing the out-projection's table, and its direct kernel, which writes
+  // them plain alone; and a layer's prepare of a variant and the path commit
+  // of its pages.
+  void attention(const std::string &where, const RelativeAttentionPlan &plan) {
+    const std::string &output = plan.step == StepKind::Decode ? plan.decodePipeline() : plan.reducePipeline();
+    for (const std::string &name :
+         {plan.splitPipeline(), output, output + tableSuffix(LinearInput::Table16), plan.directPipeline()})
+      if (!name.empty()) names_.try_emplace(name, where);
+  }
+  void relativePrepare(const std::string &where, kv::Layout layout, RelativeAttentionVariant variant) {
+    encode(where, true, [&](metal::CommandGraph &graph) {
+      const metal::MetalBuffer &b = buffer_;
+      const std::array sequences{PagedAttention::chunkParams(0, kv::kPageTokens, kv::kPageTokens, 1)};
+      const std::array tables{b};
+      const std::array<uint32_t, 1> committed{0};
+      RelativeAttention::addProjection(graph, {b, b, b}, {b, b, b}, {b, b, b}, SplashKvLayer{}, tables, sequences,
+                                       {b, kv::kPageTokens}, layout, variant);
+      RelativeAttention::addPathCommit(graph, layout, 1, tables, committed, SPLASH_TARGET_VERIFY_ROWS, b);
+    });
   }
   // A layer's q/k norms and RoPE (PagedAttention::addProjection) for norms
   // stored as F32 or as bf16.
@@ -500,16 +523,21 @@ std::vector<MoeFormatSet> moeFormatSets() {
   sets.push_back({"router-mixed", {{GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, f32},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16}}});
-  // MLX experts: 4- and 5-bit ones take the int8 prefill passes where the
-  // device's plans run int8 activations (moeInt8Experts); 3-bit ones (Flint's)
-  // and 4-bit experts beside other shared experts keep the staged passes.
-  for (const uint32_t bits : {GGUF_FMT_AF3G64, GGUF_FMT_AF4G64, GGUF_FMT_AF5G64})
-    sets.push_back({formatName(bits), std::vector<BlockFormats>(4, {bits, bits, bits, bits, GGUF_FMT_AF8G64})});
+  // Experts of MLX 4 and 5 bits take the int8 prefill passes where the
+  // device's plans run int8 activations and the family's routing has them
+  // (moeInt8Experts); MLX 3-bit ones (Flint's), Q8_0 ones (which the dense
+  // projections' int8 tile takes) and 4-bit experts beside other shared
+  // experts keep the staged passes.
+  for (const uint32_t format : {GGUF_FMT_AF3G64, GGUF_FMT_AF4G64, GGUF_FMT_AF5G64, GGUF_FMT_Q80})
+    sets.push_back(
+        {formatName(format), std::vector<BlockFormats>(4, {format, format, format, format, GGUF_FMT_AF8G64})});
   sets.push_back({"af4g64-shared-q8_0", std::vector<BlockFormats>(4, {GGUF_FMT_AF4G64, GGUF_FMT_AF4G64, GGUF_FMT_AF4G64,
                                                                       GGUF_FMT_Q80, GGUF_FMT_AF8G64})});
   return sets;
 }
 
+// A family's blocks in a set's formats; a block without a shared expert
+// (sharedSlices 0, Inkling-2-Mini's) has no shared segments, as a loaded one.
 std::vector<BlockMoeWeights> moeBlocks(const MoeShape &shape, const MoeFormatSet &set) {
   const uint32_t h = shape.hiddenSize, n = shape.expertIntermediateSize, slots = shape.experts;
   const uint32_t sharedN = n * shape.sharedSlices;
@@ -517,21 +545,49 @@ std::vector<BlockMoeWeights> moeBlocks(const MoeShape &shape, const MoeFormatSet
   for (const BlockFormats &f : set.blocks) {
     BlockMoeWeights block;
     block.router = QuantizedSegment::rows(f.router, shape.experts, h, {});
-    block.gate = {segment(f.gate, slots * n, h), segment(f.shared, sharedN, h)};
-    block.up = {segment(f.up, slots * n, h), segment(f.shared, sharedN, h)};
-    block.down = {segment(f.down, slots * h, n), segment(f.shared, h, sharedN)};
+    block.gate.routed = segment(f.gate, slots * n, h);
+    block.up.routed = segment(f.up, slots * n, h);
+    block.down.routed = segment(f.down, slots * h, n);
+    if (shape.sharedSlices) {
+      block.gate.shared = segment(f.shared, sharedN, h);
+      block.up.shared = segment(f.shared, sharedN, h);
+      block.down.shared = segment(f.shared, h, sharedN);
+    }
     blocks.push_back(std::move(block));
   }
   return blocks;
 }
 
-// The router format of the target's MoE blocks and whether their experts
-// take the int8 prefill passes, as its loaded weights give them
+// The router format of the target's MoE blocks of `shape` and whether their
+// experts take the int8 prefill passes, as its loaded weights give them
 // (QwenTargetGeometry::finish).
-std::pair<uint32_t, bool> routerFormatOf(const std::vector<BlockMoeWeights> &blocks) {
+std::pair<uint32_t, bool> routerFormatOf(const MoeShape &shape, const std::vector<BlockMoeWeights> &blocks) {
   std::vector<const BlockMoeWeights *> pointers;
   for (const BlockMoeWeights &block : blocks) pointers.push_back(&block);
-  return {moeRouterFormat(pointers), moeInt8Experts(pointers)};
+  return {moeRouterFormat(pointers), moeInt8Experts(shape, pointers)};
+}
+
+// moeInt8Experts takes the routings the int8 passes compile alone: a block
+// whose six expert tensors, its shared slots' too, are af4g64 takes them
+// under every MoE family's routing but Inkling-2-Mini's (no shared expert, a
+// softcapped SwiGLU), and a block of Q8_0 under none.
+void int8ExpertRoutings() {
+  model::forEachFamily([&](const auto &family) {
+    if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
+    const MoeShape shape = family.moeBlockShape();
+    const std::string name(family.family);
+    const uint32_t h = shape.hiddenSize, n = shape.expertIntermediateSize, slots = shape.experts;
+    for (const uint32_t format : {GGUF_FMT_AF4G64, GGUF_FMT_Q80}) {
+      BlockMoeWeights block;
+      block.gate = {segment(format, slots * n, h), segment(format, n, h)};
+      block.up = {segment(format, slots * n, h), segment(format, n, h)};
+      block.down = {segment(format, slots * h, n), segment(format, h, n)};
+      const BlockMoeWeights *blocks[] = {&block};
+      const bool takes = format == GGUF_FMT_AF4G64 && name != "Inkling-2-Mini";
+      test::require(moeInt8Experts(shape, blocks) == takes, name + "'s " + formatName(format) + " experts " +
+                                                               (takes ? "miss" : "take") + " the int8 passes");
+    }
+  });
 }
 
 std::string describe(const MoePlan &plan) {
@@ -556,7 +612,7 @@ void moePlans(Golden &golden, const std::string &name, const ExecutionPlans &pla
     const std::string f(family.family);
     for (const MoeFormatSet &set : sets) {
       MoeShape shape = family.moeBlockShape();
-      const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+      const auto [routerFormat, int8Experts] = routerFormatOf(shape, moeBlocks(shape, set));
       shape.int8Experts = int8Experts;
       Group &decode = golden.group(name, "moe-decode", f);
       Group &prefill = golden.group(name, "moe-prefill", f);
@@ -599,6 +655,21 @@ std::string describe(const AttentionPlan &plan) {
          std::to_string(plan.sinks);
 }
 
+std::string describe(const RelativeAttentionPlan &plan) {
+  const bool decode = plan.step == StepKind::Decode;
+  std::string line =
+      (decode ? plan.decodePipeline() : plan.splitPipeline() + " " + plan.reducePipeline()) + " splits ";
+  for (const RelativeAttentionPlan::Sequence &sequence : plan.sequences())
+    line += std::to_string(sequence.splits) + (&sequence == &plan.sequences().back() ? "" : ",");
+  for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches())
+    line += " [" + std::to_string(dispatch.sequences) + " tiles " + std::to_string(dispatch.tiles) + " groups " +
+            (plan.direct(dispatch) ? plan.directPipeline() + " " + describe(plan.directGroups(dispatch))
+                                   : describe(plan.splitGroups(dispatch)) +
+                                         (decode ? "" : " " + describe(plan.reduceGroups(dispatch)))) +
+            "]";
+  return line + " workspace " + describe(plan.workspace());
+}
+
 // A sequence of `rows` rows after `history` tokens, staged in whole KV
 // blocks.
 kv::ChunkedPrefillParams sequenceOf(uint32_t history, uint32_t rows) {
@@ -626,9 +697,41 @@ AttentionPlan stepPlan(const ExecutionPlans &plans, std::span<const uint32_t> hi
 constexpr uint32_t kAttentionRows[] = {1, 7, 8, 64, 255, 256, 300, 512, 1024, 2048};
 constexpr uint32_t kAttentionHistories[] = {0, 1, 511, 2047, 4096, 32768, 65536, 131072, 262144};
 
-// The variants a family's attention layers run (QwenTargetGeometry::attentionVariant).
+// The relative attention (ops::RelativeAttention) plans of a layout it
+// stores, as chunkPlan's and stepPlan's: a decode step's of lanes of
+// `laneCap` rows.
+RelativeAttentionPlan relativeChunkPlan(const ExecutionPlans &plans, uint32_t rows, uint32_t history,
+                                        const kv::Layout &layout, RelativeAttentionVariant v) {
+  const std::array sequence{sequenceOf(history, rows)};
+  return RelativeAttention::plan(sequence, layout, plans.calibration().attention, plans.linear().int8Activations(),
+                                 RelativeAttention::sequenceWorkspace(layout), v);
+}
+RelativeAttentionPlan relativeStepPlan(const ExecutionPlans &plans, std::span<const uint32_t> histories,
+                                       uint32_t laneCap, const kv::Layout &layout, RelativeAttentionVariant v) {
+  std::vector<kv::ChunkedPrefillParams> lanes;
+  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, laneCap));
+  const AttentionWorkspace lane = RelativeAttention::laneWorkspace(layout);
+  return RelativeAttention::plan(lanes, layout, plans.calibration().attention, plans.linear().int8Activations(),
+                                 {lane.partialsBytes * histories.size(), lane.statisticsBytes * histories.size()}, v,
+                                 StepKind::Decode);
+}
+
+// Whether a family's layers attend through relative attention, and the
+// variants they attend in, as its layout states them
+// (QwenHybridLayout::relativeAttention).
+template <class Family> bool relativeAttention(const Family &family) {
+  return !family.relativeAttention().empty() && RelativeAttention::stores(family.kvLayout());
+}
+template <class Family> std::vector<RelativeAttentionVariant> relativeVariants(const Family &family) {
+  const auto variants = family.relativeAttention();
+  return std::vector<RelativeAttentionVariant>(variants.begin(), variants.end());
+}
+
+// The variants a family's attention layers run (QwenTargetGeometry::attentionVariant):
+// none for a family whose layers attend through relative attention.
 template <class Family> std::vector<AttentionVariant> attentionVariants(const Family &family) {
   std::vector<AttentionVariant> variants;
+  if (!family.relativeAttention().empty()) return variants;
   const kv::Layout base = family.kvLayout();
   for (uint32_t a = 0; a < base.attentionLayers; ++a) {
     const AttentionVariant v{.rotated = a >= 64 || !(family.unrotatedLayers >> a & 1),
@@ -647,6 +750,7 @@ std::vector<uint32_t> verifyHistories(uint32_t lanes, uint32_t history) {
 
 void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlans &plans, Pipelines *library) {
   model::forEachFamily([&](const auto &family) {
+    if (!family.relativeAttention().empty()) return;
     const std::string f(family.family);
     const std::vector<AttentionVariant> variants = attentionVariants(family);
     const kv::Layout base = family.kvLayout();
@@ -695,6 +799,63 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
       workspace.add(fmt + " decode per lane: " + attempt([&] {
                       return describe(plans.laneAttentionWorkspace(family.attentionQueryHeads, layout));
                     }));
+    }
+  });
+}
+
+// The relative attention (ops::RelativeAttention) of each family whose
+// layers attend through it, in the groups attentionPlans fills for the shared
+// attention's families, at the same rows, histories and lanes: a prompt
+// chunk's plans and a decode step's single pass, of lanes of the narrow cap
+// and of a verify block's rows, in each variant its layers attend in (named
+// by its window), in INT8 and BF16 pages, its workspaces, and with a library
+// its pipelines, its layers' prepare, plain and position-scaled, and its
+// pages' path commit.
+void relativeAttentionPlans(Golden &golden, const std::string &name, const ExecutionPlans &plans,
+                            Pipelines *library) {
+  model::forEachFamily([&](const auto &family) {
+    if (!relativeAttention(family)) return;
+    const std::string f(family.family);
+    Group &prefill = golden.group(name, "attention-prefill", f);
+    Group &verify = golden.group(name, "attention-verify", f);
+    Group &verifyWide = golden.group(name, "attention-verify-wide", f);
+    Group &workspace = golden.group(name, "attention-workspace", f);
+    for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+      kv::Layout layout = family.kvLayout();
+      layout.format = format;
+      const std::string fmt = format == kv::Format::Int8 ? "int8" : "bf16";
+      for (const RelativeAttentionVariant &v : relativeVariants(family)) {
+        const uint32_t window = v.windowTokens;
+        const std::string variant = fmt + " relative window " + std::to_string(window);
+        const auto planned = [&](const std::string &line, const auto &plan) {
+          return line + ": " + attempt([&] {
+                   const RelativeAttentionPlan selected = plan();
+                   if (library) library->attention(name + " " + f + " " + line, selected);
+                   return describe(selected);
+                 });
+        };
+        for (const uint32_t rows : kAttentionRows)
+          for (const uint32_t history : kAttentionHistories)
+            prefill.add(planned(variant + " rows " + std::to_string(rows) + " history " + std::to_string(history),
+                                [&] { return relativeChunkPlan(plans, rows, history, layout, v); }));
+        for (const uint32_t cap : {uint32_t{SPLASH_DRAFT_QUERY_ROWS}, uint32_t{SPLASH_TARGET_VERIFY_ROWS}})
+          for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+            for (const uint32_t history : kAttentionHistories) {
+              const std::vector<uint32_t> each = verifyHistories(lanes, history);
+              (lanes <= SPLASH_DEFAULT_LANES ? verify : verifyWide)
+                  .add(planned(variant + " rows " + std::to_string(cap) + " lanes " + std::to_string(lanes) +
+                                   " history " + std::to_string(history),
+                               [&] { return relativeStepPlan(plans, each, cap, layout, v); }));
+            }
+        if (library)
+          for (const bool scaled : {false, true})
+            library->relativePrepare(name + " " + f + " " + variant + (scaled ? " scaled" : "") + " prepare", layout,
+                                     {.windowTokens = window, .positionScaled = scaled});
+      }
+      workspace.add(fmt + " prefill chunk: " +
+                    attempt([&] { return describe(RelativeAttention::sequenceWorkspace(layout)); }));
+      workspace.add(fmt + " decode per lane: " +
+                    attempt([&] { return describe(RelativeAttention::laneWorkspace(layout)); }));
     }
   });
 }
@@ -896,16 +1057,22 @@ std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> 
 // router tile, of the classes of the target's shape, router format and
 // experts' formats (each a kernel of its own, so each warmed by some chunk);
 // and after each of kAttentionHistories,
-// its attention's kernels and whether its block indexer selects its rows'
-// blocks (BlockIndexer::sparse: Flash-Next's prompt past 2,048 tokens, whose
-// kernels a verify does not run). Adds each that is not to `misses`. It
+// its attention's kernels (relative attention's as its dispatches run them,
+// direct or split and reduce, of its own classes) and whether its block
+// indexer selects its rows' blocks (BlockIndexer::sparse: Flash-Next's
+// prompt past 2,048 tokens, whose kernels a verify does not run). No class's
+// chunk repeats the most rows'. Adds each that is not to `misses`. It
 // checks one matrix shape and the columns of kFloatColumns; the other kernels
 // a chunk's rows pick, the staged norm and the hyper-connection norm's
 // quarters (single thresholds today, whose sides the chunks of one row and of
 // the most take) and those of GDN, the draft and vision, only the backend's
 // count of pipelines created while serving checks.
 void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
-  const auto warmed = [](std::vector<uint32_t> classes) {
+  // Warmup's chunks: each class's and the most rows', which no class's
+  // repeats.
+  const auto warmed = [&](std::vector<uint32_t> classes) {
+    if (!classes.empty() && classes.back() >= SPLASH_PREFILL_TOKEN_BUDGET)
+      misses.push_back(name + ": a prefill class's chunk repeats warmup's chunk of the most rows");
     classes.push_back(SPLASH_PREFILL_TOKEN_BUDGET);
     return classes;
   };
@@ -925,8 +1092,11 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
     return uint32_t(t) << 8 | (t == LinearTile::GgufStaged ? plan.storageRows() : 0);
   };
   // Of one matrix, whose shape the tile a chunk's rows pick does not follow,
-  // in each set of formats the plans tell apart.
+  // in each set of formats the plans tell apart; and the input each reads
+  // as an attention's out-projection, by rows, which the attention's last
+  // kernel writes (a register tile's table: LinearPlan::input).
   std::vector<UnitFormats> units;
+  std::set<std::vector<LinearInput>> outputInputs;
   for (const FormatSet &set : formatSets()) {
     std::optional<Projection> p;
     try {
@@ -938,6 +1108,9 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
     const UnitFormats formats = unitFormats(std::span(&unit, 1));
     if (std::ranges::find(units, formats) != units.end()) continue;
     units.push_back(formats);
+    std::vector<LinearInput> inputs(SPLASH_PREFILL_TOKEN_BUDGET + 1);
+    for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) inputs[rows] = linear.plan(*p, rows).input();
+    outputInputs.insert(std::move(inputs));
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
       std::vector<uint32_t> whole(SPLASH_PREFILL_TOKEN_BUDGET + 1), read(SPLASH_PREFILL_TOKEN_BUDGET + 1);
       for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
@@ -961,7 +1134,7 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
     if (family.ffnKind == model::QwenFfnKind::SparseMoe) {
       for (const MoeFormatSet &set : moeFormatSets()) {
         MoeShape shape = family.moeBlockShape();
-        const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+        const auto [routerFormat, int8Experts] = routerFormatOf(shape, moeBlocks(shape, set));
         shape.int8Experts = int8Experts;
         const std::vector<uint32_t> chunks = warmed(plans.prefillRowClasses(std::pair{shape, routerFormat}));
         const auto config = [&](uint32_t rows) { return plans.moe(shape, routerFormat, rows, StepKind::Prefill).configuration(); };
@@ -983,6 +1156,54 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
                 return plan.splitPipeline() + " " + plan.reducePipeline();
               });
     }
+    // Relative attention's kernels as a chunk runs them, a dispatch's direct
+    // kernel, which writes plain rows alone, or its split and reduce, the
+    // reduce writing the out-projection's input (outputInputs); its warmup's
+    // chunks, its own classes' (fewer than a MoE target's, its experts'
+    // passes adding classes of their own), run from no history and created
+    // after the longest history its context holds: its chunks of the most
+    // rows run the direct kernel after no history, the split over INT8
+    // queries only after a long one. No chunk runs the direct kernel where
+    // its out-projection reads a table (RelativeAttention::addAttention
+    // refuses it).
+    if (relativeAttention(family))
+      for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+        kv::Layout layout = family.kvLayout();
+        layout.format = format;
+        const std::vector<RelativeAttentionVariant> variants = relativeVariants(family);
+        const std::vector<uint32_t> chunks = warmed(plans.prefillRowClasses(std::nullopt, variants, layout));
+        for (const RelativeAttentionVariant &variant : variants) {
+          const uint32_t window = variant.windowTokens;
+          std::map<std::pair<uint32_t, uint32_t>, std::pair<std::string, std::string>> kernels;
+          const auto planned = [&](uint32_t rows, uint32_t history) -> const std::pair<std::string, std::string> & {
+            const auto [at, added] = kernels.try_emplace({rows, history});
+            if (added) {
+              const RelativeAttentionPlan plan = relativeChunkPlan(plans, rows, history, layout, variant);
+              for (const RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches())
+                at->second = plan.direct(dispatch) ? std::pair{std::string(), plan.directPipeline()}
+                                                   : std::pair{plan.splitPipeline(), plan.reducePipeline()};
+            }
+            return at->second;
+          };
+          const std::string what = "relative attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") +
+                                   " window " + std::to_string(window);
+          for (const std::vector<LinearInput> &inputs : outputInputs)
+            check(what, kAttentionHistories,
+                  [&](uint32_t rows, uint32_t history) {
+                    const auto &[split, last] = planned(rows, history);
+                    return split.empty() ? last : split + " " + last + tableSuffix(inputs[rows]);
+                  },
+                  family.nativeContextTokens, chunks);
+          for (const auto &[at, kernel] : kernels)
+            for (const std::vector<LinearInput> &inputs : outputInputs)
+              if (kernel.first.empty() && inputs[at.first] != LinearInput::Plain) {
+                misses.push_back(name + " " + what + ": a chunk of " + std::to_string(at.first) + " rows after " +
+                                 std::to_string(at.second) +
+                                 " tokens runs the direct kernel where its out-projection reads a table");
+                break;
+              }
+        }
+      }
     if (const uint32_t top = family.indexerTopBlocks)
       check("block indexer " + f, kAttentionHistories,
             [&](uint32_t rows, uint32_t history) { return BlockIndexer::sparse(history, rows, top); },
@@ -1044,7 +1265,7 @@ void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std
     const std::string f(family.family);
     for (const MoeFormatSet &set : moeFormatSets()) {
       MoeShape shape = family.moeBlockShape();
-      const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+      const auto [routerFormat, int8Experts] = routerFormatOf(shape, moeBlocks(shape, set));
       shape.int8Experts = int8Experts;
       const std::vector<uint32_t> classes = plans.decodeRowClasses(most, std::pair{shape, routerFormat});
       check("moe plan " + f + " " + set.name, classes,
@@ -1119,6 +1340,7 @@ Golden selections(bool dump, Pipelines *library) {
     floatTiles(golden, name, plans.linear());
     moePlans(golden, name, plans);
     attentionPlans(golden, name, plans, library);
+    relativeAttentionPlans(golden, name, plans, library);
     // The pipelines of the plans in bf16 activations, which the golden holds
     // as these plans (int8ActivationsOff).
     if (library) {
@@ -1218,6 +1440,9 @@ int main(int argc, char **argv) {
     int8ActivationsOff();
     std::cout << "PASS kernel selection: " << computed.groups().size() << " groups of " << std::size(kDevices)
               << " devices match the golden; with int8 activations off every plan is its plan in bf16 activations\n";
+    int8ExpertRoutings();
+    std::cout << "PASS kernel selection: the int8 expert passes take af4g64 experts under the routings they compile "
+                 "alone, Q8_0 ones under none\n";
     std::vector<std::string> misses;
     for (const auto [family, cores] : kDevices)
       for (const Int8Activations int8 : {Int8Activations::On, Int8Activations::Off})

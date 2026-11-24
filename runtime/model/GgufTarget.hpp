@@ -5,6 +5,7 @@
 // weights (BlockTargetFormat).
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -23,18 +24,34 @@ namespace splash::model {
 // split order.
 [[nodiscard]] std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &directory);
 
+// How a family's GGUFs plan (GgufTargetLoader): its images, from a GGUF's
+// metadata with what streams, its layer images first, `layerImages` of them,
+// the first MoE layer's `firstMoeLayer`.
+struct GgufTargetPlan final {
+  uint32_t layerImages = 0;
+  uint32_t firstMoeLayer = 0;
+  std::function<std::vector<gguf::Image>(const GgufFile &, gguf::PlanOptions)> images;
+};
+// A family whose GGUFs gguf::planImages plans as its layout's
+// ggufArchitecture, an image a layer; a family that plans its own declares
+// its overload beside its layout.
+template <class Layout> [[nodiscard]] GgufTargetPlan ggufTargetPlan(const Layout &layout) {
+  return {layout.layers, layout.leadingDenseLayers, [layout](const GgufFile &file, gguf::PlanOptions options) {
+            return gguf::planImages(file, Layout::ggufArchitecture, layout, options);
+          }};
+}
+
 class GgufTargetLoader final : public TargetImages {
 public:
-  // Plans every image of the GGUF of `architecture` (its family's layout's
-  // ggufArchitecture) from its metadata once. With a table store
+  // Plans every image of the GGUF as its family's `plan` does from its
+  // metadata once. With a table store
   // (table.cacheBytes), the rows of a table the family's GGUF holds stream
   // through it (streamTable()) instead of loading (table()). With expert
   // memory (experts.memoryBytes), a MoE target's routed experts stream
   // (streamedExperts()) instead of loading with their layers.
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
-                   const std::vector<std::filesystem::path> &paths, std::string_view architecture,
-                   const QwenTargetDimensions &geometry, SparseRowStoreOptions table = {},
-                   ExpertStoreOptions experts = {});
+                   const std::vector<std::filesystem::path> &paths, const GgufTargetPlan &plan,
+                   SparseRowStoreOptions table = {}, ExpertStoreOptions experts = {});
 
   // The streamed table, its store reading the open file the metadata was
   // parsed from; none when the table loads.
@@ -54,8 +71,7 @@ private:
     std::vector<gguf::Image> images;
   };
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images, std::shared_ptr<Planned> planned,
-                   std::string_view architecture, const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
-                   ExpertStoreOptions experts);
+                   const GgufTargetPlan &plan, SparseRowStoreOptions table, ExpertStoreOptions experts);
 
   std::shared_ptr<Planned> planned_;
 };

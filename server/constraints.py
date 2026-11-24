@@ -6,7 +6,6 @@ from concurrent.futures import Future, wait
 from llguidance import LLMatcher, LLTokenizer
 from llguidance.numpy import allocate_token_bitmask, fill_next_token_bitmask
 
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
 from .protocol import NO_PARENT
@@ -164,10 +163,10 @@ def validate_tokenizer(tokenizer, chat_format):
     """Before the engine starts, refuse a tokenizer that does not encode the
     tags chat_format reads the model's output by as that format has them:
     the close of thinking, the model's own opening of it where the model
-    opens it, and a call's opening must each be the format's token, and
-    each stop text one token (check_capabilities checks which stop tokens,
-    once the engine names them). Refuse too one whose added tokens the
-    server could not keep out of the text a client sent
+    opens it, and a call's opening must each be the format's tokens, and
+    each stop text and each visible tag one token (check_capabilities checks
+    which stop tokens, once the engine names them). Refuse too one whose
+    added tokens the server could not keep out of the text a client sent
     (tokenization.added_tokens), which would serve a prompt that quotes a tag
     with the tag as its control token."""
     try:
@@ -176,17 +175,26 @@ def validate_tokenizer(tokenizer, chat_format):
         raise TokenizerContractError(str(error)) from None
     vocabulary = tokenizer.get_vocab()
     expected = {
-        THINK_END: chat_format.think_end_id,
-        TOOL_CALL_OPEN: chat_format.call_open_id,
+        chat_format.think_close: (chat_format.think_end_id,),
+        chat_format.call_syntax.call_tag: (chat_format.call_open_id,),
     }
-    if chat_format.think_start_id is not None:
-        expected[THINK_START] = chat_format.think_start_id
-    for token, token_id in expected.items():
-        if vocabulary.get(token) != token_id or tokenizer.encode(
-            token, add_special_tokens=False
-        ) != [token_id]:
+    if chat_format.think_start_ids:
+        expected[chat_format.think_open] = chat_format.think_start_ids
+    for text, token_ids in expected.items():
+        # A tag of one token is that token of the vocabulary.
+        if (
+            len(token_ids) == 1 and vocabulary.get(text) != token_ids[0]
+        ) or tokenizer.encode(text, add_special_tokens=False) != list(token_ids):
+            native = (
+                f"native token {token_ids[0]}"
+                if len(token_ids) == 1
+                else f"native tokens {list(token_ids)}"
+            )
+            raise TokenizerContractError(f"tokenizer must encode {text!r} as {native}")
+    for tag in chat_format.visible_tags:
+        if len(tokenizer.encode(tag, add_special_tokens=False)) != 1:
             raise TokenizerContractError(
-                f"tokenizer must encode {token!r} as native token {token_id}"
+                f"tokenizer must encode the tag {tag!r} as one token"
             )
     for stop in chat_format.stop_tokens:
         if len(tokenizer.encode(stop, add_special_tokens=False)) != 1:

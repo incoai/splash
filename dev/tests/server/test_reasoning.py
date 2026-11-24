@@ -24,6 +24,7 @@ from dev.tests.server_fixtures import (
 from server import backend as backend_api
 from server import frontend as request_frontend
 from server import server as api
+from server.chat_format import INKLING2, QWEN
 
 
 class ReasoningTests(HarnessTestCase):
@@ -231,7 +232,7 @@ class ReasoningTests(HarnessTestCase):
                 with self.subTest(suffix=suffix, tokens=tokens):
                     self.assertEqual(
                         request_frontend._generation_prompt(
-                            (text, (7, 8, 9)), history + text, tokens
+                            (text, (7, 8, 9)), history + text, tokens, QWEN
                         ),
                         (thinking, count),
                     )
@@ -243,7 +244,17 @@ class ReasoningTests(HarnessTestCase):
             (("", ()), history),
         ):
             with self.subTest(rendered=rendered), self.assertRaises(api.APIError):
-                request_frontend._generation_prompt(probed, rendered, [1, 2, 7, 8])
+                request_frontend._generation_prompt(
+                    probed, rendered, [1, 2, 7, 8], QWEN
+                )
+        # Where the model opens its own message, the prompt ends where its
+        # last message does.
+        self.assertEqual(
+            request_frontend._generation_prompt(
+                ("", ()), history, [1, 2, 7, 8], INKLING2
+            ),
+            (False, 0),
+        )
 
     def test_reasoning_effort_is_preserved_until_the_template_renders(self):
         harness = self.harness(FakeRuntime())

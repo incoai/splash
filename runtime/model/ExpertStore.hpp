@@ -42,8 +42,8 @@
 // experts' rows that a file stores as they are is read straight from it
 // (F_NOCACHE without the buffer cache): its bytes widened to whole pages, into
 // places that start on a page, and the repack starts from the rows' offset
-// in the first page. An MLX affine or mxfp4 tensor's experts are read so too,
-// as three such runs, its codes', scales' and biases' planes as the
+// in the first page. An MLX affine, mxfp4 or mxfp8 tensor's experts are read
+// so too, as three such runs, its codes', scales' and biases' planes as the
 // checkpoint stores them (storedPlanes), which the repack interleaves; rows a
 // loader builds (an NVFP4 or FP8 tensor's, or permuted ones) are built into
 // the places instead.
@@ -179,8 +179,8 @@ public:
   // Block `block`'s routed segments (the format and size of its size's
   // slots), chunks and slot table, which `weights` reads them through, and,
   // when its experts stream, the store, which loads them; the store keeps the
-  // block's router and shared-expert gate, set before, which predict its
-  // routes.
+  // block's router, shared-expert gate and selection bias, set before, which
+  // predict its routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
   void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
                const std::function<void()> &beside = {}) const override;

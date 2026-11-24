@@ -3,8 +3,10 @@
 #include "model/RopeScaling.hpp"
 #include "model/StateLayout.hpp"
 #include "ops/DraftSelector.hpp"
+#include "ops/LogitFinish.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedKv.hpp"
+#include "ops/RelativeAttention.hpp"
 #include "ops/StopTokens.hpp"
 
 #include <array>
@@ -104,19 +106,51 @@ struct QwenTargetDimensions {
   // (Flint's mixes its scripts through all its tokens: its first 98,304 hold
   // 98.1% of English text's tokens and 88.5% of Russian text's).
   ops::DraftVocabulary draftVocabulary{};
+  // The finish of its vocabulary head's logits (ops::LogitFinish), which
+  // every target's head applies (QwenTarget::addHead), zero for none: a
+  // softcap c tanh(l / c) of its tokens' logits, and its tokens, the first
+  // vocabularyTokens of the head's vocabularySize rows, the rows past them
+  // padding its converter added, which nothing selects. Its DFlash2
+  // drafts, which project through the head, take the same finish: their
+  // logits leave the padding out, and the softcap applies to each
+  // candidate's score after its selector's edge, where DFlash2 trains a
+  // draft of a softcapped head to take it (dflash_config
+  // selector_softcap_mode after_correction).
+  float logitSoftcap = 0.0F;
+  uint32_t vocabularyTokens = 0;
+  // How its DFlash2 drafts read it, as their producer captured it. At each
+  // target layer id they read (DFlashDraftLayout::targetLayers), the rows
+  // that layer writes; with draftReadsLayerInputs, the rows passed into that
+  // layer, as the layer before wrote them (not a mix of them its norms read,
+  // as Inkling 2's block residual makes), and at id `layers` the rows its
+  // head reads, its final norm's (dflash_config capture_final_norm). Their
+  // rows of their own tokens are the token table's rows as its first layer
+  // reads them, through the table's RMS norm with draftEmbeddingNorm
+  // (dflash_config embedding_normalization folded_rmsnorm).
+  bool draftReadsLayerInputs = false;
+  bool draftEmbeddingNorm = false;
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   // The dense FFN's width.
   uint32_t intermediateSize = 0;
   // The sparse MoE's routed experts, those each token takes, and the width of
   // each; how its router weights them, and its shared expert: as wide as
   // sharedExpertSlices routed experts and weighted by the sigmoid of the
-  // block's scalar gate or, without sharedExpertGate, by 1 (ops::MoeShape).
+  // block's scalar gate or, without sharedExpertGate, by 1 (ops::MoeShape),
+  // none at zero slices. A biased selection (expertSelectionBias) ranks the
+  // experts by score plus each one's bias and scales their weights by
+  // expertRoutedScale (1 otherwise); its experts' SwiGLU softcaps its gate
+  // and up at expertGateSoftcap and expertUpSoftcap (c tanh(x / c); 0 for
+  // silu(gate) * up).
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
   ops::MoeRouter moeRouter = ops::MoeRouter::Softmax;
   uint32_t sharedExpertSlices = 1;
   bool sharedExpertGate = true;
+  bool expertSelectionBias = false;
+  float expertRoutedScale = 1.0F;
+  uint32_t expertGateSoftcap = 0;
+  uint32_t expertUpSoftcap = 0;
   // The first layers of a sparse MoE target, which run a dense FFN of
   // intermediateSize instead (a config's mlp_only_layers); its MoE blocks
   // are those of the layers after them, in layer order.
@@ -153,6 +187,20 @@ struct QwenTargetDimensions {
   [[nodiscard]] constexpr uint32_t gdnLayerCount() const noexcept { return layers - attentionLayerCount(); }
   // Whether its drafts choose their mask token (firstDraftMaskToken).
   [[nodiscard]] constexpr bool draftChoosesMaskToken() const noexcept { return lastDraftMaskToken != 0; }
+  // The tokens of its head's rows: vocabularyTokens, or every row.
+  [[nodiscard]] constexpr uint32_t tokens() const noexcept {
+    return vocabularyTokens ? vocabularyTokens : vocabularySize;
+  }
+  [[nodiscard]] constexpr ops::LogitFinishValues logitFinish() const noexcept { return {logitSoftcap, tokens()}; }
+  // Whether its head's finish changes its logits (a softcap, or padding).
+  [[nodiscard]] constexpr bool finishesLogits() const noexcept {
+    return logitSoftcap != 0.0F || tokens() != vocabularySize;
+  }
+  // The target layer ids its drafts may read: its layers, and its head's
+  // with draftReadsLayerInputs.
+  [[nodiscard]] constexpr uint32_t draftReadableLayers() const noexcept {
+    return layers + (draftReadsLayerInputs ? 1u : 0u);
+  }
   // Whether layer `layer`'s FFN is a MoE block, and the block's index among
   // the target's (its ExpertStore block).
   [[nodiscard]] constexpr bool isMoeLayer(uint32_t layer) const noexcept {
@@ -168,7 +216,11 @@ struct QwenTargetDimensions {
             .expertIntermediateSize = expertIntermediateSize,
             .router = moeRouter,
             .sharedSlices = sharedExpertSlices,
-            .sharedGate = sharedExpertGate};
+            .sharedGate = sharedExpertGate,
+            .selectionBias = expertSelectionBias,
+            .routedScale = expertRoutedScale,
+            .gateSoftcap = expertGateSoftcap,
+            .upSoftcap = expertUpSoftcap};
   }
   // The window the target serves with `scaling`: the native one, or YaRN's,
   // the native one times its factor, rounded to the nearest token so that a
@@ -223,12 +275,24 @@ struct QwenTargetDimensions {
 // uses. The type states its config's model type and the architecture of its
 // GGUFs (modelType, ggufArchitecture), and, where its config.json holds the
 // text model's keys at its top level instead of in a text_config (a
-// multimodal Qwen checkpoint's), flatConfig.
+// multimodal Qwen checkpoint's), flatConfig; and the attention its layers
+// run, relativeAttention: the variants of relative attention
+// (ops::RelativeAttention) its layers attend in, each layer one of them, or
+// none where they attend through the shared attention (ops::PagedAttention).
+// Each architecture's target is compiled against it, the start warms each
+// variant's kernels (ops::ExecutionPlans::prefillRowClasses), and the kernel
+// tests take the families' attention kernels from it.
 struct QwenHybridLayout : QwenTargetDimensions {
   static constexpr bool flatConfig = false;
 
   // The family's name, as the installer pairs its draft (install/families.py).
   std::string_view family;
+
+  // Its layers attend through the shared attention: no variant of relative
+  // attention.
+  [[nodiscard]] constexpr std::array<ops::RelativeAttentionVariant, 0> relativeAttention() const noexcept {
+    return {};
+  }
 
   // The KV pages, which also hold a QSA indexer's pooled keys; a QSA target's
   // attention reads the blocks its indexer selects, in the value order that

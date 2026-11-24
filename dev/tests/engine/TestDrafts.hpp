@@ -2,6 +2,7 @@
 
 #include "model/DFlashDraft.hpp"
 #include "model/Flint.hpp"
+#include "model/Inkling2Loop.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen4Exp.hpp"
@@ -16,8 +17,10 @@ namespace splash::test {
 // describe (model/ModelDescriptor.mm readDraftLayout): the released drafts
 // of Qwen3.8-27B, Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (Ornith-1.5-122B's,
 // trained to fill a block of 16), one of made-up sizes for
-// Qwen3.8-Flash-Next, and Flint's test draft of one layer of random weights,
-// whose mask token is Flint's first reserved token.
+// Qwen3.8-Flash-Next, Flint's test draft of one layer of random weights,
+// whose mask token is Flint's first reserved token, and Inkling-2-Mini's
+// released draft, which reads the rows its applications 5, 23 and 41 read and
+// its final norm's, id 48.
 [[nodiscard]] inline model::DFlashDraftLayout qwen3_8Draft() {
   constexpr model::Qwen3_8Layout target;
   constexpr std::array<uint32_t, 5> targetLayers{5, 19, 33, 47, 61};
@@ -43,6 +46,12 @@ namespace splash::test {
   constexpr model::FlintLayout target;
   constexpr std::array<uint32_t, 5> targetLayers{1, 12, 24, 35, 47};
   return model::draftLayout(target.hiddenSize, target.vocabularySize, 1, 6144, 10'000'000.0F, targetLayers);
+}
+
+[[nodiscard]] inline model::DFlashDraftLayout inkling2Draft() {
+  constexpr model::Inkling2LoopLayout target;
+  constexpr std::array<uint32_t, 4> targetLayers{5, 23, 41, 48};
+  return model::draftLayout(target.hiddenSize, target.vocabularySize, 5, 6912, 10'000.0F, targetLayers);
 }
 
 // The vision tower of Qwen3.8-27B, projecting into its hidden width.

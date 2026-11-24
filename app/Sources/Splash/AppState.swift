@@ -376,7 +376,7 @@ final class AppState {
 
     func download(_ model: String) {
         guard ready else { return }
-        installer.install(model)
+        installer.install(model, textOnly: settings(for: model).textOnly)
     }
 
     /// What quitting now would cut off: the requests the model answers, as its last status said
@@ -735,17 +735,19 @@ final class AppState {
             && !findingCachedModels
     }
 
-    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses.
+    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses: every
+    /// installation of it, Text only's too, whatever the launch options; one installed with Text
+    /// only alone by that option, as the model alone names no installation then.
     func delete(_ model: String) {
         guard canDelete(model) else { return }
-        installer.remove(model)
+        installer.remove(model, textOnly: installed.first { $0.id == model }?.textOnly == true)
     }
 
     /// Asks the Hub whether `model` or its draft has moved on, and installs what has, as its
     /// download did: the starts skip that question (`--offline`).
     func checkForUpdates(_ model: String) {
         guard ready, !serving(model) else { return }
-        installer.install(model, .check)
+        installer.install(model, .check, textOnly: settings(for: model).textOnly)
     }
 
     func isInstalled(_ model: String) -> Bool {

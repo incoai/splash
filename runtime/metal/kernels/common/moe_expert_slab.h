@@ -7,14 +7,14 @@
 
 // A grouped expert tile of at most tile_rows rows (kernels/shared/moe.metal)
 // holds `rows` live rows from its first grouped row on (MoeTileDescriptor).
-// An expert pass runs the matmul of the smallest of 8, 16 and tile_rows rows
-// that holds the live rows and stores the live rows alone: the rows it reads
-// past them, the next tile's or rows of no tile, which the scratch holds up
-// to tile_rows - 1 past the routes' (ops::MoeScratch), give results it
+// An expert pass runs the matmul of the smallest of 8, 16, 32 and tile_rows
+// rows that holds the live rows and stores the live rows alone: the rows it
+// reads past them, the next tile's or rows of no tile, which the scratch holds
+// up to tile_rows - 1 past the routes' (ops::MoeScratch), give results it
 // discards. The staged passes' column tiles (moe_column_tile) read their live
 // rows alone.
 inline uint moe_matmul_rows(uint rows, uint tile_rows) {
-  return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : tile_rows);
+  return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : rows <= 32 ? 32u : tile_rows);
 }
 // The staged expert passes run an expert's only tile of at most
 // GGUF_COLUMN_ROWS live rows on the column tile (moe_column_tile in
@@ -40,6 +40,10 @@ inline void moe_live_rows(uint rows, Run run) {
   if constexpr (16 < Max) {
     if (matmul == 16)
       return run(integral_constant<ushort, 16>{});
+  }
+  if constexpr (32 < Max) {
+    if (matmul == 32)
+      return run(integral_constant<ushort, 32>{});
   }
   run(integral_constant<ushort, Max>{});
 }
@@ -89,4 +93,11 @@ inline MoeGgufSegment moe_gguf_segment(uint expert, uint experts, uint input_siz
   constant QuantFormat &f = kQuantFormats[routed_format];
   const MoeExpertChunk c = moe_expert_chunk(chunks, floor_slots, chunk_slots, slots[expert], projection);
   return moe_gguf_planes(f, routed_format, c.w0, c.w1, c.meta, ulong(c.local) * output_size, input_size / 32);
+}
+
+// The scale an expert pass multiplies the fp32 sums of projection `projection` (0 gate, 1 up, 2 down) by, before it
+// rounds them: routed expert e's, at e of the projection's row of `scales` (ops::BlockMoeWeights::expertScales, F32
+// [3][experts]); 1 for a shared slice (ids `experts` on).
+inline float moe_expert_scale(device const float *scales, uint expert, uint experts, uint projection) {
+  return expert < experts ? scales[projection * experts + expert] : 1.0f;
 }

@@ -379,7 +379,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     run(RuntimeBootstrapStage::AneFfnSetUp, status, [&] {
       const auto started = AwakeClock::now();
       if (const uint32_t rows = setUp(mostRowsMilliseconds)) {
-        const KvPool::RunwayHold runway(kvPool);
+        const KvPool::RunwayHold runway(kvPool, (rows + kv::kPageTokens - 1) / kv::kPageTokens);
         return modelRuntime.warmupPrefill(rows);
       }
       // A set-up that left the GPU alone took at least the clock's tick (1 ns), even where the clock read none.

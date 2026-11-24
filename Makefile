@@ -270,6 +270,11 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/HyperConnection.cpp \
 	runtime/ops/NgramEmbedding.cpp \
+	runtime/ops/ShortConvolution.cpp \
+	runtime/ops/BlockResidualMix.cpp \
+	runtime/ops/MessageGate.cpp \
+	runtime/ops/LogitFinish.cpp \
+	runtime/ops/RelativeAttention.cpp \
 	runtime/ops/BlockIndexer.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
@@ -329,6 +334,11 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen4Steps.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/Flint.cpp \
+	runtime/model/Inkling2Loop.cpp \
+	runtime/model/Inkling2LoopGguf.cpp \
+	runtime/model/Inkling2LoopSafetensors.cpp \
+	runtime/model/Inkling2LoopSteps.cpp \
+	runtime/model/Inkling2LoopTarget.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \

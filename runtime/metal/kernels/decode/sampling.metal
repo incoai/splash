@@ -1615,7 +1615,8 @@ inline float tree_cap(threadgroup TreeRows &rows, uint parent, uint index) {
 // for position 0), the probabilities of the position's candidates (the
 // softmax at temperature 1 of their unary scores plus the edges from the
 // predecessor, the table draft_select_edges left in the partial-values
-// scratch) and the predecessor's most likely, the lowest index first among
+// scratch, each sum softcapped where the draft takes its head's softcap) and
+// the predecessor's most likely, the lowest index first among
 // equal scores, as the chain walk chose; thread 0 then grows the tree. Rows
 // are written in the order the tree takes them, lane l's from row l *
 // SPLASH_TARGET_VERIFY_ROWS, so a row's parent comes before it and its
@@ -1663,9 +1664,15 @@ kernel void draft_select_tree(
           ulong(params.lanes) * Positions * Shards * Candidates +
           ((ulong(lane) * Positions + position) * Candidates + predecessor) *
               Candidates;
+      // A softcapped head's draft takes the softcap on each sum, its tanh the
+      // precise one, as the reference computes it, and a candidate of no
+      // logit (-inf) stays none (DraftTreeParams).
+      const float softcap = params.softcap;
       float score[Candidates];
-      for (uint i = 0; i < Candidates; ++i)
-        score[i] = unary[origin + position * Candidates + i] + edges[i];
+      for (uint i = 0; i < Candidates; ++i) {
+        const float sum = unary[origin + position * Candidates + i] + edges[i];
+        score[i] = softcap > 0.0f && sum > -INFINITY ? softcap * precise::tanh(sum / softcap) : sum;
+      }
       float best = score[0];
       for (uint i = 1; i < Candidates; ++i)
         best = max(best, score[i]);

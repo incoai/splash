@@ -8,7 +8,7 @@ from jsonschema.exceptions import ValidationError
 from referencing.exceptions import Unresolvable
 
 from . import json_codec
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_CLOSE
+from .chat_format import THINK_END, THINK_START
 from .errors import APIError
 from .schema_validation import SchemaEvaluationError
 from .tool_schema import (
@@ -99,49 +99,80 @@ def _prefix_function(text):
 
 
 class ReasoningSplitter:
-    """The output's reasoning and its answer, as the output arrives. The
-    reasoning starts the output where the generation prompt opened a think
-    block (thinking), and where the model opens its reasoning itself
-    (chat_format.think_start_id), it follows a THINK_START that starts the
-    output, which is dropped. It ends at THINK_END, which is dropped too,
-    and where a call may follow (tool_calls) and a call's opening ends it
-    (chat_format.calls_end_reasoning), at a call's opening, which begins the
-    answer. A text completion, which has no chat format, reasons only where
-    thinking says so, and calls no tool."""
+    """The output's reasoning and its answer, as the output arrives, in the
+    blocks of its chat format. The reasoning starts the output where the
+    generation prompt opened it (thinking), and where the model opens its
+    reasoning itself (chat_format.think_start_ids), it follows the format's
+    think_open that starts the output, which is dropped; where the format's
+    reasoning returns after text (reasoning_returns), each think_open in the
+    answer starts it again. It ends at the format's think_close, which is
+    dropped too, and where a call may follow (tool_calls) and a call's
+    opening ends it (chat_format.calls_end_reasoning), at a call's opening,
+    which begins the answer. The tags that frame the answer's text
+    (text_frames, text_close) are dropped from it, and where they are, a
+    call, from its call_tag through its call_close, is the answer's as it is
+    written, for the projector to read. A text completion, which has no chat
+    format, reasons only where thinking says so, and calls no tool."""
 
     def __init__(self, thinking, tool_calls=False, chat_format=None):
         self.reasoning = thinking
+        self.think_open = THINK_START if chat_format is None else chat_format.think_open
+        self.think_close = THINK_END if chat_format is None else chat_format.think_close
         # Whether the output may yet open its reasoning: until it shows
-        # whether it starts with THINK_START.
+        # whether it starts with think_open. A format whose reasoning returns
+        # opens it wherever its answer holds think_open (content_tags).
         self.opening = (
             not thinking
             and chat_format is not None
-            and chat_format.think_start_id is not None
+            and bool(chat_format.think_start_ids)
+            and not chat_format.reasoning_returns
         )
         self.pending = ""
-        # Whether the newlines after </think>, which set the answer apart in
-        # the chat template's layout of a turn, are still to be dropped.
+        # Whether the newlines after the reasoning's close, which set the
+        # answer apart in the chat template's layout of a turn, are still to
+        # be dropped.
         self.separator = False
         self.ends = (
-            (THINK_END, chat_format.call_syntax.call_open)
+            (self.think_close, chat_format.call_syntax.call_open)
             if tool_calls and chat_format.calls_end_reasoning
-            else (THINK_END,)
+            else (self.think_close,)
         )
+        # The tags the answer holds that are not its text: those that frame
+        # its text, think_open where reasoning returns after text, and a
+        # call's call_tag where the answer's text is framed, whose call stays
+        # whole through its call_close (call_close), which may be a frame's
+        # close too.
+        self.content_tags = ()
+        self.call_tag = self.call_close = None
+        self.in_call = False
+        if chat_format is not None:
+            self.content_tags = (
+                chat_format.text_frames
+                + tuple(tag for tag in (chat_format.text_close,) if tag)
+                + ((self.think_open,) if chat_format.reasoning_returns else ())
+            )
+            if chat_format.text_frames:
+                syntax = chat_format.call_syntax
+                self.call_tag, self.call_close = syntax.call_tag, syntax.call_close
+                self.content_tags += (self.call_tag,)
 
     def put(self, text):
         if self.opening:
             self.pending += text
-            if len(self.pending) < len(THINK_START) and THINK_START.startswith(
+            if len(self.pending) < len(self.think_open) and self.think_open.startswith(
                 self.pending
             ):
                 return []
             self.opening = False
             text, self.pending = self.pending, ""
-            if text.startswith(THINK_START):
+            if text.startswith(self.think_open):
                 self.reasoning = True
-                text = text[len(THINK_START) :]
+                text = text[len(self.think_open) :]
         if not self.reasoning:
             return self._content(text)
+        return self._reasoning(text)
+
+    def _reasoning(self, text):
         self.pending += text
         ends = [
             (index, marker)
@@ -152,11 +183,11 @@ class ReasoningSplitter:
             end, marker = min(ends)
             reasoning = self.pending[:end]
             content = self.pending[end:]
-            if marker == THINK_END:
-                content = content[len(THINK_END) :]
+            if marker == self.think_close:
+                content = content[len(self.think_close) :]
             self.pending = ""
             self.reasoning = False
-            self.separator = marker == THINK_END
+            self.separator = marker == self.think_close
             output = [("reasoning_content", reasoning)] if reasoning else []
             return output + self._content(content)
         ready, self.pending = hold_partial(self.pending, *self.ends)
@@ -168,7 +199,52 @@ class ReasoningSplitter:
             if not text:
                 return []
             self.separator = False
-        return [("content", text)]
+        if not self.content_tags:
+            return [("content", text)]
+        # The answer without its tags: at each position the longest tag the
+        # text holds whole, and an end that may begin one held for the text
+        # after it.
+        self.pending += text
+        output = []
+        while True:
+            if self.in_call:
+                end = self.pending.find(self.call_close)
+                if end < 0:
+                    ready, self.pending = hold_partial(self.pending, self.call_close)
+                    return output + ([("content", ready)] if ready else [])
+                end += len(self.call_close)
+                output.append(("content", self.pending[:end]))
+                self.pending = self.pending[end:]
+                self.in_call = False
+                continue
+            found = [
+                (index, -len(tag), tag)
+                for tag in self.content_tags
+                if (index := self.pending.find(tag)) >= 0
+            ]
+            if not found:
+                ready, self.pending = hold_partial(self.pending, *self.content_tags)
+                return output + ([("content", ready)] if ready else [])
+            index, _, tag = min(found)
+            if index:
+                output.append(("content", self.pending[:index]))
+            self.pending = self.pending[index:]
+            # A tag that a longer one begins, at the text's end, waits for
+            # the text that tells them apart.
+            if any(
+                len(longer) > len(tag) and longer.startswith(self.pending)
+                for longer in self.content_tags
+            ):
+                return output
+            self.pending = self.pending[len(tag) :]
+            if tag == self.think_open:
+                self.reasoning = True
+                text, self.pending = self.pending, ""
+                return output + self._reasoning(text)
+            if tag == self.call_tag:
+                # A call, its tag and its text, as it is written.
+                output.append(("content", tag))
+                self.in_call = True
 
     def finish(self):
         if not self.pending:
@@ -242,29 +318,36 @@ class StreamingToolCallProjector:
     value, without the template's value_open, that ends at value_close where
     the next parameter's opening, the arguments' close or the call's close
     follows (value_ends), so a value may hold the tags in any other order.
-    The arguments' close or the call's close ends the call; the </tool_call>
-    after an arguments' close (Qwen's </function>) may be left out. Names
+    The arguments' close or the call's close ends the call; the call's close
+    after an arguments' close (Qwen's </function>) may be left out. A call
+    whose arguments are one JSON object (the "json" kind) streams them as
+    written after the object's name and ends at the call's close. Names
     lose the space around them; an opening that names no function, or a name
     too long to be one, reads as text; other text inside a call is dropped,
     and a repeated parameter keeps its first value. A value typed as string
     alone, or untyped, streams as written; any other converts at its end
-    (convert_value). Text outside calls streams as it arrives, and a
-    </think> there is dropped: a model may write one again after its
-    reasoning has ended, or with thinking off.
+    (convert_value). Text outside calls streams as it arrives, and the
+    reasoning's close there (think_close) is dropped: a model may write one
+    again after its reasoning has ended, or with thinking off.
 
     Without a tool policy the output has no calls: a call's opening is text,
-    and the projector only drops the </think>s, so that every answer reads
-    its text the same way. A structured answer's JSON is left as it is.
+    and the projector only drops the reasoning's closes, so that every
+    answer reads its text the same way. A structured answer's JSON is left as
+    it is.
     """
 
-    def __init__(self, policy, request_id, structured=False, syntax=None):
+    def __init__(
+        self, policy, request_id, structured=False, syntax=None, think_close=THINK_END
+    ):
         # The types of the tools its calls name, read as they name them.
         self.tool_types = ParameterTypes(policy) if policy is not None else None
         self.request_id = request_id
         # The layout its calls are read in, which a tool policy needs.
         self.syntax = syntax
+        # The close of the chat format's reasoning, dropped where text holds it.
+        self.think_close = think_close
         self.text_tags = (
-            (syntax.call_open, THINK_END) if policy is not None else (THINK_END,)
+            (syntax.call_open, think_close) if policy is not None else (think_close,)
         )
         self.pending = ""
         self.state = "output" if structured else "content"
@@ -355,7 +438,11 @@ class StreamingToolCallProjector:
                 },
             )
         )
-        self._emit_argument("{", events)
+        if self.syntax.arguments == "json":
+            # The name's close, then the call's JSON object.
+            self.state = "body_open"
+        else:
+            self._emit_argument("{", events)
 
     def _key(self, name):
         separator = "," if self.parameter_count else ""
@@ -412,8 +499,31 @@ class StreamingToolCallProjector:
         self.value_parts = []
         self.state = "arguments"
 
+    def _end_body(self, text, events):
+        """End a call of the "json" kind at its close, `text` the rest of its
+        object. Its arguments streamed as written, after the object's name
+        (body_arguments), end at the object's own close; an object laid out
+        otherwise is read whole: its arguments, under the syntax's
+        json_arguments_key, or its text as written where it holds none, as a
+        cut call keeps its text."""
+        if self.state == "body_arguments":
+            text = text.rstrip()
+            self._emit_argument(text.removesuffix("}"), events)
+        else:
+            try:
+                value = json_codec.loads(text)
+            except ValueError:
+                value = None
+            key = self.syntax.json_arguments_key
+            arguments = value.get(key) if isinstance(value, dict) else None
+            if isinstance(arguments, dict):
+                text = json_codec.dumps(arguments)
+            self._emit_argument(text.strip() or "{}", events)
+        self._finish_call(events)
+
     def _finish_call(self, events):
-        self._emit_argument("}", events)
+        if self.syntax.arguments != "json":
+            self._emit_argument("}", events)
         self.closed_calls.append(
             {
                 "id": self.call_id,
@@ -429,7 +539,8 @@ class StreamingToolCallProjector:
         self.function_name = None
         self.argument_fragments = []
         self.text_visible = False
-        self.state = "closing"
+        # A call of the "json" kind ended at its call_close.
+        self.state = "content" if self.syntax.arguments == "json" else "closing"
 
     def _next_tag(self, *tags):
         """The tag of `tags` that the pending text spells first, and where."""
@@ -471,7 +582,7 @@ class StreamingToolCallProjector:
                     break
                 self._emit_content(self.pending[:start], events)
                 self.pending = self.pending[start + len(tag) :]
-                if tag != THINK_END:
+                if tag != self.think_close:
                     # A call's opening, the other tag.
                     self.state = "name"
                 continue
@@ -482,6 +593,43 @@ class StreamingToolCallProjector:
                     break
                 self._begin_call(name, events)
                 continue
+            if self.state == "body_open":
+                # The name's close, which the name left in the text.
+                close = syntax.name_close
+                if len(self.pending) < len(close) and close.startswith(self.pending):
+                    break
+                self.pending = self.pending.removeprefix(close)
+                self.state = "body_prefix"
+                continue
+            if self.state == "body_prefix":
+                # The object's name, as the template writes it, before the
+                # arguments, which then stream as written; an object laid out
+                # otherwise is read whole at the call's close.
+                prefix = syntax.json_prefix(self.function_name)
+                if self.pending.startswith(prefix):
+                    self.pending = self.pending[len(prefix) :]
+                    self.state = "body_arguments"
+                elif prefix.startswith(self.pending):
+                    break
+                else:
+                    self.state = "body"
+                continue
+            if self.state in ("body_arguments", "body"):
+                end = self.pending.find(syntax.call_close)
+                if end >= 0:
+                    self._end_body(self.pending[:end], events)
+                    self.pending = self.pending[end + len(syntax.call_close) :]
+                    continue
+                if self.state == "body_arguments":
+                    # The object's own close, the last character before the
+                    # call's, waits for the text after it.
+                    ready, held = hold_partial(self.pending, syntax.call_close)
+                    if ready.endswith("}"):
+                        ready, held = ready[:-1], "}" + held
+                    if ready:
+                        self._emit_argument(ready, events)
+                    self.pending = held
+                break
             if self.state == "arguments":
                 # Text between parameters is dropped, but for a tag it may
                 # begin.
@@ -495,7 +643,7 @@ class StreamingToolCallProjector:
                     self.state = "parameter"
                 else:
                     self._finish_call(events)
-                    if tag == TOOL_CALL_CLOSE:
+                    if tag == syntax.call_close:
                         self.state = "content"
                 continue
             if self.state == "parameter":
@@ -527,9 +675,9 @@ class StreamingToolCallProjector:
             if self.state == "closing":
                 # After </function>, the template closes the call's block.
                 rest = self.pending.lstrip(NAME_SPACE)
-                if rest.startswith(TOOL_CALL_CLOSE):
-                    self.pending = rest[len(TOOL_CALL_CLOSE) :]
-                elif TOOL_CALL_CLOSE.startswith(rest):
+                if rest.startswith(syntax.call_close):
+                    self.pending = rest[len(syntax.call_close) :]
+                elif syntax.call_close.startswith(rest):
                     break
                 self.state = "content"
         return events
@@ -537,7 +685,16 @@ class StreamingToolCallProjector:
     @property
     def in_call(self):
         """Whether the output so far ends inside a call, past its opening."""
-        return self.state in ("name", "arguments", "parameter", "value")
+        return self.state in (
+            "name",
+            "arguments",
+            "parameter",
+            "value",
+            "body_open",
+            "body_prefix",
+            "body_arguments",
+            "body",
+        )
 
     def finish(self, incomplete):
         """The content and calls of the output, and the events the stream
@@ -566,6 +723,11 @@ class StreamingToolCallProjector:
             if self.state in ("arguments", "parameter"):
                 self.pending = ""
                 self._finish_call(events)
+            if self.state in ("body_open", "body_prefix", "body_arguments", "body"):
+                text, self.pending = self.pending, ""
+                if self.state in ("body_open", "body_prefix"):
+                    text = ""
+                self._end_body(text, events)
         if self.state == "closing":
             self.pending = ""
             self.state = "content"

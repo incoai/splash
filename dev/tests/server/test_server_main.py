@@ -1216,12 +1216,14 @@ class CustomTemplateStartupTests(unittest.TestCase):
         path = self.template("custom template.jinja", data)
         templates, tokenizer, _, status = self.start(main_args(chat_template_file=path))
         templates.assert_called_once_with(
-            tokenizer.return_value, override=data.decode()
+            tokenizer.return_value, override=data.decode(), opens_own_message=False
         )
         self.assertEqual(self.file_lines(status), [f"Chat template file · {path}"])
         # Without one, the tokenizer's templates, and no line.
         templates, tokenizer, _, status = self.start(main_args())
-        templates.assert_called_once_with(tokenizer.return_value, override=None)
+        templates.assert_called_once_with(
+            tokenizer.return_value, override=None, opens_own_message=False
+        )
         self.assertEqual(self.file_lines(status), [])
 
     def test_a_template_file_it_cannot_use_stops_startup_first(self):

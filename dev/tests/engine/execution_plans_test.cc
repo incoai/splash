@@ -303,6 +303,51 @@ void ggufMoePlans() {
     require(plans.moeWorkspace(shape, kRouterFormat, 2048, StepKind::Prefill) == devicePlans,
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
+  // The M5 Pro (Apple10, 16 to 31 cores) runs a prefill chunk whose routes
+  // average MoeCalibration::wideTileRoutes or more an expert on 64-row tiles:
+  // from 20 cores 64 (2048 rows of 8 of 256 experts, 1024 of 8 of 128), on the
+  // 16-core 128 (2048 rows of 8 of 128 alone). Its decode steps and shorter
+  // chunks run as every GPU's do; the 10-core M5, the M5 Max, the M6 and
+  // Apple9 keep 32-row tiles. The prefill bound holds the 64-row plans.
+  MoeShape eightOf128 = shape;
+  eightOf128.experts = 128;
+  // Flint's routing (a sigmoid router's top 6 of 256 experts and two ungated
+  // shared slices), whose chunks average at most 48 routes an expert, takes
+  // 64-row tiles on no device, and a plan of it on them throws: its passes
+  // have no 64-row kernels.
+  MoeShape flint = shape;
+  flint.expertsPerToken = 6;
+  flint.router = MoeRouter::SigmoidNormalized;
+  flint.sharedSlices = 2;
+  flint.sharedGate = false;
+  for (const auto [family, cores] : {std::pair{10U, 16U}, {10U, 19U}, {10U, 20U}, {10U, 31U}, {10U, 10U}, {10U, 32U},
+                                     {10U, 40U}, {11U, 20U}, {9U, 20U}}) {
+    DeviceCapabilities capabilities = device(family);
+    capabilities.gpuCoreCount = cores;
+    const ExecutionPlans plans(capabilities, Int8Activations::On);
+    const bool pro = family == 10 && cores >= 16 && cores < 32, sixtyFour = pro && cores >= 20;
+    for (const uint32_t rows : {33U, 1024U, 2047U, 2048U})
+      for (const auto &[block, wide] : {std::pair{shape, sixtyFour && rows == 2048},
+                                        {eightOf128, (sixtyFour && rows >= 1024) || (pro && rows == 2048)}})
+        require(plans.moe(block, kRouterFormat, rows, StepKind::Prefill).tileRows() == (wide ? 64U : 32U),
+                "GGUF MoE prefill plan of " + std::to_string(block.experts) + " experts on Apple" +
+                    std::to_string(family) + ", " + std::to_string(cores) + " cores, at " + std::to_string(rows) +
+                    " rows left its tiles");
+    for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows)
+      require(plans.moe(flint, kRouterFormat, rows, StepKind::Prefill).tileRows() <= 32,
+              "Flint's MoE prefill plan on Apple" + std::to_string(family) + ", " + std::to_string(cores) +
+                  " cores, at " + std::to_string(rows) + " rows runs 64-row tiles");
+    for (const MoeShape &block : {shape, eightOf128}) {
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        require(plans.moe(block, kRouterFormat, lanes * 16, StepKind::Decode).tileRows() <= 32,
+                "a GGUF MoE decode plan runs 64-row tiles");
+      const MoePlan widest = plans.moe(block, kRouterFormat, 2048, StepKind::Prefill);
+      covers(plans.moeWorkspace(block, kRouterFormat, 2048, StepKind::Prefill), widest.workspace(), 1,
+             kMoeWorkspaceFields);
+    }
+  }
+  rejects([&] { (void)MoE::plan(flint, 2048, MoeConfig{MoeExpertTile::M64}); },
+          "no 64-row passes for two shared slices", "a MoE plan of two shared slices on 64-row tiles was accepted");
 }
 
 // A dense tile of a sequence of more than one tile takes a history split per

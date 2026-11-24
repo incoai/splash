@@ -192,9 +192,54 @@ void chunkRowPlans() {
     }
 }
 
+// Projections side by side (Projection::sideBySide): two or three tensors of
+// one shape and format as one projection, its plan at every row count of a
+// decode step and a prompt chunk on every family and core count the
+// configuration and storage rows of one tensor's own plan, its scratch within
+// the arena bound of its shape (Linear::scratchSize), its step's storage rows
+// one tensor's; tensors of two formats or shapes, or of several segments,
+// stand side by side in no projection, and one tensor or four are refused.
+// gguf-projection checks that each tensor's columns are its own plan's bits.
+void sideBySidePlans() {
+  for (const uint32_t format : {GGUF_FMT_Q80, GGUF_FMT_Q4K, GGUF_FMT_IQ4XS, GGUF_FMT_AF4G64}) {
+    const Projection tensor = blockProjection(1024, 2304, 1, format);
+    const std::array<const Projection *, 3> three{&tensor, &tensor, &tensor};
+    for (const size_t count : {size_t{2}, size_t{3}}) {
+      const std::optional<Projection> side = Projection::sideBySide(std::span(three).first(count));
+      require(side && side->outputSize == count * 1024 && side->planOutputs() == 1024 &&
+                  side->shape().planOutputs == 1024 && side->blocks().segments.size() == count &&
+                  side->blocks().segments.back().columnOffset == (count - 1) * 1024,
+              "tensors of one shape and format stand side by side");
+      for (const uint32_t family : {9U, 10U, 11U})
+        for (const uint32_t cores : {10U, 12U, 16U, 20U, 32U, 40U})
+          for (const StepKind step : {StepKind::Prefill, StepKind::Decode}) {
+            const Linear linear(simulatedDevice(family, cores), Int8Activations::On, step);
+            for (const uint32_t rows : {1U, 2U, 3U, 8U, 9U, 16U, 24U, 32U, 33U, 48U, 64U, 65U, 96U, 128U, 129U, 2048U}) {
+              const LinearPlan own = linear.plan(tensor, rows), plan = linear.plan(*side, rows);
+              const LinearScratchSize needed = plan.scratchSize(), bound = linear.scratchSize(side->shape(), rows);
+              if (plan.configuration() != own.configuration() || plan.storageRows() != own.storageRows() ||
+                  plan.workload().matrix.outputSize != side->outputSize || needed.input > bound.input ||
+                  needed.sums > bound.sums || needed.partials > bound.partials || needed.counters > bound.counters ||
+                  linear.storageRows(rows, side->shape()) != linear.storageRows(rows, tensor.shape()))
+                broke("a projection side by side departed from its tensors' plan", family, cores, plan.workload());
+            }
+          }
+    }
+  }
+  const Projection q80 = blockProjection(1024, 2304, 1, GGUF_FMT_Q80), q4k = blockProjection(1024, 2304, 1),
+                   wide = blockProjection(2048, 2304, 1, GGUF_FMT_Q80), fused = blockProjection(2048, 2304, 2);
+  for (const auto &[a, b] : {std::pair{&q80, &q4k}, std::pair{&q80, &wide}, std::pair{&fused, &fused}})
+    require(!Projection::sideBySide(std::array<const Projection *, 2>{a, b}),
+            "tensors of two formats, two shapes or several segments stood side by side");
+  rejects([&] { (void)Projection::sideBySide(std::array<const Projection *, 1>{&q80}); },
+          "projections side by side are two or three", "one tensor stood side by side");
+  rejects([&] { (void)Projection::sideBySide(std::array<const Projection *, 4>{&q80, &q80, &q80, &q80}); },
+          "projections side by side are two or three", "four tensors stood side by side");
+}
+
 // The int8 prefill tile (ProjectionCalibration::prefillInt8): Apple10 and
-// Apple11 run every plan past the staged tile of a unit of af4g64 and af5g64
-// segments on it, at the prefill tile's storage, Apple9 none; a unit with a
+// Apple11 run every plan past the staged tile of a unit of af4g64, af5g64 and
+// Q8_0 segments on it, at the prefill tile's storage, Apple9 none; a unit with a
 // segment of another format keeps the prefill tile, and so does every unit
 // with int8 activations off, whose plans are then the bf16 ones and whose
 // device row is the same; a workload of no formats plans the same either way.
@@ -204,6 +249,7 @@ void chunkRowPlans() {
 void prefillInt8Rule() {
   const Projection af4 = blockProjection(5120, 17408, 1, GGUF_FMT_AF4G64);
   const Projection af5 = blockProjection(12288, 5120, 3, GGUF_FMT_AF5G64);
+  const Projection q80 = blockProjection(8192, 2048, 2, GGUF_FMT_Q80);
   const std::array<uint32_t, 3> mixedFormats{GGUF_FMT_AF4G64, GGUF_FMT_AF5G64, GGUF_FMT_Q4K};
   const Projection mixed = blockProjection(12288, 5120, mixedFormats);
   for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 40U}, {10U, 16U}, {10U, 32U}, {11U, 12U}}) {
@@ -218,7 +264,8 @@ void prefillInt8Rule() {
             "int8 activations changed a prefill plan of no formats");
     for (const uint32_t rows : {33U, 64U, 65U, 128U, 2048U})
       for (const auto &[p, epilogue] : {std::pair{&af4, LinearEpilogue::Residual}, {&af5, LinearEpilogue::None},
-                                        {&af4, LinearEpilogue::UpWithGate}, {&mixed, LinearEpilogue::None}}) {
+                                        {&af4, LinearEpilogue::UpWithGate}, {&q80, LinearEpilogue::None},
+                                        {&q80, LinearEpilogue::Residual}, {&mixed, LinearEpilogue::None}}) {
         const LinearPlan plan = linear.plan(*p, rows, epilogue), off = bf16.plan(*p, rows, epilogue);
         const LinearTile bf16Tile = rows <= kMaximumDecodeTileRows ? LinearTile::GgufStaged : LinearTile::GgufPrefill;
         const LinearTile tile =
@@ -1718,6 +1765,7 @@ int main(int argc, char **argv) {
     apple9StagesPastTheRegisterTile();
     decodeStepsRunRowGroups();
     chunkRowPlans();
+    sideBySidePlans();
     prefillInt8Rule();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";

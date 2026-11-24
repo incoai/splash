@@ -5,9 +5,11 @@
 // (model/GgufImage.hpp), in their order, which writeGgufImage writes from the
 // checkpoint's tensors and BlockTargetFormat reads with the GDN value heads
 // grouped, as all keep them. Every quantized tensor keeps the format its
-// tensors hold: MLX affine (metal/abi/QuantFormat.h), mxfp4 or nvfp4 as MLX
-// infers it, or NVFP4 or FP8 as the other two store them: projections and
-// experts as planes, a quantized token table as native rows. An unquantized
+// tensors hold: MLX affine (metal/abi/QuantFormat.h), mxfp4, mxfp8 or nvfp4
+// as MLX infers it, or NVFP4 or FP8 as the other two store them: projections
+// and experts as planes, a quantized token table as native rows. A projection
+// or expert of BF16 or F16 weights takes Q8_0's planes, quantized from its
+// values as the reference GGUF quantization of Q8_0 rounds them; an unquantized
 // token table is copied as its bf16 rows. Norms are bf16 as stored, or the
 // F32 1 + w of a w stored 1 below, or widened (float32Norms); the convolution and
 // dt_bias are copied as stored, and the GDN decay is
@@ -21,6 +23,7 @@
 #include "model/QwenHybridLayout.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,12 +32,13 @@ namespace splash::model::safetensors {
 
 // The format of MLX quantization `mode` at `bits` in groups of `group`
 // (metal/abi/QuantFormat.h): affine at the widths QuantFormat.h holds, mxfp4
-// 4 bits in groups of 32 or nvfp4 4 bits in groups of 16; GGUF_FMT_COUNT for
-// one the images do not load. Both the configuration check and the images
-// read it, and their refusals name what it takes in these two phrases.
+// 4 bits or mxfp8 8 bits in groups of 32, or nvfp4 4 bits in groups of 16;
+// GGUF_FMT_COUNT for one the images do not load. Both the configuration
+// check and the images read it, and their refusals name what it takes in
+// these two phrases.
 [[nodiscard]] uint32_t mlxFormat(std::string_view mode, uint32_t bits, uint32_t group) noexcept;
 inline constexpr std::string_view kMlxAffineFormats = "affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128";
-inline constexpr std::string_view kMlxFloatFormats = "mxfp4 or nvfp4";
+inline constexpr std::string_view kMlxFloatFormats = "mxfp4, mxfp8 or nvfp4";
 
 // The names a checkpoint's language-model modules take: mlx-vlm's
 // (language_model.model.*, language_model.lm_head) or mlx-lm's (model.*,
@@ -95,13 +99,44 @@ enum class NormStorage : uint8_t { Multipliers, BelowMultipliers };
                                                   const QwenTargetDimensions &geometry, NormStorage norms,
                                                   gguf::PlanOptions options = {});
 
-// The modules the images read only quantized, in their order and by `names`:
-// the layers' projections, the routed experts' (as a configuration names
-// them: MLX's stacked tensor per projection, once transformers' mlp.experts) and
-// the shared expert's, and the head. planImages refuses a checkpoint holding
-// one unquantized, and the configuration check one its config.json states
-// unquantized (model/ModelDescriptor.mm). The router, the shared-expert gate,
-// GDN alpha and beta, Flint's sinks and the token table are not among them.
-[[nodiscard]] std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names);
+// Where a checkpoint holds (a part of) a section of a family's images
+// (gguf::Section), as the family's names give it (planTargetImages): a module
+// for a section of a projection, the router, the routed experts, the head or
+// the token table, which its tensors quantize (or its .weight holds
+// unquantized), else a tensor, read as rows of its last dimension's values;
+// and the part the section takes of it: rows [first, first + rows) (rows 0:
+// all from first), each row's column window `window` of `windows` (Inkling 2's
+// release interleaves its experts' gate and up rows, which are windows of a
+// row pair), or its values transposed, its rows the section's columns, with
+// `reversed` its rows last first.
+struct SectionSource final {
+  std::string name;
+  uint64_t first = 0, rows = 0;
+  uint32_t windows = 1, window = 0;
+  bool transposed = false, reversed = false;
+};
+// A family's names for the sections of its images: the sources of a section,
+// one but for the routed experts' three (gate, up and down) and a Values
+// section's parts, which it gathers in order.
+using SectionSources = std::function<std::vector<SectionSource>(const gguf::Section &)>;
+
+// The images of a target whose family lists its images' sections, as its
+// GGUF plan lays them out (gguf::planTargetImages): `layerImages` layer images
+// of the sections `layer` lists, the head's of `head` and then the head
+// (output.weight), and the embedding's (token_embd.weight), each section of
+// the sources `sources` names, its values in the kind of section's form:
+// Norm and Values the F32 values of F32 or BF16 tensors (gathered, or a
+// transposed one's); Quantized the planes of a quantized or BF16 module's
+// rows (projection rows, Q8_0 for BF16); FloatTensor a tensor's or an
+// unquantized module's F32 or BF16 rows as stored, a quantized module's F32
+// values or a transposed tensor's; SmallProjection a float module's rows as
+// stored or a quantized one's planes padded to whole tiles; Router a module's
+// rows as stored, a quantized one's native rows; RoutedExperts the planes of
+// three modules' experts and their expert scales; the token table a quantized
+// module's native rows or its bf16 rows. The checkpoint outlives them.
+[[nodiscard]] std::vector<gguf::Image>
+planTargetImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, uint32_t layerImages,
+                 gguf::PlanOptions options, const std::function<std::vector<gguf::Section>(uint32_t)> &layer,
+                 const std::vector<gguf::Section> &head, const SectionSources &sources);
 
 } // namespace splash::model::safetensors

@@ -3,7 +3,7 @@
 // CPU reference for the GGUF image formats (metal/abi/QuantFormat.h): native
 // blocks, their fp32 values with llama.cpp's dequantize_row_* semantics (MIT
 // notice in THIRD_PARTY_NOTICES), MLX's for the affine formats, or those of
-// NVFP4's and FP8's definitions in the kernels' order of operations, and the
+// NVFP4's, FP8's and MXFP8's definitions in the kernels' order of operations, and the
 // planes the load-time repack writes,
 // and the fp64 bound a GGUF projection's result lies within, and Prism ML's
 // input rotation. Shared by the GGUF tests.
@@ -32,7 +32,8 @@ enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q
            IQ2XXS = GGUF_FMT_IQ2XXS, IQ2XS = GGUF_FMT_IQ2XS, IQ2S = GGUF_FMT_IQ2S, IQ1S = GGUF_FMT_IQ1S,
            IQ1M = GGUF_FMT_IQ1M, Q40 = GGUF_FMT_Q40, Q41 = GGUF_FMT_Q41, MXFP4 = GGUF_FMT_MXFP4,
            PQ20 = GGUF_FMT_PQ20, NVFP4 = GGUF_FMT_NVFP4, FP8 = GGUF_FMT_FP8, Q50 = GGUF_FMT_Q50, Q51 = GGUF_FMT_Q51,
-           BF16 = GGUF_FMT_BF16, F16 = GGUF_FMT_F16, Q20 = GGUF_FMT_Q20, FMT_COUNT = GGUF_FMT_COUNT };
+           BF16 = GGUF_FMT_BF16, F16 = GGUF_FMT_F16, Q20 = GGUF_FMT_Q20, NVFP464 = GGUF_FMT_NVFP464,
+           MXFP8 = GGUF_FMT_MXFP8, FMT_COUNT = GGUF_FMT_COUNT };
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
 // The format of kQuantFormats name `name`, FMT_COUNT for none.
 inline Fmt fmtNamed(const std::string &name) {
@@ -74,12 +75,19 @@ inline float e4m3(uint8_t b) {
   const float magnitude = exponent ? std::ldexp(1.0f + mantissa / 8.0f, exponent - 7) : std::ldexp(mantissa / 8.0f, -6);
   return b & 0x80 ? -magnitude : magnitude;
 }
-// NVFP4's and FP8's native blocks (metal/abi/QuantFormat.h): an NVFP4 block's 16 E4M3 scales, its tensor scale g
-// and its 128 code bytes (element e in bits 4 (e % 2) of byte e / 2); an FP8 block's g and its 256 E4M3 values.
+// NVFP4's, FP8's and MXFP8's native blocks (metal/abi/QuantFormat.h): an NVFP4 block's 16 E4M3 scales, its tensor
+// scale g and its 128 code bytes (element e in bits 4 (e % 2) of byte e / 2); an FP8 block's g and its 256 E4M3
+// values; an MXFP8 block's E8M0 exponent e and its 32 E4M3 values.
 constexpr uint32_t kNvfp4Scale = QUANT_NVFP4_G, kNvfp4Codes = QUANT_NVFP4_CODES, kFp8Values = QUANT_FP8_VALUES;
+// Either NVFP4 form: of 256-element blocks, or of 64 (NVFP464), its meta unit (its E4M3 scales, then g) leading
+// each block and its codes after it.
+inline bool nvfp4(uint32_t f) { return f == NVFP4 || f == NVFP464; }
+inline uint32_t nvfp4Scale(uint32_t f) { return kQuantFormats[f].meta_bytes - 4; }
+inline uint32_t nvfp4Codes(uint32_t f) { return kQuantFormats[f].meta_bytes; }
 inline float blockScale(const uint8_t *blk, uint32_t at) { float g; memcpy(&g, blk + at, 4); return g; }
-// N native rows of random codes and random positive E4M3 scales (NVFP4) or random E4M3 values (FP8, NaN left out),
-// whose tensor scale g is drawn from `scale`, so the weights take a model's magnitudes (a few hundredths).
+// N native rows of random codes and random positive E4M3 scales (NVFP4) or random E4M3 values (FP8 and MXFP8, NaN
+// left out), whose tensor scale g, or MXFP8's power of two at or below it per block, is drawn from `scale`, so the
+// weights take a model's magnitudes (a few hundredths).
 template <class Scale>
 std::vector<uint8_t> makeFloatNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng, Scale scale) {
   const QuantFormat &fi = kQuantFormats[f];
@@ -89,14 +97,15 @@ std::vector<uint8_t> makeFloatNative(Fmt f, uint32_t N, uint32_t K, std::mt19937
   const float g = scale();
   for (size_t b = 0; b < v.size() / fi.block_bytes; ++b) {
     uint8_t *blk = v.data() + b * fi.block_bytes;
-    if (f == NVFP4) {
-      for (uint32_t i = 0; i < 16; ++i) blk[i] = uint8_t(blockScales(rng));
-      memcpy(blk + kNvfp4Scale, &g, 4);
-    } else {
-      memcpy(blk, &g, 4);
-      for (uint32_t i = 0; i < 256; ++i)
-        if ((blk[kFp8Values + i] & 0x7F) == 0x7F) blk[kFp8Values + i] ^= 1;   // 0x7E or 0xFE: no NaN
+    if (nvfp4(f)) {
+      for (uint32_t i = 0; i < nvfp4Scale(f); ++i) blk[i] = uint8_t(blockScales(rng));
+      memcpy(blk + nvfp4Scale(f), &g, 4);
+      continue;
     }
+    if (f == MXFP8) blk[0] = uint8_t(std::ilogb(scale()) + 127);
+    else memcpy(blk, &g, 4);
+    for (uint32_t i = fi.meta_bytes; i < fi.block_bytes; ++i)
+      if ((blk[i] & 0x7F) == 0x7F) blk[i] ^= 1;   // 0x7E or 0xFE: no NaN
   }
   return v;
 }
@@ -106,7 +115,7 @@ template <class G> void setTensorScales(std::vector<uint8_t> &native, Fmt f, uin
   const uint32_t blocks = K / fi.block_elements;
   for (size_t b = 0; b < native.size() / fi.block_bytes; ++b) {
     const float value = g(uint32_t(b / blocks));
-    memcpy(native.data() + b * fi.block_bytes + (f == NVFP4 ? kNvfp4Scale : 0), &value, 4);
+    memcpy(native.data() + b * fi.block_bytes + (nvfp4(f) ? nvfp4Scale(f) : 0), &value, 4);
   }
 }
 
@@ -116,12 +125,12 @@ template <class G> void setTensorScales(std::vector<uint8_t> &native, Fmt f, uin
 constexpr uint32_t kBlockNvfp4Bytes = 36;
 // The block_nvfp4 rows of native NVFP4 rows whose E4M3 scales are positive and below 0x7F, as UE4M3 reads them;
 // their tensor scale g, which a .scale tensor holds in llama.cpp, is left out.
-inline std::vector<uint8_t> blockNvfp4Rows(const std::vector<uint8_t> &native) {
+inline std::vector<uint8_t> blockNvfp4Rows(const std::vector<uint8_t> &native, Fmt f = NVFP4) {
   std::vector<uint8_t> rows;
-  for (size_t at = 0; at < native.size(); at += kQuantFormats[NVFP4].block_bytes) {
+  for (size_t at = 0; at < native.size(); at += kQuantFormats[f].block_bytes) {
     const uint8_t *blk = native.data() + at;
-    const auto code = [&](uint32_t e) { return (blk[kNvfp4Codes + e / 2] >> (4 * (e % 2))) & 15; };
-    for (uint32_t q = 0; q < 4; ++q) {
+    const auto code = [&](uint32_t e) { return (blk[nvfp4Codes(f) + e / 2] >> (4 * (e % 2))) & 15; };
+    for (uint32_t q = 0; q < kQuantFormats[f].block_elements / 64; ++q) {
       rows.insert(rows.end(), blk + 4 * q, blk + 4 * q + 4);
       for (uint32_t s = 0; s < 4; ++s)
         for (uint32_t j = 0; j < 8; ++j)
@@ -232,10 +241,11 @@ inline uint32_t affineCode(const uint8_t *codes, uint32_t bits, uint32_t l) {
   return (word >> shift) & ((1u << bits) - 1);
 }
 // The native rows (metal/abi/QuantFormat.h) of `rows` MLX rows of K weights of format f: codes packed as MLX packs a
-// row's, a little-endian bit string of `bits` bits each, and per group of `group` its scale (bf16, mxfp4's E8M0 byte
-// or nvfp4's E4M3 byte) and an affine tensor's bf16 bias. An affine group is its scale, its bias and its codes; an
-// mxfp4 group a block_mxfp4, its exponent and its codes with element j < 16 in the low nibble of byte j and j + 16 in
-// its high nibble; 256 nvfp4 elements their 16 scales, a tensor scale of 1 and their codes as MLX packs them.
+// row's, a little-endian bit string of `bits` bits each, and per group of `group` its scale (bf16, mxfp4's and
+// mxfp8's E8M0 byte or nvfp4's E4M3 byte) and an affine tensor's bf16 bias. An affine group is its scale, its bias and
+// its codes; an mxfp4 group a block_mxfp4, its exponent and its codes with element j < 16 in the low nibble of byte j
+// and j + 16 in its high nibble; an mxfp8 group its exponent and its E4M3 bytes; 256 nvfp4 elements their 16 scales, a
+// tensor scale of 1 and their codes as MLX packs them.
 inline std::vector<uint8_t> mlxNative(Fmt f, uint32_t rows, uint32_t K, const std::vector<uint8_t> &weight,
                                       const std::vector<uint8_t> &scales, const std::vector<uint8_t> &biases) {
   std::vector<uint8_t> native;
@@ -253,7 +263,7 @@ inline std::vector<uint8_t> mlxNative(Fmt f, uint32_t rows, uint32_t K, const st
     return native;
   }
   const bool affineMode = affine(f);
-  const uint32_t bits = affineMode ? quant_affine_bits(f) : 4, group = kQuantFormats[f].block_elements;
+  const uint32_t bits = affineMode ? quant_affine_bits(f) : f == MXFP8 ? 8 : 4, group = kQuantFormats[f].block_elements;
   const uint32_t groupBytes = group * bits / 8, rowCodes = K * bits / 8, groups = K / group;
   for (uint32_t r = 0; r < rows; ++r)
     for (uint32_t g = 0; g < groups; ++g) {
@@ -261,8 +271,10 @@ inline std::vector<uint8_t> mlxNative(Fmt f, uint32_t rows, uint32_t K, const st
       const size_t parameter = size_t(r) * groups + g;
       if (!affineMode) {
         native.push_back(scales[parameter]);
-        for (uint32_t j = 0; j < 16; ++j)
-          native.push_back(uint8_t(affineCode(codes, 4, j) | affineCode(codes, 4, j + 16) << 4));
+        if (f == MXFP8) native.insert(native.end(), codes, codes + groupBytes);
+        else
+          for (uint32_t j = 0; j < 16; ++j)
+            native.push_back(uint8_t(affineCode(codes, 4, j) | affineCode(codes, 4, j + 16) << 4));
         continue;
       }
       native.insert(native.end(), scales.begin() + 2 * parameter, scales.begin() + 2 * parameter + 2);
@@ -307,8 +319,8 @@ inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
     case IQ1S: case IQ1M: return std::uniform_real_distribution<float>(0.001f, 0.008f);
     case PQ20: case Q20: return std::uniform_real_distribution<float>(0.004f, 0.03f);
     // Tensor scales: an NVFP4 block's scale is 1 to 60 of them, and an E4M3 value at most 448.
-    case NVFP4: return std::uniform_real_distribution<float>(0.000008f, 0.00006f);
-    case FP8: return std::uniform_real_distribution<float>(0.00002f, 0.00012f);
+    case NVFP4: case NVFP464: return std::uniform_real_distribution<float>(0.000008f, 0.00006f);
+    case FP8: case MXFP8: return std::uniform_real_distribution<float>(0.00002f, 0.00012f);
     // The scale whose quantized values a 16-bit tensor's take (makeFloat16Native).
     case BF16: case F16: return std::uniform_real_distribution<float>(0.001f, 0.004f);
     case FMT_COUNT: break;
@@ -319,7 +331,7 @@ inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
 inline std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng) {
   std::uniform_real_distribution<float> range = scaleRange(f);
   if (affine(f)) return makeAffineNative(f, N, K, rng, [&] { return range(rng); });
-  if (f == NVFP4 || f == FP8) return makeFloatNative(f, N, K, rng, [&] { return range(rng); });
+  if (nvfp4(f) || f == FP8 || f == MXFP8) return makeFloatNative(f, N, K, rng, [&] { return range(rng); });
   return makeNative(f, N, K, rng, [&] { return f2h(range(rng)); });
 }
 
@@ -500,21 +512,21 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
       }
       packBits(lo, 2, p0); return;
     }
-    case NVFP4: {   // kFP4Values (twice E2M1) times (e4m3 / 2^8) (128 g), as the kernels round them
-      const float g = blockScale(blk, kNvfp4Scale);
+    case NVFP4: case NVFP464: {   // kFP4Values (twice E2M1) times (e4m3 / 2^8) (128 g), as the kernels round them
+      const float g = blockScale(blk, nvfp4Scale(f));
       for (int k = 0; k < 32; ++k) {
-        const uint8_t code = (blk[kNvfp4Codes + 16 * j + k / 2] >> (4 * (k % 2))) & 15;
+        const uint8_t code = (blk[nvfp4Codes(f) + 16 * j + k / 2] >> (4 * (k % 2))) & 15;
         lo[quant_slot(k)] = code;
         vals[k] = float(kFP4Values[code]) * (e4m3(blk[2 * j + k / 16]) / 256.0f * (128.0f * g));
       }
       packBits(lo, 4, p0); return;
     }
-    case FP8: {   // (e4m3 / 2^8) (256 g)
-      const float g = blockScale(blk, 0);
+    case FP8: case MXFP8: {   // (e4m3 / 2^8) (256 g), or (e4m3 / 2^8) 2^(e - 119)
+      const float s = f == FP8 ? 256.0f * blockScale(blk, 0) : std::ldexp(1.0f, int(blk[0]) - 119);
       for (int k = 0; k < 32; ++k) {
-        const uint8_t value = blk[kFp8Values + 32 * j + k];
+        const uint8_t value = blk[fi.meta_bytes + 32 * j + k];
         lo[quant_slot(k)] = value;
-        vals[k] = e4m3(value) / 256.0f * (256.0f * g);
+        vals[k] = e4m3(value) / 256.0f * s;
       }
       packBits(lo, 8, p0); return;
     }
@@ -630,7 +642,7 @@ inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
     case IQ1S: case Q40: case Q41: case Q50: case Q51: case MXFP4: case PQ20: case Q20:
       memcpy(dst, blk, fi.meta_bytes); return;
     case Q6K: memcpy(dst, blk + kQ6KScales, 16); memcpy(dst + 16, blk + kQ6KD, 2); dst[18] = dst[19] = 0; return;
-    case NVFP4: case FP8: memcpy(dst, blk, fi.meta_bytes); return;   // the scales and g, or g
+    case NVFP4: case NVFP464: case FP8: case MXFP8: memcpy(dst, blk, fi.meta_bytes); return;   // scales, g or e
     case Q3K: memcpy(dst, blk + kQ3KD, 2); dst[2] = dst[3] = 0; memcpy(dst + 4, blk + kQ3KScales, 12); return;
     case Q2K: memcpy(dst, blk + kQ2KD, 4); memcpy(dst + 4, blk, 16); return;
     case IQ1M: memcpy(dst, blk + kIQ1MScales, 8); return;

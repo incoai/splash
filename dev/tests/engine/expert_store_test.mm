@@ -162,13 +162,13 @@ StepPlan prefillStep(const MoeShape &shape, uint32_t rows) {
 // back to back as a GGUF holds them, and the two blocks of them a store
 // streams, two layers of a target.
 // Whether an MLX checkpoint stores rows of format f, as its planes.
-bool mlxFormat(int f) { return quant_affine_format(f) || f == MXFP4; }
+bool mlxFormat(int f) { return quant_affine_format(f) || f == MXFP4 || f == MXFP8; }
 
 // The planes an MLX checkpoint stores native rows of format f as, which
 // readSafetensorsRows interleaves back (model/GgufPreparation.cpp): an
 // affine group's codes, its bf16 scale and its bias; an MXFP4 block's codes
 // as MLX packs them (element e in bits 4 (e % 2) of byte e / 2) and its E8M0
-// scale.
+// scale; an MXFP8 block's E4M3 values and its E8M0 scale.
 std::array<std::vector<uint8_t>, 3> mlxPlanes(int f, const std::vector<uint8_t> &native) {
   const uint32_t block = kQuantFormats[f].block_bytes;
   std::array<std::vector<uint8_t>, 3> planes;
@@ -180,9 +180,13 @@ std::array<std::vector<uint8_t>, 3> mlxPlanes(int f, const std::vector<uint8_t> 
       planes[2].insert(planes[2].end(), blk + 2, blk + 4);
       continue;
     }
+    planes[1].push_back(blk[0]);
+    if (f == MXFP8) {
+      planes[0].insert(planes[0].end(), blk + 1, blk + block);
+      continue;
+    }
     // A native block_mxfp4's byte l holds element l (low nibble) and l + 16.
     const auto element = [&](uint32_t e) { return e < 16 ? blk[1 + e] & 15 : blk[1 + e - 16] >> 4; };
-    planes[1].push_back(blk[0]);
     for (uint32_t e = 0; e < 32; e += 2) planes[0].push_back(uint8_t(element(e) | element(e + 1) << 4));
   }
   return planes;
@@ -378,12 +382,13 @@ bool slotsHoldTheirExperts(const Model &m, const BlockMoeWeights &streamed, cons
 // A format of experts and whether an MLX checkpoint stores them (its stored planes) rather than a GGUF.
 using StreamedFormat = std::pair<int, bool>;
 // GGUF experts, then an MLX checkpoint's: affine gate and up in 4 bits in groups of 32 and of 64 (mlx-lm's
-// default), 3, 2 and 8 bits (and down in the next affine format that fits), and mxfp4's.
+// default), 3, 2 and 8 bits (and down in the next affine format that fits), mxfp4's and mxfp8's.
 int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory,
                     std::initializer_list<StreamedFormat> formatList = {
                         {IQ2S, false}, {IQ3S, false}, {IQ3XXS, false}, {Q4K, false}, {Q80, false}, {IQ4NL, false},
                         {MXFP4, false}, {Q20, false}, {GGUF_FMT_AF4G32, true}, {GGUF_FMT_AF4G64, true},
-                        {GGUF_FMT_AF3G64, true}, {GGUF_FMT_AF2G64, true}, {GGUF_FMT_AF8G32, true}, {MXFP4, true}}) {
+                        {GGUF_FMT_AF3G64, true}, {GGUF_FMT_AF2G64, true}, {GGUF_FMT_AF8G32, true}, {MXFP4, true},
+                        {MXFP8, true}}) {
   int failures = 0;
   uint64_t decodePrefetched = 0;
   for (const auto [f, mlx] : formatList) {

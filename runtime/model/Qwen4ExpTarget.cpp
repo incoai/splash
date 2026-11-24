@@ -79,7 +79,11 @@ Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetG
                                uint32_t prefillChunks)
     : QwenTarget(weights, geometry, backend, operators), weights_(weights),
       steps_(weights, geometry_, backend, prefillChunks) {
+  static_assert(Qwen4ExpLayout{}.relativeAttention().empty(),
+                "the layout states the attention its target's layers run");
   requireLayers(std::span<const Qwen4ExpLayerWeights>(weights.layers));
+  requireSharedAttention();
+  requireDraftRows(false, false);
 }
 
 QwenTargetScratchBytes Qwen4ExpTarget::allocatedScratchBytes() const noexcept { return steps_.allocatedBytes(); }
@@ -98,6 +102,7 @@ std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &
   const bool begins = !layers.first;
   for (uint32_t index = 0; index < steps.size(); ++index) {
     PrefillStep &step = steps[index];
+    planAttention(step);
     step.indexOffsets = offsets;
     if (const QwenTargetDecodeBuffers *d = step.decode) {
       // A decode step's inputs are its lanes' (prepareVerifyLane,

@@ -65,6 +65,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const FlintLayout &layout
   return loadFlintWeights(backend, layout, files);
 }
 
+TargetWeights readTarget(metal::MetalBackend &backend, const Inkling2LoopLayout &layout,
+                         const QwenTargetFiles &files) {
+  return loadInkling2LoopWeights(backend, layout, files);
+}
+
 } // namespace
 
 SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
@@ -99,11 +104,11 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
         table.readers = options.readers;
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout, table, experts);
+          SafetensorsTargetLoader loader(backend, images, directory, safetensorsTargetPlan(layout), table, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), ggufTargetPlan(layout), table,
                                   experts);
           return readTarget(backend, layout, std::ref(loader));
         }

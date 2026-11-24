@@ -71,18 +71,16 @@ const metal::MetalBuffer &epilogueInput(const LinearBuffers &b, LinearEpilogue e
                                               : b.gateScratch;
 }
 
-// The parameters and planes of a fused decode dispatch, which runs every
-// segment of a fused projection (qkv|z|ab, q|k|v) in one dispatch, over
-// `order`, the segments in dispatch order. Slots past the last segment take
-// no columns and bind its planes again.
-GgufDecodeFusedParams fusedSegments(const LinearPlan &plan, std::span<const QuantizedSegment *const> order,
-                                    std::vector<metal::MetalBuffer> &bindings) {
-  const LinearWorkload w = plan.workload();
-  if (order.size() > kFusedSegments || w.epilogue != LinearEpilogue::None)
+// The segment slots of a fused dispatch's parameters (GgufDecodeFusedParams,
+// GgufColumnFusedParams), which run every segment of a fused projection
+// (qkv|z|ab, q|k|v) in one dispatch, over `order`, the segments in dispatch
+// order, and their planes' bindings. Slots past the last segment take no
+// columns and bind its planes again.
+template <class Params>
+Params fusedSegments(Params params, const LinearPlan &plan, std::span<const QuantizedSegment *const> order,
+                     std::vector<metal::MetalBuffer> &bindings) {
+  if (order.size() > kFusedSegments || plan.workload().epilogue != LinearEpilogue::None)
     throw std::invalid_argument("a fused block projection takes at most three segments and no epilogue");
-  const LinearConfig config = plan.configuration();
-  GgufDecodeFusedParams params{w.matrix.inputSize, config.splits, w.matrix.outputSize,
-                               {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, config.spread};
   for (size_t i = 0; i < kFusedSegments; ++i) {
     const QuantizedSegment &s = *order[std::min(i, order.size() - 1)];
     if (i < order.size()) {
@@ -93,6 +91,30 @@ GgufDecodeFusedParams fusedSegments(const LinearPlan &plan, std::span<const Quan
     bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
   }
   return params;
+}
+// A fused decode dispatch's parameters on the staged or register tile.
+GgufDecodeFusedParams decodeFusedSegments(const LinearPlan &plan, std::span<const QuantizedSegment *const> order,
+                                          std::vector<metal::MetalBuffer> &bindings) {
+  const LinearWorkload w = plan.workload();
+  const LinearConfig config = plan.configuration();
+  return fusedSegments(GgufDecodeFusedParams{w.matrix.inputSize, config.splits, w.matrix.outputSize,
+                                             {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, config.spread},
+                       plan, order, bindings);
+}
+
+// A fused projection's segments in tile order: those with the most bytes per
+// tile first, so their threadgroups do not form the tail.
+std::vector<const QuantizedSegment *> heaviestFirst(const std::vector<QuantizedSegment> &segments) {
+  std::vector<const QuantizedSegment *> order;
+  for (const QuantizedSegment &s : segments) order.push_back(&s);
+  const auto bitsPerWeight = [](const QuantizedSegment &s) {
+    const QuantFormat &f = s.format();
+    return (f.plane0_bytes + f.plane1_bytes) * 8.0 / 32.0 + f.meta_bytes * 8.0 / (32.0 * f.meta_groups);
+  };
+  std::stable_sort(order.begin(), order.end(), [&](const QuantizedSegment *a, const QuantizedSegment *c) {
+    return bitsPerWeight(*a) > bitsPerWeight(*c);
+  });
+  return order;
 }
 
 // A single tensor's decode dispatches through `tensor(segment, epilogue
@@ -202,14 +224,18 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
       : LinearScratchSize{};
 }
 
-LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, const UnitFormats &unit) const {
+LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, const UnitFormats &unit,
+                                                uint32_t planOutputs) const {
   // Every format the register tile takes K inputs in has one register plan,
   // whose partitions keep whole coefficient units of each (kRegisterTiers);
   // a projection of segments the tile does not take has none. One lane on the
   // 16-row tile runs unsplit, without partials. An int8 form counts its row
-  // groups' counters (int8RowGroups).
+  // groups' counters (int8RowGroups). A projection side by side takes the
+  // configurations of one of its tensors over all its columns.
+  LinearWorkload selected = w;
+  if (planOutputs) selected.matrix.outputSize = planOutputs;
   LinearScratchSize size;
-  for (const LinearConfig &config : decodeConfigurations(calibration_, int8Activations_, step_, w, unit))
+  for (const LinearConfig &config : decodeConfigurations(calibration_, int8Activations_, step_, selected, unit))
     size.include(LinearPlan(w, config).scratchSize());
   return size;
 }
@@ -320,20 +346,11 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
               tileGrid(s.outputSize), {GGUF_STAGED_THREADS, 1, 1});
   };
   // A fused projection's segments in one dispatch (gguf_decode_fused_m*),
-  // in tile order: segments with the most bytes per tile first, so their
-  // threadgroups do not form the tail.
+  // in tile order (heaviestFirst).
   const auto fused = [&] {
-    std::vector<const QuantizedSegment *> order;
-    for (const QuantizedSegment &s : segments) order.push_back(&s);
-    const auto bitsPerWeight = [](const QuantizedSegment &s) {
-      const QuantFormat &f = s.format();
-      return (f.plane0_bytes + f.plane1_bytes) * 8.0 / 32.0 + f.meta_bytes * 8.0 / (32.0 * f.meta_groups);
-    };
-    std::stable_sort(order.begin(), order.end(), [&](const QuantizedSegment *a, const QuantizedSegment *c) {
-      return bitsPerWeight(*a) > bitsPerWeight(*c);
-    });
+    const std::vector<const QuantizedSegment *> order = heaviestFirst(segments);
     std::vector<metal::MetalBuffer> bindings{b.input};
-    const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
+    const GgufDecodeFusedParams params = decodeFusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
     if (config.decodeInt8) {
       // The int8 tiles take segments of one format, each format a kernel of its own, specialized to the dispatch's
@@ -503,7 +520,7 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     std::vector<const QuantizedSegment *> order;
     for (const QuantizedSegment &s : segments) order.push_back(&s);
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
-    const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
+    const GgufDecodeFusedParams params = decodeFusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
     graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params,
               {segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1}, {GGUF_REGISTER_THREADS, 1, 1});
@@ -524,14 +541,20 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
 }
 
 // One dispatch per tensor, a gate/up pair's both in one (onePassTensors), each
-// threadgroup 32 of the tensor's columns over the plan's rows.
+// threadgroup GGUF_COLUMN_COLUMNS of the tensor's columns over the plan's
+// rows; a fused projection's segments in one dispatch (gguf_column_fused), in
+// tile order (heaviestFirst), where they take no epilogue and write bf16, as
+// the staged tile runs them: a narrow segment alone runs a grid too small to
+// fill the GPU (Inkling-2-Mini's [384 x 2304] relative scores, 12
+// threadgroups, at half its queries' rate on a 16-core M5 Pro).
 void Linear::addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
                            const LinearPlan &plan, const Projection *gate) const {
   const LinearWorkload w = plan.workload();
+  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   const auto add = [&](std::string name, std::vector<metal::MetalBuffer> bindings, const QuantizedSegment &s) {
     graph.add(std::move(name), std::move(bindings),
               GgufColumnParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, s.columnOffset, s.formatId},
-              {s.outputSize / 32, 1, 1}, {GGUF_COLUMN_THREADS, 1, 1});
+              {s.outputSize / GGUF_COLUMN_COLUMNS, 1, 1}, {GGUF_COLUMN_THREADS, 1, 1});
   };
   if (gate) {
     const auto [g, u] = onePassTensors(p, *gate);
@@ -539,7 +562,17 @@ void Linear::addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &b, c
         u);
     return;
   }
-  for (const QuantizedSegment &s : p.blocks().segments) {
+  if (segments.size() > 1 && w.epilogue == LinearEpilogue::None && plan.destination() == FloatOutput::BFloat16) {
+    std::vector<metal::MetalBuffer> bindings{b.input};
+    const GgufColumnFusedParams params = fusedSegments(
+        GgufColumnFusedParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, plan,
+        heaviestFirst(segments), bindings);
+    bindings.push_back(b.output);
+    graph.add("gguf_column_fused", std::move(bindings), params, {segmentColumns(p) / GGUF_COLUMN_COLUMNS, 1, 1},
+              {GGUF_COLUMN_THREADS, 1, 1});
+    return;
+  }
+  for (const QuantizedSegment &s : segments) {
     if (w.epilogue == LinearEpilogue::Residual) {
       add("gguf_column_r", {b.input, s.plane0, s.plane1Slot(), s.meta, b.output, b.residual}, s);
       continue;
