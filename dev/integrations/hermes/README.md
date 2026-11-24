@@ -47,3 +47,37 @@ Run the focused tests from the Splash checkout.
 ```sh
 python3 -m unittest discover -s dev/integrations/hermes
 ```
+
+## Qualification on Apple Silicon
+
+These measurements used a signed Splash 1.7.1-based Coder IQ1_M deployment
+on an M5 Max with 96 GiB of engine memory and a 512 GiB persistent cache.
+The branch is based on Splash 1.7.2. Model performance numbers below describe
+the tested 1.7.1-based runtime.
+
+| Comparison | Metric | Control | Candidate |
+| --- | --- | ---: | ---: |
+| Shared repo prefix, four agents and two matched rounds | Verified fixes/min, including seed time | 2.54 | 4.19 |
+| Shared repo prefix, four agents and two matched rounds | Initial p95 time to first tool call | 69.61 s | 23.31 s |
+| Shared repo prefix, four agents and two matched rounds | Held-back task passes | 7/8 | 7/8 |
+| Bounded reads with a shared prefix, two large-file tasks | Follow-up p95 TTFT | 3.29 s | 1.63 s |
+| Bounded reads with a shared prefix, two large-file tasks | Held-back task passes | 2/2 | 2/2 |
+
+The cache comparison used the same prompt content and tool definitions for
+both arms. Each cold agent used its own cache namespace. The shared arm
+seeded the common snapshot once per wave. Seven of its eight starts restored
+from memory and one restored from SSD. The two-task read comparison changed
+only the bounded-read policy. Both used independent graders on temporary
+repository copies. These are small workload-specific samples.
+
+A separate 48-line first-window cap was tested with four concurrent agents,
+four tasks per wave and reversed order in the second round. Both arms passed
+8/8 independent checks, but follow-up p95 TTFT increased from 2.04 s to 4.51 s
+and verified fixes/min including seed time decreased from 6.12 to 5.32.
+The cap remains outside this integration. The measured TTFT includes engine
+admission wait. The benchmark did not include an external queue hop.
+
+The upstream-based branch passed the focused plugin tests, Ruff, and all
+488 integrated engine tests, including shared-head checkpoint and
+persistent-cache cases. The installed Hermes runtime also exercised the
+plugin middleware and read fallback in an isolated profile.
