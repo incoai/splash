@@ -1539,6 +1539,31 @@ class InklingServingTests(fixtures.HarnessTestCase):
             **options,
         )
 
+    def test_the_started_record_leaves_thinking_to_the_model(self):
+        # Inkling 2 opens its own reasoning, at every effort: no prompt opens
+        # it, so the Started line names none, where it read "thinking off".
+        records = []
+        harness = self.harness(
+            fixtures.Plan(self.REASONED),
+            fixtures.Plan(self.REASONED),
+            request_logger=records.append,
+        )
+        for body in (
+            fixtures.chat_body(),
+            fixtures.chat_body(reasoning_effort="none"),
+        ):
+            status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+            self.assertEqual(status, 200, payload)
+            message = json.loads(payload)["choices"][0]["message"]
+            self.assertEqual(message["reasoning_content"], "Check.")
+        started = [record for record in records if record["outcome"] == "started"]
+        self.assertEqual(
+            [record["reasoning"]["thinking"] for record in started], [None, None]
+        )
+        self.assertEqual(
+            [record["reasoning"]["effort"] for record in started], [None, "none"]
+        )
+
     def test_chat_completions_read_the_reasoning_and_the_answer(self):
         harness = self.harness(
             fixtures.Plan(self.REASONED), fixtures.Plan(self.REASONED)

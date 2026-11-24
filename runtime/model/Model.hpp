@@ -169,9 +169,11 @@ struct ModelRequest final {
 
 // One image in the prompt: the run of placeholder tokens it occupies (one per
 // merged 2x2 patch group, row-major over the merged grid), the patch grid of
-// the image's resized pixels, and a 128-bit digest of that content.
-// Placeholder token ids are identical for every image, so cache identity keys
-// on the digest as well as the tokens.
+// the image's prepared pixels, in patches of the model's tower's side
+// (ModelCapabilities::imagePatchPixels), the image's own pixels at its top
+// left, before the padding to that grid (zero: the whole grid), and a 128-bit
+// digest of that content. Placeholder token ids are identical for every
+// image, so cache identity keys on the digest as well as the tokens.
 struct ImageSpan final {
   uint32_t offset = 0;
   uint32_t tokens = 0;
@@ -179,13 +181,15 @@ struct ImageSpan final {
   uint32_t gridWidth = 0;
   uint64_t digestLo = 0;
   uint64_t digestHi = 0;
+  uint32_t contentHeight = 0;
+  uint32_t contentWidth = 0;
 
   [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
   [[nodiscard]] ops::ImageGrid grid() const noexcept {
-    return {gridHeight, gridWidth};
+    return {gridHeight, gridWidth, contentHeight, contentWidth};
   }
-  [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return grid().pixelBytes();
+  [[nodiscard]] uint64_t pixelBytes(uint32_t patchPixels) const noexcept {
+    return grid().pixelBytes(patchPixels);
   }
   bool operator==(const ImageSpan &) const = default;
 };
@@ -193,10 +197,10 @@ struct ImageSpan final {
 // The first rule a request's image spans break, or none: each covers a valid
 // grid within the patch limit with one token per merged patch group, the
 // runs are sorted, disjoint and inside the prompt, and the pixels are the
-// grids' own.
+// grids' own, in patches of `patchPixels` a side.
 [[nodiscard]] inline std::optional<std::string_view>
 imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
-                          uint64_t pixelBytes) noexcept {
+                          uint64_t pixelBytes, uint32_t patchPixels) noexcept {
   uint64_t previousEnd = 0;
   uint64_t gridPixelBytes = 0;
   for (const ImageSpan &span : spans) {
@@ -205,13 +209,16 @@ imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
       return "image grid must be even-sided and within the patch limit";
     if (span.tokens != grid.mergedTokens())
       return "image span tokens must equal the merged grid size";
+    if (uint64_t{span.contentHeight} > uint64_t{span.gridHeight} * patchPixels ||
+        uint64_t{span.contentWidth} > uint64_t{span.gridWidth} * patchPixels)
+      return "image content must lie inside its grid";
     const uint64_t end = uint64_t{span.offset} + span.tokens;
     if (span.offset < previousEnd || end > promptTokens) {
       return "image spans must be sorted, non-overlapping runs inside the "
              "prompt";
     }
     previousEnd = end;
-    gridPixelBytes += grid.pixelBytes();
+    gridPixelBytes += grid.pixelBytes(patchPixels);
   }
   if (pixelBytes != gridPixelBytes)
     return "image pixels do not match the image grids";
@@ -538,6 +545,9 @@ struct ModelCapabilities final {
   uint32_t maximumContextTokens = 0;
   // Set for a block-sparse target.
   std::optional<SparseKvShape> sparseKv;
+  // The side of the square pixel patches of an image's grid (ImageSpan): its
+  // vision tower's (ops::VisionLayout::patchSize).
+  uint32_t imagePatchPixels = ops::kImagePatchPixels;
 };
 
 // A tier copy of one block's page, as reads of spilled K/V reach it on any

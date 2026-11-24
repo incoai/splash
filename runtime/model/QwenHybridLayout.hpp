@@ -8,6 +8,7 @@
 #include "ops/PagedKv.hpp"
 #include "ops/RelativeAttention.hpp"
 #include "ops/StopTokens.hpp"
+#include "ops/Vision.hpp"
 
 #include <array>
 #include <cmath>
@@ -284,6 +285,9 @@ struct QwenTargetDimensions {
 // tests take the families' attention kernels from it.
 struct QwenHybridLayout : QwenTargetDimensions {
   static constexpr bool flatConfig = false;
+  // The vision tower of the family's models, which an installation loads
+  // unless it serves text only.
+  static constexpr ops::VisionTower visionTower = ops::VisionTower::Qwen;
 
   // The family's name, as the installer pairs its draft (install/families.py).
   std::string_view family;

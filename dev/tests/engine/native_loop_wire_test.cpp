@@ -849,7 +849,7 @@ void testImageRequestBeyondVisionStaysRequestScoped() {
     loop.announceReady(protocol::peer::kTestReady);
     auto image = request(9);
     image.imageSpans = {{8, 16, 8, 8, 1, 2}};
-    image.imagePixels.assign(image.imageSpans[0].pixelBytes(), 1);
+    image.imagePixels.assign(image.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels), 1);
     for (const protocol::RequestFrame &frame : {image, request(1)}) {
       require(loop.receive(protocol::peer::serialize(frame)),
               "image request closed the native connection");

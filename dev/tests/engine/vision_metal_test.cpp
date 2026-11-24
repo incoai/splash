@@ -48,7 +48,7 @@ void run(metal::MetalBackend &backend) {
   model.mergerNorm = norm;
   model.mergerUpProjection = affine(merged, merged);
   model.mergerDownProjection = affine(layout.outputHiddenSize, merged);
-  const metal::MetalBuffer pixels = test::sharedBuffer(backend, kGrid.pixelBytes());
+  const metal::MetalBuffer pixels = test::sharedBuffer(backend, kGrid.pixelBytes(layout.patchSize));
   const metal::MetalBuffer embeddings = test::sharedBuffer(
       backend, uint64_t{kGrid.mergedTokens()} * layout.outputHiddenSize * kBf16Bytes);
   const auto encode = [&](metal::CommandGraph &graph, const VisionWeights &weights, const metal::MetalBuffer &image,
@@ -114,7 +114,7 @@ void run(metal::MetalBackend &backend) {
                   "a tower of " + std::to_string(depth) + " blocks was accepted");
   }
 
-  requireExtent(backend, pixels, kGrid.pixelBytes(), 1, "image pixel",
+  requireExtent(backend, pixels, kGrid.pixelBytes(layout.patchSize), 1, "image pixel",
                 [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
                   encode(graph, model, view, embeddings);
                 });

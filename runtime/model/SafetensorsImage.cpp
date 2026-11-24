@@ -327,15 +327,18 @@ private:
   }
 
   // A FloatTensor section [rows, columns]: its source's F32 or BF16 rows as
-  // stored after their descriptor, or the F32 values of a transposed source.
+  // stored after their descriptor (a widened source's BF16 rows as F32), or
+  // the F32 values of a transposed source.
   void sectionFloatTensor(const SectionSource &source, uint64_t rows, uint64_t columns) {
     const TensorRows part = floatSourceRows(source);
     const uint64_t partColumns = part.imageRowBytes() / valueBytes(part);
     if (source.transposed ? part.rows != columns || partColumns != rows : part.rows != rows || partColumns != columns)
       throw WeightStoreError("source tensor type or shape does not match: " + source.name);
-    const uint32_t type = source.transposed ? ggml::kF32 : part.type;
+    const uint32_t type = source.transposed || source.widened ? ggml::kF32 : part.type;
     image_.descriptor(type, rows, columns, {}, {rows * columns * (type == ggml::kF32 ? 4 : 2), 0, 0}, source.name);
-    image_.copy(part, source.transposed ? Conversion::TransposeToFloat32 : Conversion::None);
+    image_.copy(part, source.transposed  ? Conversion::TransposeToFloat32
+                      : type != part.type ? Conversion::WidenToFloat32
+                                          : Conversion::None);
   }
 
   // A FloatTensor section [rows, columns] of its source's rows of a module

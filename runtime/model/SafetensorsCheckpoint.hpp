@@ -4,7 +4,9 @@
 
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace splash::model {
 
@@ -19,6 +21,8 @@ public:
   ~SafetensorsCheckpoint();
   [[nodiscard]] const SourceTensor *find(std::string_view name) const noexcept;
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;
+  // The names of its tensors that start with prefix, in order.
+  [[nodiscard]] std::vector<std::string> names(std::string_view prefix) const;
   void checkUnchanged() const;
 private:
   struct Impl;

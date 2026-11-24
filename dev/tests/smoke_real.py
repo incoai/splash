@@ -288,7 +288,7 @@ def answer_text(chat: dict) -> str:
     ).lower()
 
 
-def run_images(port: int, model: str, nonce: str) -> None:
+def run_images(port: int, model: str, nonce: str, switch: bool = True) -> None:
     # More than a block of tokens follows the image, so the replay point a
     # repeat restores lies past it.
     question = (
@@ -296,13 +296,17 @@ def run_images(port: int, model: str, nonce: str) -> None:
         "word naming the color, with no punctuation, explanation or other words. "
         f"Request {nonce}."
     )
+    # Room for the reasoning of a model that reasons whatever it is asked.
+    limit = output_limit(32, switch)
     code, start = request(port, "GET", "/status")
     require(code == 200 and "images" in start, "status lacks image telemetry")
     code, red = request(
         port,
         "POST",
         "/v1/chat/completions",
-        image_chat_body(model, question, image_data_url("red")),
+        image_chat_body(
+            model, question, image_data_url("red"), max_completion_tokens=limit
+        ),
     )
     require(code == 200, f"image Chat failed with HTTP {code}: {red!r}")
     require("red" in answer_text(red), f"red image was not described as red: {red!r}")
@@ -331,7 +335,9 @@ def run_images(port: int, model: str, nonce: str) -> None:
         port,
         "POST",
         "/v1/chat/completions",
-        image_chat_body(model, question, image_data_url("red")),
+        image_chat_body(
+            model, question, image_data_url("red"), max_completion_tokens=limit
+        ),
     )
     require(
         code == 200 and "red" in answer_text(repeat), "repeated image request failed"
@@ -350,7 +356,9 @@ def run_images(port: int, model: str, nonce: str) -> None:
         f"a prefix covering the image used its rows: {before['images']} -> "
         f"{after['images']}",
     )
-    body = image_chat_body(model, question, image_data_url("red"))
+    body = image_chat_body(
+        model, question, image_data_url("red"), max_completion_tokens=limit
+    )
     body["messages"].insert(
         0, {"role": "system", "content": "You describe images for a test."}
     )
@@ -378,7 +386,9 @@ def run_images(port: int, model: str, nonce: str) -> None:
         port,
         "POST",
         "/v1/chat/completions",
-        image_chat_body(model, question, image_data_url("blue")),
+        image_chat_body(
+            model, question, image_data_url("blue"), max_completion_tokens=limit
+        ),
     )
     require(code == 200, f"blue image Chat failed with HTTP {code}")
     require(
@@ -425,7 +435,7 @@ def run_images(port: int, model: str, nonce: str) -> None:
                     ],
                 }
             ],
-            "max_tokens": 32,
+            "max_tokens": limit,
             "temperature": 0,
             "thinking": {"type": "disabled"},
         },
@@ -457,7 +467,7 @@ def run_images(port: int, model: str, nonce: str) -> None:
             ],
             # Responses requests reason by default, and the thinking before
             # the one-word answer can take more than 256 tokens.
-            "max_output_tokens": 1024,
+            "max_output_tokens": output_limit(1024, switch),
             "temperature": 0,
             "store": False,
         },
@@ -916,7 +926,7 @@ def run(port: int, model: str) -> None:
     run_sampling(port, model, switch)
     vision = "image" in modalities
     if vision:
-        run_images(port, model, nonce)
+        run_images(port, model, nonce, switch)
     else:
         run_text_only(port, model, nonce)
     run_protocol_extensions(port, model, vision, switch)

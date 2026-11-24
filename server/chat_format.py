@@ -352,7 +352,8 @@ INKLING2 = ChatFormat(
     ),
     message_boundary="<|end_message|>",
     turn_openings=("<|message_user|>", "<|message_model|>", "<|message_tool|>"),
-    # Its vision tower is not served yet; its template writes an image as
-    # <|content_image|><|unused_200054|>.
-    image_pad=None,
+    # Its template writes an image as <|content_image|><|unused_200054|>, the
+    # placeholder one of the image's tokens, which preparation widens to all
+    # of them (server/images.py prepare_inkling).
+    image_pad="<|unused_200054|>",
 )

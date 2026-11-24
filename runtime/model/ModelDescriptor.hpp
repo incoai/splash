@@ -135,4 +135,14 @@ inspectSourceConfiguration(std::string_view targetFormat, std::string_view visio
                            const std::optional<std::filesystem::path> &ggufHeaders,
                            const std::optional<std::filesystem::path> &draft);
 
+// Prepares once the image of the vision tower that an upstream model's
+// configuration describes (inspectSourceConfiguration's arguments but the
+// headers and draft): written from its source in root's vision/ as every
+// start writes it, then freed. A tower whose files preparation refuses, one
+// quantized or of a weight not exactly a BF16, is so refused at installation,
+// which runs it once the tower downloaded (the engine's vision-check
+// command), instead of at every start.
+void checkVisionSource(std::string_view targetFormat, std::string_view visionFormat,
+                       const std::filesystem::path &config, const std::filesystem::path &root);
+
 } // namespace splash::model

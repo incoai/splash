@@ -1,13 +1,21 @@
 #include "model/VisionLoader.hpp"
 #include "metal/abi/Vision.h"
 #include "model/GgufFile.hpp"
+#include "model/InklingVision.hpp"
+#include "model/QwenVision.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/VisionPreparation.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <sys/mman.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <functional>
+#include <memory>
 #include <set>
+#include <system_error>
 
 namespace splash::model {
 namespace {
@@ -15,8 +23,9 @@ namespace {
 using vision::Plan;
 using vision::Section;
 
-// The sections of layout, in file order, placed after the header block.
-Plan plan(const ops::VisionLayout &l) {
+// The sections of a Qwen tower's layout, in file order, placed after the
+// header block.
+Plan qwenPlan(const ops::VisionLayout &l) {
   Plan result{l.depth, l.patchSize, 0, {}};
   auto &sections = result.sections;
   const auto add = [&](std::string mlx, std::string gguf, uint32_t rows, uint32_t columns = 1,
@@ -156,6 +165,11 @@ void bindMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Plan &pla
                            gguf.source().path().string() + ")");
 }
 
+// The sections of the layout's tower's image.
+Plan plan(const ops::VisionLayout &layout) {
+  return layout.tower == ops::VisionTower::Inkling ? inklingVisionPlan(layout) : qwenPlan(layout);
+}
+
 } // namespace
 
 // The source and the plan bound to it, which the image's writer shares.
@@ -176,12 +190,16 @@ VisionLoader::VisionLoader(const std::filesystem::path &directory, VisionSource 
   auto planned = std::make_shared<Planned>();
   planned->layout = layout;
   planned->plan = plan(layout);
+  const bool inkling = layout.tower == ops::VisionTower::Inkling;
   if (source == VisionSource::Safetensors) {
     planned->checkpoint = std::make_unique<SafetensorsCheckpoint>(directory);
-    bindCheckpoint(*planned->checkpoint, layout, planned->plan);
+    if (inkling) bindInklingCheckpoint(*planned->checkpoint, layout, planned->plan);
+    else bindCheckpoint(*planned->checkpoint, layout, planned->plan);
   } else if (source == VisionSource::Gguf) {
     planned->mmproj = std::make_unique<WeightSource>(directory / "mmproj.gguf");
-    bindMmproj(GgufFile(*planned->mmproj), layout, planned->plan);
+    const GgufFile mmproj(*planned->mmproj);
+    if (inkling) bindInklingMmproj(mmproj, layout, planned->plan);
+    else bindMmproj(mmproj, layout, planned->plan);
   } else {
     throw WeightStoreError("only MLX and GGUF vision sources are written into images");
   }
@@ -200,19 +218,47 @@ ImagePlan VisionLoader::image() const {
           }};
 }
 
+void VisionLoader::check() const {
+  const ImagePlan plan = image();
+  const uint64_t bytes = plan.bytes;
+  void *memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+  if (memory == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "cannot map the vision image");
+  const std::unique_ptr<void, std::function<void(void *)>> mapped(memory, [bytes](void *m) { munmap(m, bytes); });
+  plan.write(std::span<uint8_t>(static_cast<uint8_t *>(memory), bytes), {});
+}
+
 uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
 
+VisionTowerWeights loadVisionTowerWeights(metal::MetalBackend &backend, WeightImages &images,
+                                          const VisionLoader &source) {
+  const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
+  const ops::VisionLayout &layout = source.layout();
+  VisionTowerWeights result;
+  WeightFile file = images.load(source.image());
+  result.tensors = layout.tower == ops::VisionTower::Inkling ? readInklingVision(file, layout)
+                                                             : readQwenVision(file, layout);
+  file.finish();
+  result.files.push_back(file.record());
+  result.actualAllocatedBytes =
+      metal::allocationDelta(allocationBaseline, backend.memoryStats().allocatedBytes);
+  return result;
+}
+
 // The writer relies on the patch embedding's width, two frames of RGB
-// patches, and on padding that only adds rows or columns.
+// patches for a Qwen tower and one of Inkling's, whose stored width only
+// adds zero columns, and on padding that only adds rows or columns.
 void requireVisionLayout(const ops::VisionLayout &layout) {
+  const uint32_t frames = layout.tower == ops::VisionTower::Inkling ? 1 : 2;
   if (!layout.depth || !layout.hiddenSize || !layout.patchDimension || !layout.intermediateSize ||
       !layout.paddedIntermediateSize || !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||
       !layout.headDimension || !layout.positionGridSide || !layout.patchSize || !layout.spatialMerge ||
       layout.heads * layout.headDimension != layout.hiddenSize ||
       layout.paddedIntermediateSize < layout.intermediateSize ||
       layout.mergedHiddenSize != layout.hiddenSize * layout.spatialMerge * layout.spatialMerge ||
-      layout.patchDimension != 3 * 2 * layout.patchSize * layout.patchSize)
-    throw WeightStoreError("Qwen vision layout is inconsistent");
+      layout.patchDimension != 3 * frames * layout.patchSize * layout.patchSize ||
+      layout.paddedPatchDimension < layout.patchDimension ||
+      (layout.tower == ops::VisionTower::Qwen && layout.paddedPatchDimension != layout.patchDimension))
+    throw WeightStoreError("vision layout is inconsistent");
 }
 
 } // namespace splash::model

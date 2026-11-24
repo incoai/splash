@@ -1347,6 +1347,38 @@ struct ModelFamilyTests {
         #expect(Array(runtime.removeCommand("a/b:Q4").suffix(3)) == ["--model", "a/b:Q4", "remove"])
     }
 
+    /// An installation made text only before Splash served its family's images awaits its vision
+    /// tower, which an update takes in: its record names no tower and no reason, its family serves
+    /// images, and Text only is off. One whose repository has no tower Splash serves
+    /// (`vision_unavailable`), one that has its tower and one of a family without vision do not.
+    @Test func anInstallationMadeBeforeItsFamilyServedImagesAwaitsItsTower() async throws {
+        let fake = try FakeRuntime("splash-families", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let runtime = Runtime(root: fake.root)
+        try #"print('{"Inkling-2-Mini": {"unusable": []}, "Flint": {"unusable": ["--language-only"]}}')"#
+            .write(to: runtime.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
+        func record(_ model: String, family: String, _ vision: String) throws {
+            let folder = runtime.models.appending(path: model)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try #"{"model": "\#(model)", "family": "\#(family)", "files": {}, \#(vision)}"#
+                .write(to: folder.appending(path: "model.json"), atomically: true, encoding: .utf8)
+        }
+        try record("a/Inkling-GGUF:Q4", family: "Inkling-2-Mini", #""vision_format": "none""#)
+        try record("b/Inkling-GGUF:Q4", family: "Inkling-2-Mini",
+                   #""vision_format": "none", "vision_unavailable": "its repository holds no projector""#)
+        try record("c/Inkling-GGUF:Q4", family: "Inkling-2-Mini", #""vision_format": "gguf""#)
+        try record("d/Flint-GGUF:Q4", family: "Flint", #""vision_format": "none""#)
+        #expect(runtime.installedModels().filter(\.towerless).map(\.id) == ["a/Inkling-GGUF:Q4", "d/Flint-GGUF:Q4"])
+        let state = fake.state()
+        defer { state.quit() }
+        await state.launch()
+        #expect(state.installed.count == 4)
+        #expect(state.awaitingVision.map(\.id) == ["a/Inkling-GGUF:Q4"])
+        await Snapshot.save("server-awaiting-vision", MainView().environment(state))
+        state.options["--language-only"] = "true"
+        #expect(state.awaitingVision.isEmpty)
+    }
+
     @Test func theRuntimeReportsWhatEachFamilyMakesOfTheOptions() async throws {
         let fake = try FakeRuntime("splash-families", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }

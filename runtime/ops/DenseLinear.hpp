@@ -11,16 +11,20 @@ namespace splash::ops {
 
 // A dense projection as its checkpoint stores it: bf16 weights
 // [outputs][inputs] and a bf16 bias of every output, zeros for a projection
-// stored without one.
+// stored without one; and, for one whose output a LayerScale multiplies
+// (Inkling 2's tower), that scale of every output, bf16, which the
+// ScaledResidual epilogue reads.
 struct DenseWeights final {
   metal::MetalBuffer weight;
   metal::MetalBuffer bias;
+  metal::MetalBuffer scale{};
 };
 
 // What a projection does with each sum plus its bias: stores it, or its
-// GELU in the tanh or erf form, as bf16; or adds it to the fp32 rows it
-// stores into, a residual stream updated in place.
-enum class DenseEpilogue : uint8_t { None, GeluTanh, GeluErf, Residual };
+// GELU in the tanh or erf form, as bf16; or adds it, as it is or times its
+// output's scale (ScaledResidual), to the fp32 rows it stores into, a
+// residual stream updated in place.
+enum class DenseEpilogue : uint8_t { None, GeluTanh, GeluErf, Residual, ScaledResidual };
 
 // Dense projections on the tile the device's KernelCalibration picks for
 // each one's grid (DenseLinear.cpp).
@@ -39,7 +43,8 @@ public:
   // the weights: an output size of a whole kOutputMultiple and an input size
   // of a whole kInputMultiple (the kernels compute whole tiles and K chunks
   // and would leave the rest out), outputSize x inputSize bf16 weights and
-  // outputSize bf16 biases. Throws, naming `name`, otherwise.
+  // outputSize bf16 biases, and scales if it has any. Throws, naming `name`,
+  // otherwise.
   static void requireWeights(const DenseWeights &weights, uint32_t outputSize, uint32_t inputSize,
                              const std::string &name);
   // output[r] = epilogue(input[r] weight^T + bias) for the rows r < rows of

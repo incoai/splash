@@ -6,12 +6,22 @@
 
 namespace splash::model {
 
-// The bf16 bits of value when it is exactly a bf16: preparation never rounds
-// a weight.
+// The bf16 bits of value when it is exactly a bf16: preparation rounds no F32
+// or F16 weight.
 [[nodiscard]] inline std::optional<uint16_t> exactBfloat16(float value) {
   const auto bits = std::bit_cast<uint32_t>(value);
   if (bits & 0xFFFFu) return std::nullopt;
   return static_cast<uint16_t>(bits >> 16);
+}
+
+// The bf16 nearest value (ties to even), for a finite value. Preparation
+// rounds two things with it: a vision tower's Q8_0 weight, its scale times its
+// quant, which a GPU product of bf16 operands would round as it read it anyway
+// (model/VisionPreparation.cpp), and the scale and bias of a group of 64 it
+// quantizes to 4 bits (model/GgufPreparation.cpp).
+[[nodiscard]] inline uint16_t roundBfloat16(float value) {
+  const auto bits = std::bit_cast<uint32_t>(value);
+  return static_cast<uint16_t>((bits + 0x7FFFu + (bits >> 16 & 1u)) >> 16);
 }
 
 // The float a bf16's bits hold.

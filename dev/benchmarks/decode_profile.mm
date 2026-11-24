@@ -214,27 +214,27 @@ void profileImages(metal::MetalBackend &backend,
     throw std::invalid_argument("the model has no vision role");
   model::WeightImages images(backend, descriptor.sourceIdentity);
   const auto loader = model::planVisionLoader(root, descriptor);
-  const model::QwenVisionWeights vision =
+  const model::VisionTowerWeights vision =
       model::loadVisionWeights(backend, images, loader.get());
   uint64_t largest = 0;
   for (const ops::ImageGrid &grid : grids)
     largest = std::max(largest, grid.patches());
-  const ops::Vision encoder(backend, vision.tensors,
-                            static_cast<uint32_t>(largest));
+  const auto encoder = ops::ImageEncoder::make(backend, vision.tensors, static_cast<uint32_t>(largest));
+  const uint32_t patch = vision.tensors.layout.patchSize;
 
   for (const ops::ImageGrid &grid : grids) {
     // Gradients along both axes and a checkerboard of patch-sized squares.
     const metal::MetalBuffer pixels = backend.allocateBuffer(
-        grid.pixelBytes(), metal::BufferStorage::Shared, "image pixels");
-    const uint32_t height = grid.height * ops::kImagePatchPixels;
-    const uint32_t width = grid.width * ops::kImagePatchPixels;
+        grid.pixelBytes(patch), metal::BufferStorage::Shared, "image pixels");
+    const uint32_t height = grid.height * patch;
+    const uint32_t width = grid.width * patch;
     auto *pixel = static_cast<uint8_t *>(pixels.contents());
     for (uint32_t y = 0; y < height; ++y) {
       for (uint32_t x = 0; x < width; ++x, pixel += ops::kImageChannels) {
         pixel[0] = static_cast<uint8_t>(x * 255 / width);
         pixel[1] = static_cast<uint8_t>(y * 255 / height);
         pixel[2] = static_cast<uint8_t>(
-            (x / ops::kImagePatchPixels + y / ops::kImagePatchPixels) % 2 * 255);
+            (x / patch + y / patch) % 2 * 255);
       }
     }
     const metal::MetalBuffer embeddings = backend.allocateBuffer(
@@ -243,7 +243,7 @@ void profileImages(metal::MetalBackend &backend,
         metal::BufferStorage::Private, "image embeddings");
     const auto encode = [&] {
       metal::CommandGraph graph;
-      encoder.encode(graph, grid, pixels, embeddings);
+      encoder->encode(graph, grid, pixels, embeddings);
       return backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds;
     };
 

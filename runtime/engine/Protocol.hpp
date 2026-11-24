@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 15;
+inline constexpr uint16_t kProtocolVersion = 16;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -115,6 +115,7 @@ struct ProtocolLimits {
   uint32_t maxSimulationTokens = 32;
   uint32_t maxMaskWords = 1U << 20;
   uint32_t maxImageSpans = 64;
+  uint32_t imagePatchPixels = ops::kImagePatchPixels; // the side of a grid's patch (ImageSpan)
 };
 
 [[nodiscard]] std::optional<ProtocolIssue>
@@ -139,8 +140,10 @@ validateLimits(const ProtocolLimits &limits);
 //  106 u32 thinking end token count, u32 thinkingBudget.alsoEnds, zero
 //      without a budget
 //  114 u32 headTokens
-// then the prompt tokens, the 32-byte image spans, the image pixels, the
-// score tokens and the thinking end tokens.
+// then the prompt tokens, the 40-byte image spans (u32 offset, tokens, grid
+// height and width in patches, content height and width in pixels, u64 digest
+// low and high halves), the image pixels, the score tokens and the thinking
+// end tokens.
 inline constexpr uint64_t kRequestFixedBytes = 118;
 inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
 // A thinking budget's end holds 1 to this many tokens.
@@ -163,8 +166,8 @@ struct RequestFrame {
 
   uint32_t logicalMaxOutputTokens = 0;
   std::vector<uint32_t> promptTokens;
-  // Sorted, non-overlapping image spans and their resized uint8 RGB pixels,
-  // concatenated in span order (gridHeight*16 x gridWidth*16 x 3 each).
+  // Sorted, non-overlapping image spans and their prepared uint8 RGB pixels,
+  // concatenated in span order (each its grid's patches, imagePatchPixels).
   // Both are empty for text-only requests.
   std::vector<ImageSpan> imageSpans;
   std::vector<uint8_t> imagePixels;

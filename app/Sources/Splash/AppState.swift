@@ -750,6 +750,17 @@ final class AppState {
         installer.install(model, .check, textOnly: settings(for: model).textOnly)
     }
 
+    /// The models installed text only, Text only off, whose family serves images: installations
+    /// made before Splash served them (Inkling-2-Mini's before 1.7.3). A check for updates takes
+    /// the vision tower in, as a start that reaches the Hub does (`_lacks_tower` in
+    /// `install/upstream.py`); the app's starts ask the Hub nothing (`--offline`).
+    var awaitingVision: [InstalledModel] {
+        installed.filter { model in
+            model.towerless && !model.textOnly && !settings(for: model.id).textOnly
+                && model.family.flatMap { families[$0] }?.uses("--language-only") == true
+        }
+    }
+
     func isInstalled(_ model: String) -> Bool {
         installed.contains { $0.id == model }
     }

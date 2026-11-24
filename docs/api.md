@@ -610,10 +610,24 @@ call starts the same way.
 
 Images arrive inline as base64 `data:` URLs: Chat `image_url` parts, Responses
 `input_image` items and Messages `image` blocks with a `base64` source; an image
-URL to fetch returns 400. JPEG, PNG, WebP and GIF decode. An image file may
-hold up to 32 MiB and 33,554,432 pixels, with an aspect ratio up to 200:1, and
-is resized to at most `--max-image-pixels` (4,194,304 by default). A request
-carries at most 64 images, PDF pages included.
+URL to fetch returns 400. JPEG, PNG, WebP and GIF decode; any other image, or
+one cut short, returns 400 `Could not process image`, the words of Anthropic's
+API, on which Claude Code takes the image out of the conversation and goes on.
+An image file may hold up to 32 MiB and 33,554,432 pixels, with an aspect ratio
+up to 200:1, and is resized to at most `--max-image-pixels` (4,194,304 by
+default). Inkling 2
+takes an image of any aspect ratio at its own size, padded to whole 40-pixel
+tokens, and resizes only an image of more patches than the cap gives
+(`--max-image-pixels` / 256: 16,384 patches at the default, which make 4,096
+tokens) ([Vision](models.md#vision)); `/v1/models` reports
+`limits.image_aspect` 200 for every model, Inkling 2 included. A request
+carries at most 64 images, PDF pages included. A Messages request of more
+image blocks is refused naming the oldest, as Anthropic's API names a block
+(`messages.2.content.0.image: requests support at most 64 images`): Claude
+Code, which keeps up to 100 images in a conversation, takes an image out and
+sends the request again, at one refused request for each round that brings an
+image past the 64th. It answers from the new image, then keeps the first 64
+and a note in place of the later one.
 
 PDFs arrive inline too: Chat `file` parts with `file_data`, Responses
 `input_file` items and Messages `document` blocks with a base64
@@ -629,8 +643,10 @@ system's libraries and fonts and Splash's runtime, and to write nothing, reach
 no network and start no program.
 
 A model serving without vision refuses both with 400: one served with
-`--language-only`, one of a family without a vision tower such as Flint, or a
-GGUF served without a projector ([vision](models.md#vision)).
+`--language-only`, one of a family without a vision tower such as Flint, a
+GGUF served without a projector, or an Inkling 2 installation that serves text
+because its source has no tower Splash serves or it has not taken its tower in
+yet ([vision](models.md#vision)).
 
 ## Responses state
 

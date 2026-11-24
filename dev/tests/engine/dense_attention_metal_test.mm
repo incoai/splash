@@ -1,8 +1,8 @@
 // ops::DenseAttention (kernels/shared/dense_attention.metal) against an fp64
-// reference, row by row, in the vision tower's layout: per-head planes of
-// heads of 72 (queries and keys padded to 80), every patch attending the
-// whole image, the output in per-head planes or, as the tower writes it, in
-// rows of every head. Token counts fall below,
+// reference, row by row, in the vision towers' layout: per-head planes of
+// Qwen3.5's heads of 72 (queries and keys padded to 80) or Inkling 2's of 64
+// (unpadded), every patch attending the whole image, the output in per-head
+// planes or, as the towers write it, in rows of every head. Token counts fall below,
 // on and past the 32-row query tile and 128-key tile, up to 4,100 (33 key
 // tiles, the last of four keys), and each runs three kinds of input: random
 // queries, keys and values; keys whose scores rise tile by tile, so every
@@ -336,7 +336,7 @@ int main(int argc, char **argv) {
       require(argc == 2, "usage: dense-attention METALLIB");
       MetalBackend backend(argv[1]);
       requireExtents(backend);
-      const Case cases[] = {{"output planes", 72, false}, {"output rows", 72, true}};
+      const Case cases[] = {{"output planes", 72, false}, {"output rows", 72, true}, {"heads of 64", 64, true}};
       for (const Case &c : cases)
         for (const uint32_t rows : {4U, 24U, 36U, 124U, 128U, 132U, 144U, 260U, 4100U})
           for (const Kind kind : {Kind::Random, Kind::Rising, Kind::Wide})
