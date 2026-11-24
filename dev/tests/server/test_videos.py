@@ -191,7 +191,8 @@ class VideoServerTest(unittest.TestCase):
 
     def test_a_chinese_prompt_reaches_the_engine_as_json_and_as_a_form(self):
         self.serve()
-        prompt = "一只鹦鹉在树枝上唱歌"
+        # With whitespace at both ends: both entrances pass the prompt as sent.
+        prompt = "  一只鹦鹉在树枝上唱歌\n"
         first = ("first.png", png(832, 480, bytes(832 * 480 * 3)), "image/png")
         # UTF-8 JSON, and a form as a browser's FormData sends it: text fields
         # of no charset.
@@ -204,11 +205,40 @@ class VideoServerTest(unittest.TestCase):
         ]  # fmt: skip
         for answer in answers:
             self.assertEqual(answer.status_code, 200, answer.text)
-            self.client.videos.poll(answer.json()["id"], poll_interval_ms=20)
+            video = self.client.videos.poll(answer.json()["id"], poll_interval_ms=20)
+            self.assertEqual(video.prompt, prompt)
         (from_json, from_form) = taken(self.log)
         for job in (from_json, from_form):
             self.assertEqual(job["tokens"][-len(prompt) :], [ord(c) for c in prompt])
         self.assertIn("first_frame", from_form)
+
+    def test_a_prompts_crlf_becomes_lf_as_json_and_as_a_form(self):
+        self.serve()
+        sent, lf = "  一只鹦鹉\r\n在树枝上唱歌\r\n", "  一只鹦鹉\n在树枝上唱歌\n"
+        alone = "a cat\ron a roof\n"  # a lone CR stays
+        first = ("first.png", png(832, 480, bytes(832 * 480 * 3)), "image/png")
+        answers = [
+            httpx.post(f"{self.url}/videos", json={"prompt": sent}),
+            httpx.post(f"{self.url}/videos", data={"prompt": sent},
+                       files={"input_reference": first}),
+            httpx.post(f"{self.url}/videos", json={"prompt": alone}),
+        ]  # fmt: skip
+        expected = (lf, lf, alone)
+        for answer, prompt in zip(answers, expected):
+            self.assertEqual(answer.status_code, 200, answer.text)
+            video = self.client.videos.poll(answer.json()["id"], poll_interval_ms=20)
+            self.assertEqual(video.prompt, prompt)
+        for job, prompt in zip(taken(self.log), expected):
+            self.assertEqual(job["tokens"][-len(prompt) :], [ord(c) for c in prompt])
+
+    def test_a_jobs_log_line_counts_its_prompt_without_its_text(self):
+        self.serve()
+        status = self.enterContext(mock.patch.object(videos, "print_status"))
+        self.client.videos.create(prompt="a 鹦鹉 \ufffd")
+        (queued,) = [
+            c.args[0] for c in status.call_args_list if "· queued ·" in c.args[0]
+        ]
+        self.assertIn("· prompt 6 chars, 3 non-ASCII, 1 U+FFFD, sha256 ", queued)
 
     def test_a_480p_job_renders_its_canvas_and_length(self):
         self.serve()
@@ -501,7 +531,7 @@ class EngineLifetimeTest(VideoServerTest):
         while app.videos.status()["running"] is not None:
             time.sleep(0.02)
         # A clip the user stopped is no failure.
-        status.assert_called_once_with(f"Video · {video.id} · cancelled")
+        status.assert_called_with(f"Video · {video.id} · cancelled")
         self.assertEqual([next(iter(record)) for record in taken(self.log)],
                          ["request", "cancel"])  # fmt: skip
         self.assertEqual(len(processes), 2)

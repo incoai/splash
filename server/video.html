@@ -152,14 +152,11 @@
   const VARIANTS = ['pika-6', 'pika-ref2va-6', 'vdn-8', 'vdn-50', 'fasth3-8', 'fasth3-4'];
   const PHASES = {encode: 'encoding the prompt', prepare: 'preparing', denoise: 'denoising',
                   preview: 'previewing', decode: 'decoding', audio: 'adding audio', mux: 'writing the mp4'};
-  const promptsKey = 'splash-video-prompts';
   const frames = {input_reference: null, last_frame: null};
   let references = [];
   let mode = 'frames';
   // The served variants' /v1/models entries, the default first, and the chosen one.
   let served = [], chosen = null;
-  // The prompts of the clips this browser made, by id; the API does not return them.
-  let prompts = load();
   // The clips cancelled here, which the server forgets, and the mp4s fetched.
   const cancelled = new Map();
   const clips = new Map();
@@ -177,18 +174,6 @@
   // Only a server started with --api-key answers 401; the key's field shows then and stays.
   function askForKeyIfUnauthorized(response) {
     if (response.status === 401) credentials.hidden = false;
-  }
-
-  function load() {
-    try { return JSON.parse(localStorage.getItem(promptsKey)) || {}; }
-    catch { return {}; }
-  }
-
-  function remember(id, text) {
-    prompts[id] = text;
-    prompts = Object.fromEntries(Object.entries(prompts).slice(-100));
-    try { localStorage.setItem(promptsKey, JSON.stringify(prompts)); }
-    catch { /* The page still works without browser storage. */ }
   }
 
   // The served variants, the entries repo:variant of /v1/models, the default
@@ -368,9 +353,8 @@
   async function submit(event) {
     event.preventDefault();
     formError.textContent = '';
-    const text = prompt.value;
     const body = new FormData();
-    body.append('prompt', text);
+    body.append('prompt', prompt.value);
     body.append('seconds', $('#seconds').value);
     body.append('size', $('#size').value);
     body.append('seed', $('#seed').value || '0');
@@ -390,7 +374,6 @@
         formError.textContent = job.error?.message ?? `The server answered ${response.status}.`;
         return;
       }
-      remember(job.id, text);
       watched.add(job.id);
       refresh();
     } catch {
@@ -468,7 +451,7 @@
       : state === 'completed' ? `Done${job.phases?.total ? ` in ${job.phases.total.seconds} s` : ''}`
       : state === 'failed' ? 'Failed' : 'Cancelled';
     card.querySelector('.meta').textContent = `${job.seconds} s · ${job.size} · seed ${job.seed} · ${job.variant}`;
-    card.querySelector('.job-prompt').textContent = prompts[job.id] ?? job.id;
+    card.querySelector('.job-prompt').textContent = job.prompt ?? job.id;
     card.querySelector('.job-error').textContent = state === 'failed' ? job.error?.message ?? '' : '';
     card.querySelector('.bar').hidden = !active(job) || isCancelled;
     card.querySelector('.bar div').style.width = `${job.progress}%`;

@@ -38,9 +38,16 @@ puts each on the request's canvas as the model's MLX port does
 stretched and the last scaled to cover and centre-cropped, LANCZOS; stored
 RGB, alpha dropped, no EXIF rotation). The video object has OpenAI's fields,
 and `phase`, `variant`, `seed`, `preview` (ready) and `phases`, each completed
-phase's seconds and the engine's peak footprint. Errors have the OpenAI
-shape: `video_queue_full` (503) past four queued jobs, `video_not_ready`
-(409) for content not yet decoded, `not_found` and `model_not_found` (404).
+phase's seconds and the engine's peak footprint; its `prompt` is the prompt
+as the server parsed it (as sent, each CRLF made LF), which the trial page
+shows on the clip's card. The server logs one line per job it queues,
+without the prompt's text:
+`Video · <id> · queued`, the body's content type, bytes and sha256, the
+prompt's characters, non-ASCII characters, U+FFFDs and sha256, and the
+count and sha256 of its tokens as the engine takes them (each sha256 its
+first 8 hex digits). Errors have the OpenAI shape: `video_queue_full` (503)
+past four queued jobs, `video_not_ready` (409) for content not yet decoded,
+`not_found` and `model_not_found` (404).
 
 A Ref2VA job (Pika H3 Flex's reference-conditioned video and audio) takes
 `references` in place of keyframes: a file field of the multipart body,

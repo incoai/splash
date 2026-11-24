@@ -32,8 +32,10 @@ where none runs (install/launcher.py).
 
 from __future__ import annotations
 
+import array
 import email.parser
 import email.policy
+import hashlib
 import itertools
 import os
 import re
@@ -285,6 +287,8 @@ def parse_request(fields, names, variants=H3.variants):
     prompt = fields.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise APIError(400, "prompt must be a non-empty string")
+    # Its line breaks are LF: a browser's form sends each as CRLF.
+    prompt = prompt.replace("\r\n", "\n")
     repo = names[0].partition(":")[0]
     model = fields.get("model")
     named = model.partition(":")[2] if str(model).startswith(f"{repo}:") else None
@@ -591,6 +595,12 @@ def clip(request, tokens):
             request.last_frame, wire_references(request.references))  # fmt: skip
 
 
+def short_sha256(data):
+    """The first 8 hex digits of data's sha256, which tell bytes apart in
+    the log."""
+    return hashlib.sha256(data).hexdigest()[:8]
+
+
 def form_fields(content_type, payload):
     """The fields of a multipart/form-data body, as OpenAI's SDK sends a
     video's: its text fields, the keyframes' files as their bytes, and the
@@ -626,7 +636,8 @@ def form_fields(content_type, payload):
             # charset, which get_content() would read as ASCII.
             charset = part.get_content_charset() or "utf-8"
             try:
-                fields[name] = part.get_payload(decode=True).decode(charset).strip()
+                text = part.get_payload(decode=True).decode(charset)
+                fields[name] = text if name == "prompt" else text.strip()
             except (LookupError, UnicodeError):
                 raise APIError(400, f"{name} is not {charset} text") from None
     return fields
@@ -672,6 +683,7 @@ class Job:
             "expires_at": None,
             "size": self.request.size,
             "seconds": self.request.seconds,
+            "prompt": self.request.prompt,
             "remixed_from_video_id": None,
             "error": self.error,
             "phase": self.phase.name.lower() if self.phase else None,
@@ -902,7 +914,10 @@ class VideoService:
         )
         self.worker.start()
 
-    def submit(self, fields):
+    def submit(self, fields, received):
+        """Queues the job of a request's fields and logs what it received:
+        received, its body's content type, bytes and digest, then its
+        prompt's characters and tokens, counted and digested, not its text."""
         request = parse_request(fields, self.names, self.variants)
         require_variant(request, self.names[0], self.variants)
         tokens = prompt_tokens(self.tokenizer, request.prompt, self.ready, request)
@@ -920,6 +935,14 @@ class VideoService:
             self.jobs[job.id] = job
             self.queue.append(job)
             self.lock.notify_all()
+            text = request.prompt
+            print_status(
+                f"Video · {job.id} · queued · {received} · prompt {len(text)} chars, "
+                f"{sum(not c.isascii() for c in text)} non-ASCII, "
+                f"{text.count(chr(0xFFFD))} U+FFFD, "
+                f"sha256 {short_sha256(text.encode('utf-8', 'surrogatepass'))} · "
+                f"{len(tokens)} tokens sha256 {short_sha256(array.array('I', tokens))}"
+            )
             return job.public()
 
     def get(self, job_id):
@@ -1227,7 +1250,9 @@ def handler(base):
             self._body_reservation = None
             try:
                 self._answer(
-                    lambda: self.send_json(200, self.app.videos.submit(self._fields()))
+                    lambda: self.send_json(
+                        200, self.app.videos.submit(self._fields(), self._received)
+                    )
                 )
             finally:
                 if self._body_reservation is not None:
@@ -1267,6 +1292,15 @@ def handler(base):
                 self.safe_error(error)
             except TimeoutError:
                 self.safe_error(APIError(408, "HTTP I/O timed out", "request_timeout"))
+
+        def _read_body(self, deadline, content_types):
+            payload = super()._read_body(deadline, content_types)
+            # What the body was, for its job's log line (VideoService.submit).
+            self._received = (
+                f"{self.headers.get_content_type()} · body {len(payload)} B "
+                f"sha256 {short_sha256(payload)}"
+            )
+            return payload
 
         def _query(self):
             return {
