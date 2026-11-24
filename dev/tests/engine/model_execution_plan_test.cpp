@@ -186,6 +186,36 @@ void checkGateUpLayers() {
   }
 }
 
+// A decode arena's gate scratch holds its draft's gate/up pair, af4g64 planes
+// (DraftCheckpoint) of 8 rows a lane, on the tile their format takes, at every
+// lane count of every runtime: a MoE target adds no bound of its own, and one
+// lane's pair stores 16 rows where it runs two passes on the 16-row tile.
+void checkDraftGateScratch(const model::LoadedModel &loaded) {
+  const auto &d = loaded.draft.layout;
+  const ops::Projection up(d.intermediateSize, d.hiddenSize,
+                           ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_AF4G64, d.intermediateSize,
+                                                                            d.hiddenSize, {}, {}, {})}});
+  const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
+  for (uint32_t family : {9U, 10U, 11U})
+    for (uint32_t cores : {8U, 10U, 12U, 14U, 16U, 18U, 20U, 30U, 32U, 40U, 60U, 80U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = cores;
+      const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+      for (uint32_t runtimeLanes = 1; runtimeLanes <= model::kLaneCount; ++runtimeLanes) {
+        const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts,
+                                                           runtimeLanes);
+        const uint64_t held = model::DecodeArena::gateScratchBytes(geometry, plans);
+        for (uint32_t lanes = 1; lanes <= runtimeLanes; ++lanes)
+          require(held >= plans.draftLinear()
+                              .plan(up, lanes * model::kDraftRows, ops::LinearEpilogue::GateUp, &up)
+                              .gateScratchBytes(),
+                  "the decode arena's gate scratch is below its draft's pair of " + std::to_string(lanes) +
+                      " lanes on Apple" + std::to_string(family) + " of " + std::to_string(cores) + " cores");
+      }
+    }
+}
+
 // The prefill arena holds the int8 prefill tile's codes and scales of a full
 // chunk of the target's widest projection the tile takes, wherever the family
 // runs it with int8 activations on, and none for the draft, which prefills on
@@ -736,6 +766,10 @@ int main() {
     checkGdnWidths();
     checkDraftVocabulary();
     checkGateUpLayers();
+    checkDraftGateScratch(loadedModel<model::Qwen3_8Weights>());
+    checkDraftGateScratch(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDraftGateScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    checkDraftGateScratch(loadedModel<model::Qwen4ExpWeights>());
     checkYarnGeometry();
     checkIndexTables();
     checkSpilledKvGeometry();

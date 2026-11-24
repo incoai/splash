@@ -181,15 +181,20 @@ MoeWorkspace ExecutionPlans::moeWorkspace(MoeShape shape, uint32_t routerFormat,
 // The gate scratch of the plan Linear::addSwiGlu runs over each rows of a
 // decode step: the pair's up to one row group's rows, past them the
 // up-with-gate pass's on the row groups, whose gate rows a pass of their own
-// writes.
+// writes. The shape names no formats, and a pair's tile follows its tensors'
+// own (bf16Projection): the scratch holds the rows of any tile the device may
+// run the plan on, as Linear::scratchSize bounds a plan's. A draft's pair of
+// 8 rows, one lane's, stores 16 where it runs two passes on the 16-row tile
+// (Apple10: Inkling-2-Mini's draft on 8 to 14 GPU cores, Ornith's on 16),
+// which the shape's own plan never takes.
 uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape, uint32_t maximumRows) const {
-  uint64_t bound = 0;
+  uint32_t storage = 0;
   for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
     const LinearEpilogue epilogue = rows <= kMaximumDecodeTileRows ? LinearEpilogue::GateUp : LinearEpilogue::UpWithGate;
-    bound = std::max(bound,
-                     decodeLinear_.plan({{shape.outputSize, shape.inputSize}, rows, epilogue}).gateScratchBytes());
+    storage = std::max({storage, stagedStorageRows(rows, true),
+                        decodeLinear_.plan({{shape.outputSize, shape.inputSize}, rows, epilogue}).storageRows()});
   }
-  return bound;
+  return uint64_t{storage} * shape.outputSize * 2;
 }
 
 } // namespace splash::ops
