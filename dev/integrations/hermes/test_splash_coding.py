@@ -118,12 +118,40 @@ class CodingPolicyTest(unittest.TestCase):
 
         self.assertIsNone(read())
         self.prepare()
-        self.assertIsNone(read(offset=50, limit=100))
         self.assertEqual(read()["action"], "block")
         self.assertIsNone(read())
         self.assertIsNone(read(offset=1, limit=950))
         self.policy.end("a")
         self.assertIsNone(read())
+
+    def test_an_explicit_first_read_leaves_its_later_expansion_alone(self):
+        path = self.root / "large.py"
+        path.write_text("x" * 14000)
+        self.prepare()
+        self.assertIsNone(
+            self.policy.before_tool(
+                "read_file", {"path": path.name, "limit": 100}, session_id="a"
+            )
+        )
+        self.assertIsNone(
+            self.policy.before_tool("read_file", {"path": path.name}, session_id="a")
+        )
+
+    def test_bounded_only_does_not_require_a_git_revision(self):
+        self.policy = plugin.CodingPolicy(
+            {**self.config, "shared_prefix": False},
+            lambda: self.cwd,
+            lambda _: self.fail("bounded reads should not invoke Git"),
+        )
+        large = self.root / "large.py"
+        large.write_text("x" * 14000)
+        self.assertIsNone(self.prepare())
+        self.assertEqual(
+            self.policy.before_tool("read_file", {"path": large.name}, session_id="a")[
+                "action"
+            ],
+            "block",
+        )
 
     def test_symlink_outside_workspace_and_unknown_revision(self):
         self.prepare()

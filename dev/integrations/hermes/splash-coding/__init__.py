@@ -51,8 +51,8 @@ def git_revision(root):
 
 @dataclass
 class Session:
-    revision: str
-    offered: set[Path] = field(default_factory=set)
+    revision: str | None
+    seen_large_files: set[Path] = field(default_factory=set)
 
 
 class CodingPolicy:
@@ -109,8 +109,8 @@ class CodingPolicy:
         with self.lock:
             session = self.sessions.get(session_id)
         if session is None:
-            revision = self.revision(self.root)
-            if not revision:
+            revision = self.revision(self.root) if self.share else None
+            if not revision and not self.bound:
                 return None
             with self.lock:
                 session = self.sessions.setdefault(session_id, Session(revision))
@@ -122,6 +122,7 @@ class CodingPolicy:
         messages = request.get("messages")
         if (
             not self.share
+            or not session.revision
             or request.get("cache_salt") is not None
             or (extra is not None and not isinstance(extra, dict))
             or (extra is not None and "cache_salt" in extra)
@@ -174,11 +175,11 @@ class CodingPolicy:
             not isinstance(path, str)
             or not path
             or type(offset) is not int
-            or offset != 1
+            or offset < 1
+            or (limit is not None and (type(limit) is not int or limit < 1))
         ):
             return None
-        if limit is not None and (type(limit) is not int or limit <= 120):
-            return None
+        focused = offset != 1 or (limit is not None and limit <= 120)
         try:
             candidate = (self.root / path).resolve(strict=True)
             if not candidate.is_relative_to(self.root):
@@ -193,11 +194,13 @@ class CodingPolicy:
             session = self.sessions.get(session_id)
             if (
                 session is None
-                or candidate in session.offered
-                or len(session.offered) >= 64
+                or candidate in session.seen_large_files
+                or len(session.seen_large_files) >= 64
             ):
                 return None
-            session.offered.add(candidate)
+            session.seen_large_files.add(candidate)
+        if focused:
+            return None
         return {
             "action": "block",
             "message": (
