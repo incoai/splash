@@ -206,7 +206,11 @@ def derived_files(target, vision=None):
     """DERIVED_FILES' contents, derived from a target GGUF's metadata and its
     vision projector's (local paths)."""
     metadata = Metadata(target)
-    config = model_config(metadata, None if vision is None else Metadata(vision))
+    # A projector's tensor table states what its metadata does not, such as
+    # Inkling's projector width (inkling_vision_config).
+    config = model_config(
+        metadata, None if vision is None else Metadata(vision, tensors=True)
+    )
     return {"config.json": models.json_bytes(config), **tokenizer_files(metadata)}
 
 
@@ -634,12 +638,57 @@ def inkling2_text_config(metadata, arch):
     }
 
 
+def projector_type(vision):
+    """The clip projector type of a vision GGUF: Qwen's state it as
+    clip.projector_type, Inkling's as clip.vision.projector_type."""
+    if vision.require("general.architecture", str) != "clip":
+        raise ModelError("unsupported GGUF vision architecture")
+    kind = vision.values.get("clip.projector_type")
+    return kind if kind is not None else vision.values.get("clip.vision.projector_type")
+
+
+def inkling_vision_config(vision):
+    """Inkling 2's vision_config (inkling2_vision) as its config.json states
+    it, in transformers' names, from an inkling2v projector's header: its
+    sizes, its MLP's width as a ratio of its own, its patches' side and merge
+    (native_patch_size, adapter_merge_size), the side of its position grid
+    (image_size over the patch side), its projector's hidden width (mm.1's
+    rows) and whether that has biases, and its LayerNorms' epsilon as the
+    shortest decimal of the header's float32."""
+    fields = {
+        "num_hidden_layers": "block_count",
+        "hidden_size": "embedding_length",
+        "num_attention_heads": "attention.head_count",
+        "text_hidden_size": "projection_dim",
+        "native_patch_size": "patch_size",
+        "adapter_merge_size": "spatial_merge_size",
+    }
+    result = {
+        name: vision.positive("clip.vision." + key) for name, key in fields.items()
+    }
+    image_size = vision.positive("clip.vision.image_size")
+    if image_size % result["native_patch_size"]:
+        raise ModelError("invalid GGUF vision position grid")
+    projection = vision.extents.get("mm.1.weight")
+    if projection is None or len(projection) != 2:
+        raise ModelError("the inkling2v projector has no mm.1.weight")
+    result.update(
+        model_type="inkling2_vision",
+        mlp_ratio=vision.positive("clip.vision.feed_forward_length")
+        / result["hidden_size"],
+        posemb_grid_size=image_size // result["native_patch_size"],
+        projection_hidden_dim=projection[1],
+        projector_bias="mm.1.bias" in vision.tensors,
+        layer_norm_eps=real(vision, "clip.vision.attention.layer_norm_epsilon"),
+    )
+    return result
+
+
 def vision_config(vision):
-    if (
-        vision.require("general.architecture", str) != "clip"
-        or vision.require("clip.projector_type", str) != "qwen3vl_merger"
-        or vision.require("clip.use_gelu", bool) is not True
-    ):
+    kind = projector_type(vision)
+    if kind == "inkling2v":
+        return inkling_vision_config(vision)
+    if kind != "qwen3vl_merger" or vision.require("clip.use_gelu", bool) is not True:
         raise ModelError("unsupported GGUF vision architecture")
     fields = {
         "depth": "block_count",
@@ -671,11 +720,19 @@ def vision_config(vision):
 
 
 def processor_config(vision):
+    """How the projector's tower takes images: its patches (in two temporal
+    slices for Qwen's), their merge and the normalization."""
     config = vision_config(vision)
+    if config.get("model_type") == "inkling2_vision":
+        patch, temporal = config["native_patch_size"], {}
+        merge = config["adapter_merge_size"]
+    else:
+        patch, merge = config["patch_size"], config["spatial_merge_size"]
+        temporal = {"temporal_patch_size": config["temporal_patch_size"]}
     return {
-        "patch_size": config["patch_size"],
-        "temporal_patch_size": config["temporal_patch_size"],
-        "merge_size": config["spatial_merge_size"],
+        "patch_size": patch,
+        **temporal,
+        "merge_size": merge,
         "image_mean": vision.require("clip.vision.image_mean", list),
         "image_std": vision.require("clip.vision.image_std", list),
     }

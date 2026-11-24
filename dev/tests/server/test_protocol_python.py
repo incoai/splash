@@ -87,6 +87,17 @@ def example_image_request():
     )
 
 
+def example_inkling_image_request():
+    """One token of Inkling's image: 2x2 patches of 20 pixels."""
+    span = p.ImageSpan(1, 1, 2, 2, 7, 9, patch=20)
+    return replace(
+        example_request(),
+        prompt_tokens=(7, 3, 9),
+        image_spans=(span,),
+        image_pixels=bytes((i * 5 + 3) & 0xFF for i in range(span.pixel_bytes)),
+    )
+
+
 def example_score_request():
     return replace(
         example_request(),
@@ -534,7 +545,8 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.head_tokens,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
-            + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
+            # The span's wire fields; its patch side is not one.
+            + struct.pack(p._IMAGE_SPAN.format, *astuple(span)[:6])
             + request.image_pixels
             + struct.pack("<2I", *request.thinking_budget.end)
         )
@@ -717,6 +729,14 @@ class ProtocolPythonTests(unittest.TestCase):
                 decoded = decode_event(native_peer.serialize_event(event))
                 self.assertEqual(decoded, event)
                 self.assertIs(type(decoded.reason), p.FinishReason)
+
+    def test_an_inkling_image_request_round_trips_with_its_patch_side(self):
+        request = example_inkling_image_request()
+        self.assertEqual(len(request.image_pixels), 4800)
+        ((message, _raw),) = native_peer.ClientFrameReader(patch=20).feed(
+            p.serialize_message(request)
+        )
+        self.assertEqual(message, request)
 
     def test_request_header_and_binary_prompt(self):
         request = example_request()

@@ -1,4 +1,6 @@
-"""Decode and resize images to patch-aligned uint8 RGB within the pixel budget.
+"""Decode images and prepare them as patch-aligned uint8 RGB within the pixel
+budget, as the served family's vision tower takes them (ImageFormat): Qwen's
+resized into its grid, Inkling's padded to it.
 
 The engine handles normalization and vision inference. Grid geometry and a
 content digest identify image prefixes; a byte-budgeted cache reuses images
@@ -11,6 +13,7 @@ import io
 import math
 import struct
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .lru import LRUCache
@@ -18,6 +21,13 @@ from .lru import LRUCache
 PATCH = 16
 MERGE = 2
 FACTOR = PATCH * MERGE
+# Inkling 2's tower: 20-pixel patches, merged 2x2 into one token of 40x40.
+INKLING_PATCH = 20
+INKLING_FACTOR = INKLING_PATCH * MERGE
+# The 8-pixel checkerboard of light and darker grey Inkling's preprocessing
+# composites a transparent image onto (transformers' Inkling2ImageProcessor).
+CHECKERBOARD = 8
+CHECKERBOARD_GREYS = (204, 153)
 # Qwen3-VL's shortest_edge floor; the serving cap below is far below the model's.
 MIN_PIXELS = 65_536
 # Serving default and largest cap: 16,384 patches, the protocol's per-image ceiling.
@@ -46,6 +56,8 @@ class PreparedImage:
     pixels: bytes
     digest_lo: int
     digest_hi: int
+    # The side of a grid patch in pixels, the tower's.
+    patch: int = PATCH
 
     @property
     def tokens(self) -> int:
@@ -105,23 +117,35 @@ def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
     return h_bar, w_bar
 
 
+def _upright(decoded):
+    """Turns a decoded image upright in place and reports whether its sides
+    swapped. Cameras store the sensor's orientation and an EXIF tag that
+    turns it upright for display; show the model the upright one."""
+    from PIL import ImageOps
+
+    stored = decoded.size
+    try:
+        ImageOps.exif_transpose(decoded, in_place=True)
+    except Exception:
+        pass  # A malformed tag leaves the stored orientation.
+    return decoded.size != stored
+
+
+def _digest(grid_height, grid_width, pixels):
+    digest = hashlib.sha256(struct.pack("<II", grid_height, grid_width) + pixels)
+    return struct.unpack_from("<QQ", digest.digest())
+
+
 def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
     """Decode, convert to RGB, resize into the grid, and digest the pixels."""
-    from PIL import Image, ImageOps
+    from PIL import Image
 
     try:
         with Image.open(io.BytesIO(payload), formats=IMAGE_FORMATS) as decoded:
             if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
                 raise ImageError("source image exceeds the pixel limit")
-            stored = decoded.size
             height, width = smart_resize(decoded.height, decoded.width, max_pixels)
-            try:
-                # Cameras store the sensor's orientation and an EXIF tag that
-                # turns it upright for display; show the model the upright one.
-                ImageOps.exif_transpose(decoded, in_place=True)
-            except Exception:
-                pass  # A malformed tag leaves the stored orientation.
-            if decoded.size != stored:
+            if _upright(decoded):
                 height, width = width, height
             if decoded.has_transparency_data:
                 # Composite onto white as Qwen's preprocessing does: transparent
@@ -139,9 +163,136 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
     except Exception as error:
         raise ImageError("image could not be decoded") from error
     grid_height, grid_width = height // PATCH, width // PATCH
-    digest = hashlib.sha256(struct.pack("<II", grid_height, grid_width) + pixels)
-    digest_lo, digest_hi = struct.unpack_from("<QQ", digest.digest())
+    digest_lo, digest_hi = _digest(grid_height, grid_width, pixels)
     return PreparedImage(grid_height, grid_width, pixels, digest_lo, digest_hi)
+
+
+def inkling_size(height: int, width: int, max_pixels: int) -> tuple[int, int]:
+    """The size Inkling's preprocessing gives an image: its own, which it
+    pads to whole 40-pixel tokens, unless those exceed the patch budget the
+    serving cap gives (max_patches, the encoder's bound, in Qwen's 16-pixel
+    patches; at the default, 4,096 of Inkling's tokens, llama.cpp's budget).
+    Then its sides are scaled alike, a pixel each at least, to the largest
+    size whose padded tokens fit the budget: its aspect ratio stays within a
+    pixel's rounding, and the padding takes up the rest. The reference
+    processor never resizes."""
+    if height <= 0 or width <= 0:
+        raise ImageError("image dimensions must be positive")
+    if not MIN_PIXELS <= max_pixels <= MAX_PIXELS:
+        raise ImageError("invalid image pixel budget")
+    tokens = max_patches(max_pixels) // (MERGE * MERGE)
+
+    def fits(first, second):
+        return (
+            math.ceil(first / INKLING_FACTOR) * math.ceil(second / INKLING_FACTOR)
+            <= tokens
+        )
+
+    if fits(height, width):
+        return height, width
+    longer, shorter = max(height, width), min(height, width)
+
+    def scaled(side):
+        """The shorter side, scaled as the longer one is to side."""
+        return max(1, (shorter * side + longer // 2) // longer)
+
+    # The tokens grow with the longer side, so a bisection finds the largest
+    # that fits; one pixel always does.
+    low, high = 1, longer
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(middle, scaled(middle)):
+            low = middle
+        else:
+            high = middle - 1
+    return (low, scaled(low)) if height >= width else (scaled(low), low)
+
+
+def composite_on_checkerboard(rgba):
+    """An RGBA image as RGB over Inkling's checkerboard, in integers as its
+    processor rounds them: (rgb a + grey (255 - a) + 127) // 255, the grey
+    204 where the 8-pixel squares' row and column sum to an even number, 153
+    elsewhere. A band of rows at a time, of about a megapixel, so an image
+    of the source limit costs about its own pixels' memory again."""
+    import numpy as np
+    from PIL import Image
+
+    values = np.asarray(rgba)
+    height, width = values.shape[:2]
+    composite = np.empty((height, width, 3), np.uint8)
+    columns = (np.arange(width) // CHECKERBOARD)[None, :]
+    band = max(1, (1 << 20) // width)
+    for top in range(0, height, band):
+        rows = (np.arange(top, min(top + band, height)) // CHECKERBOARD)[:, None]
+        grey = np.where((rows + columns) % 2 == 0, *CHECKERBOARD_GREYS)
+        grey = grey.astype(np.uint32)[..., None]
+        part = values[top : top + band].astype(np.uint32)
+        alpha = part[..., 3:]
+        composite[top : top + band] = (
+            part[..., :3] * alpha + grey * (255 - alpha) + 127
+        ) // 255
+    return Image.fromarray(composite, "RGB")
+
+
+def prepare_inkling(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
+    """Decode an image as Inkling 2's processor prepares it: upright, RGB (a
+    transparent one composited onto its checkerboard), at its own size
+    (inkling_size), padded right and bottom with zeros to whole 40-pixel
+    tokens of 2x2 patches of 20 pixels, and digest the pixels. The reference
+    pads with -1 on the 0-255 scale, which no uint8 holds; zero, after the
+    encoder's x / 127.5 - 1, is -1.0 for its -1.0078, which moves an image's
+    embeddings by up to about 0.3%, and a token mostly of padding by up to
+    about 3%."""
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(payload), formats=IMAGE_FORMATS) as decoded:
+            if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
+                raise ImageError("source image exceeds the pixel limit")
+            _upright(decoded)
+            height, width = inkling_size(decoded.height, decoded.width, max_pixels)
+            # A transparent image is resized first, its alpha premultiplied,
+            # so its checkerboard keeps 8-pixel squares at any size.
+            transparent = decoded.has_transparency_data
+            image = decoded.convert("RGBA" if transparent else "RGB")
+            if (image.height, image.width) != (height, width):
+                image = image.resize((width, height), Image.Resampling.BILINEAR)
+            if transparent:
+                image = composite_on_checkerboard(image)
+            grid_height = math.ceil(height / INKLING_FACTOR) * MERGE
+            grid_width = math.ceil(width / INKLING_FACTOR) * MERGE
+            canvas = Image.new(
+                "RGB", (grid_width * INKLING_PATCH, grid_height * INKLING_PATCH)
+            )
+            canvas.paste(image, (0, 0))
+            pixels = canvas.tobytes()
+    except ImageError:
+        raise
+    except Exception as error:
+        raise ImageError("image could not be decoded") from error
+    digest_lo, digest_hi = _digest(grid_height, grid_width, pixels)
+    return PreparedImage(
+        grid_height, grid_width, pixels, digest_lo, digest_hi, INKLING_PATCH
+    )
+
+
+@dataclass(frozen=True)
+class ImageFormat:
+    """How a family's vision tower takes an image: the side of its grid's
+    patches in pixels (the engine's ImageSpan counts them), the preparation
+    of a payload within a pixel cap, and whether a checkpoint may leave its
+    processor's configuration out (defaulted): Inkling2ImageProcessor's is its
+    class's defaults alone, which an MLX conversion does not save, while a
+    Qwen processor's sizes are its checkpoint's."""
+
+    name: str
+    patch: int
+    prepare: Callable[[bytes, int], PreparedImage]
+    defaulted: bool = False
+
+
+QWEN_IMAGES = ImageFormat("qwen", PATCH, prepare)
+INKLING_IMAGES = ImageFormat("inkling", INKLING_PATCH, prepare_inkling, defaulted=True)
 
 
 class PreparedImages(list):
@@ -179,7 +330,9 @@ class ImageCache:
     BUDGET_BYTES = 256 * 1024 * 1024
     REQUEST_BUDGET_BYTES = 256 * 1024 * 1024
 
-    def __init__(self):
+    def __init__(self, preparation=prepare):
+        # The served family's preparation (ImageFormat.prepare).
+        self._prepare = preparation
         # GC may finalize a cancelled batch during a cache insertion on this
         # same thread; returning its byte charge must not deadlock the cache.
         self._lock = threading.RLock()
@@ -195,7 +348,7 @@ class ImageCache:
             cached = self._entries.get(key)
         if cached is not None:
             return cached
-        prepared = prepare(payload, max_pixels)
+        prepared = self._prepare(payload, max_pixels)
         with self._lock:
             self._entries.put(key, prepared, len(prepared.pixels))
         return prepared

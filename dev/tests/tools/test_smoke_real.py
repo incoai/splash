@@ -622,10 +622,12 @@ class SmokeRealTests(unittest.TestCase):
             "content": [{"type": "output_text", "text": text}],
         }
 
-    def run_images(self, output, reused=None):
+    def run_images(self, output, reused=None, switch=True):
         """run_images over canned answers: the red image encoded once, its
         repeat a prefix hit and, behind another system prompt, its cached rows
-        reused, or the image telemetry `reused` after that request."""
+        reused, or the image telemetry `reused` after that request. Returns
+        each request's output limit, for a model whose effort switches its
+        reasoning off or not (`switch`)."""
         red = {"choices": [{"message": {"content": "red"}}]}
         repeat = {
             **red,
@@ -651,13 +653,30 @@ class SmokeRealTests(unittest.TestCase):
         with (
             mock.patch.object(
                 smoke_real, "request", side_effect=[(200, item) for item in documents]
-            ),
+            ) as request,
             mock.patch.object(
                 smoke_real, "image_data_url", return_value="data:image/png;base64,AA=="
             ),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            smoke_real.run_images(8000, "test-model", "test-request")
+            smoke_real.run_images(8000, "test-model", "test-request", switch)
+        limits = ("max_completion_tokens", "max_tokens", "max_output_tokens")
+        return [
+            body[key]
+            for call in request.call_args_list
+            for body in call.args[3:]
+            for key in limits
+            if key in body
+        ]
+
+    def test_image_requests_leave_room_for_reasoning_the_model_does_anyway(self):
+        for switch in (True, False):
+            with self.subTest(switch=switch):
+                limits = self.run_images(
+                    [self.assistant_message("Blue.")], switch=switch
+                )
+                room = 0 if switch else smoke_real.REASONING_ROOM
+                self.assertEqual(limits, [32 + room] * 5 + [1024 + room])
 
     def test_image_rows_the_cache_let_go_are_encoded_again(self):
         self.run_images(

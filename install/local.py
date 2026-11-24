@@ -236,17 +236,18 @@ def _entry(target, names):
     )
 
 
-def _projector(mmproj, repo):
+def _projector(mmproj, repo, family):
     """mmproj's name and header in repo, if it is a vision projector Splash
-    loads (upstream.read_projector); a refusal names mmproj."""
+    loads for family's tower (upstream.read_projector,
+    ModelFamily.projectors); a refusal names mmproj."""
     try:
         header, precision, kind = upstream.read_projector(repo, mmproj.name)
     except ModelError as error:
         raise models.VisionError(f"{mmproj}: {error}") from None
-    if precision is None:
+    if precision not in family.projectors:
         raise models.VisionError(
-            f"{mmproj} ({kind}) is not a vision projector Splash loads, a clip "
-            "model of BF16, F32 or F16 weights"
+            f"{mmproj} ({kind}) is not a vision projector Splash loads for "
+            f"{family.name}, a clip model of {', '.join(family.projectors)} weights"
         )
     return mmproj.name, header
 

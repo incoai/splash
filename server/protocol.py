@@ -245,8 +245,10 @@ SAMPLING_FIELDS: tuple[str, ...] = tuple(
 @dataclass(slots=True, frozen=True)
 class ImageSpan:
     """One image in the prompt: its placeholder token run, the patch grid of
-    the resized pixels, and a 128-bit digest of that content. Placeholder
+    the prepared pixels, and a 128-bit digest of that content. Placeholder
     token ids are identical for every image, so cache identity keys on spans.
+    patch, the side of a grid patch in pixels, is the served tower's, which
+    the engine knows: it is not part of the frame.
     """
 
     offset: int
@@ -255,10 +257,11 @@ class ImageSpan:
     grid_width: int
     digest_lo: int
     digest_hi: int
+    patch: int = 16
 
     @property
     def pixel_bytes(self) -> int:
-        return self.grid_height * 16 * self.grid_width * 16 * 3
+        return self.grid_height * self.patch * self.grid_width * self.patch * 3
 
 
 @dataclass(slots=True, frozen=True)

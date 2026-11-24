@@ -27,6 +27,7 @@ if __name__ == "__main__" and not __package__:
 
 from server import serve_options
 from server.chat_format import FLINT, INKLING2, QWEN, ChatFormat
+from server.images import INKLING_IMAGES, QWEN_IMAGES, ImageFormat
 
 from . import models
 
@@ -70,6 +71,14 @@ class ModelFamily:
     # loads from the target repository unless --language-only. The models of
     # a family without one serve text only, whatever their repository holds.
     vision: bool = True
+    # How its tower takes images (server/images.py), and the weight types of
+    # the GGUF vision projectors (mmproj) an installation loads for it, in
+    # the order it prefers them when a repository holds several
+    # (upstream.select_vision). Qwen's tower loads only exact ones, which
+    # preparation copies or converts without rounding; Inkling's also Q8_0,
+    # last, whose values preparation rounds to BF16.
+    image_format: ImageFormat = QWEN_IMAGES
+    projectors: tuple[str, ...] = ("BF16", "F32", "F16")
 
 
 FAMILIES = (
@@ -90,13 +99,16 @@ FAMILIES = (
     ),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
-    # Its vision tower is not served yet.
+    # Its vision tower is its release's and its MLX conversions' own, and an
+    # inkling2v projector beside its GGUFs: Unsloth publishes it in BF16, F16
+    # and F32, ggml-org in BF16 and Q8_0.
     ModelFamily(
         "Inkling-2-Mini",
         "incoai/Inkling-2-Mini-DFlash2",
         INKLING2,
         INKLING2_SAMPLING,
-        vision=False,
+        image_format=INKLING_IMAGES,
+        projectors=("BF16", "F32", "F16", "Q8_0"),
     ),
 )
 

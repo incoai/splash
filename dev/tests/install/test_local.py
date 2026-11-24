@@ -27,7 +27,7 @@ from dev.tests.installer_fixtures import (
     write_gguf,
     write_target,
 )
-from install import assembly, hub, local, models, upstream
+from install import assembly, families, hub, local, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -235,6 +235,78 @@ class LocalModelTest(unittest.TestCase):
             models.ModelError, f"the Hub cache has no snapshot of {missing}; {remedy}"
         ):
             self.prepare(target)
+
+    def test_inkling_s_checkpoint_serves_its_tower_without_a_processor(self):
+        # An MLX conversion of Inkling 2 keeps its tower under transformers'
+        # names and saves no processor, whose class takes its defaults alone;
+        # its release's states them (transformers' Inkling2ImageProcessor).
+        family = families.named("Inkling-2-Mini")
+        shards = {
+            "model.vision_tower.layers.0.lambda_1": "model-00001-of-00002.safetensors",
+            "model.language_model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+            "lm_head.weight": "model-00002-of-00002.safetensors",
+        }
+        target = mlx_target(self.root / "Inkling-2-Mini-4bit", family)
+        (target / "model.safetensors").unlink()
+        (target / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": shards})
+        )
+        for name in set(shards.values()):
+            (target / name).write_text(name)
+        draft = draft_dir(self.root / "draft", family)
+        prepared = self.prepare(target, draft)
+        record = assembly.verify(prepared, full=True)
+        self.assertEqual(
+            (record["target_format"], record["vision_format"]),
+            ("mlx-affine", "safetensors"),
+        )
+        self.assertEqual(
+            sorted(p.name for p in (prepared / "vision").iterdir()),
+            ["model-00001-of-00002.safetensors"],
+        )
+        processor = {
+            "image_processor_type": "Inkling2ImageProcessor",
+            "size": {"height": 40, "width": 40},
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "rescale_factor": 1 / 255,
+            "do_convert_rgb": True,
+            "do_normalize": True,
+            "do_rescale": True,
+        }
+        (target / "processor_config.json").write_text(
+            json.dumps({"image_processor": processor})
+        )
+        self.prepare(target, draft)
+        (target / "processor_config.json").write_text(
+            json.dumps(
+                {"image_processor": processor | {"size": {"height": 32, "width": 32}}}
+            )
+        )
+        with self.assertRaisesRegex(
+            models.VisionError,
+            "unsupported vision preprocessing configuration; pass "
+            "language_only=True to serve text only",
+        ):
+            self.prepare(target, draft)
+        # Its RoPE: a config may state transformers' axial one over 10,000,
+        # which the encoder runs, and no other base.
+        (target / "processor_config.json").write_text(
+            json.dumps({"image_processor": processor})
+        )
+        config = json.loads((target / "config.json").read_text())
+        for theta in (10_000.0, 20_000.0):
+            config["vision_config"]["rope_parameters"] = {
+                "rope_type": "axial",
+                "rope_theta": theta,
+            }
+            (target / "config.json").write_text(json.dumps(config))
+            with self.subTest(theta=theta):
+                if theta == 10_000.0:
+                    self.prepare(target, draft)
+                    continue
+                with self.assertRaisesRegex(models.VisionError, "rope_theta"):
+                    self.prepare(target, draft)
 
     def test_an_mlx_target_serves_images_with_its_own_tower(self):
         shards = {

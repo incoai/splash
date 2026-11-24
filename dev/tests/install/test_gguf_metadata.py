@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import io
 import shutil
 import struct
@@ -31,7 +32,7 @@ from dev.tests.installer_fixtures import (
     write_gguf,
     write_target,
 )
-from install import assembly, gguf, hub, models, upstream
+from install import assembly, families, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -387,39 +388,59 @@ class GgufMetadataTests(unittest.TestCase):
         repo = projectors(
             **{"mmproj-Model-bf16": bf16, "mmproj-Model-f16": f16, "mmproj-x": text}
         )
-        name, header = upstream.select_vision(repo)
+        qwen, inkling = families.named("Qwen3.8-27B"), families.named("Inkling-2-Mini")
+        repo = projectors(
+            **{"mmproj-Model-bf16": bf16, "mmproj-Model-f16": f16, "mmproj-x": text}
+        )
+        name, header = upstream.select_vision(repo, qwen)
         self.assertEqual(name, "mmproj-Model-bf16.gguf")
         self.assertEqual(header.values["general.architecture"], "clip")
         self.assertEqual(
             upstream.select_vision(
-                projectors(**{"mmproj-f16": f16, "mmproj-f32": f32})
+                projectors(**{"mmproj-f16": f16, "mmproj-f32": f32}), qwen
             )[0],
             "mmproj-f32.gguf",
         )
         only_f16 = projectors(**{"mmproj-f16": f16, "mmproj-x": text})
-        self.assertEqual(upstream.select_vision(only_f16)[0], "mmproj-f16.gguf")
+        self.assertEqual(upstream.select_vision(only_f16, qwen)[0], "mmproj-f16.gguf")
         # Text only, the model is served: the caller says how to ask for it.
         with self.assertRaisesRegex(
             models.VisionError,
-            r"no BF16, F32 or F16 vision projector \(mmproj-q8.gguf \(clip: F32, Q8_0\); "
+            r"no BF16, F32, F16 vision projector \(mmproj-q8.gguf \(clip: F32, Q8_0\); "
             r"mmproj-x.gguf \(qwen35moe: BF16, F32\)\)$",
         ):
             upstream.select_vision(
-                projectors(**{"mmproj-q8": quantized, "mmproj-x": text})
+                projectors(**{"mmproj-q8": quantized, "mmproj-x": text}), qwen
             )
+        # Inkling's tower takes a Q8_0 projector too, after an exact one.
+        both = projectors(**{"mmproj-Model-Q8_0": quantized, "mmproj-Model-BF16": bf16})
+        self.assertEqual(
+            upstream.select_vision(both, inkling)[0], "mmproj-Model-BF16.gguf"
+        )
+        self.assertEqual(
+            upstream.select_vision(both, qwen)[0], "mmproj-Model-BF16.gguf"
+        )
+        self.assertEqual(
+            upstream.select_vision(
+                projectors(**{"mmproj-Model-Q8_0": quantized}), inkling
+            )[0],
+            "mmproj-Model-Q8_0.gguf",
+        )
         with self.assertRaisesRegex(
             models.ModelError, "several BF16 vision projectors"
         ):
-            upstream.select_vision(projectors(**{"mmproj-a": bf16, "mmproj-b": bf16}))
+            upstream.select_vision(
+                projectors(**{"mmproj-a": bf16, "mmproj-b": bf16}), qwen
+            )
         # Prism ML prefixes the model's name.
         self.assertEqual(
             upstream.select_vision(
-                projectors(**{"Model-mmproj-BF16": bf16, "Model-PQ2_0": text})
+                projectors(**{"Model-mmproj-BF16": bf16, "Model-PQ2_0": text}), qwen
             )[0],
             "Model-mmproj-BF16.gguf",
         )
         with self.assertRaisesRegex(models.ModelError, "no GGUF named mmproj"):
-            upstream.select_vision(projectors())
+            upstream.select_vision(projectors(), qwen)
 
     def test_metadata_cache_hit_integrity_and_atomic_failure(self):
         path = write_gguf(self.root / "model.gguf", fixture())
@@ -708,6 +729,78 @@ class GgufMetadataTests(unittest.TestCase):
                 selection(self.root, GGUF_REPO + ":Q4_K_M", language_only=False)
             )
         self.assertEqual(fake.downloads, [])
+
+    def install_while_its_family_served_text_only(self, fake):
+        """A selection that asks for images, installed by a release in which
+        its target's family served text only (Inkling-2-Mini's before
+        1.7.3), with the requests and downloads it made forgotten."""
+        chosen = selection(self.root, GGUF_REPO + ":Q4_K_M", language_only=False)
+        text_only = tuple(
+            dataclasses.replace(family, vision=False) if family == MOE else family
+            for family in families.FAMILIES
+        )
+        with mock.patch.object(families, "FAMILIES", text_only):
+            self.prepare(chosen)
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "none")
+        self.assertNotIn(f"{GGUF_REPO}/mmproj-F32.gguf", fake.downloads)
+        fake.requests.clear(), fake.downloads.clear()
+        return chosen
+
+    @staticmethod
+    def prepare_warned(chosen):
+        """prepare's output and its warnings."""
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()) as warnings,
+        ):
+            upstream.prepare(chosen)
+        return output.getvalue(), warnings.getvalue()
+
+    def test_an_installation_without_its_family_s_tower_takes_it_in(self):
+        fake = self.gguf_repository()
+        chosen = self.install_while_its_family_served_text_only(fake)
+        output, warnings = self.prepare_warned(chosen)
+        self.assertIn("it serves images now", output)
+        self.assertEqual(warnings, "")
+        # The projector alone downloads; the installed GGUF is linked again.
+        self.assertEqual(fake.downloads, [f"{GGUF_REPO}/mmproj-F32.gguf"])
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "gguf")
+        output, warnings = self.prepare_warned(chosen)
+        self.assertIn("is already installed", output)
+        self.assertEqual(warnings, "")
+
+    def test_offline_an_installation_without_its_tower_serves_text_quietly(self):
+        fake = self.gguf_repository()
+        chosen = self.install_while_its_family_served_text_only(fake)
+        adapter = self.root / "gguf.py"
+        adapter.write_text("a new adapter\n")
+        with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
+            output, warnings = self.prepare_warned(chosen)
+            self.assertIn("is already installed", output)
+            # A new metadata adapter assembles it again, text only, from the
+            # snapshots it links, which hold no projector.
+            with mock.patch.object(gguf, "__file__", str(adapter)):
+                output, rebuilt = self.prepare_warned(chosen)
+        self.assertIn("the GGUF metadata adapter changed", output)
+        self.assertEqual(warnings + rebuilt, "")
+        self.assertEqual(fake.downloads, [])
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "none")
+
+    def test_a_repository_without_a_projector_goes_on_serving_text(self):
+        fake = self.gguf_repository(vision=False)
+        chosen = self.install_while_its_family_served_text_only(fake)
+        for start in range(2):
+            with self.subTest(start=start):
+                output, warnings = self.prepare_warned(chosen)
+                self.assertIn(
+                    f"{GGUF_REPO}:Q4_K_M serves text only: the GGUF repository has "
+                    "no BF16, F32, F16 vision projector",
+                    output,
+                )
+                self.assertIn("is already installed", output)
+                self.assertEqual(warnings, "")
+                self.assertEqual(fake.downloads, [])
+                self.assertEqual(assembly.verify(chosen.link)["vision_format"], "none")
 
     def test_a_new_metadata_adapter_rebuilds_the_metadata_locally(self):
         self.rebuild_metadata_with_a_new_adapter(offline=False)

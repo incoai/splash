@@ -168,7 +168,7 @@ def _words(payload: bytes, offset: int, count: int) -> tuple[int, ...]:
     return struct.unpack_from(f"<{count}I", payload, offset)
 
 
-def _decode_request(payload: bytes) -> wire.RequestFrame:
+def _decode_request(payload: bytes, patch: int) -> wire.RequestFrame:
     (
         request_id,
         priority,
@@ -195,7 +195,8 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
     offset += 4 * prompt_count
     spans = tuple(
         wire.ImageSpan(
-            *_IMAGE_SPAN.unpack_from(payload, offset + index * _IMAGE_SPAN.size)
+            *_IMAGE_SPAN.unpack_from(payload, offset + index * _IMAGE_SPAN.size),
+            patch,
         )
         for index in range(span_count)
     )
@@ -228,12 +229,16 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
     )
 
 
-def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
+def decode_client_frame(
+    frame_type: int, payload: bytes, patch: int = 16
+) -> wire.ClientMessage:
     """One client frame's message, read as the engine reads it but without
-    checking the rules the server's encoder already enforced."""
+    checking the rules the server's encoder already enforced. patch is the
+    side of an image's patch, the served tower's, which the engine knows and
+    the frame does not state: Qwen's 16 pixels, Inkling's 20."""
     match frame_type:
         case wire.FrameType.REQUEST:
-            return _decode_request(payload)
+            return _decode_request(payload, patch)
         case wire.FrameType.CANCEL:
             return wire.CancelFrame(*_ID.unpack(payload))
         case wire.FrameType.MASK_RESPONSE:
@@ -260,8 +265,10 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
 class ClientFrameReader:
     """Splits the server's byte stream into client frames."""
 
-    def __init__(self):
+    def __init__(self, patch: int = 16):
         self._buffer = bytearray()
+        # The served tower's patch side (decode_client_frame).
+        self._patch = patch
 
     def feed(self, data) -> list[tuple[wire.ClientMessage, bytes]]:
         """Each complete frame in what has arrived so far, as its message and
@@ -280,6 +287,11 @@ class ClientFrameReader:
             raw = bytes(self._buffer[:end])
             del self._buffer[:end]
             frames.append(
-                (decode_client_frame(frame_type, raw[wire.FRAME_HEADER_BYTES :]), raw)
+                (
+                    decode_client_frame(
+                        frame_type, raw[wire.FRAME_HEADER_BYTES :], self._patch
+                    ),
+                    raw,
+                )
             )
         return frames
