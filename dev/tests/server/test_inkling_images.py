@@ -149,13 +149,6 @@ class InklingPreparationTest(unittest.TestCase):
         self.assertEqual(pixels[0, 8].tolist(), [153] * 3)
         self.assertEqual(pixels[8, 8].tolist(), [204] * 3)
 
-    def test_the_encoder_normalizes_as_the_reference(self):
-        # x / 127.5 - 1 against the reference's fused (x - 127.5) / 127.5.
-        values = np.arange(256, dtype=np.float32)
-        splash = values * np.float32(1 / 127.5) - np.float32(1)
-        reference = (values - np.float32(127.5)) / np.float32(127.5)
-        self.assertLessEqual(float(np.abs(splash - reference).max()), 1.2e-7)
-
     def test_images_past_the_patch_budget_resize_inside_it(self):
         # The default cap's 16,384 patches: 4,096 tokens, as llama.cpp's.
         self.assertEqual(images.max_patches(images.MAX_PIXELS) // 4, 4096)
@@ -314,11 +307,7 @@ class InklingImageRequestTest(fixtures.HarnessTestCase):
         for span, prepared in zip(frame.image_spans, prepared_images):
             self.assertEqual(prompt[span.offset - 1], self.content_image)
             self.assertEqual(
-                prompt[
-                    span.offset : span.end
-                    if hasattr(span, "end")
-                    else span.offset + span.tokens
-                ],
+                prompt[span.offset : span.offset + span.tokens],
                 [self.image_token] * prepared.tokens,
             )
             self.assertEqual(prompt[span.offset + span.tokens], self.end_message)

@@ -84,15 +84,21 @@ def decode_base64(encoded: str) -> bytes:
     return base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
 
 
+def base64_limit(size: int) -> int:
+    """The longest base64 text of size bytes that decode_base64 takes,
+    which bounds a text before it is decoded: padded, and wrapped at 76
+    columns with a two-character break after each line."""
+    characters = 4 * ((size + 2) // 3)
+    return characters + 2 * ((characters + 75) // 76)
+
+
 def decode_data_url(url) -> bytes:
     if not isinstance(url, str) or not url.startswith("data:"):
         raise ImageError("only data: image URLs are supported")
     header, _, encoded = url.partition(",")
     if ";base64" not in header:
         raise ImageError("image data URLs must be base64-encoded")
-    # Its line breaks, at most 2 characters in 78 of a wrapped text, are not
-    # the image's bytes.
-    if len(encoded) > MAX_IMAGE_BYTES * 4 // 3 * 78 // 76 + 4:
+    if len(encoded) > base64_limit(MAX_IMAGE_BYTES):
         raise ImageError("image exceeds the size limit")
     try:
         raw = decode_base64(encoded)

@@ -1,3 +1,4 @@
+import base64
 import io
 import math
 import time
@@ -134,6 +135,30 @@ class DocumentTests(unittest.TestCase):
                     encoded,
                     budget=documents.DocumentBudget(deadline=math.inf),
                 )
+
+    def test_pdf_data_decodes_wrapped_unpadded_and_url_safe(self):
+        # As an image's data does (images.decode_base64): wrapped at 76
+        # columns as `base64` on Linux writes it, unpadded or URL-safe, the
+        # same document, and bounded before it is decoded as one of its size.
+        payload = pdf_bytes()
+        budget = documents.DocumentBudget(deadline=math.inf)
+        plain = documents.pdf_content(base64.b64encode(payload).decode(), budget=budget)
+        encoded = base64.b64encode(payload).decode()
+        wrapped = "".join(
+            encoded[i : i + 76] + "\r\n" for i in range(0, len(encoded), 76)
+        )
+        for variant in (
+            wrapped,
+            encoded.rstrip("="),
+            base64.urlsafe_b64encode(payload).decode(),
+        ):
+            with self.subTest(variant=variant[-8:]):
+                self.assertEqual(documents.pdf_content(variant, budget=budget), plain)
+        self.assertEqual(len(wrapped), images.base64_limit(len(payload)))
+        with mock.patch.object(documents, "MAX_PDF_BYTES", len(payload)):
+            self.assertEqual(documents.checked_file({"file_data": wrapped}), wrapped)
+            with self.assertRaisesRegex(APIError, "exceeds the size limit"):
+                documents.checked_file({"file_data": wrapped + "A"})
 
     def test_document_bounds_fail_before_processing_more_content(self):
         import pypdfium2 as pdfium

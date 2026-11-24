@@ -780,6 +780,8 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
         grid_width = _u32(span.grid_width, "image grid width")
         _u64(span.digest_lo, "image digest")
         _u64(span.digest_hi, "image digest")
+        content_height = _u32(span.content_height, "image content height")
+        content_width = _u32(span.content_width, "image content width")
         if (
             grid_height < 2
             or grid_width < 2
@@ -790,6 +792,11 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
             raise ValueError("image grid must be even-sided and within the patch limit")
         if tokens != (grid_height // 2) * (grid_width // 2):
             raise ValueError("image span tokens must equal the merged grid size")
+        if (
+            content_height > grid_height * span.patch
+            or content_width > grid_width * span.patch
+        ):
+            raise ValueError("image content must lie inside its grid")
         if offset < previous_end or offset + tokens > prompt_tokens:
             raise ValueError(
                 "image spans must be sorted, non-overlapping runs inside the prompt"

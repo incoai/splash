@@ -759,6 +759,23 @@ class ProtocolPythonTests(unittest.TestCase):
         )
         self.assertEqual(message, request)
 
+    def test_an_image_s_content_lies_inside_its_grid(self):
+        # The engine's rule (imageSpansValidationError): the image's own
+        # pixels are within the grid's, 40 a side here.
+        request = example_inkling_image_request()
+        (span,) = request.image_spans
+        for content in ({"content_height": 41}, {"content_width": 41}):
+            with self.subTest(content=content):
+                outside = replace(request, image_spans=(replace(span, **content),))
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda outside=outside: p.serialize_message(outside),
+                )
+                self.assertIn("inside its grid", issue.message)
+        whole = replace(span, content_height=40, content_width=40)
+        p.serialize_message(replace(request, image_spans=(whole,)))
+
     def test_request_header_and_binary_prompt(self):
         request = example_request()
         wire = p.serialize_message(request)
