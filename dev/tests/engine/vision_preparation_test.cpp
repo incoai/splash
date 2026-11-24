@@ -6,8 +6,10 @@
 //   vision-preparation padding DIRECTORY
 //
 // EXPECTED is an independently serialized file the image and the size
-// estimate must equal. padding writes a padded section after an unpadded one
-// and checks its padding is zero.
+// estimate must equal; the installer's check of the source
+// (VisionLoader::check) refuses what the image's writer refuses, and nothing
+// else. padding writes a padded section after an unpadded one and checks its
+// padding is zero.
 
 #include "TestFiles.hpp"
 #include "model/VisionLoader.hpp"
@@ -102,9 +104,25 @@ int main(int argc, char **argv) {
                 .positionGridSide = 2,
                 .patchSize = 2,
                 .spatialMerge = 2};
-    const model::ImagePlan image = model::VisionLoader(argv[2], source, layout).image();
+    const model::VisionLoader loader(argv[2], source, layout);
+    // The installer's check (VisionLoader::check) prepares the image as a
+    // start does: it refuses what the writer refuses, in the writer's words,
+    // and nothing the writer writes.
+    std::string refused;
+    try {
+      loader.check();
+    } catch (const std::exception &e) {
+      refused = e.what();
+    }
+    const model::ImagePlan image = loader.image();
     std::vector<uint8_t> bytes(image.bytes);
-    image.write(bytes, {});
+    try {
+      image.write(bytes, {});
+    } catch (const std::exception &e) {
+      if (refused != e.what()) throw std::runtime_error("the check's refusal is not the writer's");
+      throw;
+    }
+    if (!refused.empty()) throw std::runtime_error("the check refused a source its writer wrote: " + refused);
     const auto expected = test::readFile(argv[3]);
     const auto differs = std::mismatch(bytes.begin(), bytes.end(), expected.begin(), expected.end());
     if (differs.first != bytes.end() || differs.second != expected.end())

@@ -773,9 +773,8 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
 // Inkling's (inkling2_vision, in transformers' names as its config.json
 // states them: its patches' side and merge as native_patch_size and
 // adapter_merge_size or patch_size and spatial_merge_size, its MLP as a
-// ratio of its width), over RGB patches of
-// one frame into a projector without biases, of the exact GELU transformers'
-// default activation is.
+// ratio of its width), over RGB patches of one frame into a projector
+// without biases, of the exact GELU transformers' default activation is.
 void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                           TargetSource source) {
   if (layout.tower == ops::VisionTower::Inkling) {
@@ -793,13 +792,16 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
     // Its patches' side and merge, which transformers stores as patch_size
     // and spatial_merge_size, the release's names its aliases: either, or
     // both alike.
-    for (const ExpectedNumber alias : {ExpectedNumber("native_patch_size", layout.patchSize),
-                                       ExpectedNumber("adapter_merge_size", layout.spatialMerge)}) {
-      const char *stored = alias.key == std::string_view("native_patch_size") ? "patch_size" : "spatial_merge_size";
-      if (vision[@(stored)])
-        requireNumbers(vision, sourceName(source), "vision config", {{stored, alias.value}});
-      if (vision[@(alias.key)] || !vision[@(stored)])
-        requireNumbers(vision, sourceName(source), "vision config", {alias});
+    struct Spelling final {
+      const char *release, *stored;
+      uint32_t value;
+    };
+    for (const Spelling &size : {Spelling{"native_patch_size", "patch_size", layout.patchSize},
+                                 Spelling{"adapter_merge_size", "spatial_merge_size", layout.spatialMerge}}) {
+      if (vision[@(size.stored)])
+        requireNumbers(vision, sourceName(source), "vision config", {{size.stored, size.value}});
+      if (vision[@(size.release)] || !vision[@(size.stored)])
+        requireNumbers(vision, sourceName(source), "vision config", {{size.release, size.value}});
     }
     requireBooleans(vision, "vision config", {{"projector_bias", false}});
     if (vision[@"hidden_act"])
@@ -1046,15 +1048,14 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
   }
 }
 
-uint64_t checkVisionSource(std::string_view targetFormat, std::string_view visionFormat,
-                           const std::filesystem::path &config, const std::filesystem::path &root) {
+void checkVisionSource(std::string_view targetFormat, std::string_view visionFormat,
+                       const std::filesystem::path &config, const std::filesystem::path &root) {
   @autoreleasepool {
     const ModelDescriptor descriptor =
         describeSourceModel({}, targetFormat, visionFormat, readObject(config, "upstream model config"), nil);
     if (descriptor.visionSource != VisionSource::Safetensors && descriptor.visionSource != VisionSource::Gguf)
       throw std::invalid_argument("a vision check needs a vision source");
     VisionLoader(root / "vision", descriptor.visionSource, descriptor.vision).check();
-    return visionImageBytes(descriptor.vision);
   }
 }
 

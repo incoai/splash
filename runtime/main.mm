@@ -481,13 +481,12 @@ int checkModel(int argc, char **argv) {
 }
 
 // The tower of an upstream model's configuration prepared once from ROOT's
-// vision/, which the installer links its downloaded files into: its image's
-// bytes as JSON, or the refusal (model::checkVisionSource).
+// vision/, which the installer links its downloaded files into: nothing but
+// its status, or the refusal (model::checkVisionSource).
 int checkVision(int argc, char **argv) {
   if (argc != 6)
     throw engine::UsageError("vision-check takes the source formats, the target's config and the tower's root");
-  const uint64_t bytes = model::checkVisionSource(argv[2], argv[3], argv[4], argv[5]);
-  std::printf("{\"bytes\":%llu}\n", static_cast<unsigned long long>(bytes));
+  model::checkVisionSource(argv[2], argv[3], argv[4], argv[5]);
   return 0;
 }
 

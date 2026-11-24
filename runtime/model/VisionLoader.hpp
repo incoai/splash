@@ -11,11 +11,11 @@
 
 namespace splash::model {
 
-// Source adapter for the vision tower: the vision_tower.* tensors of an MLX
-// checkpoint or a GGUF mmproj (Qwen's tower), or a GGUF mmproj (Inkling's,
-// model/InklingVision.hpp), written into the tower's image
-// (model/VisionPreparation.hpp). Construction validates the source's metadata
-// and plans the image; tensor values are converted only when it is written.
+// Source adapter for the vision tower: the tower's tensors of a safetensors
+// checkpoint or a GGUF mmproj, Qwen's or Inkling's (model/InklingVision.hpp),
+// written into the tower's image (model/VisionPreparation.hpp). Construction
+// validates the source's metadata and plans the image; tensor values are
+// converted only when it is written.
 class VisionLoader final {
 public:
   VisionLoader(const std::filesystem::path &directory, VisionSource source, const ops::VisionLayout &layout);
@@ -26,9 +26,10 @@ public:
   [[nodiscard]] const ops::VisionLayout &layout() const noexcept;
   // The image of vision/model.bin.
   [[nodiscard]] ImagePlan image() const;
-  // Writes the image once, into memory it frees after: what preparation
-  // refuses of the source, a weight that is not exactly a BF16 say, is
-  // refused here (the engine's vision-check, at installation).
+  // Writes the image once with its writer (image), into memory it frees
+  // after: what preparation refuses of the source, a weight that is not
+  // exactly a BF16 say, is refused here (the engine's vision-check, at
+  // installation).
   void check() const;
 
 private:
