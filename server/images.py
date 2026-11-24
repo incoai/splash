@@ -45,6 +45,12 @@ class ImageError(ValueError):
     pass
 
 
+# What Anthropic's API says of an image it cannot process. Its clients act on
+# the words: Claude Code replaces that image in the conversation with a note
+# and goes on, where any other 400 fails every later request that resends it.
+UNPROCESSABLE = "Could not process image"
+
+
 class ImageCapacityError(ImageError):
     pass
 
@@ -193,7 +199,7 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
     except ImageError:
         raise
     except Exception as error:
-        raise ImageError("image could not be decoded") from error
+        raise ImageError(UNPROCESSABLE) from error
     grid_height, grid_width = height // PATCH, width // PATCH
     digest_lo, digest_hi = _digest(grid_height, grid_width, pixels)
     return PreparedImage(grid_height, grid_width, pixels, digest_lo, digest_hi)
@@ -300,7 +306,7 @@ def prepare_inkling(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedIma
     except ImageError:
         raise
     except Exception as error:
-        raise ImageError("image could not be decoded") from error
+        raise ImageError(UNPROCESSABLE) from error
     digest_lo, digest_hi = _digest(grid_height, grid_width, pixels, (height, width))
     return PreparedImage(
         grid_height,

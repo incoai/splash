@@ -610,9 +610,12 @@ call starts the same way.
 
 Images arrive inline as base64 `data:` URLs: Chat `image_url` parts, Responses
 `input_image` items and Messages `image` blocks with a `base64` source; an image
-URL to fetch returns 400. JPEG, PNG, WebP and GIF decode. An image file may
-hold up to 32 MiB and 33,554,432 pixels, with an aspect ratio up to 200:1, and
-is resized to at most `--max-image-pixels` (4,194,304 by default). Inkling 2
+URL to fetch returns 400. JPEG, PNG, WebP and GIF decode; any other image, or
+one cut short, returns 400 `Could not process image`, the words of Anthropic's
+API, on which Claude Code takes the image out of the conversation and goes on.
+An image file may hold up to 32 MiB and 33,554,432 pixels, with an aspect ratio
+up to 200:1, and is resized to at most `--max-image-pixels` (4,194,304 by
+default). Inkling 2
 takes an image of any aspect ratio at its own size, padded to whole 40-pixel
 tokens, and resizes only an image of more patches than the cap gives
 (`--max-image-pixels` / 256: 16,384 patches at the default, which make 4,096

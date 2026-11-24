@@ -668,6 +668,48 @@ class ImageRequestTest(HarnessTestCase):
         del job
         self.assertEqual(app.images.stats()["request_bytes"], 0)
 
+    def test_an_image_that_cannot_be_decoded_is_refused_in_anthropic_s_words(self):
+        # Half of a PNG, as a file cut short on its way: each tower's
+        # preparation refuses it in the words Claude Code acts on, and a
+        # Messages request that holds it gets them in a 400.
+        payload = png_bytes(64, 64)
+        cut = payload[: len(payload) // 2]
+        for prepare in (images.prepare, images.prepare_inkling):
+            with self.subTest(prepare=prepare.__name__):
+                with self.assertRaises(images.ImageError) as refused:
+                    prepare(cut)
+                self.assertEqual(str(refused.exception), "Could not process image")
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, tokenizer=ImagePadTokenizer())
+        source = {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": base64.b64encode(cut).decode(),
+        }
+        status, _, body = harness.request(
+            "POST",
+            "/v1/messages",
+            anthropic_body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {"type": "image", "source": source},
+                        ],
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(status, 400, body)
+        error = json.loads(body)
+        self.assertEqual(error["type"], "error")
+        self.assertEqual(
+            (error["error"]["type"], error["error"]["message"]),
+            ("invalid_request_error", "Could not process image"),
+        )
+        self.assertEqual(runtime.requests, [])
+
     def test_anthropic_and_responses_images_reach_the_same_pipeline(self):
         runtime = FakeRuntime(Plan([[4]]), Plan([[4]]))
         harness = self.harness(runtime, tokenizer=ImagePadTokenizer())
