@@ -22,14 +22,14 @@ GPU) with 48 GB.
 | `GET /` | the trial page (`server/video.html`) in place of the chat page: a clip from a prompt, frames or references, its queue, progress, cancel and mp4; public, and gone with `--no-webui` |
 
 `POST` takes JSON, or the multipart form OpenAI's SDK sends: `prompt`,
-`model`, `seconds` (a whole number from `4` to `15`, `10` the default:
+`model` (`MiniMaxAI/MiniMax-H3:VARIANT` picks that served variant), `seconds` (a whole number from `4` to `15`, `10` the default:
 Pika's `--duration` choices and `4`; the smallest 17 n + 5 frames at least
 seconds x 24 at 24 fps, Pika's `align_num_frames`, such as 107, 124, 175, 243
 and 362 frames for 4, 5, 7, 10 and 15 s; the golden-clip tests' server also
 takes `3`, 73 frames, under `SPLASH_GOLDEN_CLIPS=1`) and `size` (`832x480`, the
 default, or another canvas of
 [the 768p and 480p tiers](#video-canvases), such as `1344x768`), and
-Splash's `variant` (the installed one: `vdn-8`, `vdn-50`, `fasth3-8`, `fasth3-4`, `pika-6` or `pika-ref2va-6`), `seed`, `steps` (0 or the variant's: its adaLN tables are those of
+Splash's `variant` (a served one: `vdn-8`, `vdn-50`, `fasth3-8`, `fasth3-4`, `pika-6` or `pika-ref2va-6`), `seed`, `steps` (0 or the variant's: its adaLN tables are those of
 its schedule), `preview` (false) and `audio` (true). OpenAI's
 `input_reference`, a PNG or JPEG file field, is the clip's first frame, and
 Splash's `last_frame`, another (with `input_reference`), its last; the server
@@ -173,10 +173,12 @@ VDN-H3 stage, and `:vdn-50`, its
 entry and assembly, and so are FastVideo's FastH3 students, `:fasth3-8` and
 `:fasth3-4`, and Pika H3 Flex's `:pika-6` and `:pika-ref2va-6`. The model ID
 without a variant installs `H3.default_variant`, `:pika-6`, unless its
-selection link holds an installation, which keeps its variant. A server
-serves the variant it installed.
-A request without `variant` is served `H3.default_variant` by an assembly
-of several that holds it, else the first.
+selection link holds an installation, which keeps its variant. A video
+model's server serves every installed variant of its model; `--model` names
+the one a request without `model` gets. `/v1/models` lists each as
+`MiniMaxAI/MiniMax-H3:VARIANT` after the `--model` ID and its aliases, that
+one first, with `video` and `audio` in its `input_modalities` where it takes
+references, and `splash remove` refuses any of them while the server runs.
 Installation and `splash generate` print the license's name, its excluded
 territories and its URL; the assembly links the release's `LICENSE`.
 

@@ -220,10 +220,10 @@ class RequestTest(unittest.TestCase):
         self.assertEqual([r.kind for r in request.references], ["video", "image"])
         self.assertEqual(videos.clip(request, (1, 2))[0], "pika-ref2va-6")
 
-    def test_a_request_without_a_variant_takes_pika_6_where_installed(self):
+    def test_a_request_without_a_variant_takes_the_first_served_of_its_kind(self):
         for variants, variant in (
-            (("vdn-8", "pika-6"), "pika-6"),
-            (("vdn-8", "vdn-50"), "vdn-8"),
+            (("pika-6", "vdn-8"), "pika-6"),
+            (("pika-ref2va-6", "vdn-8"), "vdn-8"),
         ):
             request = videos.parse_request(
                 {"prompt": "x"}, self.NAMES, {n: H3.variants[n] for n in variants}

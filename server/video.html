@@ -42,15 +42,22 @@
   main { max-width: 780px; margin: 0 auto; padding: 22px 16px 60px }
   .brand { display: flex; align-items: center; gap: 9px; margin-bottom: 18px; font-size: 17px; font-weight: 650; letter-spacing: -.02em }
   .brand img { width: 19px; height: 19px }
-  #model { color: var(--muted); font-size: 13px; font-weight: 400; letter-spacing: 0 }
+  #picker { position: relative; font-size: 13px; font-weight: 400; letter-spacing: 0 }
+  #variant { padding: 2px 9px; color: var(--muted); border: 1px solid var(--border); border-radius: 8px }
+  #variant:hover { color: var(--text) }
+  #variant::after { content: " \25BE" }
+  #variants { position: absolute; z-index: 1; top: calc(100% + 4px); left: 0; width: max-content; max-width: calc(100vw - 32px); padding: 4px; background: var(--composer); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow) }
+  .variant { display: block; width: 100%; padding: 6px 10px; text-align: left; border-radius: 8px }
+  button.variant:hover { background: var(--hover) }
+  .variant[aria-selected="true"] { font-weight: 600 }
+  .variant small { display: block; color: var(--muted); font-size: 12px; font-weight: 400 }
+  .variant.missing { color: var(--muted); opacity: .6 }
+  .variant code { font: 12px ui-monospace, Menlo, monospace; overflow-wrap: anywhere; user-select: all }
   h2 { margin: 30px 0 4px; font-size: 15px }
   .hint { margin: 6px 0; color: var(--muted); font-size: 12px }
 
   form { padding: 14px; background: var(--composer); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow) }
   #prompt { display: block; width: 100%; min-height: 76px; padding: 4px 2px; resize: vertical; background: none; border: 0; outline: 0 }
-  #modes { display: inline-flex; margin-top: 8px; padding: 2px; background: var(--bubble); border-radius: 9px }
-  #modes button { padding: 4px 10px; border-radius: 7px; font-size: 13px; color: var(--muted) }
-  #modes button[aria-pressed="true"] { color: var(--text); background: var(--composer) }
   .drops { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px }
   .drop { position: relative; display: grid; place-items: center; min-height: 92px; padding: 10px; overflow: hidden; color: var(--muted); font-size: 13px; text-align: center; border: 1.5px dashed var(--border); border-radius: 12px; cursor: pointer }
   .drop:hover, .drop.over { color: var(--text); background: var(--hover) }
@@ -93,13 +100,11 @@
 </style>
 
 <main>
-  <div class="brand"><img src="/favicon.ico" alt="">Splash <span id="model"></span></div>
+  <div class="brand"><img src="/favicon.ico" alt="">Splash
+    <div id="picker"><button type="button" id="variant" aria-haspopup="listbox" aria-expanded="false" hidden></button><div id="variants" role="listbox" hidden></div></div>
+  </div>
   <form id="form">
     <textarea id="prompt" placeholder="Describe the clip" aria-label="Prompt" autofocus></textarea>
-    <div id="modes" hidden>
-      <button type="button" data-mode="frames">First and last frame</button>
-      <button type="button" data-mode="references">References</button>
-    </div>
     <div id="frames" class="drops">
       <label class="drop" data-field="input_reference"><span>First frame<br>PNG or JPEG: drop or click</span><input type="file" accept="image/png,image/jpeg" hidden></label>
       <label class="drop" data-field="last_frame"><span>Last frame<br>with a first frame</span><input type="file" accept="image/png,image/jpeg" hidden></label>
@@ -130,7 +135,8 @@
   const $ = selector => document.querySelector(selector);
   const form = $('#form');
   const prompt = $('#prompt');
-  const modes = $('#modes');
+  const variantButton = $('#variant');
+  const variantList = $('#variants');
   const referenceList = $('#reference-list');
   const apiKey = $('#api-key');
   const credentials = $('#credentials');
@@ -141,14 +147,17 @@
   // from 4 to 15, and the named canvases of the 480p and 768p tiers.
   const SECONDS = Array.from({length: 12}, (_, index) => index + 4);
   const SIZES = ['832x480', '864x480', '480x832', '1344x768', '768x1344'];
-  // The variant whose clips start from references instead of frames.
-  const REFERENCES_VARIANT = 'pika-ref2va-6';
+  // MiniMax-H3's variants (install/families.py, H3.variants), to show those
+  // the server does not serve with the command that installs them.
+  const VARIANTS = ['pika-6', 'pika-ref2va-6', 'vdn-8', 'vdn-50', 'fasth3-8', 'fasth3-4'];
   const PHASES = {encode: 'encoding the prompt', prepare: 'preparing', denoise: 'denoising',
                   preview: 'previewing', decode: 'decoding', audio: 'adding audio', mux: 'writing the mp4'};
   const promptsKey = 'splash-video-prompts';
   const frames = {input_reference: null, last_frame: null};
   let references = [];
   let mode = 'frames';
+  // The served variants' /v1/models entries, the default first, and the chosen one.
+  let served = [], chosen = null;
   // The prompts of the clips this browser made, by id; the API does not return them.
   let prompts = load();
   // The clips cancelled here, which the server forgets, and the mp4s fetched.
@@ -182,28 +191,73 @@
     catch { /* The page still works without browser storage. */ }
   }
 
-  // The served model, and what its variant starts from, as its id names it
-  // (repo:variant); an id without a variant leaves both kinds of input offered.
+  // The served variants, the entries repo:variant of /v1/models, the default
+  // first; its first entry is the server's --model, whose repo they share, and
+  // the others name no variant.
   async function loadModel() {
     try {
       const response = await fetch('/v1/models', {headers: authorization()});
       askForKeyIfUnauthorized(response);
       if (!response.ok) return;
-      const id = (await response.json()).data?.[0]?.id ?? '';
-      $('#model').textContent = id;
-      const variant = id.includes(':') ? id.slice(id.lastIndexOf(':') + 1) : '';
-      modes.hidden = Boolean(variant);
-      setMode(variant === REFERENCES_VARIANT ? 'references' : 'frames');
-    } catch { /* The server still refuses what its variant does not take. */ }
+      const data = (await response.json()).data ?? [];
+      const repo = (data[0]?.id ?? '').split(':')[0];
+      served = data.filter(entry => entry.id.startsWith(`${repo}:`));
+      if (!served.length) return;
+      renderVariants(repo);
+      choose(served.find(entry => entry.id === chosen?.id) ?? served[0]);
+      variantButton.hidden = false;
+    } catch { /* The server takes requests without a model too. */ }
   }
 
-  function setMode(value) {
-    mode = value;
+  const variantOf = entry => entry.id.slice(entry.id.lastIndexOf(':') + 1);
+  // A variant that takes video takes references (Ref2VA), else first and last frames.
+  const takesReferences = entry => entry.input_modalities?.includes('video');
+
+  function renderVariants(repo) {
+    variantList.replaceChildren();
+    for (const entry of served) {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = 'variant';
+      option.setAttribute('role', 'option');
+      option.entry = entry;
+      option.append(variantOf(entry));
+      const note = document.createElement('small');
+      note.textContent = takesReferences(entry) ? 'from references' : 'from a prompt, first and last frame';
+      option.append(note);
+      option.addEventListener('click', () => { choose(entry); openVariants(false); });
+      variantList.append(option);
+    }
+    const names = new Set(served.map(variantOf));
+    for (const variant of VARIANTS.filter(name => !names.has(name))) {
+      const option = document.createElement('div');
+      option.className = 'variant missing';
+      option.setAttribute('role', 'option');
+      option.setAttribute('aria-disabled', 'true');
+      option.append(`${variant} · not installed`);
+      const command = document.createElement('small');
+      const code = document.createElement('code');
+      code.textContent = `splash install ${repo}:${variant}`;
+      command.append(code);
+      option.append(command);
+      variantList.append(option);
+    }
+  }
+
+  function choose(entry) {
+    chosen = entry;
+    variantButton.textContent = entry.id;
+    for (const option of variantList.querySelectorAll('button.variant')) {
+      option.setAttribute('aria-selected', option.entry === entry);
+    }
+    mode = takesReferences(entry) ? 'references' : 'frames';
     $('#frames').hidden = mode !== 'frames';
     $('#references').hidden = mode !== 'references';
-    for (const button of modes.querySelectorAll('button')) {
-      button.setAttribute('aria-pressed', button.dataset.mode === mode);
-    }
+  }
+
+  function openVariants(open) {
+    variantList.hidden = !open;
+    variantButton.setAttribute('aria-expanded', open);
   }
 
   function kind(file) {
@@ -321,6 +375,7 @@
     body.append('size', $('#size').value);
     body.append('seed', $('#seed').value || '0');
     body.append('audio', String($('#audio').checked));
+    if (chosen) body.append('model', chosen.id);
     if (mode === 'frames') {
       for (const [field, frame] of Object.entries(frames)) if (frame) body.append(field, frame.file);
     } else {
@@ -476,7 +531,9 @@
   }
 
   form.addEventListener('submit', submit);
-  modes.addEventListener('click', event => { if (event.target.dataset.mode) setMode(event.target.dataset.mode); });
+  variantButton.addEventListener('click', () => openVariants(variantList.hidden));
+  document.addEventListener('click', event => { if (!$('#picker').contains(event.target)) openVariants(false); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') openVariants(false); });
   apiKey.addEventListener('change', () => { loadModel(); refresh(); });
   loadModel();
   refresh();

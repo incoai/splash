@@ -2434,7 +2434,7 @@ class GenerateOnServerTests(unittest.TestCase):
 
     def app(self, variants, step_seconds, fail):
         engine = test_videos.engine(self.log, step_seconds, fail)
-        variants = {n: H3.variants[n] for n in variants}
+        variants = {n: (H3.variants[n], Path("/models") / n) for n in variants}
         return videos.VideoApp(MODEL, (), engine, test_videos.tokenize, variants)
 
     def listen(self, app, port):

@@ -1,10 +1,10 @@
 """A video model's engine (runtime/video/VideoRuntime.hpp) for the server's
-tests: fake_video_engine.py LOG STEP_SECONDS [fail | hold]. Each
+tests: fake_video_engine.py LOG STEP_SECONDS [fail | hold] ROOT. Each
 request denoises in four steps of STEP_SECONDS, unless a Cancel ends it, then
 sends its preview when asked and its clip, each the request's seed; with
 `fail`, the engine's error instead. With `hold`, the first request waits at
-its first step for its Cancel, a minute at most. LOG gets a JSON line per request, with its canvas and the SHA-256 of
-each keyframe it carries, and per cancel."""
+its first step for its Cancel, a minute at most. LOG gets a JSON line per request, with its canvas, the SHA-256 of
+each keyframe it carries and the model root it runs on, and per cancel."""
 
 import hashlib
 import json
@@ -21,7 +21,7 @@ from server import protocol  # noqa: E402
 from server import video_protocol as wire  # noqa: E402
 
 
-def main(log, step_seconds, mode):
+def main(log, step_seconds, mode, root):
     reader, pending, cancelled = video_peer.ClientFrameReader(), [], set()
 
     def send(event):
@@ -56,7 +56,7 @@ def main(log, step_seconds, mode):
                                           ("last_frame", request.last_frame)) if pixels}  # fmt: skip
         note(request=number, tokens=list(request.prompt_tokens), frames=request.frames,
              size=f"{request.width}x{request.height}", outputs=int(request.outputs),
-             seed=request.seed, **keyframes)  # fmt: skip
+             seed=request.seed, **keyframes, root=root)  # fmt: skip
         for step in range(5):
             if number in cancelled:
                 send(protocol.ErrorEvent(protocol.FailureClass.REQUEST_ERROR, number, False,
@@ -84,4 +84,4 @@ def main(log, step_seconds, mode):
 
 if __name__ == "__main__":
     with open(sys.argv[1], "a") as log:
-        main(log, float(sys.argv[2]), (sys.argv[3:] or [None])[0])
+        main(log, float(sys.argv[2]), (sys.argv[3:-1] or [None])[0], sys.argv[-1])

@@ -21,6 +21,7 @@ from PIL import Image
 
 from dev.tests import native_peer, video_peer
 from dev.tests.server_fixtures import main_args
+from install import assembly
 from server import protocol, videos
 from server import server as api
 from server import video_protocol as wire
@@ -28,6 +29,11 @@ from server import video_protocol as wire
 ENGINE = Path(__file__).resolve().parents[1] / "fake_video_engine.py"
 MODEL = "MiniMaxAI/MiniMax-H3"
 SEVEN = (7).to_bytes(8, "little")
+# The served variants, each on an assembly of its own, the default first.
+VARIANTS = {
+    name: (videos.H3.variants[name], Path("/models") / name)
+    for name in ("pika-6", "pika-ref2va-6")
+}
 # A first frame of the canvas's size, which goes to the engine as it is.
 CANVAS = bytes(range(256)) * (1344 * 768 * 3 // 256)
 
@@ -49,9 +55,7 @@ def tokenize(text, add_special_tokens):
 def engine(log, step_seconds=0.0, fail=False, hold=False):
     command = [sys.executable, ENGINE, log, str(step_seconds)]
     command += ["fail"] * fail + ["hold"] * hold
-    started = videos.VideoEngine(command, 30)
-    started.start()
-    return started
+    return videos.VideoEngine(command, 30)
 
 
 def taken(log):
@@ -63,7 +67,11 @@ class VideoServerTest(unittest.TestCase):
     def serve(self, step_seconds=0.0, hold=False, fail=False):
         self.log = Path(self.enterContext(tempfile.TemporaryDirectory())) / "log"
         app = videos.VideoApp(
-            MODEL, ("h3",), engine(self.log, step_seconds, fail, hold), tokenize
+            MODEL,
+            ("h3",),
+            engine(self.log, step_seconds, fail, hold),
+            tokenize,
+            VARIANTS,
         )
         self.addCleanup(app.close)
         server = api.FrontendServer(("127.0.0.1", 0), app)
@@ -86,7 +94,7 @@ class VideoServerTest(unittest.TestCase):
         created = videos_api.create(
             prompt="a cat", model=MODEL, extra_body={"seed": 7, "preview": "true"}
         )
-        self.assertEqual((created.status, created.model), ("queued", MODEL))
+        self.assertEqual((created.status, created.model), ("queued", f"{MODEL}:pika-6"))
         video = videos_api.poll(created.id, poll_interval_ms=20)
         self.assertEqual((video.status, video.progress), ("completed", 100))
         # The defaults: 10 s at 832x480.
@@ -97,10 +105,41 @@ class VideoServerTest(unittest.TestCase):
         self.assertEqual(preview, b"preview" + SEVEN)
         self.assertEqual(taken(self.log), [{"request": 1, "tokens": [97, 32, 99, 97, 116],
                                             "frames": 243, "size": "832x480", "outputs": 3,
-                                            "seed": 7}])  # fmt: skip
+                                            "seed": 7, "root": "/models/pika-6"}])  # fmt: skip
         self.assertTrue(videos_api.delete(video.id).deleted)
         with self.assertRaises(openai.NotFoundError):
             videos_api.retrieve(video.id)
+
+    def test_a_requests_model_runs_its_variant_on_that_variants_assembly(self):
+        self.serve()
+        models = httpx.get(f"{self.url}/models").json()["data"]
+        self.assertEqual({e["id"]: e["input_modalities"] for e in models}, {
+            MODEL: ["text", "image", "video", "audio"], "h3": ["text", "image", "video", "audio"],
+            f"{MODEL}:pika-6": ["text", "image"],
+            f"{MODEL}:pika-ref2va-6": ["text", "image", "video", "audio"],
+        })  # fmt: skip
+        frames = self.client.videos.create(prompt="a cat", model=f"{MODEL}:pika-6")
+        reference = ("a.png", png(64, 36, bytes(64 * 36 * 3)), "image/png")
+        answer = httpx.post(f"{self.url}/videos", files=[("references", reference)],
+                            data={"prompt": "a cat", "model": f"{MODEL}:pika-ref2va-6"})  # fmt: skip
+        self.assertEqual(answer.status_code, 200, answer.text)
+        for created in (frames.id, answer.json()["id"]):
+            video = self.client.videos.poll(created, poll_interval_ms=20)
+            self.assertEqual(video.status, "completed")
+        self.assertEqual(answer.json()["model"], f"{MODEL}:pika-ref2va-6")
+        self.assertEqual([record["root"] for record in taken(self.log)],
+                         ["/models/pika-6", "/models/pika-ref2va-6"])  # fmt: skip
+        for body, status, message in (
+            ({"model": f"{MODEL}:vdn-8"}, 404, f"splash install {MODEL}:vdn-8, then start"),
+            ({"variant": "vdn-8"}, 400, f"splash install {MODEL}:vdn-8, then start"),
+            ({"model": f"{MODEL}:pika-6", "variant": "vdn-8"}, 400, "is the pika-6 variant"),
+        ):  # fmt: skip
+            with self.subTest(body=body):
+                refused = httpx.post(
+                    f"{self.url}/videos", json={"prompt": "a cat"} | body
+                )
+                self.assertEqual(refused.status_code, status)
+                self.assertIn(message, refused.json()["error"]["message"])
 
     def test_the_root_is_the_trial_page_public_and_gone_without_the_webui(self):
         self.serve()
@@ -365,8 +404,8 @@ class EngineLifetimeTest(VideoServerTest):
         """The engine processes started from here on, each once."""
         processes, start = [], videos.VideoEngine.start
 
-        def recorded(engine):
-            start(engine)
+        def recorded(engine, root):
+            start(engine, root)
             if engine.process not in processes:
                 processes.append(engine.process)
 
@@ -384,7 +423,8 @@ class EngineLifetimeTest(VideoServerTest):
         ready = httpx.get(self.url.removesuffix("/v1") + "/ready")
         self.assertEqual((ready.status_code, ready.json()), (200, {"status": "ready"}))
         models = httpx.get(f"{self.url}/models").json()["data"]
-        self.assertEqual([entry["id"] for entry in models], [MODEL, "h3"])
+        self.assertEqual([entry["id"] for entry in models],
+                         [MODEL, "h3", f"{MODEL}:pika-6", f"{MODEL}:pika-ref2va-6"])  # fmt: skip
         for prompt in ("job 1", "job 2"):
             video = self.client.videos.create(prompt=prompt)
             video = self.client.videos.poll(video.id, poll_interval_ms=20)
@@ -489,8 +529,46 @@ class EngineLifetimeTest(VideoServerTest):
     def test_a_server_whose_engine_cannot_start_fails_at_its_start(self):
         broken = videos.VideoEngine([sys.executable, "-c", "raise SystemExit(3)"], 30)
         with self.assertRaisesRegex(videos.VideoFailed, "exited with status 3"):
-            videos.VideoApp(MODEL, (), broken, tokenize)
+            videos.VideoApp(MODEL, (), broken, tokenize, VARIANTS)
         self.assertIsNotNone(broken.process.poll())
+
+
+class HoldVariantsTest(unittest.TestCase):
+    def installed(self, models, name, variant):
+        """The selection link name under models of an assembly whose weights
+        hold variant's DiT."""
+        entry = models / ".resolved" / name.replace("/", "-")
+        (entry / "weights" / f"dit-{videos.H3.variants[variant].dit}").mkdir(
+            parents=True
+        )
+        source = {"repo": videos.H3.release, "revision": None}
+        record = {"version": 1, "model": name, "family": "MiniMax-H3",
+                  "target_format": videos.H3.target_format, "vision_format": "none",
+                  "sources": {"target": source, "encoder": source}, "files": {}, "video": {}}  # fmt: skip
+        (entry / "model.json").write_text(json.dumps(record))
+        link = models / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(entry)
+        return link
+
+    def test_a_server_holds_every_installed_variant_of_its_model(self):
+        models = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        named = self.installed(models, f"{MODEL}:pika-ref2va-6", "pika-ref2va-6")
+        other = self.installed(models, f"{MODEL}:pika-6", "pika-6")
+        self.installed(models, "community/other", "vdn-8")
+        # An installation that does not verify is not served.
+        (models / f"{MODEL}:vdn-8").symlink_to(models / ".resolved" / "gone")
+        status = self.enterContext(mock.patch.object(videos, "print_status"))
+        variants, holds = videos.hold_variants(named, f"{MODEL}:pika-ref2va-6")
+        for held in holds:
+            self.addCleanup(held.close)
+        self.assertEqual(
+            [(name, root) for name, (_, root) in variants.items()],
+            [("pika-ref2va-6", named.resolve()), ("pika-6", other.resolve())],
+        )
+        self.assertTrue(all(assembly.is_held(root) for _, root in variants.values()))
+        ((message,), _) = status.call_args
+        self.assertIn(f"{MODEL}:vdn-8 is not served", message)
 
 
 class SeedTest(unittest.TestCase):
@@ -602,7 +680,7 @@ class StartTest(unittest.TestCase):
         sent = b"".join(frames)
         engine = videos.VideoEngine([sys.executable, "-c", sends, sent.hex()], 30)
         self.addCleanup(engine.close)
-        engine.start()
+        engine.start(Path("/models/pika-6"))
         return engine
 
     def test_an_engine_is_ready_at_its_video_ready(self):
@@ -664,7 +742,7 @@ class StartTest(unittest.TestCase):
         engine = videos.VideoEngine([sys.executable, "-c", SENDS, ""], 0.5)
         self.addCleanup(engine.close)
         with self.assertRaisesRegex(videos.VideoFailed, "did not start in time"):
-            engine.start()
+            engine.start(Path("/models/pika-6"))
         self.assertIsNotNone(engine.process.poll())
 
     def test_a_language_models_engine_is_refused(self):
@@ -683,7 +761,7 @@ class StartTest(unittest.TestCase):
                 api, "parse_args", return_value=main_args(serve_record=record)
             ),
             mock.patch.object(api.videos, "serves", return_value=True),
-            mock.patch.object(api.assembly, "hold", lambda path: (path, None)),
+            mock.patch.object(api.videos, "hold_variants", return_value=({}, [])),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(api.videos.VideoApp, "start", side_effect=start),
             mock.patch.object(

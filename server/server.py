@@ -1391,8 +1391,9 @@ def main():
         serve_record.entered(args.serve_record, "loading")
         if videos.serves(Path(args.model_root)):
             # A video model's server serves /v1/videos alone (videos.py),
-            # holding its assembly as below, and is ready, as below, once its
-            # engine is. Of the shared options it acts on VIDEO_OPTIONS
+            # holding the assemblies of every installed variant of its model
+            # as below holds one, and is ready, as below, once its engine
+            # is. Of the shared options it acts on VIDEO_OPTIONS
             # alone; the others set how a language model is served, and one
             # warning names those given.
             if ignored := [
@@ -1406,11 +1407,11 @@ def main():
                     f"served: {args.model}'s server ignores them",
                     error=True,
                 )
-            model_root, held = assembly.hold(Path(args.model_root))
+            variants, held = videos.hold_variants(Path(args.model_root), args.model)
             video = server.app = videos.VideoApp.start(
                 args.model,
                 args.served_model_name,
-                model_root,
+                variants,
                 args.binary,
                 videos.START_SECONDS,
                 not args.allow_idle_sleep,

@@ -23,6 +23,9 @@ then one per job, which exits once its job has ended. A
 job's progress follows the engine's phases, its denoising step by step; its
 preview and mp4 stay in a store of bounded bytes, which evicts the oldest
 finished job first; DELETE cancels a job, a running one at its next DiT block or decode clip.
+It serves every installed variant of its model (hold_variants): a
+request's model, OWNER/REPO:VARIANT, or its variant picks one, and its job's
+engine runs on that variant's assembly.
 `splash generate` sends its clip to such a server, one it starts itself
 where none runs (install/launcher.py).
 """
@@ -44,7 +47,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from install import assembly, video
+from install import assembly, models, video
 from install.families import H3
 
 from . import images, protocol, supervision
@@ -267,12 +270,14 @@ def clip_frames(seconds):
 def parse_request(fields, names, variants=H3.variants):
     """A POST /v1/videos body's fields (JSON, or form fields, all strings but
     the keyframes' image bytes and the references' files) as a
-    VideoRequest; `names` are the names the model answers to, and its
-    installed `variants` (name -> families.Variant), of which a request
-    without one takes H3.default_variant, or else the first. A request with
-    references takes a variant whose spec has references (REF2VA_VARIANT),
-    which takes no other. A VDN-H3 variant's steps (recipe h3) are its
-    row's; a FastH3 one's 0 leaves its trained rungs to the engine."""
+    VideoRequest; `names` are the names the server answers to, the model
+    ID's first, and its served `variants` (name -> families.Variant).
+    A model name OWNER/REPO:VARIANT picks that variant; a request whose
+    model names none takes its `variant`, or else the first variant of its
+    kind: one whose spec has references for a request with references
+    (else REF2VA_VARIANT), which takes no other request, else one without.
+    A VDN-H3 variant's steps (recipe h3) are its row's; a FastH3 one's 0
+    leaves its trained rungs to the engine."""
     if unknown := sorted(set(fields) - FIELDS):
         raise APIError(
             400, f"unsupported parameter: {unknown[0]}", "unsupported_parameter"
@@ -280,25 +285,26 @@ def parse_request(fields, names, variants=H3.variants):
     prompt = fields.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise APIError(400, "prompt must be a non-empty string")
-    if fields.get("model", names[0]) not in names:
+    repo = names[0].partition(":")[0]
+    model = fields.get("model")
+    named = model.partition(":")[2] if str(model).startswith(f"{repo}:") else None
+    if model is not None and model not in names:
         raise APIError(
-            404, f"model {fields['model']!r} is not served", "model_not_found"
+            404,
+            not_installed(repo, named) if named else f"model {model!r} is not served",
+            "model_not_found",
         )
     seconds = clip_seconds(fields.get("seconds", H3.default_seconds))
     size = fields.get("size", H3.size)
     width, height = canvas(size)
     referenced = bool(fields.get(REFERENCES))
-    if referenced:
-        default = next(
-            (n for n, v in variants.items() if _takes_references(v)), REF2VA_VARIANT
-        )
-    else:
-        default = (
-            H3.default_variant
-            if H3.default_variant in variants
-            else next(iter(variants))
-        )
-    variant = fields.get("variant", default)
+    default = next(
+        (n for n, v in variants.items() if _takes_references(v) == referenced),
+        REF2VA_VARIANT if referenced else next(iter(variants)),
+    )
+    variant = fields.get("variant", named or default)
+    if named and variant != named:
+        raise APIError(400, f"model {model} is the {named} variant, not {variant}")
     if variant not in H3.variants and variant not in variants:
         raise APIError(
             400, "variant must be one of " + ", ".join(H3.variants | variants)
@@ -348,16 +354,59 @@ def installed_variants(model_root: Path):
     return video.installed(model_root)
 
 
+def hold_variants(link: Path, model):
+    """The variants a video model's server serves, name -> (families.Variant,
+    assembly), the default first, and what holds their assemblies until the
+    server exits (assembly.hold): those of the assembly link names, the
+    model ID's, which the launcher installed, its variant first (else
+    H3.default_variant, else the first); then those of each other
+    installation of its repository in the same models root (its selection
+    links OWNER/REPO and OWNER/REPO:VARIANT, models.selection_link), a
+    variant served by the first assembly that holds it. Nothing is
+    installed for them; one that does not verify (assembly.verify: sizes and
+    times, no hashing) is left out with a warning."""
+    repo, _, variant = model.partition(":")
+    root, held = assembly.hold(link)
+    rows = installed_variants(root)
+    first = variant or (
+        H3.default_variant if H3.default_variant in rows else next(iter(rows))
+    )
+    variants = {first: (rows[first], root)} | {n: (r, root) for n, r in rows.items()}
+    holds, roots = [held], {root}
+    models_root = root.parent.parent
+    for other in sorted(models.selection_links(models_root)):
+        name = other.relative_to(models_root).as_posix()
+        if name.partition(":")[0] != repo or other.resolve() in roots:
+            continue
+        try:
+            assembly.verify(other)
+            other_root, other_held = assembly.hold(other)
+        except (models.ModelError, OSError) as error:
+            print_status(
+                f"Warning · {name} is not served: {error}; "
+                f"splash install {name} repairs it",
+                error=True,
+            )
+            continue
+        holds.append(other_held)
+        roots.add(other_root)
+        for n, r in installed_variants(other_root).items():
+            variants.setdefault(n, (r, other_root))
+    return variants, holds
+
+
+def not_installed(repo, variant):
+    """The refusal of a request of a variant the server does not serve."""
+    return (
+        f"the {variant} variant of {repo} is not installed: "
+        f"splash install {repo}:{variant}, then start the server again"
+    )
+
+
 def require_variant(request, model, variants):
-    """Refuses a request of a variant not installed: each variant is a model
-    of its own (install/video.py)."""
+    """Refuses a request of a variant not served (hold_variants)."""
     if request.variant not in variants:
-        repo = model.partition(":")[0]
-        raise APIError(
-            400,
-            f"the {request.variant} variant of {model} is not installed: "
-            f"serve {repo}:{request.variant}",
-        )
+        raise APIError(400, not_installed(model.partition(":")[0], request.variant))
 
 
 # Qwen3-VL's processor's image grid (MiniMax-H3's processor: patch 16, merge
@@ -634,7 +683,8 @@ class Job:
 
 
 class VideoEngine:
-    """The video engine process on its own stream (video_protocol): started
+    """The video engine process on its own stream (video_protocol): command,
+    its command line but the model root, started on a variant's assembly
     for a job and closed once it ends, until shut_down. With awake, the Mac
     is kept from idle sleep while it runs a job (VideoService._run), as a
     language model's engine keeps it while it serves a request unless
@@ -664,17 +714,18 @@ class VideoEngine:
     def alive(self):
         return self.process is not None and self.process.poll() is None
 
-    def start(self):
-        """Start the engine unless it runs, and wait for its Ready."""
-        if self.alive():
-            return
+    def start(self, root):
+        """Start the engine on the assembly at root, and wait for its Ready."""
         if self.process is not None:
             self.close()
         with self.lock:
             if self.shut:
                 raise VideoFailed("server_shutdown", "the server is shutting down")
             self.process = subprocess.Popen(
-                self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
+                [*self.command, str(root)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                bufsize=0,
             )
         self.parser, self.pending, self.first = wire.FrameParser(), b"", True
         try:
@@ -696,12 +747,11 @@ class VideoEngine:
         return ready
 
     def run(self, request, on_event):
-        """The clip of request, a VideoRequestFrame's fields but its id: its
-        VideoOutputEvent once every other event went to on_event; raises
-        VideoFailed with the engine's error. A cancel() before it is sent
-        cancels it as it is sent."""
+        """The clip of request, a VideoRequestFrame's fields but its id, on
+        the started engine: its VideoOutputEvent once every other event went
+        to on_event; raises VideoFailed with the engine's error. A cancel()
+        before it is sent cancels it as it is sent."""
         try:
-            self.start()
             frame = wire.VideoRequestFrame(next(self.request_ids), *request)
             with self.lock:
                 self.current = frame.request_id
@@ -820,28 +870,26 @@ class VideoEngine:
 
 
 class VideoService:
-    """Admits jobs, runs them one at a time, each on an engine of its own,
-    and keeps their results within the store's budget."""
+    """Admits jobs of the served variants (name -> (families.Variant,
+    assembly), hold_variants), runs them one at a time, each on an engine of
+    its own started on its variant's assembly, and keeps their results
+    within the store's budget."""
 
     def __init__(
-        self,
-        engine,
-        tokenizer,
-        names,
-        *,
-        variants=H3.variants,
-        budget_bytes=STORE_BUDGET_BYTES,
+        self, engine, tokenizer, names, variants, *, budget_bytes=STORE_BUDGET_BYTES
     ):
         self.engine = engine
-        # The limits the engine announces (VideoReady), which requests are
-        # checked against while no engine runs: one start for them, which
-        # also refuses an engine that cannot start, then none until a job.
-        engine.start()
+        # The limits the engine announces (VideoReady), the same on every
+        # variant's assembly, which requests are checked against while no
+        # engine runs: one start for them, on the default's, which also
+        # refuses an engine that cannot start, then none until a job.
+        self.roots = {name: root for name, (_, root) in variants.items()}
+        engine.start(next(iter(self.roots.values())))
         self.ready = engine.ready
         engine.close()
         self.tokenizer = tokenizer
         self.names = names
-        self.variants = variants
+        self.variants = {name: row for name, (row, _) in variants.items()}
         self.budget_bytes = budget_bytes
         self.jobs = OrderedDict()
         self.queue = []
@@ -867,7 +915,8 @@ class VideoService:
                     f"{MAX_QUEUED_JOBS} video jobs are already queued",
                     "video_queue_full",
                 )
-            job = Job("video_" + secrets.token_hex(16), self.names[0], request, tokens)
+            model = f"{self.names[0].partition(':')[0]}:{request.variant}"
+            job = Job("video_" + secrets.token_hex(16), model, request, tokens)
             self.jobs[job.id] = job
             self.queue.append(job)
             self.lock.notify_all()
@@ -985,7 +1034,8 @@ class VideoService:
                 self._evict()
 
     def _run(self, job):
-        """Run job on an engine started for it, which exits once it ends."""
+        """Run job on an engine started for it on its variant's assembly,
+        which exits once it ends."""
         caffeinate = None
         if self.engine.awake:
             # The language engine's assertion (PreventUserIdleSystemSleep),
@@ -1000,7 +1050,7 @@ class VideoService:
                 print_status(f"Warning · {job.id} runs without keep-awake: {error}")
         try:
             try:
-                self.engine.start()
+                self.engine.start(self.roots[job.request.variant])
                 self._require_limits(self.engine.ready)
                 output = self.engine.run(
                     clip(job.request, job.tokens),
@@ -1092,27 +1142,31 @@ class VideoService:
 
 class VideoApp:
     """What a video model's server serves (FrontendServer.app): the model
-    under its names, and its jobs on the engine."""
+    under its names, then each served variant (hold_variants) as
+    OWNER/REPO:VARIANT, the default first, and its jobs on the engine."""
 
-    def __init__(self, model, names, engine, tokenizer, variants=H3.variants):
+    def __init__(self, model, names, engine, tokenizer, variants):
         self.model = model
-        self.names = tuple(dict.fromkeys((model, *names)))
-        self.videos = VideoService(engine, tokenizer, self.names, variants=variants)
+        repo = model.partition(":")[0]
+        ids = [f"{repo}:{name}" for name in variants]
+        self.names = tuple(dict.fromkeys((model, *names, *ids)))
+        self.videos = VideoService(engine, tokenizer, self.names, variants)
 
     @classmethod
-    def start(cls, model, names, model_root, binary, startup_timeout, awake):
-        """The app of the assembly at model_root, its tokenizer loaded and
-        the limits its engine announces read (VideoService); awake keeps the
-        Mac from idle sleep while a job runs (VideoEngine)."""
+    def start(cls, model, names, variants, binary, startup_timeout, awake):
+        """The app of the served variants, the tokenizer of the default's
+        assembly loaded (every variant's installation links the release's,
+        at its pinned commit) and the limits its engine announces read
+        (VideoService); awake keeps the Mac from idle sleep while a job runs
+        (VideoEngine)."""
         from transformers import AutoTokenizer
 
+        root = next(iter(variants.values()))[1]
         tokenizer = AutoTokenizer.from_pretrained(
-            model_root / "tokenizer", local_files_only=True, trust_remote_code=False
+            root / "tokenizer", local_files_only=True, trust_remote_code=False
         )
-        engine = VideoEngine(
-            [str(binary), "serve-native", str(model_root)], startup_timeout, awake
-        )
-        return cls(model, names, engine, tokenizer, installed_variants(model_root))
+        engine = VideoEngine([str(binary), "serve-native"], startup_timeout, awake)
+        return cls(model, names, engine, tokenizer, variants)
 
     def status(self):
         return {"videos": self.videos.status()}
@@ -1232,13 +1286,26 @@ def handler(base):
             return {key: value for key, value in body.items() if value is not None}
 
         def _video_models(self, path):
+            """Each name the server answers to, with the input its variant
+            takes, references (video and audio too) or keyframes; a name
+            of no variant takes any served one's."""
+            served = self.app.videos.variants
+            repo = self.app.names[0].partition(":")[0]
+
+            def modalities(name):
+                variant = name.removeprefix(f"{repo}:")
+                rows = [served[variant]] if variant in served else served.values()
+                if any(_takes_references(row) for row in rows):
+                    return ["text", "image", "video", "audio"]
+                return ["text", "image"]
+
             entries = [
                 {
                     "id": name,
                     "object": "model",
                     "created": 0,
                     "owned_by": "splash",
-                    "input_modalities": ["text", "image"],
+                    "input_modalities": modalities(name),
                     "output_modalities": ["video", "audio"],
                 }
                 for name in self.app.names
