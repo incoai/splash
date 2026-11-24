@@ -380,8 +380,11 @@ class GgufMetadataTests(unittest.TestCase):
             root = self.root / "projectors"
             shutil.rmtree(root, ignore_errors=True)
             root.mkdir()
-            for name, (values, kinds) in files.items():
-                write_gguf(root / (name + ".gguf"), values, kinds)
+            for name, file in files.items():
+                if isinstance(file, bytes):
+                    (root / (name + ".gguf")).write_bytes(file)
+                else:
+                    write_gguf(root / (name + ".gguf"), *file)
             return hub.Repository.local_directory(root)
 
         bf16 = (vision_fixture(), tensors)
@@ -391,9 +394,6 @@ class GgufMetadataTests(unittest.TestCase):
         quantized = (vision_fixture(), [(tensors[0][0], GGML["Q8_0"]), tensors[1]])
         # Other publishers' names; BF16 is preferred to F32 and F32 to F16, and
         # non-vision files never count.
-        repo = projectors(
-            **{"mmproj-Model-bf16": bf16, "mmproj-Model-f16": f16, "mmproj-x": text}
-        )
         qwen, inkling = families.named("Qwen3.8-27B"), families.named("Inkling-2-Mini")
         repo = projectors(
             **{"mmproj-Model-bf16": bf16, "mmproj-Model-f16": f16, "mmproj-x": text}
@@ -412,7 +412,7 @@ class GgufMetadataTests(unittest.TestCase):
         # Text only, the model is served: the caller says how to ask for it.
         with self.assertRaisesRegex(
             models.VisionError,
-            r"no BF16, F32, F16 vision projector \(mmproj-q8.gguf \(clip: F32, Q8_0\); "
+            r"no BF16, F32 or F16 vision projector \(mmproj-q8.gguf \(clip: F32, Q8_0\); "
             r"mmproj-x.gguf \(qwen35moe: BF16, F32\)\)$",
         ):
             upstream.select_vision(
@@ -438,6 +438,20 @@ class GgufMetadataTests(unittest.TestCase):
             upstream.select_vision(
                 projectors(**{"mmproj-a": bf16, "mmproj-b": bf16}), qwen
             )
+        # A file named mmproj whose header Splash cannot read is no projector:
+        # another is chosen, and alone it leaves the model its text.
+        unreadable = b"GGUF" + bytes(20)
+        self.assertEqual(
+            upstream.select_vision(
+                projectors(**{"mmproj-a": unreadable, "mmproj-b": bf16}), qwen
+            )[0],
+            "mmproj-b.gguf",
+        )
+        with self.assertRaisesRegex(
+            models.VisionError,
+            r"no BF16, F32 or F16 vision projector \(mmproj-a.gguf \(.+\)\)$",
+        ):
+            upstream.select_vision(projectors(**{"mmproj-a": unreadable}), qwen)
         # Prism ML prefixes the model's name.
         self.assertEqual(
             upstream.select_vision(
@@ -828,7 +842,7 @@ class GgufMetadataTests(unittest.TestCase):
         chosen = self.install_while_its_family_served_text_only(fake)
         output, warnings = self.prepare_warned(chosen)
         self.assertIn(
-            "vision disabled (the GGUF repository has no BF16, F32, F16 vision "
+            "vision disabled (the GGUF repository has no BF16, F32 or F16 vision "
             "projector",
             output,
         )
@@ -836,7 +850,7 @@ class GgufMetadataTests(unittest.TestCase):
         record = assembly.verify(chosen.link)
         self.assertEqual(record["vision_format"], "none")
         self.assertIn(
-            "no BF16, F32, F16 vision projector", record["vision_unavailable"]
+            "no BF16, F32 or F16 vision projector", record["vision_unavailable"]
         )
         # Its commit's listing had none: later starts ask nothing more.
         fake.requests.clear()
@@ -845,6 +859,21 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertNotIn("serves images now", output)
         self.assertEqual((warnings, fake.downloads), ("", []))
         self.assertEqual(len(fake.requests), 2)  # the target's and the draft's
+        # An update that assembles it again from the snapshots it links, where
+        # nothing lists the commit, keeps what the listing said of it.
+        adapter = self.root / "gguf.py"
+        adapter.write_text("a new adapter\n")
+        with mock.patch.object(gguf, "__file__", str(adapter)):
+            output, warnings = self.prepare_warned(chosen)
+            self.assertIn("the GGUF metadata adapter changed", output)
+            self.assertEqual(
+                assembly.verify(chosen.link)["vision_unavailable"],
+                record["vision_unavailable"],
+            )
+            output, again = self.prepare_warned(chosen)
+        self.assertIn("is already installed", output)
+        self.assertNotIn("serves images now", output)
+        self.assertEqual((warnings + again, fake.downloads), ("", []))
 
     def test_a_fresh_installation_without_a_projector_serves_text(self):
         # Of a family that falls back to text: online, the listing's lack is
@@ -925,6 +954,21 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertIn("is already installed", output)
         self.assertEqual(warnings, "")
         upstream.check_vision.assert_not_called()
+        # Assembled again from the snapshots it links, which hold the
+        # projector, it stays text: the engine is not asked again.
+        adapter = self.root / "gguf.py"
+        adapter.write_text("a new adapter\n")
+        with mock.patch.object(gguf, "__file__", str(adapter)):
+            output, warnings = self.prepare_warned(chosen)
+            self.assertIn("the GGUF metadata adapter changed", output)
+            self.assertEqual(
+                assembly.verify(chosen.link)["vision_unavailable"], refusal
+            )
+            output, again = self.prepare_warned(chosen)
+        self.assertIn("is already installed", output)
+        self.assertNotIn("serves images now", output)
+        self.assertEqual(warnings + again, "")
+        upstream.check_vision.assert_not_called()
 
     def test_the_engine_prepares_a_tower_before_it_is_installed(self):
         # The engine's own check (its vision-check command) refuses the
@@ -970,6 +1014,55 @@ class GgufMetadataTests(unittest.TestCase):
             ):
                 CHECK_VISION(target, paths, scratch)
             self.assertIs(type(caught.exception), refused)
+
+    def test_a_tower_s_refusal_names_the_target_s_file(self):
+        # The engine names the file it read, a link in the check's scratch
+        # directory: the refusal, which a record keeps, names the target's.
+        self.gguf_repository()
+        repo = hub.Repository.resolve(GGUF_REPO)
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        target = upstream.inspect_target(repo, "Q4_K_M", False, scratch)
+        paths = repo.download(set(target.files.values()))
+        engine = self.root / "engine" / "splash"
+        engine.parent.mkdir()
+        engine.write_text(
+            "#!/bin/sh\n"
+            f'echo "error: the vision tower is quantized (in $5/{assembly.GGUF_VISION})" >&2\n'
+            "exit 70\n"
+        )
+        engine.chmod(0o755)
+        with (
+            mock.patch.object(paths_module, "BINARY", engine),
+            self.assertRaisesRegex(
+                models.VisionError,
+                r"^its vision tower: the vision tower is quantized "
+                r"\(in mmproj-F32\.gguf\)$",
+            ),
+        ):
+            CHECK_VISION(target, paths, scratch)
+
+    def test_an_engine_that_cannot_check_a_tower_s_configuration_fails(self):
+        # Only the engine's refusal of a projector's configuration refuses
+        # the tower, for a family that then serves text too: an engine that
+        # ends otherwise fails the inspection, and nothing is recorded of it.
+        self.gguf_repository()
+        self.as_family(text_fallback=True)
+        repo = hub.Repository.resolve(GGUF_REPO)
+        engine = self.root / "engine" / "splash"
+        engine.parent.mkdir()
+        engine.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = model-check ] && [ "$3" != none ]; then kill -9 $$; fi\n'
+            f'exec "{paths_module.BINARY}" "$@"\n'
+        )
+        engine.chmod(0o755)
+        with (
+            mock.patch.object(paths_module, "BINARY", engine),
+            self.assertRaisesRegex(models.ModelError, "model check failed") as caught,
+        ):
+            upstream.inspect_target(repo, "Q4_K_M", False, self.root)
+        self.assertIs(type(caught.exception), models.ModelError)
 
     def test_a_tower_that_cannot_download_leaves_the_rest_of_an_update(self):
         fake = self.gguf_repository()

@@ -64,7 +64,8 @@ def prepare_local_model(
     serves images; a GGUF target serves text only without one, as one of a
     family without a vision tower (Flint) always does. An MLX target's
     vision tower is in its checkpoint, and it serves images unless
-    language_only.
+    language_only, or unless the engine refuses its tower and its family
+    serves text instead (Inkling-2-Mini), which a printed line says.
     language_only: serve text only.
     models_dir: where prepared models are kept, Splash's own models
     directory by default. Preparations there run one at a time, beside the
@@ -72,15 +73,16 @@ def prepare_local_model(
 
     The directory links the files and never changes. Preparing the same
     files again returns it again, reading only their metadata, sizes and
-    times; the first preparation reads each file outside the Hugging Face
-    cache once, for its digest. Once a file changes, or a download moves the
-    draft's default branch, preparing again returns another directory: serve
-    that one. The server holds the directory it serves until it exits, and
-    takes models_dir's installation lock to hold it when it starts, so it
-    needs write access there; a directory a later preparation no longer
-    returns is removed only once no server holds it, with the files of its
-    Hub snapshots no other installation links, unless another tool shares
-    the snapshot.
+    times, and a vision tower's weights, which the engine prepares each time
+    (under a second); the first preparation reads each file outside the
+    Hugging Face cache once, for its digest. Once a file changes, or a
+    download moves the draft's default branch, preparing again returns
+    another directory: serve that one. The server holds the directory it
+    serves until it exits, and takes models_dir's installation lock to hold
+    it when it starts, so it needs write access there; a directory a later
+    preparation no longer returns is removed only once no server holds it,
+    with the files of its Hub snapshots no other installation links, unless
+    another tool shares the snapshot.
 
     A ModelError, "cannot prepare TARGET: REASON", refuses the files Splash
     cannot serve without a download (a missing file, an unsupported format,
@@ -279,7 +281,8 @@ def _projector(mmproj, repo, family):
     if precision not in family.projectors:
         raise models.VisionError(
             f"{mmproj} ({kind}) is not a vision projector Splash loads for "
-            f"{family.name}, a clip model of {', '.join(family.projectors)} weights"
+            f"{family.name}, a clip model of {upstream.either(family.projectors)} "
+            "weights"
         )
     return mmproj.name, header
 

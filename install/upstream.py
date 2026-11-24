@@ -304,7 +304,12 @@ def select_vision(repo, family):
     last for Inkling's). Each header costs a few range requests."""
     usable, found = {precision: [] for precision in family.projectors}, []
     for name in filter(projector_named, root_ggufs(repo.files)):
-        header, precision, kind = read_projector(repo, name)
+        try:
+            header, precision, kind = read_projector(repo, name)
+        except models.ModelError as error:
+            # A header Splash cannot read is no projector it loads.
+            found.append(f"{name} ({error})")
+            continue
         found.append(f"{name} ({kind})")
         if precision in usable:
             usable[precision].append((name, header))
@@ -318,9 +323,15 @@ def select_vision(repo, family):
                 + ", describe no single tower"
             )
     raise models.VisionError(
-        f"the GGUF repository has no {', '.join(family.projectors)} vision "
+        f"the GGUF repository has no {either(family.projectors)} vision "
         "projector (" + ("; ".join(found) or "no GGUF named mmproj") + ")"
     )
+
+
+def either(names):
+    """names as a choice of them: A, B or C."""
+    *others, last = names
+    return f"{', '.join(others)} or {last}" if others else last
 
 
 def read_projector(repo, name):
@@ -373,7 +384,8 @@ def inspect_target(repo, variant, language_only, scratch):
     configuration and headers are written into scratch. The target's text
     configuration is checked first, then its vision tower and the tower's
     configuration, so a model Splash cannot serve is refused for that,
-    whatever its tower; a refusal of the tower alone names --language-only."""
+    whatever its tower; a refusal of the tower alone names --language-only,
+    but for a family that serves text instead (with_text_fallback)."""
 
     def inspect(text_only):
         # Each inspection writes into a scratch directory of its own.
@@ -426,7 +438,12 @@ def check_vision(target, paths, scratch):
     try:
         models.run_engine(["vision-check", *arguments], "vision check")
     except models.EngineRefusal as error:
-        raise models.VisionError(f"its vision tower: {error}") from None
+        # The engine names the link it read: the refusal, which a record
+        # keeps (vision_unavailable), names the target's file.
+        refusal = str(error)
+        for path, name in target.files.items():
+            refusal = refusal.replace(str(root / path), name)
+        raise models.VisionError(f"its vision tower: {refusal}") from None
 
 
 def prepared_tower(target, paths, scratch, text):
@@ -490,11 +507,15 @@ def gguf_target(repo, names, scratch, *, projector=None):
         name, vision_header = projector(repo, family)
         try:
             _validate_processor(gguf.processor_config(vision_header), family)
-            config.write_bytes(
-                models.json_bytes(gguf.model_config(headers[0], vision_header))
-            )
-            check_model("gguf", "gguf", config, gguf_headers=target)
+            vision_config = gguf.model_config(headers[0], vision_header)
         except models.ModelError as error:
+            raise models.VisionError(f"vision projector {name}: {error}") from None
+        config.write_bytes(models.json_bytes(vision_config))
+        # The engine's refusal refuses the projector; an engine that cannot
+        # run the check fails the inspection, as check_vision's does.
+        try:
+            check_model("gguf", "gguf", config, gguf_headers=target)
+        except models.EngineRefusal as error:
             raise models.VisionError(f"vision projector {name}: {error}") from None
         files[assembly.GGUF_VISION] = name
         vision_format = "gguf"
@@ -548,7 +569,7 @@ def mlx_target(repo, language_only):
         vision_format = "safetensors"
         try:
             check_model("mlx-affine", vision_format, config)
-        except models.ModelError as error:
+        except models.EngineRefusal as error:
             raise models.VisionError(str(error)) from None
         files |= {"vision/" + n: n for n in shards}
     return Target("mlx-affine", vision_format, config, None, family, files)
@@ -759,8 +780,10 @@ def _start_installed(selection, target, installed):
     """Start the verified installation of the target's commit, assembled again
     first when its draft moved or this release changes it (_changes). The
     draft's repository is asked only when the Hub answered for the target, so
-    a commit revision holds its draft too. Only assembling it again reads the
-    Hub cache: the snapshots the installation links (assembly.source)."""
+    a commit revision holds its draft too. Assembling it again reads the Hub
+    cache alone: the snapshots the installation links (assembly.source). One
+    that lacks its family's tower asks the Hub for its commit's listing, and
+    downloads the tower it names (_lacks_tower)."""
     if target.unreachable_reason:
         print(
             f"Could not reach the Hub ({target.unreachable_reason}); "
@@ -812,14 +835,7 @@ def _start_installed(selection, target, installed):
             selection,
             installed,
             f"update it ({'; '.join(changes)})",
-            lambda: _install(
-                selection,
-                assembly.source(installed, "target"),
-                installed,
-                draft,
-                language_only=selection.language_only or tower,
-                keep_tower=tower,
-            ),
+            lambda: _reassemble(selection, installed, draft),
         ):
             return KEPT
         return UPDATED if answered else UNREACHABLE
@@ -832,15 +848,25 @@ def _start_installed(selection, target, installed):
     # A concurrent installation replaced or damaged the assembly after it was
     # verified: no verified installation is left to keep.
     print(f"Reinstalling {selection.model}: {replaced}", flush=True)
+    _reassemble(selection, installed, draft)
+    return UPDATED if answered else UNREACHABLE
+
+
+def _reassemble(selection, installed, draft):
+    """Assemble installed again from the snapshots it links (assembly.source),
+    to serve what it serves: one that serves text only stays so, whatever its
+    snapshots hold, its record keeping what the Hub's listing said of its
+    tower (assembly_record), and it replaces no assembly of its commit that
+    another start gave its tower since (publish)."""
+    text_only = installed["vision_format"] == "none"
     _install(
         selection,
         assembly.source(installed, "target"),
         installed,
         draft,
-        language_only=selection.language_only or tower,
-        keep_tower=tower,
+        language_only=text_only,
+        keep_tower=text_only,
     )
-    return UPDATED if answered else UNREACHABLE
 
 
 def _lacks_tower(selection, installed):
@@ -849,7 +875,7 @@ def _lacks_tower(selection, installed):
     Hub's listing of its commit was not found without a tower Splash serves
     (vision_unavailable): one assembled while its family served text only
     (Inkling-2-Mini's before 1.7.3), or from the Hub cache."""
-    family = installed and families.named(installed["family"])
+    family = families.named(installed["family"])
     return bool(
         family
         and family.vision
@@ -921,13 +947,12 @@ def _retain_installed(selection):
 def _install(
     selection, repo, installed, draft=None, *, language_only=None, keep_tower=False
 ):
-    """Assemble repo's target and its draft, publish the assembly at the
-    selection link, and return the target. draft is the draft's repository as
-    this start resolved it, or None to resolve it here, asking the Hub only
-    when it answered for repo. language_only, when given, takes the
-    selection's place: an installation that serves text only is assembled
-    again so, and with keep_tower one that another start gave its tower since
-    is kept (publish)."""
+    """Assemble repo's target and its draft, and publish the assembly at the
+    selection link. draft is the draft's repository as this start resolved
+    it, or None to resolve it here, asking the Hub only when it answered for
+    repo. language_only, when given, takes the selection's place, and
+    keep_tower publishes nothing over an assembly another start gave its
+    tower since (_reassemble, publish)."""
     # Every Hub request (header reads, downloads) happens here.
     with (
         hub.as_model_errors(f"cannot install {selection.model}"),
@@ -974,18 +999,18 @@ def _install(
     publish(
         selection.models_root,
         selection.link,
-        assembly_record(selection.model, target, repo, draft),
+        assembly_record(selection.model, target, repo, draft, installed),
         files,
         keep_tower=keep_tower,
     )
-    return target
 
 
-def assembly_record(model, target, repo, draft):
+def assembly_record(model, target, repo, draft, installed=None):
     """The record of model's assembly of target, inspected in repo, and the
     draft repository draft, but for the files it links (publish). A text
-    target of the Hub's listing of its commit (paths None: not the Hub
-    cache's) records why it serves no images."""
+    target records why it serves no images where the Hub's listing of its
+    commit said so: now (paths None: not the Hub cache's), or as installed,
+    the assembly of the same commit it replaces, records it."""
     record = {
         "version": 1,
         "model": model,
@@ -996,16 +1021,24 @@ def assembly_record(model, target, repo, draft):
     }
     if target.vision_note and repo.paths is None:
         record["vision_unavailable"] = target.vision_note
+    elif (
+        installed
+        and "vision_unavailable" in installed
+        and target.vision_format == "none"
+        and installed["sources"]["target"] == record["sources"]["target"]
+    ):
+        record["vision_unavailable"] = installed["vision_unavailable"]
     return record
 
 
 def publish(models_root, link, record, files, *, keep_tower=False):
     """Publish the assembly of record and files (assembly path -> source
-    file) at link, a selection link under models_root, and return it. A file
-    the assembly it replaces records, unchanged since, is not read again for
-    its digest (assembly.file_record); any other is read before the
-    installation lock is taken, which other installations and starting
-    servers wait for, and its record is taken again under the lock."""
+    file) at link, a selection link under models_root, and return it, or
+    with keep_tower the assembly link names where that has the commit's
+    tower. A file the assembly it replaces records, unchanged since, is not
+    read again for its digest (assembly.file_record); any other is read
+    before the installation lock is taken, which other installations and
+    starting servers wait for, and its record is taken again under the lock."""
     models_root.mkdir(parents=True, exist_ok=True)
     # One record per linked file, however many assembly paths link it.
     records = _file_records(assembly.recorded(link), set(files.values()))
