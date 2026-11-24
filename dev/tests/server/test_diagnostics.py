@@ -263,6 +263,11 @@ class DiagnosticsTests(HarnessTestCase):
             line(sent_effort="none", effort="none", thinking=False),
             " · effort none · thinking off\n",
         )
+        # A model that opens its own reasoning decides whether it thinks.
+        self.assertEqual(
+            line(sent_effort="none", effort="none", thinking=None),
+            " · effort none\n",
+        )
         self.assertEqual(
             line(
                 sent_effort="xhigh",
