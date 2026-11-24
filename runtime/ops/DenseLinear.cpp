@@ -5,6 +5,8 @@
 
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace splash::ops {
 namespace {
@@ -48,6 +50,8 @@ const char *epilogueSuffix(DenseEpilogue epilogue) noexcept {
     return "_gelu_erf";
   case DenseEpilogue::Residual:
     return "_residual";
+  case DenseEpilogue::ScaledResidual:
+    return "_scaled_residual";
   }
   return "";
 }
@@ -69,6 +73,7 @@ void DenseLinear::requireWeights(const DenseWeights &weights, uint32_t outputSiz
                                 " x " + std::to_string(kInputMultiple));
   requireBytes(weights.weight, uint64_t{outputSize} * inputSize * 2, name + " weight");
   requireBytes(weights.bias, uint64_t{outputSize} * 2, name + " bias");
+  if (weights.scale) requireBytes(weights.scale, uint64_t{outputSize} * 2, name + " scale");
 }
 
 void DenseLinear::add(metal::CommandGraph &graph, const DenseWeights &weights, uint32_t outputSize,
@@ -76,10 +81,14 @@ void DenseLinear::add(metal::CommandGraph &graph, const DenseWeights &weights, u
                       uint32_t rows, DenseEpilogue epilogue) const {
   // The weights and their sizes are requireWeights', which their owner checks once.
   requireBytes(input, uint64_t{paddedRows(rows)} * inputSize * 2, "dense input");
-  const uint64_t outputBytes = epilogue == DenseEpilogue::Residual ? 4 : 2;
+  const bool scaled = epilogue == DenseEpilogue::ScaledResidual;
+  const uint64_t outputBytes = scaled || epilogue == DenseEpilogue::Residual ? 4 : 2;
   requireBytes(output, uint64_t{rows} * outputSize * outputBytes, "dense output");
+  if (scaled) requireBytes(weights.scale, uint64_t{outputSize} * 2, "dense scale");
   const DenseTile &tile = tileOf(calibration_, rows, outputSize, inputSize);
-  graph.add(std::string(tile.name) + epilogueSuffix(epilogue), {input, weights.weight, weights.bias, output},
+  std::vector<metal::MetalBuffer> buffers{input, weights.weight, weights.bias, output};
+  if (scaled) buffers.push_back(weights.scale);
+  graph.add(std::string(tile.name) + epilogueSuffix(epilogue), std::move(buffers),
             DenseLinearParams{rows, outputSize, inputSize, 0},
             {(rows + tile.rows - 1) / tile.rows, outputSize / tile.columns, 1}, {tile.simdgroups * 32, 1, 1});
 }

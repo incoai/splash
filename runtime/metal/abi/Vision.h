@@ -7,9 +7,13 @@
 #include <stdint.h>
 #endif
 
-// The epsilon of the vision tower's LayerNorms, which a vision GGUF must
-// state; unsuffixed, as SPLASH_RMS_EPSILON.
+// The epsilon of each vision tower's LayerNorms, which its GGUF must state:
+// Qwen3.5's and Inkling 2's; unsuffixed, as SPLASH_RMS_EPSILON.
 #define SPLASH_VISION_NORM_EPSILON 1e-6
+#define SPLASH_INKLING_VISION_NORM_EPSILON 1e-5
+// The base of Inkling 2's axial RoPE, transformers' default, which a
+// config states only as rope_parameters.rope_theta.
+#define SPLASH_INKLING_VISION_ROPE_THETA 10000.0
 
 struct VisionGridParams {
   uint32_t grid_height;

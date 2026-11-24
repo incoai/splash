@@ -188,5 +188,6 @@ dense_attention<dimensions>(device bfloat *, device bfloat *, device bfloat *, \
                             device bfloat *, constant DenseAttentionParams &, \
                             uint2, uint);
 
-// The vision tower's heads of 72.
+// Qwen3.5's vision tower's heads of 72, Inkling 2's of 64.
 DENSE_ATTENTION_KERNEL(72)
+DENSE_ATTENTION_KERNEL(64)

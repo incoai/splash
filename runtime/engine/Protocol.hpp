@@ -115,6 +115,7 @@ struct ProtocolLimits {
   uint32_t maxSimulationTokens = 32;
   uint32_t maxMaskWords = 1U << 20;
   uint32_t maxImageSpans = 64;
+  uint32_t imagePatchPixels = ops::kImagePatchPixels; // the side of a grid's patch (ImageSpan)
 };
 
 [[nodiscard]] std::optional<ProtocolIssue>

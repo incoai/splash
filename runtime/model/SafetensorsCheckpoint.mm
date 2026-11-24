@@ -141,6 +141,12 @@ const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const 
   if (!tensor) throw WeightStoreError("missing source tensor: " + std::string(name));
   return *tensor;
 }
+std::vector<std::string> SafetensorsCheckpoint::names(std::string_view prefix) const {
+  std::vector<std::string> result;
+  for (auto it = impl_->tensors.lower_bound(prefix); it != impl_->tensors.end() && it->first.starts_with(prefix); ++it)
+    result.push_back(it->first);
+  return result;
+}
 void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
 
 } // namespace splash::model

@@ -263,6 +263,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
+	runtime/ops/InklingVision.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/KernelSelection.cpp \
@@ -339,6 +340,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Inkling2LoopSafetensors.cpp \
 	runtime/model/Inkling2LoopSteps.cpp \
 	runtime/model/Inkling2LoopTarget.cpp \
+	runtime/model/InklingVision.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \

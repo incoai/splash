@@ -250,10 +250,19 @@ struct QwenTargetRequest final {
   std::function<std::array<uint32_t, 3>(uint64_t)> rotary;
 };
 
+// A run of a prompt chunk's rows, from chunk row `begin`, whose embedding
+// rows (QwenTargetPrefillBuffers::hidden[0]) hold an image's embeddings in
+// place of its placeholder tokens' (Runtime.cpp addImageRows).
+struct QwenTargetImageRows final {
+  uint32_t begin = 0;
+  uint32_t rows = 0;
+};
+
 // A lane's rows of a prefill chunk: `tokens`, of positions from
 // chunk.committed_tokens on of `request`, rows rowBegin to rowBegin + rows of
-// the chunk. A decode step's lane leaves them unset: the step's layout places
-// its rows (ops::LayoutRows), and only a prompt's helpers read them.
+// the chunk, the runs of its rows that hold image embeddings among them. A
+// decode step's lane leaves them unset: the step's layout places its rows
+// (ops::LayoutRows), and only a prompt's helpers read them.
 struct QwenTargetPrefillSequence final {
   uint32_t lane = 0;
   uint32_t rowBegin = 0;
@@ -280,6 +289,7 @@ struct QwenTargetPrefillSequence final {
   // The target's auxiliary state before and after the sequence's rows.
   metal::MetalBuffer auxiliaryIn;
   metal::MetalBuffer auxiliaryOut;
+  std::span<const QwenTargetImageRows> imageRows;
 };
 
 struct QwenTargetPrefillBuffers final {

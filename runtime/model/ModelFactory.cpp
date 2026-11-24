@@ -39,9 +39,9 @@ std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root
   return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
 }
 
-QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                    const VisionLoader *loader) {
-  return loader ? loadQwenVisionWeights(backend, images, *loader) : QwenVisionWeights{};
+VisionTowerWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                     const VisionLoader *loader) {
+  return loader ? loadVisionTowerWeights(backend, images, *loader) : VisionTowerWeights{};
 }
 
 namespace {

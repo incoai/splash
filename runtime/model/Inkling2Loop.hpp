@@ -273,6 +273,9 @@ struct Inkling2LoopLayout final : QwenHybridLayout {
   // too).
   static constexpr std::string_view modelType = "inkling2_loop_text";
   static constexpr std::string_view ggufArchitecture = "inkling2_loop";
+  // Its vision tower (ops::kInklingVisionLayout), from its GGUF's inkling2v
+  // mmproj (model/InklingVision.hpp).
+  static constexpr ops::VisionTower visionTower = ops::VisionTower::Inkling;
   // Its layers attend through relative attention (ops::RelativeAttention),
   // not the shared attention, in two variants: a full layer's over its whole
   // history, its queries and relative states scaled by their rows' positions,

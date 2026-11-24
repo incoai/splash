@@ -125,9 +125,17 @@ metal::MetalBuffer Inkling2LoopTarget::rows(const PrefillStep &step, Inkling2Loo
   throw std::logic_error("unknown Inkling-2-Mini rows");
 }
 
+// The first application's input: the token embeddings' RMS norm. An image's
+// rows take its tower's embeddings as they are, which the source scatters
+// over the normed token embeddings (modeling_inkling2.py Inkling2Model).
 void Inkling2LoopTarget::addPrefillBegin(PrefillStep &step) const {
-  ops::Normalization::addRms(step.graph, step.buffers.hidden[0], weights_.embeddingNorm,
-                             rows(step, schedule_.input(0)), geometry_.hiddenSize, step.rows);
+  const uint32_t width = geometry_.hiddenSize;
+  const metal::MetalBuffer input = rows(step, schedule_.input(0));
+  ops::Normalization::addRms(step.graph, step.buffers.hidden[0], weights_.embeddingNorm, input, width, step.rows);
+  for (const QwenTargetPrefillSequence &sequence : step.sequences)
+    for (const QwenTargetImageRows &image : sequence.imageRows)
+      ops::RowCopy::add(step.graph, step.buffers.hidden[0], {image.begin, width, 0}, input, {image.begin, width, 0},
+                        image.rows, width);
 }
 
 const ops::BlockMoeWeights *Inkling2LoopTarget::moe(uint32_t application) const {

@@ -33,8 +33,8 @@ public:
   [[nodiscard]] static uint32_t paddedKeys(uint32_t rows) noexcept;
   // softmax(q k^T scale) v of `rows` rows of `heads` heads of `dimensions`,
   // every row over all `rows` keys, written for the rows alone. The kernel
-  // takes heads of 72, the vision tower's. Throws unless every tensor holds
-  // what the kernel reaches.
+  // takes heads of 72 or 64, Qwen3.5's and Inkling 2's vision towers'.
+  // Throws unless every tensor holds what the kernel reaches.
   static void add(metal::CommandGraph &graph, const DenseAttentionTensors &tensors, uint32_t heads,
                   uint32_t dimensions, uint32_t rows, float scale);
 };

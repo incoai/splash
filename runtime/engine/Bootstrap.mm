@@ -121,6 +121,7 @@ protocol::ProtocolLimits protocolLimitsFor(
   limits.maxSimulationTokens = model::ExecutionLimits::targetVerifyRows;
   limits.maxMaskWords = model::maskWordsPerToken(capabilities.vocabularySize) *
                         (model::ExecutionLimits::targetVerifyRows + 1);
+  limits.imagePatchPixels = capabilities.imagePatchPixels;
   return limits;
 }
 

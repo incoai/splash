@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
       const ImageGrid grids[] = {{6, 8}, {8, 8}, {16, 24}, {32, 32}, {64, 64}};
       const Vision encoder(backend, weights, 64 * 64);
       for (const ImageGrid &grid : grids) {
-        const MetalBuffer pixels = backend.allocateBuffer(grid.pixelBytes(), BufferStorage::Shared, "pixels");
+        const MetalBuffer pixels = backend.allocateBuffer(grid.pixelBytes(layout.patchSize), BufferStorage::Shared, "pixels");
         // Whole 32-row tiles of embeddings, as any version of the tower takes.
         const MetalBuffer embeddings =
             zeros((uint64_t{grid.mergedTokens()} + 31) / 32 * 32 * layout.outputHiddenSize);

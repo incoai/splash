@@ -1762,7 +1762,8 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
     draft.targetLayerCount = 2;
     splash::test::writeSyntheticShard(root / "draft" / "model.safetensors", splash::test::draftTensors(draft));
     const model::ModelDescriptor descriptor =
-        model::makeModelDescriptor("Inkling-2-Mini", g, draft, {}, model::TargetSource::Safetensors,
+        model::makeModelDescriptor("Inkling-2-Mini", g, draft, ops::visionLayout(g.visionTower, g.hiddenSize),
+                                   model::TargetSource::Safetensors,
                                    model::VisionSource::None);
     uint64_t planned = model::draftImageBytes(root / "draft", draft);
     for (const model::gguf::Image &plan : plans) planned += model::gguf::loadedBytes(plan);
