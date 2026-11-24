@@ -346,8 +346,8 @@ int main(int argc, char **argv) {
       }
       // The decode tiles at the row counts their plans step by.
       const Projection *pairGate = epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr;
-      for (const uint32_t rows : prefill ? std::vector<uint32_t>{} : std::vector<uint32_t>{1, 2, 8, 16, 24, 32, 40, 48,
-                                                                                            56, 64}) {
+      for (const uint32_t rows : prefill ? std::vector<uint32_t>{} : std::vector<uint32_t>{1, 2, 4, 8, 16, 24, 32, 40,
+                                                                                            48, 56, 64}) {
         const LinearWorkload w{{N, K}, rows, epilogue};
         const std::string line = "R" + std::to_string(rows);
         const LinearConfig policy = linear.plan(w, ring.front(), pairGate).configuration();
@@ -356,6 +356,15 @@ int main(int argc, char **argv) {
           cases.push_back({line, "column", Linear::plan(w, column, FloatOutput::BFloat16), column == policy, {}});
           continue;
         }
+        // The direct tile at its simdgroups over K and fragments, for every quantized segment it takes.
+        if (rows <= GGUF_DIRECT_ROWS && epilogue != LinearEpilogue::GateUp &&
+            std::all_of(images.begin(), images.end(), [&](const Image &i) { return quant_direct_format(i.format); }))
+          for (const uint32_t fragments : {1u, 2u})
+            for (uint32_t splits = 1; splits * fragments <= GGUF_DIRECT_PARTS; splits *= 2) {
+              const LinearConfig direct{.tile = LinearTile::GgufDirect, .splits = splits, .fragments = fragments};
+              cases.push_back({line, "direct F" + std::to_string(fragments) + " S" + std::to_string(splits),
+                               Linear::plan(w, direct, destination), direct == policy, {}});
+            }
         // The staged tile walks K as the policy's staged plans do (where the device registers a plan, those it
         // runs on more rows).
         const LinearConfig wide =

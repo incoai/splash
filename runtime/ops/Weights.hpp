@@ -77,6 +77,11 @@ struct ProjectionShape final {
   // (quant_decode_int8_format), of which it has one at least: rotated, a
   // decode plan may run them (UnitFormats::decodeInt8Takes).
   bool decodeInt8Formats = false;
+  // The direct decode tile takes all its quantized segments' formats
+  // (quant_direct_format), of which it has one at least; a shape that names
+  // no formats does not, so that its bound holds the register and staged
+  // tiles' scratch.
+  bool directFormats = false;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -177,7 +182,7 @@ public:
 
   [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    bool registerFormats = true, prefillInt8Formats = true, decodeInt8Formats = true;
+    bool registerFormats = true, prefillInt8Formats = true, decodeInt8Formats = true, directFormats = true;
     FormatClassifier classes;
     // The quantized segments' weights and the bytes of their native blocks.
     uint64_t weights = 0, bytes = 0;
@@ -186,13 +191,15 @@ public:
       if (s.isFloat()) continue;
       prefillInt8Formats &= quant_prefill_int8_format(s.formatId);
       decodeInt8Formats &= quant_decode_int8_format(s.formatId);
+      directFormats &= quant_direct_format(s.formatId);
       classes.add(s.formatId);
       const uint64_t n = uint64_t{s.outputSize} * s.inputSize;
       weights += n;
       bytes += n * s.format().block_bytes / s.format().block_elements;
     }
     return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, classes.formatClass(),
-            weights ? uint32_t(128 * bytes / weights) : 0, weights && prefillInt8Formats, weights && decodeInt8Formats};
+            weights ? uint32_t(128 * bytes / weights) : 0, weights && prefillInt8Formats, weights && decodeInt8Formats,
+            weights && directFormats};
   }
 
   // Rows [first, first + count) of a projection's weights.

@@ -581,6 +581,11 @@ QUANT_AFFINE_GROUPS(8)
   X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)            \
   X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16) X(FmtQ20, q20)
 #define QUANT_FORMATS(X) QUANT_REGISTER_FORMATS(X) X(FmtF16, f16)
+// The register formats of codebook, int8, E4M3 and bf16 operands (quant_direct_format), which the direct decode
+// tile takes.
+#define QUANT_DIRECT_FORMATS(X)                                                                                     \
+  X(FmtIQ4XS, iq4xs) X(FmtIQ4NL, iq4nl) X(FmtQ80, q80) X(FmtMXFP4, mxfp4) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)       \
+  X(FmtBF16, bf16)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time: any format (quant_format_switch), or one of the register tile's

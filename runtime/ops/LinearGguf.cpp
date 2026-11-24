@@ -147,6 +147,15 @@ void LinearPlan::requireConfiguration() const {
       throw std::invalid_argument("the column block tile takes up to GGUF_COLUMN_ROWS rows, unsplit, no up-with-gate");
     return;
   }
+  if (c.tile == LinearTile::GgufDirect) {
+    if (!workload_.rows || workload_.rows > GGUF_DIRECT_ROWS || !c.validSplits() ||
+        c.splits * c.fragments > GGUF_DIRECT_PARTS || c.splits > k / 32 ||
+        (c.fragments != 1 && c.fragments != 2) ||
+        (workload_.epilogue != LinearEpilogue::None && workload_.epilogue != LinearEpilogue::Residual))
+      throw std::invalid_argument("the direct block tile takes up to GGUF_DIRECT_ROWS rows, a group per simdgroup, "
+                                  "1 or 2 fragments, GGUF_DIRECT_PARTS parts, no gate/up");
+    return;
+  }
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on coefficient units, of 64 inputs at the fewest
     // (quant_register_unit); addGgufRegister checks each segment's.
@@ -164,7 +173,7 @@ void LinearPlan::requireConfiguration() const {
 }
 
 uint32_t LinearPlan::storageRows() const noexcept {
-  if (config_.tile == LinearTile::GgufColumn) return workload_.rows;
+  if (config_.tile == LinearTile::GgufColumn || config_.tile == LinearTile::GgufDirect) return workload_.rows;
   if (config_.tile == LinearTile::GgufRegister) return tableTiles(workload_.rows) * GGUF_TABLE16_ROWS;
   if (config_.tile == LinearTile::GgufPrefill || config_.tile == LinearTile::GgufPrefillInt8)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
@@ -173,8 +182,8 @@ uint32_t LinearPlan::storageRows() const noexcept {
 
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
   const auto [n, k] = workload_.matrix;
-  // The column tile sums K's parts in its threadgroup alone.
-  if (config_.tile == LinearTile::GgufColumn) return {};
+  // The column and direct tiles sum K's parts in their threadgroups alone.
+  if (config_.tile == LinearTile::GgufColumn || config_.tile == LinearTile::GgufDirect) return {};
   // Register tile: the Table16 table and sums, and split, [lane][split][row]
   // [column] partials and one counter per 64-column tile, which covers every
   // lane.
@@ -275,6 +284,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   case LinearTile::GgufPrefill: addGgufPrefill(graph, b, p, plan); break;
   case LinearTile::GgufPrefillInt8: addGgufPrefillInt8(graph, b, p, plan); break;
   case LinearTile::GgufColumn: addGgufColumn(graph, b, p, plan, gate); break;
+  case LinearTile::GgufDirect: addGgufDirect(graph, b, p, plan); break;
   }
 }
 
@@ -546,6 +556,28 @@ void Linear::addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &b, c
       continue;
     }
     add(kernelInstance("gguf_column_a", plan.destination()), {b.input, s.plane0, s.plane1Slot(), s.meta, b.output}, s);
+  }
+}
+
+// One dispatch per segment, each threadgroup the 8 x fragments columns of its simdgroups (LinearConfig::splits).
+void Linear::addGgufDirect(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
+                           const LinearPlan &plan) const {
+  const LinearWorkload w = plan.workload();
+  const LinearConfig config = plan.configuration();
+  const uint32_t columns = 8 * config.fragments;
+  for (const QuantizedSegment &s : p.blocks().segments) {
+    if (!quant_direct_format(s.formatId) || s.outputSize % columns)
+      throw std::invalid_argument(std::string("the direct tile does not take ") + s.name() + " weights of " +
+                                  std::to_string(s.outputSize) + " columns");
+    const bool residual = w.epilogue == LinearEpilogue::Residual;
+    std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
+    if (residual) bindings.push_back(b.residual);
+    graph.add(kernelInstance(std::string("gguf_direct_") + s.name() + "_f" + std::to_string(config.fragments) + "_" +
+                                 epilogueSuffix(w.epilogue),
+                             plan.destination()),
+              std::move(bindings),
+              GgufColumnParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, s.columnOffset, s.formatId},
+              {s.outputSize / columns, 1, 1}, {32 * config.splits, 1, 1});
   }
 }
 

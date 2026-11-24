@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <variant>
 
 namespace splash::ops {
@@ -137,6 +138,19 @@ LinearConfig staged(const ProjectionCalibration &p, uint32_t n, uint32_t k, uint
   return {.tile = LinearTile::GgufStaged, .splits = choice.splits, .oneGateUpPass = choice.onePass};
 }
 
+// The direct tile's configuration of an [n x k] projection: two 8-column
+// fragments per simdgroup where that leaves at least three threadgroups a
+// core, else one, each threadgroup as many simdgroups over K (of whole
+// 32-input groups) as GGUF_DIRECT_PARTS holds. On 40 cores it picks the
+// fastest or within 2% of it of Inkling's Q8_0 and IQ4_NL k/v and o_proj
+// at 8 rows, its q side within 7%.
+LinearConfig direct(uint32_t n, uint32_t k, uint32_t cores) {
+  const uint32_t fragments = n / 16 >= 3 * cores ? 2 : 1;
+  return {.tile = LinearTile::GgufDirect,
+          .splits = std::min(GGUF_DIRECT_PARTS / fragments, std::bit_floor(std::max(k / 32, 1u))),
+          .fragments = fragments};
+}
+
 // Whether one unsplit lane of `tiles` column tiles of `bits16` sixteenths of
 // a bit per weight runs the 16-row tile: never of 0 bits (float segments
 // alone or unknown formats, unmeasured), below sixteenRowBelowBits16, and
@@ -166,7 +180,8 @@ uint32_t decodeTileRows(StepKind step) noexcept {
 // more rows than `step`'s decode tiles hold (decodeTileRows) runs the
 // prefill tile unsplit. On the decode tiles, a plan of more rows than one tile
 // holds runs the staged tile's two row groups; otherwise a plan runs the column tile at up to GGUF_COLUMN_ROWS rows;
-// else the register tile where it takes every quantized segment and the
+// else, but a gate/up's, the direct tile at up to the class's directRows rows where it takes every quantized
+// segment (direct); else the register tile where it takes every quantized segment and the
 // class's RegisterBoundary holds for its table tiles, a one-pass-eligible
 // gate/up pair's column tiles counting both tensors', splitting by
 // registerSplits; else the staged tile, splitting by stagedSplits (a wave law
@@ -190,6 +205,13 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, StepKind step,
   // Max). Its one gate/up form is the pair in one pass.
   if (w.rows <= GGUF_COLUMN_ROWS && w.epilogue != LinearEpilogue::UpWithGate && (!gateUp || unit.oneFormat))
     return {.tile = LinearTile::GgufColumn, .oneGateUpPass = gateUp};
+  // A plan of up to directRows rows, but a gate/up's, whose quantized
+  // segments the direct tile takes runs it, which reads each
+  // weight once for all its rows and no activation table. A [1088 x 2304]
+  // Q8_0 projection of 8 rows takes 6.9 us on it, 9.8 us on the tile it
+  // ran before (40-core M5 Max).
+  if (w.rows <= p.directRows && !gateUp && w.epilogue != LinearEpilogue::UpWithGate && unit.directTakes)
+    return direct(n, k, cores);
   if (unit.registerTakes &&
       registers(p.decodeRegister, unit.formatClass, tiles, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
                 cores))
@@ -247,7 +269,7 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   UnitFormats unit;
   FormatClassifier classes;
   uint32_t bits = 0, count = 0;
-  bool decodeInt8 = true, prefillInt8 = true, quantized = false;
+  bool decodeInt8 = true, prefillInt8 = true, direct = true, quantized = false;
   for (const Projection *p : projections) {
     if (!p) continue;
     bits += p->shape().weightBits16, ++count;
@@ -257,11 +279,13 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
       classes.add(s.formatId);
       decodeInt8 &= static_cast<bool>(p->rotation) && quant_decode_int8_format(s.formatId);
       prefillInt8 &= quant_prefill_int8_format(s.formatId);
+      direct &= quant_direct_format(s.formatId);
       quantized = true;
     }
   }
   unit.decodeInt8Takes = quantized && decodeInt8;
   unit.prefillInt8Takes = quantized && prefillInt8;
+  unit.directTakes = quantized && direct;
   unit.formatClass = classes.formatClass();
   unit.weightBits16 = count ? bits / count : 0;
   if (projections.size() == 2 && projections[0] && projections[1]) {
@@ -278,7 +302,8 @@ UnitFormats unitFormats(const ProjectionShape &shape) noexcept {
           .registerTakes = shape.registerFormats,
           .weightBits16 = shape.weightBits16,
           .decodeInt8Takes = shape.rotated && shape.decodeInt8Formats,
-          .prefillInt8Takes = shape.prefillInt8Formats};
+          .prefillInt8Takes = shape.prefillInt8Formats,
+          .directTakes = shape.directFormats};
 }
 
 SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16, uint32_t cores,

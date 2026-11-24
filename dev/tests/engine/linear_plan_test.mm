@@ -577,7 +577,7 @@ void ggufPlans() {
         {"IQ2_XXS 1024 x 5120", 32, 1024, 5120, 8, GGUF_FMT_IQ2XXS, LinearTile::GgufRegister},
         {"IQ2_XXS 1024 x 5120, 16 rows", 32, 1024, 5120, 16, GGUF_FMT_IQ2XXS, LinearTile::GgufStaged},
         {"Q2_0 512 x 2560, 20 cores", 20, 512, 2560, 8, GGUF_FMT_Q20, LinearTile::GgufRegister},
-        {"BF16 320 x 10240", 32, 320, 10240, 8, GGUF_FMT_BF16, LinearTile::GgufRegister},
+        {"Q4_K 320 x 10240", 32, 320, 10240, 8, GGUF_FMT_Q4K, LinearTile::GgufRegister},
     };
     for (const Anchor &a : kAnchors)
       require(gpu(10, a.cores).plan({{a.n, a.k}, a.rows, kNone},
@@ -590,15 +590,17 @@ void ggufPlans() {
     require(pair(20, 1024, 5120).oneGateUpPass && pair(32, 1024, 5120).tile == LinearTile::GgufRegister &&
                 pair(20, 512, 2560).tile == LinearTile::GgufRegister,
             "Apple10 registers a one-pass gate/up pair on both tensors' columns");
-    // Flash-Next's hyper-connection down projection splits K sixteen ways on the register tile at every count of
-    // rows from 3 the register tile holds, a decode step's or a prompt chunk's, on 20 and 32 cores; past them it
-    // stages.
+    // Flash-Next's hyper-connection down projection runs the direct tile, one fragment a simdgroup, at 3 to 8
+    // rows, and splits K sixteen ways on the register tile at every count of rows from 9 the register tile holds,
+    // a decode step's or a prompt chunk's, on 20 and 32 cores; past them it stages.
     const Projection hyperDown = blockProjection(320, 10240, 1, GGUF_FMT_Q80);
     for (const uint32_t cores : {20U, 32U}) {
       for (uint32_t rows = GGUF_COLUMN_ROWS + 1; rows <= kMaximumRegisterRows; ++rows)
         require(gpu(10, cores).plan({{320, 10240}, rows, kNone}, hyperDown).configuration() ==
-                    LinearConfig{.tile = LinearTile::GgufRegister, .splits = 16},
-                "Apple10 splits the hyper-connection down projection sixteen ways");
+                    (rows <= GGUF_DIRECT_ROWS
+                         ? LinearConfig{.tile = LinearTile::GgufDirect, .splits = 8, .fragments = 1}
+                         : LinearConfig{.tile = LinearTile::GgufRegister, .splits = 16}),
+                "Apple10 runs the hyper-connection down projection direct, then splits it sixteen ways");
       require(gpu(10, cores).plan({{320, 10240}, 48, kNone}, hyperDown).configuration().tile ==
                   LinearTile::GgufStaged,
               "Apple10 stages a hyper-connection down plan past the register tile");
@@ -970,9 +972,59 @@ void columnPlans() {
   std::cout << "column plans: ok\n";
 }
 
+// The direct tile (ProjectionCalibration::directRows): on Apple10 a plan of 3 to 8 rows, but a gate/up pair's, of
+// formats it takes runs it, two fragments a simdgroup where that leaves three threadgroups a core, else one, as
+// many simdgroups as GGUF_DIRECT_PARTS holds; it stores its rows and takes no table and no scratch. Inkling's
+// Q8_0 and IQ4_NL attention projections on 40 cores: k / v one fragment, o_proj and the q side two. Q4_K and IQ3_XXS
+// projections, Apple9 and Apple11 (unmeasured), gate/up pairs and 9 rows keep the other tiles; plans past the tile's
+// bounds are refused.
+void directPlans() {
+  const Linear m5 = gpu(10, 40);
+  for (const uint32_t format : {uint32_t{GGUF_FMT_Q80}, uint32_t{GGUF_FMT_IQ4NL}})
+    for (const auto [n, k, fragments] : {std::tuple{1088U, 2304U, 1U}, {2304U, 3072U, 2U}, {6592U, 2304U, 2U}})
+      for (uint32_t rows = GGUF_COLUMN_ROWS + 1; rows <= GGUF_DIRECT_ROWS; ++rows)
+        for (const auto epilogue : {kNone, kResidual}) {
+          const LinearPlan plan = m5.plan({{n, k}, rows, epilogue}, blockProjection(n, k, 1, format));
+          require(plan.configuration() ==
+                          LinearConfig{.tile = LinearTile::GgufDirect, .splits = GGUF_DIRECT_PARTS / fragments,
+                                       .fragments = fragments} &&
+                      plan.storageRows() == rows && plan.input() == LinearInput::Plain &&
+                      sameScratch(plan.scratchSize(), {}) && plan.gateScratchBytes() == 0,
+                  "Apple10 runs Inkling's " + std::string(kQuantFormats[format].name) + " " + std::to_string(n) +
+                      " x " + std::to_string(k) + " projection on the direct tile");
+        }
+  const Projection q80 = blockProjection(1088, 2304, 1, GGUF_FMT_Q80),
+                   gate = blockProjection(1088, 2304, 1, GGUF_FMT_Q80);
+  for (const auto &[tile, rule] :
+       {std::pair{gpu(9, 40).plan({{1088, 2304}, 8, kNone}, q80).configuration().tile, "Apple9"},
+        {gpu(11, 40).plan({{1088, 2304}, 8, kNone}, q80).configuration().tile, "Apple11"},
+        {m5.plan({{1088, 2304}, 8, kNone}, blockProjection(1088, 2304, 1)).configuration().tile, "Q4_K"},
+        {m5.plan({{1088, 2304}, 8, kNone}, blockProjection(1088, 2304, 1, GGUF_FMT_IQ3XXS)).configuration().tile,
+         "IQ3_XXS"},
+        {m5.plan({{1088, 2304}, 8, kGateUp}, q80, &gate).configuration().tile, "a gate/up pair"},
+        {m5.plan({{1088, 2304}, 9, kNone}, q80).configuration().tile, "9 rows"},
+        {m5.plan({{1088, 2304}, 2, kNone}, q80).configuration().tile, "2 rows"}})
+    require(tile != LinearTile::GgufDirect, std::string(rule) + " ran the direct tile");
+  for (const auto &[w, config, what] :
+       {std::tuple{LinearWorkload{{1088, 2304}, GGUF_DIRECT_ROWS + 1, kNone},
+                   LinearConfig{.tile = LinearTile::GgufDirect, .splits = 8, .fragments = 1}, "more rows"},
+        {LinearWorkload{{1088, 2304}, 8, kNone},
+         LinearConfig{.tile = LinearTile::GgufDirect, .splits = 16, .fragments = 1}, "more parts"},
+        {LinearWorkload{{1088, 2304}, 8, kNone},
+         LinearConfig{.tile = LinearTile::GgufDirect, .splits = 1, .fragments = 4}, "four fragments"},
+        {LinearWorkload{{1088, 2304}, 8, kGateUp},
+         LinearConfig{.tile = LinearTile::GgufDirect, .splits = 4, .fragments = 2}, "a gate/up pair"}})
+    rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
+            "the direct block tile takes up to GGUF_DIRECT_ROWS rows, a group per simdgroup, 1 or 2 fragments, "
+            "GGUF_DIRECT_PARTS parts, no gate/up",
+            std::string("the direct tile ran ") + what);
+  std::cout << "direct plans: ok\n";
+}
+
 // A plan of 3 to 64 rows runs the decode tiles, whoever runs it: the configuration and storage of the plan of its table
 // tiles' rows (8 a tile), whose rows past its own are padding, on every device row and epilogue, a gate/up pair's
-// among them. One or two rows run the column tile (columnPlans).
+// among them. One or two rows run the column tile (columnPlans), and up to 8 in a format the direct tile takes it,
+// which stores its own rows (directPlans).
 void decodeTileRows() {
   const Projection down = blockProjection(5120, 17408, 1), iq = blockProjection(17408, 5120, 1, GGUF_FMT_IQ2XXS),
                    af4 = blockProjection(17408, 5120, 1, GGUF_FMT_AF4G64),
@@ -1075,6 +1127,15 @@ void ggufCoreLaws() {
                   const uint32_t rows = lanes * 8;
                   const LinearPlan other = plan(linear, n, rows);
                   const LinearConfig c = other.configuration();
+                  // One lane in a format the direct tile takes runs it on
+                  // Apple10, but a gate/up pair's (directPlans).
+                  if (family == 10 && lanes == 1 && !gateUp && quant_direct_format(format)) {
+                    require(c.tile == LinearTile::GgufDirect && other.storageRows() == rows &&
+                                other.input() == LinearInput::Plain && sameScratch(other.scratchSize(), {}),
+                            "GGUF one lane of a direct format runs the direct tile");
+                    oneLane = c;
+                    continue;
+                  }
                   const bool staged = !registers(lanes, columns), tiers = !staged || family == 9;
                   std::optional<LinearConfig> &first = staged ? stagedConfig : registerConfig;
                   require(c.tile == (staged ? LinearTile::GgufStaged : LinearTile::GgufRegister) &&
@@ -1720,6 +1781,7 @@ int main(int argc, char **argv) {
     ggufPlans();
     scratchBoundsRotated();
     columnPlans();
+    directPlans();
     decodeTileRows();
     ggufCoreLaws();
     floatOutputPlans();

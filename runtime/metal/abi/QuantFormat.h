@@ -229,6 +229,18 @@ inline constexpr bool quant_loader_format(uint32_t format) {
 // Apple9 register tile takes them (kernels/decode/linear_gguf_sgmatrix.metal):
 // every format's but F16's, whose 11-bit significands bf16 does not hold.
 inline constexpr bool quant_register_format(uint32_t format) { return format != GGUF_FMT_F16; }
+// Whether the direct decode tile (kernels/decode/linear_gguf_direct.metal, QUANT_DIRECT_FORMATS) takes a format:
+// the register tile's whose operands are the stored values or a codebook's entries (QuantCodebook, QuantInt8,
+// QuantFloat8 and QuantFloat16 in kernels/common/quant_formats.h). An offset (QuantLinear) costs the tile an input
+// sum and a coefficient pair per group, a grid (QuantGrid) a lookup and signs per pair: on the direct tile Q4_K ran
+// 1.0-1.8x and IQ3_XXS 1.5x the time of the register and staged tiles at 8 rows (M5 Max).
+inline constexpr bool quant_direct_format(uint32_t format) {
+  switch (format) {
+  case GGUF_FMT_IQ4XS: case GGUF_FMT_IQ4NL: case GGUF_FMT_Q80: case GGUF_FMT_MXFP4: case GGUF_FMT_NVFP4:
+  case GGUF_FMT_FP8: case GGUF_FMT_BF16: return true;
+  default: return false;
+  }
+}
 // Whether the int8 decode tiles (kernels/shared/gguf_linear.metal
 // gguf_decode_int8_*) take a format: PQ2_0, whose two-bit codes q stand for
 // q - 1, exact in int8, with one d per 128-input block.

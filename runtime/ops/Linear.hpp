@@ -99,7 +99,12 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // each lane one column, reading those rows alone
 // (kernels/decode/linear_gguf_column.metal); unsplit across threadgroups, a
 // gate/up pair of one format in one pass.
-enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8, GgufColumn };
+// GgufDirect: a plan of up to GGUF_DIRECT_ROWS rows on 8x8 MMAs of the weights in
+// registers against the rows as their producer wrote them
+// (kernels/decode/linear_gguf_direct.metal): no table, so no prepare; a
+// threadgroup's simdgroups split K (LinearConfig::splits) over the same
+// fragments of 8 columns each (LinearConfig::fragments); no gate/up.
+enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8, GgufColumn, GgufDirect };
 // One staged tile's most rows, and the register and column tiles' (the
 // decode tiles): a prefill chunk's plan of more runs the prefill tiles, the int8
 // one where its paths take it, and a decode step's two row groups of the
@@ -190,7 +195,8 @@ struct LinearWorkload final {
 struct LinearConfig final {
   LinearTile tile = LinearTile::GgufStaged;
   // Cross-threadgroup K partitions for GgufStaged and GgufRegister, a power
-  // of two up to kMaximumSplits; GgufPrefill uses one.
+  // of two up to kMaximumSplits; GgufPrefill uses one; GgufDirect's
+  // simdgroups over K in one threadgroup.
   uint32_t splits = 1;
   static constexpr uint32_t kMaximumSplits = 16;
   // GgufStaged: each column tile starts its walk over its K partition at its
@@ -212,6 +218,8 @@ struct LinearConfig final {
   // (gguf_decode_int8_pq20_m<rows>_*) at the plan's storage rows, splits,
   // spread and passes.
   bool decodeInt8 = false;
+  // GgufDirect: the 8-column fragments of a simdgroup, 1 or 2.
+  uint32_t fragments = 0;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -431,6 +439,8 @@ private:
                        const Projection *gate) const;
   void addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
                      const LinearPlan &plan, const Projection *gate) const;
+  void addGgufDirect(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
+                     const LinearPlan &plan) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   KernelCalibration calibration_;

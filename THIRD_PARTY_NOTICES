@@ -11,7 +11,9 @@ runtime/metal/kernels/common/quant_formats.h and the GGUF kernels built on it
 follow ggml's Metal dequantize.h and mul_mm.metal. They are compiled into
 splash.metallib. The tests' CPU reference,
 dev/tests/engine/GgufFormatReference.hpp, decodes the same blocks as ggml's
-dequantize_row_* (ggml/src/ggml-quants.c).
+dequantize_row_* (ggml/src/ggml-quants.c). The direct decode tile,
+runtime/metal/kernels/decode/linear_gguf_direct.metal, follows the design of
+ggml's Metal kernel_mul_mv_ext and kernel_mul_mv_mma_blk (ggml-metal.metal).
 
 MIT License
 

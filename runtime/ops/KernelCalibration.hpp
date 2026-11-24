@@ -7,6 +7,7 @@
 
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
 #include "ops/Weights.hpp"
 
 #include <array>
@@ -89,6 +90,10 @@ struct ProjectionCalibration final {
   // The most waves of the 16-row tile one such plan runs in from there, under
   // a wave law (sixteenRowLane); 0 never.
   uint32_t sixteenRowWaves;
+  // A plan of more rows than the column tile's and at most this many, of
+  // segments the register tile takes and no gate/up, runs the direct tile
+  // (KernelSelection.cpp: direct); 0 never.
+  uint32_t directRows;
   // A staged plan on the decode tiles of a unit the int8 decode tiles take
   // (UnitFormats::decodeInt8Takes) runs them where it stores at least this
   // many rows (a 16-row plan counts 16).
@@ -254,6 +259,8 @@ inline constexpr ProjectionCalibration kApple9Projection{
     .onePassFromCores = kNever,
     .sixteenRowBelowBits16 = 0,
     .sixteenRowWaves = 0,
+    // Unmeasured on Apple9: its plans keep the register and staged tiles.
+    .directRows = 0,
     // Apple9's matrix operations share the FP32 pipe and multiply int8 at
     // 0.9x their bf16 rate (40-core M3 Max, measured): it keeps bf16
     // activations in decode and prefill, end to end unmeasured.
@@ -268,6 +275,10 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .onePassFromCores = kApple10OnePassFromCores,
     .sixteenRowBelowBits16 = kApple10SixteenRowBelowBits16,
     .sixteenRowWaves = kApple10SixteenRowWaves,
+    // Inkling's Q8_0 and IQ4_NL attention projections at 4 and 8 rows take
+    // 4-30% less time on the direct tile than on the faster of the register
+    // and staged tiles (40-core M5 Max, gguf-projection-benchmark).
+    .directRows = GGUF_DIRECT_ROWS,
     .decodeInt8FromRows = kApple10DecodeInt8FromRows,
     // Apple10 and Apple11 multiply int8 faster than bf16, so every chunk past
     // the decode tiles runs the int8 prefill tile where it takes the formats:
@@ -284,6 +295,8 @@ inline constexpr ProjectionCalibration kApple10Projection{
 inline constexpr ProjectionCalibration kApple11Projection = [] {
   ProjectionCalibration row = kApple10Projection;
   row.sixteenRowWaves = 0;
+  // Unmeasured on Apple11: its plans keep the register and staged tiles.
+  row.directRows = 0;
   return row;
 }();
 

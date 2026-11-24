@@ -650,6 +650,61 @@ void columnTile(MetalBackend &backend, const Linear &linear) {
           "gate-up and fp32 plain within fp64, rows past the live ones unread and unwritten");
 }
 
+// The direct tile at 1 to GGUF_DIRECT_ROWS live rows: single tensors [512, K] in every format it takes
+// (quant_direct_format), at K 2048 and 2304 (a simdgroup's part of K ending inside a meta unit), at 1 fragment of 8
+// simdgroups and 2 of 4 and 1, plain, residual and the fp32 plain destination, on dense and sparse inputs: every
+// output within fp64 on the register tile's exact weights, and the rows past the live ones neither read (they hold
+// NaN) nor written.
+void directTile(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 512, columns = N + kPadding;
+  const std::vector<Fmt> formats = tileFormats(LinearTile::GgufRegister);
+  for (const uint32_t K : {2048u, 2304u})
+    for (const Fmt f : formats) {
+      if (!quant_direct_format(f)) continue;
+      if (K % quant_column_unit(kQuantFormats[f].block_elements)) continue;
+      const Tensor w = tensor(backend, f, N, K);
+      const Projection up = projection({&w}, columns);
+      for (const Inputs inputs : {Inputs::Dense, Inputs::Sparse}) {
+        const std::vector<float> x = activations(inputs, GGUF_DIRECT_ROWS, K);
+        const std::vector<float> residual = residuals(GGUF_DIRECT_ROWS, columns);
+        const std::vector<Dot> dots = products({&w}, columns, x, GGUF_DIRECT_ROWS);
+        for (const uint32_t live : {1u, 3u, 5u, 8u})
+          for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual})
+            for (const auto [fragments, splits] : {std::pair{1u, 8u}, std::pair{2u, 4u}, std::pair{2u, 1u}}) {
+                const std::string label = std::string(fmtName(f)) + " K=" + std::to_string(K) +
+                                          (inputs == Inputs::Sparse ? " sparse " : " dense ") +
+                                          epilogueName(epilogue) + " live=" + std::to_string(live) + " F" +
+                                          std::to_string(fragments) + " S" + std::to_string(splits);
+                const LinearWorkload wl{{columns, K}, live, epilogue};
+                const LinearPlan plan = Linear::plan(
+                    wl, LinearConfig{.tile = LinearTile::GgufDirect, .splits = splits, .fragments = fragments},
+                    FloatOutput::BFloat16);
+                const std::vector<uint16_t> rows = storageRows(x, K, live, kLaneRows);
+                const std::vector<uint16_t> aux = storageRows(residual, columns, live, kLaneRows);
+                const Outcome out = run(backend, linear, plan, up, nullptr, rows, aux, kPoisonNaN, N, label);
+                for (uint64_t i = uint64_t{live} * columns; i < out.output.size(); ++i)
+                  if (out.output[i] != kUnwritten) {
+                    fail(label + ": writes a row past the live ones");
+                    break;
+                  }
+                checkValues(out, within(dots, false), {}, aux, wl, live, N, label);
+                if (epilogue == LinearEpilogue::None) {
+                  Projection logits = up;
+                  logits.destination = FloatOutput::Float32;
+                  floatOutput(backend, linear,
+                              Linear::plan(wl,
+                                           LinearConfig{.tile = LinearTile::GgufDirect, .splits = splits,
+                                                        .fragments = fragments},
+                                           FloatOutput::Float32),
+                              logits, rows, out, within(dots, false), N, label);
+                }
+              }
+      }
+    }
+  section("direct decode: every format it takes, K 2048 and 2304, 1-8 live rows, F1 S8, F2 S4, F2 S1, "
+          "plain/residual and fp32 plain within fp64, rows past the live ones unread and unwritten");
+}
+
 // One fused projection of three segments of different formats ([512 | 256 | 256, K]) on one tile and walk, each format
 // it takes with the formats three and five further on of those: at every lane count and K split the tile takes in
 // all three, within fp64 and equal to the projections of each segment alone; one lane on the staged 16-row tile equal
@@ -1871,6 +1926,7 @@ int main(int argc, char **argv) {
       }
       decodeTile(backend, linear, LinearTile::GgufStaged, true, decodeInputs(true), tileFormats(LinearTile::GgufStaged));
       columnTile(backend, linear);
+      directTile(backend, linear);
       fusedDecode(backend, linear, LinearTile::GgufStaged, true);
       for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
@@ -1878,10 +1934,11 @@ int main(int argc, char **argv) {
       prefillInt8(backend, linear);
       leadingInputs(backend, linear);
       rowViews(backend, linear);
-      // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
+      // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120. gdn_in is Q4_K, which the
+      // direct tile does not take, so Apple10 plans it staged at one lane too.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);
-      const SplitOperand gdn = splitOperand(backend, IQ4XS, {12288, 5120}, LinearEpilogue::None);
+      const SplitOperand gdn = splitOperand(backend, Q4K, {12288, 5120}, LinearEpilogue::None);
       const SplitOperand gateUp = splitOperand(backend, Q4K, {17408, 5120}, LinearEpilogue::GateUp);
       // Flash-Next's hyper-connection down then up projections, Q8_0: K 10240 (sixteen partitions from 14 cores on the
       // register tile) and 320.

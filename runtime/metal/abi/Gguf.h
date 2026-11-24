@@ -57,6 +57,12 @@ struct GgufColumnParams {
   uint32_t format;      // the tensor's GGUF_FMT_*, a one-pass gate/up's both tensors'
 };
 static_assert(sizeof(GgufColumnParams) == 20, "GGUF column parameters are 20 bytes on both sides");
+// Direct tile (kernels/decode/linear_gguf_direct.metal): up to GGUF_DIRECT_ROWS live rows on 8x8 MMAs against the
+// rows as their producer wrote them, a threadgroup of simdgroups over K of the same 8 or 16 columns (1 or 2
+// 8-column fragments a simdgroup), its simdgroups times fragments at most GGUF_DIRECT_PARTS, so that its parts take
+// 2 KB of threadgroup memory; GgufColumnParams.
+#define GGUF_DIRECT_ROWS 8u
+#define GGUF_DIRECT_PARTS 8u
 
 // The register tile's activations, Table16 (kernels/common/gguf_sgmatrix.h):
 // per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,
