@@ -84,7 +84,6 @@ void DenseLinear::add(metal::CommandGraph &graph, const DenseWeights &weights, u
   const bool scaled = epilogue == DenseEpilogue::ScaledResidual;
   const uint64_t outputBytes = scaled || epilogue == DenseEpilogue::Residual ? 4 : 2;
   requireBytes(output, uint64_t{rows} * outputSize * outputBytes, "dense output");
-  if (scaled) requireBytes(weights.scale, uint64_t{outputSize} * 2, "dense scale");
   const DenseTile &tile = tileOf(calibration_, rows, outputSize, inputSize);
   std::vector<metal::MetalBuffer> buffers{input, weights.weight, weights.bias, output};
   if (scaled) buffers.push_back(weights.scale);

@@ -3,10 +3,10 @@
 // rotary tables, the q/k/v preparation and the merger's rows. Every output is
 // allocated NaN past what the kernel writes and checked to hold it. Then the
 // encoder's checks of what it reads (ops/InklingVision.cpp): every weight at
-// its extent and refused one element short, and an image's pixels and
-// embedding rows. The shared dense operators its encoder runs, the scaled
-// residual, the LayerNorm into fp32 rows in place and the attention of heads
-// of 64 among them, are dense_linear_metal_test's and
+// its extent and refused one element short, a LayerScale it lacks, and an
+// image's pixels and embedding rows. The shared dense operators its encoder
+// runs, the scaled residual, the LayerNorm into fp32 rows in place and the
+// attention of heads of 64 among them, are dense_linear_metal_test's and
 // dense_attention_metal_test's.
 //
 //   inkling-vision-metal METALLIB
@@ -313,10 +313,17 @@ void checkEncoderExtents(MetalBackend &backend) {
        {std::pair{&LayerNormWeights::weight, " weight"}, std::pair{&LayerNormWeights::bias, " bias"}})
     requireWeight(model.inputNorm.*field, hidden, std::string("vision input norm") + part,
                   [&](VisionWeights &changed, const MetalBuffer &view) { changed.inputNorm.*field = view; });
+  // Each output projection's LayerScale, at its extent, and absent: a tower
+  // without one is refused when its encoder is built, not at its first image.
   for (const auto &[member, name] : {std::pair{&VisionBlock::projection, "vision attention projection scale"},
-                                     std::pair{&VisionBlock::downProjection, "vision down projection scale"}})
+                                     std::pair{&VisionBlock::downProjection, "vision down projection scale"}}) {
     requireWeight((model.blocks.back().*member).scale, hidden, name,
                   [&](VisionWeights &changed, const MetalBuffer &view) { (changed.blocks.back().*member).scale = view; });
+    VisionWeights without = model;
+    (without.blocks.back().*member).scale = {};
+    test::rejects([&] { const ops::InklingVision vision(backend, without, kGrid.patches()); }, name,
+                  std::string("a tower without its ") + name + " was accepted");
+  }
   for (const auto &[member, output, input, name] :
        {std::tuple{&VisionBlock::qkv, 3 * hidden, hidden, "vision q/k/v"},
         std::tuple{&VisionBlock::projection, hidden, hidden, "vision attention projection"},

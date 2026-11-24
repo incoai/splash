@@ -131,9 +131,9 @@ struct Projected final {
 // One projection of `rows` rows of `inputs` into `outputs`, its values drawn
 // from `seed`, against fp64 unless `exact` is false: an output may differ by
 // bf16 rounding of its magnitude (fp32 for the residuals, of the scaled sum
-// and the residual each) plus fp32 accumulation over the inputs. The input holds whole row tiles, the rows
-// past `rows` large finite values; NaN follows the output's rows, which must
-// survive.
+// and the residual each) plus fp32 accumulation over the inputs. The input
+// holds whole row tiles, the rows past `rows` large finite values; NaN follows
+// the output's rows, which must survive.
 Projected testProjection(MetalBackend &backend, const DenseLinear &dense, uint32_t rows, uint32_t outputs,
                          uint32_t inputs, DenseEpilogue epilogue, bool exact = true, uint32_t seed = 17) {
   const std::string label = std::string(epilogueName(epilogue)) + " rows " + std::to_string(rows) + " " +
@@ -271,22 +271,15 @@ void testProjectionExtents(MetalBackend &backend, const DenseLinear &dense) {
     DenseLinear::requireWeights({weight, v}, outputs, inputs, "dense");
     dense.add(g, {weight, v}, outputs, inputs, input, output, rows);
   });
-  // A LayerScale's scales: those requireWeights takes, if any, and those the
-  // scaled residual reads.
+  // A LayerScale's scales, which requireWeights takes where a projection has
+  // them: the scaled residual reads them as its owner checked them, as it
+  // reads the weights and the bias (their owner states which projections
+  // need them, ops/InklingVision.cpp).
   const MetalBuffer scale = sharedBuffer(backend, size_t(outputs) * 2);
   requireExtent(backend, scale, scale.sizeBytes(), 2, "dense scale", [&](CommandGraph &g, const MetalBuffer &v) {
     DenseLinear::requireWeights({weight, bias, v}, outputs, inputs, "dense");
     dense.add(g, {weight, bias, v}, outputs, inputs, input, output, rows, DenseEpilogue::ScaledResidual);
   });
-  requireExtent(backend, scale, scale.sizeBytes(), 2, "dense scale", [&](CommandGraph &g, const MetalBuffer &v) {
-    dense.add(g, {weight, bias, v}, outputs, inputs, input, output, rows, DenseEpilogue::ScaledResidual);
-  });
-  splash::test::rejects(
-      [&] {
-        CommandGraph g;
-        dense.add(g, {weight, bias}, outputs, inputs, input, output, rows, DenseEpilogue::ScaledResidual);
-      },
-      "dense scale", "a scaled residual without scales was accepted");
   for (const auto [o, i] : {std::pair{192U, 384U}, std::pair{256U, 192U}, std::pair{0U, 384U}})
     splash::test::rejects([&] { DenseLinear::requireWeights({weight, bias}, o, i, "dense"); }, "not whole multiples",
                           "dense weights of " + std::to_string(o) + " x " + std::to_string(i) + " were accepted");
