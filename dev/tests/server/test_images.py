@@ -180,10 +180,25 @@ class DataUrlTest(unittest.TestCase):
         payload = png_bytes(64, 64)
         url = "data:image/png;base64," + base64.b64encode(payload).decode()
         self.assertEqual(images.decode_data_url(url), payload)
+        # Wrapped at 76 columns as `base64` on Linux writes it, unpadded or
+        # URL-safe, the same bytes.
+        encoded = base64.b64encode(payload).decode()
+        wrapped = "\n".join(encoded[i : i + 76] for i in range(0, len(encoded), 76))
+        for variant in (
+            wrapped + "\n",
+            wrapped.replace("\n", "\r\n"),
+            encoded.rstrip("="),
+            base64.urlsafe_b64encode(payload).decode(),
+        ):
+            with self.subTest(variant=variant[-8:]):
+                self.assertEqual(
+                    images.decode_data_url("data:image/png;base64," + variant), payload
+                )
         for invalid in (
             "https://example.com/x.png",
             "data:image/png,rawbytes",
             "data:image/png;base64,not*base64",
+            "data:image/png;base64,abcde",
             None,
         ):
             with self.subTest(url=invalid):

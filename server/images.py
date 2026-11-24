@@ -69,16 +69,33 @@ class PreparedImage:
         return (self.grid_height // MERGE) * (self.grid_width // MERGE)
 
 
+# What standard base64 decoding is lenient about (decode_base64): ASCII
+# whitespace, as `base64` on Linux wraps its output at 76 columns, and the
+# URL-safe alphabet's two characters.
+_BASE64_LENIENCE = str.maketrans(
+    {" ": None, "\t": None, "\n": None, "\r": None, "-": "+", "_": "/"}
+)
+
+
+def decode_base64(encoded: str) -> bytes:
+    """The bytes of a base64 text, standard or URL-safe, wrapped or not,
+    padded or not; a ValueError for any other text."""
+    text = encoded.translate(_BASE64_LENIENCE)
+    return base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
+
+
 def decode_data_url(url) -> bytes:
     if not isinstance(url, str) or not url.startswith("data:"):
         raise ImageError("only data: image URLs are supported")
     header, _, encoded = url.partition(",")
     if ";base64" not in header:
         raise ImageError("image data URLs must be base64-encoded")
-    if len(encoded) > MAX_IMAGE_BYTES * 4 // 3 + 4:
+    # Its line breaks, at most 2 characters in 78 of a wrapped text, are not
+    # the image's bytes.
+    if len(encoded) > MAX_IMAGE_BYTES * 4 // 3 * 78 // 76 + 4:
         raise ImageError("image exceeds the size limit")
     try:
-        raw = base64.b64decode(encoded, validate=True)
+        raw = decode_base64(encoded)
     except (ValueError, TypeError) as error:
         raise ImageError("image data URL is not valid base64") from error
     if len(raw) > MAX_IMAGE_BYTES:

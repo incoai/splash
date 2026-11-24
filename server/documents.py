@@ -11,6 +11,7 @@ from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass
 
 from .errors import APIError
+from .images import decode_base64
 from .lru import LRUCache
 from .protocol import MAX_IMAGE_SPANS
 
@@ -198,7 +199,7 @@ def _cache_pages(key, pages):
 def _pages(encoded, budget):
     budget.remaining_time()
     try:
-        payload = base64.b64decode(encoded, validate=True)
+        payload = decode_base64(encoded)
     except ValueError as error:
         raise APIError(400, "PDF data is not valid base64") from error
     if len(payload) > MAX_PDF_BYTES:
