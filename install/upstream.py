@@ -410,6 +410,42 @@ def with_text_fallback(inspect, language_only):
     return replace(text, vision_note=str(refusal))
 
 
+def check_vision(target, paths, scratch):
+    """Refuse target's tower, as a VisionError, where the engine cannot
+    prepare it from its files as every start does (the engine's
+    vision-check): quantized, of names it does not bind, or of a weight not
+    exactly a BF16, which headers do not show. An engine that cannot run the
+    check gives a ModelError instead. paths maps the target's file names to
+    their local files, linked into scratch as an installation links them."""
+    root = Path(tempfile.mkdtemp(dir=scratch))
+    for path, name in target.files.items():
+        if path.startswith("vision/"):
+            (root / path).parent.mkdir(exist_ok=True)
+            (root / path).symlink_to(paths[name])
+    arguments = [target.format, target.vision_format, str(target.config), str(root)]
+    try:
+        models.run_engine(["vision-check", *arguments], "vision check")
+    except models.EngineRefusal as error:
+        raise models.VisionError(f"its vision tower: {error}") from None
+
+
+def prepared_tower(target, paths, scratch, text):
+    """target once the engine prepared its tower from paths (check_vision);
+    where it refuses, for a family that serves text instead
+    (ModelFamily.text_fallback), text(), its text target, the refusal its
+    vision_note; another family's refusal stands."""
+    if target.vision_format == "none":
+        return target
+    try:
+        check_vision(target, paths, scratch)
+    except models.VisionError as refusal:
+        if not target.family.text_fallback:
+            raise
+        with contextlib.redirect_stdout(io.StringIO()):
+            return replace(text(), vision_note=str(refusal))
+    return target
+
+
 def _gguf_target(repo, variant, language_only, scratch):
     names, by_ending = select_gguf(repo.files, variant)
     name = names[0] if len(names) == 1 else f"{len(names)} split files {names[0]} ..."
@@ -917,6 +953,23 @@ def _install(
             flush=True,
         )
         downloaded = repo.download(names)
+        try:
+            checked = prepared_tower(
+                target,
+                downloaded,
+                Path(scratch),
+                lambda: inspect_target(repo, selection.variant, True, Path(scratch)),
+            )
+        except models.VisionError as error:
+            raise models.VisionError(
+                f"{error}; use --language-only to serve text only"
+            ) from None
+        if checked is not target:
+            print(
+                f"{selection.model} serves text only: {checked.vision_note}.",
+                flush=True,
+            )
+            target = checked
     files |= {path: downloaded[name] for path, name in target.files.items()}
     publish(
         selection.models_root,

@@ -124,11 +124,35 @@ def _prepare(target, draft, mmproj, language_only, models_root):
     )
     with tempfile.TemporaryDirectory(prefix="splash-target-") as scratch:
         source, inspected = _inspect(target, mmproj, language_only, Path(scratch))
+        inspected = _prepared_tower(target, mmproj, source, inspected, Path(scratch))
         repo = _draft(inspected.family, draft)
         files = upstream.draft_files(repo, inspected)
     files |= {path: source.paths[name] for path, name in inspected.files.items()}
     record = upstream.assembly_record(str(target), inspected, source, repo)
     return upstream.publish(models_root, link, record, files)
+
+
+def _prepared_tower(target, mmproj, source, inspected, scratch):
+    """inspected once the engine prepared its tower from source's files: a
+    GGUF's mmproj, named, is refused where it cannot (upstream.check_vision);
+    an MLX target of a family that serves text instead serves text
+    (upstream.prepared_tower)."""
+    try:
+        if mmproj:
+            upstream.check_vision(inspected, source.paths, scratch)
+            return inspected
+        checked = upstream.prepared_tower(
+            inspected,
+            source.paths,
+            scratch,
+            lambda: upstream.mlx_target(source, True),
+        )
+    except models.VisionError as error:
+        fix = "omit mmproj" if mmproj else "pass language_only=True"
+        raise models.VisionError(f"{error}; {fix} to serve text only") from None
+    if checked is not inspected:
+        print(f"{target} serves text only: {checked.vision_note}.", flush=True)
+    return checked
 
 
 def _path(value) -> Path:

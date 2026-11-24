@@ -26,6 +26,7 @@ from dev.tests.installer_fixtures import (
     draft_dir,
     family_config,
     fixture,
+    prepared_towers,
     selection,
     tensor_table,
     vision_fixture,
@@ -33,10 +34,12 @@ from dev.tests.installer_fixtures import (
     write_target,
 )
 from install import assembly, families, gguf, hub, models, upstream
+from install import paths as paths_module
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
 FAMILIES = families.FAMILIES  # as defined, whatever a test patches
+CHECK_VISION = upstream.check_vision  # the engine's, which tests stand in for
 
 
 class GgufMetadataTests(unittest.TestCase):
@@ -44,6 +47,7 @@ class GgufMetadataTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        prepared_towers(self)
 
     def metadata(self, values):
         return gguf.Metadata(write_gguf(self.root / "model.gguf", values))
@@ -871,6 +875,101 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual((record["vision_format"], warnings), ("none", ""))
         self.assertNotIn("vision_unavailable", record)
         self.assertEqual(fake.downloads, [])
+
+    def test_a_tower_the_engine_refuses_serves_text_where_its_family_does(self):
+        # The engine prepares the downloaded tower once (check_vision): one it
+        # refuses serves text, its refusal recorded and not asked again.
+        self.gguf_repository()
+        self.as_family(text_fallback=True)
+        refusal = "its vision tower: the vision tower is quantized"
+        upstream.check_vision.side_effect = models.VisionError(refusal)
+        chosen = selection(self.root, GGUF_REPO + ":Q4_K_M", language_only=False)
+        output, warnings = self.prepare_warned(chosen)
+        checked, paths, _ = upstream.check_vision.call_args.args
+        self.assertEqual(checked.files[assembly.GGUF_VISION], "mmproj-F32.gguf")
+        self.assertTrue(paths["mmproj-F32.gguf"].is_file())
+        self.assertIn(f"serves text only: {refusal}.", output)
+        record = assembly.verify(chosen.link)
+        self.assertEqual((record["vision_format"], warnings), ("none", ""))
+        self.assertEqual(record["vision_unavailable"], refusal)
+        self.assertNotIn(assembly.GGUF_VISION, record["files"])
+        upstream.check_vision.reset_mock()
+        output, _ = self.prepare_warned(chosen)
+        self.assertIn("is already installed", output)
+        upstream.check_vision.assert_not_called()
+        # Another family's is refused, naming --language-only.
+        self.as_family(text_fallback=False)
+        pinned = selection(
+            self.root, GGUF_REPO + ":Q4_K_M", language_only=False, revision="a" * 40
+        )
+        with self.assertRaisesRegex(
+            models.VisionError, f"{refusal}; use --language-only to serve text only"
+        ):
+            self.prepare(pinned)
+        self.assertFalse(pinned.link.exists())
+
+    def test_an_installation_whose_tower_the_engine_refuses_stays_text(self):
+        fake = self.gguf_repository()
+        chosen = self.install_while_its_family_served_text_only(fake)
+        refusal = "its vision tower: missing source tensor: v.blk.0.ln1.weight"
+        upstream.check_vision.side_effect = models.VisionError(refusal)
+        output, warnings = self.prepare_warned(chosen)
+        self.assertIn("its family serves images now", output)
+        self.assertIn(f"serves text only: {refusal}.", output)
+        self.assertEqual(warnings, "")
+        record = assembly.verify(chosen.link)
+        self.assertEqual(record["vision_format"], "none")
+        self.assertEqual(record["vision_unavailable"], refusal)
+        upstream.check_vision.reset_mock()
+        output, warnings = self.prepare_warned(chosen)
+        self.assertIn("is already installed", output)
+        self.assertEqual(warnings, "")
+        upstream.check_vision.assert_not_called()
+
+    def test_the_engine_prepares_a_tower_before_it_is_installed(self):
+        # The engine's own check (its vision-check command) refuses the
+        # fixture's projector, the header of one tensor.
+        fake = self.gguf_repository()
+        repo = hub.Repository.resolve(GGUF_REPO)
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        target = upstream.inspect_target(repo, "Q4_K_M", False, scratch)
+        self.assertEqual(target.vision_format, "gguf")
+        paths = repo.download(set(target.files.values()))
+        with self.assertRaisesRegex(
+            models.VisionError, "^its vision tower: GGUF data section is truncated$"
+        ):
+            CHECK_VISION(target, paths, scratch)
+        self.assertIn(f"{GGUF_REPO}/mmproj-F32.gguf", fake.downloads)
+
+    def test_only_the_engine_s_refusal_of_a_tower_refuses_it(self):
+        # An engine that refuses the tower (EX_SOFTWARE, EX_DATAERR) refuses
+        # it; one that cannot run the check fails the installation instead.
+        self.gguf_repository()
+        repo = hub.Repository.resolve(GGUF_REPO)
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        target = upstream.inspect_target(repo, "Q4_K_M", False, scratch)
+        paths = repo.download(set(target.files.values()))
+        engine = self.root / "engine" / "splash"
+        engine.parent.mkdir()
+        for status, report, refused in (
+            (70, "error: the vision tower is quantized", models.VisionError),
+            (65, "error: vision metadata mismatch: x", models.VisionError),
+            (74, "error: native runtime I/O failed: cannot map", models.ModelError),
+            (64, "error: unknown command vision-check", models.ModelError),
+            (-9, "", models.ModelError),
+        ):
+            stop = f"kill -{-status} $$" if status < 0 else f"exit {status}"
+            engine.write_text(f"#!/bin/sh\necho '{report}' >&2\n{stop}\n")
+            engine.chmod(0o755)
+            with (
+                self.subTest(status=status),
+                mock.patch.object(paths_module, "BINARY", engine),
+                self.assertRaises(models.ModelError) as caught,
+            ):
+                CHECK_VISION(target, paths, scratch)
+            self.assertIs(type(caught.exception), refused)
 
     def test_a_tower_that_cannot_download_leaves_the_rest_of_an_update(self):
         fake = self.gguf_repository()

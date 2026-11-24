@@ -7,9 +7,15 @@
 #include "model/VisionPreparation.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <sys/mman.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <functional>
+#include <memory>
 #include <set>
+#include <system_error>
 
 namespace splash::model {
 namespace {
@@ -210,6 +216,15 @@ ImagePlan VisionLoader::image() const {
             vision::writeVision(bytes, planned->plan);
             planned->checkUnchanged();
           }};
+}
+
+void VisionLoader::check() const {
+  const uint64_t bytes = planned_->plan.bytes;
+  void *memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+  if (memory == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "cannot map the vision image");
+  const std::unique_ptr<void, std::function<void(void *)>> mapped(memory, [bytes](void *m) { munmap(m, bytes); });
+  vision::writeVision({static_cast<uint8_t *>(memory), bytes}, planned_->plan);
+  planned_->checkUnchanged();
 }
 
 uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }

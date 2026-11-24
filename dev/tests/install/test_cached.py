@@ -14,6 +14,7 @@ from dev.tests.installer_fixtures import (
     cached_snapshot,
     fake_hub,
     mlx_target,
+    prepared_towers,
     selection,
 )
 from install import assembly, cached, models, upstream
@@ -47,6 +48,7 @@ class CachedTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.cache = self.root / "hub"
+        prepared_towers(self)
 
     def install_cached(self):
         with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):

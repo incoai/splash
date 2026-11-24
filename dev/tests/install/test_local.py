@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import fcntl
 import io
 import json
@@ -9,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from dev.tests.fixture_files import write_safetensors
 from dev.tests.installer_fixtures import (
     DENSE,
     DRAFT_COMMIT,
@@ -22,6 +24,7 @@ from dev.tests.installer_fixtures import (
     fixture,
     mlx_target,
     pins,
+    prepared_towers,
     selection,
     tensor_table,
     vision_fixture,
@@ -31,6 +34,9 @@ from dev.tests.installer_fixtures import (
 from install import assembly, families, hub, local, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
+
+
+CHECK_VISION = upstream.check_vision  # the engine's, which tests stand in for
 
 
 class LocalModelTest(unittest.TestCase):
@@ -44,6 +50,7 @@ class LocalModelTest(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.models = self.root / "models"
         self.cache = self.root / "hub"
+        prepared_towers(self)
 
         def offline(name):
             def refuse(*args, **options):
@@ -326,6 +333,69 @@ class LocalModelTest(unittest.TestCase):
                 self.assertEqual(
                     served(".*rope_theta" if vision == "none" else None), vision
                 )
+
+    def test_an_inkling_tower_the_engine_refuses_serves_text(self):
+        # The engine's own check (its vision-check) binds the tower's
+        # tensors, of which this checkpoint holds one.
+        family = families.named("Inkling-2-Mini")
+        shards = {
+            "model.vision_tower.embeddings.patch_embedding.weight": "vision.safetensors",
+            "model.language_model.embed_tokens.weight": "text.safetensors",
+        }
+        target = mlx_target(self.root / "Inkling-2-Mini-4bit", family)
+        (target / "model.safetensors").unlink()
+        (target / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": shards})
+        )
+        write_safetensors(
+            target / "vision.safetensors",
+            {
+                "model.vision_tower.embeddings.patch_embedding.weight": (
+                    [1024, 1200],
+                    "BF16",
+                    bytes(2 * 1024 * 1200),
+                )
+            },
+        )
+        (target / "text.safetensors").write_text("text")
+        draft = draft_dir(self.root / "draft", family)
+        with (
+            mock.patch.object(upstream, "check_vision", CHECK_VISION),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            prepared = local.prepare_local_model(target, draft, models_dir=self.models)
+        refusal = (
+            "its vision tower: missing source tensor: "
+            "model.vision_tower.embeddings.position_embedding.weight"
+        )
+        self.assertIn(f"{target} serves text only: {refusal}.", output.getvalue())
+        self.assertEqual(assembly.verify(prepared)["vision_format"], "none")
+
+    def test_a_projector_the_engine_refuses_is_refused_by_name(self):
+        target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
+        draft = draft_dir(self.root / "draft", MOE)
+        mmproj = self.projector(self.root / "vision" / "tower.gguf")
+        upstream.check_vision.side_effect = models.VisionError(
+            "its vision tower: vision metadata mismatch: clip.vision.block_count"
+        )
+        # Named, it is refused, also for a family that serves text instead.
+        for text_fallback in (False, True):
+            patched = tuple(
+                dataclasses.replace(family, text_fallback=text_fallback)
+                if family.name == MOE.name
+                else family
+                for family in families.FAMILIES
+            )
+            with (
+                self.subTest(text_fallback=text_fallback),
+                mock.patch.object(families, "FAMILIES", patched),
+                self.assertRaisesRegex(
+                    models.VisionError,
+                    f"^cannot prepare {target}: its vision tower: vision metadata "
+                    "mismatch: clip.vision.block_count; omit mmproj to serve text only$",
+                ),
+            ):
+                self.prepare(target, draft, mmproj=mmproj)
 
     def test_an_mlx_target_serves_images_with_its_own_tower(self):
         shards = {

@@ -158,6 +158,7 @@ void printUsage(std::string_view executable) {
       " [--max-concurrent-requests REQUESTS]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
+  writeStderrLine("       " + command + " vision-check mlx-affine|gguf safetensors|gguf CONFIG ROOT");
   writeStderrLine("       " + command + " device-check");
   writeStderrLine("       " + command + " families");
 }
@@ -479,6 +480,17 @@ int checkModel(int argc, char **argv) {
   return 0;
 }
 
+// The tower of an upstream model's configuration prepared once from ROOT's
+// vision/, which the installer links its downloaded files into: its image's
+// bytes as JSON, or the refusal (model::checkVisionSource).
+int checkVision(int argc, char **argv) {
+  if (argc != 6)
+    throw engine::UsageError("vision-check takes the source formats, the target's config and the tower's root");
+  const uint64_t bytes = model::checkVisionSource(argv[2], argv[3], argv[4], argv[5]);
+  std::printf("{\"bytes\":%llu}\n", static_cast<unsigned long long>(bytes));
+  return 0;
+}
+
 // What each family's layout gives the options a start takes
 // (model::familyFacts), as JSON by family, which the installer reports to the
 // app (install/families.py).
@@ -513,6 +525,8 @@ int main(int argc, char **argv) {
         return splash::checkDevice(argc);
       if (command == "model-check")
         return splash::checkModel(argc, argv);
+      if (command == "vision-check")
+        return splash::checkVision(argc, argv);
       if (command == "families")
         return splash::printFamilies(argc);
       if (command == "serve-native")

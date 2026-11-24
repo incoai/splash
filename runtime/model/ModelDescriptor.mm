@@ -2,6 +2,7 @@
 #include "GgufImage.hpp"
 #include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
+#include "VisionLoader.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
@@ -1032,6 +1033,18 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
           descriptor.target);
     }
     return descriptor.family();
+  }
+}
+
+uint64_t checkVisionSource(std::string_view targetFormat, std::string_view visionFormat,
+                           const std::filesystem::path &config, const std::filesystem::path &root) {
+  @autoreleasepool {
+    const ModelDescriptor descriptor =
+        describeSourceModel({}, targetFormat, visionFormat, readObject(config, "upstream model config"), nil);
+    if (descriptor.visionSource != VisionSource::Safetensors && descriptor.visionSource != VisionSource::Gguf)
+      throw std::invalid_argument("a vision check needs a vision source");
+    VisionLoader(root / "vision", descriptor.visionSource, descriptor.vision).check();
+    return visionImageBytes(descriptor.vision);
   }
 }
 

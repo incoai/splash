@@ -41,6 +41,7 @@ from dev.tests.installer_fixtures import (
     missing_revision,
     mlx_target,
     pins,
+    prepared_towers,
     selection,
     tensor_table,
     write_target,
@@ -61,6 +62,7 @@ class UpstreamTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.cache = self.root / "hub"
+        prepared_towers(self)
 
     @staticmethod
     def prepare(chosen):

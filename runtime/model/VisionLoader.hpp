@@ -26,6 +26,10 @@ public:
   [[nodiscard]] const ops::VisionLayout &layout() const noexcept;
   // The image of vision/model.bin.
   [[nodiscard]] ImagePlan image() const;
+  // Writes the image once, into memory it frees after: what preparation
+  // refuses of the source, a weight that is not exactly a BF16 say, is
+  // refused here (the engine's vision-check, at installation).
+  void check() const;
 
 private:
   struct Planned;
