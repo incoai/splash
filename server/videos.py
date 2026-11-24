@@ -567,7 +567,13 @@ def form_fields(content_type, payload):
         elif name in KEYFRAMES:
             fields[name] = part.get_payload(decode=True)
         else:
-            fields[name] = part.get_content().strip()
+            # A browser's FormData sends a text field's UTF-8 bytes with no
+            # charset, which get_content() would read as ASCII.
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                fields[name] = part.get_payload(decode=True).decode(charset).strip()
+            except (LookupError, UnicodeError):
+                raise APIError(400, f"{name} is not {charset} text") from None
     return fields
 
 

@@ -131,6 +131,27 @@ class VideoServerTest(unittest.TestCase):
         self.assertEqual((three["first_frame"], three["last_frame"]),
                          (digest(stretched), digest(bytes([10, 200, 30]) * 832 * 480)))  # fmt: skip
 
+    def test_a_chinese_prompt_reaches_the_engine_as_json_and_as_a_form(self):
+        self.serve()
+        prompt = "一只鹦鹉在树枝上唱歌"
+        first = ("first.png", png(832, 480, bytes(832 * 480 * 3)), "image/png")
+        # UTF-8 JSON, and a form as a browser's FormData sends it: text fields
+        # of no charset.
+        body = json.dumps({"prompt": prompt}, ensure_ascii=False).encode()
+        answers = [
+            httpx.post(f"{self.url}/videos", content=body,
+                       headers={"Content-Type": "application/json"}),
+            httpx.post(f"{self.url}/videos", data={"prompt": prompt},
+                       files={"input_reference": first}),
+        ]  # fmt: skip
+        for answer in answers:
+            self.assertEqual(answer.status_code, 200, answer.text)
+            self.client.videos.poll(answer.json()["id"], poll_interval_ms=20)
+        (from_json, from_form) = taken(self.log)
+        for job in (from_json, from_form):
+            self.assertEqual(job["tokens"][-len(prompt) :], [ord(c) for c in prompt])
+        self.assertIn("first_frame", from_form)
+
     def test_a_480p_job_renders_its_canvas_and_length(self):
         self.serve()
         first = ("first.png", png(1344, 768, CANVAS), "image/png")

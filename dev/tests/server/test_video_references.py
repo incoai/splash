@@ -282,6 +282,19 @@ class RequestTest(unittest.TestCase):
         )
         self.assertEqual(fields["references"][2].data, b"ID3")
 
+    def test_a_multipart_text_field_not_of_its_charset_is_refused(self):
+        # Bytes that are not UTF-8, and a charset whose codec only refuses.
+        for head, data in (
+            (b"", b"\xff"),
+            (b"\r\nContent-Type: text/plain; charset=undefined", b"a"),
+        ):
+            body = b'--XyZ\r\nContent-Disposition: form-data; name="prompt"' + head
+            body += b"\r\n\r\n" + data + b"\r\n--XyZ--\r\n"
+            with self.subTest(head=head), self.assertRaises(APIError) as caught:
+                videos.form_fields("multipart/form-data; boundary=XyZ", body)
+            self.assertEqual(caught.exception.status, 400)
+            self.assertIn("prompt", str(caught.exception))
+
     @needs_pyav
     def test_the_wire_frame_carries_the_normalized_references(self):
         fields = self.fields()

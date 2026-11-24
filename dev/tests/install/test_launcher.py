@@ -2508,6 +2508,20 @@ class GenerateOnServerTests(unittest.TestCase):
                 self.assertFalse(app.videos.engine.alive())
                 self.assertIsNotNone(app.videos.engine.process.poll())
 
+    def test_a_chinese_prompt_reaches_the_engine_with_and_without_a_file(self):
+        self.serve()
+        prompt = "一只鹦鹉在树枝上唱歌"
+        first = self.directory / "first.png"
+        first.write_bytes(test_videos.png(832, 480, bytes(832 * 480 * 3)))
+        # Without a file the request is JSON; with one, a multipart form.
+        for files in ((), ("--first-frame", str(first))):
+            status, stderr = self.generate("--prompt", prompt, *files)
+            self.assertEqual(status, 0, stderr)
+        (as_json, as_form) = test_videos.taken(self.log)
+        for taken in (as_json, as_form):
+            self.assertEqual(taken["tokens"][-len(prompt) :], [ord(c) for c in prompt])
+        self.assertIn("first_frame", as_form)
+
     def test_the_clip_and_its_preview_are_a_job_of_the_running_server(self):
         self.serve(step_seconds=0.05)
         first = self.directory / "first.png"
