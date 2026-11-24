@@ -825,10 +825,20 @@ def _start_installed(selection, target, installed):
             except (models.ModelError, OSError) as error:
                 # A projector that cannot download, say: it serves text, and
                 # what else changed is assembled from the snapshots it links.
+                # The update it was started for did not happen: kept.
                 models.warn(
                     f"{selection.model} serves text only for now; cannot take in "
                     f"its vision tower: {error}"
                 )
+                _start_as_installed(selection, installed, draft, changes, answered)
+                return KEPT
+    return _start_as_installed(selection, installed, draft, changes, answered)
+
+
+def _start_as_installed(selection, installed, draft, changes, answered):
+    """Start installed serving what it serves, assembled again first for
+    changes (_changes) or where it no longer verifies, and return what that
+    did."""
     if changes:
         print(f"Updating {selection.model}: {'; '.join(changes)}.", flush=True)
         if not _keeping_installation(

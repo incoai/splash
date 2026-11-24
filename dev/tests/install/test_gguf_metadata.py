@@ -1078,6 +1078,17 @@ class GgufMetadataTests(unittest.TestCase):
         record = assembly.verify(chosen.link)
         self.assertEqual(record["vision_format"], "none")
         self.assertNotEqual(record["metadata"], installed)
+        # A check for updates says the tower it was run for was not taken
+        # in, whatever else it assembled again or found unchanged: kept.
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(upstream.prepare(chosen), upstream.KEPT)
+            fake.download_failure = None
+            self.assertEqual(upstream.prepare(chosen), upstream.UPDATED)
+            self.assertEqual(upstream.prepare(chosen), upstream.UP_TO_DATE)
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "gguf")
 
     def test_a_text_reassembly_keeps_a_tower_another_start_took_in(self):
         # Two starts read the text installation; one takes the tower in, then
