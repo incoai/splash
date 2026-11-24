@@ -317,6 +317,8 @@ struct Runtime::Impl {
     uint64_t digestHi = 0;
     uint32_t gridHeight = 0;
     uint32_t gridWidth = 0;
+    uint32_t contentHeight = 0;
+    uint32_t contentWidth = 0;
 
     bool operator==(const ImageKey &) const = default;
   };
@@ -908,7 +910,7 @@ struct Runtime::Impl {
   uint64_t pixelBytes(const ImageSpan &span) const { return span.pixelBytes(model.descriptor.vision.patchSize); }
 
   static ImageKey imageKey(const ImageSpan &span) noexcept {
-    return {span.digestLo, span.digestHi, span.gridHeight, span.gridWidth};
+    return {span.digestLo, span.digestHi, span.gridHeight, span.gridWidth, span.contentHeight, span.contentWidth};
   }
 
   // The rows of an identical image that something still holds, moved to the

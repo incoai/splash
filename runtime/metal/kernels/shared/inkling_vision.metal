@@ -40,11 +40,12 @@ inline uint2 inkling_patch_position(uint token, uint grid_width) {
 
 // Patchify: uint8 RGB pixels (H, W, 3), H and W 20 per patch, into bf16
 // patch rows (patches, 1280) normalized x / 127.5 - 1, the columns past a
-// patch's 1200 values zero, so the patch embedding reads finite rows.
+// patch's 1200 values zero, so the patch embedding reads finite rows. A pixel
+// past the image's content is its padding, -1 as its reference pads it.
 kernel void inkling_vision_patchify(
     device const uchar *pixels [[buffer(0)]],
     device bfloat *patches [[buffer(1)]],
-    constant VisionGridParams &params [[buffer(2)]],
+    constant InklingPatchifyParams &params [[buffer(2)]],
     uint token [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]])
 {
@@ -59,12 +60,12 @@ kernel void inkling_vision_patchify(
         }
         uint channel = feature / (kInklingPatch * kInklingPatch);
         uint within = feature % (kInklingPatch * kInklingPatch);
-        uint patch_row = within / kInklingPatch;
-        uint patch_col = within % kInklingPatch;
-        ulong pixel = (ulong(position.x * kInklingPatch + patch_row) *
-                           image_width +
-                       position.y * kInklingPatch + patch_col) * 3 + channel;
-        row[feature] = bfloat(float(pixels[pixel]) * (1.0f / 127.5f) - 1.0f);
+        uint y = position.x * kInklingPatch + within / kInklingPatch;
+        uint x = position.y * kInklingPatch + within % kInklingPatch;
+        float value = y < params.content_height && x < params.content_width
+                          ? float(pixels[(ulong(y) * image_width + x) * 3 + channel])
+                          : -1.0f;
+        row[feature] = bfloat(value * (1.0f / 127.5f) - 1.0f);
     }
 }
 

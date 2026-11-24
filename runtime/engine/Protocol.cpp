@@ -843,6 +843,7 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   for (ImageSpan &span : request.imageSpans) {
     if (!reader.u32(span.offset) || !reader.u32(span.tokens) ||
         !reader.u32(span.gridHeight) || !reader.u32(span.gridWidth) ||
+        !reader.u32(span.contentHeight) || !reader.u32(span.contentWidth) ||
         !reader.u64(span.digestLo) || !reader.u64(span.digestHi) ||
         !checkedAdd(pixelBytes, span.pixelBytes(limits.imagePatchPixels), pixelBytes)) {
       return failure<ClientMessage>(

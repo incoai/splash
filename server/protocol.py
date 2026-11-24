@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 15
+PROTOCOL_VERSION = 16
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -53,7 +53,7 @@ _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
 _REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_IMAGE_SPAN = struct.Struct("<IIIIIIQQ")
 # Cancel and Stop: one request id.
 _REQUEST_END = struct.Struct("<Q")
 # Request id, mask request id, mask words, forced token words.
@@ -82,7 +82,7 @@ assert (
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
 assert _REQUEST.size == 118
-assert _IMAGE_SPAN.size == 32
+assert _IMAGE_SPAN.size == 40
 assert _READY.size == 21
 assert _START.size == 22
 assert _DONE.size == 62
@@ -245,10 +245,11 @@ SAMPLING_FIELDS: tuple[str, ...] = tuple(
 @dataclass(slots=True, frozen=True)
 class ImageSpan:
     """One image in the prompt: its placeholder token run, the patch grid of
-    the prepared pixels, and a 128-bit digest of that content. Placeholder
-    token ids are identical for every image, so cache identity keys on spans.
-    patch, the side of a grid patch in pixels, is the served tower's, which
-    the engine knows: it is not part of the frame.
+    the prepared pixels, the image's own pixels at its top left before the
+    padding to that grid (zero: the whole grid), and a 128-bit digest of that
+    content. Placeholder token ids are identical for every image, so cache
+    identity keys on spans. patch, the side of a grid patch in pixels, is the
+    served tower's, which the engine knows: it is not part of the frame.
     """
 
     offset: int
@@ -257,6 +258,8 @@ class ImageSpan:
     grid_width: int
     digest_lo: int
     digest_hi: int
+    content_height: int = 0
+    content_width: int = 0
     patch: int = 16
 
     @property
@@ -1003,6 +1006,8 @@ def _request_frame(request: RequestFrame) -> bytearray:
             span.tokens,
             span.grid_height,
             span.grid_width,
+            span.content_height,
+            span.content_width,
             span.digest_lo,
             span.digest_hi,
         )

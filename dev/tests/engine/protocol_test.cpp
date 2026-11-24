@@ -188,8 +188,9 @@ RequestFrame exampleRequest() {
 RequestFrame exampleImageRequest() {
   RequestFrame request = exampleRequest();
   request.promptTokens = {7, 3, 9};
+  // Its own pixels 30 x 28 of the grid's 32 x 32, as test_protocol_python.py's.
   request.imageSpans = {
-      {1, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
+      {1, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL, 30, 28}};
   request.imagePixels.resize(request.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index) {
     request.imagePixels[index] = static_cast<uint8_t>(index * 7 + 1);
@@ -828,6 +829,11 @@ void testPromptAndImageSpanRejections() {
   expectRequestIssue(test, wrapped, IssueCode::InvalidCount);
   expectRequestIssue(test, withSpan([](ImageSpan &span) { span.tokens = 2; }),
                      IssueCode::InvalidCount);
+  // Content past the grid's pixels; at them, the whole grid.
+  expectRequestIssue(test, withSpan([](ImageSpan &span) { span.contentHeight = 33; }),
+                     IssueCode::InvalidCount);
+  const RequestFrame whole = withSpan([](ImageSpan &span) { span.contentHeight = span.contentWidth = 32; });
+  CHECK(test, roundTrip(whole) == whole);
   expectRequestIssue(test, withSpan([](ImageSpan &span) { span.offset = 3; }),
                      IssueCode::InvalidCount);
   RequestFrame overlapping = image;

@@ -113,6 +113,11 @@ inline constexpr uint32_t kMaximumImagePatches = 16384;
 struct ImageGrid final {
   uint32_t height = 0; // patches
   uint32_t width = 0;
+  // The image's own pixels at its top left, before the padding to whole
+  // tokens (zero: the whole grid), which an Inkling tower's encoder takes as
+  // its reference pads them.
+  uint32_t contentHeight = 0;
+  uint32_t contentWidth = 0;
 
   [[nodiscard]] bool valid() const noexcept {
     return height >= 2 && width >= 2 && height % 2 == 0 && width % 2 == 0;

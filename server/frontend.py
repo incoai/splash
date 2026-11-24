@@ -416,7 +416,9 @@ class Frontend:
                     image.grid_width,
                     image.digest_lo,
                     image.digest_hi,
-                    image.patch,
+                    content_height=image.content_height,
+                    content_width=image.content_width,
+                    patch=image.patch,
                 )
             )
             expanded.extend([pad_id] * image.tokens)

@@ -82,17 +82,21 @@ std::pair<uint32_t, uint32_t> position(uint32_t token, uint32_t gridWidth) {
 }
 
 // Patchify: each patch's 1200 values [channel, row, column] x / 127.5 - 1,
-// zero to 1280, a row per patch.
+// zero to 1280, a row per patch; a pixel past the image's content its
+// padding, -1 / 127.5 - 1, whatever the pixels hold there.
 void checkPatchify(MetalBackend &backend, ops::ImageGrid grid) {
   const uint32_t patches = grid.height * grid.width, rows = patches;
   const uint32_t width = grid.width * kPatch;
+  const uint32_t contentHeight = grid.contentHeight ? grid.contentHeight : grid.height * kPatch;
+  const uint32_t contentWidth = grid.contentWidth ? grid.contentWidth : width;
   const MetalBuffer pixels = test::sharedBuffer(backend, grid.pixelBytes(kPatch));
   std::mt19937 random(patches);
   for (uint64_t index = 0; index < pixels.sizeBytes(); ++index)
     static_cast<uint8_t *>(pixels.contents())[index] = static_cast<uint8_t>(random());
   const MetalBuffer patchRows = bf16Buffer(backend, uint64_t{rows + 1} * kPatchDim);
   CommandGraph graph;
-  graph.add("inkling_vision_patchify", {pixels, patchRows}, VisionGridParams{grid.height, grid.width}, {rows, 1, 1});
+  graph.add("inkling_vision_patchify", {pixels, patchRows},
+            InklingPatchifyParams{grid.height, grid.width, contentHeight, contentWidth}, {rows, 1, 1});
   run(backend, graph);
   const auto *pixel = static_cast<const uint8_t *>(pixels.contents());
   for (uint32_t token = 0; token < rows; ++token) {
@@ -101,9 +105,9 @@ void checkPatchify(MetalBackend &backend, ops::ImageGrid grid) {
       float expected = 0.0F;
       if (feature < 3 * kPatch * kPatch) {
         const uint32_t channel = feature / (kPatch * kPatch), within = feature % (kPatch * kPatch);
-        const uint64_t at =
-            (uint64_t{row * kPatch + within / kPatch} * width + column * kPatch + within % kPatch) * 3 + channel;
-        expected = float(pixel[at]) / 127.5F - 1.0F;
+        const uint32_t y = row * kPatch + within / kPatch, x = column * kPatch + within % kPatch;
+        const uint64_t at = (uint64_t{y} * width + x) * 3 + channel;
+        expected = (y < contentHeight && x < contentWidth ? float(pixel[at]) : -1.0F) / 127.5F - 1.0F;
       }
       const float actual = bf16ToFloat(words(patchRows)[uint64_t{token} * kPatchDim + feature]);
       require(std::fabs(actual - expected) <= 0x1p-8F * std::fabs(expected),
@@ -112,7 +116,8 @@ void checkPatchify(MetalBackend &backend, ops::ImageGrid grid) {
     }
   }
   require(words(patchRows)[uint64_t{rows} * kPatchDim] == kBf16Nan, "patchify wrote past its rows");
-  std::printf("inkling_vision_patchify %ux%u: passed\n", grid.height, grid.width);
+  std::printf("inkling_vision_patchify %ux%u, content %ux%u: passed\n", grid.height, grid.width, contentHeight,
+              contentWidth);
 }
 
 // The positions resampled from the 32x32 table (half-pixel bilinear, edges
@@ -346,7 +351,10 @@ int main(int argc, char **argv) {
     try {
       require(argc == 2, "usage: inkling-vision-metal METALLIB");
       MetalBackend backend(argv[1]);
-      for (const ops::ImageGrid grid : {ops::ImageGrid{2, 2}, ops::ImageGrid{4, 6}, ops::ImageGrid{10, 2}})
+      // Whole grids, and images padded right, bottom or both.
+      for (const ops::ImageGrid grid : {ops::ImageGrid{2, 2}, ops::ImageGrid{4, 6}, ops::ImageGrid{10, 2},
+                                        ops::ImageGrid{2, 2, 33, 37}, ops::ImageGrid{4, 6, 61, 120},
+                                        ops::ImageGrid{10, 2, 200, 21}, ops::ImageGrid{2, 2, 1, 1}})
         checkPatchify(backend, grid);
       // Smaller than the table (downsampled), larger (upsampled), its size
       // and thin.

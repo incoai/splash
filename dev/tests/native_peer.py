@@ -10,7 +10,7 @@ from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHQ")
 _REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_IMAGE_SPAN = struct.Struct("<IIIIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQII")
 _ID = struct.Struct("<Q")
 
@@ -193,13 +193,32 @@ def _decode_request(payload: bytes, patch: int) -> wire.RequestFrame:
     offset = _REQUEST.size
     prompt = _words(payload, offset, prompt_count)
     offset += 4 * prompt_count
-    spans = tuple(
-        wire.ImageSpan(
-            *_IMAGE_SPAN.unpack_from(payload, offset + index * _IMAGE_SPAN.size),
-            patch,
+    spans = []
+    for index in range(span_count):
+        (
+            span_offset,
+            tokens,
+            grid_height,
+            grid_width,
+            content_height,
+            content_width,
+            digest_lo,
+            digest_hi,
+        ) = _IMAGE_SPAN.unpack_from(payload, offset + index * _IMAGE_SPAN.size)
+        spans.append(
+            wire.ImageSpan(
+                span_offset,
+                tokens,
+                grid_height,
+                grid_width,
+                digest_lo,
+                digest_hi,
+                content_height,
+                content_width,
+                patch,
+            )
         )
-        for index in range(span_count)
-    )
+    spans = tuple(spans)
     offset += _IMAGE_SPAN.size * span_count
     pixel_bytes = sum(span.pixel_bytes for span in spans)
     pixels = bytes(payload[offset : offset + pixel_bytes])

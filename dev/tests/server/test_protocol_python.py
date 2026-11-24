@@ -78,7 +78,17 @@ def example_request():
 
 
 def example_image_request():
-    span = p.ImageSpan(1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888)
+    # Its own pixels 30 x 28 of the grid's 32 x 32, as protocol_test.cpp's.
+    span = p.ImageSpan(
+        1,
+        1,
+        2,
+        2,
+        0x1111222233334444,
+        0x5555666677778888,
+        content_height=30,
+        content_width=28,
+    )
     return replace(
         example_request(),
         prompt_tokens=(7, 3, 9),
@@ -88,8 +98,9 @@ def example_image_request():
 
 
 def example_inkling_image_request():
-    """One token of Inkling's image: 2x2 patches of 20 pixels."""
-    span = p.ImageSpan(1, 1, 2, 2, 7, 9, patch=20)
+    """One token of Inkling's image: 2x2 patches of 20 pixels, its own 33 x
+    37 of them."""
+    span = p.ImageSpan(1, 1, 2, 2, 7, 9, content_height=33, content_width=37, patch=20)
     return replace(
         example_request(),
         prompt_tokens=(7, 3, 9),
@@ -545,8 +556,18 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.head_tokens,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
-            # The span's wire fields; its patch side is not one.
-            + struct.pack(p._IMAGE_SPAN.format, *astuple(span)[:6])
+            # The span's wire fields, in their order; its patch side is not one.
+            + struct.pack(
+                p._IMAGE_SPAN.format,
+                span.offset,
+                span.tokens,
+                span.grid_height,
+                span.grid_width,
+                span.content_height,
+                span.content_width,
+                span.digest_lo,
+                span.digest_hi,
+            )
             + request.image_pixels
             + struct.pack("<2I", *request.thinking_budget.end)
         )
@@ -791,12 +812,13 @@ class ProtocolPythonTests(unittest.TestCase):
             )[0],
             1,
         )
+        # Offset, tokens, grid, the image's own pixels, digest.
         self.assertEqual(
-            struct.unpack_from("<IIIIQQ", wire, span_offset),
-            (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888),
+            struct.unpack_from("<IIIIIIQQ", wire, span_offset),
+            (1, 1, 2, 2, 30, 28, 0x1111222233334444, 0x5555666677778888),
         )
         # The thinking end tokens follow the pixels.
-        self.assertEqual(wire[span_offset + 32 : -8], image.image_pixels)
+        self.assertEqual(wire[span_offset + 40 : -8], image.image_pixels)
         self.assertEqual(decode_client(wire), image)
 
     def test_thinking_budget_follows_the_cache_salt(self):

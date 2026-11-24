@@ -577,21 +577,28 @@ def fixture_image(height: int = 96, width: int = 128) -> np.ndarray:
     return np.clip(np.stack([red, green, blue], axis=-1), 0, 255).astype(np.uint8)
 
 
-def write_fixture(root: Path, out: Path, height=None, width=None) -> None:
+def write_fixture(root: Path, out: Path, height=None, width=None, content=None) -> None:
+    """content, an Inkling image's own (height, width) at the top left of
+    the fixture's pixels: past it, they hold zero, as a request's padding
+    does, and the expected embeddings pad it as the reference does."""
     layout, weights = load_model(root)
     inkling = layout == INKLING_LAYOUT
     patch = INKLING_PATCH if inkling else PATCH
     pixels = fixture_image(
         height or (120 if inkling else 96), width or (160 if inkling else 128)
     )
+    if content is not None:
+        pixels[content[0] :] = 0
+        pixels[:, content[1] :] = 0
     if inkling:
-        expected = encode_inkling(weights, pixels).astype(np.float32)
+        expected = encode_inkling(weights, pixels, content).astype(np.float32)
     else:
         expected = encode(layout, weights, pixels).astype(np.float32)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "grid.txt").write_text(
-        f"{pixels.shape[0] // patch} {pixels.shape[1] // patch}\n"
-    )
+    sides = f"{pixels.shape[0] // patch} {pixels.shape[1] // patch}"
+    if content is not None:
+        sides += f" {content[0]} {content[1]}"
+    (out / "grid.txt").write_text(sides + "\n")
     (out / "pixels.bin").write_bytes(pixels.tobytes())
     (out / "expected_fp32.bin").write_bytes(expected.tobytes())
     print(
@@ -606,5 +613,12 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--height", type=int)
     parser.add_argument("--width", type=int)
+    parser.add_argument(
+        "--content",
+        help="HxW, an Inkling image's own pixels at the top left, padded past",
+    )
     args = parser.parse_args()
-    write_fixture(args.model, args.output, args.height, args.width)
+    content = None
+    if args.content:
+        content = tuple(int(side) for side in args.content.split("x"))
+    write_fixture(args.model, args.output, args.height, args.width, content)

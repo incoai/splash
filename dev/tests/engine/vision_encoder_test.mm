@@ -216,9 +216,12 @@ int main(int argc, char **argv) {
           splash::model::loadVisionWeights(backend, images, loader.get());
       const std::string fixture = argv[3];
 
+      // The grid in patches, and for an image padded to it its own height
+      // and width in pixels, which an Inkling tower pads past.
       ImageGrid grid;
       std::ifstream gridFile(fixture + "/grid.txt");
       gridFile >> grid.height >> grid.width;
+      if (!(gridFile >> grid.contentHeight >> grid.contentWidth)) grid.contentHeight = grid.contentWidth = 0;
       if (!grid.valid())
         throw std::runtime_error("fixture grid is invalid");
       const std::vector<uint8_t> pixelBytes = readFile(fixture + "/pixels.bin");

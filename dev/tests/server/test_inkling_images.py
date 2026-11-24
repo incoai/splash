@@ -69,10 +69,14 @@ def reference_pixel_values(image):
 
 def splash_pixel_values(prepared):
     """Splash's prepared pixels as the encoder normalizes them (x / 127.5 - 1,
-    shared/inkling_vision.metal), cut into the reference's token patches."""
+    shared/inkling_vision.metal), its padding past the image's own pixels -1,
+    cut into the reference's token patches."""
     height, width = prepared.grid_height * 20, prepared.grid_width * 20
     pixels = np.frombuffer(prepared.pixels, np.uint8).reshape(height, width, 3)
-    normalized = pixels.astype(np.float32) * np.float32(1 / 127.5) - np.float32(1)
+    values = pixels.astype(np.float32)
+    values[prepared.content_height :] = -1
+    values[:, prepared.content_width :] = -1
+    normalized = values * np.float32(1 / 127.5) - np.float32(1)
     rows, columns = height // 40, width // 40
     tokens = normalized.reshape(rows, 40, columns, 40, 3).transpose(0, 2, 1, 3, 4)
     return tokens.reshape(rows * columns, 40, 40, 3), (1, rows, columns)
@@ -89,13 +93,19 @@ class InklingPreparationTest(unittest.TestCase):
             (prepared.grid_height, prepared.grid_width), (2 * grid[1], 2 * grid[2])
         )
         self.assertEqual(prepared.patch, images.INKLING_PATCH)
-        # The image's own pixels normalize as the reference's, to float32
-        # rounding; the reference's padding is -1.0078, which no uint8 holds,
-        # and Splash's zero padding is -1.
-        pad = expected < -1.0
-        np.testing.assert_allclose(actual[~pad], expected[~pad], rtol=0, atol=2e-7)
-        np.testing.assert_array_equal(expected[pad], np.float32(-128.5 / 127.5))
-        np.testing.assert_array_equal(actual[pad], -1.0)
+        # Every value normalizes as the reference's, to float32 rounding: the
+        # image's own pixels, and its padding past them, -1 on the 0-255
+        # scale, which the frame holds as zero and the encoder takes as -1
+        # from the span's content size.
+        self.assertEqual(
+            (prepared.content_height, prepared.content_width), image.size[::-1]
+        )
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=2e-7)
+        pixels = np.frombuffer(prepared.pixels, np.uint8).reshape(
+            prepared.grid_height * 20, prepared.grid_width * 20, 3
+        )
+        self.assertFalse(pixels[prepared.content_height :].any())
+        self.assertFalse(pixels[:, prepared.content_width :].any())
         return prepared
 
     def test_images_are_padded_to_whole_tokens_never_resized(self):
@@ -227,7 +237,10 @@ class InklingPreparationTest(unittest.TestCase):
 
     def test_the_digest_covers_the_grid_and_pixels(self):
         prepared = images.prepare_inkling(encoded(pattern(50, 30)), images.MAX_PIXELS)
-        digest = hashlib.sha256(struct.pack("<II", 2, 4) + prepared.pixels).digest()
+        # The grid, the image's own height and width, and the pixels.
+        digest = hashlib.sha256(
+            struct.pack("<4I", 2, 4, 30, 50) + prepared.pixels
+        ).digest()
         self.assertEqual(
             (prepared.digest_lo, prepared.digest_hi), struct.unpack_from("<QQ", digest)
         )
@@ -241,6 +254,20 @@ class InklingPreparationTest(unittest.TestCase):
             encoded(pattern(50, 30, seed=9)), images.MAX_PIXELS
         )
         self.assertNotEqual(other.digest_lo, prepared.digest_lo)
+        # Black images 40 and 39 pixels wide hold the same padded pixels, and
+        # the encoder pads the narrower one's last column: they differ.
+        from PIL import Image
+
+        wide, narrow = (
+            images.prepare_inkling(
+                encoded(Image.new("RGB", (width, 30))), images.MAX_PIXELS
+            )
+            for width in (40, 39)
+        )
+        self.assertEqual(wide.pixels, narrow.pixels)
+        self.assertNotEqual(
+            (wide.digest_lo, wide.digest_hi), (narrow.digest_lo, narrow.digest_hi)
+        )
 
     def test_undecodable_and_oversized_payloads_are_image_errors(self):
         with self.assertRaises(images.ImageError):

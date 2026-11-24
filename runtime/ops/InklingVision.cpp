@@ -156,7 +156,12 @@ void InklingVision::encode(CommandGraph &graph, ImageGrid grid, const MetalBuffe
   const MetalBuffer &qkv = scratch(Scratch::Qkv);
   const MetalBuffer &context = scratch(Scratch::Context);
 
-  graph.add("inkling_vision_patchify", {pixels, scratch(Scratch::Patches)}, gridParams, {patches, 1, 1});
+  // The image's own pixels, of a grid of zero content all of it.
+  const uint32_t patch = layout.patchSize;
+  const InklingPatchifyParams patchify{grid.height, grid.width,
+                                       grid.contentHeight ? grid.contentHeight : grid.height * patch,
+                                       grid.contentWidth ? grid.contentWidth : grid.width * patch};
+  graph.add("inkling_vision_patchify", {pixels, scratch(Scratch::Patches)}, patchify, {patches, 1, 1});
   // The positions and the class token start the rows the patch embedding
   // (of the patches' rows; it has no bias) adds to; the LayerNorm after it
   // starts the residual stream.

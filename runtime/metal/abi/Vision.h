@@ -23,6 +23,19 @@ struct VisionGridParams {
 static_assert(sizeof(VisionGridParams) == 8,
               "Vision grid parameters are 8 bytes on both sides");
 
+// Inkling 2's patchify: its grid in patches and the image's own pixels at its
+// top left; the rest is its padding, which the encoder takes as the reference
+// pads it (-1 on the 0-255 scale), where the frame's bytes hold zero.
+struct InklingPatchifyParams {
+  uint32_t grid_height;
+  uint32_t grid_width;
+  uint32_t content_height;
+  uint32_t content_width;
+};
+
+static_assert(sizeof(InklingPatchifyParams) == 16,
+              "Inkling patchify parameters are 16 bytes on both sides");
+
 struct VisionQkvParams {
   uint32_t tokens;
   uint32_t padded_tokens;

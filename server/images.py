@@ -58,6 +58,10 @@ class PreparedImage:
     digest_hi: int
     # The side of a grid patch in pixels, the tower's.
     patch: int = PATCH
+    # The image's own pixels at the grid's top left, before its padding to
+    # whole tokens; zero, the whole grid.
+    content_height: int = 0
+    content_width: int = 0
 
     @property
     def tokens(self) -> int:
@@ -131,8 +135,13 @@ def _upright(decoded):
     return decoded.size != stored
 
 
-def _digest(grid_height, grid_width, pixels):
-    digest = hashlib.sha256(struct.pack("<II", grid_height, grid_width) + pixels)
+def _digest(grid_height, grid_width, pixels, content=None):
+    """The 128-bit digest of a grid's pixels and, for an image padded to it,
+    its own pixels' height and width, which the encoder pads past."""
+    head = struct.pack("<II", grid_height, grid_width)
+    if content is not None:
+        head += struct.pack("<II", *content)
+    digest = hashlib.sha256(head + pixels)
     return struct.unpack_from("<QQ", digest.digest())
 
 
@@ -238,11 +247,10 @@ def prepare_inkling(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedIma
     """Decode an image as Inkling 2's processor prepares it: upright, RGB (a
     transparent one composited onto its checkerboard), at its own size
     (inkling_size), padded right and bottom with zeros to whole 40-pixel
-    tokens of 2x2 patches of 20 pixels, and digest the pixels. The reference
-    pads with -1 on the 0-255 scale, which no uint8 holds; zero, after the
-    encoder's x / 127.5 - 1, is -1.0 for its -1.0078, which moves an image's
-    embeddings by up to about 0.3%, and a token mostly of padding by up to
-    about 3%."""
+    tokens of 2x2 patches of 20 pixels, and digest the pixels with its own
+    size. The reference pads with -1 on the 0-255 scale, which no uint8
+    holds: the frame's padding is zero, and the encoder, which the span's
+    content size tells where the image ends, takes it as -1."""
     from PIL import Image
 
     try:
@@ -270,9 +278,16 @@ def prepare_inkling(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedIma
         raise
     except Exception as error:
         raise ImageError("image could not be decoded") from error
-    digest_lo, digest_hi = _digest(grid_height, grid_width, pixels)
+    digest_lo, digest_hi = _digest(grid_height, grid_width, pixels, (height, width))
     return PreparedImage(
-        grid_height, grid_width, pixels, digest_lo, digest_hi, INKLING_PATCH
+        grid_height,
+        grid_width,
+        pixels,
+        digest_lo,
+        digest_hi,
+        INKLING_PATCH,
+        height,
+        width,
     )
 
 

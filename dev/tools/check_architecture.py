@@ -255,8 +255,10 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # conversation went on. 31,103 adds 7 for the split's warmup, which holds only
 # the pages its rows use and allocates again an extent the first audit
 # released. 31,104 adds 1 for an image's patch side, which the protocol takes
-# from the model's tower (Inkling 2's 20 pixels, Qwen's 16).
-ENGINE_LINE_BUDGET = 31_104
+# from the model's tower (Inkling 2's 20 pixels, Qwen's 16). 31,107 adds 3 for
+# an image span's own height and width, which Inkling 2's encoder pads past as
+# its reference does, and the span's layout in the frame.
+ENGINE_LINE_BUDGET = 31_107
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
