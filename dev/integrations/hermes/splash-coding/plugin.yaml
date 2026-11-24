@@ -1,0 +1,6 @@
+name: splash-coding
+version: "0.1.0"
+description: "Opt-in Splash cache scope and recoverable large-file discovery for Hermes coding workspaces."
+provides_hooks:
+  - pre_tool_call
+  - on_session_end
