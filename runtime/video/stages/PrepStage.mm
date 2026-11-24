@@ -38,6 +38,9 @@ void PrepStage::forward(VideoBatch &batch, StageEvents &) {
                               "device_MB={:.0f}",
                               out.rows, out.textRows, out.condRows, out.steps, out.table.size(), out.totalS,
                               out.layoutS, out.encodeS, out.textS, out.adalnS, out.adalnReadGb, deviceMb(backend_)));
+  // The text states the DiT is conditioned on and the noise it starts from, both on the CPU once the prep returns.
+  splash::logLine(std::format("H3 prep digests text {} noise video {} audio {}", logDigest(batch.hidden),
+                              logDigest(out.videoNoise), logDigest(out.audioNoise)));
 }
 
 } // namespace splash::video

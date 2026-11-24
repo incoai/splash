@@ -490,6 +490,9 @@ void DenoisingStage::forward(VideoBatch &batch, StageEvents &events) {
     }
     batch.videoLatents = std::move(video);
     batch.audioLatents = std::move(audio);
+    // The final latents, which the CPU's last update step wrote.
+    splash::logLine(std::format("H3 denoise digests video {} audio {}", logDigest(batch.videoLatents),
+                                logDigest(batch.audioLatents)));
   }
   batch.prepared = {};
 }

@@ -7,10 +7,33 @@
 #include "video/pipeline/VideoBatch.hpp"
 #include "video/protocol/VideoProtocol.hpp"
 
+#include <CommonCrypto/CommonDigest.h>
+
+#include <algorithm>
 #include <cstdint>
+#include <format>
+#include <string>
 #include <vector>
 
 namespace splash::video {
+
+// The first 12 hex digits of the SHA-256 of an array's bytes, as the stages log their inputs and outputs: two runs
+// compare from their logs alone, and a digest equals that of the array kept to a file in the same order.
+[[nodiscard]] inline std::string logDigest(const std::vector<float> &values) {
+  const auto *bytes = reinterpret_cast<const uint8_t *>(values.data());
+  const size_t size = values.size() * sizeof(float);
+  CC_SHA256_CTX context;
+  CC_SHA256_Init(&context);
+  // CommonCrypto takes 32-bit lengths.
+  constexpr size_t kPieceBytes = size_t(1) << 30;
+  for (size_t at = 0; at < size; at += kPieceBytes)
+    CC_SHA256_Update(&context, bytes + at, static_cast<CC_LONG>(std::min(kPieceBytes, size - at)));
+  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256_Final(digest, &context);
+  std::string hex;
+  for (int i = 0; i < 6; ++i) hex += std::format("{:02x}", digest[i]);
+  return hex;
+}
 
 // A request stopped by its Cancel.
 struct Cancelled final {};
