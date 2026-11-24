@@ -1,0 +1,84 @@
+/* The voice chat page; style.css underneath. */
+
+/* Progress: one row per server. */
+.server-rows { display: grid; gap: 0.6rem; margin-top: 1.25rem; }
+.server-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.25rem 0.85rem;
+  padding: 0.85rem 1rem;
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+.server-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--border-strong); }
+.server-dot.ready { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+.server-dot.busy { background: var(--warn); animation: breathe 1.4s ease-in-out infinite; }
+.server-dot.down { background: var(--danger); }
+.server-main { min-width: 0; }
+.server-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 0.76rem; }
+.server-status { font-size: 0.86rem; color: var(--muted); text-align: right; max-width: 22rem; overflow-wrap: anywhere; }
+.server-row details { grid-column: 1 / -1; }
+.server-row details > summary { margin-top: 0.2rem; font-size: 0.8rem; color: var(--muted); }
+.server-row .log { max-height: 12rem; background: var(--surface); }
+.server-row .command code { background: var(--surface); }
+
+/* The conversation. */
+.chat-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 1rem; align-items: start; }
+.chat-column { display: flex; flex-direction: column; height: calc(100vh - 8.5rem); min-height: 28rem; padding: 0; overflow: hidden; }
+.conversation { flex: 1; overflow-y: auto; padding: 1.4rem; display: flex; flex-direction: column; gap: 0.8rem; }
+.conversation .empty { margin: auto; max-width: 26rem; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 0.35rem; }
+.conversation .empty > strong { font-size: 1.1rem; }
+.empty-icon { display: grid; place-items: center; width: 56px; height: 56px; border-radius: 50%; background: var(--tint-voice); color: var(--ink-voice); margin-bottom: 0.4rem; }
+.empty-icon svg { width: 26px; height: 26px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.bubble { max-width: 78%; padding: 0.7rem 0.95rem; border-radius: 18px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.bubble.user { align-self: flex-end; background: var(--gradient); color: #fff; border-bottom-right-radius: 6px; }
+.bubble.assistant { align-self: flex-start; background: var(--surface-2); border-bottom-left-radius: 6px; }
+.bubble.pending { opacity: 0.65; }
+.bubble .spoken { opacity: 1; }
+.bubble .unspoken { opacity: 0.5; }
+.bubble-meta { display: block; margin-top: 0.35rem; font-size: 0.72rem; opacity: 0.75; font-variant-numeric: tabular-nums; white-space: normal; }
+.bubble.error { background: var(--danger-soft); color: var(--danger); }
+
+.dock { border-top: 1px solid var(--border); padding: 1rem 1.1rem; display: grid; gap: 0.75rem; background: var(--surface); }
+.dock-mic { display: flex; align-items: center; gap: 1rem; }
+.dock-state { flex: 1; min-width: 0; display: grid; gap: 0.4rem; }
+.dock-state .status { margin: 0; }
+.compose { display: flex; gap: 0.5rem; }
+.compose input { flex: 1; }
+
+.mic {
+  flex: none;
+  display: flex; align-items: center; justify-content: center; gap: 0.6rem;
+  min-width: 11.5rem; padding: 0.85rem 1.4rem; font-size: 1rem; font-weight: 650; border-radius: 999px;
+  background: var(--gradient); color: #fff; border-color: transparent;
+  box-shadow: 0 4px 16px var(--glow);
+}
+.mic:hover:not(:disabled) { background: var(--gradient); filter: brightness(1.07); }
+.mic[aria-pressed="true"] { background: var(--danger); box-shadow: 0 4px 16px color-mix(in srgb, var(--danger) 35%, transparent); }
+.mic[aria-pressed="true"]:hover:not(:disabled) { background: var(--danger); }
+.mic-icon { width: 0.8rem; height: 0.8rem; border-radius: 50%; background: currentColor; }
+.mic[aria-pressed="true"] .mic-icon { animation: mic-pulse 1.2s ease-in-out infinite; }
+@keyframes mic-pulse { 50% { opacity: 0.35; } }
+.dock .meter > span { display: block; height: 100%; width: 0; background: var(--ok); transition: width 80ms linear; }
+
+.side-column { display: flex; flex-direction: column; gap: 0.85rem; }
+.side-column h2 { margin: 0; }
+.side-column textarea, .side-column select { width: 100%; }
+.side-column textarea { min-height: 4rem; }
+.side-pair { display: grid; grid-template-columns: minmax(0, 1fr) 6rem; gap: 0.6rem; }
+.side-column details.params > summary { margin: 0.2rem 0 0.7rem; }
+.side-column details.params[open] { display: grid; gap: 0.8rem; }
+.turn-metrics { display: grid; gap: 0.3rem; font-size: 0.84rem; font-variant-numeric: tabular-nums; padding: 0.7rem 0.8rem; border-radius: var(--radius-sm); background: var(--surface-2); }
+.turn-metrics div { display: flex; justify-content: space-between; gap: 0.5rem; }
+.side-actions { display: flex; gap: 0.5rem; }
+
+@media (max-width: 900px) {
+  .chat-layout { grid-template-columns: minmax(0, 1fr); }
+  .chat-column { height: 70vh; }
+}
+@media (max-width: 560px) {
+  .dock-mic { flex-direction: column; align-items: stretch; }
+  .server-row { grid-template-columns: auto minmax(0, 1fr); }
+  .server-status { grid-column: 2; text-align: left; }
+}

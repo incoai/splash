@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splash Omni Voice Chat</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e38365'/%3E%3Cpath d='M6 16h3l2-6 3 12 3-9 2 6 2-3h5' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/voice.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M6 16h3l2-6 3 12 3-9 2 6 2-3h5"/></svg>
+    <span>Splash Omni</span>
+  </div>
+  <div class="topbar-status">
+    <span id="server-pill" class="pill"><span class="dot"></span><span id="server-pill-text">Voice chat</span></span>
+  </div>
+  <nav class="topbar-actions">
+    <button type="button" id="btn-stop" class="ghost" title="Stop the three servers and choose another task" hidden>End voice chat</button>
+  </nav>
+</header>
+
+<main>
+  <!-- Progress: the three servers starting. Voice chat starts from the
+       start page (/), which this page returns to when nothing runs. -->
+  <section id="view-progress" class="view" hidden>
+    <div class="card progress-card">
+      <h1 id="progress-title">Starting voice chat</h1>
+      <p class="muted" id="progress-text"></p>
+      <div class="server-rows" id="server-rows"></div>
+      <div class="actions">
+        <button type="button" class="ghost" id="btn-cancel">Cancel</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- The conversation. -->
+  <section id="view-chat" class="view" hidden>
+    <div class="chat-layout">
+      <div class="card chat-column">
+        <div class="conversation" id="conversation" aria-live="polite">
+          <div class="empty" id="conversation-empty">
+            <span class="empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg></span>
+            <strong>Say something</strong>
+            <p class="muted">Press <strong>Start talking</strong> and speak, or type below. Use headphones if you turn on “Interrupt by speaking”, so the assistant doesn't hear itself.</p>
+          </div>
+        </div>
+        <div class="dock">
+          <div class="dock-mic">
+            <button type="button" class="mic" id="btn-mic" aria-pressed="false">
+              <span class="mic-icon" aria-hidden="true"></span>
+              <span id="mic-label">Start talking</span>
+            </button>
+            <div class="dock-state">
+              <p class="status" id="chat-status">Ready.</p>
+              <div class="meter"><span id="mic-meter"></span></div>
+            </div>
+          </div>
+          <form class="compose" id="compose">
+            <input id="compose-text" placeholder="Or type a message…" autocomplete="off">
+            <button type="submit" class="ghost">Send</button>
+          </form>
+        </div>
+      </div>
+      <aside class="card side-column">
+        <h2>Voice</h2>
+        <div class="side-pair">
+          <label class="field">
+            <span class="field-label">Language</span>
+            <select id="opt-language">
+              <option value="">Automatic</option>
+              <option value="en">English</option>
+              <option value="zh">中文</option>
+            </select>
+          </label>
+          <label class="field" title="Played faster at the same pitch">
+            <span class="field-label">Speed</span>
+            <input type="number" id="opt-speed" step="0.05" min="0.5" max="3" value="1.5">
+          </label>
+        </div>
+        <label class="field" id="voice-row">
+          <span class="field-label">Speaker</span>
+          <select id="opt-voice"></select>
+        </label>
+        <label class="field" id="style-row">
+          <span class="field-label" id="style-label">Style (optional)</span>
+          <textarea id="opt-style" rows="2"></textarea>
+        </label>
+        <label class="check"><input type="checkbox" id="opt-barge"> <span>Interrupt by speaking<small>Talking over the answer stops it. Use headphones.</small></span></label>
+        <details class="params">
+          <summary>Advanced</summary>
+          <label class="field">
+            <span class="field-label">Assistant instructions</span>
+            <textarea id="opt-system" rows="5"></textarea>
+          </label>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="opt-greet" checked> <span>Greet when the microphone starts</span></label>
+            <label class="check"><input type="checkbox" id="opt-anchor" checked> <span>Keep one voice<small>Every sentence continues the first, so the voice and pace stay the same.</small></span></label>
+          </div>
+          <div class="turn-metrics" id="metrics">
+            <div><span class="muted">End of speech → first audio</span><strong id="metric-total">–</strong></div>
+            <div><span class="muted">Transcription</span><strong id="metric-asr">–</strong></div>
+            <div><span class="muted">First token</span><strong id="metric-llm">–</strong></div>
+            <div><span class="muted">First audio after its sentence</span><strong id="metric-tts">–</strong></div>
+          </div>
+        </details>
+        <div class="side-actions">
+          <button type="button" class="ghost" id="btn-clear">New conversation</button>
+        </div>
+      </aside>
+    </div>
+  </section>
+</main>
+
+<script src="/static/logic.js"></script>
+<script src="/static/voice.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Benchmark harness for dev/benchmarks/audio (Python 3.12).
+# The baseline venv additionally needs mlx-audio for --engine mlx-audio.
+numpy>=2.0
+soundfile>=0.12
+jiwer>=3.0
+# Optional, only for --engine mlx-audio (in-process baseline):
+# mlx-audio>=0.5.8

@@ -1,0 +1,3252 @@
+{
+  "task": "asr",
+  "engine": "omni",
+  "model": "mlx-community/Qwen3-ASR-0.6B-4bit",
+  "concurrency": 8,
+  "timestamp": "2026-11-19T14:29:51",
+  "host": {
+    "machine": "arm64",
+    "macos": "27.2",
+    "python": "3.12.13",
+    "chip": "Apple M5 Pro",
+    "mem_bytes": "51539607552"
+  },
+  "config": {
+    "set": "subset",
+    "language": "English",
+    "data_dir": "data",
+    "warmup": 1,
+    "base_url": "http://127.0.0.1:8143"
+  },
+  "summary": {
+    "n": 200,
+    "errors": 0,
+    "wall_s": 8.039401749992976,
+    "latency_ms": {
+      "n": 200,
+      "mean": 317.23078960436396,
+      "p50": 277.66454199445434,
+      "p90": 554.3497534963535,
+      "p95": 653.9775872122844,
+      "min": 49.63112500263378,
+      "max": 838.4950420004316
+    },
+    "audio_s_total": 2296.945,
+    "rtfx": {
+      "n": 200,
+      "mean": 35.39655107783321,
+      "p50": 34.480273926538615,
+      "p90": 48.566840779415614,
+      "p95": 52.09848899416241,
+      "min": 11.61915526973908,
+      "max": 124.15355083509098
+    },
+    "rtfx_median": 34.480273926538615,
+    "rtfx_aggregate": 36.20305902312709,
+    "throughput_audio_s_per_s": 285.7109361404917,
+    "wer": 0.024,
+    "peak_memory_gb": null
+  },
+  "items": [
+    {
+      "latency_s": 0.2077726249990519,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.00010295800166204572
+      },
+      "transcript": "Whatever appealed to her sense of beauty was straightway transferred to paper or canvas.",
+      "id": "4992-41797-0011",
+      "set": "subset",
+      "duration": 5.445,
+      "reference": "WHATEVER APPEALED TO HER SENSE OF BEAUTY WAS STRAIGHTWAY TRANSFERRED TO PAPER OR CANVAS",
+      "rtfx": 26.206532261046643,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.20858145799138583,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.00018829098553396761
+      },
+      "transcript": "It is necessary, therefore, that he should comply. The king frowned.",
+      "id": "7127-75946-0007",
+      "set": "subset",
+      "duration": 4.755,
+      "reference": "IT IS NECESSARY THEREFORE THAT HE SHOULD COMPLY THE KING FROWNED",
+      "rtfx": 22.79684899027015,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.32913241698406637,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.00026304100174456835
+      },
+      "transcript": "It is probable that the relation of the ideas to God or of God to the world was differently conceived by Him at different times of His life.",
+      "id": "2961-960-0013",
+      "set": "subset",
+      "duration": 10.575,
+      "reference": "IT IS PROBABLE THAT THE RELATION OF THE IDEAS TO GOD OR OF GOD TO THE WORLD WAS DIFFERENTLY CONCEIVED BY HIM AT DIFFERENT TIMES OF HIS LIFE",
+      "rtfx": 32.12992538657153,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.18589991697808728,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.0004419999895617366
+      },
+      "transcript": "But that is Kaffer's knife.",
+      "id": "6930-81414-0016",
+      "set": "subset",
+      "duration": 2.16,
+      "reference": "BUT THAT IS KAFFAR'S KNIFE",
+      "rtfx": 11.61915526973908,
+      "wer": 0.2
+    },
+    {
+      "latency_s": 0.40613983300863765,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.0005041249969508499
+      },
+      "transcript": "But this frequenter of the heights of air, for all his savage valor, was troubled at the leaping waves in the tossing foam of these mad rapids. He did not understand them.",
+      "id": "7176-88083-0018",
+      "set": "subset",
+      "duration": 10.45,
+      "reference": "BUT THIS FREQUENTER OF THE HEIGHTS OF AIR FOR ALL HIS SAVAGE VALOR WAS TROUBLED AT THE LEAPING WAVES AND THE TOSSING FOAM OF THESE MAD RAPIDS HE DID NOT UNDERSTAND THEM",
+      "rtfx": 25.73005440660077,
+      "wer": 0.03125
+    },
+    {
+      "latency_s": 0.20765758398920298,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.0005347910046111792
+      },
+      "transcript": "Save me, masters! But you startled me rarely.",
+      "id": "61-70970-0030",
+      "set": "subset",
+      "duration": 3.24,
+      "reference": "SAVE ME MASTERS BUT YOU STARTLED ME RARELY",
+      "rtfx": 15.602608572044554,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.7622031249920838,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.000772458006395027
+      },
+      "transcript": "But there is always a stronger sense of life when the sun is brilliant after rain. And now he is pouring down his beams, and making sparkles among the wet straw, and lighting up every patch of vivid green moss on the red tiles of the cowshed, and turning even the muddy water that is hurrying along the channel to the drain, into a mirror, for the yellow billed ducks, who are seizing the opportunity of getting a drink. With as much body in it as possible.",
+      "id": "2094-142345-0008",
+      "set": "subset",
+      "duration": 31.65,
+      "reference": "BUT THERE IS ALWAYS A STRONGER SENSE OF LIFE WHEN THE SUN IS BRILLIANT AFTER RAIN AND NOW HE IS POURING DOWN HIS BEAMS AND MAKING SPARKLES AMONG THE WET STRAW AND LIGHTING UP EVERY PATCH OF VIVID GREEN MOSS ON THE RED TILES OF THE COW SHED AND TURNING EVEN THE MUDDY WATER THAT IS HURRYING ALONG THE CHANNEL TO THE DRAIN INTO A MIRROR FOR THE YELLOW BILLED DUCKS WHO ARE SEIZING THE OPPORTUNITY OF GETTING A DRINK WITH AS MUCH BODY IN IT AS POSSIBLE",
+      "rtfx": 41.52436399460933,
+      "wer": 0.022727272727272728
+    },
+    {
+      "latency_s": 0.40554487498593517,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.0009789160103537142
+      },
+      "transcript": "Before this travesty on the administration of law could be brought before the court of last resort, and there met with the reversal and rebuke it deserved, men were imprisoned under sentence of many years duration.",
+      "id": "4077-13754-0013",
+      "set": "subset",
+      "duration": 12.87,
+      "reference": "BEFORE THIS TRAVESTY ON THE ADMINISTRATION OF LAW COULD BE BROUGHT BEFORE THE COURT OF LAST RESORT AND THERE MEET WITH THE REVERSAL AND REBUKE IT DESERVED MEN WERE IMPRISONED UNDER SENTENCES OF MANY YEARS DURATION",
+      "rtfx": 31.73508233939918,
+      "wer": 0.05555555555555555
+    },
+    {
+      "latency_s": 0.3042431669891812,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.18747583299409598
+      },
+      "transcript": "Of this second letter, also she spoke, and told me that it contained an invitation for her to go and see the poet if ever she visited the lakes.",
+      "id": "3575-170457-0030",
+      "set": "subset",
+      "duration": 8.945,
+      "reference": "OF THIS SECOND LETTER ALSO SHE SPOKE AND TOLD ME THAT IT CONTAINED AN INVITATION FOR HER TO GO AND SEE THE POET IF EVER SHE VISITED THE LAKES",
+      "rtfx": 29.40082463813586,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.1295596249983646,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.20942762499907985
+      },
+      "transcript": "Voltaire picked up something from the ground and looked at it.",
+      "id": "6930-81414-0019",
+      "set": "subset",
+      "duration": 3.38,
+      "reference": "VOLTAIRE PICKED UP SOMETHING FROM THE GROUND AND LOOKED AT IT",
+      "rtfx": 26.08837436850149,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.12058858302771114,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.20949008301249705
+      },
+      "transcript": "I have my own reasons, Mister Marshall.",
+      "id": "6829-68769-0047",
+      "set": "subset",
+      "duration": 2.325,
+      "reference": "I HAVE MY OWN REASONS MISTER MARSHALL",
+      "rtfx": 19.280432206967035,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5542731659952551,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.20965149998664856
+      },
+      "transcript": "Beholding it, Hester was constrained to rush towards the child, to pursue the little elf in the flight which she invariably began, to snatch her to her bosom with a close pressure and earnest kisses, not so much from overflowing love as to assure herself that Pearl was flesh and blood, and not utterly delusive.",
+      "id": "1221-135766-0011",
+      "set": "subset",
+      "duration": 21.345,
+      "reference": "BEHOLDING IT HESTER WAS CONSTRAINED TO RUSH TOWARDS THE CHILD TO PURSUE THE LITTLE ELF IN THE FLIGHT WHICH SHE INVARIABLY BEGAN TO SNATCH HER TO HER BOSOM WITH A CLOSE PRESSURE AND EARNEST KISSES NOT SO MUCH FROM OVERFLOWING LOVE AS TO ASSURE HERSELF THAT PEARL WAS FLESH AND BLOOD AND NOT UTTERLY DELUSIVE",
+      "rtfx": 38.509892431239805,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.21931933300220408,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.3306445000052918
+      },
+      "transcript": "They constitute two different orders of facts which correspond to each other, which are always interlaced, and which often bring forth results.",
+      "id": "4507-16021-0034",
+      "set": "subset",
+      "duration": 11.27,
+      "reference": "THEY CONSTITUTE TWO DIFFERENT ORDERS OF FACTS WHICH CORRESPOND TO EACH OTHER WHICH ARE ALWAYS INTERLACED AND WHICH OFTEN BRING FORTH RESULTS",
+      "rtfx": 51.38625877494685,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.3683012920082547,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.33073554100701585
+      },
+      "transcript": "Besides members of Parliament who were excluded, many officers unwilling to serve under the new generals, threw up their commissions, and unwarily facilitated the project of putting the army entirely into the hands of that faction.",
+      "id": "8224-274381-0014",
+      "set": "subset",
+      "duration": 17.88,
+      "reference": "BESIDES MEMBERS OF PARLIAMENT WHO WERE EXCLUDED MANY OFFICERS UNWILLING TO SERVE UNDER THE NEW GENERALS THREW UP THEIR COMMISSIONS AND UNWARILY FACILITATED THE PROJECT OF PUTTING THE ARMY ENTIRELY INTO THE HANDS OF THAT FACTION",
+      "rtfx": 48.54720954820668,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.4322532920050435,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.33969187500770204
+      },
+      "transcript": "In December eighteen eighty eight, Mister W J Jenks read an interesting paper before the American Institute of Electrical Engineers, on the six years of practical experience had up to that time with the meter, then more generally in use than any other.",
+      "id": "2300-131720-0033",
+      "set": "subset",
+      "duration": 17.605,
+      "reference": "IN DECEMBER EIGHTEEN EIGHTY EIGHT MISTER W J JENKS READ AN INTERESTING PAPER BEFORE THE AMERICAN INSTITUTE OF ELECTRICAL ENGINEERS ON THE SIX YEARS OF PRACTICAL EXPERIENCE HAD UP TO THAT TIME WITH THE METER THEN MORE GENERALLY IN USE THAN ANY OTHER",
+      "rtfx": 40.72843475254455,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.1420433749735821,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.40796195800066926
+      },
+      "transcript": "I don't want to stand around on Nagorn.",
+      "id": "237-134500-0029",
+      "set": "subset",
+      "duration": 2.065,
+      "reference": "I DON'T WANT TO STAND AROUND AND LOOK ON",
+      "rtfx": 14.537812836283694,
+      "wer": 0.3333333333333333
+    },
+    {
+      "latency_s": 0.15164770901901647,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.4080102909938432
+      },
+      "transcript": "Hawkin there shall be your constant companion, friend Farmer.",
+      "id": "5142-33396-0037",
+      "set": "subset",
+      "duration": 3.575,
+      "reference": "HAKON THERE SHALL BE YOUR CONSTANT COMPANION FRIEND FARMER",
+      "rtfx": 23.57437526175683,
+      "wer": 0.1111111111111111
+    },
+    {
+      "latency_s": 0.19531945898779668,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.4923658749903552
+      },
+      "transcript": "You must see, Lieutenant. I should think that we are not so near the coast of Algeria as you imagined.",
+      "id": "5105-28241-0016",
+      "set": "subset",
+      "duration": 6.285,
+      "reference": "YOU MUST SEE LIEUTENANT I SHOULD THINK THAT WE ARE NOT SO NEAR THE COAST OF ALGERIA AS YOU IMAGINED",
+      "rtfx": 32.17805349539023,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.46360645900131203,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.5506349579954986
+      },
+      "transcript": "This nobleman's character, though celebrated for political courage and conduct, was very low for military prowess. And after some skirmishes in which he was worsted, he here allowed Montrose to escape him.",
+      "id": "8224-274381-0006",
+      "set": "subset",
+      "duration": 16.98,
+      "reference": "THIS NOBLEMAN'S CHARACTER THOUGH CELEBRATED FOR POLITICAL COURAGE AND CONDUCT WAS VERY LOW FOR MILITARY PROWESS AND AFTER SOME SKIRMISHES IN WHICH HE WAS WORSTED HE HERE ALLOWED MONTROSE TO ESCAPE HIM",
+      "rtfx": 36.62589178886299,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5457042920170352,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.5508529999933671
+      },
+      "transcript": "Then again, there was no known way to lubricate an engine for continuous running, and Mister Edison informed me that as a marine engine started before the ship left New York and continued running until it reached its home port, so an engine for his purposes must produce light at all times.",
+      "id": "2300-131720-0016",
+      "set": "subset",
+      "duration": 20.015,
+      "reference": "THEN AGAIN THERE WAS NO KNOWN WAY TO LUBRICATE AN ENGINE FOR CONTINUOUS RUNNING AND MISTER EDISON INFORMED ME THAT AS A MARINE ENGINE STARTED BEFORE THE SHIP LEFT NEW YORK AND CONTINUED RUNNING UNTIL IT REACHED ITS HOME PORT SO AN ENGINE FOR HIS PURPOSES MUST PRODUCE LIGHT AT ALL TIMES",
+      "rtfx": 36.67737324553642,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.20271187499747612,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.5603135830024257
+      },
+      "transcript": "I shudder as I recall these monsters to my remembrance.",
+      "id": "260-123286-0017",
+      "set": "subset",
+      "duration": 3.975,
+      "reference": "I SHUDDER AS I RECALL THESE MONSTERS TO MY REMEMBRANCE",
+      "rtfx": 19.609112687895028,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2965097909909673,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.6881080000021029
+      },
+      "transcript": "But first, I will tell you that for many years I have longed for a servant to help me with the housework and to cook the meals and wash the dishes.",
+      "id": "1284-1180-0026",
+      "set": "subset",
+      "duration": 8.29,
+      "reference": "BUT FIRST I WILL TELL YOU THAT FOR MANY YEARS I HAVE LONGED FOR A SERVANT TO HELP ME WITH THE HOUSEWORK AND TO COOK THE MEALS AND WASH THE DISHES",
+      "rtfx": 27.958604578600713,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2454317079973407,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.6997554159897845
+      },
+      "transcript": "Its origin was small, a germ, an insignificant seed, hardly to be thought of as likely to arouse opposition.",
+      "id": "4077-13751-0001",
+      "set": "subset",
+      "duration": 8.745,
+      "reference": "ITS ORIGIN WAS SMALL A GERM AN INSIGNIFICANT SEED HARDLY TO BE THOUGHT OF AS LIKELY TO AROUSE OPPOSITION",
+      "rtfx": 35.631092947838475,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.6537629580125213,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.764442332991166
+      },
+      "transcript": "Yesterday you were trembling for a health that is dear to you, today you fear for your own, tomorrow it will be anxiety about money, the day after tomorrow the diatribe of a slanderer, the day after that the misfortune of some friend, then the prevailing weather, then something that has been broken or lost, then a pleasure with which your conscience and your. Vertible column reproach you. Again, the course of public affairs.",
+      "id": "4507-16021-0047",
+      "set": "subset",
+      "duration": 34.955,
+      "reference": "YESTERDAY YOU WERE TREMBLING FOR A HEALTH THAT IS DEAR TO YOU TO DAY YOU FEAR FOR YOUR OWN TO MORROW IT WILL BE ANXIETY ABOUT MONEY THE DAY AFTER TO MORROW THE DIATRIBE OF A SLANDERER THE DAY AFTER THAT THE MISFORTUNE OF SOME FRIEND THEN THE PREVAILING WEATHER THEN SOMETHING THAT HAS BEEN BROKEN OR LOST THEN A PLEASURE WITH WHICH YOUR CONSCIENCE AND YOUR VERTEBRAL COLUMN REPROACH YOU AGAIN THE COURSE OF PUBLIC AFFAIRS",
+      "rtfx": 53.46739146290163,
+      "wer": 0.09090909090909091
+    },
+    {
+      "latency_s": 0.3318914170085918,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.7645649999903981
+      },
+      "transcript": "Therefore, I feel myself quite able as President of this Republic, to receive you with a courtesy due to the servants of a friendly ally.",
+      "id": "8455-210777-0038",
+      "set": "subset",
+      "duration": 10.03,
+      "reference": "THEREFORE I FEEL MYSELF QUITE ABLE AS PRESIDENT OF THIS REPUBLIC TO RECEIVE YOU WITH A COURTESY DUE TO THE SERVANTS OF A FRIENDLY ALLY",
+      "rtfx": 30.220727280031916,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.49595737500931136,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.7648399159952533
+      },
+      "transcript": "Habit is a concept involving the occurrence of similar events at different times. If the behaviorist feels confident that there is such a phenomenon as habit that can only be because he trusts his memory when it assures him that there have been other times.",
+      "id": "8230-279154-0007",
+      "set": "subset",
+      "duration": 15.905,
+      "reference": "HABIT IS A CONCEPT INVOLVING THE OCCURRENCE OF SIMILAR EVENTS AT DIFFERENT TIMES IF THE BEHAVIOURIST FEELS CONFIDENT THAT THERE IS SUCH A PHENOMENON AS HABIT THAT CAN ONLY BE BECAUSE HE TRUSTS HIS MEMORY WHEN IT ASSURES HIM THAT THERE HAVE BEEN OTHER TIMES",
+      "rtfx": 32.06928821191819,
+      "wer": 0.022222222222222223
+    },
+    {
+      "latency_s": 0.6372533329995349,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.7725615410017781
+      },
+      "transcript": "This compulsion leads Nemo into ugly contradictions: He is a fighter for freedom, yet all who board his ship are imprisoned there for good. He works to save lives, both human and animal, yet he himself creates a Holocaust. He detests imperialism, yet he lays personal claim to the South Pole.",
+      "id": "8463-294825-0009",
+      "set": "subset",
+      "duration": 20.005,
+      "reference": "THIS COMPULSION LEADS NEMO INTO UGLY CONTRADICTIONS HE'S A FIGHTER FOR FREEDOM YET ALL WHO BOARD HIS SHIP ARE IMPRISONED THERE FOR GOOD HE WORKS TO SAVE LIVES BOTH HUMAN AND ANIMAL YET HE HIMSELF CREATES A HOLOCAUST HE DETESTS IMPERIALISM YET HE LAYS PERSONAL CLAIM TO THE SOUTH POLE",
+      "rtfx": 31.392538828846895,
+      "wer": 0.04
+    },
+    {
+      "latency_s": 0.30586862500058487,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.9457760000077542
+      },
+      "transcript": "And it is made of mother's best yarn, and she knitted it herself, and everybody wants to get it away from me.",
+      "id": "7021-85628-0018",
+      "set": "subset",
+      "duration": 8.22,
+      "reference": "AND IT IS MADE OF MOTHER'S BEST YARN AND SHE KNITTED IT HERSELF AND EVERYBODY WANTS TO GET IT AWAY FROM ME",
+      "rtfx": 26.87428303568005,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.16978779202327132,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 0.9853741250117309
+      },
+      "transcript": "Come. We'll have our coffee in the other room, and you can smoke.",
+      "id": "4446-2273-0019",
+      "set": "subset",
+      "duration": 3.115,
+      "reference": "COME WE'LL HAVE OUR COFFEE IN THE OTHER ROOM AND YOU CAN SMOKE",
+      "rtfx": 18.34643093522916,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.3945276250015013,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.0154279159905855
+      },
+      "transcript": "We believe in a literal resurrection and an actual hereafter in which future states shall be recognized every sanctified and authorized relationship existing here on earth, of parent and child, brother and sister, husband and wife.",
+      "id": "4077-13754-0007",
+      "set": "subset",
+      "duration": 13.95,
+      "reference": "WE BELIEVE IN A LITERAL RESURRECTION AND AN ACTUAL HEREAFTER IN WHICH FUTURE STATE SHALL BE RECOGNIZED EVERY SANCTIFIED AND AUTHORIZED RELATIONSHIP EXISTING HERE ON EARTH OF PARENT AND CHILD BROTHER AND SISTER HUSBAND AND WIFE",
+      "rtfx": 35.3587407217604,
+      "wer": 0.027777777777777776
+    },
+    {
+      "latency_s": 0.5481084159982856,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.0973138750123326
+      },
+      "transcript": "When she came to her senses and blushing to find herself in Rodolfo's arms, would have disengaged herself. No, Senora, he said, \"That must not be. Strive not to withdraw from the arms of him who holds you in his soul.\"",
+      "id": "5639-40744-0039",
+      "set": "subset",
+      "duration": 14.375,
+      "reference": "WHEN SHE CAME TO HER SENSES AND BLUSHING TO FIND HERSELF IN RODOLFO'S ARMS WOULD HAVE DISENGAGED HERSELF NO SENORA HE SAID THAT MUST NOT BE STRIVE NOT TO WITHDRAW FROM THE ARMS OF HIM WHO HOLDS YOU IN HIS SOUL",
+      "rtfx": 26.22656317695542,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5988875420007389,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.0974208750121761
+      },
+      "transcript": "There was infinite skepticism around him on the subject, and while other inventors were also giving the subject their thought, the public took it for granted that anything so utterly intangible as electricity, that could not be seen or weighed, and only gave secondary evidence of itself at the exact pointed use, could not be brought to accurate registration.",
+      "id": "2300-131720-0028",
+      "set": "subset",
+      "duration": 25.94,
+      "reference": "THERE WAS INFINITE SCEPTICISM AROUND HIM ON THE SUBJECT AND WHILE OTHER INVENTORS WERE ALSO GIVING THE SUBJECT THEIR THOUGHT THE PUBLIC TOOK IT FOR GRANTED THAT ANYTHING SO UTTERLY INTANGIBLE AS ELECTRICITY THAT COULD NOT BE SEEN OR WEIGHED AND ONLY GAVE SECONDARY EVIDENCE OF ITSELF AT THE EXACT POINT OF USE COULD NOT BE BROUGHT TO ACCURATE REGISTRATION",
+      "rtfx": 43.31364101069913,
+      "wer": 0.05
+    },
+    {
+      "latency_s": 0.25321337502100505,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.1558382080111187
+      },
+      "transcript": "Here she was teaching dirty children, and the smell of confused odors and bodily perspiration, was to her at times unbearable.",
+      "id": "1995-1826-0011",
+      "set": "subset",
+      "duration": 8.94,
+      "reference": "HERE SHE WAS TEACHING DIRTY CHILDREN AND THE SMELL OF CONFUSED ODORS AND BODILY PERSPIRATION WAS TO HER AT TIMES UNBEARABLE",
+      "rtfx": 35.30619185996155,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.313518999988446,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.252273874997627
+      },
+      "transcript": "His legs, the best shaped at court, were displayed to great advantage in flesh-colored silken hose of silk so fine and so transparent, that it seemed almost like flesh itself.",
+      "id": "7127-75946-0017",
+      "set": "subset",
+      "duration": 12.33,
+      "reference": "HIS LEGS THE BEST SHAPED AT COURT WERE DISPLAYED TO GREAT ADVANTAGE IN FLESH COLORED SILKEN HOSE OF SILK SO FINE AND SO TRANSPARENT THAT IT SEEMED ALMOST LIKE FLESH ITSELF",
+      "rtfx": 39.3277600415107,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.670091957988916,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.2615967500023544
+      },
+      "transcript": "Law seemed to him well enough as a science, but he never could discover a practical case where it appeared to him worth while to go to law. And all the clients who stopped with this new clerk in the anteroom of the law office where he was writing, Philip invariably advised to settle, no matter how but settle, greatly to the disgust of his employer, who knew that justice between man and man could only be attained by the recognized processes with the attendant fees.",
+      "id": "4970-29093-0006",
+      "set": "subset",
+      "duration": 29.6,
+      "reference": "LAW SEEMED TO HIM WELL ENOUGH AS A SCIENCE BUT HE NEVER COULD DISCOVER A PRACTICAL CASE WHERE IT APPEARED TO HIM WORTH WHILE TO GO TO LAW AND ALL THE CLIENTS WHO STOPPED WITH THIS NEW CLERK IN THE ANTE ROOM OF THE LAW OFFICE WHERE HE WAS WRITING PHILIP INVARIABLY ADVISED TO SETTLE NO MATTER HOW BUT SETTLE GREATLY TO THE DISGUST OF HIS EMPLOYER WHO KNEW THAT JUSTICE BETWEEN MAN AND MAN COULD ONLY BE ATTAINED BY THE RECOGNIZED PROCESSES WITH THE ATTENDANT FEES",
+      "rtfx": 44.17304169540506,
+      "wer": 0.022988505747126436
+    },
+    {
+      "latency_s": 0.5299488340097014,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.4104322500061244
+      },
+      "transcript": "The mystery of their origin, their capacity for evolving latent faculties of crime, and the steady vitality with which they survive the hearse, and speak their deep-mouthed malignities in every new-born generation, have associated them somehow in my mind with a spell of life, exceeding and distinct from human and a special satanic action.",
+      "id": "5683-32866-0019",
+      "set": "subset",
+      "duration": 20.855,
+      "reference": "THE MYSTERY OF THEIR ORIGIN THEIR CAPACITY FOR EVOLVING LATENT FACULTIES OF CRIME AND THE STEADY VITALITY WITH WHICH THEY SURVIVE THE HEARSE AND SPEAK THEIR DEEP MOUTHED MALIGNITIES IN EVERY NEW BORN GENERATION HAVE ASSOCIATED THEM SOMEHOW IN MY MIND WITH A SPELL OF LIFE EXCEEDING AND DISTINCT FROM HUMAN AND A SPECIAL SATANIC ACTION",
+      "rtfx": 39.35285571289364,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.7330226250051055,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.4104788750119042
+      },
+      "transcript": "The Lily of the Valley, breathing in the humble grass, answered the lovely maiden, said, \"I am a watry weed, and I am very small and love to dwell in lowly vales. So weak, the gilded butterfly scarce perches on my head. Yet I am visited from heaven, and he that smiles on all walks in the valley, and each morn over me spreads his hand, saying.\" Rejoice thou humble grass, thou new-born lily flower!",
+      "id": "908-157963-0007",
+      "set": "subset",
+      "duration": 32.77,
+      "reference": "THE LILLY OF THE VALLEY BREATHING IN THE HUMBLE GRASS ANSWERD THE LOVELY MAID AND SAID I AM A WATRY WEED AND I AM VERY SMALL AND LOVE TO DWELL IN LOWLY VALES SO WEAK THE GILDED BUTTERFLY SCARCE PERCHES ON MY HEAD YET I AM VISITED FROM HEAVEN AND HE THAT SMILES ON ALL WALKS IN THE VALLEY AND EACH MORN OVER ME SPREADS HIS HAND SAYING REJOICE THOU HUMBLE GRASS THOU NEW BORN LILY FLOWER",
+      "rtfx": 44.70530496895885,
+      "wer": 0.05194805194805195
+    },
+    {
+      "latency_s": 0.37473712500650436,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.4105942499882076
+      },
+      "transcript": "The objection, of course, presents itself that expenditure on women's dress and household paraphrenia is an obvious exception to this rule, but it will appear in the sequel that this exception is much more obvious than substantial.",
+      "id": "3570-5694-0010",
+      "set": "subset",
+      "duration": 13.005,
+      "reference": "THE OBJECTION OF COURSE PRESENTS ITSELF THAT EXPENDITURE ON WOMEN'S DRESS AND HOUSEHOLD PARAPHERNALIA IS AN OBVIOUS EXCEPTION TO THIS RULE BUT IT WILL APPEAR IN THE SEQUEL THAT THIS EXCEPTION IS MUCH MORE OBVIOUS THAN SUBSTANTIAL",
+      "rtfx": 34.70432773313899,
+      "wer": 0.02702702702702703
+    },
+    {
+      "latency_s": 0.6528946249745786,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.4196860409865621
+      },
+      "transcript": "After an apprenticeship on a merchant ship, he had entered the Imperial Navy, and had already reached the rank of lieutenant when the Count appointed him to the charge of his own private yacht, in which he was accustomed to spend by far the greater part of his time. Throughout the winter, generally cruising in the Mediterranean, whilst in the summer he visited more northern waters.",
+      "id": "5105-28241-0001",
+      "set": "subset",
+      "duration": 21.015,
+      "reference": "AFTER AN APPRENTICESHIP ON A MERCHANT SHIP HE HAD ENTERED THE IMPERIAL NAVY AND HAD ALREADY REACHED THE RANK OF LIEUTENANT WHEN THE COUNT APPOINTED HIM TO THE CHARGE OF HIS OWN PRIVATE YACHT IN WHICH HE WAS ACCUSTOMED TO SPEND BY FAR THE GREATER PART OF HIS TIME THROUGHOUT THE WINTER GENERALLY CRUISING IN THE MEDITERRANEAN WHILST IN THE SUMMER HE VISITED MORE NORTHERN WATERS",
+      "rtfx": 32.18742994065581,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.20739066699752584,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.5663746249920223
+      },
+      "transcript": "Is he going to start a daily newspaper among the Kikapous?",
+      "id": "4970-29095-0029",
+      "set": "subset",
+      "duration": 3.89,
+      "reference": "IS HE GOING TO START A DAILY NEWSPAPER AMONG THE KICK A POOS",
+      "rtfx": 18.756871060385798,
+      "wer": 0.23076923076923078
+    },
+    {
+      "latency_s": 0.22653462502057664,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.6465622909890953
+      },
+      "transcript": "They set up a crane over the fire and hung the pot upon it, and we sat and watched it boil while we joked. At last, the supper began.",
+      "id": "5142-33396-0031",
+      "set": "subset",
+      "duration": 7.845,
+      "reference": "THEY SET UP A CRANE OVER THE FIRE AND HUNG THE POT UPON IT AND WE SAT AND WATCHED IT BOIL WHILE WE JOKED AT LAST THE SUPPER BEGAN",
+      "rtfx": 34.63046763507972,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.4869164169940632,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.697611165989656
+      },
+      "transcript": "I can no more help spending my life in trying to do what I can for the souls of others, than you could help running if you heard little Totty crying at the other end of the house. The voice would go to your heart; you would think the dear child was in trouble or in danger, and you couldn't rest without running to help her and comfort her.",
+      "id": "2094-142345-0038",
+      "set": "subset",
+      "duration": 20.25,
+      "reference": "I CAN NO MORE HELP SPENDING MY LIFE IN TRYING TO DO WHAT I CAN FOR THE SOULS OF OTHERS THAN YOU COULD HELP RUNNING IF YOU HEARD LITTLE TOTTY CRYING AT THE OTHER END OF THE HOUSE THE VOICE WOULD GO TO YOUR HEART YOU WOULD THINK THE DEAR CHILD WAS IN TROUBLE OR IN DANGER AND YOU COULDN'T REST WITHOUT RUNNING TO HELP HER AND COMFORT HER",
+      "rtfx": 41.58824655166002,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.408542999997735,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.7761459999892395
+      },
+      "transcript": "What world-wide iniquity such a speech as that discloses,\" said I, still turning myself to the captain, for though I would have crushed them both by my words had it been possible, my dislike centered itself on Sir Ferdinando.\"",
+      "id": "8455-210777-0051",
+      "set": "subset",
+      "duration": 13.96,
+      "reference": "WHAT WORLD WIDE INIQUITY SUCH A SPEECH AS THAT DISCLOSES SAID I STILL TURNING MYSELF TO THE CAPTAIN FOR THOUGH I WOULD HAVE CRUSHED THEM BOTH BY MY WORDS HAD IT BEEN POSSIBLE MY DISLIKE CENTRED ITSELF ON SIR FERDINANDO",
+      "rtfx": 34.170209745552846,
+      "wer": 0.025
+    },
+    {
+      "latency_s": 0.07950633301516064,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.7859280410048086
+      },
+      "transcript": "He had broken into her courtyard.",
+      "id": "8555-292519-0015",
+      "set": "subset",
+      "duration": 2.85,
+      "reference": "HE HAD BROKEN INTO HER COURTYARD",
+      "rtfx": 35.846201075033214,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.06599500001175329,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.865863665996585
+      },
+      "transcript": "You'll never dig it out of the Astor Library.",
+      "id": "4970-29093-0000",
+      "set": "subset",
+      "duration": 3.03,
+      "reference": "YOU'LL NEVER DIG IT OUT OF THE ASTOR LIBRARY",
+      "rtfx": 45.91256912584856,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2347463339974638,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.8755282500060275
+      },
+      "transcript": "The world is all there just as it used to be, but I can't get at it any more.",
+      "id": "4446-2275-0019",
+      "set": "subset",
+      "duration": 4.93,
+      "reference": "THE WORLD IS ALL THERE JUST AS IT USED TO BE BUT I CAN'T GET AT IT ANY MORE",
+      "rtfx": 21.001392933587894,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.259251041978132,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.9323295000067446
+      },
+      "transcript": "I couldn't shiver much being bound so tight, but when I am loose, I mean to have just one good shiver to relieve my feelings.",
+      "id": "8555-284447-0023",
+      "set": "subset",
+      "duration": 7.155,
+      "reference": "I COULDN'T SHIVER MUCH BEIN BOUND SO TIGHT BUT WHEN I'M LOOSE I MEAN TO HAVE JUS ONE GOOD SHIVER TO RELIEVE MY FEELIN'S",
+      "rtfx": 27.598731890935003,
+      "wer": 0.20833333333333334
+    },
+    {
+      "latency_s": 0.4552985829941463,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.932365040993318
+      },
+      "transcript": "They were absorbed in his theology, and were under the dominion of his name, while that which was truly great and truly characteristic in him—his effort to realize and connect abstractions—was not understood by them at all.",
+      "id": "2961-960-0003",
+      "set": "subset",
+      "duration": 17.315,
+      "reference": "THEY WERE ABSORBED IN HIS THEOLOGY AND WERE UNDER THE DOMINION OF HIS NAME WHILE THAT WHICH WAS TRULY GREAT AND TRULY CHARACTERISTIC IN HIM HIS EFFORT TO REALIZE AND CONNECT ABSTRACTIONS WAS NOT UNDERSTOOD BY THEM AT ALL",
+      "rtfx": 38.029988773812235,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.8384950420004316,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 1.941275165998377
+      },
+      "transcript": "So persuasive were her entreaties and so strong her assurances that no harm whatever could result to them from the information she sought, they were induced to confess that one summer's night, the same she had mentioned, themselves and another friend being out on a stroll with Rodolpho, they had been concerned in the abduction of a girl whom Rodolpho carried off, whilst the rest of them detained her family, who made a great outcry and would have defended her if they could.",
+      "id": "5639-40744-0031",
+      "set": "subset",
+      "duration": 28.42,
+      "reference": "SO PERSUASIVE WERE HER ENTREATIES AND SO STRONG HER ASSURANCES THAT NO HARM WHATEVER COULD RESULT TO THEM FROM THE INFORMATION SHE SOUGHT THEY WERE INDUCED TO CONFESS THAT ONE SUMMER'S NIGHT THE SAME SHE HAD MENTIONED THEMSELVES AND ANOTHER FRIEND BEING OUT ON A STROLL WITH RODOLFO THEY HAD BEEN CONCERNED IN THE ABDUCTION OF A GIRL WHOM RODOLFO CARRIED OFF WHILST THE REST OF THEM DETAINED HER FAMILY WHO MADE A GREAT OUTCRY AND WOULD HAVE DEFENDED HER IF THEY COULD",
+      "rtfx": 33.894058493413695,
+      "wer": 0.024096385542168676
+    },
+    {
+      "latency_s": 0.23376637499313802,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.0732145000074524
+      },
+      "transcript": "Why do they not invade the Catholic provinces and preach their doctrine to godless princes, bishops and doctors, as we have done by the help of God?",
+      "id": "2830-3980-0031",
+      "set": "subset",
+      "duration": 8.485,
+      "reference": "WHY DO THEY NOT INVADE THE CATHOLIC PROVINCES AND PREACH THEIR DOCTRINE TO GODLESS PRINCES BISHOPS AND DOCTORS AS WE HAVE DONE BY THE HELP OF GOD",
+      "rtfx": 36.29692251611922,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.07409812498372048,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.110742457996821
+      },
+      "transcript": "Vast importance and influence of this mental furnishing.",
+      "id": "7021-79759-0003",
+      "set": "subset",
+      "duration": 4.62,
+      "reference": "VAST IMPORTANCE AND INFLUENCE OF THIS MENTAL FURNISHING",
+      "rtfx": 62.34975582735763,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.3210419999959413,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.1444774999981746
+      },
+      "transcript": "One of Mister Hopkins' first tasks after calling his faithful henchmen around him, was to make a careful canvas of the voters of his district to see what was still to be accomplished.",
+      "id": "6829-68771-0001",
+      "set": "subset",
+      "duration": 10.355,
+      "reference": "ONE OF MISTER HOPKINS'S FIRST TASKS AFTER CALLING HIS FAITHFUL HENCHMEN AROUND HIM WAS TO MAKE A CAREFUL CANVASS OF THE VOTERS OF HIS DISTRICT TO SEE WHAT WAS STILL TO BE ACCOMPLISHED",
+      "rtfx": 32.25434678369469,
+      "wer": 0.06060606060606061
+    },
+    {
+      "latency_s": 0.2781595419801306,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.1851706659945194
+      },
+      "transcript": "It is sold everywhere, but for the last three weeks, nobody will use any snuff but that sold at the Savette Cat.",
+      "id": "3729-6852-0029",
+      "set": "subset",
+      "duration": 8.605,
+      "reference": "IT IS SOLD EVERYWHERE BUT FOR THE LAST THREE WEEKS NOBODY WILL USE ANY SNUFF BUT THAT SOLD AT THE CIVET CAT",
+      "rtfx": 30.93548378295313,
+      "wer": 0.045454545454545456
+    },
+    {
+      "latency_s": 0.19337974998052232,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.1852074160124175
+      },
+      "transcript": "Yet he will teach you a few tricks when morning is come.",
+      "id": "61-70970-0012",
+      "set": "subset",
+      "duration": 3.135,
+      "reference": "YET HE WILL TEACH YOU A FEW TRICKS WHEN MORNING IS COME",
+      "rtfx": 16.211625055445385,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.22580245800781995,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.1852621249854565
+      },
+      "transcript": "The inmates being removed, at the appointed hour, a few cannon balls were fired through the stone walls.",
+      "id": "7729-102255-0039",
+      "set": "subset",
+      "duration": 6.815,
+      "reference": "THE INMATES BEING REMOVED AT THE APPOINTED HOUR A FEW CANNON BALLS WERE FIRED THROUGH THE STONE WALLS",
+      "rtfx": 30.181248070222445,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5004208749742247,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.194172499992419
+      },
+      "transcript": "The present chapters can only touch upon the more salient movements of the Civil War in Kansas, which happily are not sanguinary. If, however, the individual and more isolated cases of bloodshed could be described, they would show a startling aggregate of barbarity and a loss of life for opinion's sake.",
+      "id": "7729-102255-0011",
+      "set": "subset",
+      "duration": 20.355,
+      "reference": "THE PRESENT CHAPTERS CAN ONLY TOUCH UPON THE MORE SALIENT MOVEMENTS OF THE CIVIL WAR IN KANSAS WHICH HAPPILY WERE NOT SANGUINARY IF HOWEVER THE INDIVIDUAL AND MORE ISOLATED CASES OF BLOODSHED COULD BE DESCRIBED THEY WOULD SHOW A STARTLING AGGREGATE OF BARBARITY AND LOSS OF LIFE FOR OPINION'S SAKE",
+      "rtfx": 40.67576118012349,
+      "wer": 0.04
+    },
+    {
+      "latency_s": 0.47021041699917987,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.309371499984991
+      },
+      "transcript": "Of course, the words \"This has existed before\" are a very inadequate translation of what actually happens when we form a judgment of recognition, but that is unavoidable. Words are framed to express a level of thought which is by no means primitive, and are quite incapable of expressing such an elementary occurrence as recognition.",
+      "id": "8230-279154-0043",
+      "set": "subset",
+      "duration": 24.485,
+      "reference": "OF COURSE THE WORDS THIS HAS EXISTED BEFORE ARE A VERY INADEQUATE TRANSLATION OF WHAT ACTUALLY HAPPENS WHEN WE FORM A JUDGMENT OF RECOGNITION BUT THAT IS UNAVOIDABLE WORDS ARE FRAMED TO EXPRESS A LEVEL OF THOUGHT WHICH IS BY NO MEANS PRIMITIVE AND ARE QUITE INCAPABLE OF EXPRESSING SUCH AN ELEMENTARY OCCURRENCE AS RECOGNITION",
+      "rtfx": 52.07243207468691,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.09321370898396708,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.381026374991052
+      },
+      "transcript": "Paul, an apostle, not of men, etc.",
+      "id": "2830-3980-0009",
+      "set": "subset",
+      "duration": 3.885,
+      "reference": "PAUL AN APOSTLE NOT OF MEN ET CETERA",
+      "rtfx": 41.678418789968184,
+      "wer": 0.25
+    },
+    {
+      "latency_s": 0.13809333299286664,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.3902399159851484
+      },
+      "transcript": "O life of this our spring!",
+      "id": "908-157963-0001",
+      "set": "subset",
+      "duration": 2.885,
+      "reference": "O LIFE OF THIS OUR SPRING",
+      "rtfx": 20.891667522783504,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.18948754097800702,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.4135111659998074
+      },
+      "transcript": "For some years, it was not found feasible to operate motors on alternating current circuits, and that reason was often urged against it seriously.",
+      "id": "2300-131720-0009",
+      "set": "subset",
+      "duration": 9.605,
+      "reference": "FOR SOME YEARS IT WAS NOT FOUND FEASIBLE TO OPERATE MOTORS ON ALTERNATING CURRENT CIRCUITS AND THAT REASON WAS OFTEN URGED AGAINST IT SERIOUSLY",
+      "rtfx": 50.689348494499754,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2309207090002019,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.4659154579858296
+      },
+      "transcript": "The consumption of luxuries, in the true sense, is a consumption directed to the comfort of the consumer himself, and is therefore a mark of the master.",
+      "id": "3570-5694-0008",
+      "set": "subset",
+      "duration": 9.495,
+      "reference": "THE CONSUMPTION OF LUXURIES IN THE TRUE SENSE IS A CONSUMPTION DIRECTED TO THE COMFORT OF THE CONSUMER HIMSELF AND IS THEREFORE A MARK OF THE MASTER",
+      "rtfx": 41.11800990526015,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.14535466697998345,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.4660006249905564
+      },
+      "transcript": "Edison held that the electricity sold must be measured just like gas or water, and he proceeded to develop a meter.",
+      "id": "2300-131720-0027",
+      "set": "subset",
+      "duration": 8.62,
+      "reference": "EDISON HELD THAT THE ELECTRICITY SOLD MUST BE MEASURED JUST LIKE GAS OR WATER AND HE PROCEEDED TO DEVELOP A METER",
+      "rtfx": 59.30322141763116,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.12822216699714772,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.474705875007203
+      },
+      "transcript": "Some images like some sensations feel very familiar, while others feel strange.",
+      "id": "8230-279154-0011",
+      "set": "subset",
+      "duration": 6.25,
+      "reference": "SOME IMAGES LIKE SOME SENSATIONS FEEL VERY FAMILIAR WHILE OTHERS FEEL STRANGE",
+      "rtfx": 48.74352186029604,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.17751908299396746,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.52862295799423
+      },
+      "transcript": "But when his big brother heard that he had refused to give his cap for a king's golden crown, he said that Anders was a stupid.",
+      "id": "7021-85628-0023",
+      "set": "subset",
+      "duration": 9.03,
+      "reference": "BUT WHEN HIS BIG BROTHER HEARD THAT HE HAD REFUSED TO GIVE HIS CAP FOR A KING'S GOLDEN CROWN HE SAID THAT ANDERS WAS A STUPID",
+      "rtfx": 50.86777065149025,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.46109679201617837,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.603371250006603
+      },
+      "transcript": "But as before, the leaping waves of the rapids were too much for his pursuer, and he was able to flap his way onward in a cloud of foam, while Doom hung low above his head yet hesitated to strike.",
+      "id": "7176-88083-0021",
+      "set": "subset",
+      "duration": 12.605,
+      "reference": "BUT AS BEFORE THE LEAPING WAVES OF THE RAPIDS WERE TOO MUCH FOR HIS PURSUER AND HE WAS ABLE TO FLAP HIS WAY ONWARD IN A CLOUD OF FOAM WHILE DOOM HUNG LOW ABOVE HIS HEAD YET HESITATED TO STRIKE",
+      "rtfx": 27.336993486516672,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.3789247919921763,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.6034025409899186
+      },
+      "transcript": "Time enough had he too for his reflections for days and nights passed on, and nobody came up. And when at last somebody did come, it was only to put some great trunks in a corner out of the way.",
+      "id": "672-122797-0045",
+      "set": "subset",
+      "duration": 13.96,
+      "reference": "TIME ENOUGH HAD HE TOO FOR HIS REFLECTIONS FOR DAYS AND NIGHTS PASSED ON AND NOBODY CAME UP AND WHEN AT LAST SOMEBODY DID COME IT WAS ONLY TO PUT SOME GREAT TRUNKS IN A CORNER OUT OF THE WAY",
+      "rtfx": 36.84108375861623,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.09415424999315292,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.612183958000969
+      },
+      "transcript": "Spinning indeed.",
+      "id": "2094-142345-0016",
+      "set": "subset",
+      "duration": 2.26,
+      "reference": "SPINNING INDEED",
+      "rtfx": 24.003165020849845,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.6738546249980573,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.697623582993401
+      },
+      "transcript": "Then the church was disincorporated, and its property—both real and personal—confiscated and estayed to the government of the United States. And although the personal property was soon restored, real estate of great value long lay in the hands of the court's receiver, and the Mormon Church had to pay the national government high rental on its own property.",
+      "id": "4077-13754-0015",
+      "set": "subset",
+      "duration": 22.205,
+      "reference": "THEN THE CHURCH WAS DISINCORPORATED AND ITS PROPERTY BOTH REAL AND PERSONAL CONFISCATED AND ESCHEATED TO THE GOVERNMENT OF THE UNITED STATES AND ALTHOUGH THE PERSONAL PROPERTY WAS SOON RESTORED REAL ESTATE OF GREAT VALUE LONG LAY IN THE HANDS OF THE COURT'S RECEIVER AND THE MORMON CHURCH HAD TO PAY THE NATIONAL GOVERNMENT HIGH RENTAL ON ITS OWN PROPERTY",
+      "rtfx": 32.95221131718732,
+      "wer": 0.016666666666666666
+    },
+    {
+      "latency_s": 0.28234662499744445,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.697748208011035
+      },
+      "transcript": "Although the brethren with me are not apostles like myself, yet they are all of one mind with me, think, write, and teach as I do.",
+      "id": "2830-3980-0029",
+      "set": "subset",
+      "duration": 9.075,
+      "reference": "ALTHOUGH THE BRETHREN WITH ME ARE NOT APOSTLES LIKE MYSELF YET THEY ARE ALL OF ONE MIND WITH ME THINK WRITE AND TEACH AS I DO",
+      "rtfx": 32.14134399545997,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2848353750014212,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.7066218749969266
+      },
+      "transcript": "He could write in one style, but not in another. The Greek language had not as yet been fashioned by any poet or philosopher, to describe physical phenomena.",
+      "id": "2961-960-0019",
+      "set": "subset",
+      "duration": 12.13,
+      "reference": "HE COULD WRITE IN ONE STYLE BUT NOT IN ANOTHER AND THE GREEK LANGUAGE HAD NOT AS YET BEEN FASHIONED BY ANY POET OR PHILOSOPHER TO DESCRIBE PHYSICAL PHENOMENA",
+      "rtfx": 42.58600252844113,
+      "wer": 0.034482758620689655
+    },
+    {
+      "latency_s": 0.47451583298970945,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.7067190000088885
+      },
+      "transcript": "In this way, the fete of the whole court was a fete also for the mysterious inhabitants of the forest, for certainly the deer in the break, the pheasant on the branch, the fox in its hole, were all listening.",
+      "id": "7127-75947-0040",
+      "set": "subset",
+      "duration": 13.79,
+      "reference": "IN THIS WAY THE FETE OF THE WHOLE COURT WAS A FETE ALSO FOR THE MYSTERIOUS INHABITANTS OF THE FOREST FOR CERTAINLY THE DEER IN THE BRAKE THE PHEASANT ON THE BRANCH THE FOX IN ITS HOLE WERE ALL LISTENING",
+      "rtfx": 29.061200999586152,
+      "wer": 0.025
+    },
+    {
+      "latency_s": 0.711963666981319,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.7802532500063535
+      },
+      "transcript": "Sometimes he thought he would like to stand in a conspicuous pulpit, and humbly preach the gospel of repentance, and it even crossed his mind that it would be noble, to give himself to a missionary life to some benighted region, where the date palm grows, and the nightingale's voice is in tune, and the bull bull sings on the oppnights.",
+      "id": "4970-29093-0005",
+      "set": "subset",
+      "duration": 22.16,
+      "reference": "SOMETIMES HE THOUGHT HE WOULD LIKE TO STAND IN A CONSPICUOUS PULPIT AND HUMBLY PREACH THE GOSPEL OF REPENTANCE AND IT EVEN CROSSED HIS MIND THAT IT WOULD BE NOBLE TO GIVE HIMSELF TO A MISSIONARY LIFE TO SOME BENIGHTED REGION WHERE THE DATE PALM GROWS AND THE NIGHTINGALE'S VOICE IS IN TUNE AND THE BUL BUL SINGS ON THE OFF NIGHTS",
+      "rtfx": 31.125183808826932,
+      "wer": 0.06451612903225806
+    },
+    {
+      "latency_s": 0.14895991701632738,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.7803673750022426
+      },
+      "transcript": "Only that one, answered the tree.",
+      "id": "672-122797-0059",
+      "set": "subset",
+      "duration": 3.52,
+      "reference": "ONLY THAT ONE ANSWERED THE TREE",
+      "rtfx": 23.630517997765637,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.23999687502509914,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.9317057500011288
+      },
+      "transcript": "When she could not make a rabbit or a bird look real on paper, she searched in her father's books for pictures of its bones.",
+      "id": "4992-41797-0014",
+      "set": "subset",
+      "duration": 7.215,
+      "reference": "WHEN SHE COULD NOT MAKE A RABBIT OR A BIRD LOOK REAL ON PAPER SHE SEARCHED IN HER FATHER'S BOOKS FOR PICTURES OF ITS BONES",
+      "rtfx": 30.062891440755,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5455280829919502,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.9826963329978753
+      },
+      "transcript": "We may be stopped, the fact may be put to us in general terms, which is one way of attenuating it. We may be told that all trades, professions, it may be added, all the accidents of the social hierarchy, and all forms of intelligence have their own slang.",
+      "id": "4507-16021-0020",
+      "set": "subset",
+      "duration": 22.5,
+      "reference": "WE MAY BE STOPPED THE FACT MAY BE PUT TO US IN GENERAL TERMS WHICH IS ONE WAY OF ATTENUATING IT WE MAY BE TOLD THAT ALL TRADES PROFESSIONS IT MAY BE ADDED ALL THE ACCIDENTS OF THE SOCIAL HIERARCHY AND ALL FORMS OF INTELLIGENCE HAVE THEIR OWN SLANG",
+      "rtfx": 41.24443947339739,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.30224654197809286,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.9829534580057953
+      },
+      "transcript": "There, in the cedar hollow, then, lived Olive Lord, an angry, resentful little creature weighed down by a fierce sense of injury.",
+      "id": "4992-41797-0018",
+      "set": "subset",
+      "duration": 9.155,
+      "reference": "THERE IN THE CEDAR HOLLOW THEN LIVED OLIVE LORD AN ANGRY RESENTFUL LITTLE CREATURE WEIGHED DOWN BY A FIERCE SENSE OF INJURY",
+      "rtfx": 30.289841994829384,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.675813209003536,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 2.9919223329925444
+      },
+      "transcript": "You are now in the only country in the world where wit can make a fortune by selling either a genuine or a false article. In the first case, it receives the welcome of intelligent and talented people, and in the second, fools are always ready to reward it. For silliness is truly a characteristic of the people here, and however wonderful it may appear, silliness is the daughter of wit.",
+      "id": "3729-6852-0033",
+      "set": "subset",
+      "duration": 28.575,
+      "reference": "YOU ARE NOW IN THE ONLY COUNTRY IN THE WORLD WHERE WIT CAN MAKE A FORTUNE BY SELLING EITHER A GENUINE OR A FALSE ARTICLE IN THE FIRST CASE IT RECEIVES THE WELCOME OF INTELLIGENT AND TALENTED PEOPLE AND IN THE SECOND FOOLS ARE ALWAYS READY TO REWARD IT FOR SILLINESS IS TRULY A CHARACTERISTIC OF THE PEOPLE HERE AND HOWEVER WONDERFUL IT MAY APPEAR SILLINESS IS THE DAUGHTER OF WIT",
+      "rtfx": 42.28239344734454,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.21083749999525025,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.065051040990511
+      },
+      "transcript": "Philip therefore read diligently in the Astor Library, planned literary works that should compel attention, and nursed his genius.",
+      "id": "4970-29093-0009",
+      "set": "subset",
+      "duration": 9.12,
+      "reference": "PHILIP THEREFORE READ DILIGENTLY IN THE ASTOR LIBRARY PLANNED LITERARY WORKS THAT SHOULD COMPEL ATTENTION AND NURSED HIS GENIUS",
+      "rtfx": 43.25606213413389,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.6211727079935372,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.1723078330105636
+      },
+      "transcript": "Independent of her fortune, she has beauty to captivate the heart of any man, and with all her follies, she has a frankness in her manner, an unaffected wisdom in her thoughts, of vivacity in her conversation, and withal a softness in her demeanour, that might alone engage the affections of a man of the nicest sentiments and the strongest understanding.",
+      "id": "4992-23283-0012",
+      "set": "subset",
+      "duration": 21.735,
+      "reference": "INDEPENDENT OF HER FORTUNE SHE HAS BEAUTY TO CAPTIVATE THE HEART OF ANY MAN AND WITH ALL HER FOLLIES SHE HAS A FRANKNESS IN HER MANNER AN UNAFFECTED WISDOM IN HER THOUGHTS A VIVACITY IN HER CONVERSATION AND WITHAL A SOFTNESS IN HER DEMEANOUR THAT MIGHT ALONE ENGAGE THE AFFECTIONS OF A MAN OF THE NICEST SENTIMENTS AND THE STRONGEST UNDERSTANDING",
+      "rtfx": 34.99026876149577,
+      "wer": 0.01639344262295082
+    },
+    {
+      "latency_s": 0.18244070798391476,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.181668500008527
+      },
+      "transcript": "I reside in the Mare Rouge de Duport.",
+      "id": "3729-6852-0043",
+      "set": "subset",
+      "duration": 4.205,
+      "reference": "I RESIDE IN THE MARAIS RUE DE DOUZE PORTES",
+      "rtfx": 23.048584093253695,
+      "wer": 0.4444444444444444
+    },
+    {
+      "latency_s": 0.3648522919975221,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.276411500002723
+      },
+      "transcript": "I love thee with a love I seemed to lose with my lost saints. I love thee with the breath, smiles, tears of all my life, and if God choose, I shall but love thee better after death.",
+      "id": "908-31957-0025",
+      "set": "subset",
+      "duration": 20.56,
+      "reference": "I LOVE THEE WITH A LOVE I SEEMED TO LOSE WITH MY LOST SAINTS I LOVE THEE WITH THE BREATH SMILES TEARS OF ALL MY LIFE AND IF GOD CHOOSE I SHALL BUT LOVE THEE BETTER AFTER DEATH",
+      "rtfx": 56.351571446725714,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.08833937501185574,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.2858268749841955
+      },
+      "transcript": "I named nine others and said.",
+      "id": "5142-33396-0039",
+      "set": "subset",
+      "duration": 1.995,
+      "reference": "I NAMED NINE OTHERS AND SAID",
+      "rtfx": 22.583361040671363,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.27688833299907856,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.364541791001102
+      },
+      "transcript": "Fortunately, said Mister Vanderpool, Northerners and Southerners are arriving at a better mutual understanding on most of these matters.",
+      "id": "1995-1836-0014",
+      "set": "subset",
+      "duration": 9.045,
+      "reference": "FORTUNATELY SAID MISTER VANDERPOOL NORTHERNERS AND SOUTHERNERS ARE ARRIVING AT A BETTER MUTUAL UNDERSTANDING ON MOST OF THESE MATTERS",
+      "rtfx": 32.66659848766579,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5167932079930324,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.374139332998311
+      },
+      "transcript": "He passes abruptly from persons to ideas and numbers, and from ideas and numbers to persons, from the heavens to man, from astronomy to physiology. He confuses, or rather, does not distinguish subject and object, first and final causes, and is dreaming of geometrical figures lost in a flux of sense.",
+      "id": "2961-960-0000",
+      "set": "subset",
+      "duration": 27.18,
+      "reference": "HE PASSES ABRUPTLY FROM PERSONS TO IDEAS AND NUMBERS AND FROM IDEAS AND NUMBERS TO PERSONS FROM THE HEAVENS TO MAN FROM ASTRONOMY TO PHYSIOLOGY HE CONFUSES OR RATHER DOES NOT DISTINGUISH SUBJECT AND OBJECT FIRST AND FINAL CAUSES AND IS DREAMING OF GEOMETRICAL FIGURES LOST IN A FLUX OF SENSE",
+      "rtfx": 52.593570464197064,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.22653049998916686,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.374348249984905
+      },
+      "transcript": "I see they lay helpless and naked, weeping and none to answer, none to cherish thee with mother's smiles.",
+      "id": "908-157963-0025",
+      "set": "subset",
+      "duration": 9.265,
+      "reference": "I SEE THEY LAY HELPLESS AND NAKED WEEPING AND NONE TO ANSWER NONE TO CHERISH THEE WITH MOTHERS SMILES",
+      "rtfx": 40.899569817058065,
+      "wer": 0.05263157894736842
+    },
+    {
+      "latency_s": 0.1154972079966683,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.4948048329970334
+      },
+      "transcript": "Most of all, Robin thought of his father. What would he counsel?",
+      "id": "61-70970-0002",
+      "set": "subset",
+      "duration": 4.165,
+      "reference": "MOST OF ALL ROBIN THOUGHT OF HIS FATHER WHAT WOULD HE COUNSEL",
+      "rtfx": 36.06147778152478,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5447576669976115,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.5293543330044486
+      },
+      "transcript": "Without going to any such extreme as this, we can easily see on reflection how vast an influence on the ideas and conceptions, as well as on the principles of action in mature years, must be exerted by the nature and character of the images which the period of infancy and childhood impress upon the mind.",
+      "id": "7021-79759-0004",
+      "set": "subset",
+      "duration": 24.47,
+      "reference": "WITHOUT GOING TO ANY SUCH EXTREME AS THIS WE CAN EASILY SEE ON REFLECTION HOW VAST AN INFLUENCE ON THE IDEAS AND CONCEPTIONS AS WELL AS ON THE PRINCIPLES OF ACTION IN MATURE YEARS MUST BE EXERTED BY THE NATURE AND CHARACTER OF THE IMAGES WHICH THE PERIOD OF INFANCY AND CHILDHOOD IMPRESSES UPON THE MIND",
+      "rtfx": 44.91905572410656,
+      "wer": 0.017857142857142856
+    },
+    {
+      "latency_s": 0.4069951669953298,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.6011845000030007
+      },
+      "transcript": "Before any could stop him, he butted his majesty so furiously that the king soared far into the air and tumbled in a heap among the benches, where he lay moaning and groaning.",
+      "id": "8555-284447-0019",
+      "set": "subset",
+      "duration": 10.28,
+      "reference": "BEFORE ANY COULD STOP HIM HE BUTTED HIS MAJESTY SO FURIOUSLY THAT THE KING SOARED FAR INTO THE AIR AND TUMBLED IN A HEAP AMONG THE BENCHES WHERE HE LAY MOANING AND GROANING",
+      "rtfx": 25.25828519265429,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2807231660117395,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.610567666008137
+      },
+      "transcript": "The Mohicans started on his feet and shook his shaggy covering as though the animal he counterfeited was about to make some desperate effort.",
+      "id": "1320-122617-0039",
+      "set": "subset",
+      "duration": 7.055,
+      "reference": "THE MOHICAN STARTED ON HIS FEET AND SHOOK HIS SHAGGY COVERING AS THOUGH THE ANIMAL HE COUNTERFEITED WAS ABOUT TO MAKE SOME DESPERATE EFFORT",
+      "rtfx": 25.13152049483856,
+      "wer": 0.041666666666666664
+    },
+    {
+      "latency_s": 0.5401232079893816,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.6416239159880206
+      },
+      "transcript": "Guided by you, how we might stroll towards death, our only music one another's breath, through gardens intimate with hollyhocks, where silent poppies burn between the rocks, by pools where birches bend to confidants above green waters scummed with lily plants.",
+      "id": "8555-292519-0001",
+      "set": "subset",
+      "duration": 20.82,
+      "reference": "GUIDED BY YOU HOW WE MIGHT STROLL TOWARDS DEATH OUR ONLY MUSIC ONE ANOTHER'S BREATH THROUGH GARDENS INTIMATE WITH HOLLYHOCKS WHERE SILENT POPPIES BURN BETWEEN THE ROCKS BY POOLS WHERE BIRCHES BEND TO CONFIDANTS ABOVE GREEN WATERS SCUMMED WITH LILY PLANTS",
+      "rtfx": 38.546760613199396,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5492339589982294,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.641656874999171
+      },
+      "transcript": "While the former foretold that the Scottish Covenanters, were secretly forming a union with the English Parliament, and inculcated the necessity of preventing them by some vigorous undertaking, the latter still insisted that every such attempt would precipitate them into measures to which otherwise they were not perhaps inclined.",
+      "id": "8224-274381-0002",
+      "set": "subset",
+      "duration": 24.54,
+      "reference": "WHILE THE FORMER FORETOLD THAT THE SCOTTISH COVENANTERS WERE SECRETLY FORMING A UNION WITH THE ENGLISH PARLIAMENT AND INCULCATED THE NECESSITY OF PREVENTING THEM BY SOME VIGOROUS UNDERTAKING THE LATTER STILL INSISTED THAT EVERY SUCH ATTEMPT WOULD PRECIPITATE THEM INTO MEASURES TO WHICH OTHERWISE THEY WERE NOT PERHAPS INCLINED",
+      "rtfx": 44.680412778480644,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.13663670801906846,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.6684444999846164
+      },
+      "transcript": "A great Saint Saint Francis Xavier.",
+      "id": "1089-134686-0036",
+      "set": "subset",
+      "duration": 3.25,
+      "reference": "A GREAT SAINT SAINT FRANCIS XAVIER",
+      "rtfx": 23.785701859462563,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.10403345798840746,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.7961096249928232
+      },
+      "transcript": "Again, he searched his own thoughts, nor ineffectually as before.",
+      "id": "4992-23283-0016",
+      "set": "subset",
+      "duration": 4.495,
+      "reference": "AGAIN HE SEARCHED HIS OWN THOUGHTS NOR INEFFECTUALLY AS BEFORE",
+      "rtfx": 43.20725357894844,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.43609033297980204,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.805283916008193
+      },
+      "transcript": "The condition is that I will be permitted to make Luther talk American, streamline him, so to speak, because you will never get people, whether in or outside the Lutheran Church, actually to read Luther unless we make him talk as he would talk today to Americans.",
+      "id": "2830-3979-0001",
+      "set": "subset",
+      "duration": 16.125,
+      "reference": "THE CONDITION IS THAT I WILL BE PERMITTED TO MAKE LUTHER TALK AMERICAN STREAMLINE HIM SO TO SPEAK BECAUSE YOU WILL NEVER GET PEOPLE WHETHER IN OR OUTSIDE THE LUTHERAN CHURCH ACTUALLY TO READ LUTHER UNLESS WE MAKE HIM TALK AS HE WOULD TALK TODAY TO AMERICANS",
+      "rtfx": 36.97628399560704,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.22240512497955933,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.8913330000068527
+      },
+      "transcript": "Brother Macardal. Brother Kiyof.",
+      "id": "1089-134691-0010",
+      "set": "subset",
+      "duration": 3.195,
+      "reference": "BROTHER MAC ARDLE BROTHER KEOGH",
+      "rtfx": 14.365676151993547,
+      "wer": 0.6
+    },
+    {
+      "latency_s": 0.3499112499994226,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.891475165990414
+      },
+      "transcript": "A gramophone, by the help of suitable records, might relate to us the incidents of its past, and people are not so different from gramophones as they like to believe.",
+      "id": "8230-279154-0027",
+      "set": "subset",
+      "duration": 11.135,
+      "reference": "A GRAMOPHONE BY THE HELP OF SUITABLE RECORDS MIGHT RELATE TO US THE INCIDENTS OF ITS PAST AND PEOPLE ARE NOT SO DIFFERENT FROM GRAMOPHONES AS THEY LIKE TO BELIEVE",
+      "rtfx": 31.822354954344494,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.6631377919984516,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 3.9004239159985445
+      },
+      "transcript": "Thus saying and pressing the crucifix to her breast, she fell fainting into the arms of Donna Estaphania, who as a gentlewoman, to whose sex pity is as natural as cruelty as to man, instantly pressed her lips to those of the fainting girl, shedding over her so many tears that there needed no other sprinkling of water to recover Leucadia from her swoon.",
+      "id": "5639-40744-0027",
+      "set": "subset",
+      "duration": 23.26,
+      "reference": "THUS SAYING AND PRESSING THE CRUCIFIX TO HER BREAST SHE FELL FAINTING INTO THE ARMS OF DONA ESTAFANIA WHO AS A GENTLEWOMAN TO WHOSE SEX PITY IS AS NATURAL AS CRUELTY IS TO MAN INSTANTLY PRESSED HER LIPS TO THOSE OF THE FAINTING GIRL SHEDDING OVER HER SO MANY TEARS THAT THERE NEEDED NO OTHER SPRINKLING OF WATER TO RECOVER LEOCADIA FROM HER SWOON",
+      "rtfx": 35.07566644618908,
+      "wer": 0.0625
+    },
+    {
+      "latency_s": 0.5550390410062391,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.008432915987214
+      },
+      "transcript": "The man of the household also can do something in this direction, and indeed he commonly does, but with a still lower descent into the levels of indigence, along the margin of the slums, the man and presently also the children virtually cease to consume valuable goods for appearances, and the woman remains virtually the sole exponent of the household's pecuniary decency.",
+      "id": "3570-5695-0005",
+      "set": "subset",
+      "duration": 20.03,
+      "reference": "THE MAN OF THE HOUSEHOLD ALSO CAN DO SOMETHING IN THIS DIRECTION AND INDEED HE COMMONLY DOES BUT WITH A STILL LOWER DESCENT INTO THE LEVELS OF INDIGENCE ALONG THE MARGIN OF THE SLUMS THE MAN AND PRESENTLY ALSO THE CHILDREN VIRTUALLY CEASE TO CONSUME VALUABLE GOODS FOR APPEARANCES AND THE WOMAN REMAINS VIRTUALLY THE SOLE EXPONENT OF THE HOUSEHOLD'S PECUNIARY DECENCY",
+      "rtfx": 36.087551541756945,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.24259333300869912,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.0744551660027355
+      },
+      "transcript": "Pack as much into my trunk as you can—my traveling kit, my suits, shirts, and socks. Don't bother counting; just squeeze it all in, and hurry.",
+      "id": "8463-294828-0017",
+      "set": "subset",
+      "duration": 9.3,
+      "reference": "PACK AS MUCH INTO MY TRUNK AS YOU CAN MY TRAVELING KIT MY SUITS SHIRTS AND SOCKS DON'T BOTHER COUNTING JUST SQUEEZE IT ALL IN AND HURRY",
+      "rtfx": 38.33576085813749,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5308209590148181,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.114014499995392
+      },
+      "transcript": "This meant that for an alleged misdemeanor, for which Congress prescribed a maximum penalty of six months imprisonment, and a fine of three hundred dollars, a man might be imprisoned for life, aye for many terms of a man's natural life. Did the court's power to enforce its sentences extend so far, and might be fined millions of dollars?",
+      "id": "4077-13754-0012",
+      "set": "subset",
+      "duration": 22.095,
+      "reference": "THIS MEANT THAT FOR AN ALLEGED MISDEMEANOR FOR WHICH CONGRESS PRESCRIBED A MAXIMUM PENALTY OF SIX MONTHS IMPRISONMENT AND A FINE OF THREE HUNDRED DOLLARS A MAN MIGHT BE IMPRISONED FOR LIFE AYE FOR MANY TERMS OF A MAN'S NATURAL LIFE DID THE COURT'S POWER TO ENFORCE ITS SENTENCES EXTEND SO FAR AND MIGHT BE FINED MILLIONS OF DOLLARS",
+      "rtfx": 41.62420421568774,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.23694699999759905,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.182170332991518
+      },
+      "transcript": "When Bartley arrived at Bedford Square on Sunday evening, Marie, the pretty little French girl, met him at the door and conducted him upstairs.",
+      "id": "4446-2273-0003",
+      "set": "subset",
+      "duration": 7.835,
+      "reference": "WHEN BARTLEY ARRIVED AT BEDFORD SQUARE ON SUNDAY EVENING MARIE THE PRETTY LITTLE FRENCH GIRL MET HIM AT THE DOOR AND CONDUCTED HIM UPSTAIRS",
+      "rtfx": 33.06646634090911,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.11685945899807848,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.191192583006341
+      },
+      "transcript": "May we see Gates at once? Asked Kenneth.",
+      "id": "6829-68769-0013",
+      "set": "subset",
+      "duration": 2.725,
+      "reference": "MAY WE SEE GATES AT ONCE ASKED KENNETH",
+      "rtfx": 23.31860872336237,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.18661212499137037,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.2415402499900665
+      },
+      "transcript": "But suddenly, straight and swift as a diving cormorant, he shot down into the torrent and disappeared beneath the surface.",
+      "id": "7176-88083-0004",
+      "set": "subset",
+      "duration": 7.5,
+      "reference": "BUT SUDDENLY STRAIGHT AND SWIFT AS A DIVING CORMORANT HE SHOT DOWN INTO THE TORRENT AND DISAPPEARED BENEATH THE SURFACE",
+      "rtfx": 40.19031453795849,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.233855250000488,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.241570832993602
+      },
+      "transcript": "And yet, you must own her behavior has warranted them—has it not been in this particular incoherent and unaccountable?",
+      "id": "4992-23283-0004",
+      "set": "subset",
+      "duration": 8.06,
+      "reference": "AND YET YOU MUST OWN HER BEHAVIOUR HAS WARRANTED THEM HAS IT NOT BEEN IN THIS PARTICULAR INCOHERENT AND UNACCOUNTABLE",
+      "rtfx": 34.46576461286706,
+      "wer": 0.05
+    },
+    {
+      "latency_s": 0.44503924998571165,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.308204790984746
+      },
+      "transcript": "The painter who says my grinder, the notary who says my skip the gutter, the hairdresser who says my mealy back, the cobbler who says my cub, talks slang.",
+      "id": "4507-16021-0021",
+      "set": "subset",
+      "duration": 14.48,
+      "reference": "THE PAINTER WHO SAYS MY GRINDER THE NOTARY WHO SAYS MY SKIP THE GUTTER THE HAIRDRESSER WHO SAYS MY MEALYBACK THE COBBLER WHO SAYS MY CUB TALKS SLANG",
+      "rtfx": 32.53645605520163,
+      "wer": 0.07142857142857142
+    },
+    {
+      "latency_s": 0.42690533300628886,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.317304541007616
+      },
+      "transcript": "Listen then, Socrates, to a tale of Solon's, who, being the friend of Dropidas, my great grandfather, told it to my grandfather Critias, and he told me.",
+      "id": "2961-961-0004",
+      "set": "subset",
+      "duration": 11.48,
+      "reference": "LISTEN THEN SOCRATES TO A TALE OF SOLON'S WHO BEING THE FRIEND OF DROPIDAS MY GREAT GRANDFATHER TOLD IT TO MY GRANDFATHER CRITIAS AND HE TOLD ME",
+      "rtfx": 26.891207751276525,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.3561056249891408,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.4193512499914505
+      },
+      "transcript": "With many variations, suggested by the nature of his building materials, diversity of climate, and a different mode of social life, Governor Bellingham had planned his new habitation after the residences of gentlemen of fairest state in his native land.",
+      "id": "1221-135767-0016",
+      "set": "subset",
+      "duration": 15.255,
+      "reference": "WITH MANY VARIATIONS SUGGESTED BY THE NATURE OF HIS BUILDING MATERIALS DIVERSITY OF CLIMATE AND A DIFFERENT MODE OF SOCIAL LIFE GOVERNOR BELLINGHAM HAD PLANNED HIS NEW HABITATION AFTER THE RESIDENCES OF GENTLEMEN OF FAIR ESTATE IN HIS NATIVE LAND",
+      "rtfx": 42.83841346360421,
+      "wer": 0.05
+    },
+    {
+      "latency_s": 0.12506579101318493,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.428506791009568
+      },
+      "transcript": "Was it not enough to say from God the Father?",
+      "id": "2830-3980-0046",
+      "set": "subset",
+      "duration": 2.84,
+      "reference": "WAS IT NOT ENOUGH TO SAY FROM GOD THE FATHER",
+      "rtfx": 22.708048116055938,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2996691250009462,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.475695041008294
+      },
+      "transcript": "Its depth remained invariable—still four or at most five fathoms—and although its bottom was assiduously dredged, it was only to prove it barren of marine production of any type.",
+      "id": "5105-28241-0018",
+      "set": "subset",
+      "duration": 12.83,
+      "reference": "ITS DEPTH REMAINED INVARIABLE STILL FOUR OR AT MOST FIVE FATHOMS AND ALTHOUGH ITS BOTTOM WAS ASSIDUOUSLY DREDGED IT WAS ONLY TO PROVE IT BARREN OF MARINE PRODUCTION OF ANY TYPE",
+      "rtfx": 42.81388681586563,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.09118287501041777,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.553777875000378
+      },
+      "transcript": "Mr. Edison was a leader far ahead of the time.",
+      "id": "2300-131720-0014",
+      "set": "subset",
+      "duration": 3.75,
+      "reference": "MISTER EDISON WAS A LEADER FAR AHEAD OF THE TIME",
+      "rtfx": 41.126143473448906,
+      "wer": 0.1
+    },
+    {
+      "latency_s": 0.21139974999823608,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.563786665996304
+      },
+      "transcript": "How cheerfully he seems to grin, how neatly spread his claws and welcome little fishes in with gently smiling jaws.",
+      "id": "260-123440-0010",
+      "set": "subset",
+      "duration": 8.315,
+      "reference": "HOW CHEERFULLY HE SEEMS TO GRIN HOW NEATLY SPREAD HIS CLAWS AND WELCOME LITTLE FISHES IN WITH GENTLY SMILING JAWS",
+      "rtfx": 39.3330644907072,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.18953895900631323,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.56383095800993
+      },
+      "transcript": "What then? A human hand, large and shapely, appeared distinctly on the surface of the pond.",
+      "id": "6930-81414-0006",
+      "set": "subset",
+      "duration": 6.8,
+      "reference": "WHAT THEN A HUMAN HAND LARGE AND SHAPELY APPEARED DISTINCTLY ON THE SURFACE OF THE POND",
+      "rtfx": 35.87652921409948,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.44687916699331254,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.645141207991401
+      },
+      "transcript": "That will be very well, my child,\" replied her father, \"if your plan were not liable to be frustrated by ordinary cunning, but no doubt this image had been already missed by its owner, and he will have set it down for certain that it was taken out of the room by the person he locked up there.\"",
+      "id": "5639-40744-0018",
+      "set": "subset",
+      "duration": 15.415,
+      "reference": "THAT WOULD BE VERY WELL MY CHILD REPLIED HER FATHER IF YOUR PLAN WERE NOT LIABLE TO BE FRUSTRATED BY ORDINARY CUNNING BUT NO DOUBT THIS IMAGE HAS BEEN ALREADY MISSED BY ITS OWNER AND HE WILL HAVE SET IT DOWN FOR CERTAIN THAT IT WAS TAKEN OUT OF THE ROOM BY THE PERSON HE LOCKED UP THERE",
+      "rtfx": 34.49478324021017,
+      "wer": 0.034482758620689655
+    },
+    {
+      "latency_s": 0.5862402920029126,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.6452176659950055
+      },
+      "transcript": "Angry with himself, he tried to hide his face from their eyes by gazing down sideways into the shallow, swirling water under the bridge, but he still saw a reflection therein of their top-heavy silksuits, and humble tape-like collars, and loosely hanging clerical clothes. Brother Hickey.",
+      "id": "1089-134691-0009",
+      "set": "subset",
+      "duration": 20.055,
+      "reference": "ANGRY WITH HIMSELF HE TRIED TO HIDE HIS FACE FROM THEIR EYES BY GAZING DOWN SIDEWAYS INTO THE SHALLOW SWIRLING WATER UNDER THE BRIDGE BUT HE STILL SAW A REFLECTION THEREIN OF THEIR TOP HEAVY SILK HATS AND HUMBLE TAPE LIKE COLLARS AND LOOSELY HANGING CLERICAL CLOTHES BROTHER HICKEY",
+      "rtfx": 34.209521715884314,
+      "wer": 0.04081632653061224
+    },
+    {
+      "latency_s": 0.17618158299592324,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.744508915988263
+      },
+      "transcript": "As usual, nothing was done in the way of punishment.",
+      "id": "8463-287645-0008",
+      "set": "subset",
+      "duration": 3.325,
+      "reference": "AS USUAL NOTHING WAS DONE IN THE WAY OF PUNISHMENT",
+      "rtfx": 18.87257421269134,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.29570395799237303,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.753503457992338
+      },
+      "transcript": "He doesn't say, but it's on the frontier, and on the map, everything beyond it is marked Indians and desert, and looks as desolate as a Wednesday meeting. It was time for him to do something.",
+      "id": "4970-29095-0028",
+      "set": "subset",
+      "duration": 14.67,
+      "reference": "HE DOESN'T SAY BUT IT'S ON THE FRONTIER AND ON THE MAP EVERYTHING BEYOND IT IS MARKED INDIANS AND DESERT AND LOOKS AS DESOLATE AS A WEDNESDAY MEETING HUMPH IT WAS TIME FOR HIM TO DO SOMETHING",
+      "rtfx": 49.610428279686325,
+      "wer": 0.02702702702702703
+    },
+    {
+      "latency_s": 0.2958820410131011,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.753639708011178
+      },
+      "transcript": "Henry Lord, with the degree of Ph.D. to his credit, had been professor of zoology at a New England college, but had resigned his post in order to write a series of scientific text books.",
+      "id": "4992-41797-0009",
+      "set": "subset",
+      "duration": 13.195,
+      "reference": "HENRY LORD WITH THE DEGREE OF PH D TO HIS CREDIT HAD BEEN PROFESSOR OF ZOOLOGY AT A NEW ENGLAND COLLEGE BUT HAD RESIGNED HIS POST IN ORDER TO WRITE A SERIES OF SCIENTIFIC TEXT BOOKS",
+      "rtfx": 44.59547444927808,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.26423425000393763,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.775578790984582
+      },
+      "transcript": "The last drop fly, as luck would have it, caught just in the corner of the hawk's angrily open beak, hooking itself firmly.",
+      "id": "7176-88083-0024",
+      "set": "subset",
+      "duration": 8.195,
+      "reference": "THE LAST DROP FLY AS LUCK WOULD HAVE IT CAUGHT JUST IN THE CORNER OF THE HAWK'S ANGRILY OPEN BEAK HOOKING ITSELF FIRMLY",
+      "rtfx": 31.014147484203423,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.4083705410012044,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.775649124989286
+      },
+      "transcript": "He set off abruptly for the bull, walking rapidly lest his father's shrill whistle might call him back, and in a few moments he had rounded the curve at the police barrack and was safe.",
+      "id": "1089-134691-0002",
+      "set": "subset",
+      "duration": 11.6,
+      "reference": "HE SET OFF ABRUPTLY FOR THE BULL WALKING RAPIDLY LEST HIS FATHER'S SHRILL WHISTLE MIGHT CALL HIM BACK AND IN A FEW MOMENTS HE HAD ROUNDED THE CURVE AT THE POLICE BARRACK AND WAS SAFE",
+      "rtfx": 28.405574926046853,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.3841178329894319,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.775741749996087
+      },
+      "transcript": "Simply by stopping her carriage two or three times before the shop, to have her snuff box filled, and by saying aloud to the young girl who handed back the box that her snuff was the very best in Paris,",
+      "id": "3729-6852-0032",
+      "set": "subset",
+      "duration": 13.64,
+      "reference": "SIMPLY BY STOPPING HER CARRIAGE TWO OR THREE TIMES BEFORE THE SHOP TO HAVE HER SNUFF BOX FILLED AND BY SAYING ALOUD TO THE YOUNG GIRL WHO HANDED BACK THE BOX THAT HER SNUFF WAS THE VERY BEST IN PARIS",
+      "rtfx": 35.509936869750256,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.3915047920017969,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 4.920890790992416
+      },
+      "transcript": "Who was it she was in love with? The story will tell. I took upon myself to reply. Oh, I can't wait for the story. The story won't tell,\" said Douglas. \"Not in any literal vulgar way. What is the pity then?\"",
+      "id": "121-127105-0020",
+      "set": "subset",
+      "duration": 14.355,
+      "reference": "WHO WAS IT SHE WAS IN LOVE WITH THE STORY WILL TELL I TOOK UPON MYSELF TO REPLY OH I CAN'T WAIT FOR THE STORY THE STORY WON'T TELL SAID DOUGLAS NOT IN ANY LITERAL VULGAR WAY MORE'S THE PITY THEN",
+      "rtfx": 36.66621786824544,
+      "wer": 0.04878048780487805
+    },
+    {
+      "latency_s": 0.4269899159844499,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.040215374989202
+      },
+      "transcript": "The seasons, allies of spring, followed him closely to form a quadrille. Which, after many words of more or less flattering import, was the commencement of the dance.",
+      "id": "7127-75946-0016",
+      "set": "subset",
+      "duration": 11.21,
+      "reference": "THE SEASONS ALLIES OF SPRING FOLLOWED HIM CLOSELY TO FORM A QUADRILLE WHICH AFTER MANY WORDS OF MORE OR LESS FLATTERING IMPORT WAS THE COMMENCEMENT OF THE DANCE",
+      "rtfx": 26.25354740323246,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5404083749745041,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.049490625009639
+      },
+      "transcript": "Five hundred men more, who had been levied by the Covenanters, were persuaded to embrace the royal cause, and with this combined force he hastened to attack Lord Elcho, who lay at Perth with an army of six thousand men, assembled upon the first news of the Irish invasion.",
+      "id": "8224-274381-0004",
+      "set": "subset",
+      "duration": 21.255,
+      "reference": "FIVE HUNDRED MEN MORE WHO HAD BEEN LEVIED BY THE COVENANTERS WERE PERSUADED TO EMBRACE THE ROYAL CAUSE AND WITH THIS COMBINED FORCE HE HASTENED TO ATTACK LORD ELCHO WHO LAY AT PERTH WITH AN ARMY OF SIX THOUSAND MEN ASSEMBLED UPON THE FIRST NEWS OF THE IRISH INVASION",
+      "rtfx": 39.33136676685069,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.32464800000889227,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.049718333000783
+      },
+      "transcript": "But Hawkey, who was too much occupied with his own thoughts to note the movement, continued speaking more to himself than to his companion.",
+      "id": "1320-122617-0024",
+      "set": "subset",
+      "duration": 7.555,
+      "reference": "BUT HAWKEYE WHO WAS TOO MUCH OCCUPIED WITH HIS OWN THOUGHTS TO NOTE THE MOVEMENT CONTINUED SPEAKING MORE TO HIMSELF THAN TO HIS COMPANION",
+      "rtfx": 23.271358516895422,
+      "wer": 0.041666666666666664
+    },
+    {
+      "latency_s": 0.27294904098380357,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.0923413329874165
+      },
+      "transcript": "She was the most agreeable woman I've ever known in her position. She would have been worthy of any whatever.",
+      "id": "121-127105-0011",
+      "set": "subset",
+      "duration": 5.78,
+      "reference": "SHE WAS THE MOST AGREEABLE WOMAN I'VE EVER KNOWN IN HER POSITION SHE WOULD HAVE BEEN WORTHY OF ANY WHATEVER",
+      "rtfx": 21.176113970457138,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5009914579859469,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.160163249995094
+      },
+      "transcript": "It is to let Hamlet, if that happen to be the name of your character, enter with a small dog, pet falcon, mongoose, tame bear, or whatever animal is most in keeping with the part, and confide in this animal such sorrows, hopes, or secret history as the audience has got to know.",
+      "id": "7176-92135-0025",
+      "set": "subset",
+      "duration": 15.74,
+      "reference": "IT IS TO LET HAMLET IF THAT HAPPEN TO BE THE NAME OF YOUR CHARACTER ENTER WITH A SMALL DOG PET FALCON MONGOOSE TAME BEAR OR WHATEVER ANIMAL IS MOST IN KEEPING WITH THE PART AND CONFIDE IN THIS ANIMAL SUCH SORROWS HOPES OR SECRET HISTORY AS THE AUDIENCE HAS GOT TO KNOW",
+      "rtfx": 31.41770133821626,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.23311816700152121,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.184375040989835
+      },
+      "transcript": "Missus Never Ben, you must indeed be proud of your son.",
+      "id": "8455-210777-0012",
+      "set": "subset",
+      "duration": 3.525,
+      "reference": "MISSUS NEVERBEND YOU MUST INDEED BE PROUD OF YOUR SON",
+      "rtfx": 15.121086637477712,
+      "wer": 0.2
+    },
+    {
+      "latency_s": 0.40559520802344196,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.231793832994299
+      },
+      "transcript": "Here is an equally typical Greek school landscape by Wilson, lost wholly in golden mist, the trees so slightly drawn that you don't know if they are trees or towers, and no care for color whatsoever. Perfectly deceptive in marvelous effect of sunshine through the mist, Apollo and the Python.",
+      "id": "1188-133604-0026",
+      "set": "subset",
+      "duration": 20.125,
+      "reference": "HERE IS AN EQUALLY TYPICAL GREEK SCHOOL LANDSCAPE BY WILSON LOST WHOLLY IN GOLDEN MIST THE TREES SO SLIGHTLY DRAWN THAT YOU DON'T KNOW IF THEY ARE TREES OR TOWERS AND NO CARE FOR COLOR WHATEVER PERFECTLY DECEPTIVE AND MARVELOUS EFFECT OF SUNSHINE THROUGH THE MIST APOLLO AND THE PYTHON",
+      "rtfx": 49.618436317514,
+      "wer": 0.04
+    },
+    {
+      "latency_s": 0.3157270000083372,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.312703208008315
+      },
+      "transcript": "The fact that it was Churning Day was another reason why it was inconvenient to have the widows, and why consequently, Missus Poisur should scold Molly the housemaid with unusual severity.",
+      "id": "2094-142345-0014",
+      "set": "subset",
+      "duration": 12.995,
+      "reference": "THE FACT THAT IT WAS CHURNING DAY WAS ANOTHER REASON WHY IT WAS INCONVENIENT TO HAVE THE WHITTAWS AND WHY CONSEQUENTLY MISSUS POYSER SHOULD SCOLD MOLLY THE HOUSEMAID WITH UNUSUAL SEVERITY",
+      "rtfx": 41.15897594965539,
+      "wer": 0.06451612903225806
+    },
+    {
+      "latency_s": 0.38264795899158344,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.365509041002952
+      },
+      "transcript": "Then turning towards me, he says that I look like a foreigner, and when I say that I am an Italian, he begins to speak to me of the court, the city, of the theatres, and at last he offers to accompany me everywhere.",
+      "id": "3729-6852-0020",
+      "set": "subset",
+      "duration": 13.215,
+      "reference": "THEN TURNING TOWARDS ME HE SAYS THAT I LOOK LIKE A FOREIGNER AND WHEN I SAY THAT I AM AN ITALIAN HE BEGINS TO SPEAK TO ME OF THE COURT OF THE CITY OF THE THEATRES AND AT LAST HE OFFERS TO ACCOMPANY ME EVERYWHERE",
+      "rtfx": 34.535660492809974,
+      "wer": 0.022222222222222223
+    },
+    {
+      "latency_s": 0.5019014170102309,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.374522833008086
+      },
+      "transcript": "Toddy, however, had descended from her chair with great swiftness and was already in retreat towards the dairy, with a sort of waddling run, and an amount of fat on the nape of her neck which made her look like the metamorphosis of a white suckling pig.",
+      "id": "2094-142345-0030",
+      "set": "subset",
+      "duration": 16.12,
+      "reference": "TOTTY HOWEVER HAD DESCENDED FROM HER CHAIR WITH GREAT SWIFTNESS AND WAS ALREADY IN RETREAT TOWARDS THE DAIRY WITH A SORT OF WADDLING RUN AND AN AMOUNT OF FAT ON THE NAPE OF HER NECK WHICH MADE HER LOOK LIKE THE METAMORPHOSIS OF A WHITE SUCKLING PIG",
+      "rtfx": 32.117861105124966,
+      "wer": 0.02127659574468085
+    },
+    {
+      "latency_s": 0.4175689579860773,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.417674166004872
+      },
+      "transcript": "We are of course in fact able to judge when we recognize an object that we have seen it before, but this judgment is something over and above recognition in this first sense, and may very probably be impossible to animals that nevertheless have the experience of recognition in this first sense of the word.",
+      "id": "8230-279154-0038",
+      "set": "subset",
+      "duration": 22.49,
+      "reference": "WE ARE OF COURSE IN FACT ABLE TO JUDGE WHEN WE RECOGNIZE AN OBJECT THAT WE HAVE SEEN IT BEFORE BUT THIS JUDGMENT IS SOMETHING OVER AND ABOVE RECOGNITION IN THIS FIRST SENSE AND MAY VERY PROBABLY BE IMPOSSIBLE TO ANIMALS THAT NEVERTHELESS HAVE THE EXPERIENCE OF RECOGNITION IN THIS FIRST SENSE OF THE WORD",
+      "rtfx": 53.85936758438319,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.12261966601363383,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.467587999999523
+      },
+      "transcript": "He sat down, weak, bewildered, and one thought was uppermost: Zora.",
+      "id": "1995-1837-0019",
+      "set": "subset",
+      "duration": 5.38,
+      "reference": "HE SAT DOWN WEAK BEWILDERED AND ONE THOUGHT WAS UPPERMOST ZORA",
+      "rtfx": 43.87550688159441,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.09497999999439344,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.590377415996045
+      },
+      "transcript": "But the general distinction is not on that account to be overlooked.",
+      "id": "3570-5694-0019",
+      "set": "subset",
+      "duration": 3.755,
+      "reference": "BUT THE GENERAL DISTINCTION IS NOT ON THAT ACCOUNT TO BE OVERLOOKED",
+      "rtfx": 39.53463887367502,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.0706182089925278,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.590422540990403
+      },
+      "transcript": "Do you remember that first walk we took together in Paris?",
+      "id": "4446-2273-0018",
+      "set": "subset",
+      "duration": 3.4,
+      "reference": "DO YOU REMEMBER THAT FIRST WALK WE TOOK TOGETHER IN PARIS",
+      "rtfx": 48.14622246168489,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.20673383300891146,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.628667374985525
+      },
+      "transcript": "We have come from a far lonelier place than this—a lonelier place.",
+      "id": "1284-1180-0012",
+      "set": "subset",
+      "duration": 4.88,
+      "reference": "WE HAVE COME FROM A FAR LONELIER PLACE THAN THIS A LONELIER PLACE",
+      "rtfx": 23.605231562603702,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.18882091698469594,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.637720333004836
+      },
+      "transcript": "This attitude is universal and particularly developed in those who consider themselves better than others.",
+      "id": "2830-3980-0074",
+      "set": "subset",
+      "duration": 5.7,
+      "reference": "THIS ATTITUDE IS UNIVERSAL AND PARTICULARLY DEVELOPED IN THOSE WHO CONSIDER THEMSELVES BETTER THAN OTHERS",
+      "rtfx": 30.187333538169337,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.16526787501061335,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.661278124985984
+      },
+      "transcript": "It is unintelligible in the dark.",
+      "id": "4507-16021-0041",
+      "set": "subset",
+      "duration": 2.975,
+      "reference": "IT IS UNINTELLIGIBLE IN THE DARK",
+      "rtfx": 18.001078550861433,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.49841512501006946,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.661358999990625
+      },
+      "transcript": "The free state men had only their convictions, their intelligence, their courage, and the moral support of the North. The conspiracy had its secret combination, the territorial officials, the legislature, the bogus laws, the courts, the militia officers, the president, and the army.",
+      "id": "7729-102255-0004",
+      "set": "subset",
+      "duration": 20.155,
+      "reference": "THE FREE STATE MEN HAD ONLY THEIR CONVICTIONS THEIR INTELLIGENCE THEIR COURAGE AND THE MORAL SUPPORT OF THE NORTH THE CONSPIRACY HAD ITS SECRET COMBINATION THE TERRITORIAL OFFICIALS THE LEGISLATURE THE BOGUS LAWS THE COURTS THE MILITIA OFFICERS THE PRESIDENT AND THE ARMY",
+      "rtfx": 40.43817891680717,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2947591249831021,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.6856780409871135
+      },
+      "transcript": "The news circulated with the rapidity of lightning. During its progress, it kindled every variety of coquetry, desire, and wild ambition.",
+      "id": "7127-75946-0012",
+      "set": "subset",
+      "duration": 9.87,
+      "reference": "THE NEWS CIRCULATED WITH THE RAPIDITY OF LIGHTNING DURING ITS PROGRESS IT KINDLED EVERY VARIETY OF COQUETRY DESIRE AND WILD AMBITION",
+      "rtfx": 33.48496844861317,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5185740840097424,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.748396832990693
+      },
+      "transcript": "Here he was placed in the custody of Captain Martin, of the Kickapoo Rangers, who proved a kind jailer, and materially assisted in protecting him from the dangerous intentions of the mob, which at that time held Levenworth under the reign of terror.",
+      "id": "7729-102255-0044",
+      "set": "subset",
+      "duration": 17.105,
+      "reference": "HERE HE WAS PLACED IN THE CUSTODY OF CAPTAIN MARTIN OF THE KICKAPOO RANGERS WHO PROVED A KIND JAILER AND MATERIALLY ASSISTED IN PROTECTING HIM FROM THE DANGEROUS INTENTIONS OF THE MOB WHICH AT THAT TIME HELD LEAVENWORTH UNDER A REIGN OF TERROR",
+      "rtfx": 32.9846795808613,
+      "wer": 0.046511627906976744
+    },
+    {
+      "latency_s": 0.14492679201066494,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.826708625012543
+      },
+      "transcript": "I am my dear, and all strangers are welcome to my home.",
+      "id": "1284-1180-0011",
+      "set": "subset",
+      "duration": 4.275,
+      "reference": "I AM MY DEAR AND ALL STRANGERS ARE WELCOME TO MY HOME",
+      "rtfx": 29.497651474169178,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.15370762499514967,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.826739915995859
+      },
+      "transcript": "Far from it, sire, your Majesty having given no directions about it, the musicians have retained it.",
+      "id": "7127-75946-0020",
+      "set": "subset",
+      "duration": 6.52,
+      "reference": "FAR FROM IT SIRE YOUR MAJESTY HAVING GIVEN NO DIRECTIONS ABOUT IT THE MUSICIANS HAVE RETAINED IT",
+      "rtfx": 42.41819493473887,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2727597909979522,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.835457665991271
+      },
+      "transcript": "She sat down in a rocking chair, and clasping her hands in her lap, rocked slowly back and forth. \"I'm sorry,\" said Beth.",
+      "id": "6829-68771-0025",
+      "set": "subset",
+      "duration": 7.83,
+      "reference": "SHE SAT DOWN IN A ROCKING CHAIR AND CLASPING HER HANDS IN HER LAP ROCKED SLOWLY BACK AND FORTH I'M SORRY SAID BETH",
+      "rtfx": 28.706577209757373,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.3237265410134569,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.835613708011806
+      },
+      "transcript": "At last, the little mice stayed away also, and the tree sighed. After all, it was very pleasant when the sleek little mice sat round me, and listened to what I told them.",
+      "id": "672-122797-0064",
+      "set": "subset",
+      "duration": 15.27,
+      "reference": "AT LAST THE LITTLE MICE STAYED AWAY ALSO AND THE TREE SIGHED AFTER ALL IT WAS VERY PLEASANT WHEN THE SLEEK LITTLE MICE SAT ROUND ME AND LISTENED TO WHAT I TOLD THEM",
+      "rtfx": 47.16944107268995,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.24070283299079165,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.876626874989597
+      },
+      "transcript": "Many laws exist among us which are the counterpart of yours as they were in the olden time.",
+      "id": "2961-961-0015",
+      "set": "subset",
+      "duration": 6.815,
+      "reference": "MANY LAWS EXIST AMONG US WHICH ARE THE COUNTERPART OF YOURS AS THEY WERE IN THE OLDEN TIME",
+      "rtfx": 28.31291977465307,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.33230020801420324,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.971899500000291
+      },
+      "transcript": "She tried this morning an air or two upon the piano, sang a simple song in a sweet but slightly metallic voice, and then, seating herself by the open window, read Philip's letter.",
+      "id": "4970-29095-0001",
+      "set": "subset",
+      "duration": 13.91,
+      "reference": "SHE TRIED THIS MORNING AN AIR OR TWO UPON THE PIANO SANG A SIMPLE SONG IN A SWEET BUT SLIGHTLY METALLIC VOICE AND THEN SEATING HERSELF BY THE OPEN WINDOW READ PHILIP'S LETTER",
+      "rtfx": 41.85973906885263,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.17888245801441371,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.980625500000315
+      },
+      "transcript": "But the dusk deepening in the schoolroom covered over his thoughts. The bell rang.",
+      "id": "1089-134686-0015",
+      "set": "subset",
+      "duration": 5.815,
+      "reference": "BUT THE DUSK DEEPENING IN THE SCHOOLROOM COVERED OVER HIS THOUGHTS THE BELL RANG",
+      "rtfx": 32.50737978752198,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.6580555420077872,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 5.98071108298609
+      },
+      "transcript": "Envy, hatred, malice, and uncharitableness are never so essentially detestable to my mind as when they are animated by the sense of propriety and work under the surface. But for my interest in Naomi and my other interest in the little love looks which I now and then surprised passing between her and Ambrose, I should never have sat through that supper.",
+      "id": "5142-36377-0021",
+      "set": "subset",
+      "duration": 18.87,
+      "reference": "ENVY HATRED MALICE AND UNCHARITABLENESS ARE NEVER SO ESSENTIALLY DETESTABLE TO MY MIND AS WHEN THEY ARE ANIMATED BY A SENSE OF PROPRIETY AND WORK UNDER THE SURFACE BUT FOR MY INTEREST IN NAOMI AND MY OTHER INTEREST IN THE LITTLE LOVE LOOKS WHICH I NOW AND THEN SURPRISED PASSING BETWEEN HER AND AMBROSE I SHOULD NEVER HAVE SAT THROUGH THAT SUPPER",
+      "rtfx": 28.67539105046653,
+      "wer": 0.016129032258064516
+    },
+    {
+      "latency_s": 0.34152662500855513,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.108520165988011
+      },
+      "transcript": "But Anne had begun to suffer just before the holidays, and Charlotte watched over her younger sisters, with the jealous vigilance of some wild creature, that changes her very nature if danger threatens her young.",
+      "id": "3575-170457-0053",
+      "set": "subset",
+      "duration": 11.945,
+      "reference": "BUT ANNE HAD BEGUN TO SUFFER JUST BEFORE THE HOLIDAYS AND CHARLOTTE WATCHED OVER HER YOUNGER SISTERS WITH THE JEALOUS VIGILANCE OF SOME WILD CREATURE THAT CHANGES HER VERY NATURE IF DANGER THREATENS HER YOUNG",
+      "rtfx": 34.97531122119917,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.15809129201807082,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.1175554580113385
+      },
+      "transcript": "What do you mean? Inquired Luis.",
+      "id": "7127-75946-0005",
+      "set": "subset",
+      "duration": 2.67,
+      "reference": "WHAT DO YOU MEAN INQUIRED LOUIS",
+      "rtfx": 16.8889757678418,
+      "wer": 0.16666666666666666
+    },
+    {
+      "latency_s": 0.6749996670114342,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.159526333009126
+      },
+      "transcript": "The colorist says, \"First of all, as my delicious peric quite was ruby. So this nasty viper shall be black. And then, as the question, can I round him off, even though he is black and make him slimy, and yet springy and close down, clotted like a pool of black blood on the earth, all the same?\"",
+      "id": "1188-133604-0023",
+      "set": "subset",
+      "duration": 23.67,
+      "reference": "THE COLORIST SAYS FIRST OF ALL AS MY DELICIOUS PAROQUET WAS RUBY SO THIS NASTY VIPER SHALL BE BLACK AND THEN IS THE QUESTION CAN I ROUND HIM OFF EVEN THOUGH HE IS BLACK AND MAKE HIM SLIMY AND YET SPRINGY AND CLOSE DOWN CLOTTED LIKE A POOL OF BLACK BLOOD ON THE EARTH ALL THE SAME",
+      "rtfx": 35.06668396563674,
+      "wer": 0.05263157894736842
+    },
+    {
+      "latency_s": 0.14468608400784433,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.159703415993135
+      },
+      "transcript": "May you drink heart's ease from it for many years.",
+      "id": "5142-33396-0050",
+      "set": "subset",
+      "duration": 2.885,
+      "reference": "MAY YOU DRINK HEART'S EASE FROM IT FOR MANY YEARS",
+      "rtfx": 19.93971997917634,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2902648329909425,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.159935957984999
+      },
+      "transcript": "The wind never lulls, but to acquire increased strength, the vast bank of heavy clouds is a huge reservoir of fearful windy gusts and rushing storms.",
+      "id": "260-123288-0007",
+      "set": "subset",
+      "duration": 11.2,
+      "reference": "THE WIND NEVER LULLS BUT TO ACQUIRE INCREASED STRENGTH THE VAST BANK OF HEAVY CLOUDS IS A HUGE RESERVOIR OF FEARFUL WINDY GUSTS AND RUSHING STORMS",
+      "rtfx": 38.58545275565465,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2608163339900784,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.26720941599342
+      },
+      "transcript": "Did ever anybody see the like? Screamed Missus Poisur, running towards the table, when her eye had fallen on the blue stream.",
+      "id": "2094-142345-0029",
+      "set": "subset",
+      "duration": 8.525,
+      "reference": "DID EVER ANYBODY SEE THE LIKE SCREAMED MISSUS POYSER RUNNING TOWARDS THE TABLE WHEN HER EYE HAD FALLEN ON THE BLUE STREAM",
+      "rtfx": 32.68583631086654,
+      "wer": 0.045454545454545456
+    },
+    {
+      "latency_s": 0.13340466699446552,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.275773458008189
+      },
+      "transcript": "He's not a man for country quarters.",
+      "id": "5683-32865-0014",
+      "set": "subset",
+      "duration": 2.615,
+      "reference": "HE'S NOT A MAN FOR COUNTRY QUARTERS",
+      "rtfx": 19.60201287492054,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.32473337498959154,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.30443504100549
+      },
+      "transcript": "In a few moments, he heard the cherries dropping smartly into the pail, and he began to swing his scythe with that long, even stroke that few American boys ever learn.",
+      "id": "237-134500-0012",
+      "set": "subset",
+      "duration": 10.935,
+      "reference": "IN A FEW MOMENTS HE HEARD THE CHERRIES DROPPING SMARTLY INTO THE PAIL AND HE BEGAN TO SWING HIS SCYTHE WITH THAT LONG EVEN STROKE THAT FEW AMERICAN BOYS EVER LEARN",
+      "rtfx": 33.673779297709984,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.6417832919978537,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.304519750003237
+      },
+      "transcript": "American schoolboys read with emotions of horror, of the Albigenses, driven beaten and killed, with a purple legate directing the butchery, and of the Vodou, hunted and hounded like beasts, as the effect of a royal decree. And they yet shall read in the history of their own country, of scenes as terrible as these, in the exhibition of injustice and inhuman hate.",
+      "id": "4077-13751-0018",
+      "set": "subset",
+      "duration": 26.115,
+      "reference": "AMERICAN SCHOOL BOYS READ WITH EMOTIONS OF HORROR OF THE ALBIGENSES DRIVEN BEATEN AND KILLED WITH A PAPAL LEGATE DIRECTING THE BUTCHERY AND OF THE VAUDOIS HUNTED AND HOUNDED LIKE BEASTS AS THE EFFECT OF A ROYAL DECREE AND THEY YET SHALL READ IN THE HISTORY OF THEIR OWN COUNTRY OF SCENES AS TERRIBLE AS THESE IN THE EXHIBITION OF INJUSTICE AND INHUMAN HATE",
+      "rtfx": 40.69130550080966,
+      "wer": 0.0625
+    },
+    {
+      "latency_s": 0.04963112500263378,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.409306707995711
+      },
+      "transcript": "Those clouds seem as if they were going to crush the sea.",
+      "id": "260-123288-0009",
+      "set": "subset",
+      "duration": 3.435,
+      "reference": "THOSE CLOUDS SEEM AS IF THEY WERE GOING TO CRUSH THE SEA",
+      "rtfx": 69.21060120675715,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.1884267080167774,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.45029995799996
+      },
+      "transcript": "But they have nothing to do with the interpretation of Plato, and in spirit, they are opposed to him.",
+      "id": "2961-960-0007",
+      "set": "subset",
+      "duration": 7.64,
+      "reference": "BUT THEY HAVE NOTHING TO DO WITH THE INTERPRETATION OF PLATO AND IN SPIRIT THEY ARE OPPOSED TO HIM",
+      "rtfx": 40.546269052897415,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.39337920799152926,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.450378665991593
+      },
+      "transcript": "Edison had installed his historic first great central station system in New York, on the multiple arc system covered by his feeder and main invention, which resulted in a notable saving in the cost of conductors, as against a straight two wire system, throughout of the tree kind.",
+      "id": "2300-131720-0017",
+      "set": "subset",
+      "duration": 19.915,
+      "reference": "EDISON HAD INSTALLED HIS HISTORIC FIRST GREAT CENTRAL STATION SYSTEM IN NEW YORK ON THE MULTIPLE ARC SYSTEM COVERED BY HIS FEEDER AND MAIN INVENTION WHICH RESULTED IN A NOTABLE SAVING IN THE COST OF CONDUCTORS AS AGAINST A STRAIGHT TWO WIRE SYSTEM THROUGHOUT OF THE TREE KIND",
+      "rtfx": 50.625451461147975,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.22179416700964794,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.459139457991114
+      },
+      "transcript": "But it is surmise that you will find difficulties in the way of your entering at once upon your governor.",
+      "id": "8455-210777-0059",
+      "set": "subset",
+      "duration": 5.535,
+      "reference": "BUT IT IS SURMISED THAT YOU WILL FIND DIFFICULTIES IN THE WAY OF YOUR ENTERING AT ONCE UPON YOUR GOVERNMENT",
+      "rtfx": 24.95557062940808,
+      "wer": 0.1
+    },
+    {
+      "latency_s": 0.3953502499789465,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.528274999989662
+      },
+      "transcript": "All dissent, all non-compliance, all hesitation, all mere silence—even were in their stronghold towns like Levenworth, branded as abolitionism, declared to be hostility to the public welfare, and punished with proscription, personal violence, expulsion, and frequently death.",
+      "id": "7729-102255-0009",
+      "set": "subset",
+      "duration": 18.56,
+      "reference": "ALL DISSENT ALL NON COMPLIANCE ALL HESITATION ALL MERE SILENCE EVEN WERE IN THEIR STRONGHOLD TOWNS LIKE LEAVENWORTH BRANDED AS ABOLITIONISM DECLARED TO BE HOSTILITY TO THE PUBLIC WELFARE AND PUNISHED WITH PROSCRIPTION PERSONAL VIOLENCE EXPULSION AND FREQUENTLY DEATH",
+      "rtfx": 46.94571459354931,
+      "wer": 0.02564102564102564
+    },
+    {
+      "latency_s": 0.28478887502569705,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.62947158300085
+      },
+      "transcript": "What you had best do, my child, is to keep it, and pray to it that since it was a witness to your undoing, it will deign to vindicate your cause by its righteous judgment.",
+      "id": "5639-40744-0019",
+      "set": "subset",
+      "duration": 12.06,
+      "reference": "WHAT YOU HAD BEST DO MY CHILD IS TO KEEP IT AND PRAY TO IT THAT SINCE IT WAS A WITNESS TO YOUR UNDOING IT WILL DEIGN TO VINDICATE YOUR CAUSE BY ITS RIGHTEOUS JUDGMENT",
+      "rtfx": 42.3471598000863,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.19592037500115111,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.638936041010311
+      },
+      "transcript": "There cannot be a doubt; he received you kindly. For in fact, you returned without his permission.",
+      "id": "7127-75947-0015",
+      "set": "subset",
+      "duration": 6.26,
+      "reference": "THERE CANNOT BE A DOUBT HE RECEIVED YOU KINDLY FOR IN FACT YOU RETURNED WITHOUT HIS PERMISSION",
+      "rtfx": 31.951755910855212,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.4842700829904061,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.63901466599782
+      },
+      "transcript": "But the actual course of development has been somewhat different from this ideal scheme. Leisure held the first place at the start and came to all the rank very much above wasteful consumption of goods, both as a direct exponent of wealth and as an element in the standard of decency, during the course I peaceful culture.",
+      "id": "3570-5696-0001",
+      "set": "subset",
+      "duration": 16.735,
+      "reference": "BUT THE ACTUAL COURSE OF DEVELOPMENT HAS BEEN SOMEWHAT DIFFERENT FROM THIS IDEAL SCHEME LEISURE HELD THE FIRST PLACE AT THE START AND CAME TO HOLD A RANK VERY MUCH ABOVE WASTEFUL CONSUMPTION OF GOODS BOTH AS A DIRECT EXPONENT OF WEALTH AND AS AN ELEMENT IN THE STANDARD OF DECENCY DURING THE QUASI PEACEABLE CULTURE",
+      "rtfx": 34.55716259955612,
+      "wer": 0.08928571428571429
+    },
+    {
+      "latency_s": 0.24250512500293553,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.681088499986799
+      },
+      "transcript": "The first well-established seat of the church was in the pretty little town of Kirkland, Ohio, almost within sight of Lake Erie. And here soon rose the first temple of modern times.",
+      "id": "4077-13751-0009",
+      "set": "subset",
+      "duration": 12.15,
+      "reference": "THE FIRST WELL ESTABLISHED SEAT OF THE CHURCH WAS IN THE PRETTY LITTLE TOWN OF KIRTLAND OHIO ALMOST WITHIN SIGHT OF LAKE ERIE AND HERE SOON ROSE THE FIRST TEMPLE OF MODERN TIMES",
+      "rtfx": 50.10203392548065,
+      "wer": 0.030303030303030304
+    },
+    {
+      "latency_s": 0.20149124998715706,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.835018790996401
+      },
+      "transcript": "I knew nothing of the doctrine of faith because we were taught sophistry instead of certainty, and nobody understood spiritual boasting.",
+      "id": "2830-3980-0019",
+      "set": "subset",
+      "duration": 7.015,
+      "reference": "I KNEW NOTHING OF THE DOCTRINE OF FAITH BECAUSE WE WERE TAUGHT SOPHISTRY INSTEAD OF CERTAINTY AND NOBODY UNDERSTOOD SPIRITUAL BOASTING",
+      "rtfx": 34.81540761917518,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.08840524998959154,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.83504962499137
+      },
+      "transcript": "Now, Mister Solms, at your disposal.",
+      "id": "1580-141083-0018",
+      "set": "subset",
+      "duration": 2.675,
+      "reference": "NOW MISTER SOAMES AT YOUR DISPOSAL",
+      "rtfx": 30.25838397962726,
+      "wer": 0.16666666666666666
+    },
+    {
+      "latency_s": 0.20101412499207072,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.844042000011541
+      },
+      "transcript": "Oh, she's always at the piano,\" said Van. \"She must be there now somewhere,\" and then somebody laughed.",
+      "id": "237-126133-0005",
+      "set": "subset",
+      "duration": 6.51,
+      "reference": "OH SHE'S ALWAYS AT THE PIANO SAID VAN SHE MUST BE THERE NOW SOMEWHERE AND THEN SOMEBODY LAUGHED",
+      "rtfx": 32.385783836119955,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.12201187500613742,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.914505374996224
+      },
+      "transcript": "But thou art not such a lover, my beloved.",
+      "id": "908-31957-0018",
+      "set": "subset",
+      "duration": 3.915,
+      "reference": "BUT THOU ART NOT SUCH A LOVER MY BELOVED",
+      "rtfx": 32.08704070651376,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.3677622910181526,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.923692415992264
+      },
+      "transcript": "But. They dragged him out of the room, and up the stairs, into the loft. And here, in a dark corner, where no daylight could enter. They left him.",
+      "id": "672-122797-0042",
+      "set": "subset",
+      "duration": 15.31,
+      "reference": "BUT THEY DRAGGED HIM OUT OF THE ROOM AND UP THE STAIRS INTO THE LOFT AND HERE IN A DARK CORNER WHERE NO DAYLIGHT COULD ENTER THEY LEFT HIM",
+      "rtfx": 41.630151796189196,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.19936550001148134,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.923772290989291
+      },
+      "transcript": "The wine did certainly bring back the color to the squire's cheeks.",
+      "id": "61-70968-0056",
+      "set": "subset",
+      "duration": 3.565,
+      "reference": "THE WINE DID CERTAINLY BRING BACK THE COLOR TO THE SQUIRE'S CHEEKS",
+      "rtfx": 17.881729786721845,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.12124791601672769,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.9238264999876264
+      },
+      "transcript": "Make acquaintance with Mister Yago. Sit together.",
+      "id": "5142-36377-0012",
+      "set": "subset",
+      "duration": 2.715,
+      "reference": "MAKE ACQUAINTANCE WITH MISTER JAGO SIT TOGETHER",
+      "rtfx": 22.392137441978228,
+      "wer": 0.14285714285714285
+    },
+    {
+      "latency_s": 0.34500816697254777,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 6.946583332988666
+      },
+      "transcript": "And the wan oracle, having spoken, she sat down in the same sort of abstraction again beside Dorcas, and she looked full in her cousin's eyes.",
+      "id": "5683-32879-0016",
+      "set": "subset",
+      "duration": 10.185,
+      "reference": "AND THE WAN ORACLE HAVING SPOKEN SHE SATE DOWN IN THE SAME SORT OF ABSTRACTION AGAIN BESIDE DORCAS AND SHE LOOKED FULL IN HER COUSIN'S EYES",
+      "rtfx": 29.521040297026996,
+      "wer": 0.038461538461538464
+    },
+    {
+      "latency_s": 0.6355832500266843,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.036798207991524
+      },
+      "transcript": "Now you will see in these studies that the moment the white is enclosed properly, and harmonized with the other hues, it becomes somehow more precious and pearly than the white paper. And that I am not afraid to leave a whole field of untreated white paper all round it, being sure that even the little diamonds in the round window will tell as jewels if they are gradated justly.",
+      "id": "1188-133604-0009",
+      "set": "subset",
+      "duration": 23.06,
+      "reference": "NOW YOU WILL SEE IN THESE STUDIES THAT THE MOMENT THE WHITE IS INCLOSED PROPERLY AND HARMONIZED WITH THE OTHER HUES IT BECOMES SOMEHOW MORE PRECIOUS AND PEARLY THAN THE WHITE PAPER AND THAT I AM NOT AFRAID TO LEAVE A WHOLE FIELD OF UNTREATED WHITE PAPER ALL ROUND IT BEING SURE THAT EVEN THE LITTLE DIAMONDS IN THE ROUND WINDOW WILL TELL AS JEWELS IF THEY ARE GRADATED JUSTLY",
+      "rtfx": 36.28163580307041,
+      "wer": 0.014285714285714285
+    },
+    {
+      "latency_s": 0.4074487909965683,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.03682970799855
+      },
+      "transcript": "The use of the word \"waste\" as a technical term, therefore, implies no deprecation of the motives or of the ends sought by the consumer under this canon of conspicuous waste.",
+      "id": "3570-5696-0007",
+      "set": "subset",
+      "duration": 9.5,
+      "reference": "THE USE OF THE WORD WASTE AS A TECHNICAL TERM THEREFORE IMPLIES NO DEPRECATION OF THE MOTIVES OR OF THE ENDS SOUGHT BY THE CONSUMER UNDER THIS CANON OF CONSPICUOUS WASTE",
+      "rtfx": 23.315813446799535,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.246279292012332,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.045181666006101
+      },
+      "transcript": "She closed her eyes and took a deep breath, as if to draw in again the fragrance of those days.",
+      "id": "4446-2275-0026",
+      "set": "subset",
+      "duration": 5.495,
+      "reference": "SHE CLOSED HER EYES AND TOOK A DEEP BREATH AS IF TO DRAW IN AGAIN THE FRAGRANCE OF THOSE DAYS",
+      "rtfx": 22.312066739760027,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.2544121249811724,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.045285250002053
+      },
+      "transcript": "The air and the earth are curiously mated and intermingled as if the one were the breath of the other.",
+      "id": "237-134493-0004",
+      "set": "subset",
+      "duration": 6.825,
+      "reference": "THE AIR AND THE EARTH ARE CURIOUSLY MATED AND INTERMINGLED AS IF THE ONE WERE THE BREATH OF THE OTHER",
+      "rtfx": 26.826551606001797,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.5698297920171171,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.123347665998153
+      },
+      "transcript": "O tis the first, tis flattery in my seeing, and my great mind most kingly drinks it up. Mine eye well knows what with his gust is greening, and to his palate doth prepare the cup. If it be poisoned, tis the lesser sin, that mine eye loves it, and doth first begin.",
+      "id": "121-123859-0001",
+      "set": "subset",
+      "duration": 25.395,
+      "reference": "O TIS THE FIRST TIS FLATTERY IN MY SEEING AND MY GREAT MIND MOST KINGLY DRINKS IT UP MINE EYE WELL KNOWS WHAT WITH HIS GUST IS GREEING AND TO HIS PALATE DOTH PREPARE THE CUP IF IT BE POISON'D TIS THE LESSER SIN THAT MINE EYE LOVES IT AND DOTH FIRST BEGIN",
+      "rtfx": 44.565939436239866,
+      "wer": 0.03773584905660377
+    },
+    {
+      "latency_s": 0.1259571670088917,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.123468125006184
+      },
+      "transcript": "She has been dead these twenty years.",
+      "id": "121-127105-0009",
+      "set": "subset",
+      "duration": 2.29,
+      "reference": "SHE HAS BEEN DEAD THESE TWENTY YEARS",
+      "rtfx": 18.180783629710742,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.11006170901237056,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.249572125001578
+      },
+      "transcript": "Robin was glad when, at length, they were left to their own devices.",
+      "id": "61-70968-0055",
+      "set": "subset",
+      "duration": 3.965,
+      "reference": "ROBIN WAS GLAD WHEN AT LENGTH THEY WERE LEFT TO THEIR OWN DEVICES",
+      "rtfx": 36.02524470662497,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.32102804200258106,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.291662500007078
+      },
+      "transcript": "But her greeting to Captain Leak, was more than usually haughty and frozen, and her features I fancied, particularly proud and pale.",
+      "id": "5683-32865-0005",
+      "set": "subset",
+      "duration": 10.12,
+      "reference": "BUT HER GREETING TO CAPTAIN LAKE WAS MORE THAN USUALLY HAUGHTY AND FROZEN AND HER FEATURES I FANCIED PARTICULARLY PROUD AND PALE",
+      "rtfx": 31.523725892826008,
+      "wer": 0.045454545454545456
+    },
+    {
+      "latency_s": 0.16137983300723135,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.291771165997488
+      },
+      "transcript": "So there is to me added Sanford with a sarcastic sneer.",
+      "id": "4992-23283-0003",
+      "set": "subset",
+      "duration": 4.645,
+      "reference": "SO THERE IS TO ME ADDED SANDFORD WITH A SARCASTIC SNEER",
+      "rtfx": 28.7830264379556,
+      "wer": 0.09090909090909091
+    },
+    {
+      "latency_s": 0.23008391697658226,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.291796333011007
+      },
+      "transcript": "He weighed and reweighed the meter plates, and pursued every line of investigation imaginable, but all in vain.",
+      "id": "2300-131720-0037",
+      "set": "subset",
+      "duration": 7.965,
+      "reference": "HE WEIGHED AND REWEIGHED THE METER PLATES AND PURSUED EVERY LINE OF INVESTIGATION IMAGINABLE BUT ALL IN VAIN",
+      "rtfx": 34.61780425448281,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.23101333301747218,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.299863082997035
+      },
+      "transcript": "But in Egypt, the traditions of our own and other lands are by us registered forever in our temples.",
+      "id": "2961-961-0010",
+      "set": "subset",
+      "duration": 7.83,
+      "reference": "BUT IN EGYPT THE TRADITIONS OF OUR OWN AND OTHER LANDS ARE BY US REGISTERED FOR EVER IN OUR TEMPLES",
+      "rtfx": 33.89414757029542,
+      "wer": 0.1
+    },
+    {
+      "latency_s": 0.4722831670078449,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.3598725000047125
+      },
+      "transcript": "In determining whether two or more allied forms ought to be ranked as species or varieties, naturalists are practically guided by the following considerations: namely, the amount of difference between them, and whether such differences relate to few or many points of structure, and whether they are of physiological importance, but more especially whether they are constant.",
+      "id": "5142-36600-0001",
+      "set": "subset",
+      "duration": 20.185,
+      "reference": "IN DETERMINING WHETHER TWO OR MORE ALLIED FORMS OUGHT TO BE RANKED AS SPECIES OR VARIETIES NATURALISTS ARE PRACTICALLY GUIDED BY THE FOLLOWING CONSIDERATIONS NAMELY THE AMOUNT OF DIFFERENCE BETWEEN THEM AND WHETHER SUCH DIFFERENCES RELATE TO FEW OR MANY POINTS OF STRUCTURE AND WHETHER THEY ARE OF PHYSIOLOGICAL IMPORTANCE BUT MORE ESPECIALLY WHETHER THEY ARE CONSTANT",
+      "rtfx": 42.73918998189642,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.1103056660213042,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.444538707990432
+      },
+      "transcript": "In this whole epistle, Paul treats of the resurrection of Christ.",
+      "id": "2830-3980-0024",
+      "set": "subset",
+      "duration": 3.935,
+      "reference": "IN THIS WHOLE EPISTLE PAUL TREATS OF THE RESURRECTION OF CHRIST",
+      "rtfx": 35.6735981199733,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.49052058401866816,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.453403999999864
+      },
+      "transcript": "So, those offices which are by right the proper employment of the leisure class are noble, such as government fighting, hunting, the care of arms and accoutrements, and the like. In short, those which may be classed as ostensibly predatory employments.",
+      "id": "3570-5694-0020",
+      "set": "subset",
+      "duration": 14.035,
+      "reference": "SO THOSE OFFICES WHICH ARE BY RIGHT THE PROPER EMPLOYMENT OF THE LEISURE CLASS ARE NOBLE SUCH AS GOVERNMENT FIGHTING HUNTING THE CARE OF ARMS AND ACCOUTREMENTS AND THE LIKE IN SHORT THOSE WHICH MAY BE CLASSED AS OSTENSIBLY PREDATORY EMPLOYMENTS",
+      "rtfx": 28.612458798397455,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.1412469999922905,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.522068624995882
+      },
+      "transcript": "Grace involves the remission of sins, peace, and a happy conscience.",
+      "id": "2830-3980-0041",
+      "set": "subset",
+      "duration": 4.89,
+      "reference": "GRACE INVOLVES THE REMISSION OF SINS PEACE AND A HAPPY CONSCIENCE",
+      "rtfx": 34.620204324813294,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.4300165000022389,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.531033415987622
+      },
+      "transcript": "It is to tenfold life, to love, to peace, and raptures wholly, unseen descending, weigh my light wings upon balmy flowers, and court the fair I do to take me to her shining tent, the weeping virgin trembling kneels before the risen sun.",
+      "id": "908-157963-0019",
+      "set": "subset",
+      "duration": 21.44,
+      "reference": "IT IS TO TENFOLD LIFE TO LOVE TO PEACE AND RAPTURES HOLY UNSEEN DESCENDING WEIGH MY LIGHT WINGS UPON BALMY FLOWERS AND COURT THE FAIR EYED DEW TO TAKE ME TO HER SHINING TENT THE WEEPING VIRGIN TREMBLING KNEELS BEFORE THE RISEN SUN",
+      "rtfx": 49.85855193902646,
+      "wer": 0.06976744186046512
+    },
+    {
+      "latency_s": 0.2771695420087781,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.555117624986451
+      },
+      "transcript": "Hold him fast, my men, and as soon as I've had my coffee and oatmeal, I'll take him to the room of the great knife and patch him.",
+      "id": "8555-284447-0001",
+      "set": "subset",
+      "duration": 8.61,
+      "reference": "HOLD HIM FAST MY MEN AND AS SOON AS I'VE HAD MY COFFEE AND OATMEAL I'LL TAKE HIM TO THE ROOM OF THE GREAT KNIFE AND PATCH HIM",
+      "rtfx": 31.06401929158333,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.08045687500271015,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.61310679098824
+      },
+      "transcript": "Bring in the table. We are hungry.",
+      "id": "5142-33396-0029",
+      "set": "subset",
+      "duration": 2.135,
+      "reference": "BRING IN THE TABLE WE ARE HUNGRY",
+      "rtfx": 26.53595481962335,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.1010461249970831,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.663530082994839
+      },
+      "transcript": "Won't you tell Douglas?",
+      "id": "121-127105-0021",
+      "set": "subset",
+      "duration": 2.0,
+      "reference": "WON'T YOU TELL DOUGLAS",
+      "rtfx": 19.792941095541607,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.1593731249740813,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.672736000007717
+      },
+      "transcript": "Please forgive me for this under-handed way of admitting that I had turned forty.",
+      "id": "8463-294828-0012",
+      "set": "subset",
+      "duration": 4.905,
+      "reference": "PLEASE FORGIVE ME FOR THIS UNDERHANDED WAY OF ADMITTING I HAD TURNED FORTY",
+      "rtfx": 30.776832673624842,
+      "wer": 0.23076923076923078
+    },
+    {
+      "latency_s": 0.2589619169884827,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.693505790986819
+      },
+      "transcript": "But thou, is like a faint cloud, kindled at the rising sun. I vanish from my pearly throne, and who shall find my place?",
+      "id": "908-157963-0012",
+      "set": "subset",
+      "duration": 10.09,
+      "reference": "BUT THEL IS LIKE A FAINT CLOUD KINDLED AT THE RISING SUN I VANISH FROM MY PEARLY THRONE AND WHO SHALL FIND MY PLACE",
+      "rtfx": 38.963258062569686,
+      "wer": 0.041666666666666664
+    },
+    {
+      "latency_s": 0.13841083299485035,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.693740165996132
+      },
+      "transcript": "All these honest persons are waiting their turn to get their snuff boxes filled.",
+      "id": "3729-6852-0028",
+      "set": "subset",
+      "duration": 5.265,
+      "reference": "ALL THESE HONEST PERSONS ARE WAITING THEIR TURN TO GET THEIR SNUFF BOXES FILLED",
+      "rtfx": 38.03893009007385,
+      "wer": 0.0
+    },
+    {
+      "latency_s": 0.21014454201213084,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.764783916005399
+      },
+      "transcript": "Those pretty wrongs that liberty commits. When I am some time absent from thy heart. Thy beauty, and thy years fall well befits. For still temptation follows where thou art.",
+      "id": "121-123852-0000",
+      "set": "subset",
+      "duration": 17.695,
+      "reference": "THOSE PRETTY WRONGS THAT LIBERTY COMMITS WHEN I AM SOMETIME ABSENT FROM THY HEART THY BEAUTY AND THY YEARS FULL WELL BEFITS FOR STILL TEMPTATION FOLLOWS WHERE THOU ART",
+      "rtfx": 84.20394758089189,
+      "wer": 0.10344827586206896
+    },
+    {
+      "latency_s": 0.19688179198419675,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.8322512909944635
+      },
+      "transcript": "She was honourably buried in the Church of Saint Sever, without the slightest opposition from the venerable priest, who far from sharing the anti-Christian intolerance of the clergy in general, said that her profession as an actress had not hindered her from being a good Christian, and that the earth was a common mother of all human beings, as Jesus Christ had been the Saviour of all mankind.",
+      "id": "3729-6852-0008",
+      "set": "subset",
+      "duration": 23.86,
+      "reference": "SHE WAS HONOURABLY BURIED IN THE CHURCH OF SAINT SAUVEUR WITHOUT THE SLIGHTEST OPPOSITION FROM THE VENERABLE PRIEST WHO FAR FROM SHARING THE ANTI CHRISTAIN INTOLERANCY OF THE CLERGY IN GENERAL SAID THAT HER PROFESSION AS AN ACTRESS HAD NOT HINDERED HER FROM BEING A GOOD CHRISTIAN AND THAT THE EARTH WAS THE COMMON MOTHER OF ALL HUMAN BEINGS AS JESUS CHRIST HAD BEEN THE SAVIOUR OF ALL MANKIND",
+      "rtfx": 121.18946988208634,
+      "wer": 0.057971014492753624
+    },
+    {
+      "latency_s": 0.20651845901738852,
+      "language": null,
+      "status": 200,
+      "error": null,
+      "extra": {
+        "start_offset_s": 7.832281832990702
+      },
+      "transcript": "A good neighbour of the Brantes, a clever, intelligent Yorkshire woman who keeps a druggist shop in Haworth, from her occupation, her experience in excellent sense, holds the position of village doctoress and nurse, and as such has been a friend in many a time of trial and sickness and death, in the household round. Told me a characteristic little incident connected with Tabby's fractured leg.",
+      "id": "3575-170457-0046",
+      "set": "subset",
+      "duration": 25.64,
+      "reference": "A GOOD NEIGHBOUR OF THE BRONTES A CLEVER INTELLIGENT YORKSHIRE WOMAN WHO KEEPS A DRUGGIST'S SHOP IN HAWORTH AND FROM HER OCCUPATION HER EXPERIENCE AND EXCELLENT SENSE HOLDS THE POSITION OF VILLAGE DOCTRESS AND NURSE AND AS SUCH HAS BEEN A FRIEND IN MANY A TIME OF TRIAL AND SICKNESS AND DEATH IN THE HOUSEHOLDS ROUND TOLD ME A CHARACTERISTIC LITTLE INCIDENT CONNECTED WITH TABBY'S FRACTURED LEG",
+      "rtfx": 124.15355083509098,
+      "wer": 0.08955223880597014
+    }
+  ]
+}

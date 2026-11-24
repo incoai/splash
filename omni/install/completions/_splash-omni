@@ -1,0 +1,32 @@
+#compdef splash-omni
+
+# Keep the stable install path so an already-running shell survives upgrades.
+typeset -g _splash_omni_completion_source=${${(%):-%x}:a}
+
+_splash-omni() {
+    local helper
+    local -a models
+    if (( CURRENT == 2 )); then
+        compadd -- serve ui
+        return
+    fi
+    [[ $words[2] == serve ]] || return 0
+    if [[ $words[CURRENT-1] == --model ]]; then
+        :
+    elif [[ $words[CURRENT] == --model=* ]]; then
+        compset -P '--model='
+    else
+        return 0
+    fi
+    helper="${_splash_omni_completion_source:A:h}/models"
+    [[ -x $helper ]] || return 0
+    models=(${(f)"$("$helper" "$PREFIX")"})
+    (( ${#models} )) && compadd -- "${models[@]}"
+    return 0
+}
+
+if [[ $zsh_eval_context[-1] == loadautofunc ]]; then
+    _splash-omni "$@"
+elif (( $+functions[compdef] )); then
+    compdef _splash-omni splash-omni
+fi

@@ -1,0 +1,1 @@
+"""Splash development support."""

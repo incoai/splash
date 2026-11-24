@@ -1,0 +1,425 @@
+{
+ "description": "TTS benchmark prompts: 10 each of en/zh x short/medium/long. 'units' = words (en) or characters (zh).",
+ "prompts": [
+  {
+   "id": "en_short_01",
+   "lang": "en",
+   "length": "short",
+   "text": "The train leaves at dawn tomorrow.",
+   "units": 6
+  },
+  {
+   "id": "en_short_02",
+   "lang": "en",
+   "length": "short",
+   "text": "Please close the window before you go.",
+   "units": 7
+  },
+  {
+   "id": "en_short_03",
+   "lang": "en",
+   "length": "short",
+   "text": "She painted the old fence bright blue.",
+   "units": 7
+  },
+  {
+   "id": "en_short_04",
+   "lang": "en",
+   "length": "short",
+   "text": "Our garden really needs rain this week.",
+   "units": 7
+  },
+  {
+   "id": "en_short_05",
+   "lang": "en",
+   "length": "short",
+   "text": "He forgot his keys on the kitchen table.",
+   "units": 8
+  },
+  {
+   "id": "en_short_06",
+   "lang": "en",
+   "length": "short",
+   "text": "The library opens early on weekdays.",
+   "units": 6
+  },
+  {
+   "id": "en_short_07",
+   "lang": "en",
+   "length": "short",
+   "text": "We watched the storm roll over the hills.",
+   "units": 8
+  },
+  {
+   "id": "en_short_08",
+   "lang": "en",
+   "length": "short",
+   "text": "Fresh bread smells wonderful in the morning.",
+   "units": 7
+  },
+  {
+   "id": "en_short_09",
+   "lang": "en",
+   "length": "short",
+   "text": "The cat sleeps under the warm radiator.",
+   "units": 7
+  },
+  {
+   "id": "en_short_10",
+   "lang": "en",
+   "length": "short",
+   "text": "Turn left just after the second bridge.",
+   "units": 7
+  },
+  {
+   "id": "en_medium_01",
+   "lang": "en",
+   "length": "medium",
+   "text": "When the lights went out across the valley, the neighbors gathered on the porch with candles and told stories until the power finally returned.",
+   "units": 24
+  },
+  {
+   "id": "en_medium_02",
+   "lang": "en",
+   "length": "medium",
+   "text": "The museum's new exhibit traces the history of navigation, from simple star charts to the satellite systems that guide ships and aircraft today.",
+   "units": 23
+  },
+  {
+   "id": "en_medium_03",
+   "lang": "en",
+   "length": "medium",
+   "text": "After months of careful planning, the small bakery opened its doors on a quiet street corner and sold out of everything before noon.",
+   "units": 23
+  },
+  {
+   "id": "en_medium_04",
+   "lang": "en",
+   "length": "medium",
+   "text": "My grandmother kept a journal of every garden she planted, noting which seeds thrived in clay soil and which ones needed sandy ground.",
+   "units": 23
+  },
+  {
+   "id": "en_medium_05",
+   "lang": "en",
+   "length": "medium",
+   "text": "The orchestra rehearsed the final movement three times, adjusting the tempo until the conductor was satisfied with the balance between strings and brass.",
+   "units": 23
+  },
+  {
+   "id": "en_medium_06",
+   "lang": "en",
+   "length": "medium",
+   "text": "Scientists at the research station recorded unusually warm temperatures this winter, which may explain why the migrating birds arrived several weeks early.",
+   "units": 22
+  },
+  {
+   "id": "en_medium_07",
+   "lang": "en",
+   "length": "medium",
+   "text": "If you follow the river path past the old mill, you will reach a wooden footbridge that leads directly into the village square.",
+   "units": 23
+  },
+  {
+   "id": "en_medium_08",
+   "lang": "en",
+   "length": "medium",
+   "text": "The software update fixed the login problem, but several users reported that the new settings page loads slowly on older phones.",
+   "units": 21
+  },
+  {
+   "id": "en_medium_09",
+   "lang": "en",
+   "length": "medium",
+   "text": "Every Saturday the farmers market fills the parking lot with stalls of honey, cheese, flowers, and vegetables grown within a few miles of town.",
+   "units": 24
+  },
+  {
+   "id": "en_medium_10",
+   "lang": "en",
+   "length": "medium",
+   "text": "The detective studied the muddy footprints by the gate and concluded that the visitor had arrived long before the rain stopped.",
+   "units": 21
+  },
+  {
+   "id": "en_long_01",
+   "lang": "en",
+   "length": "long",
+   "text": "The lighthouse keeper had lived alone on the island for nearly twenty years, and in all that time he had never once missed lighting the lamp at dusk. Supply boats came twice a month, bringing flour, lamp oil, newspapers, and the occasional letter from his sister on the mainland. He read every page slowly, savoring the news of a world that seemed to grow more distant with each passing season, then folded the papers neatly and stacked them beside the stove for kindling.",
+   "units": 83
+  },
+  {
+   "id": "en_long_02",
+   "lang": "en",
+   "length": "long",
+   "text": "Learning to cook well is mostly a matter of patience and attention. Begin with a few simple dishes and repeat them until the steps feel natural, paying close attention to how the onions change color as they soften and how the sauce thickens as it reduces. Taste constantly and adjust the salt in small amounts. Over time you will stop measuring everything and begin to trust your senses, which is exactly when cooking stops feeling like work and starts feeling like play.",
+   "units": 82
+  },
+  {
+   "id": "en_long_03",
+   "lang": "en",
+   "length": "long",
+   "text": "The city council met on Tuesday evening to discuss the proposed bicycle lanes along the main avenue. Supporters argued that the lanes would reduce traffic, improve air quality, and make the downtown area safer for families, while several shop owners worried about losing parking spaces in front of their stores. After two hours of public comment, the council voted to approve a one year trial on the northern half of the avenue and to review the results next spring.",
+   "units": 79
+  },
+  {
+   "id": "en_long_04",
+   "lang": "en",
+   "length": "long",
+   "text": "Astronomers announced the discovery of a small rocky planet orbiting a dim red star about forty light years from Earth. The planet completes one orbit every eleven days and receives roughly the same amount of starlight that Earth receives from the sun, placing it inside the region where liquid water could exist. The team plans to use a large space telescope to search for signs of an atmosphere, though they caution that it will take years to gather enough data to draw firm conclusions.",
+   "units": 84
+  },
+  {
+   "id": "en_long_05",
+   "lang": "en",
+   "length": "long",
+   "text": "On the first morning of the hike, the trail climbed steadily through a forest of tall pines whose needles muffled every footstep. By midday the trees thinned out and gave way to open meadows dotted with wildflowers, and the wind carried the faint sound of cowbells from a distant pasture. We stopped beside a cold stream to refill our bottles and eat bread and cheese, then pushed on toward the ridge, where the view stretched all the way to the glaciers in the north.",
+   "units": 84
+  },
+  {
+   "id": "en_long_06",
+   "lang": "en",
+   "length": "long",
+   "text": "The old bookshop on the corner survived for decades by refusing to specialize. Its shelves held cookbooks next to poetry, repair manuals next to novels, and maps of countries that no longer existed. The owner knew most of her customers by name and could often guess what they wanted before they asked. When the building was finally sold, the neighborhood organized a farewell party, and people lined up around the block to buy one last book and say goodbye.",
+   "units": 79
+  },
+  {
+   "id": "en_long_07",
+   "lang": "en",
+   "length": "long",
+   "text": "Modern weather forecasting depends on an enormous network of instruments, including ground stations, ocean buoys, weather balloons, aircraft sensors, and satellites that photograph the entire planet every few minutes. All of this data flows into supercomputers that run physical models of the atmosphere, dividing it into millions of small cells and calculating how temperature, pressure, and humidity will change over the coming days. The forecast you see on your phone is the result of this global effort.",
+   "units": 77
+  },
+  {
+   "id": "en_long_08",
+   "lang": "en",
+   "length": "long",
+   "text": "My uncle restored an old wooden sailboat in his backyard over the course of three summers. He replaced the rotten planks one by one, sanded the hull until it was smooth as glass, and sewed a new set of sails on an ancient machine that had belonged to his mother. When the boat finally touched the water, the whole family gathered on the dock, and he sailed it across the bay with a grin that nobody had seen on his face in years.",
+   "units": 83
+  },
+  {
+   "id": "en_long_09",
+   "lang": "en",
+   "length": "long",
+   "text": "The committee reviewed the proposal for a new community center and raised several practical questions. Who would manage the building during evenings and weekends? How would the heating costs be covered in winter? Could the gymnasium be shared with the local school without creating scheduling conflicts? The architect promised to return with revised drawings and a detailed budget, and the chair reminded everyone that the funding application was due at the end of the month.",
+   "units": 75
+  },
+  {
+   "id": "en_long_10",
+   "lang": "en",
+   "length": "long",
+   "text": "Honeybees communicate the location of food through a remarkable dance performed on the vertical surface of the comb. A returning forager walks in a short straight line while waggling her body, then circles back and repeats the movement. The angle of the line relative to gravity indicates the direction of the food in relation to the sun, and the duration of the waggle indicates the distance. Other bees follow the dance closely and then fly out to find the flowers themselves.",
+   "units": 81
+  },
+  {
+   "id": "zh_short_01",
+   "lang": "zh",
+   "length": "short",
+   "text": "明天早上火车准时出发。",
+   "units": 11
+  },
+  {
+   "id": "zh_short_02",
+   "lang": "zh",
+   "length": "short",
+   "text": "请在离开前关好窗户。",
+   "units": 10
+  },
+  {
+   "id": "zh_short_03",
+   "lang": "zh",
+   "length": "short",
+   "text": "她把旧篱笆刷成了蓝色。",
+   "units": 11
+  },
+  {
+   "id": "zh_short_04",
+   "lang": "zh",
+   "length": "short",
+   "text": "花园这周需要一场雨。",
+   "units": 10
+  },
+  {
+   "id": "zh_short_05",
+   "lang": "zh",
+   "length": "short",
+   "text": "他把钥匙忘在了餐桌上。",
+   "units": 11
+  },
+  {
+   "id": "zh_short_06",
+   "lang": "zh",
+   "length": "short",
+   "text": "图书馆工作日开门很早。",
+   "units": 11
+  },
+  {
+   "id": "zh_short_07",
+   "lang": "zh",
+   "length": "short",
+   "text": "我们看着暴风雨越过山丘。",
+   "units": 12
+  },
+  {
+   "id": "zh_short_08",
+   "lang": "zh",
+   "length": "short",
+   "text": "清晨的面包香气真好闻。",
+   "units": 11
+  },
+  {
+   "id": "zh_short_09",
+   "lang": "zh",
+   "length": "short",
+   "text": "猫咪睡在温暖的暖气旁。",
+   "units": 11
+  },
+  {
+   "id": "zh_short_10",
+   "lang": "zh",
+   "length": "short",
+   "text": "过了第二座桥向左转。",
+   "units": 10
+  },
+  {
+   "id": "zh_medium_01",
+   "lang": "zh",
+   "length": "medium",
+   "text": "山谷里停电的那个晚上，邻居们点着蜡烛聚在门廊上讲故事，一直到电力恢复才各自回家。",
+   "units": 40
+  },
+  {
+   "id": "zh_medium_02",
+   "lang": "zh",
+   "length": "medium",
+   "text": "博物馆的新展览讲述了航海的历史，从简单的星图一直到今天引导船只和飞机的卫星系统。",
+   "units": 40
+  },
+  {
+   "id": "zh_medium_03",
+   "lang": "zh",
+   "length": "medium",
+   "text": "经过几个月的精心筹备，这家小面包店在安静的街角开张了，还没到中午东西就全部卖光了。",
+   "units": 41
+  },
+  {
+   "id": "zh_medium_04",
+   "lang": "zh",
+   "length": "medium",
+   "text": "外婆为她种过的每一个花园都写了日记，记下哪些种子在黏土里长得好，哪些需要沙质土壤。",
+   "units": 41
+  },
+  {
+   "id": "zh_medium_05",
+   "lang": "zh",
+   "length": "medium",
+   "text": "乐团把最后一个乐章排练了三遍，不断调整速度，直到指挥对弦乐和铜管的平衡感到满意。",
+   "units": 40
+  },
+  {
+   "id": "zh_medium_06",
+   "lang": "zh",
+   "length": "medium",
+   "text": "科研站的科学家记录到今年冬天气温异常偏高，这或许可以解释候鸟为什么提前了几周到达。",
+   "units": 41
+  },
+  {
+   "id": "zh_medium_07",
+   "lang": "zh",
+   "length": "medium",
+   "text": "如果你沿着河边小路走过老磨坊，就会看到一座木桥，过桥后直接通向村子的广场。",
+   "units": 37
+  },
+  {
+   "id": "zh_medium_08",
+   "lang": "zh",
+   "length": "medium",
+   "text": "软件更新修复了登录问题，但有几位用户反映新的设置页面在旧手机上打开得很慢。",
+   "units": 37
+  },
+  {
+   "id": "zh_medium_09",
+   "lang": "zh",
+   "length": "medium",
+   "text": "每个星期六，农贸市场把停车场摆满了摊位，有蜂蜜、奶酪、鲜花和附近农场种的蔬菜。",
+   "units": 39
+  },
+  {
+   "id": "zh_medium_10",
+   "lang": "zh",
+   "length": "medium",
+   "text": "侦探仔细研究了大门旁泥地上的脚印，断定来访者早在雨停之前很久就已经到了。",
+   "units": 36
+  },
+  {
+   "id": "zh_long_01",
+   "lang": "zh",
+   "length": "long",
+   "text": "守塔人独自在岛上生活了将近二十年，这么多年来他从未错过一次黄昏点灯。补给船每月来两次，带来面粉、灯油、报纸，偶尔还有妹妹从大陆寄来的信。他慢慢地读完每一页，细细品味那个似乎一季比一季遥远的世界，然后把报纸叠得整整齐齐，堆在炉子旁边当引火的柴。",
+   "units": 121
+  },
+  {
+   "id": "zh_long_02",
+   "lang": "zh",
+   "length": "long",
+   "text": "学会做饭主要靠耐心和专注。先从几道简单的菜开始，反复练习直到每个步骤都变得自然，仔细观察洋葱变软时颜色如何变化，酱汁收干时如何变稠。要不停地尝味道，一点一点地调整盐量。时间久了你就不再需要称量每样东西，而是开始相信自己的感觉，到那时做饭就不再像工作，而更像是一种游戏。",
+   "units": 134
+  },
+  {
+   "id": "zh_long_03",
+   "lang": "zh",
+   "length": "long",
+   "text": "市议会星期二晚上开会讨论在主干道上修建自行车道的提案。支持者认为车道可以缓解交通、改善空气质量，让市中心对家庭更安全；而几位店主则担心店门口的停车位会减少。经过两个小时的公众发言，议会投票通过了在大道北半段试行一年的方案，并决定明年春天再评估结果。",
+   "units": 124
+  },
+  {
+   "id": "zh_long_04",
+   "lang": "zh",
+   "length": "long",
+   "text": "天文学家宣布发现了一颗围绕暗红色恒星运行的小型岩石行星，距离地球大约四十光年。这颗行星每十一天绕恒星一周，接收到的光照与地球从太阳获得的差不多，正好处在液态水可能存在的区域。研究团队计划用大型空间望远镜寻找大气层的迹象，但他们也提醒说，要收集足够的数据得出可靠结论还需要很多年。",
+   "units": 139
+  },
+  {
+   "id": "zh_long_05",
+   "lang": "zh",
+   "length": "long",
+   "text": "徒步的第一天早上，山路在高大的松林中平稳地向上延伸，松针盖住了每一个脚步声。到了中午，树木渐渐稀疏，开阔的草甸上点缀着野花，风里传来远处牧场隐约的牛铃声。我们在一条冰凉的小溪边停下，灌满水壶，吃了面包和奶酪，然后继续向山脊进发，从那里可以一直望到北边的冰川。",
+   "units": 129
+  },
+  {
+   "id": "zh_long_06",
+   "lang": "zh",
+   "length": "long",
+   "text": "街角那家旧书店靠着不专营任何一类书籍而生存了几十年。书架上，食谱挨着诗集，修理手册挨着小说，还有一些早已不存在的国家的地图。店主认识大多数顾客的名字，常常在他们开口之前就能猜到他们想要什么。当这栋楼最终被卖掉时，街坊们组织了一场告别聚会，人们排着长队绕过街区，只为买最后一本书，道一声再见。",
+   "units": 145
+  },
+  {
+   "id": "zh_long_07",
+   "lang": "zh",
+   "length": "long",
+   "text": "现代天气预报依赖一个庞大的仪器网络，包括地面观测站、海洋浮标、探空气球、飞机传感器，以及每隔几分钟就拍摄整个地球的卫星。所有这些数据汇入超级计算机，运行大气的物理模型，把大气分成数百万个小格子，计算未来几天温度、气压和湿度会如何变化。你在手机上看到的天气预报，正是这项全球协作的成果。",
+   "units": 142
+  },
+  {
+   "id": "zh_long_08",
+   "lang": "zh",
+   "length": "long",
+   "text": "我叔叔花了三个夏天在后院里修复一艘旧木帆船。他把腐烂的船板一块一块换掉，把船体打磨得像玻璃一样光滑，还用他母亲留下的一台老缝纫机缝了一套新帆。当船终于下水的时候，全家人聚在码头上，他驾着船驶过海湾，脸上露出了多年来没人见过的笑容。",
+   "units": 115
+  },
+  {
+   "id": "zh_long_09",
+   "lang": "zh",
+   "length": "long",
+   "text": "委员会审议了新建社区中心的提案，并提出了几个实际的问题。晚上和周末谁来管理这栋楼？冬天的取暖费用怎么解决？体育馆能否与当地学校共用而不产生排期冲突？建筑师承诺带着修改后的图纸和详细预算再来，主席提醒大家，资金申请的截止日期是月底。",
+   "units": 115
+  },
+  {
+   "id": "zh_long_10",
+   "lang": "zh",
+   "length": "long",
+   "text": "蜜蜂通过在蜂巢垂直表面上跳的一种奇妙舞蹈来传递食物的位置。采蜜归来的工蜂一边摆动身体一边沿直线走一小段，然后绕回起点重复这个动作。直线相对于重力的角度表示食物相对于太阳的方向，摆动持续的时间则表示距离。其他蜜蜂紧紧跟着这支舞，然后飞出去自己寻找那些花朵。",
+   "units": 127
+  }
+ ]
+}

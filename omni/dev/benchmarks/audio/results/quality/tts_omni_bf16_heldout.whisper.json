@@ -1,0 +1,176 @@
+{
+ "summary": {
+  "en": 0.002785515320334262,
+  "zh": 0.010582010582010581
+ },
+ "items": [
+  {
+   "id": "ho_en_short_01",
+   "lang": "en",
+   "whisper": "Please close the window before you leave.",
+   "error_rate": 0.0,
+   "audio_s": 2.16
+  },
+  {
+   "id": "ho_en_short_02",
+   "lang": "en",
+   "whisper": "The kettle whistled in the empty kitchen.",
+   "error_rate": 0.0,
+   "audio_s": 2.16
+  },
+  {
+   "id": "ho_en_short_03",
+   "lang": "en",
+   "whisper": "Our flight was delayed by two hours.",
+   "error_rate": 0.0,
+   "audio_s": 2.32
+  },
+  {
+   "id": "ho_en_short_04",
+   "lang": "en",
+   "whisper": "He planted tomatoes along the fence.",
+   "error_rate": 0.0,
+   "audio_s": 2.24
+  },
+  {
+   "id": "ho_en_medium_01",
+   "lang": "en",
+   "whisper": "The museum opens a new exhibit on ancient navigation next month, featuring star charts, wooden compasses, and a replica of a small sailing boat.",
+   "error_rate": 0.0,
+   "audio_s": 8.56
+  },
+  {
+   "id": "ho_en_medium_02",
+   "lang": "en",
+   "whisper": "After the storm passed, volunteers spent the whole weekend clearing branches from the park\n and repairing the damaged footbridge.",
+   "error_rate": 0.0,
+   "audio_s": 6.96
+  },
+  {
+   "id": "ho_en_medium_03",
+   "lang": "en",
+   "whisper": "if you want the bread to rise properly keep the dough somewhere warm and give it at least an hour before baking",
+   "error_rate": 0.0,
+   "audio_s": 7.28
+  },
+  {
+   "id": "ho_en_medium_04",
+   "lang": "en",
+   "whisper": "The committee will review every application carefully and announce the scholarship winners at the end of the spring term.",
+   "error_rate": 0.0,
+   "audio_s": 5.76
+  },
+  {
+   "id": "ho_en_long_01",
+   "lang": "en",
+   "whisper": "Every autumn, the small fishing village holds a festival to celebrate the end of the season.\n Boats are decorated with lanterns.\n Children run between stalls selling roasted chestnuts,\n and the oldest sailors tell stories about storms they survived decades ago.\n Visitors come from the nearby towns,\n and for one evening, the quiet harbor becomes the busiest place on the coast.",
+   "error_rate": 0.0,
+   "audio_s": 20.16
+  },
+  {
+   "id": "ho_en_long_02",
+   "lang": "en",
+   "whisper": "Learning a musical instrument as an adult is slower than it is for children.\n But it has its own rewards.\n Adults tend to practice with more purpose.\n They understand why certain exercises matter,\n and they often enjoy the music they choose to play.\n The hardest part is usually patience.\n Progress comes in small steps,\n and the first few months can feel frustrating before everything starts to fall into place.",
+   "error_rate": 0.0,
+   "audio_s": 20.72
+  },
+  {
+   "id": "ho_en_long_03",
+   "lang": "en",
+   "whisper": "The engineers tested the bridge by driving loaded trucks across it one at a time, while sensors recorded how much the steel beams bent.\n The measurements matched their calculations closely, and only one joint needed extra reinforcement.\n A week later, the city opened the bridge to traffic, and commuters on the east side saved almost 20 minutes each morning.",
+   "error_rate": 0.01694915254237288,
+   "audio_s": 20.0
+  },
+  {
+   "id": "ho_en_long_04",
+   "lang": "en",
+   "whisper": "When the library introduced evening hours, nobody expected how popular they would become.\n Students used the quiet tables to study after work, retired neighbors joined a weekly reading\n circle and parents brought their children for storytelling on Thursday nights.\n Within a year, the evening visitors outnumbered those who came during the day, and the library\n hired two more staff members.",
+   "error_rate": 0.0,
+   "audio_s": 21.04
+  },
+  {
+   "id": "ho_zh_short_01",
+   "lang": "zh",
+   "whisper": "请把窗户关好再出门",
+   "error_rate": 0.0,
+   "audio_s": 2.0
+  },
+  {
+   "id": "ho_zh_short_02",
+   "lang": "zh",
+   "whisper": "今天的晚饭是面条",
+   "error_rate": 0.0,
+   "audio_s": 1.52
+  },
+  {
+   "id": "ho_zh_short_03",
+   "lang": "zh",
+   "whisper": "火车晚点了半个小时",
+   "error_rate": 0.0,
+   "audio_s": 2.4
+  },
+  {
+   "id": "ho_zh_short_04",
+   "lang": "zh",
+   "whisper": "她在院子里种了花",
+   "error_rate": 0.125,
+   "audio_s": 1.68
+  },
+  {
+   "id": "ho_zh_medium_01",
+   "lang": "zh",
+   "whisper": "国务馆下个月将举办一场关于古代航海的展览\n展出星图、罗盘和一艘小帆船的复制品",
+   "error_rate": 0.05555555555555555,
+   "audio_s": 8.56
+  },
+  {
+   "id": "ho_zh_medium_02",
+   "lang": "zh",
+   "whisper": "暴风雨过后\n志愿者们花了整个周末清理公园里的树枝\n并修好了被损坏的小桥",
+   "error_rate": 0.0,
+   "audio_s": 6.64
+  },
+  {
+   "id": "ho_zh_medium_03",
+   "lang": "zh",
+   "whisper": "如果想让面包发得好,就要把面团放在温暖的地方,至少等一个小时再烤。",
+   "error_rate": 0.0,
+   "audio_s": 6.4
+  },
+  {
+   "id": "ho_zh_medium_04",
+   "lang": "zh",
+   "whisper": "评审委员会会认真审阅每一份申请,\n并在春季学期结束时公布奖学金的获得者。",
+   "error_rate": 0.0,
+   "audio_s": 6.88
+  },
+  {
+   "id": "ho_zh_long_01",
+   "lang": "zh",
+   "whisper": "每年秋天,这个小渔村都会举办一个节日来庆祝捕鱼祭的结束\n渔船上挂满了灯笼\n孩子们在摊位之间跑来跑去,买烤栗子吃\n年纪最大的老水手们讲述几十年前经历过的风暴\n附近城镇的游客也纷纷赶来\n在这一个晚上,安静的港口变成了海岸上最热闹的地方",
+   "error_rate": 0.009345794392523364,
+   "audio_s": 19.12
+  },
+  {
+   "id": "ho_zh_long_02",
+   "lang": "zh",
+   "whisper": "成年人学习乐器比孩子慢,但也有自己的收获。\n成年人练习时目的更明确,明白每个练习的意义,\n也往往更喜欢自己选择演奏的音乐。\n最难的通常是耐心。\n进步是一点一点来的。\n最初几个月可能会让人感到沮丧,\n然后一切才慢慢变得顺利起来。",
+   "error_rate": 0.0,
+   "audio_s": 21.84
+  },
+  {
+   "id": "ho_zh_long_03",
+   "lang": "zh",
+   "whisper": "工程师们让装满货物的卡车一辆接一辆地驶过大桥,同时用传感器记录钢梁弯曲的程度,测量结果与他们的计算非常接近,只有一个连接处需要额外加固。\n一周以后,城市正式开放了这座桥,住在东边的上班族每天早上能节省将近20分钟。",
+   "error_rate": 0.020202020202020204,
+   "audio_s": 18.4
+  },
+  {
+   "id": "ho_zh_long_04",
+   "lang": "zh",
+   "whisper": "图书馆开始在晚上开放时\n没有人想到会这么受欢迎\n下班后的学生在安静的桌子旁学习\n退休的邻居们参加每周一次的读书会\n父母们在周四晚上带孩子来听故事\n不到一年\n晚上来的读者就超过了白天\n图书馆又新招了两名工作人员",
+   "error_rate": 0.0,
+   "audio_s": 20.4
+  }
+ ]
+}
