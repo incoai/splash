@@ -166,12 +166,6 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
   }
 }
 
-// The BF16 nearest a finite value, ties to even.
-uint16_t nearestBfloat16(float value) {
-  const uint32_t bits = std::bit_cast<uint32_t>(value);
-  return static_cast<uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
-}
-
 // A group of 64 BF16 weights as MLX's affine quantization rounds it to 4 bits
 // (mlx.core.quantize, its Metal kernel), in float, into a native af4g64
 // block: the range runs from the minimum to the maximum or 0, whichever is
@@ -210,7 +204,7 @@ void quantizeGroup(const uint8_t *weights, uint8_t *block) {
   std::array<uint8_t, 64> code;
   for (size_t i = 0; i < w.size(); ++i)
     code[i] = static_cast<uint8_t>(std::clamp(std::round((w[i] - offset) / step), 0.0F, 15.0F));
-  const uint16_t scale = nearestBfloat16(step), bias = nearestBfloat16(offset);
+  const uint16_t scale = roundBfloat16(step), bias = roundBfloat16(offset);
   std::memcpy(block, &scale, 2);
   std::memcpy(block + 2, &bias, 2);
   for (size_t i = 0; i < w.size(); i += 2) block[4 + i / 2] = static_cast<uint8_t>(code[i] | code[i + 1] << 4);
