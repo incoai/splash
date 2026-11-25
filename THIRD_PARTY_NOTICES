@@ -249,6 +249,122 @@ LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+MiniMax H3 (https://huggingface.co/MiniMaxAI/MiniMax-H3)
+
+The video engine (runtime/video, runtime/metal/kernels/video) and its
+converter (install/h3.py) run and convert MiniMax H3's weights, which are not
+part of Splash: the installer reads them under the MiniMax H3 Community
+License Agreement, Copyright (c) 2026 MiniMax. All Rights Reserved, published
+with the model at the URL above.
+
+OpenVDN vdn-minimax-h3 (https://huggingface.co/OpenVDN/vdn-minimax-h3)
+
+The video DiT's window-softmax attention and linear branch
+(runtime/metal/kernels/video/dit/window_attention.metal and
+linear_branch.metal, runtime/video/ops/WindowTable.mm) and install/h3.py
+follow OpenVDN's code. Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). Its NOTICE:
+
+VDN — Video DeltaNet
+Copyright 2026 the VDN authors.
+
+This repository contains the VDN-H3 training and inference code, licensed
+under the Apache License, Version 2.0 (see LICENSE). It does not contain model
+weights.
+
+FastVideo (https://github.com/hao-ai-lab/FastVideo)
+
+The TAEH3 preview decoder (runtime/metal/kernels/video/preview,
+runtime/video/ops/PreviewDecoder.mm, install/h3.py) follows FastVideo's TAEH3
+port (fastvideo/mlx_runtime/minimax_h3_taeh3.py). The FastH3 variants
+implement FastVideo's VSA-H3 attention
+(fastvideo/attention/backends/video_sparse_attn_h3.py: tile geometry, pooled
+routing, top-k, gated compressed branch, keyframe rows as a dense segment)
+and its FastH3 sampling contract (DMD rungs and shifts) in
+runtime/metal/kernels/video/dit/vsa.metal, runtime/video/ops/VsaTable.mm,
+runtime/video/model/FastH3.mm and install/fasth3.py. The FastH3 student
+weights (FastVideo/FastVideo-FastH3-8-Step-V2,
+FastVideo/FastVideo-FastH3-4-step-Preview-v1-*) are derivatives of MiniMax
+H3 under the MiniMax H3 Community License Agreement; none is part of Splash.
+Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+minimax-h3-mlx (https://github.com/PipeNetwork/minimax-h3-mlx)
+
+The video VAE tile plan (runtime/video/ops/Geometry.cpp), the request
+preparation (runtime/video/model/Prep.mm), the audio VAE decoder
+(runtime/video/ops/AudioDecoder.mm) and the rotary tables and audio weights of
+install/h3.py follow this MLX port of MiniMax H3. Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).
+
+Pika H3 Flex (https://huggingface.co/Pika-Labs/Pika-H3-Flex)
+
+The pika-6 and pika-ref2va-6 variants run Pika H3 Flex's adapters and its
+Ref2VA base, which the installer reads from Pika H3 Flex's repository and
+converts (install/fasth3.py); none is part of Splash. They are Model Derivatives of MiniMax
+H3 under the MiniMax H3 Community License Agreement, Copyright (c) 2026
+Mellis, Inc.
+The reference decoding and normalization of server/references.py follow
+Pika H3 Flex's example code (pika_h3.core.media, pika_h3.core.conditioning).
+Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+Qwen3-VL-32B-Instruct (https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct)
+
+The video text encoder runs Qwen3-VL-32B-Instruct's weights, which are not
+part of Splash: the installer reads mlx-community's MLX conversion
+(https://huggingface.co/mlx-community/Qwen3-VL-32B-Instruct-8bit). Apache
+License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+diffusers (https://github.com/huggingface/diffusers)
+
+The reference video normalization of server/references.py follows diffusers'
+MiniMaxH3Ref2VASetupStep. Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).
+
+PyAV (https://github.com/PyAV-Org/PyAV)
+
+server/references.py decodes reference videos and audio with PyAV, which
+Splash does not distribute: it is optional, and the user installs it
+(av==19.0.2). Its binary wheels bundle FFmpeg and the libraries it links,
+among them libx264 and libx265; PyAV, FFmpeg and each of those libraries are
+under their own licenses.
+
+BigVGAN (https://github.com/NVIDIA/BigVGAN)
+
+The audio VAE decoder's kernels (runtime/metal/kernels/video/audio) implement
+BigVGAN's anti-aliased SnakeBeta activations and Kaiser-windowed sinc
+resampling. Copyright (c) 2024 NVIDIA CORPORATION.
+
+MLX (https://github.com/ml-explore/mlx)
+
+The video request preparation (runtime/metal/kernels/video/prep,
+runtime/video/ops/PrepOps.mm, runtime/video/model/Prep.mm) reproduces the
+arithmetic of MLX 0.32.1's primitives. Copyright © 2023 Apple Inc.
+
+TAEH3 / taehv (https://github.com/madebyollin/taehv)
+
+The preview decoder runs TAEH3, whose weights install/h3.py converts.
+Copyright (c) 2025 Ollin Boer Bohan.
+
+BigVGAN, MLX and taehv are under the MIT License:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 SwiftTerm 1.20.0 (https://github.com/migueldeicaza/SwiftTerm)
 
 The Splash desktop app's terminal, in its drawer, is SwiftTerm, built into the
