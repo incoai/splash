@@ -1,0 +1,115 @@
+name: Model request
+description: Request support for a model family or a new variant.
+title: "[model] "
+labels: ["type/model-request", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Splash supports families with a matching DFlash2 draft and kernels for
+        their shapes. A request starts a feasibility study; it is not a promise
+        or a date. See `docs/models.md` for what is supported today.
+
+  - type: input
+    id: repository
+    attributes:
+      label: Upstream repository
+      description: The Hugging Face or other repository, with the variant or file.
+      placeholder: "owner/model-GGUF:UD-Q4_K_M"
+    validations:
+      required: true
+
+  - type: input
+    id: family
+    attributes:
+      label: Model family and architecture
+      description: For example, Qwen, Llama, GLM, Gemma, and the exact architecture name.
+      placeholder: "Qwen3.8-27B, qwen3_5"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: Format
+      options:
+        - GGUF
+        - MLX
+        - compressed-tensors
+        - Safetensors (BF16/F16)
+        - Other or mixed
+    validations:
+      required: true
+
+  - type: input
+    id: size
+    attributes:
+      label: Size and quantisation
+      description: Parameters, file size, and quantisation.
+      placeholder: "27B, 16.5 GB, UD-Q4_K_M"
+    validations:
+      required: true
+
+  - type: input
+    id: license
+    attributes:
+      label: License
+      placeholder: "Apache-2.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Paste `config.json` or link the file. Name hidden size, layers, attention, FFN and experts.
+      render: json
+    validations:
+      required: true
+
+  - type: dropdown
+    id: draft
+    attributes:
+      label: Is a compatible draft available?
+      options:
+        - "Yes, same family and width"
+        - "No"
+        - "Unknown"
+    validations:
+      required: true
+
+  - type: input
+    id: draft_link
+    attributes:
+      label: Draft repository or checkpoint
+      description: Required when a draft exists.
+    validations:
+      required: false
+
+  - type: input
+    id: memory
+    attributes:
+      label: Mac and memory you want to run it on
+      placeholder: "Mac Studio M3 Ultra, 256 GB"
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: What you want to do with it
+      description: Coding agent, chat, vision, long context, a specific workload.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I read `docs/models.md` and this family is not already supported.
+          required: true
+        - label: I searched the open and closed issues for this model.
+          required: true
+        - label: I can help test on the Mac named above.
+          required: false

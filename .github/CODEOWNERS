@@ -1,0 +1,14 @@
+# Default owner for changes in this repository. Replace an area's handle when
+# a second maintainer takes ownership of that area.
+* @jianc99
+
+/server/ @jianc99
+/runtime/engine/ @jianc99
+/runtime/model/ @jianc99
+/runtime/ops/ @jianc99
+/runtime/metal/ @jianc99
+/install/ @jianc99
+/app/ @jianc99
+/dev/ @jianc99
+/docs/ @jianc99
+/.github/ @jianc99

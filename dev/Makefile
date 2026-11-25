@@ -65,7 +65,7 @@ release-app: install-environment all
 # app's own tasks such as following a server's start, until it returns, so beside
 # it they miss their clocks: run in parallel, a different test failed from run
 # to run (M6, 2 of 4 runs).
-check-app:
+check-app: ## Run the desktop app's tests
 	swift test --package-path app --no-parallel
 
 # Uploads the built RELEASE_VERSION archive, its checksum, the tester installer
@@ -78,6 +78,7 @@ publish-test:
 	$(PYTHON) dev/tools/publish_test.py $(PACKAGE_ARGS) --repo "$(TEST_RELEASE_REPO)"
 
 PYTHON_TEST_PATTERN ?= test_*.py
+PYTHON_SOURCES = server install/*.py dev/tools dev/tests dev/benchmarks
 # Comma-separated subset of claude,opencode,codex,hermes,pi for the real client
 # gates on a machine that lacks one of them; empty runs all five.
 AGENT_CLIENTS ?=
@@ -91,9 +92,9 @@ HTTP_SMOKE_ARGS ?=
 # Define native targets before aggregate prerequisites expand.
 -include dev/native.mk
 
-.PHONY: agent-preflight architecture-check check check-source \
+.PHONY: agent-preflight architecture-check check check-fast check-source \
 	check-native-engine check-native-cpu check-native-metal check-native-build \
-	check-python \
+	check-python doctor labels lint-python \
 	install-development _install-development release-check test \
 	test-agent-real test-http-real test-performance-real test-pressure-real test-release-real \
 	test-python test-real verify-models \
@@ -113,64 +114,73 @@ _install-development:
 
 # Build production and every native test and tool, and run the native tests
 # that do not require model weights.
-check-native-engine: check-native-cpu check-native-metal check-native-build
+check-native-engine: check-native-cpu check-native-metal check-native-build ## Build and run every native test
 
-check-native-cpu: platform-check $(TARGET) test-engine-cpu
+check-native-cpu: platform-check $(TARGET) test-engine-cpu ## Build and run native CPU tests
 
-check-native-metal: platform-check $(TARGET) test-engine-metal test-sanitizers-metal
+check-native-metal: platform-check $(TARGET) test-engine-metal test-sanitizers-metal ## Build and run Metal tests
 
 # Build every native test, benchmark and tool, the outputs TEST_CONFIG_TARGETS
 # and PRODUCTION_FLAG_TOOLS name, and run none: hosted CI has no GPU the Metal
 # tests support and no model for the real-model tests and profiles, and builds
 # them so that none breaks unnoticed.
-check-native-build: platform-check $(TARGET) $(TEST_CONFIG_TARGETS) \
-	$(PRODUCTION_FLAG_TOOLS)
+check-native-build: platform-check $(TARGET) $(TEST_CONFIG_TARGETS) $(PRODUCTION_FLAG_TOOLS) ## Build every native test and tool
 
 # Every Python test, each in the directory of what it tests (dev/tests/server,
 # install or tools). Discovering dev/tests keeps this gate complete as tests
 # are added; discovered from the checkout root (-t .), a module has the package
 # name it is imported by, so none loads twice. The installer tests check
 # configurations with the engine.
-test-python: install-development $(TARGET)
+test-python: install-development $(TARGET) ## Run Python tests (PYTHON_TEST_PATTERN)
 	$(PYTHON) -m unittest discover -s dev/tests -t . -p '$(PYTHON_TEST_PATTERN)'
 
-check-python: install-development test-python
-	$(PYTHON) -m compileall -q server install/*.py \
-		dev/tools dev/tests dev/benchmarks
-	$(PYTHON) -m ruff check --config dev/ruff.toml server \
-		install/*.py dev/tools dev/tests dev/benchmarks
-	$(PYTHON) -m ruff format --check --config dev/ruff.toml server \
-		install/*.py dev/tools dev/tests dev/benchmarks
+check-python: install-development test-python lint-python ## Python tests, lint and format
+
+lint-python: install-environment ## Compile, lint and format-check Python sources
+	$(PYTHON) -m compileall -q $(PYTHON_SOURCES)
+	$(PYTHON) -m ruff check --config dev/ruff.toml $(PYTHON_SOURCES)
+	$(PYTHON) -m ruff format --check --config dev/ruff.toml $(PYTHON_SOURCES)
+
+# The source and Python checks that need no native build. A Linux agent can
+# run the commands above with a Python 3.12-3.14 environment; this target
+# assumes the macOS checkout's .venv through architecture-check.
+check-fast: check-source lint-python ## Source and Python checks without a native build
+
+doctor: ## Print this checkout's platform, toolchain and build state
+	@$(if $(wildcard $(PYTHON)),$(PYTHON),python3) dev/tools/doctor.py
+
+labels: ## Create or update the GitHub labels from .github/labels.json
+	@$(if $(wildcard $(PYTHON)),$(PYTHON),python3) dev/tools/sync_labels.py
 
 # It parses the server's sources, which need the environment's Python
 # (3.12-3.14); BUILD_ID_PYTHON, the build tools' python3, may be Xcode's 3.9.
-architecture-check: install-environment
+architecture-check: install-environment ## Enforce layer and source rules
 	$(PYTHON) dev/tools/check_architecture.py
 
-check: check-source check-native-engine check-python check-app
+check: check-source check-native-engine check-python check-app ## Full model-free check: source, native, Python, app
 
-check-source: architecture-check
+check-source: architecture-check ## Architecture and whitespace checks
 	@git diff --check
 	@empty_tree=$$(git hash-object -t tree /dev/null); \
 		git diff --check $$empty_tree HEAD
 
-test: test-engine test-python
+test: test-engine test-python ## Run every native and Python test
 
-test-http-real: preflight $(TARGET) verify-build-identity
+test-http-real: preflight $(TARGET) verify-build-identity ## Run the real HTTP smoke (MODEL=...)
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/smoke_real.py \
 		--model "$(MODEL)" --model-root "$(MODEL_ROOT)" $(HTTP_SMOKE_ARGS)
 
 # Finds the selected clients and runs test_clients.py's tests of the installed
 # OpenCode, Codex and Pi among them, which need no model.
-agent-preflight: model-selection install-development
+agent-preflight: model-selection install-development ## Check the installed agent clients
 	$(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) --preflight-only
 
-test-agent-real: preflight $(TARGET) agent-preflight verify-build-identity
+test-agent-real: preflight $(TARGET) agent-preflight verify-build-identity ## Run the agent clients (MODEL=...)
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS)
 
 # The release path loads the model once for generic HTTP and all five official
 # clients. The individual targets remain useful while diagnosing one surface.
-test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
+test-release-real: preflight $(TARGET) agent-preflight verify-build-identity ## Run HTTP and every agent on one serve
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
@@ -190,8 +200,7 @@ EXACT_STATES_MODEL ?= mlx-community/Qwen3.8-27B-4bit
 BASELINE ?=
 ANE_FFN_SHARE ?=
 ANE_FFN_SHARE_ARGS = $(if $(ANE_FFN_SHARE),--ane-ffn-share "$(ANE_FFN_SHARE)",)
-test-performance-real: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB) \
-		$(if $(BASELINE),$(WEIGHT_DIGESTS))
+test-performance-real: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB) $(if $(BASELINE),$(WEIGHT_DIGESTS)) ## Benchmark this build or ABBA against BASELINE
 	@mkdir -p "$(MODEL_RESULTS)"
 	@$(BUILD_ID_PYTHON) $(BUILD_ID_SCRIPT) check --root . \
 		--header $(BUILD_ID_HEADER) --stamp $(BUILD_ID_STAMP) \
@@ -221,7 +230,7 @@ endif
 PRESSURE_ARGS ?= --max-memory 18G
 PRESSURE_MINUTES ?= 5
 PRESSURE_RESULTS = $(MODEL_RESULTS)/pressure
-test-pressure-real: preflight $(TARGET) verify-build-identity
+test-pressure-real: preflight $(TARGET) verify-build-identity ## Run the serving pressure gate
 	@rm -rf "$(PRESSURE_RESULTS)"
 	$(PYTHON) -m dev.benchmarks.serving.run --tree . --machine other --model "$(MODEL)" \
 		--model-root "$(MODEL_ROOT)" --scenario churn --minutes $(PRESSURE_MINUTES) \
@@ -237,7 +246,7 @@ test-pressure-real: preflight $(TARGET) verify-build-identity
 # both builds of the comparison with BASELINE, and leaves their bytes out of
 # the images (dev/tools/weight_digests.mm).
 WEIGHT_DIGESTS_ARGS ?=
-verify-models: preflight $(TARGET) $(WEIGHT_DIGESTS) $(LIB)
+verify-models: preflight $(TARGET) $(WEIGHT_DIGESTS) $(LIB) ## Restart offline and record weight digests
 	@$(PYTHON) dev/tools/installer_restarts.py $(MODEL_ARGS)
 	@mkdir -p "$(MODEL_RESULTS)"
 	@$(WEIGHT_DIGESTS) $(LIB) "$(MODEL_ROOT)" $(WEIGHT_DIGESTS_ARGS) \
@@ -247,7 +256,7 @@ verify-models: preflight $(TARGET) $(WEIGHT_DIGESTS) $(LIB)
 # One model on this machine against BASELINE, a retained build that loads it
 # (docs/validate.md, Release check); make check and test-sanitizers run once per
 # source identity, check-native-metal and the agent clients once per machine.
-release-check: preflight
+release-check: preflight ## Run the release gate for one model
 	@test -n "$(BASELINE)" || { \
 		echo "error: release-check compares with BASELINE, a retained build that loads the model" >&2; \
 		exit 1; \

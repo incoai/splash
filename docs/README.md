@@ -1,6 +1,8 @@
 # Splash documentation
 
-These documents run from using Splash to working on it:
+These documents run from using Splash to working on it. Working on Splash
+itself? Start with [AGENTS.md](../AGENTS.md) and the
+[contributing paths](contributing/README.md).
 
 - [Server](server.md): building and running Splash, its server's options, where
   models are kept, API model aliases, reasoning and thinking settings, agent
