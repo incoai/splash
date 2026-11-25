@@ -1413,6 +1413,17 @@ keeping the hosts already there and leaving `*` as it is, so no proxy receives
 the server's key. A proxy set only in macOS system settings is left to that
 setting's own exceptions.
 
+`splash claude` starts Claude Code in its default permission mode, whatever the
+user's settings say; `splash claude --permission-mode auto` selects auto mode.
+Splash gives no verdict on a tool call, so the launcher sets
+`CLAUDE_CODE_AUTO_MODE_SERVER=0`: Claude Code then reviews each action with
+classifier requests of its own, which the served model answers like any other
+(a prompt of about 30K tokens, prefilled once and cached; a request the client
+gives up on keeps its prefill, and the one it sends again resumes there). Auto
+mode works this way with Claude Code 2.1.278 and later, and with 2.1.236, which
+asks no server; 2.1.269 and 2.1.277 ask on every request, read no such variable
+and deny the calls.
+
 `splash pi` adds a `splash` provider to Pi's `models.json` (`splash-<port>` for
 a server on another port), preserving other providers, settings and sessions.
 Where every chat template of the server renders a later system message in
