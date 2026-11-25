@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Splash</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<style>
+  * { box-sizing: border-box }
+  :root {
+    --bg: #fff;
+    --text: #171717;
+    --muted: #727272;
+    --link: #2563eb;
+    --hover: #ececec;
+    --bubble: #f1f1f1;
+    --composer: #fff;
+    --border: #e5e5e5;
+    --error: #b91c1c;
+    --done: #15803d;
+    --shadow: 0 8px 28px #00000012;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #212121;
+      --text: #ececec;
+      --muted: #9b9b9b;
+      --link: #60a5fa;
+      --hover: #2b2b2b;
+      --bubble: #303030;
+      --composer: #2f2f2f;
+      --border: #424242;
+      --error: #f87171;
+      --done: #4ade80;
+      --shadow: 0 8px 28px #0005;
+    }
+  }
+  body { margin: 0; color: var(--text); background: var(--bg); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif }
+  button, input, textarea, select { color: inherit; font: inherit }
+  button { border: 0; background: none; cursor: pointer }
+  button:disabled { cursor: default; opacity: .45 }
+  [hidden] { display: none !important }
+  main { max-width: 780px; margin: 0 auto; padding: 22px 16px 60px }
+  .brand { display: flex; align-items: center; gap: 9px; margin-bottom: 18px; font-size: 17px; font-weight: 650; letter-spacing: -.02em }
+  .brand img { width: 19px; height: 19px }
+  #picker { position: relative; font-size: 13px; font-weight: 400; letter-spacing: 0 }
+  #variant { padding: 2px 9px; color: var(--muted); border: 1px solid var(--border); border-radius: 8px }
+  #variant:hover { color: var(--text) }
+  #variant::after { content: " \25BE" }
+  #variants { position: absolute; z-index: 1; top: calc(100% + 4px); left: 0; width: max-content; max-width: calc(100vw - 32px); padding: 4px; background: var(--composer); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow) }
+  .variant { display: block; width: 100%; padding: 6px 10px; text-align: left; border-radius: 8px }
+  button.variant:hover { background: var(--hover) }
+  .variant[aria-selected="true"] { font-weight: 600 }
+  .variant small { display: block; color: var(--muted); font-size: 12px; font-weight: 400 }
+  .variant.missing { color: var(--muted); opacity: .6 }
+  .variant code { font: 12px ui-monospace, Menlo, monospace; overflow-wrap: anywhere; user-select: all }
+  h2 { margin: 30px 0 4px; font-size: 15px }
+  .hint { margin: 6px 0; color: var(--muted); font-size: 12px }
+
+  form { padding: 14px; background: var(--composer); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow) }
+  #prompt { display: block; width: 100%; min-height: 76px; padding: 4px 2px; resize: vertical; background: none; border: 0; outline: 0 }
+  .drops { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px }
+  .drop { position: relative; display: grid; place-items: center; min-height: 92px; padding: 10px; overflow: hidden; color: var(--muted); font-size: 13px; text-align: center; border: 1.5px dashed var(--border); border-radius: 12px; cursor: pointer }
+  .drop:hover, .drop.over { color: var(--text); background: var(--hover) }
+  .drop img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover }
+  .remove { position: absolute; top: 6px; right: 6px; display: grid; place-items: center; width: 24px; height: 24px; color: #fff; background: #000a; border-radius: 50% }
+  #references .drop { margin-top: 10px }
+  #reference-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 0; padding: 0; list-style: none }
+  .reference { position: relative; width: 112px }
+  .reference .thumb { display: grid; place-items: center; width: 112px; height: 72px; overflow: hidden; color: var(--muted); font-size: 12px; background: var(--bubble); border-radius: 9px }
+  .reference .thumb img, .reference .thumb video { width: 100%; height: 100%; min-width: 0; min-height: 0; object-fit: cover }
+  .tag { display: block; margin-top: 3px; padding: 0; font-size: 12px; font-family: ui-monospace, Menlo, monospace; color: var(--link) }
+  .file-name { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap }
+  .options { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 12px; font-size: 13px }
+  .options select, .options input[type="number"], #api-key { padding: 4px 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 7px }
+  #seed { width: 118px }
+  #generate { margin-left: auto; padding: 7px 16px; color: var(--bg); background: var(--text); border-radius: 999px; font-weight: 600 }
+  #credentials { display: block; margin-top: 12px; color: var(--muted); font-size: 12px }
+  #api-key { display: block; width: 100%; margin-top: 4px }
+  #form-error { margin: 10px 0 0; color: var(--error); font-size: 13px }
+  #form-error:empty { display: none }
+
+  #jobs { display: grid; gap: 10px; margin-top: 10px }
+  .job { padding: 12px 14px; border: 1px solid var(--border); border-radius: 14px }
+  .job-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px }
+  .state { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 14px }
+  .state::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted) }
+  .job.running .state::before { background: var(--link) }
+  .job.completed .state::before { background: var(--done) }
+  .job.failed .state::before { background: var(--error) }
+  .meta { color: var(--muted); font-size: 12px }
+  .actions { display: flex; gap: 4px; margin-left: auto }
+  .actions button { padding: 3px 10px; font-size: 13px; border: 1px solid var(--border); border-radius: 999px }
+  .actions button:hover { background: var(--hover) }
+  .job-prompt { margin: 6px 0 0; overflow-wrap: anywhere; white-space: pre-wrap }
+  .job-error { margin: 6px 0 0; color: var(--error); font-size: 13px }
+  .bar { height: 4px; margin-top: 10px; overflow: hidden; background: var(--bubble); border-radius: 2px }
+  .bar div { height: 100%; background: var(--link); transition: width .4s ease }
+  .job video { display: block; width: 100%; margin-top: 10px; background: #000; border-radius: 10px }
+  @media (max-width: 560px) { .drops { grid-template-columns: 1fr } }
+</style>
+
+<main>
+  <div class="brand"><img src="/favicon.ico" alt="">Splash
+    <div id="picker"><button type="button" id="variant" aria-haspopup="listbox" aria-expanded="false" hidden></button><div id="variants" role="listbox" hidden></div></div>
+  </div>
+  <form id="form">
+    <textarea id="prompt" placeholder="Describe the clip" aria-label="Prompt" autofocus></textarea>
+    <div id="frames" class="drops">
+      <label class="drop" data-field="input_reference"><span>First frame<br>PNG or JPEG: drop or click</span><input type="file" accept="image/png,image/jpeg" hidden></label>
+      <label class="drop" data-field="last_frame"><span>Last frame<br>with a first frame</span><input type="file" accept="image/png,image/jpeg" hidden></label>
+    </div>
+    <div id="references" hidden>
+      <label class="drop"><span>Images, videos or audio: drop or click<br>PNG, JPEG, MP4, MOV, WebM, MP3, WAV, M4A or AAC</span><input type="file" multiple hidden accept="image/png,image/jpeg,video/mp4,video/quicktime,video/webm,audio/mpeg,audio/wav,audio/mp4,audio/aac,.m4a,.aac"></label>
+      <ol id="reference-list"></ol>
+      <p class="hint">At most 9 images, 3 videos and 3 audio clips, 12 in all; audio needs an image or video beside it. Click a tag to put it in the prompt.</p>
+    </div>
+    <div class="options">
+      <label>Duration <select id="seconds"></select></label>
+      <label>Size <select id="size"></select></label>
+      <label>Seed <input id="seed" type="number" min="0" max="4294967295" value="0"></label>
+      <label><input id="audio" type="checkbox" checked> Audio</label>
+      <button id="generate">Generate</button>
+    </div>
+    <label id="credentials" hidden>This server needs an API key
+      <input id="api-key" type="password" autocomplete="off" spellcheck="false" aria-label="API key">
+    </label>
+    <p id="form-error" role="alert"></p>
+  </form>
+  <h2>Clips</h2>
+  <p class="hint">The server renders one clip at a time; up to four more wait in its queue.</p>
+  <div id="jobs"></div>
+</main>
+
+<script>
+  const $ = selector => document.querySelector(selector);
+  const form = $('#form');
+  const prompt = $('#prompt');
+  const variantButton = $('#variant');
+  const variantList = $('#variants');
+  const referenceList = $('#reference-list');
+  const apiKey = $('#api-key');
+  const credentials = $('#credentials');
+  const formError = $('#form-error');
+  const generate = $('#generate');
+  const jobsBox = $('#jobs');
+  // The video API's rules for every variant (server/videos.py): whole seconds
+  // from 4 to 15, and the named canvases of the 480p and 768p tiers.
+  const SECONDS = Array.from({length: 12}, (_, index) => index + 4);
+  const SIZES = ['832x480', '864x480', '480x832', '1344x768', '768x1344'];
+  // MiniMax-H3's variants (install/families.py, H3.variants), to show those
+  // the server does not serve with the command that installs them.
+  const VARIANTS = ['pika-6', 'pika-ref2va-6', 'vdn-8', 'vdn-50', 'fasth3-8', 'fasth3-4'];
+  const PHASES = {encode: 'encoding the prompt', prepare: 'preparing', denoise: 'denoising',
+                  preview: 'previewing', decode: 'decoding', audio: 'adding audio', mux: 'writing the mp4'};
+  const frames = {input_reference: null, last_frame: null};
+  let references = [];
+  let mode = 'frames';
+  // The served variants' /v1/models entries, the default first, and the chosen one.
+  let served = [], chosen = null;
+  // The clips cancelled here, which the server forgets, and the mp4s fetched.
+  const cancelled = new Map();
+  const clips = new Map();
+  // The clips made from this page while it is open, played once they are done.
+  const watched = new Set();
+  let refreshTimer, refreshing = false, refreshAgain = false;
+
+  for (const value of SECONDS) $('#seconds').add(new Option(`${value} s`, value, false, value === 10));
+  for (const value of SIZES) $('#size').add(new Option(value.replace('x', ' × '), value));
+
+  function authorization() {
+    return apiKey.value ? {Authorization: `Bearer ${apiKey.value}`} : {};
+  }
+
+  // Only a server started with --api-key answers 401; the key's field shows then and stays.
+  function askForKeyIfUnauthorized(response) {
+    if (response.status === 401) credentials.hidden = false;
+  }
+
+  // The served variants, the entries repo:variant of /v1/models, the default
+  // first; its first entry is the server's --model, whose repo they share, and
+  // the others name no variant.
+  async function loadModel() {
+    try {
+      const response = await fetch('/v1/models', {headers: authorization()});
+      askForKeyIfUnauthorized(response);
+      if (!response.ok) return;
+      const data = (await response.json()).data ?? [];
+      const repo = (data[0]?.id ?? '').split(':')[0];
+      served = data.filter(entry => entry.id.startsWith(`${repo}:`));
+      if (!served.length) return;
+      renderVariants(repo);
+      choose(served.find(entry => entry.id === chosen?.id) ?? served[0]);
+      variantButton.hidden = false;
+    } catch { /* The server takes requests without a model too. */ }
+  }
+
+  const variantOf = entry => entry.id.slice(entry.id.lastIndexOf(':') + 1);
+  // A variant that takes video takes references (Ref2VA), else first and last frames.
+  const takesReferences = entry => entry.input_modalities?.includes('video');
+
+  function renderVariants(repo) {
+    variantList.replaceChildren();
+    for (const entry of served) {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = 'variant';
+      option.setAttribute('role', 'option');
+      option.entry = entry;
+      option.append(variantOf(entry));
+      const note = document.createElement('small');
+      note.textContent = takesReferences(entry) ? 'from references' : 'from a prompt, first and last frame';
+      option.append(note);
+      option.addEventListener('click', () => { choose(entry); openVariants(false); });
+      variantList.append(option);
+    }
+    const names = new Set(served.map(variantOf));
+    for (const variant of VARIANTS.filter(name => !names.has(name))) {
+      const option = document.createElement('div');
+      option.className = 'variant missing';
+      option.setAttribute('role', 'option');
+      option.setAttribute('aria-disabled', 'true');
+      option.append(`${variant} · not installed`);
+      const command = document.createElement('small');
+      const code = document.createElement('code');
+      code.textContent = `splash install ${repo}:${variant}`;
+      command.append(code);
+      option.append(command);
+      variantList.append(option);
+    }
+  }
+
+  function choose(entry) {
+    chosen = entry;
+    variantButton.textContent = entry.id;
+    for (const option of variantList.querySelectorAll('button.variant')) {
+      option.setAttribute('aria-selected', option.entry === entry);
+    }
+    mode = takesReferences(entry) ? 'references' : 'frames';
+    $('#frames').hidden = mode !== 'frames';
+    $('#references').hidden = mode !== 'references';
+  }
+
+  function openVariants(open) {
+    variantList.hidden = !open;
+    variantButton.setAttribute('aria-expanded', open);
+  }
+
+  function kind(file) {
+    const type = file.type || ({m4a: 'audio/mp4', aac: 'audio/aac'})[file.name.split('.').pop().toLowerCase()] || '';
+    if (type === 'image/png' || type === 'image/jpeg') return 'image';
+    if (type.startsWith('video/')) return 'video';
+    if (type.startsWith('audio/')) return 'audio';
+    return null;
+  }
+
+  function setFrame(drop, file) {
+    const field = drop.dataset.field;
+    if (frames[field]) URL.revokeObjectURL(frames[field].url);
+    frames[field] = file && {file, url: URL.createObjectURL(file)};
+    drop.querySelector('img')?.remove();
+    drop.querySelector('.remove')?.remove();
+    if (!file) return;
+    const image = document.createElement('img');
+    image.src = frames[field].url;
+    image.alt = file.name;
+    const remove = removeButton(() => setFrame(drop, null));
+    drop.append(image, remove);
+  }
+
+  function removeButton(onRemove) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'remove';
+    button.textContent = '×';
+    button.setAttribute('aria-label', 'Remove');
+    // Inside a drop's label, a click would also open the file picker.
+    button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); onRemove(); });
+    return button;
+  }
+
+  function addReferences(files) {
+    const refused = files.filter(file => !kind(file));
+    if (refused.length) formError.textContent = `${refused.map(file => file.name).join(', ')}: not PNG, JPEG, MP4, MOV, WebM, MP3, WAV, M4A or AAC`;
+    for (const file of files.filter(kind)) references.push({file, kind: kind(file), url: URL.createObjectURL(file)});
+    renderReferences();
+  }
+
+  // Each reference with the tag the prompt names it by, numbered per kind in
+  // order. A video's soundtrack takes an audio number before the video's, which
+  // the page cannot see, so audio is numbered only while no video is given.
+  function renderReferences() {
+    referenceList.replaceChildren();
+    const counts = {image: 0, video: 0, audio: 0};
+    const videos = references.some(reference => reference.kind === 'video');
+    for (const reference of references) {
+      counts[reference.kind] += 1;
+      const tag = reference.kind === 'image' ? `<Picture ${counts.image}>`
+        : reference.kind === 'video' ? `<Video ${counts.video}>`
+        : videos ? '<Audio>' : `<Audio ${counts.audio}>`;
+      const item = document.createElement('li');
+      item.className = 'reference';
+      const thumb = document.createElement('div');
+      thumb.className = 'thumb';
+      if (reference.kind === 'audio') thumb.textContent = 'Audio';
+      else {
+        const media = document.createElement(reference.kind === 'image' ? 'img' : 'video');
+        media.src = reference.url;
+        media.muted = true;
+        thumb.append(media);
+      }
+      const tagButton = document.createElement('button');
+      tagButton.type = 'button';
+      tagButton.className = 'tag';
+      tagButton.textContent = tag;
+      tagButton.title = 'Put this tag in the prompt';
+      tagButton.addEventListener('click', () => insert(tag));
+      const name = document.createElement('div');
+      name.className = 'file-name';
+      name.textContent = reference.file.name;
+      item.append(thumb, removeButton(() => {
+        URL.revokeObjectURL(reference.url);
+        references = references.filter(other => other !== reference);
+        renderReferences();
+      }), tagButton, name);
+      referenceList.append(item);
+    }
+  }
+
+  function insert(text) {
+    const start = prompt.selectionStart, end = prompt.selectionEnd;
+    prompt.setRangeText(text, start, end, 'end');
+    prompt.focus();
+  }
+
+  for (const drop of document.querySelectorAll('.drop')) {
+    const picker = drop.querySelector('input');
+    const take = files => {
+      formError.textContent = '';
+      if (!drop.dataset.field) addReferences(files);
+      else if (files[0] && kind(files[0]) === 'image') setFrame(drop, files[0]);
+      else if (files[0]) formError.textContent = `${files[0].name}: a frame is a PNG or JPEG image`;
+    };
+    picker.addEventListener('change', () => { take(Array.from(picker.files)); picker.value = ''; });
+    drop.addEventListener('dragover', event => { event.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+    drop.addEventListener('drop', event => {
+      event.preventDefault();
+      drop.classList.remove('over');
+      take(Array.from(event.dataTransfer.files));
+    });
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    formError.textContent = '';
+    const body = new FormData();
+    body.append('prompt', prompt.value);
+    body.append('seconds', $('#seconds').value);
+    body.append('size', $('#size').value);
+    body.append('seed', $('#seed').value || '0');
+    body.append('audio', String($('#audio').checked));
+    if (chosen) body.append('model', chosen.id);
+    if (mode === 'frames') {
+      for (const [field, frame] of Object.entries(frames)) if (frame) body.append(field, frame.file);
+    } else {
+      for (const reference of references) body.append('references', reference.file);
+    }
+    generate.disabled = true;
+    try {
+      const response = await fetch('/v1/videos', {method: 'POST', headers: authorization(), body});
+      askForKeyIfUnauthorized(response);
+      const job = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        formError.textContent = job.error?.message ?? `The server answered ${response.status}.`;
+        return;
+      }
+      watched.add(job.id);
+      refresh();
+    } catch {
+      formError.textContent = 'The server did not answer.';
+    } finally {
+      generate.disabled = false;
+    }
+  }
+
+  const active = job => job.status === 'queued' || job.status === 'in_progress';
+
+  // The server's clips, newest first, polled while one is queued or running;
+  // a refresh asked for during one runs once it ends.
+  async function refresh() {
+    if (refreshing) { refreshAgain = true; return; }
+    refreshing = true;
+    clearTimeout(refreshTimer);
+    let again = false;
+    try {
+      const response = await fetch('/v1/videos?limit=20', {headers: authorization()});
+      askForKeyIfUnauthorized(response);
+      if (response.ok) {
+        const jobs = (await response.json()).data;
+        render(jobs);
+        again = jobs.some(active);
+      }
+    } catch {
+      again = true;
+    }
+    refreshing = false;
+    if (refreshAgain) { refreshAgain = false; refresh(); }
+    else if (again) refreshTimer = setTimeout(refresh, 1000);
+  }
+
+  function render(jobs) {
+    // The queue runs in order of arrival: a queued clip waits for the running
+    // one and every clip queued before it.
+    let ahead = 0;
+    for (const job of [...jobs].reverse()) {
+      if (job.status === 'queued') job.ahead = ahead;
+      if (active(job)) ahead += 1;
+    }
+    const shown = [...jobs, ...cancelled.values()].sort((a, b) => b.created_at - a.created_at);
+    const ids = new Set(shown.map(job => job.id));
+    for (const card of [...jobsBox.children]) if (!ids.has(card.dataset.id)) card.remove();
+    shown.forEach((job, index) => {
+      const card = jobsBox.querySelector(`[data-id="${job.id}"]`) || createCard(job);
+      if (jobsBox.children[index] !== card) jobsBox.insertBefore(card, jobsBox.children[index] || null);
+      updateCard(card, job);
+    });
+  }
+
+  function createCard(job) {
+    const card = document.createElement('article');
+    card.className = 'job';
+    card.dataset.id = job.id;
+    card.innerHTML = '<div class="job-head"><span class="state"></span><span class="meta"></span>' +
+      '<div class="actions"><button type="button" class="play">Play</button>' +
+      '<button type="button" class="download">Download</button><button type="button" class="cancel"></button></div></div>' +
+      '<p class="job-prompt"></p><div class="bar"><div></div></div><p class="job-error"></p><video controls playsinline hidden></video>';
+    card.querySelector('.play').addEventListener('click', () => play(card));
+    card.querySelector('.download').addEventListener('click', () => download(card));
+    card.querySelector('.cancel').addEventListener('click', () => cancel(card));
+    return card;
+  }
+
+  function updateCard(card, job) {
+    const isCancelled = cancelled.has(job.id);
+    const state = isCancelled ? 'cancelled' : job.status === 'in_progress' ? 'running' : job.status;
+    card.className = `job ${state}`;
+    card.job = job;
+    card.querySelector('.state').textContent =
+      state === 'queued' ? (job.ahead ? `Queued · ${job.ahead} ahead` : 'Queued · next')
+      : state === 'running' ? `Running · ${PHASES[job.phase] ?? 'starting'} · ${job.progress}%`
+      : state === 'completed' ? `Done${job.phases?.total ? ` in ${job.phases.total.seconds} s` : ''}`
+      : state === 'failed' ? 'Failed' : 'Cancelled';
+    card.querySelector('.meta').textContent = `${job.seconds} s · ${job.size} · seed ${job.seed} · ${job.variant}`;
+    card.querySelector('.job-prompt').textContent = job.prompt ?? job.id;
+    card.querySelector('.job-error').textContent = state === 'failed' ? job.error?.message ?? '' : '';
+    card.querySelector('.bar').hidden = !active(job) || isCancelled;
+    card.querySelector('.bar div').style.width = `${job.progress}%`;
+    const done = state === 'completed';
+    card.querySelector('.play').hidden = !done || !card.querySelector('video').hidden;
+    card.querySelector('.download').hidden = !done;
+    const cancelButton = card.querySelector('.cancel');
+    cancelButton.hidden = isCancelled;
+    cancelButton.textContent = active(job) ? 'Cancel' : 'Delete';
+    if (done && watched.delete(job.id)) play(card);
+  }
+
+  // The clip's mp4, fetched once: its content route takes the API key, which
+  // a plain link would not send.
+  async function clip(card) {
+    const id = card.dataset.id;
+    if (!clips.has(id)) {
+      const response = await fetch(`/v1/videos/${id}/content`, {headers: authorization()});
+      askForKeyIfUnauthorized(response);
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error?.message ?? `The server answered ${response.status}.`);
+      clips.set(id, URL.createObjectURL(await response.blob()));
+    }
+    return clips.get(id);
+  }
+
+  async function play(card) {
+    try {
+      const video = card.querySelector('video');
+      video.src = await clip(card);
+      video.hidden = false;
+      card.querySelector('.play').hidden = true;
+    } catch (error) {
+      card.querySelector('.job-error').textContent = error.message;
+    }
+  }
+
+  async function download(card) {
+    try {
+      const link = document.createElement('a');
+      link.href = await clip(card);
+      link.download = `${card.dataset.id}.mp4`;
+      link.click();
+    } catch (error) {
+      card.querySelector('.job-error').textContent = error.message;
+    }
+  }
+
+  // DELETE cancels a queued or running clip, which the server then forgets,
+  // and deletes a finished one.
+  async function cancel(card) {
+    const job = card.job;
+    try {
+      const response = await fetch(`/v1/videos/${job.id}`, {method: 'DELETE', headers: authorization()});
+      askForKeyIfUnauthorized(response);
+      if (response.ok && active(job)) cancelled.set(job.id, job);
+      if (clips.has(job.id)) URL.revokeObjectURL(clips.get(job.id));
+      clips.delete(job.id);
+    } catch { /* The next refresh shows the clip as the server has it. */ }
+    refresh();
+  }
+
+  form.addEventListener('submit', submit);
+  variantButton.addEventListener('click', () => openVariants(variantList.hidden));
+  document.addEventListener('click', event => { if (!$('#picker').contains(event.target)) openVariants(false); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') openVariants(false); });
+  apiKey.addEventListener('change', () => { loadModel(); refresh(); });
+  loadModel();
+  refresh();
+</script>
+</html>

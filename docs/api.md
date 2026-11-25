@@ -29,7 +29,7 @@ Messages requires it.
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
 | `GET /ready` | 200 while the engine is ready, else 503; public |
-| `GET /` | The chat page; public, and gone with `--no-webui` |
+| `GET /` | The chat page, or a video model's trial page; public, and gone with `--no-webui` |
 
 ## Request fields
 
