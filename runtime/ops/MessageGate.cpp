@@ -116,8 +116,7 @@ PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuff
   // [gates][rows][hidden], over the same bytes of forget.
   static_assert(2 * sizeof(uint16_t) == sizeof(float), "a gate's concatenation takes its gated rows' bytes");
   requireBytes(buffers.forget, uint64_t{count} * rows * hidden * sizeof(float), "message gate gated rows");
-  requireBytes(buffers.gain, uint64_t{count} * groups * slices * MESSAGE_GATE_GROUP_ROWS * sizeof(float),
-               "message gate partial sums");
+  requireBytes(buffers.gain, partialSumsBytes(count, hidden, rows), "message gate partial sums");
   requireBytes(buffers.counters, uint64_t{count} * groups * sizeof(uint32_t), "message gate counters");
   graph.add("message_gate_normalize", {buffers.x, buffers.message, buffers.forget}, p, {rows, 1, count}, threads);
   graph.add("message_gate_down" + suffix,

@@ -29,16 +29,19 @@ namespace splash::model {
 // keyValueProjection), and a full layer's dynamic taps of each (KV heads x
 // taps a row); a prompt chunk's relative states and row
 // sinks the attention's projection stages for its split (fp32, in the
-// queries' staged rows); a message gate's concatenated norms (2 hiddenSize),
-// low rank (loopGateRank, three gates' in a row) and forget and gain rows
-// (fp32; a decode step's forget rows three fused gates' gated rows; a longer
-// prompt chunk's forget, gain and concatenation rows its three tiled gates'
-// gated rows, fp32 of hiddenSize each), and the fused gates' counters
-// (ops::MessageGate::kCountersBytes, zero between calls); zero rows, which
-// the MoE adds its weighted sum to (ops::MoeBuffers::residual); and a decode
-// step's convolution inputs of every application, rows of stateColumns() values,
-// which its commit reads, and its relative attention's counters
-// (ops::RelativeAttention::kCountersBytes, zero between layers).
+// queries' staged rows); a message gate's rank values (loopGateRank, three
+// gates' in a row, up to ops::MessageGate::kFusedRows rows), forget and gain
+// rows (fp32; a decode step's forget rows three fused gates' gated rows and
+// its gain rows their partial sums; a prompt chunk's forget, gain and
+// concatenation rows its three tiled gates' gated rows, fp32 of hiddenSize
+// each, with gateConcat empty in decode and sharing bytes with gateLow in
+// prefill), and the fused gates' counters (ops::MessageGate::kCountersBytes,
+// zero between calls); zero rows, which the MoE adds its weighted sum to
+// (ops::MoeBuffers::residual); and a decode step's convolution inputs of every
+// application, rows of stateColumns() values, which its commit reads, and its
+// relative attention's counters (ops::RelativeAttention::kCountersBytes, zero
+// between layers). Non-overlapping mix/gate and attention tensors share one
+// page-aligned transient region past the persistent tensors.
 struct Inkling2LoopScratch final {
   metal::MetalBuffer stack;
   metal::MetalBuffer previous;

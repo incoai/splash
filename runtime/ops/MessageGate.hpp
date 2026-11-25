@@ -85,6 +85,13 @@ struct MessageGate final {
   static constexpr uint64_t kCountersBytes = uint64_t{kMaximumGates} *
                                              ((kFusedRows + MESSAGE_GATE_GROUP_ROWS - 1) / MESSAGE_GATE_GROUP_ROWS) *
                                              sizeof(uint32_t);
+  // The partial sums of the fused gates of `gates` gates of `rows` rows of
+  // `hidden` values (message_gate_apply).
+  static constexpr uint64_t partialSumsBytes(uint32_t gates, uint32_t hidden, uint32_t rows) noexcept {
+    const uint64_t groups = (uint64_t{rows} + MESSAGE_GATE_GROUP_ROWS - 1) / MESSAGE_GATE_GROUP_ROWS;
+    const uint64_t slices = (uint64_t{hidden} + MESSAGE_GATE_THREADS - 1) / MESSAGE_GATE_THREADS;
+    return uint64_t{gates} * groups * slices * MESSAGE_GATE_GROUP_ROWS * sizeof(float);
+  }
   // The gated rows of `rows` rows of `hidden` values, each gate's through its
   // norm into its output. The projections reading the outputs prepare their
   // own tables, so the scratch describes nothing. Throws for a call the fused
