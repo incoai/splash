@@ -22,4 +22,5 @@ mlx-community/Inkling-2-Mini-4bit	Inkling-2-Mini	36	18	Agentic all-rounder
 unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS	Inkling-2-Mini	24	13	Agentic all-rounder
 unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL	Ornith-1.5-122B	128	82	Largest model
 ornith-ai/Ornith-1.5-122B-MLX-4bit	Ornith-1.5-122B	128	71	Largest model
+prism-ml/Ternary-Bonsai-2.5-27B-GGUF:PQ2_0	Ternary-Bonsai-2.5-27B	24	12	Agentic, smallest download
 prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0	Ternary-Bonsai-2-27B	24	12	Smallest download

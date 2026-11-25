@@ -464,7 +464,8 @@ PQ2_0 is Prism ML's type 142, `block_pq2_0` of PrismML-Eng/llama.cpp, which
 upstream GGML does not define: 2-bit codes q worth d (q - 1) with one half d per
 128 weights.
 
-Prism ML's GGUFs, such as `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0`, store
+Prism ML's GGUFs, such as `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0` and
+`prism-ml/Ternary-Bonsai-2.5-27B-GGUF:PQ2_0`, store
 every projection for rotated inputs: the `prism.hadamard.*` metadata names the
 tensors whose weights multiply H (D x), H the normalized Walsh-Hadamard
 transform of each block of 1024 inputs and D an explicit sign per input, and the
@@ -480,6 +481,13 @@ model decodes in int8 activations, one scale per row and block of 1024 rotated
 inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
 20-core M5 Pro), which `--activations bf16` turns off
 ([server options](server.md#server-options)).
+
+Bonsai 2 keeps its GDN alpha/beta in BF16 and Bonsai 2.5 in F32; both load as
+F32 values. Bonsai 2.5's PQ2_0 `-mtp` file declares one extra block
+(`nextn_predict_layers`) whose draft head the target does not run: the
+planner leaves it unread, and Splash decodes with the family's DFlash2 draft.
+Only the PQ2_0 packing is served: PTQ1_0 is a type the engine does not
+implement, and Q2_0 keeps a Q2_0 token table the rotation cannot gather.
 
 ## Drafts
 

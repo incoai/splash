@@ -376,6 +376,28 @@ class UpstreamTest(unittest.TestCase):
             ):
                 upstream.select_gguf(folders, variant)
 
+    def test_bonsai_25_publishes_a_plain_and_an_mtp_file_of_each_packing(self):
+        files = {
+            "Ternary-Bonsai-2.5-27B-PQ2_0.gguf",
+            "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf",
+            "Ternary-Bonsai-2.5-27B-PTQ1_0.gguf",
+            "Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf",
+            "Ternary-Bonsai-2.5-27B-Q2_0.gguf",
+            "Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf",
+            "Ternary-Bonsai-2.5-27B-mmproj-BF16.gguf",
+            "Ternary-Bonsai-2.5-27B-mmproj-Q8_0.gguf",
+        }
+        # A variant names its own file, never the file whose name only starts
+        # with it, and no projector is a target.
+        for variant, chosen in (
+            ("PQ2_0", "Ternary-Bonsai-2.5-27B-PQ2_0.gguf"),
+            ("PQ2_0-mtp", "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf"),
+        ):
+            with self.subTest(variant=variant):
+                self.assertEqual(
+                    upstream.select_gguf(files, variant), ([chosen], False)
+                )
+
     def test_a_root_split_gguf_is_one_target(self):
         parts = [f"Model-Q1_0-0000{n}-of-00003.gguf" for n in (1, 2, 3)]
         files = {*parts, "mmproj-BF16.gguf", "README.md"}
