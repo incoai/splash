@@ -271,18 +271,6 @@ a status document of another schema. An added field keeps the version, as
 `weights` did in 1.2.1 and `ane_ffn` in 1.3.0. Builds between releases share a
 version while its layout changes.
 
-## LoopCD smoke benchmark
-
-On an Apple Silicon Mac with the source checkout, stop any running Splash
-server first, then run `python3 dev/benchmarks/loop_cd.py`. It starts its own
-servers sequentially, defaulting to Inkling-2-Mini UD-IQ1_S with one lane and a
-2K context. It compares speed in on/off/off/on order and scores the same
-100 GSM8K questions once per mode with greedy decoding and thinking disabled.
-Use `--questions 10` for a quicker check or `--questions 0` for speed only.
-The script saves a summary, per-request data, and startup logs in a new
-`loop-cd-*` directory. It does not measure perplexity (current score-only paths
-bypass LoopCD) or reproduce the published coda-based recipe.
-
 ## Local benchmarks
 
 From a source checkout with the model installed, use the native benchmark for
