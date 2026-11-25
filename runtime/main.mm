@@ -154,7 +154,7 @@ void printUsage(std::string_view executable) {
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
       " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
-      " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]"
+      " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all] [--loop-cd on|off]"
       " [--max-concurrent-requests REQUESTS]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
@@ -241,6 +241,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.kvSpillAlways = arguments.kvSpillAlways;
   config.resources.kvWindowTrim = arguments.kvWindowTrim;
   config.resources.verifyRows = arguments.verifyRows;
+  config.resources.loopCD = arguments.loopCD;
   config.resources.lanes = arguments.lanes;
   config.resources.int8Activations = arguments.int8Activations;
   config.nativeLoop.engine.maxContext = arguments.maxContext;

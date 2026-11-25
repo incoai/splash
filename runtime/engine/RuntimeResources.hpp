@@ -166,6 +166,7 @@ struct RuntimeResourcesConfig {
   // benchmark round verifies every row of a draft's block a lane (all) so
   // that rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  bool loopCD = false;
   // --max-concurrent-requests: the lanes the runtime runs and plans for.
   uint32_t lanes = model::ExecutionLimits::defaultLanes;
   // --activations: whether the plans may round activations to int8
@@ -384,7 +385,7 @@ private:
                    AneFfnStart aneFfn, kv::Format kvFormat, std::string buildId, std::function<bool()> cancelled,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-                   model::VerifyRows verifyRows);
+                   model::VerifyRows verifyRows, bool loopCD);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -428,6 +429,7 @@ private:
   bool spillAlways_ = false;
   // --verify-rows, which modelContext() passes on.
   model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
+  bool loopCD_ = false;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

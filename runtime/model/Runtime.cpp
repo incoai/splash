@@ -385,6 +385,7 @@ struct Runtime::Impl {
     // included. Composite cache state never stores it; every cache hit
     // replays one input token and regenerates this value.
     std::vector<uint16_t> finalTargetHidden;
+    std::vector<uint16_t> amateurPromptHidden;
     std::array<float, kSamplingUniformCount> cycleUniforms{};
     // A decode cycle's noise, with which a sampled lane's draft draws the
     // children of its tree's rows (ops::DraftTreeLane).
@@ -513,6 +514,7 @@ struct Runtime::Impl {
   MetalBackend &backend;
   const LoadedModel &model;
   const RuntimeGeometry geometry;
+  const LoopCDProfile *const loopCD;
   const ops::ExecutionPlans &operators;
   kv::PageStorage &kvPages;
   QwenStateStorage &states;
@@ -744,7 +746,8 @@ struct Runtime::Impl {
       : backend(value.backend),
         model(value.model),
         geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format, value.stateStorage.layout().target,
-                                       StreamedParts::loaded(value.model, value.blockCache != nullptr), value.lanes)),
+                                       StreamedParts::loaded(value.model, value.blockCache != nullptr), value.lanes, value.loopCD)),
+        loopCD(value.loopCD ? loopCDProfile(value.model.descriptor) : nullptr),
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
@@ -855,10 +858,11 @@ struct Runtime::Impl {
     for (uint32_t first = 0; first < policies.size(); first += lanes) {
       const auto policy = std::span(policies).subspan(first, lanes);
       const ops::PenaltyTable penalties{penaltyTable, std::span(stateLanes).first(lanes)};
+      const auto contrast = loopCDSampling((uint32_t{1} << lanes) - 1);
       sampling.addInitial(graph, policy, samplingBuffers(lanes), laneRowsOf(lanes), geometry.target.stopTokens,
-                          penalties);
+                          penalties, contrast);
       sampling.addVerify(graph, policy, samplingBuffers(lanes), stepOf(lanes, lanes * kDraftRows),
-                         geometry.target.stopTokens, penalties);
+                         geometry.target.stopTokens, penalties, contrast);
     }
     backend.preparePipelines(graph.dispatches());
   }
@@ -1391,6 +1395,10 @@ struct Runtime::Impl {
         contents<uint16_t>(decodeArena->rows(TargetTensor::Hidden0, {lane, 1}), "target final hidden source");
     entry.finalTargetHidden.assign(source,
                                    source + geometry.target.hiddenSize);
+    if (loopCD) {
+      source = contents<uint16_t>(targetModel->loopCDPromptRow(lane), "LoopCD prompt hidden source");
+      entry.amateurPromptHidden.assign(source, source + geometry.target.hiddenSize);
+    }
   }
 
   static DispatchDraftCapturePlan
@@ -1704,19 +1712,22 @@ struct Runtime::Impl {
       return;
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
     std::array<uint32_t, kLaneCount> stateLanes{};
+    uint32_t selecting = 0;
     for (const InitialSelection &lane : lanes) {
       if (!lane.select)
         continue;
+      selecting |= uint32_t{1} << lane.lane;
       policies[lane.lane] = samplingPolicy(*lane.entry);
       stateLanes[lane.lane] = lane.entry->stateLane;
     }
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
     encodeTargetLogitsCapture(graph, width, false);
 #endif
+    if (loopCD) targetModel->addLoopCDPromptHead(graph, width, decodeArena->linearScratch());
     sampling.addInitial(graph, std::span(policies).first(width),
                         samplingBuffers(width), laneRowsOf(width),
                         geometry.target.stopTokens,
-                        {penaltyTable, std::span(stateLanes).first(width)});
+                        {penaltyTable, std::span(stateLanes).first(width)}, loopCDSampling(selecting));
   }
 
   // The first token encodeInitialSelections() selected for a batch lane: a
@@ -1744,6 +1755,12 @@ struct Runtime::Impl {
       std::ranges::copy(entry.finalTargetHidden,
                         contents<uint16_t>(decodeArena->rows(TargetTensor::Hidden0, {lane, 1}),
                                            "final prompt hidden"));
+      if (loopCD) {
+        if (entry.amateurPromptHidden.size() != geometry.target.hiddenSize)
+          throw std::logic_error("LoopCD initial selection state is invalid");
+        std::ranges::copy(entry.amateurPromptHidden,
+                          contents<uint16_t>(targetModel->loopCDPromptRow(lane), "LoopCD prompt hidden"));
+      }
       if (samplingEnabled(entry))
         uploadInitialUniform(entry, lane);
       uploadConstraintMasks(lane, entry.maskWords);
@@ -1773,6 +1790,7 @@ struct Runtime::Impl {
         keepGrammarChain(entry, 0, token);
         entry.maskWords.clear();
         entry.finalTargetHidden.clear();
+        entry.amateurPromptHidden.clear();
         entry.decodeStage = DecodeStage::Regular;
         emitTerminalAnchor(entry, result);
       }
@@ -2349,6 +2367,9 @@ struct Runtime::Impl {
         destination.auxiliaryIn = in.auxiliary;
         destination.auxiliaryOut = out.auxiliary;
         destination.imageRows = imageRows;
+        if (loopCD && ends && parts[sequence.lane].back() == std::pair{c, s} &&
+            !sequence.entry->replayingGeneration && part.logicalPosition + part.tokenCount == sequence.entry->promptTokens)
+          destination.amateurPromptRow = targetModel->loopCDPromptRow(sequence.lane);
         // A state at the part's end takes the codes of the state the part
         // writes, and the convolution rows and auxiliary state of the cell
         // it writes them to (above, or sealStates).
@@ -2824,6 +2845,11 @@ struct Runtime::Impl {
         targetModel->addPrefill(graph, std::span(&chunk, 1), kvPages, reads, {0, geometry.target.layers}, nullptr));
   }
 
+  ops::LoopCDSampling loopCDSampling(uint32_t lanes) const {
+    if (!loopCD) return {};
+    return {targetModel->loopCDLogits(), lanes, loopCD->weight, loopCD->logPlausibility};
+  }
+
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
                                      std::span<Request *const> entries, const ops::StepRows &step) {
     if (entries.empty() || entries.size() > kLaneCount)
@@ -2841,7 +2867,8 @@ struct Runtime::Impl {
     encodeTargetLogitsCapture(graph, lanes, true);
 #endif
     sampling.addVerify(graph, std::span(policies).first(lanes), samplingBuffers(lanes), step,
-                       geometry.target.stopTokens, {penaltyTable, std::span(stateLanes).first(lanes)});
+                       geometry.target.stopTokens, {penaltyTable, std::span(stateLanes).first(lanes)},
+                       loopCDSampling((uint32_t{1} << lanes) - 1));
   }
 
   void encodeDraftStateCommitBatch(CommandGraph &graph,
@@ -3644,6 +3671,7 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
   entry.promptComplete = false;
   if (!entry.replayingGeneration) {
     entry.finalTargetHidden.clear();
+    entry.amateurPromptHidden.clear();
     entry.pendingToken.reset();
   }
   entry.draftContextPlan.reset();
@@ -4811,18 +4839,18 @@ ModelMemoryPlan memoryPlanOf(const ModelDescriptor &descriptor, ops::GdnStateFor
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format kvFormat,
-                                     ops::GdnStateFormat stateFormat, StreamedParts parts, uint32_t lanes) {
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts, uint32_t lanes, bool loopCD) {
   requireCompatibleModel(model);
-  return memoryPlanOf(model.descriptor, stateFormat, RuntimeGeometry::from(model, kvFormat, stateFormat, parts, lanes),
+  return memoryPlanOf(model.descriptor, stateFormat, RuntimeGeometry::from(model, kvFormat, stateFormat, parts, lanes, loopCD),
                       operators);
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor, const QwenTargetGeometry &target,
                                      const ops::ExecutionPlans &operators, kv::Format kvFormat,
-                                     ops::GdnStateFormat stateFormat, StreamedParts parts, uint32_t lanes) {
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts, uint32_t lanes, bool loopCD) {
   return memoryPlanOf(
       descriptor, stateFormat,
-      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts, lanes), operators);
+      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts, lanes, loopCD), operators);
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {

@@ -69,6 +69,14 @@ struct TargetSamplingParams {
 static_assert(sizeof(TargetSamplingParams) == 44 + 16 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Target sampling parameters are the same size on both sides");
 
+struct LoopCDParams {
+  TargetSamplingParams selection;
+  uint32_t lanes;
+  float weight;
+  float log_plausibility;
+};
+static_assert(sizeof(LoopCDParams) == sizeof(TargetSamplingParams) + 12);
+
 // The selection of each lane's first token after its prompt from its one row
 // of the logits, row[l]: decode_sample_first_rows writes the lane rows
 // (TargetSamplingParams) and that row's tree row, a tree's root, that the

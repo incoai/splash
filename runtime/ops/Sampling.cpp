@@ -170,11 +170,21 @@ void Sampling::addPenalties(metal::CommandGraph &graph, const SamplingBuffers &b
             {kPenaltyThreads, 1, 1});
 }
 
+static void addLoopCD(metal::CommandGraph &graph, const TargetSamplingParams &selection,
+                      const SamplingBuffers &buffers, uint64_t end, uint32_t lanes, uint32_t laneCap,
+                      const LoopCDSampling &loopCD) {
+  if (!loopCD.lanes) return;
+  requireBytes(loopCD.amateurLogits, end * selection.vocabulary * sizeof(float), "LoopCD amateur logits");
+  const LoopCDParams params{selection, loopCD.lanes, loopCD.weight, loopCD.logPlausibility};
+  graph.add("decode_loop_cd", {buffers.logits, loopCD.amateurLogits, buffers.constraintMasks, buffers.laneRows},
+            params, {laneCap, lanes, 1}, {kVocabularyThreads, 1, 1});
+}
+
 void Sampling::addInitial(metal::CommandGraph &graph,
                           std::span<const SamplingPolicy> policies,
                           SamplingBuffers buffers, std::span<const uint32_t> rows,
                           const StopTokens &stopTokens,
-                          const PenaltyTable &penalties) const {
+                          const PenaltyTable &penalties, LoopCDSampling loopCD) const {
   if (policies.empty() || policies.size() > kMaximumLanes || rows.size() != policies.size())
     throw std::invalid_argument("invalid sampling batch width");
   const uint32_t lanes = static_cast<uint32_t>(rows.size());
@@ -191,6 +201,7 @@ void Sampling::addInitial(metal::CommandGraph &graph,
   // Each lane's one row is its tree's root.
   requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
   graph.add("decode_sample_first_rows", {buffers.laneRows, buffers.treeRows}, first, {lanes, 1, 1}, {1, 1, 1});
+  addLoopCD(graph, params, buffers, end, lanes, selected.laneCap, loopCD);
   addPenalties(graph, buffers, penalties, penalized);
   addSelection(graph, params, policies, buffers, selected);
 }
@@ -199,7 +210,7 @@ void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
                          SamplingBuffers buffers, const StepRows &step,
                          const StopTokens &stopTokens,
-                         const PenaltyTable &penalties) const {
+                         const PenaltyTable &penalties, LoopCDSampling loopCD) const {
   requireStepRows(step);
   if (policies.size() != step.lanes)
     throw std::invalid_argument("invalid sampling batch width");
@@ -207,6 +218,7 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   // draft's children.
   const TargetRows selected{step.rows, step.laneCap, 1, true};
   const TargetSamplingParams params = selection(policies, buffers, selected, stopTokens);
+  addLoopCD(graph, params, buffers, selected.end, step.lanes, selected.laneCap, loopCD);
   addPenalties(graph, buffers, penalties, penaltyParams(policies, buffers, penalties, selected));
   addSelection(graph, params, policies, buffers, selected);
 }

@@ -84,6 +84,10 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
   // the last (ops::ShortConvolution::addCommit), and its relative attention's
   // counters (ops::RelativeAttention::addDecode).
   if (decode) {
+    if (g.loopCDAmateurPass) {
+      result.push_back({&Inkling2LoopScratch::amateurHidden, bytesFor<uint16_t>(hidden), 0, false});
+      result.push_back({&Inkling2LoopScratch::amateurLogits, bytesFor<float>(g.vocabularySize), 0, false});
+    }
     result.push_back({&Inkling2LoopScratch::keyValues, bytesFor<uint16_t>(2 * kv), 0, false});
     result.push_back({&Inkling2LoopScratch::tape, bytesFor<uint16_t>(schedule.stateColumns()), 0, false});
     result.push_back({&Inkling2LoopScratch::attentionCounters, 0, ops::RelativeAttention::kCountersBytes, false});

@@ -83,6 +83,65 @@ inline TargetRow selected_row(device const float *logits,
           0.0f};
 }
 
+// Whether no token can be selected for a logit: NaN has no order and -inf
+// no probability. A bit test, which Metal's fast math keeps.
+inline bool unselectable_logit(float value) {
+  const uint bits = as_type<uint>(value);
+  return (bits & 0x7fffffffu) > 0x7f800000u || bits == 0xff800000u;
+}
+
+// One group per generation row. The normalizers of both log-softmaxes
+// are row constants, so subtracting the two finished logits gives the same
+// next-token distribution (before optional sampling penalties).
+kernel void decode_loop_cd(
+    device float *expert [[buffer(0)]],
+    device const float *amateur [[buffer(1)]],
+    device const uint *token_mask [[buffer(2)]],
+    device const SplashLaneRows *lane_rows [[buffer(3)]],
+    constant LoopCDParams &params [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint lane = group.y, index = group.x;
+  if (!(params.lanes & (1u << lane)) || index >= lane_rows[lane].rows)
+    return;
+  const TargetRow row = selected_row(expert, token_mask, params.selection, lane_rows, lane, index);
+  const ulong offset = ulong(selected_logits_row(lane_rows, lane, index)) * row.vocabulary;
+  float best = -INFINITY, admitted = -INFINITY;
+  for (uint token = tid; token < row.vocabulary; token += SPLASH_TARGET_VOCABULARY_THREADS) {
+    const float value = row.logits[token];
+    if (unselectable_logit(value)) continue;
+    best = max(best, value);
+    if (row.admits(token))
+      admitted = max(admitted, value);
+  }
+  constexpr uint groups = SPLASH_TARGET_VOCABULARY_THREADS / 32;
+  threadgroup float bests[groups], admitted_bests[groups];
+  best = simd_max(best);
+  admitted = simd_max(admitted);
+  if (simd_lane == 0) {
+    bests[simd_group] = best;
+    admitted_bests[simd_group] = admitted;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  best = -INFINITY;
+  admitted = -INFINITY;
+  for (uint g = 0; g < groups; ++g) {
+    best = max(best, bests[g]);
+    admitted = max(admitted, admitted_bests[g]);
+  }
+  const float cutoff = best + params.log_plausibility;
+  // Grammar or stop-token exclusion can remove every plausible token.
+  if (unselectable_logit(admitted) || admitted < cutoff)
+    return;
+  for (uint token = tid; token < row.vocabulary; token += SPLASH_TARGET_VOCABULARY_THREADS) {
+    const float value = row.logits[token];
+    if (!unselectable_logit(value))
+      expert[offset + token] = value < cutoff ? -INFINITY : value - params.weight * amateur[offset + token];
+  }
+}
+
 // Each lane's lane rows and tree row for the selection of its first token
 // after its prompt (SampleFirstRowsParams), one group a lane: its one row of
 // the logits, a tree's root, which the selection's kernels read as a decode
@@ -979,13 +1038,6 @@ kernel void decode_sample_vocabulary_draw(
                       simd_group, token) &&
       thread_index == 0)
     tokens[s] = token;
-}
-
-// Whether no token can be selected for a logit: NaN has no order and -inf
-// no probability. A bit test, which Metal's fast math keeps.
-inline bool unselectable_logit(float value) {
-  const uint bits = as_type<uint>(value);
-  return (bits & 0x7fffffffu) > 0x7f800000u || bits == 0xff800000u;
 }
 
 // The sampling penalties of one logit: repetition divides a positive

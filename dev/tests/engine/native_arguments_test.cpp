@@ -155,6 +155,7 @@ void testServerCommandLines(const char *path) {
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
       {"recalibrate_ane", [](NativeArguments &read) { read.recalibrateAne = true; }},
       {"activations_bf16", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
+      {"loop_cd", [](NativeArguments &read) { read.loopCD = true; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // The defaults the server leaves out are the engine's: each meaning
       // names the value, so a change of the engine's default fails it.
@@ -218,7 +219,8 @@ void testServerCommandLines(const char *path) {
            read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations &&
+           read.loopCD == meant.loopCD && read.verifyRows == meant.verifyRows &&
+           read.int8Activations == meant.int8Activations &&
            read.lanes == meant.lanes;
   };
   const auto golden = readGolden(path);
@@ -261,6 +263,9 @@ void testVerifyRows() {
   require(parse(model, {"auto", "auto"}).verifyRows == model::VerifyRows::Auto &&
               parse(model, {"auto", "auto", "--verify-rows", "auto"}).verifyRows == model::VerifyRows::Auto,
           "--verify-rows auto was not the engine's rule");
+  require(!parse(model, {"auto", "auto"}).loopCD &&
+              !parse(model, {"auto", "auto", "--loop-cd", "off"}).loopCD,
+          "LoopCD must be off by default and accept explicit off");
 }
 
 // The stores' memory is the planner's unless set, which the server writes

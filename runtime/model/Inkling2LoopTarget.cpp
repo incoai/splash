@@ -50,6 +50,8 @@ Inkling2LoopTarget::Inkling2LoopTarget(const Inkling2LoopWeights &weights, const
   // weights hold a layer per weight layer; the relative attention stores
   // the KV layout's pages.
   requireLayers(schedule_.applications(), schedule_.applications());
+  if (geometry_.loopCDAmateurPass >= schedule_.shape.loopPasses)
+    throw std::invalid_argument("LoopCD amateur must exit before the full loop");
   if (weights_.layers.size() != schedule_.shape.weightLayers || !ops::RelativeAttention::stores(geometry_.kvLayout))
     throw std::invalid_argument("Inkling-2-Mini weights do not match its loop and attention");
   // Its draft's captures and rows are those its producer trained it on: the
@@ -429,11 +431,39 @@ void Inkling2LoopTarget::addPrefillExperts(PrefillStep &step, uint32_t applicati
         .tree = d->tree,
         .tape = step.scratch.tape};
     ops::MoE::addRouted(step.graph, step.ffn, layer.ffn, *step.moe, &combined);
-    return;
+  } else {
+    ops::MoE::addRouted(step.graph, step.ffn, layer.ffn, *step.moe);
+    addConvolution(step, application, Inkling2LoopConvolution::Ffn, convolution, shape,
+                   ops::ShortConvOutput::RoundedSum);
   }
-  ops::MoE::addRouted(step.graph, step.ffn, layer.ffn, *step.moe);
-  addConvolution(step, application, Inkling2LoopConvolution::Ffn, convolution, shape,
-                 ops::ShortConvOutput::RoundedSum);
+  const uint32_t pass = geometry_.loopCDAmateurPass;
+  if (pass && application + 1 == schedule_.shape.loopFirstLayer + pass * schedule_.loopLayers())
+    addAmateurReadout(step, application);
+}
+
+// Use the head's residual mix and norm at the early exit, reading only
+// the stack planes produced so far. The amateur skips Inkling's coda.
+void Inkling2LoopTarget::addAmateurReadout(PrefillStep &step, uint32_t application) const {
+  const uint32_t width = geometry_.hiddenSize;
+  const uint32_t states = schedule_.ffnStates(application);
+  const auto current = rows(step, schedule_.output(application));
+  const auto mix = [&](metal::MetalBuffer stack, metal::MetalBuffer input, const metal::MetalBuffer &output,
+                       uint32_t count) {
+    ops::BlockResidualMix::addMixNorm(
+        step.graph, {.stack = stack, .planeRows = step.scratch.planeRows, .current = input},
+        weights_.outputQuery, std::span(&weights_.finalNorm, 1), std::span(&output, 1),
+        {.hidden = width, .stack = states, .queries = 1}, count);
+  };
+  if (step.decode) {
+    mix(step.scratch.stack, current, step.scratch.amateurHidden, step.rows);
+  } else {
+    for (const auto &sequence : step.sequences) {
+      if (!sequence.amateurPromptRow) continue;
+      const uint32_t row = sequence.rowBegin + sequence.rows - 1;
+      mix(rowsOf<uint16_t>(step.scratch.stack, row, (states - 1) * step.scratch.planeRows + 1, width),
+          rowsOf<uint16_t>(current, row, 1, width), sequence.amateurPromptRow, 1);
+    }
+  }
 }
 
 // A decode step's every row, and a prompt chunk's rows of its sequences'
@@ -448,14 +478,31 @@ metal::MetalBuffer Inkling2LoopTarget::addPrefillEnd(PrefillStep &step) const {
       weights_.outputQuery, std::span(&weights_.finalNorm, 1), std::span(&output, 1),
       {.hidden = geometry_.hiddenSize, .stack = schedule_.headStates(), .queries = 1}, step.rows);
   addDraftCapture(step, schedule_.applications(), output);
-  if (const QwenTargetDecodeBuffers *d = step.decode)
+  if (const QwenTargetDecodeBuffers *d = step.decode) {
+    if (geometry_.loopCDAmateurPass)
+      addHead(step.graph, linear(step), s.amateurHidden, s.amateurLogits, step.rows, step.buffers.linearScratch, {});
     addHead(step.graph, linear(step), d->finalHidden, d->logits, step.rows, step.buffers.linearScratch, {});
+  }
   return output;
 }
 
 void Inkling2LoopTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer,
                                       metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const {
   addHead(graph, operators_.linear(), std::move(hidden), std::move(logits), rows, scratch, {});
+}
+
+metal::MetalBuffer Inkling2LoopTarget::loopCDPromptRow(uint32_t lane) const {
+  return rowsOf<uint16_t>(steps_.verifyScratch().amateurHidden, lane, 1, geometry_.hiddenSize);
+}
+
+metal::MetalBuffer Inkling2LoopTarget::loopCDLogits() const {
+  return steps_.verifyScratch().amateurLogits;
+}
+
+void Inkling2LoopTarget::addLoopCDPromptHead(metal::CommandGraph &graph, uint32_t rows,
+                                            ops::LinearScratch scratch) const {
+  const auto buffers = steps_.verifyScratch();
+  addHead(graph, operators_.linear(), buffers.amateurHidden, buffers.amateurLogits, rows, scratch, {});
 }
 
 void Inkling2LoopTarget::addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,

@@ -93,6 +93,7 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  bool loopCD = false;
   // --max-concurrent-requests REQUESTS: the lanes the runtime runs, 1 to
   // ExecutionLimits::maximumBatchWidth (RuntimeResourcesConfig::lanes).
   uint32_t lanes = model::ExecutionLimits::defaultLanes;

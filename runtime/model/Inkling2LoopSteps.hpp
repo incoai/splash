@@ -64,6 +64,8 @@ struct Inkling2LoopScratch final {
   metal::MetalBuffer zeros;
   metal::MetalBuffer tape;
   metal::MetalBuffer attentionCounters;
+  metal::MetalBuffer amateurHidden{};
+  metal::MetalBuffer amateurLogits{};
   // The rows each plane of `stack` and `previous` holds.
   uint32_t planeRows = 0;
 };

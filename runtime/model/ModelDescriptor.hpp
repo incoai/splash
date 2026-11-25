@@ -79,6 +79,23 @@ struct ModelDescriptor final {
   [[nodiscard]] bool valid() const noexcept;
 };
 
+struct LoopCDProfile final {
+  std::string_view family;
+  uint32_t amateurPass; // one-based
+  float weight;
+  float logPlausibility; // log(alpha), in expert-logit space
+};
+
+inline constexpr LoopCDProfile kLoopCDModels[] = {
+    {Inkling2LoopLayout{}.family, 1, 0.2F, -2.302585093F}, // alpha = 0.1
+};
+
+[[nodiscard]] inline const LoopCDProfile *loopCDProfile(const ModelDescriptor &model) noexcept {
+  for (const auto &profile : kLoopCDModels)
+    if (profile.family == model.family()) return &profile;
+  return nullptr;
+}
+
 // Derives the capabilities and cache layouts the engine consumes from the
 // concrete target and draft layouts.
 [[nodiscard]] ModelDescriptor makeModelDescriptor(std::string name,

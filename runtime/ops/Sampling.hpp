@@ -90,6 +90,13 @@ struct PenaltyTable final {
   std::span<const uint32_t> rows;
 };
 
+struct LoopCDSampling final {
+  metal::MetalBuffer amateurLogits{};
+  uint32_t lanes = 0; // bitmask of generation lanes
+  float weight = 0;
+  float logPlausibility = 0;
+};
+
 struct SamplingWorkspace final {
   uint64_t argmaxValuesBytes = 0;
   uint64_t argmaxIndicesBytes = 0;
@@ -202,12 +209,12 @@ public:
                   std::span<const SamplingPolicy> policies,
                   SamplingBuffers buffers, std::span<const uint32_t> rows,
                   const StopTokens &stopTokens,
-                  const PenaltyTable &penalties) const;
+                  const PenaltyTable &penalties, LoopCDSampling loopCD = {}) const;
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, const StepRows &step,
                  const StopTokens &stopTokens,
-                 const PenaltyTable &penalties) const;
+                 const PenaltyTable &penalties, LoopCDSampling loopCD = {}) const;
   // Each lane's acceptance of its rows of a decode step (addVerify's) as a
   // tree: the path its rows' selections follow from its anchor, of which
   // it retains at most maximumRetained[lane] rows (metal/abi/Sampling.h

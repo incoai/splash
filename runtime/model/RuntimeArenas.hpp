@@ -87,19 +87,19 @@ struct RuntimeGeometry final {
   }
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
                                             ops::GdnStateFormat stateFormat, StreamedParts parts,
-                                            uint32_t lanes = ExecutionLimits::defaultLanes) {
+                                            uint32_t lanes = ExecutionLimits::defaultLanes, bool loopCD = false) {
     const DFlashDraftLayout &draft = model.draft.layout;
     return from(model.descriptor, draft,
                 std::visit([&](const auto &weights) { return qwenTargetGeometry(weights, draft.targetLayerIds()); },
                            model.target),
-                kvFormat, stateFormat, parts, lanes);
+                kvFormat, stateFormat, parts, lanes, loopCD);
   }
   // The same with a cached state's form as `states`, a runtime's state
   // storage's, holds it (GdnStateLayout::cachedCodes).
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
                                             const GdnStateLayout &states, StreamedParts parts,
-                                            uint32_t lanes = ExecutionLimits::defaultLanes) {
-    RuntimeGeometry result = from(model, kvFormat, states.format, parts, lanes);
+                                            uint32_t lanes = ExecutionLimits::defaultLanes, bool loopCD = false) {
+    RuntimeGeometry result = from(model, kvFormat, states.format, parts, lanes, loopCD);
     result.target.stateLayout.cachedCodes = states.cachedCodes;
     return result;
   }
@@ -111,11 +111,16 @@ struct RuntimeGeometry final {
   [[nodiscard]] static RuntimeGeometry from(const ModelDescriptor &descriptor, const DFlashDraftLayout &draft,
                                             QwenTargetGeometry target, kv::Format kvFormat,
                                             ops::GdnStateFormat stateFormat, StreamedParts parts,
-                                            uint32_t lanes = ExecutionLimits::defaultLanes) {
+                                            uint32_t lanes = ExecutionLimits::defaultLanes, bool loopCD = false) {
     if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
       throw std::invalid_argument("invalid model runtime lanes");
     RuntimeGeometry result;
     target.lanes = lanes;
+    if (loopCD) {
+      const auto *profile = loopCDProfile(descriptor);
+      if (!profile) throw std::invalid_argument("--loop-cd is unsupported for this model");
+      target.loopCDAmateurPass = profile->amateurPass;
+    }
     result.draft = draft;
     result.target = std::move(target);
     result.target.kvLayout = descriptor.targetKvLayout;

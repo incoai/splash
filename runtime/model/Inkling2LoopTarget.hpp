@@ -47,6 +47,9 @@ public:
   // reads as they are; its logits take the family's finish.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const override;
+  [[nodiscard]] metal::MetalBuffer loopCDPromptRow(uint32_t lane) const override;
+  [[nodiscard]] metal::MetalBuffer loopCDLogits() const override;
+  void addLoopCDPromptHead(metal::CommandGraph &graph, uint32_t rows, ops::LinearScratch scratch) const override;
   // The token table's rows through its norm, as the first application reads
   // them (addPrefillBegin), in place.
   void addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer hidden,
@@ -97,6 +100,7 @@ private:
   // Its routed work and the FFN's convolution onto the residual into its
   // output rows, a decode step's run by the MoE combine.
   void addPrefillExperts(PrefillStep &step, uint32_t application) const;
+  void addAmateurReadout(PrefillStep &step, uint32_t application) const;
   // The final mix and output norm into buffers.hidden[1], a decode step's
   // into its final hidden rows, which the draft captures at id
   // applications() and its head then reads.

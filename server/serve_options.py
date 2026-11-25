@@ -928,6 +928,13 @@ SERVE_OPTIONS = (
         engine=EngineArgument("--activations"),
     ),
     ServeOption(
+        "--loop-cd",
+        "requests",
+        dict(action="store_true", default=False,
+             help="enable experimental loop-wise contrastive decoding (Inkling-2-Mini only)"),
+        engine=EngineArgument("--loop-cd", text=_spelled("on")),
+    ),
+    ServeOption(
         "--verify-rows",
         "requests",
         dict(

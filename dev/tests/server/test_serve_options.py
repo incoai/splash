@@ -126,6 +126,7 @@ OPTIONS = {
     "--activations": values(
         "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")
     ),
+    "--loop-cd": ([(["--loop-cd"], True)], [["--loop-cd=on"]]),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},

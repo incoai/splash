@@ -111,6 +111,13 @@ model::ModelDescriptor inspectModel(const std::filesystem::path &root) {
   }
 }
 
+bool parseChoice(std::string_view option, std::string_view value,
+                 std::string_view first, std::string_view second) {
+  if (value != first && value != second)
+    throw UsageError(std::string(option) + " requires " + std::string(first) + " or " + std::string(second));
+  return value == first;
+}
+
 } // namespace
 
 NativeArguments parseNativeArguments(int argc, const char *const *argv) {
@@ -131,26 +138,18 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     const std::string_view option(argv[next]);
     const std::string_view value(next + 1 < argc ? argv[next + 1] : "");
     if (option == "--kv-format") {
-      if (value != "int8" && value != "bf16")
-        throw UsageError("--kv-format requires int8 or bf16");
-      result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      result.kvFormat = parseChoice(option, value, "int8", "bf16") ? kv::Format::Int8 : kv::Format::BFloat16;
     } else if (option == "--state-format") {
-      if (value != "fp32" && value != "bf16")
-        throw UsageError("--state-format requires fp32 or bf16");
       result.stateFormat =
-          value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
+          parseChoice(option, value, "fp32", "bf16") ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
     } else if (option == "--cached-states") {
-      if (value != "int8" && value != "exact")
-        throw UsageError("--cached-states requires int8 or exact");
-      result.exactCachedStates = value == "exact";
+      result.exactCachedStates = !parseChoice(option, value, "int8", "exact");
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {
       result.maxImagePatches = parseMaxImagePatches(value);
     } else if (option == "--persistent-cache") {
-      if (value != "on" && value != "off")
-        throw UsageError("--persistent-cache requires on or off");
-      result.persistentCache = value == "on";
+      result.persistentCache = parseChoice(option, value, "on", "off");
     } else if (option == "--max-cache-disk-writes") {
       if (value != "0" && !parsePositive(value, result.maxCacheDiskWritesBytes))
         throw UsageError("--max-cache-disk-writes requires a nonnegative integer byte count");
@@ -161,9 +160,7 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     } else if (option == "--idle-release") {
       result.idleReleaseSeconds = parseIdleRelease(value);
     } else if (option == "--idle-sleep") {
-      if (value != "prevent" && value != "allow")
-        throw UsageError("--idle-sleep requires prevent or allow");
-      result.preventIdleSleep = value == "prevent";
+      result.preventIdleSleep = parseChoice(option, value, "prevent", "allow");
     } else if (option == "--ple-memory") {
       result.pleMemory = parseStreamedSetting(option, value);
     } else if (option == "--expert-memory") {
@@ -178,13 +175,9 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
         throw UsageError("--kv-spill requires always");
       result.kvSpillAlways = true;
     } else if (option == "--kv-window-trim") {
-      if (value != "on" && value != "off")
-        throw UsageError("--kv-window-trim requires on or off");
-      result.kvWindowTrim = value == "on";
+      result.kvWindowTrim = parseChoice(option, value, "on", "off");
     } else if (option == "--ane") {
-      if (value != "on" && value != "off")
-        throw UsageError("--ane requires on or off");
-      result.neuralEngine = value == "on";
+      result.neuralEngine = parseChoice(option, value, "on", "off");
     } else if (option == "--ane-calibration") {
       if (value != "again")
         throw UsageError("--ane-calibration requires again");
@@ -193,6 +186,8 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "bf16")
         throw UsageError("--activations requires auto or bf16");
       result.int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+    } else if (option == "--loop-cd") {
+      result.loopCD = parseChoice(option, value, "on", "off");
     } else if (option == "--verify-rows") {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");
