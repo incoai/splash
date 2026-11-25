@@ -12,7 +12,8 @@
 // token-major values for the selected blocks' readers); HeadDim, RotaryPairs
 // and Gated: full_qkv_storage_phase's. A sequence's page table is its binding
 // among the eight (SPLASH_LANE_BINDING).
-#define ATTENTION_QKV(Name, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, CacheElement, ValuesTokenMajor)     \
+#define ATTENTION_QKV(Name, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, CacheElement, ValuesTokenMajor,    \
+                      NormalizeValue, SharedKv)                                                              \
   kernel void Name(                                                                                          \
       device const bfloat *qkv [[buffer(0)]],                                                                \
       device const W *q_norm [[buffer(1)]],                                                                  \
@@ -33,7 +34,8 @@
     threadgroup float reductions[HeadDim / 32];                                                              \
     threadgroup bfloat normalized[HeadDim];                                                                  \
     SPLASH_STORE_MAXIMA_##CacheElement(HeadDim)                                                              \
-    full_qkv_storage_phase<QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, CacheElement, ValuesTokenMajor>(  \
+    full_qkv_storage_phase<QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, CacheElement, ValuesTokenMajor,   \
+                           NormalizeValue, SharedKv>(                                                       \
         qkv, q_norm, k_norm, rope_cos, rope_sin, queries,                                                    \
         SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7), layout, params,     \
         reductions, normalized, maxima, group, thread_index, lane, simd_group);                              \
@@ -71,9 +73,9 @@
 // GGUFs hold (model/SafetensorsImage.hpp float32Norms).
 #define ATTENTION_QKV_FORMATS(Suffix, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, ValuesTokenMajor)         \
   ATTENTION_QKV(attention_q8_qkv##Suffix, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, int8_t,               \
-                ValuesTokenMajor)                                                                            \
+                ValuesTokenMajor, false, false)                                                              \
   ATTENTION_QKV(attention_bf16_qkv##Suffix, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, bfloat,             \
-                ValuesTokenMajor)
+                ValuesTokenMajor, false, false)
 ATTENTION_QKV_FORMATS(, 24, 4, 256, 32, true, bfloat, false)
 ATTENTION_QKV_FORMATS(_kv2_g8, 16, 2, 256, 32, true, bfloat, false)
 ATTENTION_QKV_FORMATS(_f32, 24, 4, 256, 32, true, float, false)
@@ -86,6 +88,8 @@ ATTENTION_QKV_FORMATS(_kv2_g16_f32, 32, 2, 256, 32, true, float, false)
 ATTENTION_QKV_FORMATS(_kv4_g8_d128_f32, 32, 4, 128, 64, false, float, false)
 ATTENTION_QKV_NOPE(attention_q8_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float, int8_t, false)
 ATTENTION_QKV_NOPE(attention_bf16_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float, bfloat, false)
+ATTENTION_QKV(attention_bf16_qkv_kv4_g8_d512_f32, 32, 4, 512, 256, false, float, bfloat, false, true, true)
+ATTENTION_QKV(attention_bf16_qkv_kv16_g2_f32, 32, 16, 256, 128, false, float, bfloat, false, true, false)
 #undef ATTENTION_QKV_FORMATS
 #undef ATTENTION_QKV_NOPE
 #undef ATTENTION_QKV

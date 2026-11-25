@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -44,11 +45,18 @@ uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
 //   without RoPE (NoPE) as well, for an AttentionVariant that is not rotated;
 // - windowTokens: a split and reduce over a window of that many keys before
 //   each row as well as over the whole history, for an AttentionVariant of
-//   that window; 0 without.
+//   that window; 0 without;
+// - commitSuffix: the KV path commits of its pages, or none for pages that
+//   never leave their extent (Gemma 4's);
+// - bf16Only: BF16 pages alone, without the INT8 ones (Gemma 4's);
+// - wholeHistory: the whole history's split and reduce, which a geometry of
+//   sliding layers alone leaves out (Gemma 4's, a window of 1023 keys);
+// - sharedKv: projection rows whose key heads are their value heads too, the
+//   values RMS-normalized without a weight (Gemma 4's global layers).
 // Its q/k norm kernels take the norm types its families store (normKernel):
 // F32 and bf16, or F32 alone for the geometries of families whose norms load
 // as F32 from GGUFs and MLX images alike (Qwen3.8-Flash-Next's, Flint's:
-// model/SafetensorsImage.hpp float32Norms).
+// model/SafetensorsImage.hpp float32Norms) or from GGUFs only (Gemma 4's).
 struct CompiledAttention final {
   uint32_t queryHeads;
   uint32_t kvHeads;
@@ -60,7 +68,10 @@ struct CompiledAttention final {
   bool unrotated;
   uint32_t windowTokens;
   std::string_view suffix;
-  std::string_view commitSuffix;
+  std::optional<std::string_view> commitSuffix;
+  bool bf16Only = false;
+  bool wholeHistory = true;
+  bool sharedKv = false;
 };
 constexpr std::array kCompiledAttention{
     CompiledAttention{24, 4, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "", ""},
@@ -68,12 +79,17 @@ constexpr std::array kCompiledAttention{
     CompiledAttention{32, 2, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "_kv2_g16", "_kv2_g8"},
     CompiledAttention{24, 2, 256, kv::Reads::SelectedBlocks, true, false, 32, false, 0, "_kv2_g12", "_kv2_vt"},
     CompiledAttention{32, 4, 128, kv::Reads::EveryPage, false, true, 64, true, 512, "_kv4_g8_d128", "_kv4_d128"},
+    CompiledAttention{32, 4, 512, kv::Reads::EveryPage, false, false, 256, false, 0, "_kv4_g8_d512", std::nullopt,
+                      true, true, true},
+    CompiledAttention{32, 16, 256, kv::Reads::EveryPage, false, false, 128, false, 1023, "_kv16_g2", std::nullopt,
+                      true, false},
 };
 
 // Whether a compiled geometry's pages are a layout's: its KV heads, head
 // dimension and value order.
 bool storesLayout(const CompiledAttention &compiled, kv::Layout layout) {
-  return compiled.kvHeads == layout.kvHeads && compiled.headDimension == layout.headDimension &&
+  return !layout.hasWindowShape() && (!compiled.bf16Only || layout.format == kv::Format::BFloat16) &&
+         compiled.kvHeads == layout.kvHeads && compiled.headDimension == layout.headDimension &&
          kv::valuesTokenMajorFor(compiled.reads) == layout.valuesTokenMajor;
 }
 
@@ -82,7 +98,7 @@ bool storesLayout(const CompiledAttention &compiled, kv::Layout layout) {
 std::string_view commitSuffix(kv::Layout layout) {
   if (layout.valid())
     for (const CompiledAttention &compiled : kCompiledAttention)
-      if (storesLayout(compiled, layout)) return compiled.commitSuffix;
+      if (storesLayout(compiled, layout) && compiled.commitSuffix) return *compiled.commitSuffix;
   throw std::invalid_argument("no KV store kernel for layout");
 }
 
@@ -90,16 +106,19 @@ std::string_view commitSuffix(kv::Layout layout) {
 // its pages as it does, so the kernels need no geometry branches, which must
 // compile a layer's variant.
 const CompiledAttention &compiledAttention(uint32_t queryHeads, kv::Layout layout,
-                                           AttentionVariant variant = {}) {
-  static_cast<void>(commitSuffix(layout));
+                                           std::optional<AttentionVariant> variant = std::nullopt) {
+  if (!layout.valid()) throw std::invalid_argument("no KV store kernel for layout");
+  bool hasStore = false;
   for (const CompiledAttention &compiled : kCompiledAttention) {
-    if (compiled.queryHeads != queryHeads || compiled.reads != layout.reads || !storesLayout(compiled, layout))
-      continue;
-    if ((!variant.rotated && !compiled.unrotated) ||
-        (variant.windowTokens && variant.windowTokens != compiled.windowTokens))
+    if (!storesLayout(compiled, layout)) continue;
+    hasStore = true;
+    if (compiled.queryHeads != queryHeads || compiled.reads != layout.reads) continue;
+    if (variant && ((!variant->rotated && !compiled.unrotated) ||
+                    (variant->windowTokens ? variant->windowTokens != compiled.windowTokens : !compiled.wholeHistory)))
       throw std::invalid_argument("no attention kernel for the layer's variant");
     return compiled;
   }
+  if (!hasStore) throw std::invalid_argument("no KV store kernel for layout");
   throw std::invalid_argument(selectsBlocks(layout) ? "no sparse attention kernel for layout"
                                                     : "no paged-attention kernel for layout");
 }
@@ -161,8 +180,8 @@ void requireQueries(const metal::MetalBuffer &queries, const CommandRows &rows, 
 // A packed projection row: every query head's q and, gated, its gate, then
 // the K and V heads. The gates read each row's query heads only.
 uint64_t packedWidth(const CompiledAttention &compiled) {
-  return (uint64_t{compiled.queryHeads} * (compiled.gated ? 2 : 1) + uint64_t{compiled.kvHeads} * 2) *
-         compiled.headDimension;
+  return (uint64_t{compiled.queryHeads} * (compiled.gated ? 2 : 1) +
+          uint64_t{compiled.kvHeads} * (compiled.sharedKv ? 1 : 2)) * compiled.headDimension;
 }
 uint64_t gateBytes(uint64_t rows, const CompiledAttention &compiled) {
   return rowBytes(rows, packedWidth(compiled), uint64_t{compiled.queryHeads} * 2 * compiled.headDimension, 2);

@@ -146,8 +146,9 @@ template <uint Window> inline uint splash_attention_first_page(uint first_positi
 
 // The scale of a head's scores, 1/sqrt(HeadDim), as the literal of each head
 // dimension the kernels are compiled for.
-template <uint HeadDim> constexpr float splash_attention_scale() {
-  static_assert(HeadDim == 128 || HeadDim == 256, "a score scale for each compiled head dimension");
+template <uint HeadDim, bool UnitScale = false> constexpr float splash_attention_scale() {
+  static_assert(UnitScale || HeadDim == 128 || HeadDim == 256, "a score scale for each compiled head dimension");
+  if constexpr (UnitScale) return 1.0f;
   return HeadDim == 256 ? 0.0625f : 0.08838834764831845f;
 }
 
@@ -369,7 +370,7 @@ inline float splash_attention_query_codes(device const bfloat *queries, device i
 // the block; its K/V, the store's, sit at the slots of their rows before
 // any tile runs, so a row of a later tile reads its ancestors' from them.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          uint Window, typename CacheElement, bool Int8Queries>
+          uint Window, typename CacheElement, bool Int8Queries, bool UnitScale>
 inline void splash_paged_attention_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -398,7 +399,7 @@ inline void splash_paged_attention_tile(
   using QueryElement = conditional_t<Int8Queries, int8_t, bfloat>;
   using Score = conditional_t<Int8Queries, int, float>;
   device QueryElement *queries;
-  float score_scale = splash_attention_scale<HeadDim>();
+  float score_scale = splash_attention_scale<HeadDim, UnitScale>();
   if constexpr (Int8Queries) {
     queries = reinterpret_cast<device int8_t *>(partials + slot * M * D);
     score_scale *= splash_attention_query_codes<M, HeadDim>(tile_queries, queries, thread_index);

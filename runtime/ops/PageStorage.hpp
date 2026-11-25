@@ -159,7 +159,7 @@ private:
   // Where an extent's index plane starts in its buffer: after the regions
   // its form holds.
   [[nodiscard]] uint64_t indexPlaneOffset(PageForm form) const noexcept {
-    return uint64_t{extentPages_} * layout_.regions(form) * layout_.bytesPerLayerPage();
+    return extentPages_ * layout_.kvBytesBeforeRegion(layout_.regions(form));
   }
   // The page's spans of its first `regions` regions, then of its index.
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page, uint32_t regions) const;

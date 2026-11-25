@@ -14,7 +14,7 @@
 // vary first, then the dispatch's tiles, then history splits. A tile's
 // sequence names its page table among the bindings.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement,
-          bool Int8Queries>
+          bool Int8Queries, bool UnitScale>
 inline void splash_attention_split_phase(
     device bfloat *queries, device float *partials, device float *statistics,
     device const SplashKvPage *page_table0, device const SplashKvPage *page_table1,
@@ -39,7 +39,7 @@ inline void splash_attention_split_phase(
   if (!tile.active || split >= tile.splits)
     return;
   splash_paged_attention_tile<KVHeads, QueryHeadsPerKVHead, SPLASH_ATTENTION_TILE_ROWS / Parts, HeadDim, Window,
-                              CacheElement, Int8Queries>(
+                              CacheElement, Int8Queries, UnitScale>(
       queries + tile.offset, SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7),
       params.kv, kv_head, tile.first_position, tile.active_rows, tile.splits, split, partials, statistics,
       tile.first_slot + split, scores, probabilities, row_max, row_sum, previous_scale, rescale,
@@ -79,7 +79,7 @@ inline void splash_attention_reduce_phase(
       group.x * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead, thread_index, place.writes, pairs);
 }
 
-#define PAGED_ATTENTION_SPLIT(Name, Heads, Group, HeadDim, Window, CacheElement, Int8Queries)                   \
+#define PAGED_ATTENTION_SPLIT_KERNEL(Name, Heads, Group, HeadDim, Window, CacheElement, Int8Queries, UnitScale) \
   kernel void Name(                                                                                           \
       device bfloat *queries [[buffer(0)]],                                                                   \
       device float *partials [[buffer(1)]],                                                                   \
@@ -101,10 +101,12 @@ inline void splash_attention_reduce_phase(
     threadgroup float row_sum[M];                                                                             \
     threadgroup float previous_scale[M];                                                                      \
     threadgroup atomic_uint rescale;                                                                          \
-    splash_attention_split_phase<Heads, Group, HeadDim, Window, CacheElement, Int8Queries>(                   \
+    splash_attention_split_phase<Heads, Group, HeadDim, Window, CacheElement, Int8Queries, UnitScale>(        \
         queries, partials, statistics, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7, tree, layout,     \
         params, scores, probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index);      \
   }
+#define PAGED_ATTENTION_SPLIT(Name, Heads, Group, HeadDim, Window, CacheElement, Int8Queries)                  \
+  PAGED_ATTENTION_SPLIT_KERNEL(Name, Heads, Group, HeadDim, Window, CacheElement, Int8Queries, false)
 
 PAGED_ATTENTION_SPLIT(attention_q8_split, 4, 6, 256, 0, int8_t, false)
 PAGED_ATTENTION_SPLIT(attention_q8_split_kv2_g8, 2, 8, 256, 0, int8_t, false)
@@ -126,7 +128,10 @@ PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat, false)
+PAGED_ATTENTION_SPLIT_KERNEL(attention_bf16_split_kv4_g8_d512, 4, 8, 512, 0, bfloat, false, true)
+PAGED_ATTENTION_SPLIT_KERNEL(attention_bf16_split_kv16_g2_w1023, 16, 2, 256, 1023, bfloat, false, true)
 #undef PAGED_ATTENTION_SPLIT
+#undef PAGED_ATTENTION_SPLIT_KERNEL
 
 // Bindings: the partials and statistics, the projection's packed rows (a
 // gated geometry's gates, another buffer of the dispatch for an ungated one),
@@ -183,6 +188,8 @@ PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfl
 PAGED_ATTENTION_REDUCE(attention_reduce, 4, 6, 256, 0, true)
 PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g8, 2, 8, 256, 0, true)
 PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g16, 2, 16, 256, 0, true)
+PAGED_ATTENTION_REDUCE(attention_reduce_kv4_g8_d512, 4, 8, 512, 0, false)
+PAGED_ATTENTION_REDUCE(attention_reduce_kv16_g2_w1023, 16, 2, 256, 1023, false)
 // Flint's layers have no output gate.
 PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_sinks, 4, 8, 128, 0, false)
 PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_w512_sinks, 4, 8, 128, 512, false)

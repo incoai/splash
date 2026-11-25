@@ -175,6 +175,10 @@ struct Layout final {
   uint64_t windowedLayers = 0;
   // How an attention reads the pages.
   Reads reads = Reads::EveryPage;
+  // A second head shape for the windowed regions, whose bytes follow the
+  // whole-history regions in each extent.
+  uint32_t windowKvHeads = 0;
+  uint32_t windowHeadDimension = 0;
 
   // A block-selecting reader gathers token-major values, and only it reads
   // a block index.
@@ -183,7 +187,12 @@ struct Layout final {
            !windowTokens == !windowedLayers &&
            (attentionLayers >= 64 || !(windowedLayers >> attentionLayers)) &&
            (reads != Reads::SelectedBlocks || valuesTokenMajor) &&
-           (!indexDimension || reads == Reads::SelectedBlocks);
+           (!indexDimension || reads == Reads::SelectedBlocks) &&
+           (!hasWindowShape() || (windowKvHeads && windowHeadDimension && windowedLayers &&
+                                  regions(PageForm::Slim) && reads == Reads::EveryPage));
+  }
+  [[nodiscard]] constexpr bool hasWindowShape() const noexcept {
+    return windowKvHeads || windowHeadDimension;
   }
   [[nodiscard]] constexpr bool windowed(uint32_t layer) const noexcept {
     return layer < 64 && (windowedLayers >> layer & 1);
@@ -208,6 +217,19 @@ struct Layout final {
     case PageForm::Index: return 0;
     }
     return 0;
+  }
+  [[nodiscard]] constexpr Layout layerLayout(uint32_t layer) const noexcept {
+    const bool sliding = windowed(layer);
+    const bool distinct = sliding && hasWindowShape();
+    return {.attentionLayers = 1,
+            .kvHeads = distinct ? windowKvHeads : kvHeads,
+            .headDimension = distinct ? windowHeadDimension : headDimension,
+            .format = format,
+            .indexDimension = indexDimension,
+            .valuesTokenMajor = valuesTokenMajor,
+            .windowTokens = sliding ? windowTokens : 0,
+            .windowedLayers = sliding,
+            .reads = reads};
   }
   // The pages before a row's own that hold keys a windowed layer's row
   // reads: a row at or past a page boundary reads none before them.
@@ -237,16 +259,23 @@ struct Layout final {
   [[nodiscard]] constexpr uint64_t indexBytesPerLayerPage() const noexcept {
     return uint64_t{kPageTokens} / SPLASH_ATTENTION_BLOCK_TOKENS * indexDimension * 2;
   }
+  // The bytes of the first `count` KV regions of a page, in extent order.
+  [[nodiscard]] constexpr uint64_t kvBytesBeforeRegion(uint32_t count) const noexcept {
+    if (!hasWindowShape()) return uint64_t{count} * bytesPerLayerPage();
+    const uint32_t whole = std::min(count, regions(PageForm::Slim));
+    return uint64_t{whole} * bytesPerLayerPage() +
+           uint64_t{count - whole} * layerLayout(std::countr_zero(windowedLayers)).bytesPerLayerPage();
+  }
   // A page's K/V and its index, in every layer.
   [[nodiscard]] constexpr uint64_t kvBytesPerModelPage() const noexcept {
-    return uint64_t{attentionLayers} * bytesPerLayerPage();
+    return kvBytesBeforeRegion(attentionLayers);
   }
   [[nodiscard]] constexpr uint64_t indexBytesPerModelPage() const noexcept {
     return uint64_t{attentionLayers} * indexBytesPerLayerPage();
   }
   // What a page of the form holds (PageForm).
   [[nodiscard]] constexpr uint64_t bytesPerModelPage(PageForm form = PageForm::Full) const noexcept {
-    return uint64_t{regions(form)} * bytesPerLayerPage() + indexBytesPerModelPage();
+    return kvBytesBeforeRegion(regions(form)) + indexBytesPerModelPage();
   }
   // Whether a page's K/V can leave memory while its index stays (PageForm::
   // Index): the reader selects blocks by the layout's block index, so that a
@@ -277,6 +306,8 @@ struct Layout final {
                                        detail::pagesForAlignedRegion(scaleBytesPerLayerPage()));
     if (indexDimension)
       pages = detail::lcm(pages, detail::pagesForAlignedRegion(indexBytesPerLayerPage()));
+    if (hasWindowShape())
+      pages = detail::lcm(pages, layerLayout(std::countr_zero(windowedLayers)).extentAlignmentPages());
     return static_cast<uint32_t>(pages);
   }
 
