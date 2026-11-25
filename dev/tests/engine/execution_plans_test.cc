@@ -464,6 +464,59 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)lanesAfter(edge); }, "context_out_of_range",
           "decode rows past the physical context were accepted");
 }
+
+// A draft's gate and up, af4g64 planes (DraftCheckpoint), run as one pair
+// over its block's rows, 8 a lane, on the tile their format takes, which the
+// shape gateUpWorkspace sizes by does not name. Where the pair runs two
+// passes, below ProjectionCalibration::onePassFromCores or by the wave law,
+// its gate pass writes the rows its tile stores: 16 at one lane's 8 on the
+// 16-row tile, which Inkling-2-Mini's draft takes on an M5 of 10 GPU cores
+// (a start at one lane threw "projection gate scratch buffer holds 114688
+// bytes, needs 221184") and Ornith's on an M5 Pro of 16.
+void draftGateUpScratch() {
+  // Inkling-2-Mini's, Qwen3.6-35B-A3B's and Flint's, Qwen3.8-27B's,
+  // Qwen3.8-Flash-Next's and Ornith's.
+  constexpr std::array pairs{LinearMatrix{6912, 2304}, LinearMatrix{6144, 2048}, LinearMatrix{17408, 5120},
+                             LinearMatrix{7680, 2560}, LinearMatrix{9216, 3072}};
+  const auto planes = [](LinearMatrix matrix) {
+    return Projection(matrix.outputSize, matrix.inputSize,
+                      BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, matrix.outputSize, matrix.inputSize, {},
+                                                             {}, {})}});
+  };
+  bool tallerTile = false;
+  for (uint32_t family : {9U, 10U, 11U})
+    for (uint32_t cores : {8U, 10U, 12U, 14U, 16U, 18U, 20U, 30U, 32U, 40U, 60U, 80U}) {
+      DeviceCapabilities value = device(family);
+      value.gpuCoreCount = cores;
+      const ExecutionPlans plans(value, Int8Activations::On);
+      for (const auto matrix : pairs) {
+        const Projection up = planes(matrix);
+        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
+          const uint64_t bound = plans.gateUpWorkspace(gateUp(matrix), lanes * SPLASH_DRAFT_QUERY_ROWS);
+          // No more than the staged tile of the lanes' rows, 16 at the fewest.
+          require(bound == uint64_t{stagedStorageRows(lanes * SPLASH_DRAFT_QUERY_ROWS, true)} * matrix.outputSize * 2,
+                  "the gate/up workspace is not the staged tile's rows of a draft's lanes");
+          for (uint32_t step = 1; step <= lanes; ++step) {
+            const uint32_t rows = step * SPLASH_DRAFT_QUERY_ROWS;
+            const LinearPlan pair = plans.draftLinear().plan(up, rows, LinearEpilogue::GateUp, &up);
+            require(bound >= pair.gateScratchBytes(),
+                    "the gate/up workspace is below a draft's pair on its formats' tile");
+            tallerTile |= pair.gateScratchBytes() && pair.storageRows() > rows;
+          }
+        }
+      }
+    }
+  require(tallerTile, "no device ran a draft's two-pass pair on a tile of more rows than its own");
+  DeviceCapabilities m5 = device(10);
+  m5.gpuCoreCount = 10;
+  const ExecutionPlans plans(m5, Int8Activations::On);
+  const Projection up = planes(pairs[0]);
+  const LinearPlan pair = plans.draftLinear().plan(up, SPLASH_DRAFT_QUERY_ROWS, LinearEpilogue::GateUp, &up);
+  require(pair.configuration().sixteenRows && !pair.configuration().oneGateUpPass &&
+              pair.gateScratchBytes() == 221184 &&
+              plans.gateUpWorkspace(gateUp(pairs[0]), SPLASH_DRAFT_QUERY_ROWS) == 221184,
+          "Inkling-2-Mini's draft at one lane on an M5 of 10 cores left its gate scratch's 16 rows");
+}
 } // namespace
 
 int main() {
@@ -476,6 +529,7 @@ int main() {
     unknownCoreCount();
     prefillSplitsFollowTheDeviceRow();
     workspaceBounds();
+    draftGateUpScratch();
     invalidLookupsAndContextEdges();
     std::cout << "PASS execution plans: device policies, int8 activations on and off, the draft's bf16 prefill, "
                  "device MoE tiles, B1-B4 and prefill workspace bounds (CPU only)\n";
