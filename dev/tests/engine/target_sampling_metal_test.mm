@@ -3600,7 +3600,7 @@ void loopCD(MetalBackend &backend) {
     CommandGraph graph;
     sampling.addInitial(graph, policies, batch.buffers, initialRows(2, 0, 1), {}, {},
                         {amateur, 1, 0.2F, -2.302585093F});
-    backend.submitCommandAsync(graph.dispatches()).wait();
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   };
   reset();
   select();
