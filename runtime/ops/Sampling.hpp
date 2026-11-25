@@ -162,7 +162,7 @@ struct AcceptanceBuffers final {
 // tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
-  explicit Sampling(uint32_t vocabulary);
+  explicit Sampling(uint32_t vocabulary, metal::MetalBuffer suppressedTokens = {});
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI, for a
   // selection whose lanes' rows end before row `rows` (the workspaces are
@@ -193,7 +193,8 @@ public:
   // a decode step's verify row testing the children its draft drew with the
   // uniforms after (metal/abi/Sampling.h), both among the tokens the lane
   // admits: the first token after a prompt
-  // from each lane's one row of the logits (`rows`), and the rows of each
+  // from one row of the logits for each lane in `selectMask` (the other
+  // lanes can still read their raw logits), and the rows of each
   // lane of a decode step (`step`, as its proposer laid them out in the
   // buffers' lane rows). Each selected row's token goes to the
   // output tokens at its logits row. A lane's rows from its thinking cutoff on
@@ -202,7 +203,8 @@ public:
                   std::span<const SamplingPolicy> policies,
                   SamplingBuffers buffers, std::span<const uint32_t> rows,
                   const StopTokens &stopTokens,
-                  const PenaltyTable &penalties) const;
+                  const PenaltyTable &penalties,
+                  uint32_t selectMask = ~uint32_t{0}) const;
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, const StepRows &step,
@@ -253,6 +255,7 @@ private:
 
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;
+  metal::MetalBuffer suppressedTokens_;
 };
 
 } // namespace splash::ops

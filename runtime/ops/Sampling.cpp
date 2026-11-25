@@ -7,6 +7,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 
 namespace splash::ops {
 namespace {
@@ -120,8 +121,9 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary)
-    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
+Sampling::Sampling(uint32_t vocabulary, metal::MetalBuffer suppressedTokens)
+    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32),
+      suppressedTokens_(std::move(suppressedTokens)) {
   if (!vocabulary)
     throw std::invalid_argument("invalid sampling geometry");
 }
@@ -174,11 +176,12 @@ void Sampling::addInitial(metal::CommandGraph &graph,
                           std::span<const SamplingPolicy> policies,
                           SamplingBuffers buffers, std::span<const uint32_t> rows,
                           const StopTokens &stopTokens,
-                          const PenaltyTable &penalties) const {
+                          const PenaltyTable &penalties, uint32_t selectMask) const {
   if (policies.empty() || policies.size() > kMaximumLanes || rows.size() != policies.size())
     throw std::invalid_argument("invalid sampling batch width");
   const uint32_t lanes = static_cast<uint32_t>(rows.size());
   SampleFirstRowsParams first{};
+  first.select_mask = selectMask;
   uint64_t end = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     first.row[lane] = rows[lane];
@@ -288,6 +291,13 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
   // past a lane's rows, return at once.
   const uint32_t lanes = static_cast<uint32_t>(policies.size());
   const uint32_t most = rows.laneCap;
+  if (suppressedTokens_) {
+    constexpr uint32_t threads = 128;
+    const auto count = static_cast<uint32_t>(suppressedTokens_.sizeBytes() / sizeof(uint32_t));
+    graph.add("decode_sample_suppress", {buffers.logits, suppressedTokens_, buffers.laneRows},
+              SuppressTokensParams{vocabulary_, count},
+              {(count + threads - 1) / threads, most, lanes}, {threads, 1, 1});
+  }
   if (params.sampling_mask != (uint32_t{1} << lanes) - 1) {
     graph.add("decode_sample_argmax_sharded",
               {buffers.logits, buffers.constraintMasks, buffers.argmaxValues, buffers.argmaxIndices,

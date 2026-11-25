@@ -448,24 +448,23 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
   }
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
-  // Images are admitted up to the server's pixel cap; a model without vision
-  // admits none.
+  // A model without vision admits no image patches.
   config.nativeLoop.engine.maxImagePatches =
       config.resources.model.hasVision() ? config.resources.maximumImagePatches
                                          : 0;
 
   std::unique_ptr<model::RuntimeModel> modelRuntime;
   try {
-    // The plan's fixed bytes already proved the arenas' sum fits.
+    // Admit the planned arenas and the optional token ID buffer together.
     const auto &budget = resources->memoryPlan().breakdown();
-    // Admission reports a refusal by its failure alone. One raised while the
-    // runtime allocates keeps its own message, which says what to do.
     std::string refusal;
+    auto context = resources->modelContext();
+    context.suppressedTokens = config.nativeLoop.engine.suppressedTokens;
     const metal::AllocationResult arenas =
         resources->memoryGovernor().allocationAdmission()(
-            budget.sharedPrefillBytes + budget.sharedDecodeBytes, [&] {
+            budget.sharedPrefillBytes + budget.sharedDecodeBytes + context.suppressedTokens.size_bytes(), [&] {
               try {
-                modelRuntime = model::createRuntime(resources->modelContext());
+                modelRuntime = model::createRuntime(std::move(context));
               } catch (const metal::MetalAllocationError &error) {
                 refusal = error.what();
                 throw;
@@ -489,8 +488,7 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "modelRuntime creation failed with an unknown exception");
   }
-  // The parser and engine consume the same resolved ceiling. In automatic
-  // mode it cannot be known until resource planning has measured the device.
+  // The parser and engine use the same context, resolved by the memory plan.
   const protocol::ProtocolLimits limits = protocolLimitsFor(
       config.resources.model.capabilities, config.nativeLoop.engine.maxContext);
   const protocol::ReadyEvent ready =
@@ -499,9 +497,7 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
-    // The model's pools join the ledger, which ranks them after the sources
-    // the engine registers as it is built (the cache, then the engine's own
-    // victims), and the ledger logs each decision it makes.
+    // The ledger ranks model pools after the cache and engine victims.
     MemoryLedger &ledger = resources->memoryGovernor().ledger();
     for (model::ElasticPool *pool : modelRuntime->pools())
       ledger.addPool(*pool);

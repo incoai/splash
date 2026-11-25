@@ -193,6 +193,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "bf16")
         throw UsageError("--activations requires auto or bf16");
       result.int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+    } else if (option == "--suppress-tokens") {
+      if (value.empty())
+        throw UsageError("--suppress-tokens requires a JSON file");
+      result.suppressTokensFile = std::filesystem::path(value);
     } else if (option == "--verify-rows") {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");

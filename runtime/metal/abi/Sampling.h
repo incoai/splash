@@ -69,16 +69,22 @@ struct TargetSamplingParams {
 static_assert(sizeof(TargetSamplingParams) == 44 + 16 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Target sampling parameters are the same size on both sides");
 
-// The selection of each lane's first token after its prompt from its one row
-// of the logits, row[l]: decode_sample_first_rows writes the lane rows
-// (TargetSamplingParams) and that row's tree row, a tree's root, that the
-// selection's kernels read.
+// The first token after each selecting lane's prompt, from row[l] of its
+// logits. The other lanes share the head but select no token.
 struct SampleFirstRowsParams {
+  uint32_t select_mask;
   uint32_t row[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SampleFirstRowsParams) == 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(SampleFirstRowsParams) == 4 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "First-token row parameters are the same size on both sides");
+
+struct SuppressTokensParams {
+  uint32_t vocabulary;
+  uint32_t tokens;
+};
+
+static_assert(sizeof(SuppressTokensParams) == 8, "Output suppression parameters are 8 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its

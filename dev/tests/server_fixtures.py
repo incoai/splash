@@ -925,6 +925,7 @@ def main_args(**overrides):
             "disable_ane": False,
             "recalibrate_ane": False,
             "activations": "auto",
+            "suppress_tokens": None,
             "verify_rows": "auto",
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,

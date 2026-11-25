@@ -208,6 +208,12 @@ def parse_chat_template_file(value):
     return Path(value).expanduser().absolute()
 
 
+def parse_suppress_tokens_file(value: str) -> Path:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must name a token mask file")
+    return Path(value).expanduser().absolute()
+
+
 def parse_request_size(value):
     try:
         size = parse_max_memory(value)
@@ -926,6 +932,17 @@ SERVE_OPTIONS = (
             "bf16, for evaluations and bf16 parity (default: auto)",
         ),
         engine=EngineArgument("--activations"),
+    ),
+    ServeOption(
+        "--suppress-tokens",
+        "requests",
+        dict(
+            type=parse_suppress_tokens_file,
+            metavar="FILE",
+            help="JSON array of output token IDs to forbid, or an object with "
+            "target_token_ids; fixed when the engine starts",
+        ),
+        engine=EngineArgument("--suppress-tokens"),
     ),
     ServeOption(
         "--verify-rows",

@@ -2776,6 +2776,51 @@ void setChildren(const Batch &batch, uint32_t lane, uint32_t row, uint32_t depth
     next[i] = static_cast<float>(children.q[i]);
 }
 
+void outputSuppression(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003, forbidden = 529, allowed = 701;
+  const MetalBuffer mask = allocate(backend, 130 * sizeof(uint32_t));
+  std::iota(static_cast<uint32_t *>(mask.contents()), static_cast<uint32_t *>(mask.contents()) + 130, 400U);
+  const Sampling sampling(vocabulary, mask);
+  const Batch batch = makeBatch(backend, vocabulary, 2);
+  const std::array<SamplingPolicy, 2> policies{{{}, {.temperature = 1.0F}}};
+  const auto fill = [&] {
+    for (uint32_t row = 0; row < batch.rows; ++row) {
+      std::fill_n(batch.row(row), vocabulary, -1.0e4F);
+      batch.row(row)[forbidden] = 100.0F;
+      batch.row(row)[allowed] = 0.0F;
+    }
+    batch.poison();
+  };
+
+  fill();
+  const auto firstRows = initialRows(policies.size(), 3);
+  CommandGraph first;
+  sampling.addInitial(first, policies, batch.buffers, firstRows, kStopTokens, {});
+  static_cast<void>(backend.submitCommandAsync(first.dispatches()).wait());
+  for (const uint32_t row : firstRows)
+    require(batch.outputTokens()[row] == allowed, "the first token must exclude a suppressed maximum");
+
+  fill();
+  CommandGraph mixed;
+  sampling.addInitial(mixed, policies, batch.buffers, firstRows, kStopTokens, {}, 0b10);
+  static_cast<void>(backend.submitCommandAsync(mixed.dispatches()).wait());
+  require(batch.row(firstRows[0])[forbidden] == 100.0F, "a score-only lane must keep its raw logit");
+  require(batch.outputTokens()[firstRows[1]] == allowed, "the generating lane must exclude a suppressed maximum");
+
+  fill();
+  Children children;
+  std::iota(children.ids.begin(), children.ids.end(), 100U);
+  children.ids[0] = forbidden;
+  children.q[0] = 1.0;
+  children.draws = {0};
+  setChildren(batch, 1, 0, 0, children);
+  CommandGraph verify;
+  sampling.addVerify(verify, policies, batch.buffers, layOut(batch.buffers, blocks(policies.size())), kStopTokens, {});
+  static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
+  for (uint32_t row = 0; row < batch.rows; ++row)
+    require(batch.outputTokens()[row] == allowed, "a verify row must not select a suppressed token");
+}
+
 // A sampled verify row that tests the children its draft drew selects as the
 // recursion does with its uniforms: for each lane's chain of rows, with
 // production and other policies, of zero to four children each, their
@@ -3594,6 +3639,8 @@ int main(int argc, char **argv) {
     stage = "recursive rejection sampling";
     recursiveRejectionSampling();
     MetalBackend backend(argv[1]);
+    stage = "output suppression in initial and speculative selection";
+    outputSuppression(backend);
     stage = "invalid penalties";
     invalidPenalties(backend);
     stage = "buffer extents";
