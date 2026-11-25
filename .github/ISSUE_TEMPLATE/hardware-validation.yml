@@ -1,0 +1,119 @@
+name: Hardware validation report
+description: Report how a Splash release or a model behaves on your Mac.
+title: "[hardware] "
+labels: ["type/hardware", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Hardware reports extend the release matrix to Macs the self-hosted gate
+        does not cover. Include the exact commands and the numbers you observed.
+        Remove tokens and private model names first.
+
+  - type: input
+    id: mac
+    attributes:
+      label: Mac model
+      placeholder: "MacBook Pro 14-inch"
+    validations:
+      required: true
+
+  - type: input
+    id: chip
+    attributes:
+      label: Chip and GPU cores
+      placeholder: "M2 Pro, 19-core GPU"
+    validations:
+      required: true
+
+  - type: input
+    id: memory
+    attributes:
+      label: Unified memory
+      placeholder: "32 GB"
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "26.4"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Splash version
+      placeholder: "1.7.3"
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model and revision
+      placeholder: "owner/repo:variant at <commit>"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scenario
+    attributes:
+      label: Scenario
+      options:
+        - Install and first start
+        - Serve and chat
+        - Coding agent
+        - Vision or PDF
+        - Long context or cache
+        - Benchmark
+        - Upgrade or restart
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: What worked, what failed, and the numbers. Include `make doctor` output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or `/status`
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: duration
+    attributes:
+      label: How long did the scenario run?
+      placeholder: "20 minutes"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed tokens, keys and private data.
+          required: true
+        - label: I ran the command on the version and macOS named above.
+          required: true
+        - label: I can rerun the scenario if asked.
+          required: true

@@ -689,14 +689,14 @@ verify-build-identity: $(TARGET) $(BUILD_ID_HEADER) $(BUILD_ID_STAMP)
 # real model. (The API debug layer is not enabled: it misestimates the 32-row
 # prefill kernels' threadgroup memory, which Metal itself reports as 32768.)
 METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
-test-engine: test-engine-cpu test-engine-metal
+test-engine: test-engine-cpu test-engine-metal ## Run every native engine test
 
 # test-engine-cpu runs every suite and fails at its end, naming each that
 # failed, so that one run shows every failure instead of the first of 50.
 # engine-sim, the slowest, runs last.
 ENGINE_CPU_FAILED := $(ENGINE_TEST_BUILD)/test-engine-cpu.failed
 ENGINE_CPU_STEP = @step() { echo "$$*"; "$$@" || echo "$$*" >> $(ENGINE_CPU_FAILED); }; step
-test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK)
+test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK) ## Run native CPU tests
 	@: > $(ENGINE_CPU_FAILED)
 	$(ENGINE_CPU_STEP) $(TEST_SLOT_FILE)
 	$(ENGINE_CPU_STEP) $(TEST_KV_SLOT_FORMAT)
@@ -758,7 +758,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_ENGINE_SIM)
 	@if [ -s $(ENGINE_CPU_FAILED) ]; then echo "test-engine-cpu failed:"; sed "s/^/  /" $(ENGINE_CPU_FAILED); exit 1; fi
 
-test-engine-metal: $(TEST_METAL_TARGETS)
+test-engine-metal: $(TEST_METAL_TARGETS) ## Run native Metal tests
 	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/run_draft_preparation.py $(TEST_DRAFT_PREPARATION) $(LIB) \
 		$(WEIGHT_GOLDENS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PREPARATION) $(LIB) $(WEIGHT_GOLDENS) $(MLX_QUANTIZATION_FIXTURE)
@@ -846,8 +846,7 @@ ORACLE_ARGS ?=
 VISION_FIXTURE_FAMILY := import json, pathlib, sys; \
 	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
 	print("" if model["vision_format"] == "none" else model["family"].lower())
-test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
-		$(TEST_VISION_ENCODER_TEST) $(LIB)
+test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(LIB) ## Run the real-model oracle (MODEL=...)
 	family=$$($(BUILD_ID_PYTHON) -c '$(VISION_FIXTURE_FAMILY)' "$(MODEL_ROOT)") && \
 		if test -n "$$family"; then \
 			$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
@@ -1018,7 +1017,7 @@ ENGINE_SIM_SANITIZER_SKIPPED := sim/testRegrowthAfterABurstTakesOnlyCacheThatFre
 	sim/testChurnKeepsItsBoundsWhereLanesConvert
 # The names of sim binary $(1)'s scenarios but the skipped ones, for --filter.
 engine_sim_sanitizer_scenarios = "$$($(1) --list | grep -v -x -F $(foreach name,$(ENGINE_SIM_SANITIZER_SKIPPED),-e $(name)) | paste -s -d , -)"
-test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
+test-sanitizers: $(SANITIZER_CONFIG_TARGETS) ## Run CPU tests under ASan/UBSan and TSan
 	$(ASAN_TEST_ENV) $(TEST_SLOT_FILE_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_FILE_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_KV_SLOT_FORMAT_ASAN)
@@ -1083,7 +1082,7 @@ METAL_TSAN_BUILD := $(BUILD)/metal-tsan
 METAL_TSAN_CXXFLAGS := $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread
 METAL_TSAN_TEST_ENV := $(TSAN_TEST_ENV):suppressions=dev/tests/engine/metal_tsan_suppressions.txt
 .PHONY: test-sanitizers-metal
-test-sanitizers-metal:
+test-sanitizers-metal: ## Run Metal tests under ThreadSanitizer
 	$(MAKE) --no-print-directory -f "$(SPLASH_MAKEFILE)" BUILD=$(METAL_TSAN_BUILD) \
 		ENGINE_CXXFLAGS='$(METAL_TSAN_CXXFLAGS)' ENGINE_TEST_CXXFLAGS='$(METAL_TSAN_CXXFLAGS)' \
 		$(METAL_TSAN_BUILD)/splash.metallib $(METAL_TSAN_BUILD)/host-step.metallib \

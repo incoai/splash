@@ -1,0 +1,102 @@
+name: Bug report
+description: Something does not work as documented.
+title: "[bug] "
+labels: ["type/bug", "needs-repro"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A precise reproduction is the fastest path to a fix.
+        Please remove API keys, tokens and private model names before posting.
+
+  - type: input
+    id: version
+    attributes:
+      label: Splash version
+      description: The version from `splash --version` or the app's About window.
+      placeholder: "1.7.3"
+    validations:
+      required: true
+
+  - type: input
+    id: mac
+    attributes:
+      label: Mac model and chip
+      description: For example, MacBook Pro M5 Pro, 48 GB.
+      placeholder: "MacBook Pro M5 Pro, 48 GB"
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "26.4"
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model and revision
+      description: The `--model` value and, when known, the pinned revision.
+      placeholder: "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M at <commit>"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or app path
+      description: The exact `splash serve` command, client command, or app action.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The complete error, wrong answer, crash or stalled request.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: "`/status` and relevant logs"
+      description: Paste `GET /status` while the problem is present, and the lines around it.
+      render: shell
+    validations:
+      required: false
+
+  - type: dropdown
+    id: latest
+    attributes:
+      label: Did you retry on the latest release?
+      options:
+        - "Yes, the problem remains"
+        - "Yes, the problem is gone"
+        - "No, I cannot update"
+        - "No, this is the latest release"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the open and closed issues for this problem.
+          required: true
+        - label: I removed tokens, keys and private data from the report.
+          required: true
+        - label: I can reproduce this on the version above.
+          required: true

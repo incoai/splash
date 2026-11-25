@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/incoai/splash/blob/main/docs/README.md
+    about: Installation, serving, the API, models, internals and validation.
+  - name: Validation and benchmarks
+    url: https://github.com/incoai/splash/blob/main/docs/validate.md
+    about: Every check, the release gate and the local benchmark protocol.
+  - name: Contributing guide
+    url: https://github.com/incoai/splash/blob/main/docs/contributing/README.md
+    about: Task-shaped paths for documentation, server, model, kernel and review work.

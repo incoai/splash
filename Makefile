@@ -71,20 +71,28 @@ LIB := $(BUILD)/splash.metallib
 # then runs awake host steps as plain ones (metal/MetalBackend.hpp, EventStep).
 HOST_STEP_SOURCE := runtime/metal/kernels/host_step.metal
 HOST_STEP_LIB := $(BUILD)/host-step.metallib
-.PHONY: all clean force-build-identity install \
+.PHONY: all clean force-build-identity help install \
 	install-environment _install-environment \
 	platform-check model-selection preflight
+.DEFAULT_GOAL := all
 
-all: $(TARGET)
+help: ## List the make targets documented with a double-hash comment
+	@printf '%s\n' "Splash make targets:"
+	@awk 'BEGIN { FS = ":.*## " } /^[a-zA-Z0-9_.-]+:.*## / { printf "  make %-32s %s\n", $$1, $$2 }' \
+		"$(SPLASH_MAKEFILE)" \
+		"$(dir $(SPLASH_MAKEFILE))dev/Makefile" \
+		"$(dir $(SPLASH_MAKEFILE))dev/native.mk"
+
+all: $(TARGET) ## Build the production engine
 
 # The installer checks a model's configuration with the engine (build/splash
 # model-check) before it downloads any weight. It takes the models' own lock
 # for what it writes; the download holds up no other setup of the
 # environment.
-install: model-selection platform-check install-environment $(TARGET)
+install: model-selection platform-check install-environment $(TARGET) ## Install a model and build the engine
 	$(MODEL_INSTALL) prepare
 
-model-selection:
+model-selection: ## Require MODEL and validate LANGUAGE_ONLY
 	@test -n "$(MODEL)" || { \
 		echo "error: set MODEL to a model ID as splash serve --model takes it (OWNER/REPO[:VARIANT])" >&2; \
 		exit 1; \
@@ -94,7 +102,7 @@ model-selection:
 		exit 1;; \
 	esac
 
-platform-check:
+platform-check: ## Require Apple Silicon and the Metal toolchain
 	@test "$(SYSTEM_NAME)" = Darwin && test "$(SYSTEM_ARCH)" = arm64 || { \
 		echo "error: Splash requires an Apple Silicon Mac" >&2; \
 		exit 1; \
@@ -110,7 +118,7 @@ platform-check:
 		}; \
 	done
 
-install-environment:
+install-environment: ## Create .venv and install the Python requirements
 	@$(ANNOUNCE_INSTALL_WAIT)
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
 		-f "$(SPLASH_MAKEFILE)" _install-environment
@@ -434,7 +442,7 @@ $(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-clean:
+clean: ## Remove build outputs
 	rm -rf $(BUILD)
 
 -include dev/Makefile

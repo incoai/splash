@@ -197,6 +197,7 @@ ship precompiled, with no Xcode or local tuning required.
 ## More
 
 - [Documentation](docs/README.md): configuration, API, internals, building, and testing.
+- [Contributing](CONTRIBUTING.md): setup, verification, AI policy, and task-shaped paths.
 - [Issues and feedback](https://github.com/incoai/splash/issues)
 - [Apache-2.0](LICENSE). GGUF kernels include MIT-licensed material from
   llama.cpp; see [third-party notices](THIRD_PARTY_NOTICES). Model weights keep their own licenses.

@@ -1,0 +1,69 @@
+name: Feature request
+description: Propose a behavior, API, app or workflow change.
+title: "[feature] "
+labels: ["type/feature", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem before the solution. For a change that needs engine,
+        protocol or model work, expect a design discussion before code.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What is hard, missing or surprising today? Who hits it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: The smallest change that solves the problem. Include the user-visible result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing flags, workarounds, or a different layer that could own this.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Server or HTTP API
+        - Installer or model loading
+        - Engine, scheduling or memory
+        - Kernel or performance
+        - Desktop app
+        - Documentation
+        - Developer tooling or CI
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence or benchmark
+      description: A reproduction, a measurement, or a reference workload. A claim without evidence is a wish.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the open and closed issues for this request.
+          required: true
+        - label: I am willing to open a pull request for this change.
+          required: false
+        - label: I understand that a larger change needs an agreed design first.
+          required: true
