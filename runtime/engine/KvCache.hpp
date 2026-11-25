@@ -226,6 +226,10 @@ public:
   // The blocks trimCandidate() goes over, and whether it goes over this one.
   [[nodiscard]] uint32_t trimCandidates() const noexcept { return static_cast<uint32_t>(trimmable_.size()); }
   [[nodiscard]] bool trimmable(uint64_t blockId) const;
+  // With a window, the blocks of the tail that ends at this block that
+  // trimCandidate() goes over once no tail holds them, each with the tails
+  // that hold it (countState).
+  [[nodiscard]] std::vector<std::pair<uint64_t, uint32_t>> tailPins(uint64_t blockId) const;
   // What leaves a resident page in place when a reclaim takes all it may
   // (Cache::reach): its block, or a block below it, has a reason the
   // reclaim's walk names, and a page stays while one below it does. Busy:

@@ -283,6 +283,10 @@ struct CacheSpillPolicy final {
 struct CacheWindowPolicy final {
   uint32_t windowPages = 0;
   bool trim = true;
+  // The Full pages the plan counts for a lane (kvWindowFloorPages): at the
+  // memory wall only the Full extents beyond the lanes' leave for Slim ones
+  // (Cache::trimWindows). 0 counts none.
+  uint32_t floorPages = 0;
 };
 
 // Whether a request may start to spill now, or what holds it back: the KV
@@ -683,9 +687,14 @@ public:
   // block left for a writer's (KvCache::insert). Free Slim pages take them
   // first, the runway's among them, then with `allocate` the extents of the
   // form it allocates, and the runway refills; a refusal leaves the rest
-  // Full, which costs only memory, for the next pass. Returns the pages
-  // moved; none with trim off.
-  uint32_t trimWindows(bool allocate = true);
+  // Full, which costs only memory, for the next pass. Where the budget
+  // refuses, the tails behind the lanes leave first (releaseTails), for an
+  // extent's Full pages beside the `taking` a refused Full target takes
+  // (ensureTokens): a refill refused, the wall, trims them into what the
+  // runway holds, and a Full extent left free beyond the lanes' floors
+  // (CacheWindowPolicy::floorPages) leaves for the Slim extents of the rest.
+  // Returns the pages moved; none with trim off.
+  uint32_t trimWindows(bool allocate = true, uint32_t taking = 0);
   // The request's pages of the index form, whose K/V only the SSD cache
   // holds.
   [[nodiscard]] uint32_t indexPages(uint64_t requestId) const;
@@ -1662,6 +1671,15 @@ private:
   // last, a cost the running requests bound, not the cache.
   [[nodiscard]] std::vector<uint32_t> trimmablePages(size_t most) const;
   [[nodiscard]] uint32_t trimmableCount() const;
+  // The states behind the lanes leave, in RAM or on the SSD with their
+  // copies, oldest first: each whose tail holds a page a running request
+  // holds a window behind it, which the plan counts Slim
+  // (kvWindowFloorPages), and no state that stays holds too, until `pages`
+  // such pages wait for a trim. The resume point, what a waiting request
+  // restores (certainReuse), a state a request uses and, of each running
+  // request's chain, the head-most state and the newest stay. A prompt that
+  // matched a state gone resumes at one before it (KvCache::insert).
+  void releaseTails(uint32_t pages);
   // The pages requests keep beside their blocks that are Full and every
   // window has passed, each once, sorted: those trimWindows moves of them.
   [[nodiscard]] std::vector<uint32_t> passedKeptPages() const;

@@ -455,6 +455,17 @@ KvCache::Keeps KvCache::keeps(uint64_t blockId) const { return block(blockId).ke
 
 bool KvCache::trimmable(uint64_t blockId) const { return orders(block(blockId)).trimmable; }
 
+std::vector<std::pair<uint64_t, uint32_t>> KvCache::tailPins(uint64_t blockId) const {
+  std::vector<std::pair<uint64_t, uint32_t>> pins;
+  for (uint32_t index = 0; blockId && index < windowPages_; ++index) {
+    const Block &entry = block(blockId);
+    if (entry.transfer == Transfer::None && !entry.poisoned && entry.page != noPage && entry.form == kv::PageForm::Full)
+      pins.emplace_back(blockId, entry.windowPins);
+    blockId = entry.parent;
+  }
+  return pins;
+}
+
 void KvCache::setStateMarks(uint64_t blockId, StateMarks state, bool inRam) noexcept {
   const auto found = blocks_.find(blockId);
   if (found == blocks_.end())

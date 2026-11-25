@@ -3140,8 +3140,20 @@ closer than a window share the pages of their tails. The cache keeps it so
 - Every state, in RAM or on the SSD, pins its tail (`KvCache::countState`, a
   bounded walk beside the counts of the states below); only its removal
   unpins the tail, which the next pass trims: a state written to the SSD
-  keeps its entry and its tail Full, on a request's own chain too, where the
-  plan's floor (`kvWindowFloorPages`) does not count it.
+  keeps its entry and its tail Full (`StateCache::reclaim` discards its RAM
+  copy alone), on a request's own chain too, where the plan's floor
+  (`kvWindowFloorPages`) does not count it. A conversation of turns shorter
+  than a window thus keeps every page it appends Full behind its own lane,
+  which no reclaim reaches. While the budget has room nothing changes; once
+  it refuses, the states behind the lanes leave for those pages
+  (`Cache::releaseTails`), in RAM or on the SSD with their copies, oldest
+  first: each whose tail holds a page that a running request holds a window
+  behind it and that no state that stays holds too. The resume point, what a
+  waiting request restores, a state a request uses and, of each running
+  request's chain, the head-most state (a prompt's head, which the next
+  conversation resumes at) and the newest stay. A prompt that matched a state
+  gone resumes at a state before it, or runs from its start, and computes the
+  blocks past it again.
 - A writer that computes a block again keeps its own page, which the block
   takes once no transfer moves the block's (`KvCache::insert`,
   `kv.window.upgrades`), rather than moving onto the block's page as a
@@ -3183,6 +3195,25 @@ goes (`Cache::peek`, `Cache::take`). At the memory wall, where the Slim runway
 cannot refill, no state goes for its tail, and the victims go as without a
 window, dead leaves before ordinary states. A state the SSD cache keeps unpins
 nothing. Empty Slim extents beyond the runway go for the retry to grow by.
+
+That walk is a page need's (`Cache::trims`). A KV target the budget refuses
+lacks an extent's bytes with its pages in place, a device walk, which trims
+nothing and takes a state only for its buffers; in either walk a state with a
+copy on the SSD keeps its entry, and so its tail. The cache therefore gives up
+the tails behind the lanes itself, where the budget refuses
+(`Cache::trimWindows`); a refusal of the host's, which a wait lifts, takes
+none. A lane's target refused Full pages (`Cache::ensureTokens`) first
+releases the tails that hold the pages it takes and an extent's more, before
+anything else cached goes, and trims them. A Slim runway that cannot refill
+releases those that leave an extent's Full pages free, while the runway still
+holds pages to trim them into. A Full extent the trims leave free then leaves
+(`Cache::compactExtent`) and pays for the Slim extents of the rest and the
+runway's, six for one on Inkling-2-Mini's layout, but only while the Full pool
+holds more than the lanes' floors (`CacheWindowPolicy::floorPages`): each
+refusal brings a pool that tails fattened an extent nearer the plan's shape,
+and a pool at that shape, a long prompt's between its commands, keeps its
+extents as before. The tails that stay, a head's, a lane's newest and those of
+states in use, are Full pages the plan's floor does not count.
 
 ## Disk tier
 
