@@ -92,6 +92,8 @@ class PackageAppTests(unittest.TestCase):
                 "CFBundleVersion": "1505",
                 "CFBundleIconFile": "AppIcon",
                 "CFBundleIconName": "AppIcon",
+                "CFBundleDevelopmentRegion": "en",
+                "CFBundleLocalizations": ["en", "zh-Hans"],
                 "LSMinimumSystemVersion": "26.4",
                 "LSApplicationCategoryType": "public.app-category.developer-tools",
                 "NSHighResolutionCapable": True,

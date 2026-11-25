@@ -6,6 +6,7 @@ import PackageDescription
 
 let package = Package(
     name: "Splash",
+    defaultLocalization: "en",
     platforms: [.macOS("26.4")],
     dependencies: [
         // Updates the app from the appcast of the GitHub releases (docs/package.md, Updates).
@@ -21,8 +22,9 @@ let package = Package(
             name: "Splash",
             dependencies: [.product(name: "Sparkle", package: "Sparkle"), .product(name: "SwiftTerm", package: "SwiftTerm")],
             path: "Sources/Splash",
-            // The Chat's transcript is a web page, in Transcript/.
-            resources: [.copy("Transcript")],
+            // The Chat's transcript is a web page, in Transcript/; the app's
+            // words are Localizable.strings, in Resources/.
+            resources: [.copy("Transcript"), .process("Resources")],
             // Where the executable finds Sparkle.framework: in Contents/Frameworks of Splash.app, and
             // beside it in .build, for a build run from there.
             linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks",

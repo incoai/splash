@@ -29,14 +29,15 @@ const transcript = (() => {
   let conversation = null;
   let askAgain = {enabled: false, help: ''};
 
-  const replyMarkup =
+  const replyMarkup = () =>
     '<div class="line"><button type="button" class="hover toggle"><span class="glyph chevron"></span>' +
     '<span class="verb"></span><span class="facts"></span></button>' +
     '<div class="thought"><div class="fold"><div class="reasoning"><div class="text"><div></div></div></div></div></div></div>' +
     '<div class="markdown"></div>' +
     '<p class="error"><span class="glyph warning"></span><span class="message"></span></p>' +
-    '<div class="actions"><button type="button" class="hover copy-reply" title="Copy" aria-label="Copy Reply">' + markdown.copyGlyphs +
-    '</button><button type="button" class="hover again" aria-label="Ask Again"><span class="glyph again"></span></button>' +
+    '<div class="actions"><button type="button" class="hover copy-reply" title="' + page.text('copy') +
+    '" aria-label="' + page.text('copyReply') + '">' + markdown.copyGlyphs +
+    '</button><button type="button" class="hover again" aria-label="' + page.text('askAgain') + '"><span class="glyph again"></span></button>' +
     '<span class="details"></span></div>';
 
   // Draws `message`; a reply's Markdown `later` where it is above a conversation's first screen.
@@ -46,7 +47,7 @@ const transcript = (() => {
       const element = document.createElement('article');
       element.className = message.role === 'user' ? 'user' : 'reply';
       element.dataset.id = message.id;
-      element.innerHTML = message.role === 'user' ? '<div class="attachments"></div><p class="bubble"></p>' : replyMarkup;
+      element.innerHTML = message.role === 'user' ? '<div class="attachments"></div><p class="bubble"></p>' : replyMarkup();
       follow.keep(element);
       view = {element, message: null, shown: null};
       if (message.role !== 'user') {

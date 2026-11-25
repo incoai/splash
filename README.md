@@ -30,7 +30,11 @@ on `127.0.0.1:8000`. Later starts reuse the downloads; leave room on disk for
 them ([storage requirements](docs/server.md#model-storage)).
 
 Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
-in your browser, or run an installed coding agent from another terminal:
+in your browser, or run an installed coding agent from another terminal. The
+chat page follows the browser's language, English and Simplified Chinese today,
+and its sidebar's Language menu keeps a choice; the desktop app follows the
+language macOS picks for Splash in System Settings › General › Language &
+Region › Applications.
 
 ```bash
 splash opencode    # or: splash claude / splash codex / splash hermes / splash pi

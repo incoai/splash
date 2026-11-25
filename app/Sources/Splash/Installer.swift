@@ -94,12 +94,12 @@ final class Installer {
     /// whether it did what was asked.
     nonisolated static func words(_ result: Result, name: String) -> (title: String, detail: String, done: Bool) {
         switch result {
-        case .checked(.updated): ("\(name) is updated", "Its next start uses the new files.", true)
-        case .checked(.upToDate): ("\(name) is up to date", "Hugging Face has nothing newer.", true)
-        case .checked(.unreachable): ("Splash couldn’t check \(name) for updates", "Hugging Face was not reachable.", false)
-        case .checked(.kept): ("Splash couldn’t update \(name)", "It kept the installed version.", false)
-        case .deleted(let freed) where freed > 0: ("Deleted \(name)", "Freed \(Format.size(freed)).", true)
-        case .deleted: ("Deleted \(name)", "Its files stayed: other models or tools use them.", true)
+        case .checked(.updated): (L("%@ is updated", name), L("Its next start uses the new files."), true)
+        case .checked(.upToDate): (L("%@ is up to date", name), L("Hugging Face has nothing newer."), true)
+        case .checked(.unreachable): (L("Splash couldn’t check %@ for updates", name), L("Hugging Face was not reachable."), false)
+        case .checked(.kept): (L("Splash couldn’t update %@", name), L("It kept the installed version."), false)
+        case .deleted(let freed) where freed > 0: (L("Deleted %@", name), L("Freed %@.", Format.size(freed)), true)
+        case .deleted: (L("Deleted %@", name), L("Its files stayed: other models or tools use them."), true)
         }
     }
 
@@ -109,23 +109,22 @@ final class Installer {
     /// is free, two figures that read apart however they round; without, where the disk filled
     /// during it.
     nonisolated static func problem(_ failure: Failure, model: String) -> String {
-        let name = model.split(separator: ":")[0]
+        let name = String(model.split(separator: ":")[0])
         switch failure.kind {
         case "disk":
             if let needed = failure.needed, let available = failure.available {
-                return "It needs \(Format.size(needed)) of disk space, \(Format.size(needed - available)) more than is free. "
-                    + "Free some space, then try again."
+                return L("It needs %@ of disk space, %@ more than is free. Free some space, then try again.",
+                         Format.size(needed), Format.size(needed - available))
             }
-            return "The disk is full. Free some space, then try again."
+            return L("The disk is full. Free some space, then try again.")
         case "not_found":
-            return "Hugging Face has no public model named \(name). Check the name, then try again."
+            return L("Hugging Face has no public model named %@. Check the name, then try again.", name)
         case "offline":
-            return "Splash couldn’t reach Hugging Face. Check the internet connection, then try again."
+            return L("Splash couldn’t reach Hugging Face. Check the internet connection, then try again.")
         case "interrupted":
-            return "The connection to Hugging Face dropped during the download. Check the internet connection, then try again."
+            return L("The connection to Hugging Face dropped during the download. Check the internet connection, then try again.")
         case "auth":
-            return "Hugging Face refused access to \(name). Sign in with an account that can read it (hf auth login) and, "
-                + "if the model asks, accept its terms at huggingface.co/\(name), then try again."
+            return L("Hugging Face refused access to %@. Sign in with an account that can read it (hf auth login) and, if the model asks, accept its terms at huggingface.co/%@, then try again.", name, name)
         default:
             return failure.message
         }
@@ -147,9 +146,9 @@ final class Installer {
         /// downloads it.
         func phrase(_ name: String, downloading: Bool) -> String {
             switch self {
-            case .download: "Downloading \(name)"
-            case .check: downloading ? "Downloading \(name)" : "Checking \(name) for updates"
-            case .removal: "Deleting \(name)"
+            case .download: L("Downloading %@", name)
+            case .check: downloading ? L("Downloading %@", name) : L("Checking %@ for updates", name)
+            case .removal: L("Deleting %@", name)
             }
         }
     }
@@ -230,7 +229,7 @@ final class Installer {
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
-            failure = (model, "Splash couldn’t start: \(error.localizedDescription)")
+            failure = (model, L("Splash couldn’t start: %@", error.localizedDescription))
             self.model = nil
             return
         }
@@ -304,7 +303,7 @@ final class Installer {
             }
         } else if !cancelled {
             failure = (model, reported.map { Self.problem($0, model: model) }
-                ?? "It stopped unexpectedly. The log has the details.")
+                ?? L("It stopped unexpectedly. The log has the details."))
         }
     }
 }

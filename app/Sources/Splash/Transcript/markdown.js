@@ -186,7 +186,7 @@ const markdown = (() => {
   function code(source, language, open) {
     const text = source.replace(/\n$/, '');
     return `<figure class="code"><figcaption><span>${escape(language)}</span>` +
-      `<button type="button" class="hover copy-code" title="Copy" aria-label="Copy Code">${copyGlyphs}</button></figcaption>` +
+      `<button type="button" class="hover copy-code" title="${page.text('copy')}" aria-label="${page.text('copyCode')}">${copyGlyphs}</button></figcaption>` +
       `<pre><code>${open ? escape(text) : highlighted(text, language)}</code></pre></figure>`;
   }
 

@@ -181,37 +181,37 @@ final class AppState {
     var serverStatus: ServerStatus {
         switch server.phase {
         case .stopped:
-            return ServerStatus(look: .off, phrase: "Not running")
+            return ServerStatus(look: .off, phrase: L("Not running"))
         case .starting:
-            return ServerStatus(look: .loading, phrase: server.stepPhrase, note: server.step.note)
+            return ServerStatus(look: .loading, phrase: server.stepPhrase, note: server.step.note.map { L($0) })
         case .stopping:
-            guard let next = server.next else { return ServerStatus(look: .off, phrase: "Stopping…") }
-            return ServerStatus(look: .off, phrase: next == server.model ? "Restarting…" : "Switching to \(displayName(of: next))…")
+            guard let next = server.next else { return ServerStatus(look: .off, phrase: L("Stopping…")) }
+            return ServerStatus(look: .off, phrase: next == server.model ? L("Restarting…") : L("Switching to %@…", displayName(of: next)))
         case .ready:
             let look: MarkLook = switch server.serving {
             case .running: .on
             case .sleeping: .asleep
             case .recovering: .loading
             }
-            return ServerStatus(look: look, phrase: server.serving.rawValue)
+            return ServerStatus(look: look, phrase: L(server.serving.rawValue))
         case .failed:
-            return ServerStatus(look: .failed, phrase: "Ran into a problem")
+            return ServerStatus(look: .failed, phrase: L("Ran into a problem"))
         }
     }
 
     /// What runs, in a sentence: VoiceOver announces it, and the Chat's composer says it while a
     /// model starts, stops or fails.
     var status: String {
-        guard server.phase != .stopped, let model = server.model else { return "No model running" }
-        return "\(displayName(of: model)) · \(serverStatus.phrase)"
+        guard server.phase != .stopped, let model = server.model else { return L("No model running") }
+        return L("%@ · %@", displayName(of: model), serverStatus.phrase)
     }
 
     /// What the installer does, a download, a check or a deletion, in the words the menus use.
     var downloadStatus: String? {
         guard let model = installer.model else { return nil }
         let name = displayName(of: model)
-        guard let progress = installer.progress else { return "\(installer.work.phrase(name, downloading: false))…" }
-        return "\(installer.work.phrase(name, downloading: true)) · \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
+        guard let progress = installer.progress else { return L("%@…", installer.work.phrase(name, downloading: false)) }
+        return L("%@ · %@", installer.work.phrase(name, downloading: true), progress.fraction.formatted(.percent.precision(.fractionLength(0))))
     }
 
     /// The model picked on the Server screen: the last one picked while it is listed, else the
@@ -252,12 +252,12 @@ final class AppState {
         // The shell's Hugging Face settings, read beside the checks, for all the app runs after them.
         let shellSettings = Task { await Runtime.readShellSettings(drawer.shell()) }
         if let reason = await runtime.unsupportedReason() {
-            blocker = Blocker(title: "This Mac Can’t Run Splash", symbol: "exclamationmark.triangle", message: reason)
+            blocker = Blocker(title: L("This Mac Can’t Run Splash"), symbol: "exclamationmark.triangle", message: reason)
             return
         }
         if Self.mustMoveToApplications(Bundle.main.bundleURL) {
-            blocker = Blocker(title: "Move Splash to Applications", symbol: "externaldrive",
-                              message: "Splash can’t run from the disk image. Drag it to your Applications folder, then open it from there.")
+            blocker = Blocker(title: L("Move Splash to Applications"), symbol: "externaldrive",
+                              message: L("Splash can’t run from the disk image. Drag it to your Applications folder, then open it from there."))
             return
         }
         // The drafts of chats gone since, deleted by another copy of the app, go, unless a chat
@@ -269,8 +269,8 @@ final class AppState {
         // the window shows the models, so that it lists from the first only those it offers.
         let served = Task { await runtime.families() }
         await listed()
-        await installer.stopLeftover { self.launchWait = "Stopping the download Splash left running…" }
-        await server.stopLeftover { self.launchWait = "Stopping the model Splash left running…" }
+        await installer.stopLeftover { self.launchWait = L("Stopping the download Splash left running…") }
+        await server.stopLeftover { self.launchWait = L("Stopping the model Splash left running…") }
         families = await served.value
         launchWait = nil
         installCached()
@@ -394,13 +394,17 @@ final class AppState {
         var message: String? {
             var lines: [String] = []
             if requests > 0, let model {
-                lines.append("\(model) is answering \(requests == 1 ? "a request" : "\(requests) requests").")
+                lines.append(requests == 1
+                    ? L("%@ is answering a request.", model)
+                    : L("%@ is answering %d requests.", model, requests))
             }
             if let download {
-                lines.append("\(download) is still downloading. If you quit, it stops. Download it again later to go on: the files it finished are kept.")
+                lines.append(L("%@ is still downloading. If you quit, it stops. Download it again later to go on: the files it finished are kept.", download))
             }
             if programs > 0 {
-                lines.append(programs == 1 ? "A terminal is running a program." : "\(programs) terminals are running programs.")
+                lines.append(programs == 1
+                    ? L("A terminal is running a program.")
+                    : L("%d terminals are running programs.", programs))
             }
             return lines.isEmpty ? nil : lines.joined(separator: "\n\n")
         }
@@ -482,26 +486,26 @@ final class AppState {
     nonisolated static func attachmentProblem(_ attachments: [Attachment], vision: Bool, limits: Server.Limits?) -> String? {
         guard !attachments.isEmpty else { return nil }
         let pdfs = attachments.filter { $0.kind == .pdf }
-        guard vision else { return pdfs.isEmpty ? "This model can’t see images" : "This model can’t read PDFs" }
+        guard vision else { return pdfs.isEmpty ? L("This model can’t see images") : L("This model can’t read PDFs") }
         guard let limits else { return nil }
         if let pdf = pdfs.first(where: { $0.bytes > limits.pdf_bytes }) {
-            return "\(pdf.name ?? "This PDF") is larger than the model’s \(Format.size(Int64(limits.pdf_bytes))) limit"
+            return L("%@ is larger than the model’s %@ limit", pdf.name ?? L("This PDF"), Format.size(Int64(limits.pdf_bytes)))
         }
         if let pdf = pdfs.first(where: { ($0.pages ?? 0) > limits.pdf_pages }) {
-            return "\(pdf.name ?? "This PDF") has more than the model’s \(limits.pdf_pages) pages"
+            return L("%@ has more than the model’s %d pages", pdf.name ?? L("This PDF"), limits.pdf_pages)
         }
         if pdfs.reduce(0, { $0 + $1.bytes }) > limits.pdf_bytes {
-            return "These PDFs are larger together than the model’s \(Format.size(Int64(limits.pdf_bytes))) limit"
+            return L("These PDFs are larger together than the model’s %@ limit", Format.size(Int64(limits.pdf_bytes)))
         }
         if attachments.contains(where: { $0.kind == .image && $0.bytes > limits.image_bytes }) {
-            return "An image is larger than the model’s \(Format.size(Int64(limits.image_bytes))) limit"
+            return L("An image is larger than the model’s %@ limit", Format.size(Int64(limits.image_bytes)))
         }
         if attachments.reduce(0, { $0 + ($1.kind == .pdf ? $1.pages ?? 1 : 1) }) > limits.images {
-            return "The images and PDF pages are more than the model’s \(limits.images)"
+            return L("The images and PDF pages are more than the model’s %d", limits.images)
         }
         // Sent as base64, a third larger.
         if (attachments.reduce(0, { $0 + $1.bytes }) + 2) / 3 * 4 > limits.request_bytes {
-            return "The attachments are larger than one message to the model takes"
+            return L("The attachments are larger than one message to the model takes")
         }
         return nil
     }
@@ -591,9 +595,9 @@ final class AppState {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
-        panel.prompt = "Choose"
-        let gone = missing ? agentFolder.map { "“\($0.lastPathComponent)” can’t be found. " } ?? "" : ""
-        panel.message = gone + "Choose the project folder the coding agents work in."
+        panel.prompt = L("Choose")
+        let gone = missing ? agentFolder.map { L("“%@” can’t be found. ", $0.lastPathComponent) } ?? "" : ""
+        panel.message = gone + L("Choose the project folder the coding agents work in.")
         panel.directoryURL = agentFolder
         NSApp.activate()
         guard panel.runModal() == .OK, let folder = panel.url else { return false }

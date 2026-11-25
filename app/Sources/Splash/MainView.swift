@@ -37,9 +37,9 @@ struct MainView: View {
                 if state.available {
                     ToolbarItem {
                         Button { state.toggleDrawer() } label: {
-                            Label("Terminal and Logs", systemImage: "terminal")
+                            Label(L("Terminal and Logs"), systemImage: "terminal")
                         }
-                        .help(state.showsDrawer ? "Hide Terminal and Logs (⌘J)" : "Show Terminal and Logs (⌘J)")
+                        .help(L(state.showsDrawer ? "Hide Terminal and Logs (⌘J)" : "Show Terminal and Logs (⌘J)"))
                     }
                     ToolbarItem { ServerButton() }
                         .sharedBackgroundVisibility(.hidden)
@@ -121,7 +121,7 @@ struct SectionSwitch: View {
 
     var body: some View {
         Segments(selected: state.section, height: 28, pick: { state.section = $0 }, segments: [
-            .init(title: "Chat", value: .chat, help: "Chat with the model that runs (⌘2)"),
+            .init(title: L("Chat"), value: .chat, help: L("Chat with the model that runs (⌘2)")),
         ])
     }
 }
@@ -268,8 +268,8 @@ struct SidebarButton: View {
                 .contentShape(.circle)
         }
         .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.circle)))
-        .accessibilityLabel(state.showsSidebar ? "Hide Sidebar" : "Show Sidebar")
-        .help(state.showsSidebar ? "Hide Sidebar (⌘B)" : "Show Sidebar (⌘B)")
+        .accessibilityLabel(L(state.showsSidebar ? "Hide Sidebar" : "Show Sidebar"))
+        .help(L(state.showsSidebar ? "Hide Sidebar (⌘B)" : "Show Sidebar (⌘B)"))
         .disabled(state.section == .server)
     }
 }
@@ -286,15 +286,15 @@ extension AppState {
     var serverTitle: String {
         if installer.running {
             return switch installer.work {
-            case .removal: "Deleting…"
-            case .check where installer.progress == nil: "Checking…"
-            default: "Downloading…"
+            case .removal: L("Deleting…")
+            case .check where installer.progress == nil: L("Checking…")
+            default: L("Downloading…")
             }
         }
-        guard let name = server.model.map(catalog.name(of:)) else { return "Server" }
+        guard let name = server.model.map(catalog.name(of:)) else { return L("Server") }
         switch server.phase {
         case .starting, .ready, .stopping: return name
-        case .stopped, .failed: return "Server"
+        case .stopped, .failed: return L("Server")
         }
     }
 }
@@ -332,8 +332,8 @@ struct ServerButton: View {
         }
         .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.capsule)))
         .animation(Motion.settle, value: selected)
-        .help("\(state.downloadStatus ?? state.status) (⌘1)")
-        .accessibilityLabel("Server")
+        .help(L("%@ (⌘1)", state.downloadStatus ?? state.status))
+        .accessibilityLabel(L("Server"))
         .accessibilityValue(state.downloadStatus ?? state.status)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }

@@ -164,7 +164,7 @@ final class Draft {
     }
 
     private static func unattached(_ failed: Int) -> String {
-        failed == 1 ? "An image couldn’t be attached" : "\(failed) images couldn’t be attached"
+        failed == 1 ? L("An image couldn’t be attached") : L("%d images couldn’t be attached", failed)
     }
 
     /// Attaches the PDFs at `urls` as they are, with their names and pages, read and kept away from
@@ -184,7 +184,7 @@ final class Draft {
                 draft.attaching -= urls.count
                 let failed = read.filter { $0.1 == nil }.map { $0.0.lastPathComponent }
                 if let first = failed.first {
-                    draft.notice = failed.count == 1 ? "“\(first)” couldn’t be read" : "\(failed.count) PDFs couldn’t be read"
+                    draft.notice = failed.count == 1 ? L("“%@” couldn’t be read", first) : L("%d PDFs couldn’t be read", failed.count)
                 }
             }
         }
@@ -328,7 +328,7 @@ struct Composer: View {
             }
             ComposerField(text: $draft.text, chat: state.chats.selection, focusRequests: draft.focusRequests,
                           yields: state.terminalShows, held: held,
-                          placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images && !held,
+                          placeholder: L("Message Splash"), submit: state.sendDraft, cancel: stop, acceptsImages: images && !held,
                           attach: { draft.attach($0, unreadable: $1) }, attachPDFs: { draft.attach(pdfs: $0) })
                 .alignmentGuide(.composerPlain) { $0[.top] - Self.inset }
             // As the server's stage changes them (`MainView`), a control that goes goes at once, and
@@ -339,8 +339,8 @@ struct Composer: View {
                 if images {
                     Button { if !held { picking = true } } label: { Image(systemName: "plus") }
                         .foregroundStyle(.secondary)
-                        .help("Attach Images or PDFs")
-                        .accessibilityLabel("Attach Images or PDFs")
+                        .help(L("Attach Images or PDFs"))
+                        .accessibilityLabel(L("Attach Images or PDFs"))
                         .transition(Motion.comingAndGoing)
                 }
                 EngineSlot()
@@ -361,8 +361,8 @@ struct Composer: View {
                 .buttonStyle(InkCircle())
                 .disabled(!streaming && !state.canSendDraft)
                 .keyboardShortcut(streaming ? KeyboardShortcut(".", modifiers: .command) : nil)
-                .help(streaming ? "Stop" : help)
-                .accessibilityLabel(streaming ? "Stop" : "Send")
+                .help(streaming ? L("Stop") : help)
+                .accessibilityLabel(L(streaming ? "Stop" : "Send"))
             }
             .buttonStyle(.hover)
             // The first control's glyph on the text's edge.
@@ -413,15 +413,15 @@ struct Composer: View {
     private var streaming: Bool { state.chats.answering }
 
     private var help: String {
-        if !state.server.answers { return "Available once a model is running" }
-        if draft.attaching > 0 { return "Reading the attachments…" }
+        if !state.server.answers { return L("Available once a model is running") }
+        if draft.attaching > 0 { return L("Reading the attachments…") }
         if let streaming = state.chats.streaming, streaming != state.chats.selection {
             let title = state.chats.conversations.first { $0.id == streaming }?.title ?? ""
-            return title.isEmpty ? "Wait for the reply in another chat" : "Wait for the reply in “\(title)”"
+            return title.isEmpty ? L("Wait for the reply in another chat") : L("Wait for the reply in “%@”", title)
         }
         if let problem = state.attachmentProblem { return problem }
         if let note = state.overflow?.note { return note }
-        return "Send"
+        return L("Send")
     }
 
     /// Stops the open chat's request, the way Escape cancels; false when none is under way.
@@ -447,7 +447,7 @@ private struct ContextRing: View {
             .animation(Motion.settle, value: usage)
             .help(usage?.explanation ?? "")
             .accessibilityElement()
-            .accessibilityLabel("Context")
+            .accessibilityLabel(L("Context"))
             .accessibilityValue(usage?.explanation ?? "")
     }
 
@@ -508,7 +508,7 @@ private struct EngineSlot: View {
         let name = server.model.map(state.displayName(of:)) ?? ""
         let words = switch server.phase {
         case .ready where !server.recovering: name
-        case .stopped: state.installed.isEmpty ? "No model on this Mac" : "No model running"
+        case .stopped: state.installed.isEmpty ? L("No model on this Mac") : L("No model running")
         default: state.status
         }
         let mark = StatusMark(look: state.serverStatus.look, since: server.since, size: 12)
@@ -517,18 +517,18 @@ private struct EngineSlot: View {
                 HStack(spacing: 6) {
                     mark
                     Text(words).foregroundStyle(.secondary).contentTransition(.identity)
-                    Text("Open Server").foregroundStyle(.tint)
+                    Text(L("Open Server")).foregroundStyle(.tint)
                 }
                 .font(.callout)
                 .lineLimit(1)
             }
-            .help("Open Server (⌘1)")
+            .help(L("Open Server (⌘1)"))
         } else {
             // The models by their ids, and Manage Models… by an empty one, which no model has.
             let models = state.installed.map { model in
                 PopupItem(id: model.id, title: state.displayName(of: model.id), disabled: !state.canStart(model.id))
             }
-            PopupMenu(header: "Model", items: models + [PopupItem(id: "", title: "Manage Models…", separated: true)],
+            PopupMenu(header: L("Model"), items: models + [PopupItem(id: "", title: L("Manage Models…"), separated: true)],
                       chosen: state.checkedModel, above: true) { choice in
                 if choice.isEmpty { state.section = .server } else { state.choose(choice) }
             } label: {
@@ -554,8 +554,8 @@ private struct EngineSlot: View {
                 .transaction(value: words) { $0.animation = nil }
                 .geometryGroup()
             }
-            .help("Start or Switch Models")
-            .accessibilityLabel("Model")
+            .help(L("Start or Switch Models"))
+            .accessibilityLabel(L("Model"))
             .accessibilityValue(words)
         }
     }
@@ -574,9 +574,9 @@ private struct EffortMenu: View {
             let choices = (levels ? reasoning.efforts.reversed() : ["on"])
                 + (levels && reasoning.default == nil && thinks ? [""] : []) + ["none"]
             let chosen = state.effort.isEmpty ? initial : !levels && state.effort != "none" ? "on" : state.effort
-            PopupMenu(header: "Thinking", items: choices.map { choice in
+            PopupMenu(header: L("Thinking"), items: choices.map { choice in
                 // The default's own item is named Default already.
-                PopupItem(id: choice, title: Self.title(choice), badge: choice == initial && !choice.isEmpty ? "Default" : nil)
+                PopupItem(id: choice, title: Self.title(choice), badge: choice == initial && !choice.isEmpty ? L("Default") : nil)
             }, chosen: chosen, above: true) { choice in
                 // On, for a model whose thinking is only on or off, is any effort but none.
                 state.effort = choice == initial ? "" : choice == "on" ? "medium" : choice
@@ -593,8 +593,8 @@ private struct EffortMenu: View {
             }
             .fixedSize()
             .transition(Motion.comingAndGoing)
-            .help("How much the model thinks before it answers")
-            .accessibilityLabel("Thinking")
+            .help(L("How much the model thinks before it answers"))
+            .accessibilityLabel(L("Thinking"))
             .accessibilityValue(Self.title(chosen))
         }
     }
@@ -602,10 +602,15 @@ private struct EffortMenu: View {
     /// An effort's name.
     private static func title(_ effort: String) -> String {
         switch effort {
-        case "": "Default"
-        case "on": "Thinking"
-        case "none": "No Thinking"
-        case "xhigh": "Extra High"
+        case "": L("Default")
+        case "on": L("Thinking")
+        case "none": L("No Thinking")
+        case "xhigh": L("Extra High")
+        case "minimal": L("Minimal")
+        case "low": L("Low")
+        case "medium": L("Medium")
+        case "high": L("High")
+        case "max": L("Max")
         default: effort.capitalized
         }
     }
@@ -644,7 +649,7 @@ private struct Attachments: View {
                         }
                         .buttonStyle(.borderless)
                         .offset(x: 6, y: -6)
-                        .accessibilityLabel(attachment.kind == .pdf ? "Remove PDF" : "Remove Image")
+                        .accessibilityLabel(L(attachment.kind == .pdf ? "Remove PDF" : "Remove Image"))
                     }
                 }
             }
@@ -662,7 +667,7 @@ extension Attachments {
         return HStack(spacing: 8) {
             Image(systemName: "doc.text").font(.system(size: 22, weight: .light)).foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 2) {
-                Text(attachment.name ?? "PDF").font(.callout).lineLimit(1).truncationMode(.middle)
+                Text(attachment.name ?? L("PDF")).font(.callout).lineLimit(1).truncationMode(.middle)
                 Text(attachment.details)
                     .font(.caption)
                     .foregroundStyle(over ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))

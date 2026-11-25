@@ -21,15 +21,15 @@ struct ContextUsage: Equatable, Sendable {
     /// The exact figures: 12,345 of 262,144 tokens · 5%.
     var summary: String {
         let share = (Double(input) / Double(max(1, limit))).formatted(.percent.precision(.fractionLength(0)))
-        return "\(input.formatted()) of \(limit.formatted()) tokens · \(share)"
+        return L("%@ of %@ tokens · %@", input.formatted(), limit.formatted(), share)
     }
 
     /// What a prompt short of room means for the reply, nil while there is room.
     var note: String? {
         switch level {
         case .normal: nil
-        case .tight: "\((limit - input).formatted()) tokens are left for thinking and the reply."
-        case .full: "Too long for the model’s context. Start a new chat, or shorten the message."
+        case .tight: L("%@ tokens are left for thinking and the reply.", (limit - input).formatted())
+        case .full: L("Too long for the model’s context. Start a new chat, or shorten the message.")
         }
     }
 

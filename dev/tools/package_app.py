@@ -108,6 +108,10 @@ def info_plist(version, build, macos_min):
         "CFBundleVersion": build,
         "CFBundleIconFile": "AppIcon",
         "CFBundleIconName": "AppIcon",
+        # The app's words, which System Settings > General > Language & Region
+        # > Applications picks from: Localizable.strings in the resource bundle.
+        "CFBundleDevelopmentRegion": "en",
+        "CFBundleLocalizations": ["en", "zh-Hans"],
         "LSMinimumSystemVersion": macos_min,
         "LSApplicationCategoryType": "public.app-category.developer-tools",
         "NSHighResolutionCapable": True,
