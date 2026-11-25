@@ -3144,16 +3144,16 @@ closer than a window share the pages of their tails. The cache keeps it so
   copy alone), on a request's own chain too, where the plan's floor
   (`kvWindowFloorPages`) does not count it. A conversation of turns shorter
   than a window thus keeps every page it appends Full behind its own lane,
-  which no reclaim reaches. While the budget has room nothing changes; once
-  it refuses, the states behind the lanes leave for those pages
-  (`Cache::releaseTails`), in RAM or on the SSD with their copies, oldest
-  first: each whose tail holds a page that a running request holds a window
-  behind it and that no state that stays holds too. The resume point, what a
-  waiting request restores, a state a request uses and, of each running
-  request's chain, the head-most state (a prompt's head, which the next
-  conversation resumes at) and the newest stay. A prompt that matched a state
-  gone resumes at a state before it, or runs from its start, and computes the
-  blocks past it again.
+  which no reclaim reaches. While memory has room nothing changes; once it
+  refuses, the budget's or the host's, the states behind the lanes leave for
+  those pages (`Cache::releaseTails`), in RAM or on the SSD with their
+  copies, oldest first: each whose tail holds a page that a running request
+  holds a window behind it and that no state that stays holds too. The resume
+  point, what a waiting request restores, a state a request uses and, of each
+  running request's chain, the head-most state (a prompt's head, which the
+  next conversation resumes at) and the newest stay. A prompt that matched a
+  state gone resumes at a state before it, or runs from its start, and
+  computes the blocks past it again.
 - A writer that computes a block again keeps its own page, which the block
   takes once no transfer moves the block's (`KvCache::insert`,
   `kv.window.upgrades`), rather than moving onto the block's page as a
@@ -3200,11 +3200,13 @@ That walk is a page need's (`Cache::trims`). A KV target the budget refuses
 lacks an extent's bytes with its pages in place, a device walk, which trims
 nothing and takes a state only for its buffers; in either walk a state with a
 copy on the SSD keeps its entry, and so its tail. The cache therefore gives up
-the tails behind the lanes itself, where the budget refuses
-(`Cache::trimWindows`); a refusal of the host's, which a wait lifts, takes
-none. A lane's target refused Full pages (`Cache::ensureTokens`) first
-releases the tails that hold the pages it takes and an extent's more, before
-anything else cached goes, and trims them. A Slim runway that cannot refill
+the tails behind the lanes itself, where memory refuses
+(`Cache::trimWindows`): the budget's, which no wait lifts, and the host's,
+which a claim in service passes rather than wait, so the lane's pages come from
+the tails before the claim passes the host's reserve. A lane's target refused
+Full pages (`Cache::ensureTokens`) first releases the tails that hold the
+pages it takes and an extent's more, before anything else cached goes, and
+trims them. A Slim runway that cannot refill
 releases those that leave an extent's Full pages free, while the runway still
 holds pages to trim them into. A Full extent the trims leave free then leaves
 (`Cache::compactExtent`) and pays for the Slim extents of the rest and the

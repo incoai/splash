@@ -687,8 +687,9 @@ public:
   // block left for a writer's (KvCache::insert). Free Slim pages take them
   // first, the runway's among them, then with `allocate` the extents of the
   // form it allocates, and the runway refills; a refusal leaves the rest
-  // Full, which costs only memory, for the next pass. Where the budget
-  // refuses, the tails behind the lanes leave first (releaseTails), for an
+  // Full, which costs only memory, for the next pass. Where memory refuses
+  // (the budget's, or the host's, which a claim in service passes rather
+  // than wait), the tails behind the lanes leave first (releaseTails), for an
   // extent's Full pages beside the `taking` a refused Full target takes
   // (ensureTokens): a refill refused, the wall, trims them into what the
   // runway holds, and a Full extent left free beyond the lanes' floors
@@ -754,7 +755,8 @@ public:
   // pages of the form waiting claims ranked above the request hold, stay
   // free (KvPool::acquirePages): a request refused the pages waits
   // (Pending) only while those on their way back cover what the free pages
-  // beyond them do not.
+  // beyond them do not. Refused by the budget or the host, the tails behind
+  // the lanes give way first (trimWindows), before anything cached.
   [[nodiscard]] TokenAdmission
   ensureTokens(uint64_t requestId, uint64_t tokenCount,
                uint64_t writtenTokens = std::numeric_limits<uint64_t>::max(),

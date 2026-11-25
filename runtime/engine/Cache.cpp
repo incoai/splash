@@ -41,6 +41,13 @@ uint32_t completedExtents(uint32_t free, uint32_t pages, uint32_t extentPages, b
   return beyond(free + pages) - beyond(free);
 }
 
+// Memory's refusals of a Full page or extent: the budget's, which no wait
+// lifts, and the host's, which a claim in service passes rather than wait
+// (MemoryGovernor). A driver's leaves both the pages and the caches alone.
+bool refusedByMemory(metal::AllocationFailure failure) noexcept {
+  return failure == metal::AllocationFailure::EngineBudget || failure == metal::AllocationFailure::HostPressure;
+}
+
 } // namespace
 
 Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
@@ -552,9 +559,10 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount,
   std::vector<uint32_t> acquired;
   const uint32_t count = needed - previousSize, kept = held[static_cast<size_t>(kv::PageForm::Full)];
   TokenAdmission admission = admitPages(count, acquired, kv::PageForm::Full, kept);
-  // Refused by the budget, which no wait lifts, the tails behind the lanes
-  // give way before anything cached.
-  if (admission.allocationFailure == metal::AllocationFailure::EngineBudget && trimWindows(true, count + kept))
+  // Refused by memory, the tails behind the lanes give way before anything
+  // cached, so the pages come from their extents and not past the host.
+  const metal::AllocationFailure refusal = admission.allocationFailure;
+  if (refusedByMemory(refusal) && trimWindows(true, count + kept))
     admission = admitPages(count, acquired, kv::PageForm::Full, kept);
   if (!admission.granted())
     return admission;
@@ -2422,9 +2430,9 @@ uint32_t Cache::trimWindows(bool allocate, uint32_t taking) {
   trimmedPages_ += moved;
   // The next pass, at the memory wall too, trims without an allocation.
   if (!allocate || pool_.freePageCount(kv::PageForm::Slim) >= extent ||
-      pool_.fillRunway(kv::PageForm::Slim).failure != metal::AllocationFailure::EngineBudget)
+      !refusedByMemory(pool_.fillRunway(kv::PageForm::Slim).failure))
     return moved;
-  // A refill the budget refused is that wall. While the runway still holds
+  // A refill memory refused is that wall. While the runway still holds
   // pages, the tails trim into it, and a Full extent the trims leave free
   // beyond the lanes' floors pays for the Slim extents of the rest and the
   // runway's.
