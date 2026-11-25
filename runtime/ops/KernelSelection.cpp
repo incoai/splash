@@ -364,14 +364,13 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
 }
 
 bool moeInt8Experts(const MoeShape &shape, std::span<const BlockMoeWeights *const> blocks) noexcept {
-  // moe_int8.metal compiles the passes for a routing of one or two shared
-  // slices (slicesSuffix "" and "_s2") whose gate/up applies SiLU (no
-  // activationSuffix), in the formats quant_moe_int8_format takes.
+  // moe_int8.metal compiles the passes for every compiled routing
+  // (ops::kCompiledMoeRoutings), in the formats quant_moe_int8_format takes.
   const CompiledMoeRouting *routing = shape.compiledRouting();
-  if (!routing || (routing->sharedSlices != 1 && routing->sharedSlices != 2) || !routing->activationSuffix.empty())
-    return false;
-  const auto takes = [](const BlockExpertProjection &p) {
-    return p.routed.formatId == p.shared.formatId && quant_moe_int8_format(p.routed.formatId);
+  if (!routing) return false;
+  const auto takes = [&](const BlockExpertProjection &p) {
+    return (!routing->sharedSlices || p.routed.formatId == p.shared.formatId) &&
+           quant_moe_int8_format(p.routed.formatId);
   };
   return !blocks.empty() && std::ranges::all_of(blocks, [&](const BlockMoeWeights *block) {
     return takes(block->gate) && takes(block->up) && takes(block->down);
