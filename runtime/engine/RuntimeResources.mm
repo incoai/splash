@@ -1292,7 +1292,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     std::optional<CacheWindowPolicy> windowPolicy;
     if (kvLayout.windowedLayers)
       windowPolicy = CacheWindowPolicy{.windowPages = kvLayout.windowPages(),
-                                       .trim = kvLayout.slimmable() && config.kvWindowTrim};
+                                       .trim = kvLayout.slimmable() && config.kvWindowTrim,
+                                       .floorPages = budget.kvWindowFloorPages};
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });

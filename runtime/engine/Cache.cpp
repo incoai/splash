@@ -550,10 +550,13 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount,
   if (needed <= previousSize)
     return {};
   std::vector<uint32_t> acquired;
-  if (const TokenAdmission admission =
-          admitPages(needed - previousSize, acquired, kv::PageForm::Full,
-                     held[static_cast<size_t>(kv::PageForm::Full)]);
-      !admission.granted())
+  const uint32_t count = needed - previousSize, kept = held[static_cast<size_t>(kv::PageForm::Full)];
+  TokenAdmission admission = admitPages(count, acquired, kv::PageForm::Full, kept);
+  // Refused by the budget, which no wait lifts, the tails behind the lanes
+  // give way before anything cached.
+  if (admission.allocationFailure == metal::AllocationFailure::EngineBudget && trimWindows(true, count + kept))
+    admission = admitPages(count, acquired, kv::PageForm::Full, kept);
+  if (!admission.granted())
     return admission;
   const uint64_t written = std::min(writtenTokens, tokenCount);
   for (uint32_t index = 0; index < acquired.size(); ++index)
@@ -2335,9 +2338,57 @@ uint32_t Cache::passedPages() const {
   return trimmableCount() + static_cast<uint32_t>(passedKeptPages().size());
 }
 
-uint32_t Cache::trimWindows(bool allocate) {
+void Cache::releaseTails(uint32_t pages) {
+  // Of each running request's chain the head-most state stays, a prompt's
+  // head, which the next conversation resumes at, and the newest, its own.
+  std::unordered_set<uint64_t> kept;
+  const auto holds = [&](uint64_t block) { return states_.contains(block); };
+  for (const auto &[_, active] : requests_) {
+    const std::vector<uint64_t> &chain = active.cachedBlocks;
+    if (const auto head = std::ranges::find_if(chain, holds); head != chain.end())
+      kept.insert({*head, *std::find_if(chain.rbegin(), chain.rend(), holds)});
+  }
+  std::vector<CacheEvictionCandidate> states;
+  for (auto state = states_.checkpointCandidate(); state; state = states_.checkpointCandidate(state))
+    states.push_back(*state);
+  for (auto state = states_.ordinaryCandidate(); state; state = states_.ordinaryCandidate(state))
+    states.push_back(*state);
+  for (auto state = states_.diskCandidate(false); state; state = states_.diskCandidate(false, state))
+    states.push_back(*state);
+  std::erase_if(states, [&](const auto &state) { return certainReuse(state.id) || kept.contains(state.id); });
+  std::ranges::sort(states, {}, &CacheEvictionCandidate::lastUsed);
+  // Of the tails that hold each block, those of the states that stay.
+  std::unordered_map<uint64_t, uint32_t> staying;
+  for (const CacheEvictionCandidate &state : states)
+    for (const auto &[block, pins] : kv_.tailPins(state.id))
+      --staying.try_emplace(block, pins).first->second;
+  const auto passed = [&](uint64_t block) {
+    return pool_.pageActive(kv_.page(block)) && windowsPassed(kv_.page(block), kv_.chainLength(block) - 1);
+  };
+  uint64_t waiting = passedPages();
+  for (const CacheEvictionCandidate &state : states) {
+    if (waiting >= pages)
+      return;
+    const std::vector<std::pair<uint64_t, uint32_t>> tail = kv_.tailPins(state.id);
+    if (std::ranges::none_of(tail, [&](const auto &each) { return !staying[each.first] && passed(each.first); }))
+      continue;
+    waiting += std::ranges::count_if(tail, [&](const auto &each) { return each.second == 1 && passed(each.first); });
+    states_.evict(state.id);
+  }
+}
+
+uint32_t Cache::trimWindows(bool allocate, uint32_t taking) {
   if (!window_ || !window_->trim)
     return 0;
+  // Memory refused, the tails behind the lanes leave for the Full pages a
+  // refused target takes and an extent's more.
+  const uint32_t extent = pool_.extentPages();
+  const auto yield = [&] {
+    if (const uint32_t free = pool_.freePageCount(kv::PageForm::Full); free < taking + extent)
+      releaseTails(taking + extent - free);
+  };
+  if (taking)
+    yield();
   // Without `allocate`, no more than the free Slim pages take.
   std::vector<uint32_t> pages =
       trimmablePages(allocate ? std::numeric_limits<size_t>::max() : pool_.freePageCount(kv::PageForm::Slim));
@@ -2370,8 +2421,22 @@ uint32_t Cache::trimWindows(bool allocate) {
   }
   trimmedPages_ += moved;
   // The next pass, at the memory wall too, trims without an allocation.
-  if (allocate && pool_.freePageCount(kv::PageForm::Slim) < pool_.extentPages())
-    static_cast<void>(pool_.fillRunway(kv::PageForm::Slim));
+  if (!allocate || pool_.freePageCount(kv::PageForm::Slim) >= extent ||
+      pool_.fillRunway(kv::PageForm::Slim).failure != metal::AllocationFailure::EngineBudget)
+    return moved;
+  // A refill the budget refused is that wall. While the runway still holds
+  // pages, the tails trim into it, and a Full extent the trims leave free
+  // beyond the lanes' floors pays for the Slim extents of the rest and the
+  // runway's.
+  if (pool_.freePageCount(kv::PageForm::Slim)) {
+    yield();
+    moved += trimWindows(false);
+  }
+  const auto leaves = [&] { return pool_.reclaimEmptyExtents(false, 1, kv::PageForm::Full) != 0; };
+  const uint64_t floor = uint64_t{window_->floorPages} * std::max<size_t>(requests_.size(), 1);
+  if (uint64_t{pool_.allocatedExtents(kv::PageForm::Full)} * extent >= floor + extent &&
+      (leaves() || (compactExtent(kv::PageForm::Full) && leaves())))
+    moved += trimWindows();
   return moved;
 }
 

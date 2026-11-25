@@ -258,8 +258,12 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # from the model's tower (Inkling 2's 20 pixels, Qwen's 16). 31,107 adds 3 for
 # an image span's own height and width, which Inkling 2's encoder pads past as
 # its reference does, and the span's layout in the frame. 31,110 adds 3 for
-# that size in a KV block's identity, as the image cache keys it.
-ENGINE_LINE_BUDGET = 31_110
+# that size in a KV block's identity, as the image cache keys it. 31,209 adds
+# 99 for the tails behind a lane, which a windowed cache gives up where the
+# budget refuses: the states that pin them leave, oldest first, and a Full
+# extent their trims empty beyond the lanes' floors pays for the Slim ones
+# (Cache::releaseTails).
+ENGINE_LINE_BUDGET = 31_209
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
