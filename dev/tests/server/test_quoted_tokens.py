@@ -245,11 +245,13 @@ def laid_out(name, chat_format, special, tags, splits, *, nfc, vision):
 
 
 def installed():
-    """The tokenizer and template of each model installed in this checkout,
-    served as its family is."""
+    """The tokenizer and template of each model installed in this checkout
+    that assembly.family names a family for, served as its family is."""
     served = []
     for root in sorted((paths.MODELS / ".resolved").glob("*/tokenizer")):
         family = assembly.family(root.parent)
+        if family is None:
+            continue
         record = json.loads((root.parent / "model.json").read_text())
         served.append(
             Served(
