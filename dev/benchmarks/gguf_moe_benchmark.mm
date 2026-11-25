@@ -108,14 +108,18 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
   // An ungated block's weights carry no scalar gate.
   const QuantizedSegment sharedGateSegment =
       shape.sharedGate ? floatSegment(backend, sharedGate, 1, H) : QuantizedSegment{};
+  const auto sharedPlanes = [&](Fmt f, uint32_t rows, uint32_t k) {
+    return shape.sharedSlices ? planes(f, rows, k) : QuantizedSegment{};
+  };
   const std::vector<float> scales(3 * E, 1.0f);
   BlockMoeWeights gguf{routerSegment, sharedGateSegment,
-                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                       {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
+                       {planes(gateUpFormat, E * I, H), sharedPlanes(sharedFormat, shape.sharedSlices * I, H)},
+                       {planes(gateUpFormat, E * I, H), sharedPlanes(sharedFormat, shape.sharedSlices * I, H)},
+                       {planes(downFormat, E * H, I), sharedPlanes(sharedFormat, shape.sharedSlices * H, I)},
                        upload(backend, scales.data(), scales.size() * sizeof(float), "moe-expert-scales"),
                        splash::model::residentExpertSlots(backend, E), E};
   gguf.chunks = splash::ops::residentExpertChunks(gguf);
+  if (shape.selectionBias) gguf.selectionBias = zeros(backend, uint64_t{E} * sizeof(float), "moe-selection-bias");
   const std::array<const BlockMoeWeights *, 1> blocks{&gguf};
   const uint32_t routerFormat = splash::ops::moeRouterFormat(blocks);
   // Rows whose expert e scores 4 x[e]: the first E inputs rank the experts, the row's routes at 1 - 0.05 rank and the
@@ -228,6 +232,7 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
     const auto passes = [&](uint32_t rows, bool on) {
       splash::ops::MoeConfig config = plans.moe(shape, routerFormat, rows, splash::ops::StepKind::Prefill).configuration();
       config.int8Passes = on;
+      if (on && config.expertTile == splash::ops::MoeExpertTile::M64) config.expertTile = splash::ops::MoeExpertTile::M32;
       return MoE::plan(shape, rows, config);
     };
     // The plan's passes where every block's experts take them (MoeShape::int8Experts).
@@ -510,19 +515,29 @@ int main(int argc, const char *argv[]) {
     // Or HxIxExK: hidden H, intermediate I, E experts, top K, routed as the 35B's (softmax, a gated shared slice).
     uint32_t custom[4] = {};
     const bool sized = std::sscanf(shapeName.c_str(), "%ux%ux%ux%u", &custom[0], &custom[1], &custom[2], &custom[3]) == 4;
-    if (count < 2 || count > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint" && !sized) ||
+    if (count < 2 || count > 7 ||
+        (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint" && shapeName != "inkling2" && !sized) ||
         gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles|int8] [35b|flash-next|flint|HxIxExK] [rounds] "
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles|int8] [35b|flash-next|flint|inkling2|HxIxExK] [rounds] "
                    "[gate/up format] [down format] [shared format]\n";
       return 2;
     }
-    const bool flashNext = shapeName == "flash-next", flint = shapeName == "flint";
-    const uint32_t H = sized ? custom[0] : flashNext ? 2560 : 2048, I = sized ? custom[1] : flashNext ? 640 : 512;
-    MoeShape shape{H, sized ? custom[2] : flashNext ? 512u : 256u, sized ? custom[3] : flashNext ? 10u : flint ? 6u : 8u, I};
+    const bool flashNext = shapeName == "flash-next", flint = shapeName == "flint", inkling2 = shapeName == "inkling2";
+    const uint32_t H = sized ? custom[0] : flashNext ? 2560 : inkling2 ? 2304 : 2048,
+                   I = sized ? custom[1] : flashNext ? 640 : inkling2 ? 1152 : 512;
+    MoeShape shape{H, sized ? custom[2] : flashNext ? 512u : inkling2 ? 128u : 256u,
+                   sized ? custom[3] : flashNext ? 10u : flint ? 6u : 8u, I};
     if (flint) {
       shape.router = splash::ops::MoeRouter::SigmoidNormalized;
       shape.sharedSlices = 2;
       shape.sharedGate = false;
+    } else if (inkling2) {
+      shape.router = splash::ops::MoeRouter::SigmoidNormalized;
+      shape.sharedSlices = 0;
+      shape.sharedGate = false;
+      shape.selectionBias = true;
+      shape.gateSoftcap = 4;
+      shape.upSoftcap = 25;
     }
     try {
       MetalBackend backend(args[1]);

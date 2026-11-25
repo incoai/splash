@@ -67,16 +67,19 @@ using MoeExpertInt8Kernel = void(device const char *, device const float2 *, dev
                                  device const uint *, device uchar *, device uchar *, device uchar *, device bfloat *,
                                  device const uint *, device const float *, constant MoeInt8ExpertParams &,
                                  constant ulong *, uint2, ushort, ushort);
-// moe_expert_int8_<format>_<pass><slices suffix>: the gate (plain), up (times the gate's SiLU) and down passes.
-#define MOE_EXPERT_INT8(B, f, Shared, suffix)                                                                         \
+// moe_expert_int8_<format>_<pass><slices suffix>[<activation suffix>]: the gate (plain), up (times the gate's
+// activation) and down passes, for every compiled routing (ops::kCompiledMoeRoutings).
+#define MOE_EXPERT_INT8(B, f, Shared, suffix, UpEp, act)                                                              \
   template [[host_name("moe_expert_int8_" #f "_gate" suffix)]] kernel MoeExpertInt8Kernel                            \
       moe_expert_int8<B, EpNone, Shared, 0>;                                                                         \
-  template [[host_name("moe_expert_int8_" #f "_up" suffix)]] kernel MoeExpertInt8Kernel                              \
-      moe_expert_int8<B, EpUpWithGate, Shared, 1>;                                                                   \
+  template [[host_name("moe_expert_int8_" #f "_up" suffix act)]] kernel MoeExpertInt8Kernel                          \
+      moe_expert_int8<B, UpEp, Shared, 1>;                                                                           \
   template [[host_name("moe_expert_int8_" #f "_down" suffix)]] kernel MoeExpertInt8Kernel                            \
       moe_expert_int8<B, EpNone, Shared, 2>;
-MOE_EXPERT_INT8(4, af4g64, 1, "")
-MOE_EXPERT_INT8(5, af5g64, 1, "")
-MOE_EXPERT_INT8(4, af4g64, 2, "_s2")
-MOE_EXPERT_INT8(5, af5g64, 2, "_s2")
+MOE_EXPERT_INT8(4, af4g64, 1, "", EpUpWithGate, "")
+MOE_EXPERT_INT8(5, af5g64, 1, "", EpUpWithGate, "")
+MOE_EXPERT_INT8(4, af4g64, 2, "_s2", EpUpWithGate, "")
+MOE_EXPERT_INT8(5, af5g64, 2, "_s2", EpUpWithGate, "")
+MOE_EXPERT_INT8(4, af4g64, 0, "_s0", EpUpWithGateSoftcap4_25, "_softcap4_25")
+MOE_EXPERT_INT8(5, af5g64, 0, "_s0", EpUpWithGateSoftcap4_25, "_softcap4_25")
 #undef MOE_EXPERT_INT8

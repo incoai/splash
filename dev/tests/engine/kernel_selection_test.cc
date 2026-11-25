@@ -567,23 +567,28 @@ std::pair<uint32_t, bool> routerFormatOf(const MoeShape &shape, const std::vecto
   return {moeRouterFormat(pointers), moeInt8Experts(shape, pointers)};
 }
 
-// moeInt8Experts takes the routings the int8 passes compile alone: a block
-// whose six expert tensors, its shared slots' too, are af4g64 takes them
-// under every MoE family's routing but Inkling-2-Mini's (no shared expert, a
-// softcapped SwiGLU), and a block of Q8_0 under none.
+// moeInt8Experts takes every compiled MoE routing: a block whose routed (and,
+// where present, shared) expert tensors are af4g64 takes them under every MoE
+// family's routing, and a block of Q8_0 under none.
 void int8ExpertRoutings() {
   model::forEachFamily([&](const auto &family) {
     if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
     const MoeShape shape = family.moeBlockShape();
     const std::string name(family.family);
     const uint32_t h = shape.hiddenSize, n = shape.expertIntermediateSize, slots = shape.experts;
+    const uint32_t sharedN = n * shape.sharedSlices;
     for (const uint32_t format : {GGUF_FMT_AF4G64, GGUF_FMT_Q80}) {
       BlockMoeWeights block;
-      block.gate = {segment(format, slots * n, h), segment(format, n, h)};
-      block.up = {segment(format, slots * n, h), segment(format, n, h)};
-      block.down = {segment(format, slots * h, n), segment(format, h, n)};
+      block.gate.routed = segment(format, slots * n, h);
+      block.up.routed = segment(format, slots * n, h);
+      block.down.routed = segment(format, slots * h, n);
+      if (shape.sharedSlices) {
+        block.gate.shared = segment(format, sharedN, h);
+        block.up.shared = segment(format, sharedN, h);
+        block.down.shared = segment(format, h, sharedN);
+      }
       const BlockMoeWeights *blocks[] = {&block};
-      const bool takes = format == GGUF_FMT_AF4G64 && name != "Inkling-2-Mini";
+      const bool takes = format == GGUF_FMT_AF4G64;
       test::require(moeInt8Experts(shape, blocks) == takes, name + "'s " + formatName(format) + " experts " +
                                                                (takes ? "miss" : "take") + " the int8 passes");
     }

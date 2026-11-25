@@ -1263,11 +1263,6 @@ void bufferExtents(MetalBackend &backend) {
 // fixtures of gguf-moe-e512 and gguf-moe-sigmoid (experts of 640 and 512 on a hidden size of 256) run them too.
 int int8Experts(MetalBackend &backend) {
   int failures = 0;
-  // The int8 passes are compiled for the SiLU routings' shared slices alone (moeInt8Experts).
-  if (!kShape.compiledRouting()->activationSuffix.empty()) {
-    printf("int8 passes: not compiled for the routing\n");
-    return 0;
-  }
   const bool runs =
       splash::ops::Linear(backend.capabilities(), splash::ops::Int8Activations::On, splash::ops::StepKind::Prefill).calibration().projection.prefillInt8;
   if (!runs)

@@ -251,10 +251,21 @@ void addInt8Experts(metal::CommandGraph &graph, const MoeBuffers &buffers, const
              scratch.tileCount, scratch.groupedCodes, scratch.groupedScales},
             MoeGatherInt8Params{hidden, shape.routesPerToken(), rows, routes},
             {plan.maximumTiles(), hidden / 256, 1});
-  const std::string slices(compiledRouting(shape).slicesSuffix);
-  const auto pass = [&](const char *name, const BlockExpertProjection &p, uint32_t k, uint32_t n,
-                        const metal::MetalBuffer &output) {
-    graph.add(std::string("moe_expert_int8_") + p.routed.name() + "_" + name + slices,
+  const CompiledMoeRouting &routing = compiledRouting(shape);
+  const std::string slices(routing.slicesSuffix);
+  const std::string activation(routing.activationSuffix);
+  // A block without a shared expert binds its slot table in the shared
+  // planes' slots, as addExperts does.
+  const auto sharedOf = [&](const BlockExpertProjection &p) {
+    if (shape.sharedSlices) return p;
+    return BlockExpertProjection{p.routed, QuantizedSegment::planes(p.routed.formatId, 0, p.routed.inputSize,
+                                                                    weights.slotTable, weights.slotTable,
+                                                                    weights.slotTable)};
+  };
+  const auto pass = [&](const char *name, const std::string &act, const BlockExpertProjection &raw, uint32_t k,
+                        uint32_t n, const metal::MetalBuffer &output) {
+    const BlockExpertProjection p = sharedOf(raw);
+    graph.add(std::string("moe_expert_int8_") + p.routed.name() + "_" + name + slices + act,
               {scratch.groupedCodes, scratch.groupedScales, scratch.tileDescriptors, scratch.tileCount,
                p.shared.plane0, p.shared.plane1Slot(), p.shared.meta, output, weights.slotTable,
                weights.expertScales},
@@ -263,11 +274,11 @@ void addInt8Experts(metal::CommandGraph &graph, const MoeBuffers &buffers, const
               {n / GGUF_TILE_COLUMNS, plan.maximumTiles(), 1}, {GGUF_PREFILL_INT8_THREADS, 1, 1});
     graph.addresses(weights.chunks.planes());
   };
-  pass("gate", weights.gate, hidden, intermediate, scratch.expertIntermediate);
-  pass("up", weights.up, hidden, intermediate, scratch.expertIntermediate);
+  pass("gate", {}, weights.gate, hidden, intermediate, scratch.expertIntermediate);
+  pass("up", activation, weights.up, hidden, intermediate, scratch.expertIntermediate);
   addGgufPrefillInt8Quantize(graph, scratch.expertIntermediate, scratch.groupedCodes, scratch.groupedScales,
                              intermediate, routes, routes);
-  pass("down", weights.down, intermediate, hidden, scratch.expertOutput);
+  pass("down", {}, weights.down, intermediate, hidden, scratch.expertOutput);
 }
 
 // The combine, or with `convolution` the combine running a verify step's
