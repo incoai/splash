@@ -148,11 +148,20 @@ kernel void gguf_decode(device bfloat *input [[buffer(0)]], device uchar *w0 [[b
   quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
   threadgroup half stage[kStagedStages];
   threadgroup uint arrival;
-  const ulong rows = ulong(group.z) * Rows;
-  gguf_decode_tile<F, Rows, Ep>(input + rows * p.input_size, w0, w1, meta, output + rows * p.out_stride,
-                                partials + rows * p.splits * p.out_stride,
-                                counters + group.z * (p.out_stride / GGUF_TILE_COLUMNS), aux + rows * p.out_stride, p,
-                                group.xy, simd_lane, simd_group, stage, tl, &arrival);
+  // Row group z's rows, outputs, partials and counters, taken past the first group alone. With the offsets computed
+  // in every dispatch, shader validation rejected loads inside an IQ4_NL plane on the 16- and 32-row tiles of a
+  // 16-core M5 Pro, and the rejected codes read as zero (a two-pass gate/up of 32 rows in 16 partitions differed
+  // from its lanes' own projections in 600 of 600 runs, and in none with the offsets taken so).
+  if (group.z != 0) {
+    const ulong rows = ulong(group.z) * Rows;
+    input += rows * p.input_size;
+    output += rows * p.out_stride;
+    partials += rows * p.splits * p.out_stride;
+    counters += group.z * (p.out_stride / GGUF_TILE_COLUMNS);
+    aux += rows * p.out_stride;
+  }
+  gguf_decode_tile<F, Rows, Ep>(input, w0, w1, meta, output, partials, counters, aux, p, group.xy, simd_lane, simd_group,
+                                stage, tl, &arrival);
 }
 template <class Out>
 using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, device uchar *, device Out *,
