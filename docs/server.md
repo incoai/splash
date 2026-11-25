@@ -169,8 +169,8 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--host` | `127.0.0.1` | HTTP bind address, or `unix:PATH` for a UNIX socket. See [network and authentication](#network-and-authentication). |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
-| `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page, `/health` and `/ready`. |
-| `--no-webui` | Off | Disable the chat page. |
+| `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page or a video model's trial page, `/health` and `/ready`. |
+| `--no-webui` | Off | Disable the chat page, or a video model's trial page. |
 | `--max-memory` | Auto | Set the ceiling on Metal allocations in place of the automatic one, e.g. `28G`, up to the GPU's recommended working set less a margin; not combined process RSS. See [memory and context](#memory-and-context). |
 | `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to the model's limit; past the 256K native window a model with YaRN turns it on. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |

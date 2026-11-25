@@ -589,9 +589,10 @@ class Repository:
 
         return Path(hf_hub_download(self.name, name, revision=self.revision))
 
-    def open(self, name):
+    def open(self, name, *, readahead=True):
         """A binary stream of one file read on demand: reading a GGUF header
-        costs a few range requests, not a download."""
+        costs a few range requests, not a download. Without readahead, each
+        read is one range request of what it reads (conversion.py)."""
         self._require(name)
         if self.paths is not None:
             return self.paths[name].open("rb")
@@ -601,7 +602,11 @@ class Repository:
         if isinstance(cached, str):
             return open(cached, "rb")
         return HfFileSystem().open(
-            f"{self.name}/{name}", "rb", revision=self.revision, block_size=8 << 20
+            f"{self.name}/{name}",
+            "rb",
+            revision=self.revision,
+            block_size=8 << 20,
+            **({} if readahead else {"cache_type": "none"}),
         )
 
     def stored(self, names):

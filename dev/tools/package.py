@@ -32,6 +32,10 @@ INSTALL_FILES = (
     "local.py",
     "cached.py",
     "gguf.py",
+    "video.py",
+    "conversion.py",
+    "h3.py",
+    "fasth3.py",
     "requirements.txt",
     "suggested-models.tsv",
 )
@@ -75,7 +79,11 @@ SERVER_FILES = (
     "crash_trace.py",
     "supervision.py",
     "serve_record.py",
+    "videos.py",
+    "video_protocol.py",
+    "references.py",
     "chat.html",
+    "video.html",
     "favicon.svg",
 )
 # How each API dialect answers (server/dialects).
