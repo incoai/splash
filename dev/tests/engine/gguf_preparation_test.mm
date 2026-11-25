@@ -1307,9 +1307,11 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
 // as each converter stores one; BF16 norms, clips, convolutions, relative
 // bias and router (the relative bias and a full layer's static taps stored
 // transposed, the taps last first); F32 queries, router bias and message
-// gates; NVFP4 experts with each expert's amax over a denominator of 2688
-// (MLX's global_scale the amax, mlx-lm's weight_scale_2 the quotient), MXFP8
-// ones in the last block. Each checkpoint holds them as its converter does:
+// gates of BF16 values (mlx-vlm's down projections BF16, a call of both
+// formats as mlx-community's conversions hold them); NVFP4 experts with each
+// expert's amax over a denominator of 2688 (MLX's global_scale the amax,
+// mlx-lm's weight_scale_2 the quotient), MXFP8 ones in the last block. Each
+// checkpoint holds them as its converter does:
 // its convolutions' shapes, oMLX's fused projections and its message gates
 // packed and transposed, the experts' gate and up interleaved a row each
 // (mlx-lm's apart), the release's message queries in two lists of every loop
@@ -1318,7 +1320,8 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
 // GGUF as llama.cpp's converter writes it (Q8_0 projections and head of the
 // reference quantization, NVFP4 output projections and experts and their
 // .scale, BF16 sinks, tap projections, router and token table, F32 the rest),
-// but the last block's, whose MXFP8 experts no GGUF type holds.
+// but the last block's, whose MXFP8 experts no GGUF type holds. The
+// release's own gates, BF16 in every call, stay BF16, as its GGUF's do.
 void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path &directory) {
   model::Inkling2LoopLayout g = inkling2EngineLayout();
   g.attentionWidth = 512;
@@ -1430,6 +1433,10 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
     }
     return rows;
   };
+  // Each gate's BF16 bytes, by the release's name and the GGUF's.
+  std::map<std::string, std::vector<uint8_t>> bfloatGates;
+  // Each gate's down projection's BF16 bytes, by the GGUF's name.
+  std::map<std::string, std::vector<uint8_t>> bfloatDowns;
   std::vector<float> crossQueries(2 * loops * hidden), crossKvQueries(2 * loops * hidden), messageQueries;
   for (uint32_t layer = 0; layer < g.weightLayers; ++layer) {
     const std::string l = std::to_string(layer), gp = "blk." + l + ".";
@@ -1662,11 +1669,18 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
            {std::tuple{0, "down", "down_proj", rank, 2 * hidden}, std::tuple{1, "forget", "forget_gate_proj", hidden, rank},
             std::tuple{2, "gain", "message_gate_proj", hidden, rank}}) {
         projections[index] = draw(rows * columns, 0.1f);
-        const std::vector<uint8_t> bytes = floatBytes(projections[index]);
-        put(Release, p[Release] + "controllers." + controller + "." + name + "_weight", "F32", {rows, columns}, bytes);
-        for (const Naming naming : {MlxVlm, MlxLm})
-          put(naming, p[naming] + messageGate + "_message_gate." + mlx + ".weight", "F32", {rows, columns}, bytes);
-        gguf.push_back({gp + "loop_" + input + "_ctrl_" + name + ".weight", {columns, rows}, model::ggml::kF32, bytes});
+        const std::vector<uint8_t> bfloat = bfloatBytes(projections[index]), bytes = floatBytes(projections[index]);
+        const std::string release = p[Release] + "controllers." + controller + "." + name + "_weight",
+                          converted = gp + "loop_" + input + "_ctrl_" + name + ".weight";
+        put(Release, release, "F32", {rows, columns}, bytes);
+        for (const Naming naming : {MlxVlm, MlxLm}) {
+          const bool narrow = naming == MlxVlm && index == 0;
+          put(naming, p[naming] + messageGate + "_message_gate." + mlx + ".weight", narrow ? "BF16" : "F32",
+              {rows, columns}, narrow ? bfloat : bytes);
+        }
+        gguf.push_back({converted, {columns, rows}, model::ggml::kF32, bytes});
+        bfloatGates[release] = bfloatGates[converted] = bfloat;
+        if (index == 0) bfloatDowns[converted] = bfloat;
       }
       const std::vector<float> downT = transposed(projections[0], rank, 2 * hidden, false),
                                forgetT = transposed(projections[1], hidden, rank, false),
@@ -1752,7 +1766,8 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
     draft.targetLayerCount = 2;
     splash::test::writeSyntheticShard(root / "draft" / "model.safetensors", splash::test::draftTensors(draft));
     const model::ModelDescriptor descriptor =
-        model::makeModelDescriptor("Inkling-2-Mini", g, draft, {}, model::TargetSource::Safetensors,
+        model::makeModelDescriptor("Inkling-2-Mini", g, draft, ops::visionLayout(g.visionTower, g.hiddenSize),
+                                   model::TargetSource::Safetensors,
                                    model::VisionSource::None);
     uint64_t planned = model::draftImageBytes(root / "draft", draft);
     for (const model::gguf::Image &plan : plans) planned += model::gguf::loadedBytes(plan);
@@ -1768,6 +1783,49 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
     same = converted[image] == release[image] ||
            (image < g.weightLayers && image + g.blockResidualPeriod >= g.weightLayers);
   check(same, "Inkling-2-Mini's release writes its GGUF's images, but its MXFP8 experts'");
+
+  // The release's own format, BF16 gates in every call: kept as stored, so
+  // its images are not the F32 release's but those of its GGUF of BF16 gates.
+  std::vector<splash::test::SyntheticTensor> bfloatShard = shards[Release];
+  std::vector<Tensor> bfloatGguf = gguf;
+  for (splash::test::SyntheticTensor &tensor : bfloatShard)
+    if (const auto found = bfloatGates.find(tensor.name); found != bfloatGates.end()) {
+      tensor.dtype = "BF16";
+      tensor.data = found->second;
+    }
+  for (Tensor &tensor : bfloatGguf)
+    if (const auto found = bfloatGates.find(tensor.name); found != bfloatGates.end()) {
+      tensor.type = model::ggml::kBF16;
+      tensor.data = found->second;
+    }
+  splash::test::writeSyntheticShard(directory / "inkling2-bf16-gates" / "target" / "model.safetensors", bfloatShard);
+  const model::SafetensorsCheckpoint bfloatCheckpoint(directory / "inkling2-bf16-gates" / "target");
+  const std::vector<std::string> kept = written(model::safetensorsTargetPlan(g).images(bfloatCheckpoint, {}).images);
+  const auto bfloatPath = directory / "inkling2-bf16-gates.gguf";
+  splash::test::writeFile(bfloatPath, test_gguf::file(inkling2Metadata(g), bfloatGguf));
+  model::WeightSource bfloatSource(bfloatPath);
+  const std::vector<std::string> keptConverted =
+      written(model::ggufTargetPlan(g).images(model::GgufFile(bfloatSource), {}));
+  bool keeps = kept != release && keptConverted.size() == kept.size();
+  for (size_t image = 0; keeps && image < kept.size(); ++image)
+    keeps = keptConverted[image] == kept[image] ||
+            (image < g.weightLayers && image + g.blockResidualPeriod >= g.weightLayers);
+  check(keeps, "an Inkling-2-Mini checkpoint of BF16 gates keeps them, as its GGUF does");
+
+  // A GGUF whose calls of gates mix BF16 and other formats, as some quantized
+  // GGUFs keep BF16 gates beside Q8_0 ones: its BF16 gates widen to F32,
+  // exactly, so it writes the F32 GGUF's images.
+  std::vector<Tensor> mixedGguf = gguf;
+  for (Tensor &tensor : mixedGguf)
+    if (const auto found = bfloatDowns.find(tensor.name); found != bfloatDowns.end()) {
+      tensor.type = model::ggml::kBF16;
+      tensor.data = found->second;
+    }
+  const auto mixedPath = directory / "inkling2-mixed-gates.gguf";
+  splash::test::writeFile(mixedPath, test_gguf::file(inkling2Metadata(g), mixedGguf));
+  model::WeightSource mixedSource(mixedPath);
+  check(written(model::ggufTargetPlan(g).images(model::GgufFile(mixedSource), {})) == converted,
+        "an Inkling-2-Mini GGUF whose gates mix BF16 and F32 widens them to its F32 GGUF's images");
 }
 
 } // namespace

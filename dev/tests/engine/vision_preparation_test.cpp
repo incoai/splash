@@ -1,12 +1,15 @@
 // Writes the tiny vision source run_vision_preparation.py writes (depth 2,
-// width 8, 2x2 patches) and prints its image's SHA-256.
+// width 8, 2x2 patches; Inkling's of width 32) and prints its image's
+// SHA-256.
 //
-//   vision-preparation safetensors|gguf DIRECTORY EXPECTED
+//   vision-preparation [inkling-]safetensors|[inkling-]gguf DIRECTORY EXPECTED
 //   vision-preparation padding DIRECTORY
 //
 // EXPECTED is an independently serialized file the image and the size
-// estimate must equal. padding writes a padded section after an unpadded one
-// and checks its padding is zero.
+// estimate must equal; the installer's check of the source
+// (VisionLoader::check) refuses what the image's writer refuses, and nothing
+// else. padding writes a padded section after an unpadded one and checks its
+// padding is zero.
 
 #include "TestFiles.hpp"
 #include "model/VisionLoader.hpp"
@@ -19,6 +22,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace splash;
@@ -61,9 +65,13 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (argc != 4)
-      throw std::runtime_error("usage: vision-preparation safetensors|gguf DIRECTORY EXPECTED | padding DIRECTORY");
-    const std::string format = argv[1];
-    if (format != "safetensors" && format != "gguf") throw std::runtime_error("invalid vision-preparation arguments");
+      throw std::runtime_error(
+          "usage: vision-preparation [inkling-]safetensors|[inkling-]gguf DIRECTORY EXPECTED | padding DIRECTORY");
+    std::string_view format = argv[1];
+    const bool inkling = format.starts_with("inkling-");
+    if (inkling) format.remove_prefix(std::string_view("inkling-").size());
+    if (format != "safetensors" && format != "gguf")
+      throw std::runtime_error("invalid vision-preparation arguments");
     const auto source = format == "safetensors" ? model::VisionSource::Safetensors
                                         : model::VisionSource::Gguf;
     ops::VisionLayout layout;
@@ -71,6 +79,7 @@ int main(int argc, char **argv) {
     layout.hiddenSize = 8;
     layout.patchSize = 2;
     layout.patchDimension = 24;
+    layout.paddedPatchDimension = 24;
     layout.intermediateSize = 10;
     layout.paddedIntermediateSize = 16;
     layout.mergedHiddenSize = 32;
@@ -78,9 +87,42 @@ int main(int argc, char **argv) {
     layout.heads = 2;
     layout.headDimension = 4;
     layout.positionGridSide = 2;
-    const model::ImagePlan image = model::VisionLoader(argv[2], source, layout).image();
+    // Inkling's tower of width 32, so its matrices' rows are whole Q8_0
+    // blocks: one frame of 2x2 patches (12 values, stored 16 wide).
+    if (inkling)
+      layout = {.tower = ops::VisionTower::Inkling,
+                .depth = 2,
+                .hiddenSize = 32,
+                .patchDimension = 12,
+                .paddedPatchDimension = 16,
+                .intermediateSize = 64,
+                .paddedIntermediateSize = 64,
+                .mergedHiddenSize = 128,
+                .outputHiddenSize = 32,
+                .heads = 2,
+                .headDimension = 16,
+                .positionGridSide = 2,
+                .patchSize = 2,
+                .spatialMerge = 2};
+    const model::VisionLoader loader(argv[2], source, layout);
+    // The installer's check (VisionLoader::check) prepares the image as a
+    // start does: it refuses what the writer refuses, in the writer's words,
+    // and nothing the writer writes.
+    std::string refused;
+    try {
+      loader.check();
+    } catch (const std::exception &e) {
+      refused = e.what();
+    }
+    const model::ImagePlan image = loader.image();
     std::vector<uint8_t> bytes(image.bytes);
-    image.write(bytes, {});
+    try {
+      image.write(bytes, {});
+    } catch (const std::exception &e) {
+      if (refused != e.what()) throw std::runtime_error("the check's refusal is not the writer's");
+      throw;
+    }
+    if (!refused.empty()) throw std::runtime_error("the check refused a source its writer wrote: " + refused);
     const auto expected = test::readFile(argv[3]);
     const auto differs = std::mismatch(bytes.begin(), bytes.end(), expected.begin(), expected.end());
     if (differs.first != bytes.end() || differs.second != expected.end())

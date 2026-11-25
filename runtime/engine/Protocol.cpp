@@ -335,9 +335,8 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::LimitExceeded,
                    "image span count exceeds its limit");
   }
-  if (auto error = imageSpansValidationError(request.imageSpans,
-                                             request.promptTokens.size(),
-                                             request.imagePixels.size())) {
+  if (auto error = imageSpansValidationError(request.imageSpans, request.promptTokens.size(),
+                                             request.imagePixels.size(), limits.imagePatchPixels)) {
     return invalid(IssueCode::InvalidCount, std::string(*error));
   }
   if (request.generationPromptTokens >= request.promptTokens.size()) {
@@ -844,8 +843,9 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   for (ImageSpan &span : request.imageSpans) {
     if (!reader.u32(span.offset) || !reader.u32(span.tokens) ||
         !reader.u32(span.gridHeight) || !reader.u32(span.gridWidth) ||
+        !reader.u32(span.contentHeight) || !reader.u32(span.contentWidth) ||
         !reader.u64(span.digestLo) || !reader.u64(span.digestHi) ||
-        !checkedAdd(pixelBytes, span.pixelBytes(), pixelBytes)) {
+        !checkedAdd(pixelBytes, span.pixelBytes(limits.imagePatchPixels), pixelBytes)) {
       return failure<ClientMessage>(
           requestIssue(IssueCode::InvalidPayloadLength, request.requestId,
                        "image span payload is malformed"));
@@ -1020,7 +1020,7 @@ std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
   }
   if (!limits.maxPromptTokens || !limits.maxLogicalOutputTokens ||
       !limits.maxTokenBatch || !limits.maxSimulationTokens ||
-      !limits.maxMaskWords || !limits.maxImageSpans) {
+      !limits.maxMaskWords || !limits.maxImageSpans || !limits.imagePatchPixels) {
     return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
                      "all configured token, mask, and image limits must be "
                      "non-zero");

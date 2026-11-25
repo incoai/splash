@@ -312,7 +312,8 @@ def _reasoning_parts(reasoning):
     effort, which the template renders over the others, named as such, or
     the server's (its default for an absent one, or the one it sets for
     every request); its enable_thinking where it set one that counted, and
-    whether it thinks."""
+    whether it thinks, where its prompt decides that: a model that opens its
+    own reasoning (thinking None) decides it itself."""
     sent, effort = reasoning["sent_effort"], reasoning["effort"]
     if (template := reasoning.get("template_effort")) is not None:
         rendered = f"{template} (chat_template_kwargs)"
@@ -327,7 +328,8 @@ def _reasoning_parts(reasoning):
             parts[0] += f" → {effort}"
     if reasoning["enable_thinking"] is not None:
         parts.append(f"enable_thinking {str(reasoning['enable_thinking']).lower()}")
-    parts.append("thinking on" if reasoning["thinking"] else "thinking off")
+    if reasoning["thinking"] is not None:
+        parts.append("thinking on" if reasoning["thinking"] else "thinking off")
     return parts
 
 

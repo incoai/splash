@@ -108,12 +108,13 @@ enum class NormStorage : uint8_t { Multipliers, BelowMultipliers };
 // all from first), each row's column window `window` of `windows` (Inkling 2's
 // release interleaves its experts' gate and up rows, which are windows of a
 // row pair), or its values transposed, its rows the section's columns, with
-// `reversed` its rows last first.
+// `reversed` its rows last first. A FloatTensor section of a `widened`
+// source holds its BF16 rows as F32.
 struct SectionSource final {
   std::string name;
   uint64_t first = 0, rows = 0;
   uint32_t windows = 1, window = 0;
-  bool transposed = false, reversed = false;
+  bool transposed = false, reversed = false, widened = false;
 };
 // A family's names for the sections of its images: the sources of a section,
 // one but for the routed experts' three (gate, up and down) and a Values
@@ -128,12 +129,13 @@ using SectionSources = std::function<std::vector<SectionSource>(const gguf::Sect
 // Norm and Values the F32 values of F32 or BF16 tensors (gathered, or a
 // transposed one's); Quantized the planes of a quantized or BF16 module's
 // rows (projection rows, Q8_0 for BF16); FloatTensor a tensor's or an
-// unquantized module's F32 or BF16 rows as stored, a quantized module's F32
-// values or a transposed tensor's; SmallProjection a float module's rows as
-// stored or a quantized one's planes padded to whole tiles; Router a module's
-// rows as stored, a quantized one's native rows; RoutedExperts the planes of
-// three modules' experts and their expert scales; the token table a quantized
-// module's native rows or its bf16 rows. The checkpoint outlives them.
+// unquantized module's F32 or BF16 rows as stored (a widened source's as F32),
+// a quantized module's F32 values or a transposed tensor's; SmallProjection a
+// float module's rows as stored or a quantized one's planes padded to whole
+// tiles; Router a module's rows as stored, a quantized one's native rows;
+// RoutedExperts the planes of three modules' experts and their expert scales;
+// the token table a quantized module's native rows or its bf16 rows. The
+// checkpoint outlives them.
 [[nodiscard]] std::vector<gguf::Image>
 planTargetImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, uint32_t layerImages,
                  gguf::PlanOptions options, const std::function<std::vector<gguf::Section>(uint32_t)> &layer,

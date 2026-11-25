@@ -103,23 +103,27 @@ NORM_RMS(norm_rms, bfloat)
 NORM_RMS(norm_rms_f32, float)
 #undef NORM_RMS
 
-// LayerNorm with bias of an fp32 row, a tower's residual stream, into bf16
+// LayerNorm with bias of an fp32 row, a tower's residual stream
 // (ops/Normalization.hpp, addLayer): fp32 mean and variance over the row,
-// one threadgroup of 256 threads per row.
-kernel void norm_layer(
-    device const float *input [[buffer(0)]],
-    device const bfloat *weight [[buffer(1)]],
-    device const bfloat *bias [[buffer(2)]],
-    device bfloat *output [[buffer(3)]],
-    constant LayerNormParams &params [[buffer(4)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]])
+// one threadgroup of 256 threads per row, into bf16 rows (norm_layer), or
+// into fp32 rows (norm_layer_f32) that may be its input's: each thread
+// writes only the values it reads after the row's statistics (Inkling 2's
+// LayerNorm before its tower's blocks, which starts its residual stream).
+template <typename Output>
+inline void norm_layer_row(
+    device const float *input,
+    device const bfloat *weight,
+    device const bfloat *bias,
+    device Output *output,
+    constant LayerNormParams &params,
+    uint group,
+    uint thread_index,
+    uint simd_lane,
+    uint simd_group,
+    threadgroup float *reductions)
 {
-    threadgroup float reductions[8];
     device const float *row = input + ulong(group) * params.width;
-    device bfloat *out = output + ulong(group) * params.width;
+    device Output *out = output + ulong(group) * params.width;
 
     float sum = 0.0f;
     for (uint column = thread_index; column < params.width; column += 256) {
@@ -150,11 +154,29 @@ kernel void norm_layer(
 
     for (uint column = thread_index; column < params.width; column += 256) {
         float normalized = (row[column] - mean) * inverse;
-        out[column] = bfloat(normalized * float(weight[column]) +
+        out[column] = Output(normalized * float(weight[column]) +
                              float(bias[column]));
     }
 }
 
+#define NORM_LAYER(Name, Output)                                              \
+  kernel void Name(                                                           \
+      device const float *input [[buffer(0)]],                                \
+      device const bfloat *weight [[buffer(1)]],                              \
+      device const bfloat *bias [[buffer(2)]],                                \
+      device Output *output [[buffer(3)]],                                    \
+      constant LayerNormParams &params [[buffer(4)]],                         \
+      uint group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]],                      \
+      uint simd_lane [[thread_index_in_simdgroup]],                           \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
+    threadgroup float reductions[8];                                          \
+    norm_layer_row(input, weight, bias, output, params, group, thread_index,  \
+                   simd_lane, simd_group, reductions);                        \
+  }
+NORM_LAYER(norm_layer, bfloat)
+NORM_LAYER(norm_layer_f32, float)
+#undef NORM_LAYER
 // Plain norms of few rows of at most 2048 columns (ops/Normalization.cpp)
 // load each row once into threadgroup memory, a vector per thread of a
 // 1024-thread group, and scale it from there instead of reading it from

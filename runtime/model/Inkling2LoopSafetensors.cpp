@@ -195,17 +195,40 @@ std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint,
   }
   // A loop layer's message gates: oMLX's packed and transposed, a gate's
   // down projection rows of its loop_down and its gain and forget the column
-  // windows of its rows of loop_gain_forget.
+  // windows of its rows of loop_gain_forget; the others' tensors, by the
+  // release's names (which mlx-lm's earlier conversions keep) or mlx-vlm's
+  // and mlx-lm's. The fused kernels take a call's gates in one format
+  // (ops::MessageGate): the mixer's q, k and v gates, or the FFN's
+  // (kInkling2LoopGateCalls). A call whose projections mix BF16 and F32
+  // (mlx-community's conversions keep a gate's forget and gain F32 and its
+  // down projection BF16) takes its BF16 rows widened to F32, exactly; one of
+  // a single format keeps it.
+  const auto controller = [&](size_t gate, size_t projection) {
+    return p + "controllers." + std::string(kControllers[gate]) + "." + std::string(kGateProjections[projection]) +
+           "_weight";
+  };
+  const auto gateTensor = [&](size_t gate, size_t projection) {
+    if (names == Release || checkpoint.find(controller(gate, projection))) return controller(gate, projection);
+    return p + (gate == 3 ? std::string("mlp") : std::string(kGateInputs[gate])) + "_message_gate." +
+           std::string(kMessageGateProjections[projection]) + ".weight";
+  };
+  const auto mixedCall = [&](size_t gate) {
+    bool bfloat16 = false, float32 = false;
+    const Inkling2LoopGateCall call = inkling2LoopGateCall(gate);
+    for (size_t other = call.first; other < call.end; ++other)
+      for (size_t projection = 0; projection < kGateProjections.size(); ++projection)
+        if (const SourceTensor *tensor = checkpoint.find(gateTensor(other, projection))) {
+          bfloat16 = bfloat16 || tensor->dtype == "BF16";
+          float32 = float32 || tensor->dtype == "F32";
+        }
+    return bfloat16 && float32;
+  };
   for (size_t gate = 0; gate < kGateInputs.size(); ++gate)
     for (size_t projection = 0; projection < kGateProjections.size(); ++projection) {
       if (rest != "loop_" + std::string(kGateInputs[gate]) + "_ctrl_" + std::string(kGateProjections[projection]) +
                       ".weight")
         continue;
-      // The release's names, which mlx-lm's earlier conversions keep.
-      const std::string controller = p + "controllers." + std::string(kControllers[gate]) + "." +
-                                     std::string(kGateProjections[projection]) + "_weight";
-      if (names == Release || checkpoint.find(controller)) return {{controller}};
-      if (names == OMlx) {
+      if (names == OMlx && !checkpoint.find(controller(gate, projection))) {
         const uint64_t rank = layout.loopGateRank;
         if (projection == 0)
           return {{.name = p + "loop_down", .first = gate * 2 * hidden, .rows = 2 * hidden, .transposed = true}};
@@ -216,8 +239,7 @@ std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint,
                  .window = projection == 1 ? 1u : 0u,
                  .transposed = true}};
       }
-      return {{p + (gate == 3 ? std::string("mlp") : std::string(kGateInputs[gate])) + "_message_gate." +
-               std::string(kMessageGateProjections[projection]) + ".weight"}};
+      return {{.name = gateTensor(gate, projection), .widened = mixedCall(gate)}};
     }
   // Every other section by its aliases, oMLX's projections as its fused rows.
   for (const Alias &alias : kLayerAliases) {

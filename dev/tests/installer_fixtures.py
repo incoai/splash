@@ -22,7 +22,7 @@ from huggingface_hub.hf_api import RepoSibling
 from tokenizers import pre_tokenizers
 
 from dev.tests import fixture_files
-from install import families, hub, models
+from install import families, hub, models, upstream
 
 DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
@@ -191,6 +191,14 @@ def vision_fixture():
         "clip.vision.image_mean": [0.5] * 3,
         "clip.vision.image_std": [0.5] * 3,
     }
+
+
+def prepared_towers(test):
+    """The engine's preparation of each tower the test installs (its
+    vision-check, upstream.check_vision), which the fixtures' towers, a few
+    tensors' headers, would fail: accepted until the test ends. A test of
+    the check patches upstream.check_vision again, or calls it."""
+    test.enterContext(mock.patch.object(upstream, "check_vision"))
 
 
 def selection(root, model=MODEL, **options):

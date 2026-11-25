@@ -54,6 +54,11 @@ RECORD_KEYS = {
     "sources",
     "files",
 }
+# A text-only assembly of a family that serves images may record why the
+# Hub's listing of its commit gave no tower Splash serves (vision_unavailable),
+# so that later starts do not ask again until the commit moves
+# (upstream._lacks_tower).
+OPTIONAL_RECORD_KEYS = {"vision_unavailable"}
 FILE_RECORD_KEYS = {"path", "bytes", "mtime_ns", "ctime_ns", "digest"}
 
 
@@ -175,7 +180,12 @@ def _well_formed(record):
     sources = record.get("sources")
     files = record.get("files")
     return (
-        set(record) == RECORD_KEYS | ({"metadata"} if gguf_target else set())
+        set(record) - OPTIONAL_RECORD_KEYS
+        == RECORD_KEYS | ({"metadata"} if gguf_target else set())
+        and isinstance(record.get("vision_unavailable", ""), str)
+        and (
+            "vision_unavailable" not in record or record.get("vision_format") == "none"
+        )
         and type(record["version"]) is int
         and record["version"] == 1
         and isinstance(record["model"], str)

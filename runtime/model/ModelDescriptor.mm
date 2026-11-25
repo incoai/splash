@@ -2,10 +2,12 @@
 #include "GgufImage.hpp"
 #include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
+#include "VisionLoader.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
+#include "metal/abi/Vision.h"
 #include "ops/MoE.hpp"
 
 #import <Foundation/Foundation.h>
@@ -767,9 +769,57 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
 
 // The vision tower's config, config.json's vision_config, which the
 // installer derives from a GGUF's mmproj too: the tower the layout describes,
-// over RGB patches of two frames, without deepstack layers.
+// a Qwen tower over RGB patches of two frames, without deepstack layers; or
+// Inkling's (inkling2_vision, in transformers' names as its config.json
+// states them: its patches' side and merge as native_patch_size and
+// adapter_merge_size or patch_size and spatial_merge_size, its MLP as a
+// ratio of its width), over RGB patches of one frame into a projector
+// without biases, of the exact GELU transformers' default activation is.
 void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                           TargetSource source) {
+  if (layout.tower == ops::VisionTower::Inkling) {
+    requireEqual(requireString(vision, @"model_type", "vision config model_type"), "inkling2_vision",
+                 sourceName(source), "vision config model_type");
+    requireNumbers(vision, sourceName(source), "vision config",
+                   {{"num_hidden_layers", layout.depth},
+                    {"hidden_size", layout.hiddenSize},
+                    {"num_attention_heads", layout.heads},
+                    {"mlp_ratio", double(layout.intermediateSize) / layout.hiddenSize},
+                    {"text_hidden_size", layout.outputHiddenSize},
+                    {"projection_hidden_dim", layout.mergedHiddenSize},
+                    {"posemb_grid_size", layout.positionGridSide},
+                    {"layer_norm_eps", SPLASH_INKLING_VISION_NORM_EPSILON}});
+    // Its patches' side and merge, which transformers stores as patch_size
+    // and spatial_merge_size, the release's names its aliases: either, or
+    // both alike.
+    struct Spelling final {
+      const char *release, *stored;
+      uint32_t value;
+    };
+    for (const Spelling &size : {Spelling{"native_patch_size", "patch_size", layout.patchSize},
+                                 Spelling{"adapter_merge_size", "spatial_merge_size", layout.spatialMerge}}) {
+      if (vision[@(size.stored)])
+        requireNumbers(vision, sourceName(source), "vision config", {{size.stored, size.value}});
+      if (vision[@(size.release)] || !vision[@(size.stored)])
+        requireNumbers(vision, sourceName(source), "vision config", {{size.release, size.value}});
+    }
+    requireBooleans(vision, "vision config", {{"projector_bias", false}});
+    if (vision[@"hidden_act"])
+      requireEqual(requireString(vision, @"hidden_act", "vision config hidden_act"), "gelu", sourceName(source),
+                   "vision config hidden_act");
+    // Its RoPE, axial over the encoder's base, which a config states only to
+    // set transformers' defaults.
+    if (vision[@"rope_parameters"]) {
+      NSDictionary *rope = requireObject(vision, @"rope_parameters", "vision config rope_parameters");
+      if (rope[@"rope_type"])
+        requireEqual(requireString(rope, @"rope_type", "vision config rope_type"), "axial", sourceName(source),
+                     "vision config rope_type");
+      if (rope[@"rope_theta"])
+        requireNumbers(rope, sourceName(source), "vision config rope_parameters",
+                       {{"rope_theta", SPLASH_INKLING_VISION_ROPE_THETA}});
+    }
+    return;
+  }
   requireNumbers(vision, sourceName(source), "vision config",
                  {{"depth", layout.depth},
                   {"hidden_size", layout.hiddenSize},
@@ -839,10 +889,11 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
-  ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
-                                               {.outputHiddenSize = std::visit(
-                                                    [](const auto &layout) { return layout.hiddenSize; }, *target)},
-                                               targetSource, visionSource);
+  // The family's tower, projecting into its text model's width.
+  const ops::VisionLayout vision = std::visit(
+      [](const auto &layout) { return ops::visionLayout(layout.visionTower, layout.hiddenSize); }, *target);
+  ModelDescriptor result =
+      makeModelDescriptor(std::move(name), *target, dflashLayout, vision, targetSource, visionSource);
   if (result.hasVision())
     validateVisionConfig(requireObject(config, @"vision_config", "vision config"), result.vision,
                          result.targetSource);
@@ -878,7 +929,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   std::visit(
       [&](const auto &layout) {
         result.capabilities = {layout.vocabularySize,
-                               layout.nativeContextTokens, sparseKvShape(layout)};
+                               layout.nativeContextTokens, sparseKvShape(layout), vision.patchSize};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -907,6 +958,8 @@ bool ModelDescriptor::valid() const noexcept {
                  capabilities.maximumContextTokens <= layout.yarnContextTokens)) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
+               vision.tower == layout.visionTower && vision.outputHiddenSize == layout.hiddenSize &&
+               capabilities.imagePatchPixels == vision.patchSize &&
                layout.hiddenSize == draft.hiddenSize &&
                draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
                draft.targetLayers[draft.targetLayerCount - 1] < layout.draftReadableLayers() &&
@@ -992,6 +1045,17 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
           descriptor.target);
     }
     return descriptor.family();
+  }
+}
+
+void checkVisionSource(std::string_view targetFormat, std::string_view visionFormat,
+                       const std::filesystem::path &config, const std::filesystem::path &root) {
+  @autoreleasepool {
+    const ModelDescriptor descriptor =
+        describeSourceModel({}, targetFormat, visionFormat, readObject(config, "upstream model config"), nil);
+    if (descriptor.visionSource != VisionSource::Safetensors && descriptor.visionSource != VisionSource::Gguf)
+      throw std::invalid_argument("a vision check needs a vision source");
+    VisionLoader(root / "vision", descriptor.visionSource, descriptor.vision).check();
   }
 }
 

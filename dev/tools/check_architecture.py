@@ -254,8 +254,16 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # for a head's state, which a persistent tier copies ahead though its
 # conversation went on. 31,103 adds 7 for the split's warmup, which holds only
 # the pages its rows use and allocates again an extent the first audit
-# released.
-ENGINE_LINE_BUDGET = 31_103
+# released. 31,104 adds 1 for an image's patch side, which the protocol takes
+# from the model's tower (Inkling 2's 20 pixels, Qwen's 16). 31,107 adds 3 for
+# an image span's own height and width, which Inkling 2's encoder pads past as
+# its reference does, and the span's layout in the frame. 31,110 adds 3 for
+# that size in a KV block's identity, as the image cache keys it. 31,209 adds
+# 99 for the tails behind a lane, which a windowed cache gives up where the
+# budget refuses: the states that pin them leave, oldest first, and a Full
+# extent their trims empty beyond the lanes' floors pays for the Slim ones
+# (Cache::releaseTails).
+ENGINE_LINE_BUDGET = 31_209
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

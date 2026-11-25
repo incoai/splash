@@ -193,7 +193,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or the template's close | Text that ends thinking where a budget runs out, `</think>` its last token; unset, the close the chat template writes after a reasoning. See [thinking token budget](#thinking-token-budget). |
 | `--chat-template-file` | The model's own | A Jinja chat template to render every request with, in place of the model's. See [custom chat templates](models.md#custom-chat-templates). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](api.md#request-limits-and-timeouts). |
-| `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
+| `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default for Qwen's tower and about 500 MiB for Inkling 2's. For Inkling 2, which pads an image rather than resize it, pixels / 256 is the most 20-pixel patches an image keeps its size within: 16,384 at the default, which is 4,096 tokens or about 6.5 megapixels ([Vision](models.md#vision)). |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--max-concurrent-requests` | `4` | Requests the engine runs at once, 1 to 8: its lanes, each holding a request from its start to its end, and a decode step holds a verify block of each (64 rows at four, 128 at eight). More let more clients be answered together, each a little slower, and take memory for their states and arenas. Where that streams more of the weights than four lanes would, the start logs both stores; else where it leaves less context than four would serve, with the same SSD cache staging and Neural Engine split and no more than `--max-context`, the start logs both contexts and `/status` reports four's as `memory_plan.budget.default_lanes_context_tokens` (0 otherwise). A step of more than 64 rows runs its projections on two row groups of the decode tiles: a decode step rounds no activations because other requests share it (`--activations`, below). |
@@ -1159,7 +1159,10 @@ fails to load would need. There is no update flag; to stay on one commit,
 pass it as `--revision`. A 40-hex `--revision` never moves, nor does its draft,
 and `--offline` (or
 `HF_HUB_OFFLINE=1`) forbids the Hub: both start the installed model without a
-request.
+request. The one exception is a text-only installation of a family that serves
+images, as Inkling-2-Mini's from 1.7.2: under a 40-hex `--revision` its start
+asks the Hub for that commit's listing, to take its tower in, until it has the
+tower or the listing has none Splash serves ([Vision](models.md#vision)).
 
 When the Hub does not answer, or a new commit cannot be installed, the
 installed model starts, with a line naming the reason. Without the Hub, Splash
@@ -1306,7 +1309,9 @@ the template renders over the others, followed by `(chat_template_kwargs)`;
 its `enable_thinking` when it set one that counted; and whether it thinks, as in
 `Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`,
 `effort low (chat_template_kwargs) · thinking on`
-or, under `--reasoning-effort none`, `effort high → none · thinking off`.
+or, under `--reasoning-effort none`, `effort high → none · thinking off`. A
+model that opens its own reasoning, as Inkling 2 and Flint do, decides whether
+it thinks, and the line names the effort alone.
 
 A Chat or Messages request's `chat_template_kwargs` are passed to the template
 as variables and outrank the effort, and in Messages `thinking`, so

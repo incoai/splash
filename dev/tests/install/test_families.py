@@ -45,16 +45,14 @@ UNUSABLE = {
     },
     # Its effort reaches its template, which tells the model, but the model
     # opens its reasoning itself, which no thinking budget caps; it has no
-    # recurrent state and its vision tower is not served yet.
+    # recurrent state.
     "Inkling-2-Mini": {
-        "--language-only",
         "--state-format",
         "--cached-states",
         "--ple-memory",
         "--sparse-kv-memory",
         "--disable-ane",
         "--recalibrate-ane",
-        "--max-image-pixels",
         "--thinking-token-budget",
         "--thinking-end-text",
     },

@@ -43,6 +43,26 @@ class LocalServeTests(unittest.TestCase):
         self.enterContext(mock.patch.object(launcher, "_check_port"))
         self.enterContext(mock.patch.object(launcher, "_version", return_value="test"))
 
+    @staticmethod
+    def prepared_towers():
+        """The preparation helper as the launcher runs it, but for the
+        engine's vision-check, which refuses the fixtures' towers
+        (installer_fixtures.prepared_towers)."""
+        run = launcher._run_held
+        helper = (
+            "import runpy; from unittest import mock; from install import upstream; "
+            "mock.patch.object(upstream, 'check_vision').start(); "
+            "runpy.run_module('install.local', run_name='__main__', alter_sys=True)"
+        )
+
+        def run_held(command, **options):
+            module = command.index("-m")
+            return run(
+                [*command[:module], "-c", helper, *command[module + 2 :]], **options
+            )
+
+        return mock.patch.object(launcher, "_run_held", run_held)
+
     def gguf(self):
         return write_target(
             self.root / "my model.gguf", fixture(native=True), tensor_table()
@@ -104,7 +124,10 @@ class LocalServeTests(unittest.TestCase):
             [("v.patch_embd.weight", GGML["F32"])],
         )
         draft = draft_dir(self.root / "draft", MOE)
-        with mock.patch("os.getcwd", return_value=str(self.root)):
+        with (
+            mock.patch("os.getcwd", return_value=str(self.root)),
+            self.prepared_towers(),
+        ):
             result, execute = self.serve(
                 "snapshot/named-model.gguf",
                 "--draft-model",

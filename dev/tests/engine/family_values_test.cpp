@@ -65,7 +65,7 @@ std::string familyValues() {
     if (target.draftChoosesMaskToken()) target.maskToken = target.firstDraftMaskToken;
     const model::ModelDescriptor model =
         model::makeModelDescriptor(std::string(family.family), target, draft,
-                                   {.outputHiddenSize = draft.hiddenSize}, model::TargetSource::Gguf,
+                                   ops::visionLayout(family.visionTower, draft.hiddenSize), model::TargetSource::Gguf,
                                    model::VisionSource::None);
     require(model.valid(), std::string(family.family) + "'s descriptor is not valid");
     const kv::Layout &kv = model.targetKvLayout;

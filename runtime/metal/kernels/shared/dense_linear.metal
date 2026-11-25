@@ -19,8 +19,11 @@ using namespace metal;
 using namespace mpp::tensor_ops;
 
 // What a tile does with a sum plus its bias: stores it (bf16), stores its
-// GELU (bf16), or adds it to the fp32 rows it stores into.
-enum DenseEpilogue { DenseNone, DenseGeluTanh, DenseGeluErf, DenseResidual };
+// GELU (bf16), or adds it to the fp32 rows it stores into, as it is or times
+// its output's scale (a LayerScale's).
+enum DenseEpilogue {
+    DenseNone, DenseGeluTanh, DenseGeluErf, DenseResidual, DenseScaledResidual
+};
 
 template <ushort TileM, ushort TileN, ushort Simdgroups,
           DenseEpilogue Epilogue, typename Output>
@@ -30,7 +33,8 @@ inline void dense_linear_tile(
     device bfloat *bias,
     device Output *output,
     constant DenseLinearParams &params,
-    uint2 group)
+    uint2 group,
+    device bfloat *scale = nullptr)
 {
     const uint row_origin = group.x * TileM;
     const uint output_origin = group.y * TileN;
@@ -77,7 +81,9 @@ inline void dense_linear_tile(
             value = splash_gelu_erf(value);
         }
         device Output *out = output + ulong(row) * params.output_size + column;
-        if constexpr (Epilogue == DenseResidual) {
+        if constexpr (Epilogue == DenseScaledResidual) {
+            value = value * float(scale[column]) + float(*out);
+        } else if constexpr (Epilogue == DenseResidual) {
             value += float(*out);
         }
         *out = Output(value);
@@ -98,10 +104,27 @@ kernel void name(                                                             \
         input, weights, bias, output, params, group);                         \
 }
 
+// The scaled residual binds its scale, bf16 of every output, before the
+// parameters.
+#define DENSE_LINEAR_SCALED_KERNEL(name, tile_m, tile_n, simdgroups)          \
+kernel void name(                                                             \
+    device bfloat *input [[buffer(0)]],                                       \
+    device bfloat *weights [[buffer(1)]],                                     \
+    device bfloat *bias [[buffer(2)]],                                        \
+    device float *output [[buffer(3)]],                                       \
+    device bfloat *scale [[buffer(4)]],                                       \
+    constant DenseLinearParams &params [[buffer(5)]],                         \
+    uint2 group [[threadgroup_position_in_grid]])                             \
+{                                                                             \
+    dense_linear_tile<tile_m, tile_n, simdgroups, DenseScaledResidual,        \
+                      float>(input, weights, bias, output, params, group,     \
+                             scale);                                          \
+}
+
 // dense_linear_m<TileM>n<TileN>s<Simdgroups> and its epilogues, on the tiles
 // ops/DenseLinear.cpp picks. The residual rows, a tower's residual stream,
-// stay fp32: rounded to bf16 at each of the vision tower's 55 updates, they
-// carried most of its drift from the fp32 reference.
+// stay fp32: rounded to bf16 at each of Qwen3.5's vision tower's 55 updates,
+// they carried most of its drift from the fp32 reference.
 #define DENSE_LINEAR_TILE(tile, tile_m, tile_n, simdgroups)                   \
 DENSE_LINEAR_KERNEL(dense_linear_##tile, tile_m, tile_n, simdgroups,          \
                     DenseNone, bfloat)                                        \
@@ -110,7 +133,9 @@ DENSE_LINEAR_KERNEL(dense_linear_##tile##_gelu_tanh, tile_m, tile_n,          \
 DENSE_LINEAR_KERNEL(dense_linear_##tile##_gelu_erf, tile_m, tile_n,           \
                     simdgroups, DenseGeluErf, bfloat)                         \
 DENSE_LINEAR_KERNEL(dense_linear_##tile##_residual, tile_m, tile_n,           \
-                    simdgroups, DenseResidual, float)
+                    simdgroups, DenseResidual, float)                         \
+DENSE_LINEAR_SCALED_KERNEL(dense_linear_##tile##_scaled_residual, tile_m,     \
+                           tile_n, simdgroups)
 
 DENSE_LINEAR_TILE(m64n64s8, 64, 64, 8)
 DENSE_LINEAR_TILE(m64n64s4, 64, 64, 4)

@@ -113,6 +113,8 @@ FrameType write(Writer &out, const RequestFrame &request) {
     out.u32(span.tokens);
     out.u32(span.gridHeight);
     out.u32(span.gridWidth);
+    out.u32(span.contentHeight);
+    out.u32(span.contentWidth);
     out.u64(span.digestLo);
     out.u64(span.digestHi);
   }

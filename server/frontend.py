@@ -169,6 +169,7 @@ class Frontend:
         thinking_codec,
         response_store,
         max_image_pixels=image_input.MAX_PIXELS,
+        image_format=image_input.QWEN_IMAGES,
         served_model_names=(),
         announce_served_name=False,
         reasoning_effort=None,
@@ -240,7 +241,8 @@ class Frontend:
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
         self.max_image_pixels = max_image_pixels
-        self.images = image_input.ImageCache()
+        # The served family's: how its tower takes an image.
+        self.images = image_input.ImageCache(image_format.prepare)
         self.ids = count(1)
         self.preparation_capacity = preparation_capacity
         self.preparation_slots = threading.BoundedSemaphore(preparation_capacity)
@@ -414,6 +416,9 @@ class Frontend:
                     image.grid_width,
                     image.digest_lo,
                     image.digest_hi,
+                    content_height=image.content_height,
+                    content_width=image.content_width,
+                    patch=image.patch,
                 )
             )
             expanded.extend([pad_id] * image.tokens)

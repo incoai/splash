@@ -20,13 +20,15 @@ from pathlib import Path
 from tokenizers import pre_tokenizers
 from transformers import AutoTokenizer
 
+from dev.tests import fixture_files
 from dev.tests.installer_fixtures import (
     CONFIGS,
     CONTROL,
+    GGML,
     NORMAL,
     write_target,
 )
-from install import gguf, models
+from install import families, gguf, hub, models, upstream
 
 FIXTURES = CONFIGS / "inkling-2-mini"
 TEMPLATE = (CONFIGS.parent / "chat_templates/inkling2.jinja").read_text()
@@ -122,6 +124,125 @@ class Inkling2GgufTests(unittest.TestCase):
             (),
         )
         return gguf.Metadata(path)
+
+    def projector(
+        self, name="mmproj-Inkling-2-Mini-BF16.gguf", matrices="BF16", **changed
+    ):
+        """A header like Unsloth's inkling2v mmproj (its metadata, and its
+        patch embedding's and projector's tensors among its matrices, of type
+        `matrices`), without data."""
+        values = {
+            "general.architecture": "clip",
+            "general.type": "mmproj",
+            "clip.has_vision_encoder": True,
+            "clip.vision.projection_dim": 2304,
+            "clip.vision.image_size": 640,
+            "clip.vision.patch_size": 20,
+            "clip.vision.embedding_length": 1024,
+            "clip.vision.feed_forward_length": 4096,
+            "clip.vision.block_count": 23,
+            "clip.vision.attention.head_count": 16,
+            "clip.vision.image_mean": [0.5] * 3,
+            "clip.vision.image_std": [0.5] * 3,
+            "clip.vision.projector_type": "inkling2v",
+            "clip.vision.attention.layer_norm_epsilon": 1e-5,
+            "clip.vision.spatial_merge_size": 2,
+        } | changed
+        tensors = [
+            ("v.patch_embd.weight", [20, 20, 3, 1024], GGML["F32"], b""),
+            ("v.blk.0.attn_q.weight", [1024, 1024], GGML[matrices], b""),
+            ("mm.1.weight", [4096, 4096], GGML[matrices], b""),
+            ("mm.2.weight", [4096, 2304], GGML[matrices], b""),
+        ]
+        path = fixture_files.write_gguf(self.root / name, values, tensors)
+        return gguf.Metadata(path, tensors=True)
+
+    def test_the_projector_derives_the_release_s_vision_config(self):
+        # transformers' vision_config as the release's config.json states it,
+        # but for the temporal patches its tower has none of.
+        config = gguf.model_config(self.metadata(), self.projector())
+        release = json.loads((FIXTURES / "config.json").read_text())["vision_config"]
+        del release["temporal_patch_size"]
+        self.assertEqual(config["vision_config"], release)
+        self.assertEqual(
+            gguf.processor_config(self.projector()),
+            {
+                "patch_size": 20,
+                "merge_size": 2,
+                "image_mean": [0.5] * 3,
+                "image_std": [0.5] * 3,
+            },
+        )
+        with self.assertRaisesRegex(models.ModelError, "position grid"):
+            gguf.vision_config(self.projector(**{"clip.vision.image_size": 650}))
+
+    def test_the_family_takes_an_exact_projector_before_a_q8_0_one(self):
+        family = families.named("Inkling-2-Mini")
+        self.assertTrue(family.vision)
+        self.assertEqual(family.projectors, ("BF16", "F32", "F16", "Q8_0"))
+        quantized = self.projector("mmproj-Inkling-2-Mini-Q8_0.gguf", matrices="Q8_0")
+        repo = hub.Repository.local_directory(self.root)
+        header, precision, kind = upstream.read_projector(
+            repo, "mmproj-Inkling-2-Mini-Q8_0.gguf"
+        )
+        self.assertEqual((precision, kind), ("Q8_0", "clip: F32, Q8_0"))
+        self.assertEqual(header.values, quantized.values)
+        # ggml-org's Q8_0 alone serves; beside a BF16 one, the BF16 one does.
+        self.assertEqual(
+            upstream.select_vision(repo, family)[0], "mmproj-Inkling-2-Mini-Q8_0.gguf"
+        )
+        self.projector()
+        repo = hub.Repository.local_directory(self.root)
+        self.assertEqual(
+            upstream.select_vision(repo, family)[0], "mmproj-Inkling-2-Mini-BF16.gguf"
+        )
+        # Inkling's processor is its own: 20-pixel patches of one frame.
+        upstream._validate_processor(gguf.processor_config(quantized), family)
+        with self.assertRaisesRegex(models.ModelError, "preprocessing"):
+            upstream._validate_processor(
+                gguf.processor_config(quantized), families.named("Qwen3.8-27B")
+            )
+
+    def test_inkling_s_processor_configuration_is_its_class_s(self):
+        family = families.named("Inkling-2-Mini")
+        # thinkingmachines/Inkling-2-Mini's processor_config.json image_processor.
+        release = {
+            "do_convert_rgb": True,
+            "do_normalize": True,
+            "do_rescale": True,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_processor_type": "Inkling2ImageProcessor",
+            "image_std": [0.5, 0.5, 0.5],
+            "rescale_factor": 0.00392156862745098,
+            "size": {"height": 40, "width": 40},
+        }
+        projector = gguf.processor_config(self.projector())
+        # The class's defaults; temporal_patch_size, which it ignores.
+        for accepted in ({}, release, release | {"temporal_patch_size": 2}, projector):
+            with self.subTest(accepted=accepted):
+                upstream._validate_processor(accepted, family)
+        for refused in (
+            release | {"size": {"height": 80, "width": 80}},
+            projector | {"size": {"height": 80, "width": 80}},
+            release | {"patch_size": 16},
+            release | {"merge_size": 4},
+            release | {"image_mean": [0.48, 0.46, 0.41]},
+            release | {"do_rescale": False},
+        ):
+            with (
+                self.subTest(refused=refused),
+                self.assertRaisesRegex(models.ModelError, "preprocessing"),
+            ):
+                upstream._validate_processor(refused, family)
+        # A processor_config.json without an image processor: its class's
+        # defaults for Inkling's, which has no other; refused for Qwen's.
+        (self.root / "processor_config.json").write_text(
+            json.dumps({"processor_class": "Inkling2Processor"})
+        )
+        repo = hub.Repository.local_directory(self.root)
+        self.assertEqual(upstream._image_processor(repo, family), {})
+        with self.assertRaisesRegex(models.VisionError, "has no image_processor"):
+            upstream._image_processor(repo, families.named("Qwen3.8-27B"))
 
     def test_the_derived_config_is_inkling_2_s_own(self):
         # The release's shape, its text model under text_config, with the

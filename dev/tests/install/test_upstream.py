@@ -41,6 +41,7 @@ from dev.tests.installer_fixtures import (
     missing_revision,
     mlx_target,
     pins,
+    prepared_towers,
     selection,
     tensor_table,
     write_target,
@@ -61,6 +62,7 @@ class UpstreamTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.cache = self.root / "hub"
+        prepared_towers(self)
 
     @staticmethod
     def prepare(chosen):
@@ -2259,6 +2261,10 @@ class UpstreamTest(unittest.TestCase):
             lambda r: r["files"]["config.json"].update(digest="z" * 64),
             lambda r: r["files"].update({"../escape": r["files"]["config.json"]}),
             lambda r: r["files"].update({".": r["files"]["config.json"]}),
+            lambda r: r.update(surplus=""),
+            lambda r: r.update(vision_unavailable=None),
+            # Only a text-only assembly records why it serves no images.
+            lambda r: r.update(vision_format="gguf", vision_unavailable="none"),
         ):
             changed = json.loads(json.dumps(record))
             change(changed)
@@ -2269,6 +2275,11 @@ class UpstreamTest(unittest.TestCase):
             (built / "model.json").write_text(json.dumps(changed))
             with self.assertRaisesRegex(models.ModelError, "invalid resolved model"):
                 assembly.verify(built)
+        (built / "model.json").unlink()
+        (built / "model.json").write_text(
+            json.dumps(record | {"vision_unavailable": "no tower"})
+        )
+        assembly.verify(built)
 
     def test_hub_resolution_pins_one_commit(self):
         fake = FakeHub(self, self.cache)

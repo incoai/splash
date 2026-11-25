@@ -1,13 +1,16 @@
 import contextlib
+import dataclasses
 import fcntl
 import io
 import json
+import re
 import tempfile
 import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from dev.tests.fixture_files import write_safetensors
 from dev.tests.installer_fixtures import (
     DENSE,
     DRAFT_COMMIT,
@@ -21,15 +24,19 @@ from dev.tests.installer_fixtures import (
     fixture,
     mlx_target,
     pins,
+    prepared_towers,
     selection,
     tensor_table,
     vision_fixture,
     write_gguf,
     write_target,
 )
-from install import assembly, hub, local, models, upstream
+from install import assembly, families, hub, local, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
+
+
+CHECK_VISION = upstream.check_vision  # the engine's, which tests stand in for
 
 
 class LocalModelTest(unittest.TestCase):
@@ -43,6 +50,7 @@ class LocalModelTest(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.models = self.root / "models"
         self.cache = self.root / "hub"
+        prepared_towers(self)
 
         def offline(name):
             def refuse(*args, **options):
@@ -235,6 +243,159 @@ class LocalModelTest(unittest.TestCase):
             models.ModelError, f"the Hub cache has no snapshot of {missing}; {remedy}"
         ):
             self.prepare(target)
+
+    def test_inkling_s_checkpoint_serves_its_tower_without_a_processor(self):
+        # An MLX conversion of Inkling 2 keeps its tower under transformers'
+        # names and saves no processor, whose class takes its defaults alone;
+        # its release's states them (transformers' Inkling2ImageProcessor).
+        family = families.named("Inkling-2-Mini")
+        shards = {
+            "model.vision_tower.layers.0.lambda_1": "model-00001-of-00002.safetensors",
+            "model.language_model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+            "lm_head.weight": "model-00002-of-00002.safetensors",
+        }
+        target = mlx_target(self.root / "Inkling-2-Mini-4bit", family)
+        (target / "model.safetensors").unlink()
+        (target / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": shards})
+        )
+        for name in set(shards.values()):
+            (target / name).write_text(name)
+        draft = draft_dir(self.root / "draft", family)
+        prepared = self.prepare(target, draft)
+        record = assembly.verify(prepared, full=True)
+        self.assertEqual(
+            (record["target_format"], record["vision_format"]),
+            ("mlx-affine", "safetensors"),
+        )
+        self.assertEqual(
+            sorted(p.name for p in (prepared / "vision").iterdir()),
+            ["model-00001-of-00002.safetensors"],
+        )
+        processor = {
+            "image_processor_type": "Inkling2ImageProcessor",
+            "size": {"height": 40, "width": 40},
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "rescale_factor": 1 / 255,
+            "do_convert_rgb": True,
+            "do_normalize": True,
+            "do_rescale": True,
+        }
+        (target / "processor_config.json").write_text(
+            json.dumps({"image_processor": processor})
+        )
+        self.prepare(target, draft)
+
+        def served(why=None):
+            """The vision format target is prepared with, saying why it serves
+            text only where it does."""
+            with (
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                contextlib.redirect_stderr(io.StringIO()) as warnings,
+            ):
+                prepared = local.prepare_local_model(
+                    target, draft, models_dir=self.models
+                )
+            self.assertEqual(warnings.getvalue(), "")
+            if why is not None:
+                self.assertRegex(
+                    output.getvalue(),
+                    f"{re.escape(str(target))} serves text only: {why}",
+                )
+            else:
+                self.assertNotIn("serves text only", output.getvalue())
+            return assembly.verify(prepared)["vision_format"]
+
+        # A tower the encoder does not take: Inkling 2, which 1.7.2 served as
+        # text only, serves text, saying why (ModelFamily.text_fallback).
+        (target / "processor_config.json").write_text(
+            json.dumps(
+                {"image_processor": processor | {"size": {"height": 32, "width": 32}}}
+            )
+        )
+        self.assertEqual(
+            served("unsupported vision preprocessing configuration"), "none"
+        )
+        # Its RoPE: a config may state transformers' axial one over 10,000,
+        # which the encoder runs, and no other base.
+        (target / "processor_config.json").write_text(
+            json.dumps({"image_processor": processor})
+        )
+        config = json.loads((target / "config.json").read_text())
+        for theta, vision in ((20_000.0, "none"), (10_000.0, "safetensors")):
+            config["vision_config"]["rope_parameters"] = {
+                "rope_type": "axial",
+                "rope_theta": theta,
+            }
+            (target / "config.json").write_text(json.dumps(config))
+            with self.subTest(theta=theta):
+                self.assertEqual(
+                    served(".*rope_theta" if vision == "none" else None), vision
+                )
+
+    def test_an_inkling_tower_the_engine_refuses_serves_text(self):
+        # The engine's own check (its vision-check) binds the tower's
+        # tensors, of which this checkpoint holds one.
+        family = families.named("Inkling-2-Mini")
+        shards = {
+            "model.vision_tower.embeddings.patch_embedding.weight": "vision.safetensors",
+            "model.language_model.embed_tokens.weight": "text.safetensors",
+        }
+        target = mlx_target(self.root / "Inkling-2-Mini-4bit", family)
+        (target / "model.safetensors").unlink()
+        (target / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": shards})
+        )
+        write_safetensors(
+            target / "vision.safetensors",
+            {
+                "model.vision_tower.embeddings.patch_embedding.weight": (
+                    [1024, 1200],
+                    "BF16",
+                    bytes(2 * 1024 * 1200),
+                )
+            },
+        )
+        (target / "text.safetensors").write_text("text")
+        draft = draft_dir(self.root / "draft", family)
+        with (
+            mock.patch.object(upstream, "check_vision", CHECK_VISION),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            prepared = local.prepare_local_model(target, draft, models_dir=self.models)
+        refusal = (
+            "its vision tower: missing source tensor: "
+            "model.vision_tower.embeddings.position_embedding.weight"
+        )
+        self.assertIn(f"{target} serves text only: {refusal}.", output.getvalue())
+        self.assertEqual(assembly.verify(prepared)["vision_format"], "none")
+
+    def test_a_projector_the_engine_refuses_is_refused_by_name(self):
+        target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
+        draft = draft_dir(self.root / "draft", MOE)
+        mmproj = self.projector(self.root / "vision" / "tower.gguf")
+        upstream.check_vision.side_effect = models.VisionError(
+            "its vision tower: vision metadata mismatch: clip.vision.block_count"
+        )
+        # Named, it is refused, also for a family that serves text instead.
+        for text_fallback in (False, True):
+            patched = tuple(
+                dataclasses.replace(family, text_fallback=text_fallback)
+                if family.name == MOE.name
+                else family
+                for family in families.FAMILIES
+            )
+            with (
+                self.subTest(text_fallback=text_fallback),
+                mock.patch.object(families, "FAMILIES", patched),
+                self.assertRaisesRegex(
+                    models.VisionError,
+                    f"^cannot prepare {target}: its vision tower: vision metadata "
+                    "mismatch: clip.vision.block_count; omit mmproj to serve text only$",
+                ),
+            ):
+                self.prepare(target, draft, mmproj=mmproj)
 
     def test_an_mlx_target_serves_images_with_its_own_tower(self):
         shards = {

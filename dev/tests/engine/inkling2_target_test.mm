@@ -135,11 +135,12 @@ struct Fixture final {
   std::filesystem::path root;
   model::Inkling2LoopLayout layout = gguf_fixtures::inkling2EngineLayout();
 
-  // Without vision, its layout's output width is the target's, as a model
-  // root's descriptor states it (ModelDescriptor.mm describeSourceModel).
+  // Without vision, its family's tower projecting into the target's width,
+  // as a model root's descriptor states it (ModelDescriptor.mm
+  // describeSourceModel).
   [[nodiscard]] model::ModelDescriptor descriptor(std::span<const uint32_t> ids) const {
     return model::makeModelDescriptor("inkling2-target-test", layout, draftReading(layout, ids),
-                                      {.outputHiddenSize = layout.hiddenSize}, model::TargetSource::Gguf,
+                                      ops::visionLayout(layout.visionTower, layout.hiddenSize), model::TargetSource::Gguf,
                                       model::VisionSource::None);
   }
 };

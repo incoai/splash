@@ -5505,7 +5505,8 @@ void testFullShortfallsTrimBeforeAnyLeafGoes() {
   cache.endRequest(2);
 }
 
-// A state the SSD keeps still pins its tail Full; the shortfall moves on to the ordinary state.
+// A state the SSD keeps on a chain no request runs on still pins its tail Full, and the shortfall moves on to the
+// ordinary state: only the tails behind a lane leave for it (testRefusedLanesTakeTheTailsBehindThem).
 void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
   Windowed windowed;
   windowed.storage.budgetPages = 16;
@@ -5535,6 +5536,63 @@ void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
           "the checkpoint the SSD keeps lost its entry, or its tail was trimmed");
   cache.checkInvariants();
   cache.endRequest(2);
+}
+
+// A conversation of one-page turns, each ending in a state, on the SSD or in RAM: the tails, closer than a window,
+// hold every page Full. With memory to spare no state leaves; refused Full pages, the lane takes the tails behind it,
+// oldest first, and grows to the pages the plan counts, its head's state, its newest and its KV kept; refused at the
+// plan's bound it leaves no page waiting for a trim and no state behind it but those.
+void testRefusedLanesTakeTheTailsBehindThem() {
+  for (const bool ssd : {true, false}) {
+    Windowed windowed;
+    windowed.storage.budgetPages = 16;
+    engine::Cache &cache = windowed.cache;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    control->capacity = 64;
+    const std::vector<uint32_t> prompt = Windowed::prompt(9000, 48);
+    cache.beginRequest(1);
+    const auto turn = [&](uint32_t pages) {
+      static_cast<void>(cache.trimWindows());
+      if (!admitTokens(cache, 1, pages * KvCache::pageTokens + 1).granted())
+        return false;
+      cache.publishCommittedBlocks(1, prompt, pages * KvCache::pageTokens, {});
+      const uint64_t block = cache.blockAt(1, pages * KvCache::pageTokens);
+      if (!ssd)
+        cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
+      else {
+        cache.publishCompositeState(block, std::make_shared<TieredState>(control), false);
+        require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
+                    cache.pollTransfers() && cache.snapshot().stateCache.bytes == 0,
+                "a turn's state was not written to the SSD");
+      }
+      cache.checkInvariants();
+      return true;
+    };
+    uint32_t pages = 0;
+    while (pages < 8 && turn(pages + 1))
+      ++pages;
+    require(pages == 8 && cache.snapshot().stateCache.entries == 8 && windowed.forms(1) == "FFFFFFFFF",
+            "a state left, or a page was trimmed, with memory to spare");
+    while (pages < 47 && turn(pages + 1))
+      ++pages;
+    const std::string forms = windowed.forms(1);
+    const auto full = static_cast<uint32_t>(std::ranges::count(forms, 'F'));
+    require(pages >= 24 && full <= 8 && windowed.slimPages() == forms.size() - full,
+            "the lane did not grow to the pages the plan counts on Slim pages");
+    // A walk takes a head's state in RAM for its tail, as any state in RAM.
+    const auto head = std::span<const uint32_t>(prompt).first(KvCache::pageTokens + 1);
+    const auto whole = std::span<const uint32_t>(prompt).first(pages * KvCache::pageTokens + 1);
+    const CacheLookup newest = cache.lookup(whole, {});
+    require((!ssd || (forms.front() == 'F' && cache.lookup(head, {}).state)) && newest.state &&
+                newest.resumeBoundary() == pages * KvCache::pageTokens &&
+                newest.kvBoundary == pages * KvCache::pageTokens,
+            "the head's state or the lane's newest left, or a block of its history");
+    require(cache.trimWindows() == 0 && cache.snapshot().stateCache.entries <= 3,
+            "refused, the lane left a page waiting for a trim, or a state behind it");
+    cache.checkInvariants();
+    cache.endRequest(1);
+  }
 }
 
 // At the memory wall a Full shortfall takes dead leaves first, keeping the states a resume needs.
@@ -7044,6 +7102,7 @@ int main() {
     testStatesNeedTheirTailFull();
     testFullShortfallsTrimBeforeAnyLeafGoes();
     testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps();
+    testRefusedLanesTakeTheTailsBehindThem();
     testFullShortfallsAtTheWallTakeDeadLeavesFirst();
     testRestoresReturnNothing();
     testHeldDemotionReturnsNoPage();

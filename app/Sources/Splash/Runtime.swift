@@ -210,6 +210,12 @@ struct Runtime: Sendable {
             let model: String
             let family: String?
             let files: [String: File]
+            let visionFormat: String?
+            let visionUnavailable: String?
+
+            enum CodingKeys: String, CodingKey {
+                case model, family, files, visionFormat = "vision_format", visionUnavailable = "vision_unavailable"
+            }
         }
         let manager = FileManager.default
         let installed = { (link: URL) -> InstalledModel? in
@@ -219,7 +225,8 @@ struct Runtime: Sendable {
             else { return nil }
             // An assembly can link one file under two names (a checkpoint's vision tower).
             let files = Dictionary(record.files.values.map { ($0.path, $0.bytes) }) { first, _ in first }
-            return InstalledModel(id: record.model, bytes: files.values.reduce(0, +), family: record.family)
+            return InstalledModel(id: record.model, bytes: files.values.reduce(0, +), family: record.family,
+                                  towerless: record.visionFormat == "none" && record.visionUnavailable == nil)
         }
         let owners = (try? manager.contentsOfDirectory(at: models, includingPropertiesForKeys: nil)) ?? []
         let named = owners.filter { !$0.lastPathComponent.hasPrefix(".") }
@@ -416,6 +423,10 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
     /// Whether it is installed with Text only alone (`Runtime.installedModels`): what removes it names
     /// that option.
     var textOnly = false
+    /// Whether its record names no vision tower, nor why its repository has none Splash serves
+    /// (`vision_format`, `vision_unavailable`): of a family that serves images, an installation
+    /// that a check for updates gives its tower (`AppState.awaitingVision`).
+    var towerless = false
 
     /// Whether it is model files on this Mac that are a GGUF file, or a folder holding one besides
     /// a projector, as they were measured; the vision projector they may be given is a GGUF's.
