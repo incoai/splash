@@ -10,6 +10,9 @@
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
 - `runtime/ane/`: the Neural Engine client, on the private AppleNeuralEngine
   framework, and the handoff of a Metal command's work to it.
+- `runtime/video/`: the video model's engine beside `runtime/engine/`: its
+  runtime, stages, model, operators, Metal encoding and wire protocol
+  ([Video engine](video.md#video-engine)).
 - `install/`: launcher, client configuration and model installation.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
@@ -3571,6 +3574,11 @@ counters include:
   past what the cache changed.
 
 ## Native protocol
+
+A video model's engine speaks a stream of its own beside this one
+([Video protocol](video.md#video-protocol)): this protocol's header with the
+magic `SPLV` and a version of its own, so a frame sent to the other engine
+fails at its magic, and this protocol's Cancel, Error and StartFailed payloads.
 
 The engine receives `ignore_eos` as bit 0 of the request frame's flags word and
 `return_progress` as bit 1; the word rejects undefined bits.
