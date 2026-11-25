@@ -58,6 +58,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     : config_(config), cache_(cache), writeBehind_(cache), model_(model), events_(events),
       scheduler_({.decodeShare = config_.decodeShare,
                   .decodeGapMilliseconds = config_.decodeGapMilliseconds,
+                  .isolatedPrefillMilliseconds = config_.isolatedPrefillMilliseconds,
                   .limits = model.commandLimits()},
                  model) {
   if (!config_.maxContext || !config_.vocabularySize) {

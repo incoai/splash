@@ -31,10 +31,13 @@ struct HyperConnection final {
   // The normalized streams (bf16) and, with inject, the injection weights
   // (fp32 [rows][streams]), of the shape its kernels are compiled for
   // (HYPER_CONNECTION_NORM_HIDDEN). A register-tile projection reading the
-  // output prepares its own table.
+  // output prepares its own table. `quarterThreadgroups` picks the decode
+  // kernel of a threadgroup a quarter per stream (4 x 256 threads) where the
+  // GPU's pipeline holds it; a caller on a pipeline under 1,024 threads passes
+  // false and every row runs the 256-thread kernel, which sums the same.
   static void addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
                       metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
-                      HyperShape shape, uint32_t rows);
+                      HyperShape shape, uint32_t rows, bool quarterThreadgroups = true);
   // silu(low / streams) in place or, with a table layout, into the table
   // alone, leaving `low` as it was.
   static PreparedInput addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows,

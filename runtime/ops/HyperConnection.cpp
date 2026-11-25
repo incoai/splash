@@ -43,7 +43,7 @@ void HyperConnection::addInit(metal::CommandGraph &graph, metal::MetalBuffer emb
 
 void HyperConnection::addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
                               metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
-                              HyperShape shape, uint32_t rows) {
+                              HyperShape shape, uint32_t rows, bool quarterThreadgroups) {
   requireShape(shape);
   if (shape.streams != HYPER_CONNECTION_MAXIMUM_STREAMS || shape.hidden != HYPER_CONNECTION_NORM_HIDDEN)
     throw std::invalid_argument("no hyper-connection norm kernel for the shape");
@@ -61,7 +61,7 @@ void HyperConnection::addNorm(metal::CommandGraph &graph, metal::MetalBuffer str
                                            std::move(normalized), injects ? weights : norm.buffer};
   // An injecting mix of decode's few rows runs a threadgroup of a quarter per
   // stream each, the rest one of kThreads (kernels/shared/hyper_connection.metal).
-  const bool quarters = injects && rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
+  const bool quarters = quarterThreadgroups && injects && rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
   graph.add(quarters ? "hyper_connection_norm_quarters" : "hyper_connection_norm_loaded", std::move(bindings),
             hyperParams(shape, rows, injects), {rows, 1, 1},
             {quarters ? HYPER_CONNECTION_NORM_QUARTER_THREADS : kThreads, 1, 1});

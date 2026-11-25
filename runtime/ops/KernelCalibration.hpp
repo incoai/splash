@@ -388,13 +388,24 @@ inline constexpr DenseTileCalibration kApple9DenseTile{0, kNever, 0};
 inline constexpr AttentionCalibration kApple10Attention{.pagesPerSplit = 32, .int8QueriesFromPages = 8};
 
 // No Apple9 GPU scores INT8 queries: on a 10-core M4 they took 8-12% longer,
-// its matrix operations sharing the FP32 pipe. Larger Apple9 GPUs, unmeasured,
-// share that pipe too.
+// its matrix operations sharing the FP32 pipe, and on an 80-core M3 Ultra
+// 10-13% longer at every history from 2K to 250K tokens (an external
+// measurement of this row, 27B and 35B, prefill and verify). Apple9's larger
+// GPUs share that pipe.
 inline constexpr AttentionCalibration kApple9Attention = [] {
   AttentionCalibration row = kApple10Attention;
   row.int8QueriesFromPages = kNever;
   return row;
 }();
+
+// Apple8 (M2) scores INT8 queries faster than BF16 ones: measured on a
+// 38-core M2 Max, one 27B attention layer, 8 verify rows: 9.30 -> 6.58 ms at
+// 131,072 tokens and 18.41 -> 11.98 at 249,935 (repeat 5, fused graphs), and
+// a 2,048-row prefill chunk 310.7 -> 198.2 ms at 16,384 tokens. The INT8
+// kernels read half the K bytes; the M4 result above is an Apple9 one, whose
+// pipeline layout differs. Short histories keep BF16 queries: a split under
+// int8QueriesFromPages pages never takes them.
+inline constexpr AttentionCalibration kApple8Attention{.pagesPerSplit = 32, .int8QueriesFromPages = 8};
 
 // On a 10-core M4 one split per 64 pages leaves every case within the A/A
 // spread (0.7%), where one per 32 takes 1.8% more on the 35B's 512-row chunk
@@ -449,14 +460,16 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   const uint32_t cores = device.plannedGpuCores();
   const GpuClass gpu = device.gpuClass();
   AttentionCalibration attention =
-      gpu != GpuClass::Apple9 ? kApple10Attention
-                              : cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention;
+      gpu == GpuClass::Apple8         ? kApple8Attention
+      : gpu != GpuClass::Apple9       ? kApple10Attention
+      : cores <= kApple9SmallGpuCores ? kApple9SmallAttention
+                                      : kApple9Attention;
   attention.cores = cores;
   const bool pro = gpu == GpuClass::Apple10 && cores >= kApple10ProGpuCores && cores < kApple10LargeGpuCores;
   const MoeCalibration moe = !pro                              ? kThirtyTwoRowMoe
                              : cores < kApple10ProMoeFromCores ? kApple10SixteenCoreMoe
                                                                : kApple10ProMoe;
-  if (gpu != GpuClass::Apple9)
+  if (gpu == GpuClass::Apple10 || gpu == GpuClass::Apple11)
     return {cores,
             gpu == GpuClass::Apple11            ? kApple11Projection
             : cores >= kApple10LargeGpuCores ? kApple10LargeProjection

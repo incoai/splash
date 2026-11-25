@@ -79,7 +79,7 @@ void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
 }
 
 void baselinePlans() {
-  for (uint32_t family : {9U, 10U, 11U}) {
+  for (uint32_t family : {8U, 9U, 10U, 11U}) {
     const ExecutionPlans plans(device(family), Int8Activations::On);
     const Linear baseline(device(family), Int8Activations::On, StepKind::Prefill);
     for (auto matrix : matrices) {
@@ -168,7 +168,7 @@ void int8ActivationsSetting() {
   const kv::Layout layout{1, 2, 256};
   const std::array<uint32_t, 1> history{131072};
   const auto int8Queries = [](const std::string &pipeline) { return pipeline.find("q8q") != std::string::npos; };
-  for (uint32_t family : {9U, 10U, 11U}) {
+  for (uint32_t family : {8U, 9U, 10U, 11U}) {
     const ExecutionPlans on(device(family), Int8Activations::On), off(device(family), Int8Activations::Off);
     const ProjectionCalibration &row = on.calibration().projection, &offRow = off.calibration().projection;
     require(on.linear().int8Activations() == Int8Activations::On &&
@@ -177,6 +177,10 @@ void int8ActivationsSetting() {
                 off.calibration().attention.int8QueriesFromPages == on.calibration().attention.int8QueriesFromPages,
             "the int8-activation setting did not reach the plans' Linear, or moved the device's row");
     const bool int8 = family >= 10;
+    // Apple8 and Apple10/11 score INT8 attention queries from 8 pages a
+    // split; Apple9 scores BF16 ones at every history. The projections' INT8
+    // prefill tile still stops at Apple10.
+    const bool int8QueriesRow = family == 8 || int8;
     const auto tile = [&](const ExecutionPlans &plans) {
       return plans.linear().plan(af4, 2048, LinearEpilogue::Residual).configuration().tile;
     };
@@ -189,9 +193,23 @@ void int8ActivationsSetting() {
                                         plans.sequenceAttentionWorkspace(16, layout));
       return int8Queries(plan.splitPipeline());
     };
-    require(queries(on, sequenceOf(32768, 64)) == int8 && !queries(off, sequenceOf(32768, 64)) &&
-                queries(on, sequenceOf(history[0], 8)) == int8 && !queries(off, sequenceOf(history[0], 8)),
+    require(queries(on, sequenceOf(32768, 64)) == int8QueriesRow &&
+                !queries(off, sequenceOf(32768, 64)) &&
+                queries(on, sequenceOf(history[0], 8)) == int8QueriesRow &&
+                !queries(off, sequenceOf(history[0], 8)),
             "INT8 attention queries do not follow the int8-activation setting");
+    if (family == 9 || family == 10) {
+      // Apple9 scores no INT8 queries at any history; Apple10 takes them
+      // from eight pages a split, which a decode lane after 16,384 tokens
+      // reads.
+      const std::array sequence{sequenceOf(16384, 8)};
+      const auto shortQueries = [&](const ExecutionPlans &plans) {
+        return int8Queries(plans.attention(sequence, 16, layout, plans.laneAttentionWorkspace(16, layout))
+                               .splitPipeline());
+      };
+      require(shortQueries(on) == (family == 10) && !shortQueries(off),
+              "an Apple9 plan did not keep its BF16 queries");
+    }
   }
 }
 
@@ -203,7 +221,7 @@ void int8ActivationsSetting() {
 void draftPlans() {
   const Projection context(5120, 25600,
                            BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, 5120, 25600, {}, {}, {})}});
-  for (uint32_t family : {9U, 10U, 11U})
+  for (uint32_t family : {8U, 9U, 10U, 11U})
     for (const Int8Activations setting : {Int8Activations::On, Int8Activations::Off}) {
       const ExecutionPlans plans(device(family), setting);
       const Linear &draft = plans.draftLinear(), &target = plans.linear();
@@ -376,10 +394,69 @@ void prefillSplitsFollowTheDeviceRow() {
     }
 }
 
+// Apple8 (M2) multiplies on the FP32 pipe as Apple9 does, so its linear plans
+// are the Apple9 row's at every core count, small or large. Its attention is
+// its own row (kApple8Attention): the same page partition as Apple9's, but
+// INT8 query codes from eight pages a split where Apple9 scores BF16 ones.
+void apple8TakesTheApple9Row() {
+  const kv::Layout layout{1, 2, 256};
+  const std::array prefill{sequenceOf(32768, 64)};
+  const std::array<uint32_t, 1> decodeHistory{131072};
+  const auto decode = lanesAfter(decodeHistory);
+  for (const uint32_t cores : {10U, 32U, 38U}) {
+    DeviceCapabilities m2 = device(8), m3 = device(9);
+    m2.gpuCoreCount = m3.gpuCoreCount = cores;
+    require(m2.gpuClass() == GpuClass::Apple8 && m3.gpuClass() == GpuClass::Apple9,
+            "the GPU family 8 or 9 did not map to its class");
+    const ExecutionPlans apple8(m2, Int8Activations::On), apple9(m3, Int8Activations::On);
+    for (auto matrix : matrices) {
+      for (uint32_t rows : {64U, 256U, 2048U})
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+          require(apple8.linear().plan({matrix, rows, epilogue}).configuration() ==
+                      apple9.linear().plan({matrix, rows, epilogue}).configuration(),
+                  "an Apple8 prefill plan took another row than Apple9's");
+      for (const uint32_t rows : {1U, 8U, 16U, 32U, 64U})
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+          require(apple8.linear().plan({matrix, rows, epilogue}).configuration() ==
+                      apple9.linear().plan({matrix, rows, epilogue}).configuration(),
+                  "an Apple8 decode plan took another row than Apple9's");
+    }
+    if (cores > kApple9SmallGpuCores) {
+      const auto apple8Prefill =
+          apple8.attention(prefill, 16, layout, apple8.sequenceAttentionWorkspace(16, layout));
+      const auto apple9Prefill =
+          apple9.attention(prefill, 16, layout, apple9.sequenceAttentionWorkspace(16, layout));
+      const auto apple8Decode = apple8.attention(decode, 16, layout, apple8.laneAttentionWorkspace(16, layout));
+      const auto apple9Decode = apple9.attention(decode, 16, layout, apple9.laneAttentionWorkspace(16, layout));
+      require(apple8Prefill.sequences()[0].splits == apple9Prefill.sequences()[0].splits &&
+                  apple8Decode.sequences()[0].splits == apple9Decode.sequences()[0].splits,
+              "an Apple8 attention plan took another split count than Apple9's");
+      const auto scoresInt8 = [](const AttentionPlan &plan) {
+        return plan.splitPipeline().find("q8q") != std::string::npos;
+      };
+      require(scoresInt8(apple8Prefill) && scoresInt8(apple8Decode) && !scoresInt8(apple9Prefill) &&
+                  !scoresInt8(apple9Decode),
+              "an Apple8 plan did not score the INT8 queries Apple9's scored BF16");
+    }
+  }
+  // Apple8 keeps the 32-page split at every core count; Apple9's small row
+  // (10 cores or fewer) takes 64, so the same prompt splits in two.
+  DeviceCapabilities small{device(8)}, smallM3{device(9)};
+  small.gpuCoreCount = smallM3.gpuCoreCount = kApple9SmallGpuCores;
+  const ExecutionPlans smallApple8(small, Int8Activations::On), smallApple9(smallM3, Int8Activations::On);
+  const auto small8 = smallApple8.attention(prefill, 16, layout, smallApple8.sequenceAttentionWorkspace(16, layout));
+  const auto small9 = smallApple9.attention(prefill, 16, layout, smallApple9.sequenceAttentionWorkspace(16, layout));
+  require(small8.sequences()[0].splits > small9.sequences()[0].splits,
+          "an Apple8 prefill plan on a small Apple9 row did not keep its 32-page splits");
+  require(small8.splitPipeline().find("q8q") != std::string::npos &&
+              small9.splitPipeline().find("q8q") == std::string::npos,
+          "a small Apple9 row did not keep the BF16 queries the M4 measured");
+}
+
 // A device that reports no core count gets the plans of kAssumedGpuCores
 // cores, Linear and MoE alike.
 void unknownCoreCount() {
-  for (uint32_t family : {9U, 10U}) {
+  for (uint32_t family : {8U, 9U, 10U}) {
     DeviceCapabilities assumed = device(family);
     assumed.gpuCoreCount = DeviceCapabilities::kAssumedGpuCores;
     const ExecutionPlans unknown(device(family), Int8Activations::On), planned(assumed, Int8Activations::On);
@@ -522,6 +599,7 @@ void draftGateUpScratch() {
 int main() {
   try {
     baselinePlans();
+    apple8TakesTheApple9Row();
     int8ActivationsSetting();
     draftPlans();
     ggufMoePlans();
