@@ -145,6 +145,7 @@ struct RuntimeContext final {
   // The lanes its arenas hold, the most requests it runs at once, as its
   // start chose them (QwenTargetGeometry::lanes).
   uint32_t lanes = ExecutionLimits::defaultLanes;
+  std::span<const uint32_t> suppressedTokens{};
 };
 
 // What the step costs a start's decode warmups measure follow

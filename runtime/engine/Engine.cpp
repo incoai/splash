@@ -93,30 +93,26 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
 Engine::~Engine() { config_.governor->ledger().removeSource(victims_); }
 
 void Engine::submit(EngineRequest value) {
-  const auto outOfVocabulary = [&](uint32_t token) {
-    return token >= config_.vocabularySize;
-  };
-  if (value.prompt.size() + value.maxNewTokens > config_.maxContext) {
+  const auto outOfVocabulary = [&](uint32_t token) { return token >= config_.vocabularySize; };
+  if (value.prompt.size() + value.maxNewTokens > config_.maxContext)
     throw std::invalid_argument("request exceeds the context window");
-  }
-  if (std::any_of(value.prompt.begin(), value.prompt.end(), outOfVocabulary)) {
+  if (std::ranges::any_of(value.prompt, outOfVocabulary))
     throw std::invalid_argument("prompt token is out of vocabulary");
-  }
-  if (std::any_of(value.scoreTokens.begin(), value.scoreTokens.end(),
-                  outOfVocabulary)) {
+  if (std::ranges::any_of(value.scoreTokens, outOfVocabulary))
     throw std::invalid_argument("score token is out of vocabulary");
-  }
   if (value.thinkingBudget) {
     if (const char *reason = value.thinkingBudget->unusable())
       throw std::invalid_argument(reason);
-    if (std::any_of(value.thinkingBudget->end.begin(),
-                    value.thinkingBudget->end.end(), outOfVocabulary) ||
+    if (std::ranges::any_of(value.thinkingBudget->end, outOfVocabulary) ||
         outOfVocabulary(value.thinkingBudget->alsoEnds))
       throw std::invalid_argument("thinking end token is out of vocabulary");
+    if (std::ranges::any_of(value.thinkingBudget->end, [&](uint32_t token) {
+          return std::ranges::binary_search(config_.suppressedTokens, token);
+        }))
+      throw std::invalid_argument("thinking end token is suppressed by --suppress-tokens");
   }
-  if (!value.images.empty() && !config_.maxImagePatches) {
+  if (!value.images.empty() && !config_.maxImagePatches)
     throw std::invalid_argument("this model is serving without vision");
-  }
   // The protocol bounds an image by the most patches the vision encoder
   // takes; the server's pixel cap may allow fewer.
   if (std::any_of(value.images.begin(), value.images.end(),

@@ -78,6 +78,8 @@ struct EngineConfig final {
   // the next request (WeightResidency): the native loop's; empty where
   // nothing is released.
   std::optional<WeightResidencyConfig> weights;
+  // Sorted output exclusions also checked against forced thinking ends.
+  std::vector<uint32_t> suppressedTokens;
 };
 
 // What a request fails with once it has waited the resource wait limit for

@@ -740,6 +740,14 @@ struct Runtime::Impl {
   // request (RuntimeInstrumentation::redrawTree).
   std::unordered_map<uint64_t, std::pair<float, uint64_t>> treeDraws;
 #endif
+  static MetalBuffer uploadSuppressedTokens(MetalBackend &backend, std::span<const uint32_t> tokens) {
+    if (tokens.empty())
+      return {};
+    auto buffer = backend.allocateBuffer(tokens.size_bytes(), BufferStorage::Shared, "suppressed output tokens");
+    std::ranges::copy(tokens, contents<uint32_t>(buffer, "suppressed output tokens"));
+    return buffer;
+  }
+
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -748,7 +756,7 @@ struct Runtime::Impl {
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
-        sampling(geometry.target.vocabularySize),
+        sampling(geometry.target.vocabularySize, uploadSuppressedTokens(backend, value.suppressedTokens)),
         targetModel(std::visit(
                         [&](const auto &weights) {
                           return makeQwenTarget(weights, geometry.target, value.backend, operators,
@@ -1689,10 +1697,9 @@ struct Runtime::Impl {
   // One LM head over the batch's `width` lanes' rows, row `lane` each,
   // its tensors bound whole as a decode step's forward binds them, then one
   // selection of the first token of every selecting lane from its row's
-  // logits, whose token initialToken() reads. The head computes, and nothing
-  // reads, the rows of the lanes not listed; a lane that does not select
-  // takes the argmax of its row. Sampled lanes' uniforms and constrained
-  // lanes' masks are uploaded first.
+  // logits, whose token initialToken() reads. A score-only lane reads its
+  // raw logits instead. Sampled lanes' uniforms and constrained lanes'
+  // masks are uploaded first.
   void encodeInitialSelections(CommandGraph &graph,
                                std::span<const InitialSelection> lanes,
                                uint32_t width) {
@@ -1700,23 +1707,25 @@ struct Runtime::Impl {
                              decodeArena->all(DecodeTensor::FinalHidden),
                              decodeArena->all(DecodeTensor::Logits), width,
                              decodeArena->linearScratch());
-    if (std::ranges::none_of(lanes, &InitialSelection::select))
-      return;
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
     std::array<uint32_t, kLaneCount> stateLanes{};
+    uint32_t selectMask = 0;
     for (const InitialSelection &lane : lanes) {
       if (!lane.select)
         continue;
+      selectMask |= uint32_t{1} << lane.lane;
       policies[lane.lane] = samplingPolicy(*lane.entry);
       stateLanes[lane.lane] = lane.entry->stateLane;
     }
+    if (!selectMask)
+      return;
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
     encodeTargetLogitsCapture(graph, width, false);
 #endif
     sampling.addInitial(graph, std::span(policies).first(width),
                         samplingBuffers(width), laneRowsOf(width),
                         geometry.target.stopTokens,
-                        {penaltyTable, std::span(stateLanes).first(width)});
+                        {penaltyTable, std::span(stateLanes).first(width)}, selectMask);
   }
 
   // The first token encodeInitialSelections() selected for a batch lane: a

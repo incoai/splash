@@ -155,6 +155,7 @@ void testServerCommandLines(const char *path) {
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
       {"recalibrate_ane", [](NativeArguments &read) { read.recalibrateAne = true; }},
       {"activations_bf16", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
+      {"suppress_tokens", [](NativeArguments &read) { read.suppressTokensFile = "/srv/mask.json"; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // The defaults the server leaves out are the engine's: each meaning
       // names the value, so a change of the engine's default fails it.
@@ -219,7 +220,7 @@ void testServerCommandLines(const char *path) {
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
            read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations &&
-           read.lanes == meant.lanes;
+           read.lanes == meant.lanes && read.suppressTokensFile == meant.suppressTokensFile;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),

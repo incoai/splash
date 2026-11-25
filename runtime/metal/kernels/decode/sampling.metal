@@ -64,6 +64,20 @@ inline uint selected_logits_row(device const SplashLaneRows *lane_rows,
   return lane_rows[lane].first + index;
 }
 
+// One store per suppressed token and selected row. A sampled verifier
+// gives a suppressed draft candidate zero target probability.
+kernel void decode_sample_suppress(
+    device float *logits [[buffer(0)]],
+    device const uint *tokens [[buffer(1)]],
+    device const SplashLaneRows *lane_rows [[buffer(2)]],
+    constant SuppressTokensParams &params [[buffer(3)]],
+    uint3 index [[thread_position_in_grid]]) {
+  if (index.x < params.tokens && index.y < lane_rows[index.z].rows) {
+    const uint row = selected_logits_row(lane_rows, index.z, index.y);
+    logits[ulong(row) * params.vocabulary + tokens[index.x]] = -INFINITY;
+  }
+}
+
 // Row `index` of lane `lane` of a dispatch (TargetSamplingParams).
 inline TargetRow selected_row(device const float *logits,
                               device const uint *token_mask,
@@ -83,15 +97,17 @@ inline TargetRow selected_row(device const float *logits,
           0.0f};
 }
 
-// Each lane's lane rows and tree row for the selection of its first token
-// after its prompt (SampleFirstRowsParams), one group a lane: its one row of
-// the logits, a tree's root, which the selection's kernels read as a decode
-// cycle's.
+// Each generating lane selects its first token from a one-row tree. A lane
+// that only scores has zero selection rows, leaving its raw logits intact.
 kernel void decode_sample_first_rows(
     device SplashLaneRows *lane_rows [[buffer(0)]],
     device SplashTreeRow *tree [[buffer(1)]],
     constant SampleFirstRowsParams &params [[buffer(2)]],
     uint lane [[threadgroup_position_in_grid]]) {
+  if ((params.select_mask & (1u << lane)) == 0) {
+    lane_rows[lane] = {0, 0};
+    return;
+  }
   lane_rows[lane] = {params.row[lane], 1};
   tree[params.row[lane]] = {1u, SPLASH_TREE_ROOT, 0};
 }

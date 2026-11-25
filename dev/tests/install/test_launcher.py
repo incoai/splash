@@ -673,6 +673,7 @@ class LauncherTests(unittest.TestCase):
             "--draft-model",
             "--mmproj",
             "--chat-template-file",
+            "--suppress-tokens",
             "--reasoning-effort",
         }
         self.assertIn("--max-memory", flags)

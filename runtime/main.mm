@@ -8,6 +8,7 @@
 #include "engine/NativeArguments.hpp"
 #include "model/ModelDescriptor.hpp"
 
+#import <Foundation/Foundation.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
@@ -20,6 +21,7 @@
 #include <cerrno>
 #include <csignal>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -155,7 +157,7 @@ void printUsage(std::string_view executable) {
       " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
       " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]"
-      " [--max-concurrent-requests REQUESTS]");
+      " [--max-concurrent-requests REQUESTS] [--suppress-tokens FILE]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " vision-check mlx-affine|gguf safetensors|gguf CONFIG ROOT");
@@ -211,8 +213,53 @@ std::filesystem::path splashCaches() {
                        : std::filesystem::path();
 }
 
+std::vector<uint32_t> readSuppressedTokens(const engine::NativeArguments &arguments) {
+  const auto &path = arguments.suppressTokensFile;
+  if (path.empty())
+    return {};
+  std::error_code error;
+  if (const auto bytes = std::filesystem::file_size(path, error); error || bytes > 4 * 1024 * 1024)
+    throw engine::UsageError("--suppress-tokens requires a readable JSON file no larger than 4 MiB");
+  NSString *name = [NSString stringWithUTF8String:path.c_str()];
+  NSData *data = name ? [NSData dataWithContentsOfFile:name] : nil;
+  if (!data)
+    throw engine::UsageError("--suppress-tokens could not read " + path.string());
+  id document = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+  if ([document isKindOfClass:[NSDictionary class]]) {
+    NSDictionary *mask = document;
+    document = mask[@"target_token_ids"];
+  }
+  if (![document isKindOfClass:[NSArray class]])
+    throw engine::UsageError("--suppress-tokens expected a JSON array or an object with target_token_ids");
+  const auto tokens = std::visit([](const auto &target) { return target.tokens(); }, arguments.model.target);
+  const auto stops = std::visit([](const auto &target) { return target.stopTokens; }, arguments.model.target);
+  NSArray *ids = static_cast<NSArray *>(document);
+  if (ids.count >= tokens)
+    throw engine::UsageError("--suppress-tokens must leave at least one output token available");
+  std::vector<uint32_t> suppressed;
+  suppressed.reserve(ids.count);
+  for (id value in ids) {
+    if (![value isKindOfClass:[NSNumber class]] ||
+        CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID())
+      throw engine::UsageError("--suppress-tokens IDs must be whole numbers");
+    NSNumber *idNumber = value;
+    const double number = idNumber.doubleValue;
+    if (!(number >= 0 && number < tokens) || number != std::floor(number))
+      throw engine::UsageError("--suppress-tokens IDs must be whole numbers in [0, " +
+                               std::to_string(tokens) + ")");
+    const auto token = static_cast<uint32_t>(number);
+    if (stops.contains(token))
+      throw engine::UsageError("--suppress-tokens cannot suppress stop token " + std::to_string(token));
+    suppressed.push_back(token);
+  }
+  std::ranges::sort(suppressed);
+  if (std::ranges::adjacent_find(suppressed) != suppressed.end())
+    throw engine::UsageError("--suppress-tokens IDs must be unique");
+  return suppressed;
+}
+
 engine::RuntimeBootstrapConfig
-bootstrapConfig(const engine::NativeArguments &arguments) {
+bootstrapConfig(const engine::NativeArguments &arguments, const std::vector<uint32_t> &suppressedTokens) {
   engine::RuntimeBootstrapConfig config;
   config.resources.metallibPath =
       executablePath().parent_path() / "splash.metallib";
@@ -245,6 +292,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.int8Activations = arguments.int8Activations;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
+  config.nativeLoop.engine.suppressedTokens = suppressedTokens;
   return config;
 }
 
@@ -360,13 +408,16 @@ int serveNative(int argc, char **argv) {
   std::unique_ptr<engine::ServingRuntime> runtime;
   try {
     const engine::NativeArguments arguments = engine::parseNativeArguments(argc, argv);
+    const auto suppressedTokens = readSuppressedTokens(arguments);
+    if (!suppressedTokens.empty())
+      logLine("Suppressing ", suppressedTokens.size(), " output token IDs.");
     pressureMonitor.emplace(transport.controlNotifier());
     engine::StartupRetryWindow recovery(supervision::kStartRetryWindow);
     bool reportedRecoveryWait = false;
     while (!runtime) {
       if (transport.shutdownRequested())
         return static_cast<int>(engine::NativeProcessExit::CleanEof);
-      engine::RuntimeBootstrapConfig config = bootstrapConfig(arguments);
+      engine::RuntimeBootstrapConfig config = bootstrapConfig(arguments, suppressedTokens);
       config.resources.memoryPressure = [&] { return pressureMonitor->pressure(); };
       config.resources.cancelled = [&] { return transport.shutdownRequested(); };
       if (arguments.preventIdleSleep)

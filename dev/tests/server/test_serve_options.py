@@ -126,6 +126,9 @@ OPTIONS = {
     "--activations": values(
         "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")
     ),
+    "--suppress-tokens": values(
+        "--suppress-tokens", {"/srv/mask.json": Path("/srv/mask.json")}, ("", " ")
+    ),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},
