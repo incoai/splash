@@ -27,7 +27,7 @@ from urllib.parse import unquote
 from install import assembly
 from install.models import ModelError
 
-from . import dialects, json_codec, serve_options, serve_record, unix_socket
+from . import dialects, json_codec, serve_options, serve_record, unix_socket, videos
 from . import runtime as engine_runtime
 from .backend import (
     NativeBackend,
@@ -423,6 +423,26 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _read_json_body(self, deadline):
         """The request's body, a JSON object, read by `deadline`."""
+        payload = self._read_body(deadline, ("application/json",))
+        try:
+            text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+            payload.clear()
+            body = json_codec.loads(text)
+        except ValueError:
+            # Text that is not JSON, or JSON nested past json_codec.MAX_DEPTH.
+            raise RequestValidationError(
+                [field_error([], "invalid JSON request body")]
+            ) from None
+        if not isinstance(body, dict):
+            raise RequestValidationError(
+                [field_error([], "request body must be an object")]
+            )
+        return body
+
+    def _read_body(self, deadline, content_types):
+        """The request's body, read by `deadline`: of one of `content_types`
+        (application/json also as application/*+json), a Content-Length
+        within the server's limit, and no transfer or content encoding."""
         if self.headers.get_all("Transfer-Encoding"):
             raise APIError(400, "transfer encoding is not supported")
         encodings = self.headers.get_all("Content-Encoding", [])
@@ -430,16 +450,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
             encodings and encodings[0].strip().lower() != "identity"
         ):
             raise APIError(415, "content encoding is not supported")
-        content_types = self.headers.get_all("Content-Type", [])
         content_type = self.headers.get_content_type().lower()
-        if len(content_types) != 1 or not (
-            content_type == "application/json"
-            or (
-                content_type.startswith("application/")
-                and content_type.endswith("+json")
-            )
+        if content_type.startswith("application/") and content_type.endswith("+json"):
+            content_type = "application/json"
+        if (
+            len(self.headers.get_all("Content-Type", [])) != 1
+            or content_type not in content_types
         ):
-            raise APIError(415, "Content-Type must be application/json")
+            raise APIError(415, f"Content-Type must be {' or '.join(content_types)}")
         lengths = self.headers.get_all("Content-Length", [])
         if len(lengths) != 1:
             raise APIError(400, "exactly one Content-Length header is required")
@@ -474,20 +492,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         finally:
             self._unread_body = length - len(payload)
             self.connection.settimeout(HTTP_IO_TIMEOUT)
-        try:
-            text = payload.decode(json.detect_encoding(payload), "surrogatepass")
-            payload.clear()
-            body = json_codec.loads(text)
-        except ValueError:
-            # Text that is not JSON, or JSON nested past json_codec.MAX_DEPTH.
-            raise RequestValidationError(
-                [field_error([], "invalid JSON request body")]
-            ) from None
-        if not isinstance(body, dict):
-            raise RequestValidationError(
-                [field_error([], "request body must be an object")]
-            )
-        return body
+        return payload
 
     def do_HEAD(self):
         self.do_GET()
@@ -1306,6 +1311,15 @@ class ListenError(Exception):
     """The HTTP server cannot listen at its address."""
 
 
+# The shared options a video model's server acts on (main): its HTTP
+# server's, its names, and whether its engine keeps the Mac awake.
+VIDEO_OPTIONS = frozenset((
+    "--host", "--allowed-host", "--allowed-origin", "--api-key", "--no-webui",
+    "--max-request-size", "--queue-size", "--served-model-name",
+    "--allow-idle-sleep",
+))  # fmt: skip
+
+
 class OptionError(Exception):
     """An option the served model's family cannot follow."""
 
@@ -1323,6 +1337,7 @@ def main():
     server = None
     runtime = None
     backend = None
+    video = None
     # Why the backend stopped restarting the engine, once it has.
     stopped = None
     # Why the start failed, which the record says once the engine has stopped
@@ -1374,6 +1389,39 @@ def main():
         thinking_codec = ThinkingCodec(load_thinking_key())
         print_status(f"Loading · {args.model}")
         serve_record.entered(args.serve_record, "loading")
+        if videos.serves(Path(args.model_root)):
+            # A video model's server serves /v1/videos alone (videos.py),
+            # holding its assembly as below, and is ready, as below, once its
+            # engine is. Of the shared options it acts on VIDEO_OPTIONS
+            # alone; the others set how a language model is served, and one
+            # warning names those given.
+            if ignored := [
+                option.flag
+                for option in serve_options.SERVE_OPTIONS
+                if option.flag not in VIDEO_OPTIONS
+                and getattr(args, option.dest) != option.default()
+            ]:
+                print_status(
+                    f"Warning · {', '.join(ignored)} set how a language model is "
+                    f"served: {args.model}'s server ignores them",
+                    error=True,
+                )
+            model_root, held = assembly.hold(Path(args.model_root))
+            video = server.app = videos.VideoApp.start(
+                args.model,
+                args.served_model_name,
+                model_root,
+                args.binary,
+                videos.START_SECONDS,
+                not args.allow_idle_sleep,
+            )
+            server.RequestHandlerClass = videos.handler(FrontendHandler)
+            server.server_activate()
+            serve_record.ready(args.serve_record)
+            address = f"http://{args.host}:{server.server_port}"
+            print_status(f"Ready · {args.model} · video · {address}")
+            server.serve_forever()
+            return
         # Nothing reads `held`: it keeps the assembly held until the server
         # exits, so that no installation collects the assembly its tokenizer
         # and engines, a relaunched one too, serve.
@@ -1537,7 +1585,7 @@ def main():
         mode = "" if served.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
-    except engine_runtime.EngineStartFailed as error:
+    except (engine_runtime.EngineStartFailed, videos.VideoStartFailed) as error:
         failure = serve_record.engine_failure(error.event, str(error))
         _start_failed(error)
     except ListenError as error:
@@ -1554,7 +1602,12 @@ def main():
     ) as error:
         failure = serve_record.failure(serve_record.MODEL, str(error))
         _start_failed(error)
-    except (engine_runtime.EngineRuntimeError, ThinkingKeyError, OSError) as error:
+    except (
+        engine_runtime.EngineRuntimeError,
+        videos.VideoFailed,
+        ThinkingKeyError,
+        OSError,
+    ) as error:
         failure = serve_record.failure(serve_record.INTERNAL, str(error))
         _start_failed(error)
     except serve_record.NotRecorded as error:
@@ -1589,6 +1642,9 @@ def main():
             # the requests in flight.
             if server is not None:
                 server.socket.close()
+            if video is not None:
+                print_status("Stopping · releasing engine resources")
+                video.close()
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()
