@@ -40,18 +40,18 @@ struct ChatScreen: View {
                 .sharedBackgroundVisibility(.hidden)
             }
         }
-        .alert("Rename Chat", isPresented: Binding(
+        .alert(L("Rename Chat"), isPresented: Binding(
             get: { renaming != nil }, set: { if !$0 { renaming = nil } }
         ), presenting: renaming) { conversation in
-            TextField("Name", text: $name)
-            Button("Rename") { state.chats.rename(conversation.id, to: name) }
+            TextField(L("Name"), text: $name)
+            Button(L("Rename")) { state.chats.rename(conversation.id, to: name) }
                 .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            Button("Cancel", role: .cancel) {}
+            Button(L("Cancel"), role: .cancel) {}
         }
         .confirmationDialog(deletion?.title ?? "", isPresented: Binding(
             get: { deletion != nil }, set: { if !$0 { deletion = nil } }
         ), presenting: deletion) { deletion in
-            Button("Delete", role: .destructive) {
+            Button(L("Delete"), role: .destructive) {
                 state.delete(deletion.ids)
                 // Those picked, deleted, end the picking; another chat deleted leaves the rest.
                 if picked == deletion.ids { picked = nil } else { picked?.subtract(deletion.ids) }
@@ -64,12 +64,12 @@ struct ChatScreen: View {
     /// What can be done with a chat, as its title in the window's top row, its row's menu and a right
     /// click on its row give it: pin it to the list's top, or take it off there; rename it; delete it.
     @ViewBuilder private func actions(for conversation: Conversation) -> some View {
-        Button(conversation.pinned == nil ? "Pin" : "Unpin") { state.chats.pin(conversation.id, conversation.pinned == nil) }
-        Button("Rename…") {
+        Button(L(conversation.pinned == nil ? "Pin" : "Unpin")) { state.chats.pin(conversation.id, conversation.pinned == nil) }
+        Button(L("Rename…")) {
             name = conversation.title
             renaming = conversation
         }
-        Button("Delete…", role: .destructive) { deletion = ChatDeletion([conversation]) }
+        Button(L("Delete…"), role: .destructive) { deletion = ChatDeletion([conversation]) }
     }
 }
 
@@ -124,7 +124,7 @@ private struct ChatTitle<Actions: View>: View {
     private var menu: some View {
         Menu(content: actions) {
             HStack(spacing: 5) {
-                Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
+                Text(conversation.title.isEmpty ? L("New Chat") : conversation.title)
                     .font(.body.weight(.medium))
                     .lineLimit(1)
                 Image(systemName: "chevron.down")
@@ -137,9 +137,9 @@ private struct ChatTitle<Actions: View>: View {
         .menuStyle(.button)
         .buttonStyle(HoverStyle(padding: EdgeInsets()))
         .menuIndicator(.hidden)
-        .help("Pin, Rename or Delete This Chat")
-        .accessibilityLabel(conversation.title.isEmpty ? "New Chat" : conversation.title)
-        .accessibilityHint("Pins, renames or deletes this chat")
+        .help(L("Pin, Rename or Delete This Chat"))
+        .accessibilityLabel(conversation.title.isEmpty ? L("New Chat") : conversation.title)
+        .accessibilityHint(L("Pins, renames or deletes this chat"))
     }
 }
 
@@ -246,11 +246,11 @@ struct ChatDeletion {
     init(_ chats: [Conversation]) {
         ids = Set(chats.map(\.id))
         if chats.count == 1 {
-            title = "Delete this chat?"
-            message = "“\(chats[0].title)” will be deleted from this Mac."
+            title = L("Delete this chat?")
+            message = L("“%@” will be deleted from this Mac.", chats[0].title)
         } else {
-            title = "Delete \(chats.count) chats?"
-            message = "They will be deleted from this Mac."
+            title = L("Delete %d chats?", chats.count)
+            message = L("They will be deleted from this Mac.")
         }
     }
 }
@@ -262,12 +262,12 @@ struct ChatSection: Identifiable {
 
         var title: String {
             switch self {
-            case .pinned: "Pinned"
-            case .today: "Today"
-            case .yesterday: "Yesterday"
-            case .week: "Previous 7 Days"
-            case .month: "Previous 30 Days"
-            case .older: "Older"
+            case .pinned: L("Pinned")
+            case .today: L("Today")
+            case .yesterday: L("Yesterday")
+            case .week: L("Previous 7 Days")
+            case .month: L("Previous 30 Days")
+            case .older: L("Older")
             }
         }
     }
@@ -320,18 +320,18 @@ private struct ChatList<Actions: View>: View {
                 state.newChat()
                 state.draft.focus()
             } label: {
-                Label("New Chat", systemImage: "plus")
+                Label(L("New Chat"), systemImage: "plus")
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(.rect)
             }
             .buttonStyle(HoverStyle(padding: EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8)))
-            .help("New Chat (⌘N)")
+            .help(L("New Chat (⌘N)"))
             .padding(.horizontal, 10)
             .padding(.top, 10)
             .padding(.bottom, 4)
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search", text: $query, prompt: Text("Search"))
+                TextField(L("Search"), text: $query, prompt: Text(L("Search")))
                     .textFieldStyle(.plain)
                     // Esc clears it, as it does a search field.
                     .onExitCommand { query = "" }
@@ -340,8 +340,8 @@ private struct ChatList<Actions: View>: View {
                         Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
-                    .help("Clear Search")
-                    .accessibilityLabel("Clear Search")
+                    .help(L("Clear Search"))
+                    .accessibilityLabel(L("Clear Search"))
                 }
             }
             .padding(.horizontal, 8)
@@ -367,13 +367,13 @@ private struct ChatList<Actions: View>: View {
     private func picking(_ picked: Set<UUID>, shown: [Conversation]) -> some View {
         let all = !shown.isEmpty && shown.allSatisfy { picked.contains($0.id) }
         return HStack(spacing: 2) {
-            Button(all ? "Deselect All" : "Select All") { self.picked = all ? [] : Set(shown.map(\.id)) }
+            Button(L(all ? "Deselect All" : "Select All")) { self.picked = all ? [] : Set(shown.map(\.id)) }
                 .disabled(shown.isEmpty)
             Spacer()
             // The chats picked that the search shows.
-            Button("Delete") { deletion = ChatDeletion(shown.filter { picked.contains($0.id) }) }
+            Button(L("Delete")) { deletion = ChatDeletion(shown.filter { picked.contains($0.id) }) }
                 .disabled(!shown.contains { picked.contains($0.id) })
-            Button("Done") { self.picked = nil }
+            Button(L("Done")) { self.picked = nil }
         }
         .buttonStyle(.hover)
         .padding(.horizontal, 12)
@@ -384,9 +384,9 @@ private struct ChatList<Actions: View>: View {
     /// what is searched for, which the search field's button clears.
     private var empty: some View {
         VStack(spacing: 4) {
-            Text(query.isEmpty ? "No Chats Yet" : "No Results for “\(query)”")
+            Text(query.isEmpty ? L("No Chats Yet") : L("No Results for “%@”", query))
                 .font(.callout.weight(.medium))
-            Text(query.isEmpty ? "Chats show here once they have a message." : "Check the spelling or try a new search.")
+            Text(query.isEmpty ? L("Chats show here once they have a message.") : L("Check the spelling or try a new search."))
                 .font(.caption)
         }
         .foregroundStyle(.secondary)
@@ -434,7 +434,7 @@ private struct ChatList<Actions: View>: View {
                             actions(conversation)
                             if picked == nil {
                                 Divider()
-                                Button("Select") { picked = [id] }
+                                Button(L("Select")) { picked = [id] }
                             }
                         }
                     }
@@ -471,11 +471,11 @@ private struct ChatRow<Actions: View>: View {
                     Image(systemName: picked ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(picked ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                 }
-                Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
+                Text(conversation.title.isEmpty ? L("New Chat") : conversation.title)
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if answering && !more {
-                    ProgressView().controlSize(.mini).accessibilityLabel("Answering")
+                    ProgressView().controlSize(.mini).accessibilityLabel(L("Answering"))
                 }
             }
             .contentShape(.rect)
@@ -558,7 +558,7 @@ private struct ConversationView: View {
     private func page(_ conversation: Conversation) -> TranscriptPage {
         let server = state.server
         let askAgain = TranscriptPage.AskAgain(enabled: server.answers && state.chats.streaming == nil,
-                                               help: "Ask \(server.model.map(state.displayName(of:)) ?? "the model") Again")
+                                               help: L("Ask %@ Again", server.model.map(state.displayName(of:)) ?? L("the model")))
         return TranscriptPage(conversation, askAgain: askAgain, name: state.displayName(of:))
     }
 }

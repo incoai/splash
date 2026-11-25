@@ -71,6 +71,8 @@
   #credentials { display: block; margin: 18px 10px; color: var(--muted); font-size: 12px }
   #credentials[hidden] { display: none }
   #api-key { width: 100%; margin-top: 6px; padding: 6px 8px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px }
+  #language { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 18px 10px; color: var(--muted); font-size: 12px }
+  #language select { appearance: auto; padding: 4px 6px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px }
 
   main { min-height: 100vh; margin-left: var(--sidebar); transition: margin-left var(--sidebar-duration) ease }
   #chat { width: min(760px, 100%); margin: auto; padding: 38px 20px 150px }
@@ -180,49 +182,55 @@
   <div class="brand">
     <img src="/favicon.ico" alt="">
     Splash
-    <button id="sidebar-close" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-controls="sidebar" aria-expanded="true">
+    <button id="sidebar-close" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-controls="sidebar" aria-expanded="true" data-i18n-aria-label="collapseSidebar" data-i18n-title="collapseSidebar">
       <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18m7-12-3 3 3 3"/></svg>
     </button>
   </div>
   <button id="new-chat" type="button">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="M18 2v8M14 6h8"/></svg>
-    New chat
+    <span data-i18n="newChat">New chat</span>
   </button>
-  <div class="recent-label">Recents</div>
-  <nav id="recents" aria-label="Recent chats"></nav>
-  <label id="credentials" hidden>This server needs an API key
-    <input id="api-key" type="password" autocomplete="off" spellcheck="false" aria-label="API key">
+  <div class="recent-label" data-i18n="recents">Recents</div>
+  <nav id="recents" aria-label="Recent chats" data-i18n-aria-label="recentChats"></nav>
+  <label id="credentials" hidden><span data-i18n="apiKeyNeeded">This server needs an API key</span>
+    <input id="api-key" type="password" autocomplete="off" spellcheck="false" aria-label="API key" data-i18n-aria-label="apiKey">
+  </label>
+  <label id="language"><span data-i18n="language">Language</span>
+    <select id="language-select" aria-label="Language" data-i18n-aria-label="language">
+      <option value="en">English</option>
+      <option value="zh-Hans">简体中文</option>
+    </select>
   </label>
 </aside>
-<button id="sidebar-open" type="button" aria-label="Open sidebar" title="Open sidebar" aria-controls="sidebar" aria-expanded="false">
+<button id="sidebar-open" type="button" aria-label="Open sidebar" title="Open sidebar" aria-controls="sidebar" aria-expanded="false" data-i18n-aria-label="openSidebar" data-i18n-title="openSidebar">
   <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18m4-12 3 3-3 3"/></svg>
 </button>
 <div id="scrim"></div>
 <header id="mobile-header">
-  <button id="menu" type="button" aria-label="Open sidebar" aria-controls="sidebar" aria-expanded="false"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  <button id="menu" type="button" aria-label="Open sidebar" aria-controls="sidebar" aria-expanded="false" data-i18n-aria-label="openSidebar"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
   <div class="brand">Splash</div>
-  <button id="mobile-new" type="button" aria-label="New chat"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="M18 2v8M14 6h8"/></svg></button>
+  <button id="mobile-new" type="button" aria-label="New chat" data-i18n-aria-label="newChat"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="M18 2v8M14 6h8"/></svg></button>
 </header>
 <main><div id="chat"></div></main>
 <form id="form">
-  <button id="scroll-bottom" type="button" hidden aria-label="Jump to latest message">&#8595; Jump to latest</button>
-  <button id="attach" type="button" aria-label="Add images or PDFs" title="Add images or PDFs">
+  <button id="scroll-bottom" type="button" hidden aria-label="Jump to latest message" data-i18n-aria-label="jumpToLatest">&#8595; <span data-i18n="jumpToLatest">Jump to latest</span></button>
+  <button id="attach" type="button" aria-label="Add images or PDFs" title="Add images or PDFs" data-i18n-aria-label="addImagesOrPDFs" data-i18n-title="addImagesOrPDFs">
     <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
   </button>
   <input id="file-input" type="file" accept="image/*,application/pdf" multiple hidden>
   <div class="composer">
-    <div id="attachments" aria-label="Attachments"></div>
-    <textarea id="input" rows="1" placeholder="Message Splash" autofocus></textarea>
+    <div id="attachments" aria-label="Attachments" data-i18n-aria-label="attachments"></div>
+    <textarea id="input" rows="1" placeholder="Message Splash" autofocus data-i18n-placeholder="messageSplash"></textarea>
   </div>
   <div class="toolbar">
-    <label class="effort" id="thinking"><span>Thinking</span>
-      <select id="effort" aria-label="Thinking effort">
-        <option value="">Auto</option>
-        <option value="none">Off</option>
+    <label class="effort" id="thinking"><span data-i18n="thinking">Thinking</span>
+      <select id="effort" aria-label="Thinking effort" data-i18n-aria-label="thinkingEffort">
+        <option value="" data-i18n="auto">Auto</option>
+        <option value="none" data-i18n="off">Off</option>
       </select>
       <svg class="effort-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 4.5 3 3 3-3"/></svg>
     </label>
-    <button id="send" aria-label="Send">&#8593;</button>
+    <button id="send" aria-label="Send" data-i18n-aria-label="send">&#8593;</button>
   </div>
 </form>
 
@@ -244,7 +252,161 @@
   const send = $('#send');
   const recents = $('#recents');
   const scrollBottom = $('#scroll-bottom');
+  const languageSelect = $('#language-select');
   const mobileLayout = window.matchMedia('(max-width: 720px)');
+
+  // The page's own words, by language: the browser's language decides, and the
+  // menu beside the chats keeps the reader's choice. Adding a language adds a
+  // column here and its name to the menu; `en` is the fallback.
+  const translations = {
+    en: {
+      newChat: 'New chat',
+      recents: 'Recents',
+      recentChats: 'Recent chats',
+      collapseSidebar: 'Collapse sidebar',
+      openSidebar: 'Open sidebar',
+      apiKeyNeeded: 'This server needs an API key',
+      apiKey: 'API key',
+      language: 'Language',
+      thinking: 'Thinking',
+      thinkingEffort: 'Thinking effort',
+      auto: 'Auto',
+      autoWith: 'Auto ({0})',
+      off: 'Off',
+      send: 'Send',
+      stop: 'Stop',
+      messageSplash: 'Message Splash',
+      addImagesOrPDFs: 'Add images or PDFs',
+      attachments: 'Attachments',
+      jumpToLatest: 'Jump to latest',
+      howCanIHelp: 'How can I help?',
+      generatingResponse: 'Generating response',
+      copyCode: 'Copy code',
+      copyReplyMarkdown: 'Copy reply as Markdown',
+      copied: 'Copied!',
+      copyFailed: 'Copy failed',
+      deleteChat: 'Delete chat',
+      deleteChatAria: 'Delete chat: {0}',
+      deleteChatConfirm: 'Delete chat "{0}"? This cannot be undone.',
+      attachedImage: 'Attached image',
+      attachedImageAlt: 'Attached image',
+      attachedPDF: 'Attached PDF',
+      pdf: 'PDF',
+      image: 'Image',
+      imageNotSaved: '[Image not saved]',
+      fileNotSaved: '[{0} not saved]',
+      remove: 'Remove {0}',
+      readFailed: 'Read failed',
+      tooLarge: 'Too large',
+      loading: 'Loading…',
+      attachmentTooLarge: '{0} is larger than the model’s {1} limit',
+      connectionClosed: 'Connection closed early',
+      effortMinimal: 'Minimal',
+      effortLow: 'Low',
+      effortMedium: 'Medium',
+      effortHigh: 'High',
+      effortExtraHigh: 'Extra High',
+      effortMax: 'Max',
+    },
+    'zh-Hans': {
+      newChat: '新建对话',
+      recents: '最近',
+      recentChats: '最近的对话',
+      collapseSidebar: '收起侧边栏',
+      openSidebar: '打开侧边栏',
+      apiKeyNeeded: '此服务器需要 API 密钥',
+      apiKey: 'API 密钥',
+      language: '语言',
+      thinking: '思考',
+      thinkingEffort: '思考强度',
+      auto: '自动',
+      autoWith: '自动（{0}）',
+      off: '关闭',
+      send: '发送',
+      stop: '停止',
+      messageSplash: '给 Splash 发消息',
+      addImagesOrPDFs: '添加图片或 PDF',
+      attachments: '附件',
+      jumpToLatest: '跳到最新',
+      howCanIHelp: '有什么可以帮你？',
+      generatingResponse: '正在生成回复',
+      copyCode: '复制代码',
+      copyReplyMarkdown: '以 Markdown 复制回复',
+      copied: '已复制！',
+      copyFailed: '复制失败',
+      deleteChat: '删除对话',
+      deleteChatAria: '删除对话：{0}',
+      deleteChatConfirm: '删除对话“{0}”？此操作无法撤销。',
+      attachedImage: '已附加图片',
+      attachedImageAlt: '已附加的图片',
+      attachedPDF: '已附加 PDF',
+      pdf: 'PDF',
+      image: '图片',
+      imageNotSaved: '[图片未保存]',
+      fileNotSaved: '[{0} 未保存]',
+      remove: '移除 {0}',
+      readFailed: '读取失败',
+      tooLarge: '太大',
+      loading: '加载中…',
+      attachmentTooLarge: '{0} 超过了模型的 {1} 上限',
+      connectionClosed: '连接过早关闭',
+      effortMinimal: '最少',
+      effortLow: '低',
+      effortMedium: '中',
+      effortHigh: '高',
+      effortExtraHigh: '极高',
+      effortMax: '最高',
+    },
+  };
+  const languages = Object.keys(translations);
+  const languageKey = 'splash-language';
+
+  // The reader's choice, else the first language the browser asks for that
+  // this page speaks, else English.
+  function chooseLanguage() {
+    const saved = storageGet(languageKey);
+    if (languages.includes(saved)) return saved;
+    const tags = typeof navigator === 'undefined' ? [] : navigator.languages?.length
+      ? navigator.languages : [navigator.language].filter(Boolean);
+    for (const tag of tags) {
+      const lower = String(tag).toLowerCase();
+      if (lower.startsWith('zh')) return 'zh-Hans';
+      if (lower.startsWith('en')) return 'en';
+    }
+    return 'en';
+  }
+
+  let locale = chooseLanguage();
+  // The figures the page writes follow the language it speaks, not the
+  // browser's, so that a choice here changes both.
+  let formatLocale = locale;
+  // The efforts /v1/models last reported, so that a change of language keeps
+  // the menu it makes.
+  let modelReasoning = null;
+
+  function t(key, ...args) {
+    const words = translations[locale] ?? translations.en;
+    return (words[key] ?? translations.en[key] ?? key)
+      .replace(/\{(\d+)\}/g, (_, index) => String(args[index] ?? ''));
+  }
+
+  // Puts the page's words in the markup that carries them, and names the
+  // language to assistive technology.
+  function applyTranslations() {
+    document.documentElement.lang = locale;
+    for (const element of document.querySelectorAll('[data-i18n]')) {
+      element.textContent = t(element.dataset.i18n);
+    }
+    for (const element of document.querySelectorAll('[data-i18n-aria-label]')) {
+      element.setAttribute('aria-label', t(element.dataset.i18nAriaLabel));
+    }
+    for (const element of document.querySelectorAll('[data-i18n-title]')) {
+      element.title = t(element.dataset.i18nTitle);
+    }
+    for (const element of document.querySelectorAll('[data-i18n-placeholder]')) {
+      element.placeholder = t(element.dataset.i18nPlaceholder);
+    }
+  }
   const copyIcons = {
     copy: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
     success: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>',
@@ -266,7 +428,7 @@
       const language = markdown.utils.escapeHtml(markdown.utils.unescapeAll(tokens[index].info || '').trim().split(/\s+/)[0] || 'text');
       tokens[index].attrJoin('class', 'hljs');
       return '<div class="code-block"><div class="code-toolbar"><span class="code-language">' + language +
-        '</span><button type="button" class="copy-code" title="Copy code" aria-label="Copy code" aria-live="polite">' + copyIcons.copy + '</button></div>' +
+        '</span><button type="button" class="copy-code" title="' + t('copyCode') + '" aria-label="' + t('copyCode') + '" aria-live="polite">' + copyIcons.copy + '</button></div>' +
         renderCode(tokens, index, ...args) + '</div>';
     };
   }
@@ -326,11 +488,24 @@
       attach.hidden = !imagesAccepted && !pdfsAccepted;
       attachments = attachments.filter(attachment => takes(attachment.type));
       renderAttachments();
-      showEfforts(model.reasoning);
+      modelReasoning = model.reasoning ?? modelReasoning;
+      showEfforts(modelReasoning);
     } catch { /* The server still rejects input the model cannot take. */ }
   }
 
+  const effortKeys = {
+    minimal: 'effortMinimal',
+    low: 'effortLow',
+    medium: 'effortMedium',
+    high: 'effortHigh',
+    xhigh: 'effortExtraHigh',
+    extrahigh: 'effortExtraHigh',
+    max: 'effortMax',
+  };
+
   function effortTitle(value) {
+    const key = effortKeys[String(value).toLowerCase().replace(/\s+/g, '')];
+    if (key) return t(key);
     return value === 'xhigh' ? 'Extra High' : value[0].toUpperCase() + value.slice(1);
   }
 
@@ -340,12 +515,13 @@
   // takes no effort, and the menu hides. Until the server answers, the
   // markup's Auto and Off.
   function showEfforts(reasoning) {
+    reasoning ??= {thinks: true, efforts: [], default: null};
     thinking.hidden = reasoning.thinks === null;
-    const auto = reasoning.thinks === false ? 'Off' : reasoning.default && effortTitle(reasoning.default);
+    const auto = reasoning.thinks === false ? t('off') : reasoning.default && effortTitle(reasoning.default);
     const choices = thinking.hidden ? [] : [
-      ['', auto ? `Auto (${auto})` : 'Auto'],
+      ['', auto ? t('autoWith', auto) : t('auto')],
       ...[...reasoning.efforts].reverse().map(value => [value, effortTitle(value)]),
-      ['none', 'Off'],
+      ['none', t('off')],
     ];
     effort.replaceChildren(...choices.map(([value, title]) => {
       const option = document.createElement('option');
@@ -359,6 +535,23 @@
   // The effort picked last where the menu offers it, else Auto.
   function selectEffort() {
     effort.value = [...effort.options].some(option => option.value === chosenEffort) ? chosenEffort : '';
+  }
+
+  // The reader's language: a new one redraws the page's own words, the chats
+  // and attachments, and the effort menu the server's model makes. The menu
+  // waits while a reply streams, so nothing it is drawing is lost.
+  function setLanguage(value) {
+    if (!languages.includes(value) || value === locale) return;
+    locale = value;
+    formatLocale = locale;
+    storageSet(languageKey, locale);
+    applyTranslations();
+    showEfforts(modelReasoning);
+    renderChat();
+    renderRecents();
+    renderAttachments();
+    setRunning(Boolean(controller));
+    updateComposer();
   }
 
   function storageGet(key) {
@@ -378,7 +571,7 @@
 
   // What a message says in place of an image or a PDF that isn't kept.
   function notSaved(part) {
-    return {type: 'text', text: part.type === 'image_url' ? '[Image not saved]' : `[${part.file?.filename || 'PDF'} not saved]`};
+    return {type: 'text', text: part.type === 'image_url' ? t('imageNotSaved') : t('fileNotSaved', part.file?.filename || t('pdf'))};
   }
 
   // A saved question's text, images and PDFs; an image or a PDF that can't be
@@ -392,7 +585,7 @@
       if (typeof url === 'string' && url.startsWith('data:image/')) return [{type: 'image_url', image_url: {url}}];
       const file = part?.type === 'file' ? part.file : null;
       if (typeof file?.file_data === 'string' && file.file_data.startsWith('data:application/pdf;base64,')) {
-        const filename = typeof file.filename === 'string' ? file.filename : 'PDF';
+        const filename = typeof file.filename === 'string' ? file.filename : t('pdf');
         return [{type: 'file', file: {filename, file_data: file.file_data}}];
       }
       return part?.type === 'image_url' || part?.type === 'file' ? [notSaved(part)] : [];
@@ -488,7 +681,7 @@
     return {
       text: content.filter(part => part.type === 'text').map(part => part.text).join('\n'),
       images: content.filter(part => part.type === 'image_url').map(part => part.image_url.url),
-      files: content.filter(part => part.type === 'file').map(part => part.file.filename || 'PDF')
+      files: content.filter(part => part.type === 'file').map(part => part.file.filename || t('pdf'))
     };
   }
 
@@ -508,7 +701,7 @@
 
   function size(bytes) {
     const [value, unit] = bytes < 1e6 ? [bytes / 1e3, 'kilobyte'] : [bytes / 1e6, 'megabyte'];
-    return new Intl.NumberFormat(undefined, {style: 'unit', unit, maximumFractionDigits: bytes < 1e6 ? 0 : 1}).format(value);
+    return new Intl.NumberFormat(formatLocale, {style: 'unit', unit, maximumFractionDigits: bytes < 1e6 ? 0 : 1}).format(value);
   }
 
   function requestMessages() {
@@ -543,10 +736,10 @@
         }
       }
       button.innerHTML = copyIcons.success;
-      status = 'Copied!';
+      status = t('copied');
     } catch {
       button.innerHTML = copyIcons.error;
-      status = 'Copy failed';
+      status = t('copyFailed');
     }
     button.title = status;
     button.setAttribute('aria-label', status);
@@ -588,7 +781,8 @@
     const details = document.createElement('details');
     details.open = live;
     details.hidden = !message.reasoning_content;
-    details.innerHTML = '<summary>Thinking</summary><div class="reasoning"></div>';
+    details.innerHTML = '<summary></summary><div class="reasoning"></div>';
+    details.querySelector('summary').textContent = t('thinking');
     const reasoning = details.querySelector('.reasoning');
     reasoning.textContent = message.reasoning_content || '';
     reasoning.addEventListener('scroll', () => updateReasoningFade(reasoning), {passive: true});
@@ -598,25 +792,25 @@
     renderMarkdown(content, message.content || '');
     content.addEventListener('click', event => {
       const button = event.target.closest('.copy-code');
-      if (button) copyText(button, button.closest('.code-block').querySelector('code').textContent, 'Copy code');
+      if (button) copyText(button, button.closest('.code-block').querySelector('code').textContent, t('copyCode'));
     });
     const waiting = document.createElement('div');
     waiting.className = 'waiting';
     waiting.hidden = !live || Boolean(message.content || message.reasoning_content);
-    waiting.setAttribute('aria-label', 'Generating response');
+    waiting.setAttribute('aria-label', t('generatingResponse'));
     const stats = document.createElement('div');
     stats.className = 'stats';
     stats.hidden = !message.tps;
-    if (message.tps) stats.textContent = `${Number(message.tps).toLocaleString(undefined, {maximumFractionDigits: 1})} tok/s`;
+    if (message.tps) stats.textContent = `${Number(message.tps).toLocaleString(formatLocale, {maximumFractionDigits: 1})} tok/s`;
     const copy = document.createElement('button');
     copy.type = 'button';
     copy.className = 'copy-markdown';
     copy.innerHTML = copyIcons.copy;
-    copy.title = 'Copy reply as Markdown';
+    copy.title = t('copyReplyMarkdown');
     copy.hidden = !message.content;
-    copy.setAttribute('aria-label', 'Copy reply as Markdown');
+    copy.setAttribute('aria-label', t('copyReplyMarkdown'));
     copy.setAttribute('aria-live', 'polite');
-    copy.addEventListener('click', () => copyText(copy, message.content, 'Copy reply as Markdown'));
+    copy.addEventListener('click', () => copyText(copy, message.content, t('copyReplyMarkdown')));
     const footer = document.createElement('div');
     footer.className = 'message-footer';
     footer.hidden = stats.hidden && copy.hidden;
@@ -642,10 +836,10 @@
         images.forEach(url => {
           const image = document.createElement('img');
           image.src = url;
-          image.alt = 'Attached image';
+          image.alt = t('attachedImageAlt');
           gallery.append(image);
         });
-        files.forEach(name => gallery.append(fileChip('user-file', name, 'PDF')));
+        files.forEach(name => gallery.append(fileChip('user-file', name, t('pdf'))));
         box.append(gallery);
       }
     }
@@ -659,7 +853,7 @@
     if (!messages.length) {
       const empty = document.createElement('div');
       empty.id = 'empty';
-      empty.textContent = 'How can I help?';
+      empty.textContent = t('howCanIHelp');
       chat.append(empty);
     } else messages.forEach(message => addMessage(message));
     scrollToLatest();
@@ -680,8 +874,8 @@
       const remove = document.createElement('button');
       remove.type = 'button';
       remove.className = 'recent-delete';
-      remove.setAttribute('aria-label', `Delete chat: ${conversation.title}`);
-      remove.title = 'Delete chat';
+      remove.setAttribute('aria-label', t('deleteChatAria', conversation.title));
+      remove.title = t('deleteChat');
       remove.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6"/></svg>';
       remove.disabled = Boolean(controller);
       remove.addEventListener('click', () => deleteChat(conversation.id));
@@ -693,7 +887,7 @@
   function deleteChat(id) {
     if (controller) return;
     const conversation = conversations.find(item => item.id === id);
-    if (!conversation || !window.confirm(`Delete chat "${conversation.title}"? This cannot be undone.`)) return;
+    if (!conversation || !window.confirm(t('deleteChatConfirm', conversation.title))) return;
     conversations = conversations.filter(conversation => conversation.id !== id);
     if (activeId === id) newChat();
     save();
@@ -766,10 +960,10 @@
       const pdf = attachment.type === 'application/pdf';
       const item = document.createElement('div');
       item.className = pdf ? 'attachment pdf' : 'attachment';
-      const name = attachment.name || (pdf ? 'Attached PDF' : 'Attached image');
+      const name = attachment.name || (pdf ? t('attachedPDF') : t('attachedImage'));
       const limit = overLimit(attachment);
-      item.title = limit ? `${name} is larger than the model’s ${size(limit)} limit` : name;
-      const status = attachment.error ? 'Read failed' : limit ? 'Too large' : null;
+      item.title = limit ? t('attachmentTooLarge', name, size(limit)) : name;
+      const status = attachment.error ? t('readFailed') : limit ? t('tooLarge') : null;
       let preview;
       if (pdf) {
         preview = fileChip('attachment-file', name, status ?? size(attachment.bytes), Boolean(status));
@@ -780,13 +974,13 @@
       } else {
         preview = document.createElement('span');
         preview.className = `attachment-status${status ? ' error' : ''}`;
-        preview.textContent = status ?? 'Loading…';
+        preview.textContent = status ?? t('loading');
         preview.setAttribute('role', 'status');
       }
       const remove = document.createElement('button');
       remove.type = 'button';
       remove.className = 'remove-attachment';
-      remove.setAttribute('aria-label', `Remove ${name}`);
+      remove.setAttribute('aria-label', t('remove', name));
       remove.textContent = '\u00d7';
       remove.addEventListener('click', () => {
         attachments = attachments.filter(value => value !== attachment);
@@ -857,9 +1051,10 @@
 
   function setRunning(running) {
     send.textContent = running ? '\u25a0' : '\u2191';
-    send.setAttribute('aria-label', running ? 'Stop' : 'Send');
+    send.setAttribute('aria-label', t(running ? 'stop' : 'send'));
     effort.disabled = running;
     attach.disabled = running;
+    languageSelect.disabled = running;
     $('#new-chat').disabled = running;
     $('#mobile-new').disabled = running;
     renderRecents();
@@ -875,7 +1070,7 @@
     if (Number.isFinite(speed) && speed > 0) {
       assistant.tps = speed;
       const stats = box.querySelector('.stats');
-      stats.textContent = `${speed.toLocaleString(undefined, {maximumFractionDigits: 1})} tok/s`;
+      stats.textContent = `${speed.toLocaleString(formatLocale, {maximumFractionDigits: 1})} tok/s`;
       stats.hidden = false;
       box.querySelector('.message-footer').hidden = false;
     }
@@ -950,10 +1145,10 @@
         if (done) break;
       }
       if (buffer) doneEvent ||= consume(buffer, assistant, box);
-      if (!doneEvent) throw new Error('Connection closed early');
+      if (!doneEvent) throw new Error(t('connectionClosed'));
       box.querySelector('.waiting').hidden = true;
       messages.push(assistant);
-      persist(text || pendingAttachments[0]?.name || 'Image');
+      persist(text || pendingAttachments[0]?.name || t('image'));
     } catch (error) {
       messages.pop();
       userBox.remove();
@@ -1005,6 +1200,7 @@
     if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); complete(); }
   });
   apiKey.addEventListener('change', loadModel);
+  languageSelect.addEventListener('change', () => setLanguage(languageSelect.value));
   $('#new-chat').addEventListener('click', newChat);
   $('#mobile-new').addEventListener('click', newChat);
   $('#sidebar-close').addEventListener('click', () => setSidebarOpen(false));
@@ -1025,6 +1221,9 @@
   });
   chat.addEventListener('load', updateResponseScroll, true);
   updateSidebar();
+  languageSelect.value = locale;
+  applyTranslations();
+  showEfforts(modelReasoning);
   renderChat();
   renderRecents();
   updateComposer();

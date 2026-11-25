@@ -19,7 +19,7 @@ struct LaunchOptions: View {
             if state.server.phase == .ready, let cost = state.server.lanesCost {
                 LanesCostNote(cost: cost)
             }
-            DisclosureRow(title: "Advanced", open: $advanced)
+            DisclosureRow(title: L("Advanced"), open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
                 .onChange(of: advanced) { if advanced { row.scrollToTop() } else { row.stop() } }
             if advanced {
@@ -28,7 +28,7 @@ struct LaunchOptions: View {
                     if !options.isEmpty {
                         // A band across the card, as a list groups its rows, so that each part
                         // reads as one.
-                        Text(section.rawValue)
+                        Text(L(section.rawValue))
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -46,14 +46,14 @@ struct LaunchOptions: View {
             }
         } header: {
             HStack(alignment: .firstTextBaseline) {
-                SectionTitle(text: LaunchOption.Section.main.rawValue)
+                SectionTitle(text: L(LaunchOption.Section.main.rawValue))
                 Spacer()
                 // For the options the card shows. Laid out while hidden, so that the header keeps
                 // its height: the button is taller than the title, and as it came and went the card
                 // under it moved. It shows within `settle` and goes at once.
                 let defaults = state.options.defaults(for: family)
                 let changed = state.options != defaults
-                Button("Restore Defaults") { state.options = defaults }
+                Button(L("Restore Defaults")) { state.options = defaults }
                     .buttonStyle(.hover)
                     .foregroundStyle(.tint)
                     .font(.callout)
@@ -91,7 +91,8 @@ private struct LanesCostNote: View {
     let cost: Server.LanesCost
 
     var body: some View {
-        Label("The model running answers \(cost.lanes) requests at once, which leaves \(ContextLength.title(cost.context)) of context; 4 would leave \(ContextLength.title(cost.defaultContext)).",
+        Label(L("The model running answers %d requests at once, which leaves %@ of context; 4 would leave %@.",
+                cost.lanes, ContextLength.title(cost.context), ContextLength.title(cost.defaultContext)),
               systemImage: "info.circle")
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -106,7 +107,7 @@ private struct CacheOffNote: View {
     let reason: String
 
     var body: some View {
-        Label("The model running has the SSD cache off: \(reason).", systemImage: "exclamationmark.triangle.fill")
+        Label(L("The model running has the SSD cache off: %@.", reason), systemImage: "exclamationmark.triangle.fill")
             .font(.callout)
             .foregroundStyle(.secondary)
             .symbolRenderingMode(.multicolor)
@@ -140,7 +141,7 @@ private struct OptionLabel: View {
             .animation(Motion.quick, value: visible)
             // A dimmed option still says what it does, and what it needs to apply.
             .environment(\.isEnabled, true)
-            .accessibilityLabel("About \(title)")
+            .accessibilityLabel(L("About %@", title))
             .popover(isPresented: $shown, arrowEdge: .bottom) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(help)
@@ -190,17 +191,17 @@ private struct OptionRow: View {
                 case .toggle(let on):
                     Toggle(isOn: Binding(get: { applies && (value.wrappedValue == "true") == on },
                                          set: { value.wrappedValue = $0 == on ? "true" : nil })) {
-                        OptionLabel(title: option.title, help: option.help)
+                        OptionLabel(title: L(option.title), help: L(option.help))
                     }
                 case .choice(let standard, _, let custom):
-                    ChoicePicker(title: option.title, help: option.help, standard: standard, choices: option.choices(for: family),
+                    ChoicePicker(title: L(option.title), help: L(option.help), standard: L(standard), choices: option.choices(for: family),
                                  custom: custom, family: family, takes: takes, value: value)
                 case .text(let custom, _):
-                    TextRow(title: option.title, help: option.help, custom: custom, takes: takes, value: value)
+                    TextRow(title: L(option.title), help: L(option.help), custom: custom, takes: takes, value: value)
                 case .folder:
-                    FolderRow(title: option.title, help: option.help, value: value)
+                    FolderRow(title: L(option.title), help: L(option.help), value: value)
                 case .secret:
-                    TextRow(title: option.title, help: option.help, custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
+                    TextRow(title: L(option.title), help: L(option.help), custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
                             takes: takes, secure: true, value: $state.options.apiKey, left: state.keepKey)
                         .disabled(state.keyProblem != nil)
                 }
@@ -251,12 +252,12 @@ private struct ChoicePicker: View {
     var body: some View {
         // A value typed in before, which the choices don't hold.
         let typed = value.flatMap { value in
-            choices.contains { $0.value == value } ? nil : custom.map { PopupItem(id: value, title: $0.title(value)) }
+            choices.contains { $0.value == value } ? nil : custom.map { PopupItem(id: value, title: L($0.title(value))) }
         }
-        let items = [PopupItem(id: Self.none, title: standard, badge: "Default")]
-            + choices.map { PopupItem(id: $0.value, title: $0.title) }
+        let items = [PopupItem(id: Self.none, title: standard, badge: L("Default"))]
+            + choices.map { PopupItem(id: $0.value, title: L($0.title)) }
             + [typed].compactMap { $0 }
-            + (custom == nil ? [] : [PopupItem(id: Self.other, title: "Custom…", separated: true)])
+            + (custom == nil ? [] : [PopupItem(id: Self.other, title: L("Custom…"), separated: true)])
         OptionLabeled(title: title, help: help) {
             // Its row names it.
             PopupMenu(items: items, chosen: value ?? Self.none) { choice in
@@ -300,9 +301,9 @@ private struct TextRow: View {
         OptionLabeled(title: title, help: help) {
             Group {
                 if secure {
-                    SecureField(title, text: $text, prompt: Text(custom.prompt))
+                    SecureField(title, text: $text, prompt: Text(L(custom.prompt)))
                 } else {
-                    TextField(title, text: $text, prompt: Text(custom.prompt))
+                    TextField(title, text: $text, prompt: Text(L(custom.prompt)))
                 }
             }
             .labelsHidden()
@@ -350,13 +351,13 @@ private struct FolderRow: View {
         OptionLabeled(title: title, help: help) {
             HStack {
                 Spacer(minLength: 0)
-                Text(value.map { URL(filePath: $0).lastPathComponent } ?? "Default")
+                Text(value.map { URL(filePath: $0).lastPathComponent } ?? L("Default"))
                     .foregroundStyle(.secondary)
                     .truncationMode(.middle)
                     .layoutPriority(1)
                     .help(value ?? "")
                 if value != nil {
-                    Button { value = nil } label: { Text("Use Default").optionField() }.buttonStyle(.hoverFlush)
+                    Button { value = nil } label: { Text(L("Use Default")).optionField() }.buttonStyle(.hoverFlush)
                 }
                 Button {
                     let panel = NSOpenPanel()
@@ -365,7 +366,7 @@ private struct FolderRow: View {
                     panel.canCreateDirectories = true
                     if panel.runModal() == .OK, let url = panel.url { value = url.path }
                 } label: {
-                    Text("Choose…").optionField()
+                    Text(L("Choose…")).optionField()
                 }
                 .buttonStyle(.hoverFlush)
             }
@@ -388,7 +389,7 @@ private struct CustomValueSheet: View {
     var body: some View {
         Form {
             Section {
-                TextField(title, text: $text, prompt: Text(custom.prompt))
+                TextField(title, text: $text, prompt: Text(L(custom.prompt)))
                     .labelsHidden()
                     .focused($focused)
                     .onSubmit(done)
@@ -405,9 +406,9 @@ private struct CustomValueSheet: View {
             focused = true
         }
         .toolbar {
-            ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+            ToolbarItem(placement: .cancellationAction) { Button(L("Cancel")) { dismiss() } }
             ToolbarItem(placement: .confirmationAction) {
-                Button("Set", action: done).disabled(value == nil)
+                Button(L("Set"), action: done).disabled(value == nil)
             }
         }
     }

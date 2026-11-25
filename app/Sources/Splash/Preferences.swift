@@ -235,7 +235,7 @@ struct LaunchOption: Identifiable, Sendable {
 
     /// What the option lacks to have effect with the others set as they are; nil while it has it.
     func lacks(_ settings: ServeSettings) -> String? {
-        let reasons = requires.filter { !$0.met(settings) }.map(\.reason)
+        let reasons = requires.filter { !$0.met(settings) }.map { L($0.reason) }
         return reasons.isEmpty ? nil : reasons.joined(separator: " ")
     }
 
@@ -309,7 +309,7 @@ struct ModelFamily: Decodable, Equatable, Sendable {
     /// they serve; nil for any other.
     func refusal(_ flag: String, _ value: String) -> String? {
         guard flag == "--max-context", let tokens = Int(value), let most = maxContextTokens, tokens > most else { return nil }
-        return "The model picked serves at most \(ContextLength.title(most)); it starts on Auto."
+        return L("The model picked serves at most %@; it starts on Auto.", ContextLength.title(most))
     }
 
     /// What to beware of with `value` for the option `flag`, which its models take: a context
@@ -339,7 +339,7 @@ extension LaunchOption {
             help: "The most memory the model may use, to leave room for other apps. Auto gives it what this Mac can.",
             section: .main,
             kind: .choice(standard: "Auto", choices: ServeSettings.memoryLimits(memory: Catalog.memory).map { ("\($0)G", "\($0) GB") },
-                          custom: Value(prompt: "40", message: "Gigabytes, a whole number. This Mac has \(Catalog.memory) GB.",
+                          custom: Value(prompt: "40", message: L("Gigabytes, a whole number. This Mac has %d GB.", Catalog.memory),
                                         parse: { Int($0.trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? "\($0)G" : nil } },
                                         text: { String($0.dropLast()) }, title: { "\($0.dropLast()) GB" }))),
         LaunchOption(
@@ -353,7 +353,7 @@ extension LaunchOption {
             section: .main,
             kind: .choice(standard: "After 10 Minutes",
                           choices: [("30m", "After 30 Minutes"), ("1h", "After 1 Hour"), ("off", "Never")],
-                          custom: duration(message: "Seconds, or with s, m or h, such as 45m."))),
+                          custom: duration(message: L("Seconds, or with s, m or h, such as 45m.")))),
         LaunchOption(
             flag: "--language-only", title: "Text only",
             help: "Leaves the model’s vision out: it loads less, and refuses images and PDFs.",
@@ -426,7 +426,7 @@ extension LaunchOption {
             section: .network,
             kind: .choice(standard: "This Mac Only", choices: [("0.0.0.0", "All Networks")], custom: nil),
             warning: { $0["--host"] != nil && $0.apiKey == nil
-                ? "Any device on these networks can use the model. Set an API key to require one." : nil }),
+                ? L("Any device on these networks can use the model. Set an API key to require one.") : nil }),
         LaunchOption(
             flag: "--allowed-host", title: "Host names",
             help: "Names other than this Mac’s own .local name that clients reach it by, such as a DNS name.",
@@ -440,7 +440,7 @@ extension LaunchOption {
             kind: .text(Value(prompt: "None", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
                         list: true),
             warning: { $0["--allowed-origin"].map(items)?.contains("*") == true && $0.apiKey == nil
-                ? "Any website open in a browser can use the model. Set an API key to require one." : nil }),
+                ? L("Any website open in a browser can use the model. Set an API key to require one.") : nil }),
         LaunchOption(
             flag: "--api-key", title: "API key",
             help: "A key every request but the chat page’s must carry. Splash’s own chat and coding agents send it.",
@@ -463,7 +463,7 @@ extension LaunchOption {
             flag: "--thinking-token-budget", title: "Thinking tokens",
             help: "The most a request that sets none thinks before its thinking closes.",
             section: .api,
-            kind: .choice(standard: "No Limit", choices: [], custom: Value(prompt: "4096", message: "Tokens, a whole number.",
+            kind: .choice(standard: "No Limit", choices: [], custom: Value(prompt: "4096", message: L("Tokens, a whole number."),
                                                                           parse: whole))),
         LaunchOption(
             flag: "--thinking-end-text", title: "Thinking end text",
@@ -486,7 +486,8 @@ extension LaunchOption {
             help: "The value of a sampling setting for requests that set none, as name=value, such as temperature=0.7.",
             section: .api,
             kind: .text(Value(prompt: "temperature=0.7",
-                              message: "Name=value pairs, split at commas, each name one of \(samplingNames.formatted(.list(type: .or))); top_k a whole number.",
+                              message: L("Name=value pairs, split at commas, each name one of %@; top_k a whole number.",
+                                         samplingNames.formatted(.list(type: .or))),
                               parse: { samplingDefaults($0) }), list: true)),
     ]
 
@@ -496,12 +497,12 @@ extension LaunchOption {
             help: "How long a request may wait and run before it ends with an error.",
             section: .requests,
             kind: .choice(standard: "None", choices: [("5m", "5 Minutes"), ("30m", "30 Minutes"), ("1h", "1 Hour")],
-                          custom: duration(message: "Seconds, or with s, m or h, such as 10m."))),
+                          custom: duration(message: L("Seconds, or with s, m or h, such as 10m.")))),
         LaunchOption(
             flag: "--queue-size", title: "Queue limit",
             help: "Requests taken at once, running or waiting; more are turned away.",
             section: .requests,
-            kind: .choice(standard: "32", choices: [], custom: Value(prompt: "64", message: "A whole number.", parse: whole))),
+            kind: .choice(standard: "32", choices: [], custom: Value(prompt: "64", message: L("A whole number."), parse: whole))),
         LaunchOption(
             flag: "--max-request-size", title: "Request size",
             help: "The largest request body, images and PDFs included.",
@@ -510,14 +511,14 @@ extension LaunchOption {
             flag: "--max-image-pixels", title: "Image pixels",
             help: "The most pixels an image is resized to, 65,536 to 4,194,304.",
             section: .requests,
-            kind: .choice(standard: "4,194,304", choices: [], custom: Value(prompt: "1048576", message: "Pixels, 65,536 to 4,194,304.",
+            kind: .choice(standard: "4,194,304", choices: [], custom: Value(prompt: "1048576", message: L("Pixels, 65,536 to 4,194,304."),
                                                                            parse: whole)),
             requires: [Requirement("Needs the model’s vision (Text only off).") { !$0.textOnly }]),
         LaunchOption(
             flag: "--decode-share", title: "Decode share",
             help: "Seconds of answering for each second spent reading a new prompt: more keeps answers flowing, less starts the new one sooner; 0 takes turns step by step.",
             section: .requests,
-            kind: .choice(standard: "0.5", choices: [], custom: Value(prompt: "1", message: "A number, 0 or more.",
+            kind: .choice(standard: "0.5", choices: [], custom: Value(prompt: "1", message: L("A number, 0 or more."),
                                                                      parse: { Double($0).flatMap { $0 >= 0 ? String($0) : nil } }))),
         LaunchOption(
             flag: "--verify-rows", title: "Repeatable answers",
@@ -547,7 +548,7 @@ extension LaunchOption {
 
     /// A size typed in, as `splash serve` takes one: bytes, or a number with K, M or G.
     private static func size(example: String) -> Value {
-        Value(prompt: example, message: "A size with K, M or G, such as \(example).",
+        Value(prompt: example, message: L("A size with K, M or G, such as %@.", example),
               parse: { text in
                   let value = text.trimmingCharacters(in: .whitespaces).uppercased().replacing(/\s+/, with: "")
                   return value.wholeMatch(of: /\d+(\.\d+)?[KMG]|\d+/) != nil ? value : nil
@@ -592,7 +593,7 @@ enum ContextLength {
 
     /// A length as the menu names it: 32K tokens, 1M tokens, 100,000 tokens.
     static func title(_ tokens: Int) -> String {
-        "\(figure(tokens)) tokens"
+        L("%@ tokens", figure(tokens))
     }
 
     /// A length in short: 32K, 1M, 100,000.
@@ -610,18 +611,19 @@ enum ContextLength {
     /// What the sheet that asks for a length says, for a model of `family`: the most it serves,
     /// and whether YaRN stretches its own window that far.
     static let message: @Sendable (ModelFamily) -> String = { family in
-        let units = "Tokens, with K for 1024 or M for a million"
+        let units = L("Tokens, with K for 1024 or M for a million")
         guard let window = family.contextTokens, let most = family.maxContextTokens else {
-            return "\(units), such as 100K or 1M. \(yarn(nil))"
+            return L("%@, such as 100K or 1M. %@", units, yarn(nil))
         }
-        guard most > window else { return "\(units), such as 100K; at most \(figure(window)), the model’s own window." }
-        return "\(units), such as 100K or 1M; at most \(figure(most)). \(yarn(window))"
+        guard most > window else { return L("%@, such as 100K; at most %@, the model’s own window.", units, figure(window)) }
+        return L("%@, such as 100K or 1M; at most %@. %@", units, figure(most), yarn(window))
     }
 
     /// What a length past a model's own window `window`, which YaRN stretches, costs: one sentence,
     /// the window named where it is known.
     static func yarn(_ window: Int?) -> String {
-        "Past the model’s own window\(window.map { ", \(figure($0))," } ?? "") it stretches it with YaRN, which changes answers at every length."
+        L("Past the model’s own window%@ it stretches it with YaRN, which changes answers at every length.",
+          window.map { L(", %@,", figure($0)) } ?? "")
     }
 
     /// The most context `splash serve` takes, its MAX_YARN_CONTEXT_TOKENS, which a test holds this
@@ -651,7 +653,7 @@ struct Keychain: Sendable {
     /// Why the Keychain didn't read or keep the key.
     struct Failure: LocalizedError {
         let status: OSStatus
-        var errorDescription: String? { SecCopyErrorMessageString(status, nil) as String? ?? "Keychain error \(status)." }
+        var errorDescription: String? { SecCopyErrorMessageString(status, nil) as String? ?? L("Keychain error %d.", Int(status)) }
     }
 
     private var query: [CFString: Any] {

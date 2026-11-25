@@ -146,7 +146,13 @@ the same id, or a status no longer has it. A start that fails
 says why, as its serve record
 has it, the log keeping the starts before it; one that failed for want of
 memory offers the start that would fit, under a memory limit that holds the
-model or with the context length on Auto. Its chat is its own, not the chat page: it streams
+model or with the context length on Auto. The app's words follow the language
+macOS picks for Splash, English and Simplified Chinese, set per app in System
+Settings › General › Language & Region › Applications; another language adds
+its `Localizable.strings` beside theirs in `app/Sources/Splash/Resources` and
+its name to `CFBundleLocalizations` (`dev/tools/package_app.py`), as the chat
+page adds a column to its `translations` and a name to its Language menu. Its
+chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, its attachments as files of their
 own in that folder's `Attachments`, so a conversation outlives a switch of

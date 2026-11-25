@@ -36,17 +36,17 @@ struct SplashCommands: Commands {
     var body: some Commands {
         let shows = state.windowShows
         CommandGroup(after: .appInfo) {
-            Button("Check for Updates…") { updates.check() }
+            Button(L("Check for Updates…")) { updates.check() }
                 .disabled(!updates.canCheck)
         }
         CommandGroup(after: .pasteboard) {
             // In what the drawer shows: a terminal, a log.
-            Button("Find…") { state.drawer.find() }
+            Button(L("Find…")) { state.drawer.find() }
                 .keyboardShortcut("f")
                 .disabled(!state.available || !shows || !state.showsDrawer)
         }
         CommandGroup(replacing: .newItem) {
-            Button("New Chat") {
+            Button(L("New Chat")) {
                 inWindow {
                     state.section = .chat
                     state.newChat()
@@ -59,17 +59,17 @@ struct SplashCommands: Commands {
         // The toolbar holds the switch to the Chat and the Server's button; it is not to be
         // hidden. The sidebar is.
         CommandGroup(replacing: .toolbar) {
-            Button(shows && state.showsSidebar ? "Hide Sidebar" : "Show Sidebar") {
+            Button(L(shows && state.showsSidebar ? "Hide Sidebar" : "Show Sidebar")) {
                 if shows { state.toggleSidebar() } else { inWindow { state.showsSidebar = true } }
             }
             .keyboardShortcut("b")
             .disabled(!state.available || state.section == .server)
-            Button(shows && state.showsDrawer ? "Hide Terminal and Logs" : "Show Terminal and Logs") {
+            Button(L(shows && state.showsDrawer ? "Hide Terminal and Logs" : "Show Terminal and Logs")) {
                 if shows { state.toggleDrawer() } else { inWindow { state.showDrawer(state.drawer.part) } }
             }
             .keyboardShortcut("j")
             .disabled(!state.available)
-            Button("New Terminal") {
+            Button(L("New Terminal")) {
                 inWindow {
                     state.newTerminal()
                     state.showDrawer(.terminal)
@@ -78,16 +78,16 @@ struct SplashCommands: Commands {
             .keyboardShortcut("t", modifiers: [.command, .shift])
             .disabled(!state.available)
             Divider()
-            Button("Server") { inWindow { state.section = .server } }
+            Button(L("Server")) { inWindow { state.section = .server } }
                 .keyboardShortcut("1")
                 .disabled(!state.available)
-            Button("Chat") { inWindow { state.section = .chat } }
+            Button(L("Chat")) { inWindow { state.section = .chat } }
                 .keyboardShortcut("2")
                 .disabled(!state.available)
         }
         CommandGroup(replacing: .help) {
-            Button("Show Server Log") { Self.open(state.server.log) }
-            Button("Show Download Log") { Self.open(state.installer.log) }
+            Button(L("Show Server Log")) { Self.open(state.server.log) }
+            Button(L("Show Download Log")) { Self.open(state.installer.log) }
         }
     }
 
@@ -120,8 +120,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     override convenience init() {
         guard let runtime = Runtime.locate() else {
             let alert = NSAlert()
-            alert.messageText = "Splash is damaged"
-            alert.informativeText = "Its runtime is missing. Download Splash again."
+            alert.messageText = L("Splash is damaged")
+            alert.informativeText = L("Its runtime is missing. Download Splash again.")
             alert.runModal()
             exit(1)
         }
@@ -249,10 +249,10 @@ private final class QuitQuestion: NSObject {
             return
         }
         let alert = NSAlert()
-        alert.messageText = "Quit Splash?"
+        alert.messageText = L("Quit Splash?")
         alert.informativeText = message
         // Return chooses the first, Escape Cancel, as AppKit gives an alert's buttons.
-        for (title, action) in [("Quit", #selector(quitChosen)), ("Cancel", #selector(cancelChosen))] {
+        for (title, action) in [(L("Quit"), #selector(quitChosen)), (L("Cancel"), #selector(cancelChosen))] {
             let button = alert.addButton(withTitle: title)
             button.target = self
             button.action = action

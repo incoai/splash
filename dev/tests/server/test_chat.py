@@ -56,7 +56,7 @@ class Element {
 }
 
 function createChat(storage = new Map(), writable = true, models = null,
-                    crypto = require('node:crypto').webcrypto) {
+                    crypto = require('node:crypto').webcrypto, languages) {
   const elements = {};
   const requests = [];
   const modelRequests = [];
@@ -70,11 +70,13 @@ function createChat(storage = new Map(), writable = true, models = null,
   for (const id of ['chat', 'form', 'input', 'attachments', 'file-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
                    'mobile-new', 'menu', 'scrim', 'scroll-bottom', 'sidebar',
-                   'sidebar-close', 'sidebar-open', 'credentials', 'thinking']) elements[id] = new Element();
+                   'sidebar-close', 'sidebar-open', 'credentials', 'thinking',
+                   'language-select']) elements[id] = new Element();
   // Elements the markup hides start hidden, as in a browser.
   for (const [, id] of html.matchAll(/<\w+ id="([^"]+)"[^>]* hidden[ >]/g)) elements[id].hidden = true;
-  // The menu's options are the markup's.
-  elements.effort.children = [...html.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)]
+  // The effort menu's options are the markup's.
+  const effortMarkup = html.match(/<select id="effort"[^>]*>([\s\S]*?)<\/select>/)?.[1] ?? '';
+  elements.effort.children = [...effortMarkup.matchAll(/<option value="([^"]*)"[^>]*>([^<]*)<\/option>/g)]
     .map(([, value, textContent]) => Object.assign(new Element('option'), {value, textContent}));
   class FileReader {
     readAsDataURL(file) {
@@ -87,6 +89,7 @@ function createChat(storage = new Map(), writable = true, models = null,
   const context = vm.createContext({
     document: {
       querySelector: selector => elements[selector.slice(1)] || null,
+      querySelectorAll: () => [],
       createElement: tag => new Element(tag),
       body: new Element(),
       documentElement: viewport,
@@ -108,7 +111,7 @@ function createChat(storage = new Map(), writable = true, models = null,
       context.scrollY = Math.min(options.top, viewport.scrollHeight - 800);
     },
     AbortController, TextDecoder, Uint8Array, console, FileReader,
-    navigator: {clipboard},
+    navigator: {clipboard, ...(languages ? {languages} : {})},
     confirm(message) { dialog.messages.push(message); return dialog.accept; },
     setTimeout: callback => { timers.push(callback); },
     atob: value => Buffer.from(value, 'base64').toString('binary'),
@@ -451,6 +454,26 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
     assert.equal(chat.requests[0].body.reasoning_effort, 'low');
     assert.equal(storage.get('splash-thinking-effort'), 'low');
   }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_the_chat_page_speaks_the_browsers_language_and_can_switch(self):
+        self.run_chat(r"""
+(async () => {
+  const storage = new Map();
+  const chat = createChat(storage, true, null, undefined, ['zh-CN', 'en']);
+  assert.equal(chat.elements['language-select'].value, 'zh-Hans');
+  assert.equal(chat.elements.chat.children[0].textContent, '有什么可以帮你？');
+  // The effort menu, from the markup while the server is offline, speaks too.
+  assert.deepEqual(effortMenu(chat), [['', '自动'], ['none', '关闭']]);
+  // A direction picked here outranks the browser on the next load.
+  chat.elements['language-select'].value = 'en';
+  chat.elements['language-select'].handlers.change();
+  assert.equal(storage.get('splash-language'), 'en');
+  assert.equal(chat.elements.chat.children[0].textContent, 'How can I help?');
+  const english = createChat(new Map([['splash-language', 'en']]), true, null, undefined, ['zh-CN']);
+  assert.equal(english.elements['language-select'].value, 'en');
+  assert.equal(english.elements.chat.children[0].textContent, 'How can I help?');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
@@ -1155,13 +1178,16 @@ class ChatPageTest(HarnessTestCase):
             self.assertIn(b">" + label + b"</option>", payload)
         for label in (b"Splash", b"New chat", b"Recents"):
             self.assertIn(label, payload)
-        self.assertIn(
-            b'<label id="credentials" hidden>This server needs an API key', payload
-        )
+        self.assertIn(b"This server needs an API key", payload)
+        self.assertIn(b'data-i18n="apiKeyNeeded"', payload)
+        self.assertIn(b'id="language-select"', payload)
+        self.assertIn(b'value="zh-Hans"', payload)
+        self.assertIn("新建对话".encode(), payload)
+        self.assertIn(b'data-i18n="newChat"', payload)
         self.assertIn(b"reasoning_effort", payload)
         self.assertIn(b"include_usage", payload)
         self.assertIn(b"tokens_per_second", payload)
-        self.assertIn(b"showEfforts(model.reasoning)", payload)
+        self.assertIn(b"showEfforts(modelReasoning)", payload)
         self.assertIn(b"function storageGet", payload)
         self.assertIn(b"function storageSet", payload)
         self.assertIn(b"JSON.parse(storageGet(storeKey))", payload)

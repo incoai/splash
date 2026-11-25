@@ -70,8 +70,8 @@ struct RowMenuButton<Actions: View>: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .padding(.trailing, trailing)
-        .help("More")
-        .accessibilityLabel("More")
+        .help(L("More"))
+        .accessibilityLabel(L("More"))
     }
 }
 
@@ -153,6 +153,6 @@ struct DisclosureRow: View {
         }
         .buttonStyle(.hoverRow)
         .hoverRowAligned()
-        .accessibilityValue(open ? "Expanded" : "Collapsed")
+        .accessibilityValue(L(open ? "Expanded" : "Collapsed"))
     }
 }

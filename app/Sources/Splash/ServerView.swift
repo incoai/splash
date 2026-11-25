@@ -62,15 +62,15 @@ private struct ServerSections: View {
                 || state.installer.running || state.keyProblem != nil || !awaitingVision.isEmpty {
                 GroupedSection {
                     if let problem = state.keyProblem {
-                        NoticeRow(title: "Splash can’t use its API key",
-                                  message: "The Keychain says: \(problem) Allow Splash to use it, then try again.",
-                                  action: ("Try Again", state.retryKey))
+                        NoticeRow(title: L("Splash can’t use its API key"),
+                                  message: L("The Keychain says: %@ Allow Splash to use it, then try again.", problem),
+                                  action: (L("Try Again"), state.retryKey))
                     }
                     if case .failed(let message) = state.server.phase, let model = state.server.model {
                         // What its failure says would help: a start that would fit, or, for files on
                         // this Mac Splash can't serve, the start without the projector or draft
                         // chosen for them, else taking them off the list.
-                        NoticeRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
+                        NoticeRow(title: L("%@ ran into a problem", state.displayName(of: model)), message: message,
                                   log: .server, dismiss: state.server.dismissFailure,
                                   action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) })
                     }
@@ -79,15 +79,15 @@ private struct ServerSections: View {
                         let name = state.displayName(of: failure.model)
                         switch state.installer.work {
                         case .download:
-                            NoticeRow(title: "\(name) couldn’t download", message: failure.message, log: .downloads,
+                            NoticeRow(title: L("%@ couldn’t download", name), message: failure.message, log: .downloads,
                                       dismiss: state.installer.dismissFailure,
-                                      action: ("Download Again", { state.download(failure.model) }))
+                                      action: (L("Download Again"), { state.download(failure.model) }))
                         case .check:
-                            NoticeRow(title: "Splash couldn’t check \(name) for updates", message: failure.message,
+                            NoticeRow(title: L("Splash couldn’t check %@ for updates", name), message: failure.message,
                                       log: .downloads, dismiss: state.installer.dismissFailure,
-                                      action: ("Check Again", { state.checkForUpdates(failure.model) }))
+                                      action: (L("Check Again"), { state.checkForUpdates(failure.model) }))
                         case .removal:
-                            NoticeRow(title: "Splash couldn’t delete \(name)", message: failure.message, log: .downloads,
+                            NoticeRow(title: L("Splash couldn’t delete %@", name), message: failure.message, log: .downloads,
                                       dismiss: state.installer.dismissFailure)
                         }
                     }
@@ -97,10 +97,10 @@ private struct ServerSections: View {
                     ForEach(awaitingVision) { model in
                         // One download at a time, and the model that runs is updated once stopped.
                         let serving = state.serving(model.id)
-                        NoticeRow(quietSymbol: "photo", title: "\(state.displayName(of: model.id)) is installed text only",
-                                  message: "Splash serves its images now. \(serving ? "Stop it, then update" : "Update") it to add its vision tower.",
+                        NoticeRow(quietSymbol: "photo", title: L("%@ is installed text only", state.displayName(of: model.id)),
+                                  message: L("Splash serves its images now. %@ it to add its vision tower.", L(serving ? "Stop it, then update" : "Update")),
                                   action: serving || !state.ready || state.installer.running
-                                      ? nil : ("Update", { state.checkForUpdates(model.id) }))
+                                      ? nil : (L("Update"), { state.checkForUpdates(model.id) }))
                     }
                     if state.installer.running { DownloadRow() }
                 } header: {
@@ -111,7 +111,7 @@ private struct ServerSections: View {
                 GroupedSection {
                     ForEach(state.installed) { ModelRow(model: $0) }
                 } header: {
-                    SectionTitle(text: "Models on This Mac")
+                    SectionTitle(text: L("Models on This Mac"))
                 } footer: {
                     otherModels
                 }
@@ -123,10 +123,10 @@ private struct ServerSections: View {
                                  lead: first && !state.installer.running && !state.findingCachedModels && variant == suggestions.first)
                 }
             } header: {
-                if !available.isEmpty { SectionTitle(text: "Available to Download") }
+                if !available.isEmpty { SectionTitle(text: L("Available to Download")) }
             } footer: {
                 if suggestions.isEmpty, let minimum = state.catalog.minimumMemory {
-                    Text("The suggested models need a Mac with at least \(minimum) GB of memory; this one has \(Catalog.memory) GB.")
+                    Text(L("The suggested models need a Mac with at least %d GB of memory; this one has %d GB.", minimum, Catalog.memory))
                 }
                 if first { otherModels }
             }
@@ -159,9 +159,9 @@ private struct ServerSections: View {
     /// Ways to models the list doesn't offer: one from Hugging Face by its ID, or files on this Mac.
     private var otherModels: some View {
         HStack(spacing: 4) {
-            Button("Download Another Model…") { customModel = true }
+            Button(L("Download Another Model…")) { customModel = true }
                 .disabled(state.installer.running || !state.ready)
-            Button("Add Model from This Mac…", action: addLocal)
+            Button(L("Add Model from This Mac…"), action: addLocal)
                 .disabled(!state.ready)
         }
         .buttonStyle(.hover)
@@ -175,8 +175,8 @@ private struct ServerSections: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowedContentTypes = [.folder] + (UTType(filenameExtension: "gguf").map { [$0] } ?? [])
-        panel.prompt = "Add"
-        panel.message = "Choose a GGUF file, or the folder of an MLX or GGUF model."
+        panel.prompt = L("Add")
+        panel.message = L("Choose a GGUF file, or the folder of an MLX or GGUF model.")
         guard panel.runModal() == .OK, let url = panel.url else { return }
         state.addLocal(url)
     }
@@ -185,18 +185,18 @@ private struct ServerSections: View {
     /// looked for and after.
     private var welcome: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Welcome to Splash")
+            Text(L("Welcome to Splash"))
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.primary)
             if state.findingCachedModels {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text("Looking for models already on this Mac…")
+                    Text(L("Looking for models already on this Mac…"))
                 }
                 .font(.body)
                 .foregroundStyle(.secondary)
             } else {
-                Text("Splash runs AI models privately on this Mac. Download one to get started.")
+                Text(L("Splash runs AI models privately on this Mac. Download one to get started."))
                     .font(.body)
                     .foregroundStyle(.secondary)
             }
@@ -262,20 +262,20 @@ private struct ControlBar: View {
             let step = server.step.rawValue
             TimelineView(.periodic(from: server.stepSince, by: 1)) { context in
                 let seconds = Int(context.date.timeIntervalSince(server.stepSince))
-                Text(seconds < 3 ? "\(step)…" : "\(step) · \(seconds)s").monospacedDigit()
+                Text(seconds < 3 ? L("%@…", L(step)) : L("%@ · %ds", L(step), seconds)).monospacedDigit()
             }
-            .help(server.step.note ?? "")
+            .help(server.step.note.map { L($0) } ?? "")
         case .ready where !server.recovering:
             HStack(spacing: 4) {
-                Text(verbatim: "\(server.serving.rawValue) · Port \(server.settings.port)")
-                    .help(server.asleep ? "It freed its memory while idle and loads again with the next message." : "")
+                Text(verbatim: "\(L(server.serving.rawValue)) · \(L("Port %d", server.settings.port))")
+                    .help(server.asleep ? L("It freed its memory while idle and loads again with the next message.") : "")
                 CopyButton(copy: state.copyAPIAddress)
                     .buttonStyle(.hover)
-                    .help("Copy API Address: \(state.apiAddress)")
-                    .accessibilityLabel("Copy API Address")
+                    .help(L("Copy API Address: %@", state.apiAddress))
+                    .accessibilityLabel(L("Copy API Address"))
             }
         case .failed where othersFailure:
-            Text("Not running")
+            Text(L("Not running"))
         default:
             Text(state.serverStatus.phrase)
         }
@@ -286,31 +286,31 @@ private struct ControlBar: View {
         switch server.phase {
         case .stopped, .failed:
             Button { if let model = state.selection { state.start(model) } } label: {
-                Text(failedPicked ? "Try Again" : "Start").frame(maxWidth: 240)
+                Text(L(failedPicked ? "Try Again" : "Start")).frame(maxWidth: 240)
             }
             .buttonStyle(.borderedProminent)
             .disabled(!(state.selection.map(state.canStart) ?? false))
         case .starting:
-            LateButton(title: "Cancel") { state.stop() }
+            LateButton(title: L("Cancel")) { state.stop() }
         case .stopping:
-            if server.next != nil { LateButton(title: "Cancel") { state.stop() } }
+            if server.next != nil { LateButton(title: L("Cancel")) { state.stop() } }
         case .ready:
             if let selection = state.selection, selection != server.model {
-                Button("Stop") { state.stop() }
+                Button(L("Stop")) { state.stop() }
                 Button { state.start(selection) } label: {
-                    Text("Switch to \(state.displayName(of: selection))").frame(maxWidth: 240)
+                    Text(L("Switch to %@", state.displayName(of: selection))).frame(maxWidth: 240)
                 }
                     .buttonStyle(.borderedProminent)
                     .disabled(!state.canStart(selection))
             } else {
                 AgentsPopup()
-                Button("Stop") { state.stop() }
+                Button(L("Stop")) { state.stop() }
                 if state.optionsChanged, let model = server.model {
-                    Button("Restart to Apply") { state.start(model) }
+                    Button(L("Restart to Apply")) { state.start(model) }
                         .buttonStyle(.borderedProminent)
                         .disabled(!state.canStart(model))
                 } else {
-                    Button("Open Chat") { state.section = .chat }.buttonStyle(.borderedProminent)
+                    Button(L("Open Chat")) { state.section = .chat }.buttonStyle(.borderedProminent)
                 }
             }
         }
@@ -345,7 +345,7 @@ private struct ActivitySection: View {
             RequestLog(requests: state.server.requests, totals: RequestLog.totals(state.server.activity, requests: state.server.requests),
                        open: advanced)
         } header: {
-            SectionTitle(text: "Activity")
+            SectionTitle(text: L("Activity"))
         }
     }
 }
@@ -360,13 +360,13 @@ private struct ActivityFigures: View {
         let latency = activity.firstToken.map(Format.latency)
         let memory = activity.memory.map { Format.parts(Format.memory($0)) }
         HStack(spacing: 0) {
-            Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering",
-                   help: "Average since the model started")
-            Figure(value: activity.reading.map(Format.whole), unit: "tok/s", caption: "Reading prompts",
-                   help: "Average since the model started")
-            Figure(value: latency?.0, unit: latency?.1, caption: "To first token", help: "Median since the model started")
-            Figure(value: context.map(ContextLength.figure), caption: "Context limit", help: "The tokens a conversation can hold")
-            Figure(value: memory?.0, unit: memory?.1, caption: "Memory", help: "What the engine holds in memory now")
+            Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: L("Answering"),
+                   help: L("Average since the model started"))
+            Figure(value: activity.reading.map(Format.whole), unit: "tok/s", caption: L("Reading prompts"),
+                   help: L("Average since the model started"))
+            Figure(value: latency?.0, unit: latency?.1, caption: L("To first token"), help: L("Median since the model started"))
+            Figure(value: context.map(ContextLength.figure), caption: L("Context limit"), help: L("The tokens a conversation can hold"))
+            Figure(value: memory?.0, unit: memory?.1, caption: L("Memory"), help: L("What the engine holds in memory now"))
         }
         .padding(.vertical, 6)
         .animation(Motion.settle, value: activity)
@@ -381,12 +381,12 @@ struct RequestLog: View {
     @State var open = false
 
     var body: some View {
-        DisclosureRow(title: "Requests", open: $open, detail: totals)
+        DisclosureRow(title: L("Requests"), open: $open, detail: totals)
         if open {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if requests.isEmpty {
-                        Text("No requests yet.").font(.callout).foregroundStyle(.tertiary).frame(height: 22)
+                        Text(L("No requests yet.")).font(.callout).foregroundStyle(.tertiary).frame(height: 22)
                     }
                     ForEach(requests) { request in
                         RequestRow(request: request)
@@ -410,9 +410,9 @@ struct RequestLog: View {
     static func totals(_ activity: Server.Activity, requests: [ServedRequest]) -> String? {
         guard activity.served > 0 || !requests.isEmpty else { return nil }
         let running = requests.count(where: \.running)
-        var parts = [activity.served.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
-        if activity.cached > 0 { parts.append("\(Format.count(activity.cached)) cached") }
-        if running > 0 { parts.append("\(running) running") }
+        var parts = [activity.served.formatted(), L("%@ tokens out", Format.count(activity.generated)), L("%@ in", Format.count(activity.read))]
+        if activity.cached > 0 { parts.append(L("%@ cached", Format.count(activity.cached))) }
+        if running > 0 { parts.append(L("%d running", running)) }
         return parts.joined(separator: " · ")
     }
 }
@@ -430,7 +430,7 @@ private struct RequestRow: View {
             if let end = request.end {
                 switch end.outcome {
                 case .cancelled:
-                    Text("Cancelled").foregroundStyle(.secondary)
+                    Text(L("Cancelled")).foregroundStyle(.secondary)
                 case .error:
                     Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).font(.system(size: 11))
                     Text(end.message ?? "").foregroundStyle(.secondary)
@@ -439,20 +439,20 @@ private struct RequestRow: View {
                     Text(Self.facts(end)).foregroundStyle(.secondary)
                 }
             } else if request.gone {
-                Text("Ended").foregroundStyle(.secondary)
+                Text(L("Ended")).foregroundStyle(.secondary)
             } else {
                 let input = request.input ?? 0
                 ProgressView().controlSize(.mini)
                 switch request.stage {
                 case .waiting(let why):
                     Text(why)
-                    Text("\(input.formatted()) in").foregroundStyle(.secondary)
+                    Text(L("%@ in", input.formatted())).foregroundStyle(.secondary)
                 case .reading(let read):
-                    Text("Reading \(Int(Double(read) / Double(max(input, 1)) * 100))%")
-                    Text("\(read.formatted()) of \(input.formatted()) in").foregroundStyle(.secondary)
+                    Text(L("Reading %d%%", Int(Double(read) / Double(max(input, 1)) * 100)))
+                    Text(L("%@ of %@ in", read.formatted(), input.formatted())).foregroundStyle(.secondary)
                 case .answering(let written):
                     Text(tokens(written))
-                    Text("Answering · \(input.formatted()) in").foregroundStyle(.secondary)
+                    Text(L("Answering · %@ in", input.formatted())).foregroundStyle(.secondary)
                 }
             }
         }
@@ -463,23 +463,23 @@ private struct RequestRow: View {
         .help(request.end?.raw ?? "")
         .contextMenu {
             if let line = request.end?.raw {
-                Button("Copy Line") { NSPasteboard.put(line) }
+                Button(L("Copy Line")) { NSPasteboard.put(line) }
             }
         }
     }
 
     private static func facts(_ end: RequestEntry) -> String {
         [end.rate.map { "\($0.formatted(.number.precision(.fractionLength(1)))) tok/s" },
-         end.firstToken.map { "first \(Format.seconds($0))" },
-         end.input.map { "\($0.formatted()) in" },
-         end.cached.flatMap { $0 > 0 ? "\($0.formatted()) cached" : nil }]
+         end.firstToken.map { L("first %@", Format.seconds($0)) },
+         end.input.map { L("%@ in", $0.formatted()) },
+         end.cached.flatMap { $0 > 0 ? L("%@ cached", $0.formatted()) : nil }]
             .compactMap { $0 }.joined(separator: " · ")
     }
 }
 
 /// So many tokens, as a request's line says them.
 private func tokens(_ count: Int) -> String {
-    "\(count.formatted()) \(count == 1 ? "token" : "tokens")"
+    count == 1 ? L("%@ token", count.formatted()) : L("%@ tokens", count.formatted())
 }
 
 /// The coding agents to open on the model that runs, in the drawer's terminals, in the folder they
@@ -490,10 +490,10 @@ private struct AgentsPopup: View {
 
     var body: some View {
         let folder = state.agentFolder?.lastPathComponent
-        PopupMenu(header: folder.map { "Open in \($0)" } ?? "Open in a Terminal",
+        PopupMenu(header: folder.map { L("Open in %@", $0) } ?? L("Open in a Terminal"),
                   items: Agent.allCases.map { PopupItem(id: $0.rawValue, title: folder == nil ? "\($0.title)…" : $0.title) }
-                      + [PopupItem(id: Self.folder, title: "Choose Folder…", separated: true),
-                         PopupItem(id: Self.copy, title: "Copy API Address", separated: true)],
+                      + [PopupItem(id: Self.folder, title: L("Choose Folder…"), separated: true),
+                         PopupItem(id: Self.copy, title: L("Copy API Address"), separated: true)],
                   chosen: nil, above: true) { choice in
             if let agent = Agent(rawValue: choice) {
                 state.open(agent)
@@ -504,14 +504,14 @@ private struct AgentsPopup: View {
             }
         } label: {
             HStack(spacing: 4) {
-                Text("Coding Agents")
+                Text(L("Coding Agents"))
                 MenuChevron()
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
         }
         .fixedSize()
-        .help("Open a coding agent in a terminal of the drawer, connected to this model")
+        .help(L("Open a coding agent in a terminal of the drawer, connected to this model"))
     }
 }
 
@@ -557,15 +557,15 @@ private struct NoticeRow: View {
             }
             Spacer(minLength: 12)
             if let log {
-                Button("Show Log") { state.showLog(log) }
+                Button(L("Show Log")) { state.showLog(log) }
             }
             if let action { Button(action.title, action: action.run) }
             if let dismiss {
                 Button(action: dismiss) { Image(systemName: "xmark") }
                     .buttonStyle(.hover)
                     .foregroundStyle(.secondary)
-                    .help("Dismiss")
-                    .accessibilityLabel("Dismiss")
+                    .help(L("Dismiss"))
+                    .accessibilityLabel(L("Dismiss"))
             }
         }
         .padding(.vertical, 4)
@@ -585,7 +585,7 @@ private struct DownloadRow: View {
                     .font(.headline)
                 Spacer()
                 // A deletion is quick, and cut short it would leave files no one uses.
-                if installer.work != .removal { Button("Cancel") { installer.cancel() } }
+                if installer.work != .removal { Button(L("Cancel")) { installer.cancel() } }
             }
             if let progress = installer.progress {
                 ProgressView(value: progress.fraction)
@@ -603,16 +603,16 @@ private struct DownloadRow: View {
         let installer = state.installer
         guard let progress = installer.progress else {
             switch installer.work {
-            case .download: return "Preparing download…"
-            case .check: return "Asking Hugging Face…"
-            case .removal: return "Removing its files…"
+            case .download: return L("Preparing download…")
+            case .check: return L("Asking Hugging Face…")
+            case .removal: return L("Removing its files…")
             }
         }
-        let amount = "\(Format.size(progress.done)) of \(Format.size(progress.total))"
+        let amount = L("%@ of %@", Format.size(progress.done), Format.size(progress.total))
         guard let remaining = installer.remaining else { return amount }
-        if remaining < .seconds(60) { return "\(amount) — less than a minute left" }
+        if remaining < .seconds(60) { return L("%@ — less than a minute left", amount) }
         let time = remaining.formatted(.units(allowed: [.hours, .minutes], width: .wide, maximumUnitCount: 1))
-        return "\(amount) — about \(time) left"
+        return L("%@ — about %@ left", amount, time)
     }
 }
 
@@ -625,10 +625,10 @@ private struct WarmupRow: View {
         let server = state.server
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Warming up \(server.model.map(state.displayName(of:)) ?? "")").font(.headline)
+                Text(L("Warming up %@", server.model.map(state.displayName(of:)) ?? "")).font(.headline)
                 Spacer()
                 if let warmup = server.warmup {
-                    Text("\(warmup.steps_done) of \(warmup.steps) steps").foregroundStyle(.secondary).monospacedDigit()
+                    Text(L("%d of %d steps", warmup.steps_done, warmup.steps)).foregroundStyle(.secondary).monospacedDigit()
                 }
             }
             if let warmup = server.warmup {
@@ -636,7 +636,7 @@ private struct WarmupRow: View {
             } else {
                 ProgressView().progressViewStyle(.linear)
             }
-            Text(server.step.note ?? "").font(.callout).foregroundStyle(.secondary)
+            Text(server.step.note.map { L($0) } ?? "").font(.callout).foregroundStyle(.secondary)
         }
         .padding(.vertical, 4)
     }
@@ -656,9 +656,9 @@ private struct ModelRow: View {
         let selected = state.selection == model.id
         let files = state.modelFiles[model.id]
         // A projector, which Text only leaves out of the start, says so.
-        let projector = files?.projector.map { _ in state.settings(for: model.id).textOnly ? "projector off (Text only)" : "with projector" }
-        let detail = ([model.id, model.missing ? "Not found" : model.bytes.map(Format.size), projector,
-                       files?.draft.map { _ in "with draft" }] as [String?])
+        let projector = files?.projector.map { _ in state.settings(for: model.id).textOnly ? L("projector off (Text only)") : L("with projector") }
+        let detail = ([model.id, model.missing ? L("Not found") : model.bytes.map(Format.size), projector,
+                       files?.draft.map { _ in L("with draft") }] as [String?])
             .compactMap { $0 }.joined(separator: " · ")
         Button { state.selection = model.id } label: {
             HStack(spacing: 8) {
@@ -702,15 +702,15 @@ private struct ModelRow: View {
         .accessibilityLabel("\(state.displayName(of: model.id)), \(detail)")
         .accessibilityValue(phase ?? "")
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .help(state.catalog.about(of: model.id) ?? model.id)
+        .help(state.catalog.about(of: model.id).map { L($0) } ?? model.id)
         .contextMenu { actions }
         // The question goes where its answer no longer could, as a start begun from the menu bar.
         .onChange(of: state.canDelete(model.id)) { _, can in if !can { deleting = false } }
-        .confirmationDialog("Delete \(state.displayName(of: model.id))?", isPresented: $deleting) {
-            Button("Delete", role: .destructive) { state.delete(model.id) }
+        .confirmationDialog(L("Delete %@?", state.displayName(of: model.id)), isPresented: $deleting) {
+            Button(L("Delete"), role: .destructive) { state.delete(model.id) }
         } message: {
-            Text("Its files\(model.bytes.map { ", \(Format.size($0))," } ?? "") go from the Hugging Face cache, where the splash "
-                + "command and other apps may use them too, unless another model on this Mac uses them.")
+            Text(L("Its files%@ go from the Hugging Face cache, where the splash command and other apps may use them too, unless another model on this Mac uses them.",
+                   model.bytes.map { L(", %@,", Format.size($0)) } ?? ""))
         }
     }
 
@@ -722,26 +722,26 @@ private struct ModelRow: View {
         if model.local {
             let files = state.modelFiles[model.id] ?? AppState.ModelFiles()
             if model.gguf {
-                Button(files.projector == nil ? "Choose Vision Projector…" : "Change Vision Projector…") { chooseProjector() }
+                Button(L(files.projector == nil ? "Choose Vision Projector…" : "Change Vision Projector…")) { chooseProjector() }
                 if files.projector != nil {
-                    Button("Remove Vision Projector") { state.modelFiles[model.id, default: files].projector = nil }
+                    Button(L("Remove Vision Projector")) { state.modelFiles[model.id, default: files].projector = nil }
                 }
             }
-            Button(files.draft == nil ? "Choose Draft Model…" : "Change Draft Model…") { chooseDraft() }
+            Button(L(files.draft == nil ? "Choose Draft Model…" : "Change Draft Model…")) { chooseDraft() }
             if files.draft != nil {
-                Button("Use the Family’s Draft") { state.modelFiles[model.id, default: files].draft = nil }
+                Button(L("Use the Family’s Draft")) { state.modelFiles[model.id, default: files].draft = nil }
             }
             Divider()
-            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }
-            Button("Remove from List") { state.removeLocal(model.id) }
+            Button(L("Show in Finder")) { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }
+            Button(L("Remove from List")) { state.removeLocal(model.id) }
         } else {
             // One download at a time; the model that runs is checked or deleted once stopped.
             let busy = !state.ready || state.installer.running || state.serving(model.id)
-            Button("Check for Updates") { state.checkForUpdates(model.id) }
+            Button(L("Check for Updates")) { state.checkForUpdates(model.id) }
                 .disabled(busy)
             CopyModelID(id: model.id)
             Divider()
-            Button("Delete…", role: .destructive) { deleting = true }
+            Button(L("Delete…"), role: .destructive) { deleting = true }
                 .disabled(!state.canDelete(model.id))
         }
     }
@@ -753,8 +753,8 @@ private struct ModelRow: View {
         panel.canChooseDirectories = false
         panel.allowedContentTypes = UTType(filenameExtension: "gguf").map { [$0] } ?? []
         panel.directoryURL = model.id.hasSuffix(".gguf") ? URL(filePath: model.id).deletingLastPathComponent() : URL(filePath: model.id)
-        panel.prompt = "Choose"
-        panel.message = "Choose the GGUF vision projector of this model, such as mmproj-BF16.gguf."
+        panel.prompt = L("Choose")
+        panel.message = L("Choose the GGUF vision projector of this model, such as mmproj-BF16.gguf.")
         guard panel.runModal() == .OK, let url = panel.url else { return }
         state.modelFiles[model.id, default: AppState.ModelFiles()].projector = url.path
     }
@@ -764,8 +764,8 @@ private struct ModelRow: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
-        panel.prompt = "Choose"
-        panel.message = "Choose the folder of a DFlash2 draft for this model."
+        panel.prompt = L("Choose")
+        panel.message = L("Choose the folder of a DFlash2 draft for this model.")
         guard panel.runModal() == .OK, let url = panel.url else { return }
         state.modelFiles[model.id, default: AppState.ModelFiles()].draft = url.path
     }
@@ -773,10 +773,10 @@ private struct ModelRow: View {
     /// What the server does with this model, if anything.
     private var phase: String? {
         let server = state.server
-        if server.next == model.id && server.model != model.id { return "Up next" }
+        if server.next == model.id && server.model != model.id { return L("Up next") }
         guard server.running, server.model == model.id, server.phase != .stopped else { return nil }
         // Switched away from, it says Stopping…: the next model's own row says Up next.
-        if server.phase == .stopping, server.next != model.id { return "Stopping…" }
+        if server.phase == .stopping, server.next != model.id { return L("Stopping…") }
         return state.serverStatus.phrase
     }
 }
@@ -789,15 +789,15 @@ private struct SuggestedRow: View {
 
     var body: some View {
         LabeledContent {
-            Button("Download") { state.download(variant.id) }
+            Button(L("Download")) { state.download(variant.id) }
                 .disabled(state.installer.running || !state.ready)
-                .help(state.downloadStatus.map { "One at a time: \($0)" } ?? "")
+                .help(state.downloadStatus.map { L("One at a time: %@", $0) } ?? "")
                 .prominent(lead)
         } label: {
             // The anatomy of a model row.
             VStack(alignment: .leading, spacing: 2) {
                 Text(variant.name)
-                Text(([recommended ? "Recommended" : nil, variant.about, Format.size(Format.gigabytes(variant.size))]
+                Text(([recommended ? L("Recommended") : nil, L(variant.about), Format.size(Format.gigabytes(variant.size))]
                     as [String?]).compactMap { $0 }.joined(separator: " · "))
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -828,7 +828,7 @@ private struct CopyModelID: View {
     let id: String
 
     var body: some View {
-        Button("Copy Model ID") { NSPasteboard.put(id) }
+        Button(L("Copy Model ID")) { NSPasteboard.put(id) }
     }
 }
 
@@ -842,23 +842,23 @@ private struct CustomModelSheet: View {
     var body: some View {
         Form {
             Section {
-                TextField("Model", text: $model, prompt: Text("owner/model or owner/model:variant"))
+                TextField(L("Model"), text: $model, prompt: Text(L("owner/model or owner/model:variant")))
                     .monospaced()
                     .focused($focused)
                     .onSubmit(download)
             } header: {
-                Text("Download Another Model").font(.headline)
+                Text(L("Download Another Model")).font(.headline)
             } footer: {
-                Text("Any Hugging Face model Splash runs, such as unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M.")
+                Text(L("Any Hugging Face model Splash runs, such as unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M."))
             }
         }
         .formStyle(.grouped)
         .frame(width: 480)
         .onAppear { focused = true }
         .toolbar {
-            ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+            ToolbarItem(placement: .cancellationAction) { Button(L("Cancel")) { dismiss() } }
             ToolbarItem(placement: .confirmationAction) {
-                Button("Download", action: download).disabled(id == nil)
+                Button(L("Download"), action: download).disabled(id == nil)
             }
         }
     }

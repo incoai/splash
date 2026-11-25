@@ -70,7 +70,7 @@ struct Attachment: Codable, Identifiable, Equatable, Sendable {
 
     /// Its pages, where they are known, and its size, as a PDF's chip says them.
     var details: String {
-        [pages.map { $0 == 1 ? "1 page" : "\($0) pages" }, Format.size(Int64(bytes))].compactMap { $0 }.joined(separator: " · ")
+        [pages.map { $0 == 1 ? L("1 page") : L("%d pages", $0) }, Format.size(Int64(bytes))].compactMap { $0 }.joined(separator: " · ")
     }
 }
 
@@ -336,7 +336,7 @@ final class ChatStore {
     /// A chat's title until the model sums it up (`title`): the first line of its first message,
     /// or, for attachments alone, the first PDF's name, else Image.
     static func firstLine(_ text: String, attachments: [Attachment] = []) -> String {
-        let line = text.split(separator: "\n").first.map(String.init) ?? attachments.lazy.compactMap(\.name).first ?? "Image"
+        let line = text.split(separator: "\n").first.map(String.init) ?? attachments.lazy.compactMap(\.name).first ?? L("Image")
         return String(line.prefix(80))
     }
 
@@ -434,7 +434,7 @@ final class ChatStore {
                     answer.reasoningTokens = delta.reasoningTokens ?? answer.reasoningTokens
                     read = delta.read ?? read
                     // Asked for no limit, a reply runs to the end of the context.
-                    if delta.cut { answer.error = "The reply reached the end of the model’s context." }
+                    if delta.cut { answer.error = L("The reply reached the end of the model’s context.") }
                     // An answer asked again is its chat's once it says something.
                     if !answer.isEmpty { self?.keep() }
                     // A redraw per token would be wasted work: the page lets out what comes at an
@@ -539,7 +539,7 @@ final class ChatStore {
         for index in conversation.messages.indices where conversation.messages[index].role == .assistant
             && conversation.messages[index].isEmpty && conversation.messages[index].error == nil
             && conversation.messages[index].stopped != true {
-            conversation.messages[index].error = "The reply was interrupted."
+            conversation.messages[index].error = L("The reply was interrupted.")
         }
         return conversation
     }
@@ -581,7 +581,7 @@ enum ChatClient {
         }
         struct Count: Decodable { let input_tokens: Int }
         guard let count = try? JSONDecoder().decode(Count.self, from: data), count.input_tokens >= 0 else {
-            throw Failure(errorDescription: "The model returned an invalid token count.")
+            throw Failure(errorDescription: L("The model returned an invalid token count."))
         }
         return count.input_tokens
     }
@@ -634,7 +634,7 @@ enum ChatClient {
                         case nil: continue
                         }
                     }
-                    throw Failure(errorDescription: "The connection closed before the reply ended.")
+                    throw Failure(errorDescription: L("The connection closed before the reply ended."))
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -774,10 +774,10 @@ enum ChatClient {
         struct Body: Decodable { struct Problem: Decodable { let message: String; let code: String? }; let error: Problem }
         guard let problem = try? JSONDecoder().decode(Body.self, from: data).error else { return nil }
         guard problem.code == "context_length_exceeded" else { return problem.message }
-        let context = server.context.map { "the model’s \(ContextLength.figure($0))-token context" } ?? "the model’s context"
+        let context = server.context.map { L("the model’s %@-token context", ContextLength.figure($0)) } ?? L("the model’s context")
         // A new chat leaves the earlier messages behind; a first message has none to leave.
-        return messages.count == 1 ? "This message is longer than \(context)."
-            : "This chat is longer than \(context). Start a new chat to continue."
+        return messages.count == 1 ? L("This message is longer than %@.", context)
+            : L("This chat is longer than %@. Start a new chat to continue.", context)
     }
 
     /// What a model that sees no attachments is told in their place.

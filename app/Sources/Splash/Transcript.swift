@@ -145,12 +145,12 @@ struct TranscriptMessage: Encodable, Equatable {
         text = message.text
         reasoning = message.reasoning
         images = (message.attachments ?? []).filter { $0.kind == .image }
-        documents = (message.attachments ?? []).filter { $0.kind == .pdf }.map { Document(name: $0.name ?? "PDF", details: $0.details) }
+        documents = (message.attachments ?? []).filter { $0.kind == .pdf }.map { Document(name: $0.name ?? L("PDF"), details: $0.details) }
         error = message.error
         line = message.role == .assistant ? ReplyLine(message, live: live, asleep: asleep) : nil
         self.live = live != nil
         details = [message.model.map(name), message.tokensPerSecond.map { "\(Format.whole($0)) tok/s" },
-                   message.stopped == true ? "Stopped" : nil]
+                   message.stopped == true ? L("Stopped") : nil]
             .compactMap { $0 }.joined(separator: " · ")
     }
 
@@ -204,16 +204,16 @@ extension ReplyLine {
         let waiting = message.text.isEmpty ? live : nil
         if let live = waiting, message.reasoning.isEmpty {
             // After the idle release, the model loads again before it reads.
-            verb = asleep ? "Loading into memory" : "Reading"
+            verb = asleep ? L("Loading into memory") : L("Reading")
             facts = asleep ? nil : live.read.map { "\(Int($0 * 100))%" }
             since = facts == nil ? live.asked : nil
         } else if let started = waiting?.thinking {
-            verb = "Thinking"
+            verb = L("Thinking")
             facts = nil
             since = started
         } else if !message.reasoning.isEmpty {
-            verb = "Thinking"
-            let facts = [message.reasoningTokens.map { "\(Format.count($0)) tokens" }, message.thinkingTime.map(Format.seconds)]
+            verb = L("Thinking")
+            let facts = [message.reasoningTokens.map { L("%@ tokens", Format.count($0)) }, message.thinkingTime.map(Format.seconds)]
                 .compactMap { $0 }.joined(separator: " · ")
             self.facts = facts.isEmpty ? nil : facts
             since = nil

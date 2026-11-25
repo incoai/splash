@@ -118,8 +118,27 @@ extension WebPage: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         loaded = true
-        call("page.setup(JSON.parse(json))", with: ["glyphs": glyphs])
+        // The page speaks the app's language, and takes the words it draws
+        // from the app's Localizable.strings, so that both share one source.
+        call("page.setup(JSON.parse(json))", with: PageSetup(
+            glyphs: glyphs,
+            language: Localization.language,
+            strings: [
+                "scrollToLatest": L("Scroll to Latest"),
+                "copy": L("Copy"),
+                "copyReply": L("Copy Reply"),
+                "copyCode": L("Copy Code"),
+                "askAgain": L("Ask Again"),
+            ]))
         didLoad()
+    }
+
+    /// What a page is given as it loads: the symbols it draws, its language,
+    /// and the words it shows.
+    private struct PageSetup: Encodable {
+        let glyphs: [String: Glyph]
+        let language: String
+        let strings: [String: String]
     }
 
     /// The page's process ended, as when the system took its memory back: the page loads again

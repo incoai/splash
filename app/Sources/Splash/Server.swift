@@ -27,13 +27,13 @@ final class Server {
         /// Its button: the start with it, or taking the files off the list.
         var title: String {
             switch self {
-            case .memoryLimit(let limit?): "Start with \(limit.dropLast()) GB"
-            case .memoryLimit(nil): "Start Without a Limit"
-            case .autoContext: "Start with Auto Context"
-            case .without(projector: true, draft: true): "Start Without Projector and Draft"
-            case .without(projector: true, draft: false): "Start Without Projector"
-            case .without(projector: false, _): "Start Without Draft"
-            case .removeFromList: "Remove from List"
+            case .memoryLimit(let limit?): L("Start with %@ GB", String(limit.dropLast()))
+            case .memoryLimit(nil): L("Start Without a Limit")
+            case .autoContext: L("Start with Auto Context")
+            case .without(projector: true, draft: true): L("Start Without Projector and Draft")
+            case .without(projector: true, draft: false): L("Start Without Projector")
+            case .without(projector: false, _): L("Start Without Draft")
+            case .removeFromList: L("Remove from List")
             }
         }
     }
@@ -85,8 +85,8 @@ final class Server {
     private(set) var warmup: ServeRecord.Warmup?
     /// While starting: its step as the window words it, with how far the warm-up is once it says.
     var stepPhrase: String {
-        guard step == .warming, let warmup else { return "\(step.rawValue)…" }
-        return "\(step.rawValue) · \(warmup.steps_done) of \(warmup.steps)"
+        guard step == .warming, let warmup else { return L("%@…", L(step.rawValue)) }
+        return L("%@ · %d of %d", L(step.rawValue), warmup.steps_done, warmup.steps)
     }
     /// The model starting, served or last failed.
     private(set) var model: String?
@@ -297,7 +297,7 @@ final class Server {
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
-            phase = .failed("Splash couldn’t start it: \(error.localizedDescription)")
+            phase = .failed(L("Splash couldn’t start it: %@", error.localizedDescription))
             return
         }
         let pid = child!.pid
@@ -345,9 +345,9 @@ final class Server {
             return problem(failure, port: port)
         }
         if let holder, holder != pid {
-            return "Another Splash server is using port \(port). Stop it, or choose another port in Launch Options › Advanced."
+            return L("Another Splash server is using port %d. Stop it, or choose another port in Launch Options › Advanced.", port)
         }
-        return "It stopped unexpectedly. The log has the details."
+        return L("It stopped unexpectedly. The log has the details.")
     }
 
     /// What the launch options would need for a start that failed with `settings` on a Mac with
@@ -375,7 +375,7 @@ final class Server {
 
     /// That another app holds `port`.
     nonisolated static func portTaken(_ port: Int) -> String {
-        "Port \(port) is in use by another app. Quit that app, or choose another port in Launch Options › Advanced."
+        L("Port %d is in use by another app. Quit that app, or choose another port in Launch Options › Advanced.", port)
     }
 
     /// A failure on `port` in the words of the launch options: the model, with its reserves,
@@ -387,35 +387,35 @@ final class Server {
     nonisolated static func problem(_ failure: ServeRecord.Failure, port: Int) -> String {
         switch (failure.kind, failure.bound) {
         case ("memory_budget", "max_memory"):
-            return "It needs \(Format.memory(failure.required_bytes ?? 0)) of memory but the memory limit is "
-                + "\(Format.memory(failure.budget_bytes ?? 0)). Raise the memory limit in Launch Options."
+            return L("It needs %@ of memory but the memory limit is %@. Raise the memory limit in Launch Options.",
+                     Format.memory(failure.required_bytes ?? 0), Format.memory(failure.budget_bytes ?? 0))
         case ("memory_budget", "device_memory"):
-            return "It needs \(Format.memory(failure.required_bytes ?? 0)) of memory but this Mac can give it "
-                + "\(Format.memory(failure.budget_bytes ?? 0)). Choose a smaller model."
+            return L("It needs %@ of memory but this Mac can give it %@. Choose a smaller model.",
+                     Format.memory(failure.required_bytes ?? 0), Format.memory(failure.budget_bytes ?? 0))
         case ("context_budget", let bound?):
             let tokens = ContextLength.figure(failure.plan_context_tokens ?? 0)
             switch bound {
             case "max_memory":
-                return "Its context fits up to \(tokens) tokens within the memory limit. Choose a shorter context length, or raise the memory limit."
+                return L("Its context fits up to %@ tokens within the memory limit. Choose a shorter context length, or raise the memory limit.", tokens)
             case "disk":
-                return "Its context fits up to \(tokens) tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache."
+                return L("Its context fits up to %@ tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache.", tokens)
             default:
-                return "Its context fits up to \(tokens) tokens on this Mac. Choose a shorter context length, or Auto."
+                return L("Its context fits up to %@ tokens on this Mac. Choose a shorter context length, or Auto.", tokens)
             }
         case ("host_memory", _):
-            return "Other apps are using the memory it needs. Quit some, then start it again."
+            return L("Other apps are using the memory it needs. Quit some, then start it again.")
         case ("command_memory", _):
-            return "Another app is using the GPU memory this model needs, such as another Splash server. Quit it, then start again."
+            return L("Another app is using the GPU memory this model needs, such as another Splash server. Quit it, then start again.")
         case ("port", _):
             return portTaken(port)
         case ("upgrade", _):
-            return "Splash is being updated. Wait for the update to finish, then start it again."
+            return L("Splash is being updated. Wait for the update to finish, then start it again.")
         case ("install", _):
-            return "Splash couldn’t prepare its files: \(failure.message)"
+            return L("Splash couldn’t prepare its files: %@", failure.message)
         case ("model", _):
-            return "Splash can’t serve this model: \(failure.message)"
+            return L("Splash can’t serve this model: %@", failure.message)
         case ("internal", _):
-            return "It stopped: \(failure.message). The log has the details."
+            return L("It stopped: %@. The log has the details.", failure.message)
         case ("configuration", _):
             return refusedOption(failure.message) ?? failure.message
         default:
@@ -430,7 +430,7 @@ final class Server {
         guard let refusal = message.wholeMatch(of: /argument (--[a-z0-9-]+): (.+)/),
               let option = LaunchOption.all.first(where: { $0.flag == refusal.1 })
         else { return nil }
-        return "\(option.title): \(refusal.2)"
+        return L("%@: %@", L(option.title), String(refusal.2))
     }
 
     /// Follows this start's server through its start, as its serve record gives it, until it
@@ -649,9 +649,9 @@ struct LiveRequest: Equatable, Identifiable {
     /// written `written`.
     nonisolated static func stage(phase: String?, read: Int, written: Int) -> Stage {
         switch phase {
-        case "queued": .waiting("Queued")
-        case "waiting_resources": .waiting("Waiting for memory")
-        case "waiting_prefix": .waiting("Waiting for a shared prefix")
+        case "queued": .waiting(L("Queued"))
+        case "waiting_resources": .waiting(L("Waiting for memory"))
+        case "waiting_prefix": .waiting(L("Waiting for a shared prefix"))
         case "prefill": .reading(read)
         default: .answering(written)
         }

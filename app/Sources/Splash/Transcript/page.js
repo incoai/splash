@@ -8,15 +8,29 @@ const page = (() => {
   const post = message => window.webkit?.messageHandlers.page.postMessage(message);
   const reduced = matchMedia('(prefers-reduced-motion: reduce)');
 
+  // The words the app sends, by key, in the app's language: the page's own
+  // markup starts in English, and a key the app sends none for stays as it is.
+  let words = {};
+
   // The SF Symbols the page draws, which it can't name: masks, colored as text is, but the warning
   // sign, in its own colors (page.css).
-  function setup({glyphs}) {
+  function setup({glyphs, language = 'en', strings = {}}) {
+    words = strings;
+    document.documentElement.lang = language;
     const style = document.documentElement.style;
     for (const [name, glyph] of Object.entries(glyphs)) {
       style.setProperty(`--${name}`, `url("${glyph.url}")`);
       style.setProperty(`--${name}-width`, `${glyph.width}px`);
       style.setProperty(`--${name}-height`, `${glyph.height}px`);
     }
+    const latest = document.getElementById('latest');
+    latest?.setAttribute('title', text('scrollToLatest'));
+    latest?.setAttribute('aria-label', text('scrollToLatest'));
+  }
+
+  // The app's word for `key`, or the key, which is its English word.
+  function text(key) {
+    return words[key] ?? key;
   }
 
   // Copies, and says so: the button shows a check for 1.5 s, which another copy holds longer.
@@ -342,5 +356,5 @@ const page = (() => {
     element.tick = setTimeout(() => element.isConnected && count(element, since, show), 1000 - elapsed % 1000);
   }
 
-  return {post, setup, copy, follower, paced, write, latest, measure, estimator, count};
+  return {post, setup, text, copy, follower, paced, write, latest, measure, estimator, count};
 })();

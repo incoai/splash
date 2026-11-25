@@ -20,7 +20,7 @@ struct MenuBarPanel: View {
                 StatusMark(look: state.serverStatus.look, since: server.since)
                 VStack(alignment: .leading, spacing: 1) {
                     // At its end, as the Server button cuts the model's name.
-                    Text(model.map(state.displayName(of:)) ?? "No model running")
+                    Text(model.map(state.displayName(of:)) ?? L("No model running"))
                         .font(.headline)
                         .truncationMode(.tail)
                     if model != nil { Text(state.serverStatus.phrase).font(.callout).foregroundStyle(.secondary) }
@@ -41,15 +41,15 @@ struct MenuBarPanel: View {
                 Text(download).font(.callout).foregroundStyle(.secondary).padding(.horizontal, 10).padding(.bottom, 6)
             }
             Divider().padding(.horizontal, 8).padding(.vertical, 4)
-            PanelRow(title: "Open Server") { show(.server) }
-            PanelRow(title: "Open Chat") { show(.chat) }
+            PanelRow(title: L("Open Server")) { show(.server) }
+            PanelRow(title: L("Open Chat")) { show(.chat) }
             Divider().padding(.horizontal, 8).padding(.vertical, 4)
             if !state.installed.isEmpty {
                 // Its rows, as Coding Agents' do, come and go at once, as a menu's items do: the
                 // panel's window takes its new height at once. Faded and slid in, they drew over
                 // the rows moving past them, a check under a chevron, the panel's content laid out
                 // off its window's middle until the animation ended.
-                PanelRow(title: "Model", open: models) { models.toggle() }
+                PanelRow(title: L("Model"), open: models) { models.toggle() }
                 if models {
                     let checked = state.checkedModel
                     // As high as the rows up to some ten of them, then scrolling, so that a long
@@ -71,11 +71,11 @@ struct MenuBarPanel: View {
                 }
             }
             if let stop = state.stopItem {
-                PanelRow(title: "Stop \(state.displayName(of: stop.model))") { state.stop() }
+                PanelRow(title: L("Stop %@", state.displayName(of: stop.model))) { state.stop() }
                     .disabled(!stop.enabled)
             }
             if server.phase == .ready {
-                PanelRow(title: "Coding Agents", open: agents) { agents.toggle() }
+                PanelRow(title: L("Coding Agents"), open: agents) { agents.toggle() }
                 if agents {
                     // In the window's drawer, which comes forward; a folder is asked for first.
                     ForEach(Agent.allCases) { agent in
@@ -84,17 +84,17 @@ struct MenuBarPanel: View {
                             state.open(agent)
                         }
                     }
-                    PanelRow(title: "Choose Folder…", shortcut: state.agentFolder?.lastPathComponent, indent: true) {
+                    PanelRow(title: L("Choose Folder…"), shortcut: state.agentFolder?.lastPathComponent, indent: true) {
                         state.chooseAgentFolder()
                     }
-                    CopyButton(copy: state.copyAPIAddress) { PanelLabel(title: "Copy API Address", indent: true, check: $0) }
+                    CopyButton(copy: state.copyAPIAddress) { PanelLabel(title: L("Copy API Address"), indent: true, check: $0) }
                         .buttonStyle(.hoverFlush)
                 }
             }
             if server.running || !state.installed.isEmpty {
                 Divider().padding(.horizontal, 8).padding(.vertical, 4)
             }
-            PanelRow(title: "Quit Splash", shortcut: "⌘Q") { NSApp.terminate(nil) }
+            PanelRow(title: L("Quit Splash"), shortcut: "⌘Q") { NSApp.terminate(nil) }
         }
         .padding(6)
         .frame(width: 300)
@@ -108,14 +108,14 @@ struct MenuBarPanel: View {
         let memory = activity.memory.map { Format.parts(Format.memory($0)) }
         return VStack(spacing: 10) {
             HStack(spacing: 0) {
-                Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering", compact: true)
-                Figure(value: activity.served.formatted(), caption: "Requests", compact: true)
-                Figure(value: memory?.0, unit: memory?.1, caption: "Memory", compact: true)
+                Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: L("Answering"), compact: true)
+                Figure(value: activity.served.formatted(), caption: L("Requests"), compact: true)
+                Figure(value: memory?.0, unit: memory?.1, caption: L("Memory"), compact: true)
             }
             HStack(spacing: 0) {
-                Figure(value: Format.count(activity.generated), caption: "Generated", compact: true)
-                Figure(value: Format.count(activity.read), caption: "Prompt read", compact: true)
-                Figure(value: Format.count(activity.cached), caption: "From cache", compact: true)
+                Figure(value: Format.count(activity.generated), caption: L("Generated"), compact: true)
+                Figure(value: Format.count(activity.read), caption: L("Prompt read"), compact: true)
+                Figure(value: Format.count(activity.cached), caption: L("From cache"), compact: true)
             }
         }
         .padding(.horizontal, 10)
@@ -145,7 +145,7 @@ private struct PanelRow: View {
             PanelLabel(title: title, shortcut: shortcut, open: open, indent: indent, check: check)
         }
         .buttonStyle(.hoverFlush)
-        .accessibilityValue(open.map { $0 ? "Expanded" : "Collapsed" } ?? "")
+        .accessibilityValue(open.map { $0 ? L("Expanded") : L("Collapsed") } ?? "")
         .accessibilityAddTraits(check ? .isSelected : [])
     }
 }

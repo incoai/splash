@@ -360,14 +360,14 @@ private struct DrawerView: View {
                 }
             HStack(spacing: 10) {
                 Segments(selected: drawer.part, pick: { state.showDrawer($0) }, segments: [
-                    .init(title: "Terminal", value: .terminal),
-                    .init(title: "Logs", value: .logs),
+                    .init(title: L("Terminal"), value: .terminal),
+                    .init(title: L("Logs"), value: .logs),
                 ])
                 switch drawer.part {
                 case .terminal: TerminalTabs()
                 case .logs:
                     Segments(selected: drawer.log, pick: { drawer.log = $0 },
-                             segments: LogSource.allCases.map { .init(title: $0.rawValue, value: $0) })
+                             segments: LogSource.allCases.map { .init(title: L($0.rawValue), value: $0) })
                     Spacer(minLength: 0)
                     Button {
                         NSWorkspace.shared.activateFileViewerSelecting([drawer.log.url(in: state)])
@@ -375,8 +375,8 @@ private struct DrawerView: View {
                         Image(systemName: "folder")
                     }
                     .buttonStyle(.hover)
-                    .help("Show in Finder")
-                    .accessibilityLabel("Show in Finder")
+                    .help(L("Show in Finder"))
+                    .accessibilityLabel(L("Show in Finder"))
                 }
                 Button {
                     state.toggleDrawer()
@@ -384,8 +384,8 @@ private struct DrawerView: View {
                     Image(systemName: "chevron.down")
                 }
                 .buttonStyle(.hover)
-                .help("Hide (⌘J)")
-                .accessibilityLabel("Hide Terminal and Logs")
+                .help(L("Hide (⌘J)"))
+                .accessibilityLabel(L("Hide Terminal and Logs"))
             }
             .padding(.horizontal, 12)
             .frame(height: 36)
@@ -442,8 +442,8 @@ private struct TerminalTabs: View {
                             }
                             .buttonStyle(.plain)
                             .foregroundStyle(.secondary)
-                            .help("Close Terminal")
-                            .accessibilityLabel("Close Terminal")
+                            .help(L("Close Terminal"))
+                            .accessibilityLabel(L("Close Terminal"))
                         }
                         .font(.callout)
                         .padding(.horizontal, 10)
@@ -455,8 +455,8 @@ private struct TerminalTabs: View {
                         Image(systemName: "plus")
                     }
                     .buttonStyle(.hover)
-                    .help("New Terminal")
-                    .accessibilityLabel("New Terminal")
+                    .help(L("New Terminal"))
+                    .accessibilityLabel(L("New Terminal"))
                     .id(Self.end)
                 }
             }
@@ -467,13 +467,13 @@ private struct TerminalTabs: View {
                 proxy.scrollTo(id == drawer.terminals.last?.id ? AnyHashable(Self.end) : AnyHashable(id))
             }
         }
-        .confirmationDialog("Close this terminal?", isPresented: Binding(
+        .confirmationDialog(L("Close this terminal?"), isPresented: Binding(
             get: { drawer.closing != nil }, set: { if !$0 { drawer.closing = nil } })) {
-            Button("Close", role: .destructive) {
+            Button(L("Close"), role: .destructive) {
                 if let id = drawer.closing { drawer.close(id) }
             }
         } message: {
-            Text("A program is running in it. Closing the terminal ends the program.")
+            Text(L("A program is running in it. Closing the terminal ends the program."))
         }
         Spacer(minLength: 0)
     }
