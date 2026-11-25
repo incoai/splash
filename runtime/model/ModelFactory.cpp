@@ -2,6 +2,7 @@
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/LoraAdapter.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/SafetensorsTarget.hpp"
@@ -94,7 +95,7 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
                                    .floorBytes = options.expertFloorBytes,
                                    .floorShare = options.expertFloorShare,
                                    .readers = options.readers};
-  return std::visit(
+  TargetWeights target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
         // A streamed table's store: its memory and readers here, the rows a
@@ -116,6 +117,10 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
         throw std::invalid_argument("unknown target source");
       },
       descriptor.target);
+  // The root's LoRA adapter updates the projections it names (model/LoraAdapter.hpp).
+  if (descriptor.lora)
+    std::visit([&](auto &weights) { attachLoraAdapter(backend, weights, root / "lora", *descriptor.lora); }, target);
+  return target;
 }
 
 } // namespace

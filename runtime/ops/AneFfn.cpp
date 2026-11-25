@@ -4,6 +4,7 @@
 #include "StderrLine.hpp"
 #include "Supervision.hpp"
 #include "metal/abi/AneFfn.h"
+#include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/BufferExtent.hpp"
 
@@ -103,10 +104,34 @@ std::vector<uint32_t> segments(uint32_t channels) {
   return result;
 }
 
+// The rank of the layers' LoRA updates (ProjectionLora) where every gate, up
+// and down has one of that rank on its one tensor, and 0 where none has one;
+// none where only some have, or they differ.
+std::optional<uint32_t> loraRank(std::span<const SwiGluProjections> layers) {
+  uint32_t rank = 0;
+  bool every = true;
+  for (const SwiGluProjections &layer : layers)
+    for (const Projection *projection : {layer.gate, layer.up, layer.down}) {
+      const ProjectionLora &update = projection->lora;
+      if (!update) {
+        every = false;
+        continue;
+      }
+      if (update.slots != 1 || update.segments.size() != 1 || !update.segments.front().b ||
+          (rank && update.rank != rank))
+        return std::nullopt;
+      rank = update.rank;
+    }
+  if (rank && !every) return std::nullopt;
+  return rank;
+}
+
 } // namespace
 
 const char *AneFfn::unsupported(std::span<const SwiGluProjections> layers) {
   if (layers.empty()) return "ANE FFN split has no layers";
+  if (!loraRank(layers))
+    return "ANE FFN split takes LoRA updates of one rank on the gate, up and down of every layer, or on none";
   if (!fits(static_cast<uint32_t>(layers.size()), Steps::One))
     return "ANE FFN split has more layers than the Neural Engine holds evaluations of in flight";
   const uint32_t hidden = layers.front().gate->inputSize, intermediate = layers.front().gate->outputSize;
@@ -138,6 +163,9 @@ std::string AneFfn::calibrationKey(std::span<const SwiGluProjections> layers, co
     for (const Projection *projection : {layer.gate, layer.up, layer.down})
       key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":g" +
              std::to_string(projection->blocks().segments.front().formatId);
+  // The rank of the layers' LoRA updates: with them the program does more on
+  // the Neural Engine and the GPU's part more on the GPU.
+  if (const uint32_t rank = *loraRank(layers)) key += " lora " + std::to_string(rank);
   return key + " int8-activations " + (linear.int8Activations() == Int8Activations::On ? "on" : "off");
 }
 
@@ -253,7 +281,16 @@ AneFfn::Shape AneFfn::shapeOf(std::span<const SwiGluProjections> layers, uint32_
   shape.ane = shape.intermediate - shape.gpu;
   shape.inputSegments = segments(shape.hidden);
   shape.downSegments = segments(shape.ane);
+  shape.rank = *loraRank(layers);
   return shape;
+}
+
+uint64_t AneFfn::loraLeadingBytes(const Shape &shape) {
+  return uint64_t{shape.layers} * shape.rank * shape.gpu * sizeof(uint16_t);
+}
+uint64_t AneFfn::loraCodeBytes(const Shape &shape) { return uint64_t{shape.layers} * shape.rank * shape.ane; }
+uint64_t AneFfn::loraBytes(const Shape &shape) {
+  return loraLeadingBytes(shape) + loraCodeBytes(shape) + uint64_t{shape.layers} * shape.rank * sizeof(uint16_t);
 }
 
 uint64_t AneFfn::rowScaleBytes(const Shape &shape) {
@@ -268,16 +305,31 @@ AneFfn::Memory AneFfn::allocate(const Shape &shape, MakeBuffer &&buffer, MakeSur
   memory.status = buffer(sizeof(uint32_t), "ane ffn status");
   for (const uint32_t width : shape.inputSegments) memory.inputs.push_back(surface(width, kMaximumRows, Element::Int8));
   memory.tokenScale = surface(1, kMaximumRows, Element::Float16);
-  memory.partial = surface(shape.hidden + 1, kMaximumRows, Element::Float16);
+  // LoRA: down's rotated A as rows of down's weights after its own, before
+  // the intermediate scale.
+  memory.partial = surface(shape.hidden + shape.rank + 1, kMaximumRows, Element::Float16);
+  if (shape.rank) {
+    memory.loraDownGpu = buffer(uint64_t{kMaximumRows} * shape.rank * sizeof(float), "ane ffn lora down t");
+    memory.loraT = buffer(lora::rowsBytes(kMaximumRows, 2 * shape.rank), "ane ffn lora gate/up t");
+    memory.loraDown = buffer(uint64_t{kMaximumRows} * shape.rank * sizeof(uint16_t), "ane ffn lora down rows");
+    memory.loraDelta = buffer(uint64_t{kMaximumRows} * shape.hidden * sizeof(uint16_t), "ane ffn lora delta");
+    memory.loraGate = surface(shape.rank, kMaximumRows, Element::Float16);
+    memory.loraUp = surface(shape.rank, kMaximumRows, Element::Float16);
+  }
   for (Weights &set : memory.sets) {
     for (const uint32_t width : shape.inputSegments) {
       set.gate.push_back(surface(shape.ane, width, Element::Int8));
       set.up.push_back(surface(shape.ane, width, Element::Int8));
     }
-    for (const uint32_t width : shape.downSegments) set.down.push_back(surface(shape.hidden, width, Element::Int8));
+    for (const uint32_t width : shape.downSegments)
+      set.down.push_back(surface(shape.hidden + shape.rank, width, Element::Int8));
     set.gateScale = surface(shape.ane, 1, Element::Float16);
     set.upScale = surface(shape.ane, 1, Element::Float16);
-    set.downScale = surface(shape.hidden, 1, Element::Float16);
+    set.downScale = surface(shape.hidden + shape.rank, 1, Element::Float16);
+    if (shape.rank) {
+      set.loraGate = surface(shape.ane, shape.rank, Element::Float16);
+      set.loraUp = surface(shape.ane, shape.rank, Element::Float16);
+    }
   }
   return memory;
 }
@@ -285,7 +337,11 @@ AneFfn::Memory AneFfn::allocate(const Shape &shape, MakeBuffer &&buffer, MakeSur
 uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, Shares shares) {
   uint64_t bytes = 0;
   for (const uint32_t units : {shares.oneStep, shares.twoSteps})
-    if (units) bytes += alignUp(rowScaleBytes(shapeOf(layers, units)));
+    if (units) {
+      const Shape shape = shapeOf(layers, units);
+      bytes += alignUp(rowScaleBytes(shape));
+      if (shape.rank) bytes += alignUp(loraBytes(shape));
+    }
   static_cast<void>(allocate(
       shapeOf(layers, shares.most()),
       [&](uint64_t size, const char *) {
@@ -319,9 +375,17 @@ std::vector<AneFfn::Input> AneFfn::programInputs(const Shape &shape, const Memor
   inputs.push_back({"sg", both(&Weights::gateScale), shape.ane, 1});
   inputs.push_back({"su", both(&Weights::upScale), shape.ane, 1});
   for (uint32_t i = 0; i < shape.downSegments.size(); ++i)
-    inputs.push_back({"wd" + std::to_string(i), {&memory.sets[0].down[i], &memory.sets[1].down[i]}, shape.hidden,
-                      shape.downSegments[i]});
-  inputs.push_back({"sd", both(&Weights::downScale), shape.hidden, 1});
+    inputs.push_back({"wd" + std::to_string(i), {&memory.sets[0].down[i], &memory.sets[1].down[i]},
+                      shape.hidden + shape.rank, shape.downSegments[i]});
+  inputs.push_back({"sd", both(&Weights::downScale), shape.hidden + shape.rank, 1});
+  // LoRA: xlg and xlu, gate's and up's rows t over their tokens' scales; wlg
+  // and wlu, their B's rows over the ANE's channels.
+  if (shape.rank) {
+    inputs.push_back({"xlg", {&memory.loraGate, &memory.loraGate}, shape.rank, 0});
+    inputs.push_back({"xlu", {&memory.loraUp, &memory.loraUp}, shape.rank, 0});
+    inputs.push_back({"wlg", both(&Weights::loraGate), shape.ane, shape.rank});
+    inputs.push_back({"wlu", both(&Weights::loraUp), shape.ane, shape.rank});
+  }
   return inputs;
 }
 
@@ -398,6 +462,21 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
     if (!whole) slice("fp16", name + "_scale", scales + "_t", begin, count, 1);
     f16(name, count, rows, "mul(x = " + total + ", y = " + (whole ? scales + "_t" : name + "_scale") + ")");
   };
+  // LoRA: `name`, the `count` channels from `begin` of gate's or up's
+  // (`p`) scaled sums `sums` with B t over the token's scale, as the sums are
+  // before it; the sums themselves under that name without an update.
+  const auto updated = [&](const std::string &name, const std::string &p, uint64_t begin, uint64_t count) {
+    if (!shape.rank) return name;
+    const bool whole = count == channels;
+    if (!whole) slice("fp16", name + "_lb", "wl" + p + "_t", begin, count, shape.rank);
+    f16(name + "_l", count, rows,
+        "matmul(transpose_x = bool(false), transpose_y = bool(false), x = " +
+            (whole ? "wl" + p + "_t" : name + "_lb") + ", y = xl" + p + "_t)");
+    return name + "_w";
+  };
+  const auto update = [&](const std::string &name, uint64_t count) {
+    if (shape.rank) f16(name, count, rows, "add(x = " + name + "_w, y = " + name + "_l)");
+  };
   // The ANE's channels through gate and up, their scales, SiLU and product:
   // where the chip runs them in blocks (gateUpInBlocks), a block at a time;
   // else each projection whole, as 1.7.0's program does.
@@ -416,8 +495,11 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
       const uint64_t count = std::min<uint64_t>(kOutputBlock, channels - begin);
       const std::string b = "b" + std::to_string(begin / kOutputBlock) + "_",
                         h = channels > kOutputBlock ? b + "h" : "h";
-      project(b + "gs", gate, "sg", begin, count, channels);
-      project(b + "us", up, "su", begin, count, channels);
+      for (const char *projection : {"g", "u"}) {
+        const std::string p = projection, sums = updated(b + p + "s", p, begin, count);
+        project(sums, p == "g" ? gate : up, "s" + p, begin, count, channels);
+        update(b + p + "s", count);
+      }
       // silu(g) = g/2 (1 + tanh(g/2)): through the ANE's sigmoid, layers whose
       // gate pre-activations are about 0.1 differed from the GPU alone by 6.5%
       // RMS, through its tanh by 1.6%.
@@ -441,7 +523,9 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
       for (uint32_t k = 0; k < segmentCount; ++k)
         matmul(p + "m" + std::to_string(k), "w" + p + std::to_string(k), "x" + std::to_string(k) + "_d", channels,
                shape.inputSegments[k]);
-      f16(p + "s", channels, rows, "mul(x = " + sum(p + "m", segmentCount, channels) + ", y = s" + p + "_t)");
+      const std::string sums = updated(p + "s", p, 0, channels);
+      f16(sums, channels, rows, "mul(x = " + sum(p + "m", segmentCount, channels) + ", y = s" + p + "_t)");
+      update(p + "s", channels);
     }
     f16("gt", channels, rows, "mul(x = gs, y = tx_t)");
     f16("gh", channels, rows, "mul(x = gt, y = " + fp16(0.5) + ")");
@@ -471,6 +555,9 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
   line(tensor("int8", channels, rows) + " hq = quantize(input = hs, scale = fp16(1), output_dtype = string(\"int8\"))");
   f16("hd", channels, rows, "dequantize(input = hq, scale = " + unit + ")");
   f16("hscale", 1, rows, "mul(x = floor, y = " + fp16(double(ANE_FFN_INT8_UNIT) / ANE_FFN_INT8_PEAK) + ")");
+  // Down's rows, then with LoRA updates its rotated A's, then the
+  // intermediate scale.
+  const uint32_t products = shape.hidden + shape.rank, outputs = products + 1;
   if (blocks) {
     std::vector<Matmul> down;
     uint32_t input = 0;
@@ -481,7 +568,7 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
       down.push_back({"wd" + index, "hd" + index, width});
       input += width;
     }
-    project("ds", down, "sd", 0, shape.hidden, shape.hidden);
+    project("ds", down, "sd", 0, products, products);
   } else {
     uint32_t begin = 0;
     for (size_t i = 0; i < shape.downSegments.size(); ++i) {
@@ -490,15 +577,15 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
       f16(part, width, rows,
           "slice_by_size(x = hd, begin = tensor<int32, [4]>([0, 0, " + std::to_string(begin) +
               ", 0]), size = tensor<int32, [4]>(" + dimensions(width, rows) + "))");
-      matmul("dm" + index, "wd" + index, part, shape.hidden, width);
+      matmul("dm" + index, "wd" + index, part, products, width);
       begin += width;
     }
-    f16("ds", shape.hidden, rows, "mul(x = " + sum("dm", shape.downSegments.size(), shape.hidden) + ", y = sd_t)");
+    f16("ds", products, rows, "mul(x = " + sum("dm", shape.downSegments.size(), products) + ", y = sd_t)");
   }
-  f16("yt", shape.hidden + 1, rows, "concat(axis = int32(2), interleave = bool(false), values = (ds, hscale))");
-  line(output.bufferType(shape.hidden + 1, rows) +
+  f16("yt", outputs, rows, "concat(axis = int32(2), interleave = bool(false), values = (ds, hscale))");
+  line(output.bufferType(outputs, rows) +
        " y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), "
-       "strides = tensor<int64, [4]>(" + output.strides(shape.hidden + 1) + "))");
+       "strides = tensor<int64, [4]>(" + output.strides(outputs) + "))");
   return "    func " + functionName(shape.ane, rows) + "<ios18>(" + parameters + ") {\n" + body + "    } -> (y);\n";
 }
 
@@ -555,8 +642,12 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
   std::memcpy(memory_.signs.contents(), signs.data(), sizeof signs);
   *static_cast<uint32_t *>(memory_.status.contents()) = 0;
 
-  for (const SwiGluProjections &source : layers) planes_.push_back({Planes(*source.gate), Planes(*source.up),
-                                                                    Planes(*source.down)});
+  for (const SwiGluProjections &source : layers) {
+    planes_.push_back({Planes(*source.gate), Planes(*source.up), Planes(*source.down)});
+    if (shape_.rank)
+      loraB_.push_back({source.gate->lora.segments.front().b, source.up->lora.segments.front().b,
+                        source.down->lora.segments.front().b});
+  }
   // Each share's GPU parts and program text, a function of each of its rows.
   std::string text = "program(1.3)\n{\n";
   std::array<std::vector<Input>, 2> inputs;
@@ -569,6 +660,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
     Share &share = shares_[kind].emplace();
     share.shape = shapeOf(layers, units);
     share.rowScales = buffer(rowScaleBytes(share.shape), "ane ffn row scales");
+    if (shape_.rank) share.lora = buffer(loraBytes(share.shape), "ane ffn lora down A");
     for (const SwiGluProjections &source : layers)
       share.layers.push_back({source.gate->rows(backend_, {{0, share.shape.gpu}}),
                               source.up->rows(backend_, {{0, share.shape.gpu}}),
@@ -619,6 +711,93 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
       add(Matrix::Down, 0, channels.gpu, channels.ane, channels.hidden, Rotation::Intermediate);
     }
   static_cast<void>(backend_.submitCommandAsync(graph.dispatches()).wait());
+  if (shape_.rank) prepareLora(layers);
+}
+
+// Down's A as each share takes it (metal/abi/AneFfn.h, Share::lora): over the
+// GPU's channels as it is, and over the ANE's, in the surfaces' order
+// (ane_ffn_descending), rotated as down's rows are
+// (ane_ffn_weights_gguf_intermediate), each block of
+// ANE_FFN_INTERMEDIATE_BLOCK inputs through H times the signs over
+// sqrt(block), scaled by a power of two that puts the layer's largest value
+// in [0.5, 1), so that every row's scale is a normal half, and coded against
+// its row's peak as a weight row is. Each share's scales are over its own
+// channels, so that it computes what a split of that share alone computes.
+void AneFfn::prepareLora(std::span<const SwiGluProjections> layers) {
+  const uint32_t rank = shape_.rank, block = ANE_FFN_INTERMEDIATE_BLOCK;
+  const std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs = rotationSigns();
+  const float norm = 1.0f / std::sqrt(float(block));
+  const auto value = [](uint16_t bits) { return std::bit_cast<float>(uint32_t{bits} << 16); };
+  const auto bf16 = [](float v) {
+    const uint32_t bits = std::bit_cast<uint32_t>(v);
+    return static_cast<uint16_t>((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+  };
+  const auto code = [](float v) { return static_cast<int8_t>(std::clamp(std::rint(v), -127.0f, 127.0f)); };
+  // A layer's rotated rows over the ANE's most channels, of which each share
+  // takes the leading ones.
+  std::vector<float> values(uint64_t{shape_.ane} * rank);
+  for (uint32_t layer = 0; layer < shape_.layers; ++layer) {
+    const QuantizedSegment &downA = layers[layer].down->lora.a;
+    if (downA.inputSize != shape_.intermediate || layers[layer].gate->lora.a.inputSize != shape_.hidden ||
+        layers[layer].up->lora.a.inputSize != shape_.hidden)
+      throw std::invalid_argument("ANE FFN split does not take these LoRA updates");
+    const auto *a = static_cast<const uint16_t *>(downA.plane0.contents());
+    if (!a) throw std::invalid_argument("ANE FFN split reads LoRA rows the CPU cannot");
+    for (uint32_t j = 0; j < rank; ++j) {
+      const uint16_t *row = a + uint64_t{j} * shape_.intermediate;
+      float *out = values.data() + uint64_t{j} * shape_.ane;
+      for (uint32_t origin = 0; origin < shape_.ane; origin += block) {
+        // The surfaces' unit at `origin`: the channels below those before it.
+        const uint16_t *unit = row + shape_.intermediate - origin - block;
+        float *v = out + origin;
+        for (uint32_t i = 0; i < block; ++i) v[i] = value(unit[i]);
+        for (uint32_t span = 1; span < block; span <<= 1)
+          for (uint32_t i = 0; i < block; i += 2 * span)
+            for (uint32_t k = i; k < i + span; ++k) {
+              const float x = v[k], y = v[k + span];
+              v[k] = x + y;
+              v[k + span] = x - y;
+            }
+        for (uint32_t i = 0; i < block; ++i) v[i] *= signs[i] * norm;
+      }
+    }
+    for (std::optional<Share> &share : shares_) {
+      if (!share) continue;
+      const uint32_t gpu = share->shape.gpu, ane = share->shape.ane;
+      const uint64_t leadingBytes = uint64_t{rank} * gpu * sizeof(uint16_t);
+      auto *base = static_cast<uint8_t *>(share->lora.contents());
+      auto *leading = reinterpret_cast<uint16_t *>(base) + uint64_t{layer} * rank * gpu;
+      auto *codes = reinterpret_cast<int8_t *>(base + loraLeadingBytes(share->shape)) + uint64_t{layer} * rank * ane;
+      auto *rowScaleBits =
+          reinterpret_cast<uint16_t *>(base + loraLeadingBytes(share->shape) + loraCodeBytes(share->shape)) +
+          uint64_t{layer} * rank;
+      float peak = 0.0f;
+      for (uint32_t j = 0; j < rank; ++j) {
+        std::memcpy(leading + uint64_t{j} * gpu, a + uint64_t{j} * shape_.intermediate,
+                    uint64_t{gpu} * sizeof(uint16_t));
+        const float *row = values.data() + uint64_t{j} * shape_.ane;
+        for (uint32_t i = 0; i < ane; ++i) peak = std::max(peak, std::fabs(row[i]));
+      }
+      const int exponent = peak > 0.0f ? -static_cast<int>(std::floor(std::log2(peak))) - 1 : 0;
+      const float scale = std::ldexp(1.0f, exponent);
+      for (uint32_t j = 0; j < rank; ++j) {
+        const float *row = values.data() + uint64_t{j} * shape_.ane;
+        float rowPeak = 0.0f;
+        for (uint32_t i = 0; i < ane; ++i) rowPeak = std::max(rowPeak, std::fabs(row[i]) * scale);
+        // As ane_ffn_row_scale_gguf's, then the bf16 the staging kernel reads.
+        const uint16_t bits = bf16(std::max(rowPeak, ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK * ANE_FFN_INT8_UNIT);
+        rowScaleBits[j] = bits;
+        const float inverse = ANE_FFN_INT8_UNIT / value(bits);
+        for (uint32_t i = 0; i < ane; ++i) codes[uint64_t{j} * ane + i] = code(row[i] * scale * inverse);
+      }
+      share->loraDownScale.push_back(std::ldexp(1.0f, -exponent));
+      share->loraLeadingRows.push_back(QuantizedSegment::rows(
+          GGUF_FMT_BF16, rank, gpu, backend_.view(share->lora, layer * leadingBytes, leadingBytes)));
+    }
+  }
+  // The inputs t hold zeros until a step writes them.
+  for (const ane::Surface *input : {&memory_.loraGate, &memory_.loraUp})
+    std::memset(input->buffer.contents(), 0, input->buffer.sizeBytes());
 }
 
 double AneFfn::share(Steps steps) const noexcept {
@@ -693,6 +872,41 @@ void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set
         Rotation::Intermediate);
     end -= width;
   }
+  if (!channels.rank) return;
+  // LoRA: gate's and up's rows of B over the share's channels in fp16, in the
+  // surfaces' order, and down's codes of its rotated A as the rows after its
+  // own, with their scales.
+  const uint32_t rank = channels.rank;
+  const uint64_t matrix = uint64_t{channels.ane} * rank, codes = loraLeadingBytes(channels),
+                 scales = codes + loraCodeBytes(channels);
+  // `count` bf16 rows of `width` values into the surface's rows from `row`,
+  // in fp16 times `scale`; with a span, the rows of the ANE's channels of a
+  // projection of that many (AneFfnLoraRowsParams).
+  const auto values = [&](metal::MetalBuffer rows, const ane::Surface &output, uint32_t count, uint32_t width,
+                          uint32_t row, float scale, uint32_t span) {
+    requireBytes(rows, uint64_t{span ? span : count} * width * sizeof(uint16_t), "ANE FFN LoRA rows");
+    requireBytes(output.buffer, rowBytes(row + count, output.strideBytes, uint64_t{width} * sizeof(_Float16), 1),
+                 "ANE FFN LoRA surface");
+    graph.add("ane_ffn_lora_rows", {std::move(rows), output.buffer},
+              AneFfnLoraRowsParams{count, width, width, 0, output.strideBytes, row, 0, scale, span},
+              {(width + 31) / 32, (count + 7) / 8, 1}, {32, 8, 1});
+  };
+  const std::array<metal::MetalBuffer, 3> &b = loraB_.at(layer);
+  values(b[0], target.loraGate, channels.ane, rank, 0, 1.0f / ANE_FFN_LORA_UNIT, channels.intermediate);
+  values(b[1], target.loraUp, channels.ane, rank, 0, 1.0f / ANE_FFN_LORA_UNIT, channels.intermediate);
+  uint32_t offset = 0;
+  for (size_t i = 0; i < channels.downSegments.size(); ++i) {
+    const ane::Surface &output = target.down[i];
+    const uint32_t width = channels.downSegments[i];
+    requireBytes(output.buffer, rowBytes(channels.hidden + rank, output.strideBytes, width, 1),
+                 "ANE FFN LoRA surface");
+    graph.add("ane_ffn_lora_codes", {backend_.view(current.lora, codes + layer * matrix, matrix), output.buffer},
+              AneFfnLoraRowsParams{rank, width, channels.ane, offset, output.strideBytes, channels.hidden, 0, 1.0f, 0},
+              {(width + 31) / 32, (rank + 7) / 8, 1}, {32, 8, 1});
+    offset += width;
+  }
+  values(backend_.view(current.lora, scales + uint64_t{layer} * rank * sizeof(uint16_t), rank * sizeof(uint16_t)),
+         target.downScale, rank, 1, channels.hidden, 1.0f, 0);
 }
 
 bool AneFfn::begin(Steps steps) {
@@ -751,14 +965,33 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
               {tiles, width / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
     channel += width;
   }
+  const GpuPart &part = current.layers[layer];
+  // LoRA: gate's and up's t = A x of the step, for the ANE over each token's
+  // scale; the GPU's part computes its own beside its sums
+  // (Linear::addSwiGlu).
+  const uint32_t rank = shape_.rank;
+  if (rank) {
+    const LoraRows down =
+        lora::addDown(graph, linear_, ffn.normalized, rows, &part.gate.lora, &part.up.lora, memory_.loraT, false);
+    size_t update = 0;
+    for (const ane::Surface *input : {&memory_.loraGate, &memory_.loraUp})
+      graph.add("ane_ffn_lora_inputs", {down.t, memory_.tokenScale.buffer, input->buffer},
+                AneFfnLoraInputParams{rows, rank, input->strideBytes / uint32_t{sizeof(_Float16)}, down.stride,
+                                      down.offsets[update++], ANE_FFN_LORA_UNIT},
+                {(uint64_t{rows} * rank + 255) / 256, 1, 1}, {256, 1, 1});
+  }
   const uint64_t ready = ane ? handoff_.next() : 0;
   if (ane) graph.signal(handoff_.event(), ready);
-  const GpuPart &part = current.layers[layer];
+  // The GPU's channels, gate's and up's with their updates; down's view of
+  // them has none, and its t over them joins the ANE's in join().
   linear_.addSwiGlu(graph, {&part.gate, &part.up, &part.down}, ffn, residual, output, rows);
+  if (rank)
+    addGgufFloat(graph, ffn.intermediate, current.loraLeadingRows.at(layer), memory_.loraDownGpu, rows, rank, 0,
+                 FloatOutput::Float32, lora::floatTile(linear_, rows, rank, current.shape.gpu));
   if (next && layer + 1 < planes_.size()) addWeights(graph, layer + 1, set ^ 1);
   const uint64_t done = ane ? handoff_.next() : 0;
   if (ane) jobs_.push_back({index, set, ready, done});
-  pending_ = Join{std::move(output), rows, done};
+  pending_ = Join{std::move(output), rows, layer, done};
   layersAdded_ = layer + 1;
 }
 
@@ -766,10 +999,28 @@ void AneFfn::join(metal::CommandGraph &graph) {
   const std::optional<Join> step = std::exchange(pending_, std::nullopt);
   if (!step) return;
   if (step->done) graph.wait(handoff_.event(), step->done);
-  const uint32_t tiles = (step->rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE;
-  graph.add("ane_ffn_join", {step->output, memory_.partial.buffer, memory_.tokenScale.buffer, memory_.status},
-            AneFfnJoinParams{shape_.hidden, memory_.partial.strideBytes / uint32_t{sizeof(_Float16)}, step->rows},
-            {tiles, shape_.hidden / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+  const uint32_t tiles = (step->rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE, rank = shape_.rank, rows = step->rows,
+                 partialStride = memory_.partial.strideBytes / uint32_t{sizeof(_Float16)};
+  const AneFfnJoinParams params{shape_.hidden, partialStride, rows, shape_.hidden + rank};
+  const metal::DispatchSize grid{tiles, shape_.hidden / ANE_FFN_TILE, 1}, threads{ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1};
+  if (!rank) {
+    graph.add("ane_ffn_join", {step->output, memory_.partial.buffer, memory_.tokenScale.buffer, memory_.status},
+              params, grid, threads);
+    return;
+  }
+  // LoRA: down's t of both parts, then B t beside the ANE's part of the sums.
+  graph.add("ane_ffn_lora_down",
+            {memory_.loraDownGpu, memory_.partial.buffer, memory_.tokenScale.buffer, memory_.loraDown,
+             memory_.status},
+            AneFfnLoraDownParams{shape_.hidden, partialStride, rows, rank, share().loraDownScale.at(step->layer)},
+            {(uint64_t{rows} * rank + 255) / 256, 1, 1}, {256, 1, 1});
+  addGgufFloat(graph, memory_.loraDown,
+               QuantizedSegment::rows(GGUF_FMT_BF16, shape_.hidden, rank, loraB_.at(step->layer)[2]),
+               memory_.loraDelta, rows, shape_.hidden, 0, FloatOutput::BFloat16,
+               lora::floatTile(linear_, rows, shape_.hidden, rank));
+  graph.add("ane_ffn_join_lora",
+            {step->output, memory_.partial.buffer, memory_.tokenScale.buffer, memory_.status, memory_.loraDelta},
+            params, grid, threads);
 }
 
 metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::CommandCompletion completion) {

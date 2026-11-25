@@ -159,6 +159,8 @@ std::array<uint64_t, prefillTensorCount> prefillTensorBytes(const RuntimeGeometr
   put(PrefillTensor::LinearTable, linear.input);
   put(PrefillTensor::LinearSums, linear.sums);
   put(PrefillTensor::LinearRotated, linear.rotated);
+  put(PrefillTensor::LinearLoraDown, linear.loraDown);
+  put(PrefillTensor::LinearLoraRows, linear.loraRows);
   return result;
 }
 
@@ -395,7 +397,8 @@ uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
   const ops::LinearScratchSize linear = DecodeArena::linearScratchSize(geometry, operators);
   uint64_t bytes = decodeArenaBaseBytes(geometry, operators);
   for (const uint64_t scratch : {DecodeArena::gateScratchBytes(geometry, operators), linear.input, linear.sums,
-                                 linear.partials, linear.counters, linear.rotated})
+                                 linear.partials, linear.counters, linear.rotated, linear.loraDown,
+                                 linear.loraRows})
     bytes = checkedAdd(bytes, alignUp(scratch), "decode scratch");
   return bytes;
 }

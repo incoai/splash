@@ -14,7 +14,9 @@
 //   model and fails a function bound to another's procedure; layers it is given out of order are refused, and it keeps
 //   what it needs of the layers it was built from; an infinity in the ANE's output stops it; its program unloaded for
 //   the idle release and loaded again computes what it computed before, and a command encoded or in flight refuses the
-//   release;
+//   release; layers with a LoRA update on every gate, up and down (ops::ProjectionLora) compute what the GPU
+//   computes alone with them, within the same error, in one step and in two, layers of which only some have one are
+//   not taken, and updates are part of a calibration's key;
 // - faults: each fault of the ANE's evaluations (ane/ProgramInstrumentation.hpp) at each layer of chunks of three
 //   sizes, and a program that does not load again after the idle release, stop the split without failing the Metal
 //   command or throwing, and the GPU alone then computes what it computes on its own; a Neural Engine slower than the
@@ -321,7 +323,7 @@ uint32_t joined(MetalBackend &backend, const MetalBuffer &output, const std::vec
   const MetalBuffer status = filled(backend, sizeof(uint32_t), 0);
   CommandGraph graph;
   graph.add("ane_ffn_join", {output, upload(backend, partial), upload(backend, tokenScale), status},
-            AneFfnJoinParams{kHidden, stride, rows},
+            AneFfnJoinParams{kHidden, stride, rows, kHidden},
             {(rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE, kHidden / ANE_FFN_TILE, 1},
             {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   run(backend, graph);
@@ -433,6 +435,35 @@ Model ggufModel(MetalBackend &backend) {
   using namespace gguf_reference;
   return blockModel(backend, "GGUF", {{{Q4K, Q4K, Q5K}, {Q5K, Q5K, Q4K}, {Q4K, Q5K, Q80}}});
 }
+// The rank of the updates of loraModel's layers.
+constexpr uint32_t kLoraRank = 32;
+// An MLX 4-bit target's layers with a LoRA update of every projection, as an adapter's loader attaches them: B of a
+// largest value near one, A of a magnitude that moves a sum by a fraction of itself.
+Model loraModel(MetalBackend &backend) {
+  Model model = mlxModel(backend);
+  model.name = "MLX af4g64 with LoRA updates";
+  const auto rows = [&](uint64_t count, float magnitude) {
+    std::uniform_real_distribution<float> unit(-magnitude, magnitude);
+    std::vector<uint8_t> bytes(count * 2);
+    for (uint64_t i = 0; i < count; ++i) {
+      const uint16_t bits = floatToBf16(unit(rng));
+      std::memcpy(bytes.data() + 2 * i, &bits, 2);
+    }
+    return upload(backend, bytes);
+  };
+  uint32_t seed = 0;
+  for (Projection &projection : model.projections) {
+    ProjectionLora update;
+    update.rank = kLoraRank;
+    update.slots = 1;
+    update.seed = seed++;
+    update.a = QuantizedSegment::rows(GGUF_FMT_BF16, kLoraRank, projection.inputSize,
+                                      rows(uint64_t{kLoraRank} * projection.inputSize, 0x1p-9f));
+    update.segments.push_back({rows(uint64_t{projection.outputSize} * kLoraRank, 0.9f), 0});
+    projection.lora = std::move(update);
+  }
+  return model;
+}
 
 // Which layers and shares the split takes.
 void takes(const Model &mlx, const Model &gguf) {
@@ -455,6 +486,15 @@ void takes(const Model &mlx, const Model &gguf) {
   if (const char *reason = AneFfn::unsupported(narrow)) fail(std::string("the split refuses a hidden size of 4096: ") + reason);
   if (!AneFfn::unsupported(uneven)) fail("the split takes a hidden size of 4608, which ane_ffn_rotate does not");
   if (!AneFfn::unsupported(mixed)) fail("the split takes layers of two shapes");
+  // LoRA updates on every layer's gate, up and down, or on none.
+  {
+    Projection updated = projection(kIntermediate, 4096);
+    updated.lora.rank = kLoraRank;
+    updated.lora.slots = 1;
+    updated.lora.segments.push_back({gate.blocks().segments.front().plane0, 0});
+    const std::vector<SwiGluProjections> some{{&updated, &gate, &down}};
+    if (!AneFfn::unsupported(some)) fail("the split takes layers of which only a gate has a LoRA update");
+  }
   if (AneFfn::units(mlx.layers) != kIntermediate / 512) fail("the split moves other units than 512 channels");
   // Units that leave the GPU or the ANE no channels.
   for (const uint32_t aneUnits : {0u, AneFfn::units(mlx.layers)})
@@ -488,13 +528,16 @@ struct Chunk {
 Chunk chunk(MetalBackend &backend, uint32_t rows) {
   const auto bf16Rows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{rows} * width * 2); };
   // Chunks of at least kMinimumRows rows take no split scratch, but where the family runs the int8 prefill tile its
-  // codes and scales (Linear::scratchSize).
+  // codes and scales, and the rows of loraModel's updates (Linear::scratchSize).
   const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
-  LinearScratchSize size = linear.scratchSize({kIntermediate, kHidden}, SPLASH_PREFILL_TOKEN_BUDGET);
-  size.include(linear.scratchSize({kHidden, kIntermediate}, SPLASH_PREFILL_TOKEN_BUDGET));
+  ProjectionShape wide{kIntermediate, kHidden}, narrow{kHidden, kIntermediate};
+  wide.loraValues = narrow.loraValues = kLoraRank;
+  LinearScratchSize size = linear.scratchSize(wide, SPLASH_PREFILL_TOKEN_BUDGET);
+  size.include(linear.scratchSize(narrow, SPLASH_PREFILL_TOKEN_BUDGET));
   const auto bytes = [&](uint64_t count) { return count ? test::sharedBuffer(backend, count) : MetalBuffer{}; };
   return {{bf16Rows(kHidden), bf16Rows(kIntermediate), bf16Rows(kIntermediate),
-           {.input = bytes(size.input), .sums = bytes(size.sums)}},
+           {.input = bytes(size.input), .sums = bytes(size.sums), .loraDown = bytes(size.loraDown),
+            .loraRows = bytes(size.loraRows)}},
           {bf16Rows(kHidden), bf16Rows(kHidden)}};
 }
 // Normal values scaled by row(r) into the leading rows of the chunk's normalized rows.
@@ -1101,6 +1144,13 @@ void split(MetalBackend &backend) {
   pipelined(backend, linear, mlx, buffers);
   pipelined(backend, linear, gguf, buffers);
   programAndInFlight(backend, linear, mlx, buffers);
+  // With a LoRA update of every projection: the GPU alone adds them where it runs the projections, the split in its
+  // program and its join.
+  const Model lora = loraModel(backend);
+  if (AneFfn::calibrationKey(lora.layers, linear) == AneFfn::calibrationKey(mlx.layers, linear))
+    fail("layers with LoRA updates share the calibration key of the layers without");
+  split(backend, linear, lora, buffers);
+  pipelined(backend, linear, lora, buffers);
   misbound(backend, mlx, buffers);
   refusals(backend, mlx, buffers);
   quietRows(backend, linear, mlx, buffers);

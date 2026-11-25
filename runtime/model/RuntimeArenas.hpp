@@ -412,6 +412,9 @@ enum class PrefillTensor : uint32_t {
   LinearSums,
   // The rotated input of a rotated projection (ops::LinearScratch::rotated).
   LinearRotated,
+  // The rows of a projection's LoRA update (ops::LinearScratch).
+  LinearLoraDown,
+  LinearLoraRows,
   // A prefill group's scratch GDN cell, which carries the state from a chunk
   // to the next when the lane's cells cannot (Runtime's prefill groups): one
   // layer's convolution and recurrent state, and the auxiliary
@@ -761,6 +764,8 @@ public:
     linearScratch_.counters =
         allocate(linearSize.counters, metal::BufferStorage::Shared, "linear-counters");
     linearScratch_.rotated = allocate(linearSize.rotated, metal::BufferStorage::Private, "linear-rotated");
+    linearScratch_.loraDown = allocate(linearSize.loraDown, metal::BufferStorage::Private, "linear-lora-down");
+    linearScratch_.loraRows = allocate(linearSize.loraRows, metal::BufferStorage::Private, "linear-lora-rows");
     if (linearSize.counters)
       std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
     bytes_ = decodeArenaBytes(geometry_, operators);

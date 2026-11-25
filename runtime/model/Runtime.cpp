@@ -255,7 +255,9 @@ ops::LinearScratch prefillScratch(const PrefillArena &arena) {
           .sums = arena.get(PrefillTensor::LinearSums),
           .partials = arena.get(PrefillTensor::LinearPartials),
           .counters = arena.get(PrefillTensor::LinearCounters),
-          .rotated = arena.get(PrefillTensor::LinearRotated)};
+          .rotated = arena.get(PrefillTensor::LinearRotated),
+          .loraDown = arena.get(PrefillTensor::LinearLoraDown),
+          .loraRows = arena.get(PrefillTensor::LinearLoraRows)};
 }
 
 // A prefill arena's tensors as the draft's context prefill of chunk `chunk`

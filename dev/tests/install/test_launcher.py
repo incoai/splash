@@ -672,6 +672,7 @@ class LauncherTests(unittest.TestCase):
             "--revision",
             "--draft-model",
             "--mmproj",
+            "--lora",
             "--chat-template-file",
             "--reasoning-effort",
         }

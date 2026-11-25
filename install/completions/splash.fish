@@ -19,8 +19,8 @@ function __splash_local_file_value
     set -l words (commandline -opc)
     test "$words[2]" = serve; or return 1
     contains -- -- $words[3..-1]; and return 1
-    contains -- "$words[-1]" --model-dir --draft-model --mmproj
-    or string match -qr -- '^--(model-dir|draft-model|mmproj)=' (commandline -ct)
+    contains -- "$words[-1]" --model-dir --draft-model --mmproj --lora
+    or string match -qr -- '^--(model-dir|draft-model|mmproj|lora)=' (commandline -ct)
 end
 
 complete -c splash -f

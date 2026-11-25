@@ -166,6 +166,48 @@ class LocalModelTest(unittest.TestCase):
         self.assertIn("target/model-Q4_K_M.gguf", record["files"])
         self.assertEqual(record["vision_format"], "none")
 
+    def test_a_lora_adapter_is_linked_for_the_engine_to_apply(self):
+        target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
+        draft = draft_dir(self.root / "draft", MOE)
+        # The installer links the adapter's two files, whatever else lies
+        # beside them; the engine checks what they hold as it loads them.
+        adapter = self.root / "my adapter"
+        adapter.mkdir()
+        for name in (*assembly.LORA_FILES, "README.md"):
+            (adapter / name).write_text(name)
+        without = self.prepare(target, draft)
+        prepared = self.prepare(target, draft, lora=adapter)
+        record = assembly.verify(prepared, full=True)
+        self.assertEqual(
+            [name for name in record["files"] if name.startswith("lora/")],
+            ["lora/adapter_config.json", "lora/adapter_model.safetensors"],
+        )
+        for name in assembly.LORA_FILES:
+            self.assertEqual((prepared / "lora" / name).readlink(), adapter / name)
+        # The model with the adapter is another one than the model without,
+        # which stays as it was prepared before adapters were.
+        self.assertNotEqual(prepared, without)
+        self.assertFalse((without / "lora").exists())
+        self.assertEqual(
+            models.local_selection_link(self.models, target, draft, None, False),
+            models.local_selection_link(self.models, target, draft, None, False, None),
+        )
+        self.assertEqual(
+            models.local_selection_link(
+                self.models, target, draft, None, False, adapter
+            ).resolve(),
+            prepared,
+        )
+        # A changed adapter is another model again.
+        (adapter / "adapter_model.safetensors").write_text("retrained")
+        self.assertNotEqual(self.prepare(target, draft, lora=adapter), prepared)
+        (adapter / "adapter_config.json").unlink()
+        with self.assertRaisesRegex(
+            local.ModelError,
+            "is not a PEFT LoRA adapter's directory: it holds no adapter_config.json",
+        ):
+            self.prepare(target, draft, lora=adapter)
+
     def test_a_gguf_projector_is_loaded_when_mmproj_names_it(self):
         target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
         draft = draft_dir(self.root / "draft", MOE)

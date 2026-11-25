@@ -1402,6 +1402,48 @@ at 2K and 32K tokens of real text it is about that of a cache hit against a cold
 against 1.3e-2 at 2K, 6.7e-2 against 6.2e-2 at 32K), and a second turn does not add to it. The
 prefill arena holds the codes, 47 MB at 2,048 rows on the 35B.
 
+### LoRA updates
+
+A [LoRA adapter](models.md#lora-adapters) is loaded beside the target (`runtime/model/LoraAdapter.cpp`)
+and attached to the projections its modules name as their update (`ops::ProjectionLora`): the
+tensors' A one after another as BF16 rows, each segment's B as BF16 rows with the adapter's scale in
+them, the rank padded with zeros to whole steps of the staged tile. From there the update is part of
+the projection: `Linear` adds it wherever it runs the projection, and neither the model's steps nor
+the engine know of it. A quantized weight cannot take the update itself, which is smaller than the
+weight's rounding, so the update stays a second, low-rank product.
+
+Every path first writes `t = A x` of the plan's input, one dispatch for all the tensors of a
+projection or of a gate/up pair (`lora::addDown`): a decode step's few rows on a kernel that runs one
+fragment of rows a threadgroup, a chunk's on the float projection. The staged decode tile then adds
+`B t` to its own sums as further steps of its accumulation, B staged as a step's weights are
+(`gguf_decode_lora_*`), so the tile's store and epilogue are the plain tile's and an update of zeros
+changes no bit; a decode step of more than 64 rows adds it in each of the tile's two row groups, its
+gate plan and its up plan each with their own. A plan on any other tile, a chunk's int8 prefill tile among them, writes its sums as
+without the update, and a tile kernel after it adds `B t` by the same matmul where the value that
+depends on the sum is rounded (`lora_tile`, `lora_swiglu_tile`): a residual plan's sums go to the
+scratch and take the residual with the update; a gate and an up are multiplied with theirs; and rows
+that are stored as they are, the attention's packed q, k and v, are rounded again with a dither of
+one unit, since on the grid they were rounded to a correction below half a unit would be lost whole.
+The rows `t` and those sums are linear scratch of the arenas, sized from the projections' shapes
+(`ProjectionShape::loraValues`).
+
+The [Neural Engine split](#neural-engine-prefill) takes updates of one rank on every layer's gate,
+up and down, or none: the program adds gate's and up's `B t` over the ANE's channels as a small FP16
+product beside its int8 one, and down's rotated A runs as int8 rows after down's own, whose products
+the GPU adds to its own part of down's `t` before it multiplies B, in the step's join. Gate's and
+up's rows of B are staged with the layer's weights, in the surfaces' descending order. Each kind of
+command's share holds its own parts of every layer's down A, the rows over its GPU channels and the
+codes over its ANE channels with their scales, so that a share computes what a split of it alone
+computes, as it does without an adapter. An adapter that leaves the FFN alone leaves the split as it
+is, and one that updates only some layers' FFN keeps the FFN on the GPU.
+
+With an adapter of rank 32 on every module of Qwen3.8-27B MLX 4-bit on a 20-core M5 Pro, a decode
+cycle takes 72.1-73.3 ms against 71.2-71.3 without, and a 9.3K-token prompt
+prefills at 857-893 tokens/s against 915-945 (747-761 against 770-786 with `--disable-ane`). The
+memory plan holds 304 MiB for the adapter, 71 MiB more of linear scratch and 96 MiB more for the
+split.
+`lora-projection` checks each path against the float product on the device.
+
 ## Sparse attention
 
 Qwen3.8-Flash-Next's full-attention layers attend sparsely (QSA): past 512
