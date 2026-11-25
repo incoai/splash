@@ -56,6 +56,7 @@
 #include "engine/Types.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/Bfloat16.hpp"
+#include "model/Inkling2LoopSteps.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/QwenState.hpp"
@@ -903,14 +904,134 @@ int runCycleRows(Loaded &loaded) {
   return failures;
 }
 
+// Inkling-2-Mini's step scratch (model/Inkling2LoopSteps.cpp) plans what it
+// allocates, keeps persistent and carried tensors (including every prefill
+// chunk's slice) disjoint from every other tensor, keeps simultaneously live
+// tensors within each transient phase disjoint, leaves its zeroed buffers zero
+// and overlays the non-overlapping gate and attention phases so both prefill
+// and decode allocate less than placing all tensors end to end.
+int runScratchLayout(metal::MetalBackend &backend) {
+  const model::Inkling2LoopLayout layout;
+  const model::Inkling2LoopShape shape = layout.loopShape();
+  struct Span final {
+    const std::byte *begin;
+    const std::byte *end;
+  };
+  const auto spanOf = [](const metal::MetalBuffer &buffer) -> Span {
+    const auto *p = static_cast<const std::byte *>(buffer.contents());
+    require(p && buffer.sizeBytes(), "scratch view is missing its allocation");
+    return {p, p + buffer.sizeBytes()};
+  };
+  const auto overlaps = [](Span a, Span b) { return a.begin < b.end && b.begin < a.end; };
+  const auto requireDisjoint = [&](std::span<const Span> spans, const char *what) {
+    for (size_t i = 0; i < spans.size(); ++i)
+      for (size_t j = i + 1; j < spans.size(); ++j)
+        require(!overlaps(spans[i], spans[j]), std::string("overlapping Inkling-2-Mini scratch views: ") + what);
+  };
+  const auto requireAllZero = [](const metal::MetalBuffer &buffer, const char *what) {
+    const auto *bytes = static_cast<const uint8_t *>(buffer.contents());
+    require(bytes && buffer.sizeBytes(), std::string("missing zeroed scratch view: ") + what);
+    for (uint64_t i = 0; i < buffer.sizeBytes(); ++i)
+      require(bytes[i] == 0, std::string("nonzero byte in ") + what);
+  };
+  for (const uint32_t lanes : {4u, 8u})
+    for (const uint32_t chunks : {1u, 4u}) {
+      model::QwenTargetGeometry geometry(layout, {});
+      geometry.lanes = lanes;
+      geometry.kvLayout = layout.kvLayout();
+      geometry.stateLayout = layout.gdnStateLayout();
+      const model::QwenTargetScratchBytes planned = model::Inkling2LoopSteps::scratchBytes(geometry, shape, chunks);
+      model::Inkling2LoopSteps steps(geometry, shape, backend, chunks);
+      const model::QwenTargetScratchBytes allocated = steps.allocatedBytes();
+      require(allocated.prefill == planned.prefill && allocated.decode == planned.decode,
+              "Inkling-2-Mini step scratch planned bytes do not match allocated bytes");
+
+      // Prefill: carried slices across chunks, persistent views, Gate (tiled
+      // and fused) and Attention.
+      std::vector<Span> persistent;
+      for (uint32_t c = 0; c < chunks; ++c) {
+        const model::Inkling2LoopScratch s = steps.prefillScratch(c);
+        persistent.push_back(spanOf(s.stack));
+        persistent.push_back(spanOf(s.previous));
+        persistent.push_back(spanOf(s.residual));
+      }
+      const model::Inkling2LoopScratch p = steps.prefillScratch(0);
+      for (const metal::MetalBuffer &b : {p.messages, p.keyInput, p.valueInput, p.gateCounters, p.zeros})
+        persistent.push_back(spanOf(b));
+      requireAllZero(p.zeros, "prefill zeros");
+      requireAllZero(p.gateCounters, "prefill gateCounters");
+      const std::array<Span, 4> prefillGateTiled{spanOf(p.mixed), spanOf(p.gateForget), spanOf(p.gateGain),
+                                                 spanOf(p.gateConcat)};
+      const std::array<Span, 4> prefillGateFused{spanOf(p.mixed), spanOf(p.gateForget), spanOf(p.gateGain),
+                                                 spanOf(p.gateLow)};
+      const std::array<Span, 8> prefillAttention{spanOf(p.keys),          spanOf(p.values),        spanOf(p.keyTaps),
+                                                 spanOf(p.valueTaps),     spanOf(p.convolvedKeys), spanOf(p.convolvedValues),
+                                                 spanOf(p.relativeStates), spanOf(p.rowSinks)};
+      const auto withPersistent = [&](std::span<const Span> phase) {
+        std::vector<Span> all = persistent;
+        all.insert(all.end(), phase.begin(), phase.end());
+        return all;
+      };
+      requireDisjoint(withPersistent(prefillGateTiled), "prefill persistent + tiled gate");
+      requireDisjoint(withPersistent(prefillGateFused), "prefill persistent + fused gate");
+      requireDisjoint(withPersistent(prefillAttention), "prefill persistent + attention");
+      require(overlaps(spanOf(p.gateConcat), spanOf(p.gateLow)),
+              "prefill gateLow did not share bytes with mutually exclusive gateConcat");
+      require(overlaps(spanOf(p.mixed), spanOf(p.keys)),
+              "prefill attention scratch did not share bytes with gate scratch");
+      uint64_t unaliasedPrefill = 0;
+      for (const Span &s : persistent) unaliasedPrefill += alignUp(static_cast<uint64_t>(s.end - s.begin));
+      for (const Span &s : prefillGateTiled) unaliasedPrefill += alignUp(static_cast<uint64_t>(s.end - s.begin));
+      unaliasedPrefill += alignUp(p.gateLow.sizeBytes());
+      for (const Span &s : prefillAttention) unaliasedPrefill += alignUp(static_cast<uint64_t>(s.end - s.begin));
+      require(allocated.prefill < unaliasedPrefill, "prefill step scratch aliasing saved no memory");
+
+      // Decode: persistent views (including tape and attentionCounters), Gate
+      // (no gateConcat), and Attention (separate K/V and paired keyValues).
+      const model::Inkling2LoopScratch d = steps.verifyScratch();
+      require(!d.gateConcat, "decode step scratch should not allocate unused gateConcat");
+      requireAllZero(d.zeros, "decode zeros");
+      requireAllZero(d.gateCounters, "decode gateCounters");
+      requireAllZero(d.attentionCounters, "decode attentionCounters");
+      const std::array<Span, 10> decodePersistent{
+          spanOf(d.stack),      spanOf(d.previous), spanOf(d.residual),         spanOf(d.messages),
+          spanOf(d.keyInput),   spanOf(d.valueInput), spanOf(d.gateCounters),   spanOf(d.zeros),
+          spanOf(d.tape),       spanOf(d.attentionCounters)};
+      const std::array<Span, 4> decodeGate{spanOf(d.mixed), spanOf(d.gateForget), spanOf(d.gateGain),
+                                           spanOf(d.gateLow)};
+      const std::array<Span, 6> decodeAttentionSplit{spanOf(d.keys),      spanOf(d.values),        spanOf(d.keyTaps),
+                                                     spanOf(d.valueTaps), spanOf(d.convolvedKeys), spanOf(d.convolvedValues)};
+      const std::array<Span, 5> decodeAttentionPaired{spanOf(d.keyValues), spanOf(d.keyTaps), spanOf(d.valueTaps),
+                                                      spanOf(d.convolvedKeys), spanOf(d.convolvedValues)};
+      const auto withDecodePersistent = [&](std::span<const Span> phase) {
+        std::vector<Span> all(decodePersistent.begin(), decodePersistent.end());
+        all.insert(all.end(), phase.begin(), phase.end());
+        return all;
+      };
+      requireDisjoint(withDecodePersistent(decodeGate), "decode persistent + gate");
+      requireDisjoint(withDecodePersistent(decodeAttentionSplit), "decode persistent + split attention");
+      requireDisjoint(withDecodePersistent(decodeAttentionPaired), "decode persistent + paired attention");
+      require(overlaps(spanOf(d.mixed), spanOf(d.keys)) && overlaps(spanOf(d.keys), spanOf(d.keyValues)),
+              "decode attention scratch did not share bytes with gate scratch or paired keyValues");
+      uint64_t unaliasedDecode = 0;
+      for (const Span &s : decodePersistent) unaliasedDecode += alignUp(static_cast<uint64_t>(s.end - s.begin));
+      for (const Span &s : decodeGate) unaliasedDecode += alignUp(static_cast<uint64_t>(s.end - s.begin));
+      for (const Span &s : decodeAttentionSplit) unaliasedDecode += alignUp(static_cast<uint64_t>(s.end - s.begin));
+      unaliasedDecode += alignUp(d.keyValues.sizeBytes());
+      require(allocated.decode < unaliasedDecode, "decode step scratch aliasing saved no memory");
+    }
+  std::printf("step scratch layout: planned == allocated, persistent and intra-phase views disjoint, transient phases aliased\n");
+  return 0;
+}
+
 // The comparisons within bounds.
 int runComparisons(Loaded &loaded) {
+  int failures = runScratchLayout(loaded.backend);
   const model::Inkling2LoopLayout &layout = loaded.fixture.layout;
   const std::vector<uint32_t> &ids = loaded.ids;
   const uint32_t hidden = layout.hiddenSize, applications = layout.layers, tokens = layout.tokens();
   const std::array<uint32_t, 1> whole{kPromptRows};
   const model::Inkling2LoopSchedule schedule = layout.schedule();
-  int failures = 0;
   std::optional<Run> wholeRun;
   // The ids 1 to the applications: the rows passed into each application, the
   // output of the application before it; the last, the final norm's.

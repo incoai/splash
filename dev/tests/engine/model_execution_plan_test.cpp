@@ -37,6 +37,10 @@ model::DFlashDraftLayout draftOf() {
     return test::qwen3_6MoeDraft();
   else if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>)
     return test::flashNextDraft();
+  else if constexpr (std::is_same_v<Weights, model::FlintWeights>)
+    return test::flintDraft();
+  else if constexpr (std::is_same_v<Weights, model::Inkling2LoopWeights>)
+    return test::inkling2Draft();
   else
     return test::qwen3_8Draft();
 }
@@ -54,47 +58,88 @@ model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
     return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(format, n, k, {}, {}, {})}});
   };
   const auto &layout = target.layout;
-  // Qwen3.8-Flash-Next's hyper-connection mixes, QSA indexers and PLE layer.
-  const auto hyper = [&] {
-    return model::Qwen4HyperWeights{.norm = {}, .down = projection(layout.hyperRank, layout.streamWidth()),
-                                    .up = projection(layout.streamWidth(), layout.hyperRank), .inject = {}};
-  };
   target.logitsProjection = projection(layout.vocabularySize, layout.hiddenSize);
-  target.layers.resize(layout.layers);
-  for (uint32_t i = 0; i < layout.layers; ++i) {
-    auto &layer = target.layers[i];
-    if (layout.isFullAttentionLayer(i)) {
-      model::QwenAttentionWeights attention;
-      attention.inputProjection = projection(layout.packedFullWidth, layout.hiddenSize);
-      attention.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
-      layer.mixer = std::move(attention);
-    } else {
-      model::QwenGdnWeights gdn;
-      gdn.inputProjection = projection(layout.packedGdnWidth, layout.hiddenSize);
-      gdn.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
-      layer.mixer = std::move(gdn);
+  if constexpr (std::is_same_v<Weights, model::Inkling2LoopWeights>) {
+    const auto floatProjection = [](uint32_t n, uint32_t k) {
+      return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::floats(n, k, {})}});
+    };
+    const uint32_t taps =
+        (layout.convolutionTapsWidth() + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+    target.layers.resize(layout.weightLayers);
+    for (uint32_t i = 0; i < layout.weightLayers; ++i) {
+      auto &layer = target.layers[i];
+      layer.mixer.inputProjection = projection(layout.packedFullWidth, layout.hiddenSize);
+      layer.mixer.key = projection(layout.kvWidth(), layout.hiddenSize);
+      layer.mixer.value = projection(layout.kvWidth(), layout.hiddenSize);
+      layer.mixer.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
+      if (layout.slides(i)) {
+        layer.inputs = model::Inkling2LoopSlidingInputs{};
+      } else {
+        layer.inputs = model::Inkling2LoopFullInputs{.keyTaps = floatProjection(taps, layout.hiddenSize),
+                                                     .valueTaps = floatProjection(taps, layout.hiddenSize)};
+      }
+      if (layout.schedule().isLoopLayer(i)) {
+        model::Inkling2LoopMessageWeights messages;
+        for (auto &gate : messages.gates) {
+          gate.down = floatProjection(layout.loopGateRank, 2 * layout.hiddenSize);
+          gate.forget = floatProjection(layout.hiddenSize, layout.loopGateRank);
+          gate.gain = floatProjection(layout.hiddenSize, layout.loopGateRank);
+        }
+        layer.messages = std::move(messages);
+      }
     }
-    if constexpr (std::is_same_v<Weights, model::Qwen3_8Weights>) {
-      layer.gateProjection = projection(layout.intermediateSize, layout.hiddenSize);
-      layer.upProjection = layer.gateProjection;
-      layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
+  } else {
+    // Qwen3.8-Flash-Next's hyper-connection mixes, QSA indexers and PLE layer.
+    const auto hyper = [&] {
+      return model::Qwen4HyperWeights{.norm = {}, .down = projection(layout.hyperRank, layout.streamWidth()),
+                                      .up = projection(layout.streamWidth(), layout.hyperRank), .inject = {}};
+    };
+    target.layers.resize(layout.layers);
+    for (uint32_t i = 0; i < layout.layers; ++i) {
+      auto &layer = target.layers[i];
+      if (layout.isFullAttentionLayer(i)) {
+        model::QwenAttentionWeights attention;
+        attention.inputProjection = projection(layout.packedFullWidth, layout.hiddenSize);
+        attention.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
+        layer.mixer = std::move(attention);
+      } else {
+        model::QwenGdnWeights gdn;
+        gdn.inputProjection = projection(layout.packedGdnWidth, layout.hiddenSize);
+        gdn.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
+        layer.mixer = std::move(gdn);
+      }
+      if constexpr (std::is_same_v<Weights, model::Qwen3_8Weights>) {
+        layer.gateProjection = projection(layout.intermediateSize, layout.hiddenSize);
+        layer.upProjection = layer.gateProjection;
+        layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
+      }
+      if constexpr (std::is_same_v<Weights, model::FlintWeights>) {
+        if (i < layout.leadingDenseLayers) {
+          layer.ffn = model::FlintDenseFfnWeights{
+              .gate = projection(layout.intermediateSize, layout.hiddenSize),
+              .up = projection(layout.intermediateSize, layout.hiddenSize),
+              .down = projection(layout.hiddenSize, layout.intermediateSize)};
+        } else {
+          layer.ffn = ops::BlockMoeWeights{};
+        }
+      }
+      if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>) {
+        layer.mixerHyper = hyper();
+        layer.ffnHyper = hyper();
+        if (layout.isFullAttentionLayer(i))
+          layer.indexer = model::Qwen4IndexerWeights{
+              .query = projection(layout.indexerHeads * layout.indexerHeadDimension, layout.hiddenSize),
+              .key = projection(layout.indexerHeadDimension, layout.hiddenSize), .queryNorm = {}, .keyNorm = {}};
+        if (i == layout.pleLayer)
+          layer.ple = model::Qwen4PleWeights{.key = projection(layout.hiddenSize, layout.pleWidth()),
+                                             .value = projection(layout.hiddenSize, layout.pleWidth()),
+                                             .keyNorm = {}, .queryNorm = {}, .convolutionNorm = {},
+                                             .convolution = {}};
+      }
     }
-    if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>) {
-      layer.mixerHyper = hyper();
-      layer.ffnHyper = hyper();
-      if (layout.isFullAttentionLayer(i))
-        layer.indexer = model::Qwen4IndexerWeights{
-            .query = projection(layout.indexerHeads * layout.indexerHeadDimension, layout.hiddenSize),
-            .key = projection(layout.indexerHeadDimension, layout.hiddenSize), .queryNorm = {}, .keyNorm = {}};
-      if (i == layout.pleLayer)
-        layer.ple = model::Qwen4PleWeights{.key = projection(layout.hiddenSize, layout.pleWidth()),
-                                           .value = projection(layout.hiddenSize, layout.pleWidth()),
-                                           .keyNorm = {}, .queryNorm = {}, .convolutionNorm = {},
-                                           .convolution = {}};
-    }
+    if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>)
+      target.finalHyper = hyper();
   }
-  if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>)
-    target.finalHyper = hyper();
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.layout.hiddenSize;
   result.descriptor = model::makeModelDescriptor(
@@ -735,6 +780,65 @@ void checkDraftVocabulary() {
           "a subset whose parts cross was accepted");
 }
 
+// A target arena overlays mutually exclusive transient layer phases (GDN,
+// attention, dense FFN and MoE FFN) past the carried group tensors: every
+// carried tensor stays disjoint from every other tensor, every pair within one
+// phase stays disjoint, every tensor is page-aligned and fits within the
+// arena's bytes, and any model with two non-empty transient phases uses less
+// memory than placing all tensors end to end.
+void checkTargetArenaTransientAliasing(const char *name, const model::LoadedModel &loaded) {
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+  const auto checkShape = [&](const model::RuntimeGeometry &geometry, const model::TargetRows &shape,
+                              const char *kind) {
+    const model::TargetArenaLayout layout = model::targetArenaLayout(geometry.target, shape);
+    require(layout.bytes == model::TargetArena::bytes(geometry.target, shape),
+            std::string(name) + " " + kind + ": target arena bytes disagree with its layout");
+    uint64_t unaliased = 0;
+    std::array<uint64_t, static_cast<uint32_t>(model::TargetPhase::Count)> phaseBytes{};
+    for (uint32_t i = 0; i < model::targetTensorCount; ++i) {
+      const uint64_t size = layout.sizes[i];
+      if (!size) continue;
+      const uint64_t start = layout.offsets[i], end = start + alignUp(size);
+      require(start % kHostPageBytes == 0 && end <= layout.bytes,
+              std::string(name) + " " + kind + ": target tensor is misaligned or past the arena");
+      unaliased += alignUp(size);
+      const model::TargetPhase phase = model::targetTensorPhase(static_cast<model::TargetTensor>(i));
+      phaseBytes[static_cast<uint32_t>(phase)] += alignUp(size);
+      for (uint32_t j = i + 1; j < model::targetTensorCount; ++j) {
+        if (!layout.sizes[j]) continue;
+        const model::TargetPhase other = model::targetTensorPhase(static_cast<model::TargetTensor>(j));
+        const bool mustDisjoint = phase == model::TargetPhase::Carried || other == model::TargetPhase::Carried ||
+                                  phase == other;
+        if (!mustDisjoint) continue;
+        const uint64_t otherStart = layout.offsets[j], otherEnd = otherStart + alignUp(layout.sizes[j]);
+        require(end <= otherStart || otherEnd <= start,
+                std::string(name) + " " + kind + ": carried or same-phase target tensors overlap");
+      }
+    }
+    uint32_t nonEmptyTransient = 0;
+    for (uint32_t p = 1; p < phaseBytes.size(); ++p) nonEmptyTransient += phaseBytes[p] != 0;
+    require(nonEmptyTransient < 2 || layout.bytes < unaliased,
+            std::string(name) + " " + kind + ": mutually exclusive transient phases did not share memory");
+  };
+  const model::StreamedParts loadedParts = model::StreamedParts::loaded(loaded);
+  const auto four = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, loadedParts);
+  checkShape(four, model::prefillTargetRows(four, plans), "prefill");
+  checkShape(four, model::decodeTargetRows(four, plans), "decode-4L");
+  const auto eight =
+      model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, loadedParts, 8);
+  checkShape(eight, model::decodeTargetRows(eight, plans), "decode-8L");
+  if (four.target.ffnKind == model::QwenFfnKind::SparseMoe) {
+    model::StreamedParts streamed = loadedParts;
+    streamed.experts = true;
+    const auto grouped =
+        model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, streamed);
+    checkShape(grouped, model::prefillTargetRows(grouped, plans), "prefill-group");
+  }
+}
+
 } // namespace
 
 // A prefill chunk's attention plan follows the history its chunk committed:
@@ -779,12 +883,22 @@ int main() {
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
-    checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {450'576'384, 434'864'128},
-                              {749'715'456, 733'609'984, 733'609'984});
-    checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {279'281'664, 273'874'944},
-                              {539'017'216, 533'610'496, 533'446'656});
+    checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {443'301'888, 427'589'632},
+                              {517'390'336, 501'284'864, 501'284'864});
+    checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {270'073'856, 264'667'136},
+                              {313'999'360, 308'592'640, 308'428'800});
     checkArenasHoldTheirLanes("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>(),
-                              {409'796'608, 403'963'904}, {1'124'614'144, 1'118'781'440, 1'118'781'440});
+                              {396'443'648, 390'610'944}, {807'010'304, 801'177'600, 801'177'600});
+    checkArenasHoldTheirLanes("Inkling-2-Mini", loadedModel<model::Inkling2LoopWeights>(),
+                              {175'751'168, 173'047'808}, {591'200'256, 588'709'888, 588'496'896});
+    checkTargetArenaTransientAliasing("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>());
+    checkTargetArenaTransientAliasing("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>());
+    checkTargetArenaTransientAliasing("Qwen3.5-122B",
+                                      loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout,
+                                                                            test::qwen3_5_122BDraft()));
+    checkTargetArenaTransientAliasing("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>());
+    checkTargetArenaTransientAliasing("Flint", loadedModel<model::FlintWeights>());
+    checkTargetArenaTransientAliasing("Inkling-2-Mini", loadedModel<model::Inkling2LoopWeights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepRows(loadedModel<model::Qwen3_8Weights>());
@@ -793,7 +907,8 @@ int main() {
     checkMoeInt8Passes(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkDecodeStepMoe(loadedModel<model::Qwen4ExpWeights>());
-    std::cout << "model execution plans: PASS (three paired geometries)\n";
+    checkDecodeStepMoe(loadedModel<model::Inkling2LoopWeights>());
+    std::cout << "model execution plans: PASS (four paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

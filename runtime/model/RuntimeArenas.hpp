@@ -318,10 +318,77 @@ struct TargetRows final {
   return false;
 }
 
+// Which phase of a layer uses a target step tensor: a group tensor
+// (targetGroupTensor) outlives a phase and keeps its own bytes; the others
+// live within one mutually exclusive phase — a GDN mixer, an attention mixer,
+// a dense FFN (whose GPU channels complete before AneFfn returns) or a MoE
+// block's routing scores and expert passes — so the phases share one
+// page-aligned transient region after the group tensors (saving 214.6 MiB of
+// prefill scratch on Qwen3.6-35B-A3B).
+enum class TargetPhase : uint8_t { Carried, Gdn, Attention, DenseFfn, MoeFfn, Count };
+
+[[nodiscard]] constexpr TargetPhase targetTensorPhase(TargetTensor tensor) noexcept {
+  if (targetGroupTensor(tensor)) return TargetPhase::Carried;
+  switch (tensor) {
+  case TargetTensor::GdnPacked:
+  case TargetTensor::GdnQueries:
+  case TargetTensor::GdnKeys:
+  case TargetTensor::GdnValues:
+  case TargetTensor::GdnDecay:
+  case TargetTensor::GdnBeta:
+  case TargetTensor::Recurrent:
+  case TargetTensor::GdnHidden:
+    return TargetPhase::Gdn;
+  case TargetTensor::FullPacked:
+  case TargetTensor::FullQueries:
+  case TargetTensor::AttentionPartials:
+  case TargetTensor::AttentionStatistics:
+  case TargetTensor::AttentionHidden:
+    return TargetPhase::Attention;
+  case TargetTensor::Intermediate:
+    return TargetPhase::DenseFfn;
+  default:
+    return TargetPhase::MoeFfn;
+  }
+}
+
 // The bytes of each target tensor of commands of `shape`, a group tensor's
 // holding every chunk's rows, each chunk's aligned.
 [[nodiscard]] std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeometry &target,
                                                                        const TargetRows &shape);
+
+// The placed offsets and sizes of a TargetArena's tensors and its total bytes.
+struct TargetArenaLayout final {
+  std::array<uint64_t, targetTensorCount> sizes{};
+  std::array<uint64_t, targetTensorCount> offsets{};
+  uint64_t bytes = 0;
+};
+
+// Places carried tensors one after another and overlays each transient phase
+// from the same aligned offset past them.
+[[nodiscard]] inline TargetArenaLayout targetArenaLayout(const QwenTargetGeometry &target, const TargetRows &shape) {
+  TargetArenaLayout layout;
+  layout.sizes = targetTensorBytes(target, shape);
+  uint64_t carried = 0;
+  for (uint32_t index = 0; index < targetTensorCount; ++index) {
+    if (targetTensorPhase(static_cast<TargetTensor>(index)) != TargetPhase::Carried) continue;
+    layout.offsets[index] = carried;
+    carried = checkedAdd(carried, alignUp(layout.sizes[index]), "target arena");
+  }
+  std::array<uint64_t, static_cast<uint32_t>(TargetPhase::Count)> cursors{};
+  cursors.fill(carried);
+  uint64_t total = carried;
+  for (uint32_t index = 0; index < targetTensorCount; ++index) {
+    const TargetPhase phase = targetTensorPhase(static_cast<TargetTensor>(index));
+    if (phase == TargetPhase::Carried) continue;
+    uint64_t &cursor = cursors[static_cast<uint32_t>(phase)];
+    layout.offsets[index] = cursor;
+    cursor = checkedAdd(cursor, alignUp(layout.sizes[index]), "target arena");
+    total = std::max(total, cursor);
+  }
+  layout.bytes = total;
+  return layout;
+}
 
 // The target step tensors of a command (TargetRows), views of an arena's
 // allocation from `offset` on: a prompt's (the prefill arena's) or a decode
@@ -332,24 +399,19 @@ struct TargetRows final {
 class TargetArena final {
 public:
   [[nodiscard]] static uint64_t bytes(const QwenTargetGeometry &target, const TargetRows &shape) {
-    uint64_t total = 0;
-    for (const uint64_t value : targetTensorBytes(target, shape))
-      total = checkedAdd(total, alignUp(value), "target arena");
-    return total;
+    return targetArenaLayout(target, shape).bytes;
   }
 
   TargetArena(metal::MetalBackend &backend, const metal::MetalBuffer &base, uint64_t offset,
               const QwenTargetGeometry &target, const TargetRows &shape)
       : shape_(shape) {
-    const auto sizes = targetTensorBytes(target, shape);
-    uint64_t cursor = offset;
-    for (uint32_t index = 0; index < sizes.size(); ++index) {
-      if (sizes[index]) {
-        tensors_[index] = backend.view(base, cursor, sizes[index]);
-        if (shape.chunks > 1 && targetGroupTensor(static_cast<TargetTensor>(index)))
-          chunkViews_[index] = groupViews(backend, base, cursor, sizes[index], shape.chunks);
-      }
-      cursor += alignUp(sizes[index]);
+    const TargetArenaLayout layout = targetArenaLayout(target, shape);
+    for (uint32_t index = 0; index < layout.sizes.size(); ++index) {
+      if (!layout.sizes[index]) continue;
+      const uint64_t at = checkedAdd(offset, layout.offsets[index], "target arena");
+      tensors_[index] = backend.view(base, at, layout.sizes[index]);
+      if (shape.chunks > 1 && targetGroupTensor(static_cast<TargetTensor>(index)))
+        chunkViews_[index] = groupViews(backend, base, at, layout.sizes[index], shape.chunks);
     }
   }
 

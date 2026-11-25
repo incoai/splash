@@ -6,6 +6,7 @@
 #include "ops/MessageGate.hpp"
 #include "ops/RelativeAttention.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -18,36 +19,40 @@ constexpr uint32_t kMixerQueries = 3;
 // The messages of a loop layer: its q, k, v and FFN inputs'.
 constexpr uint32_t kMessages = 4;
 // A layer's mixer gates run as one call (ops::MessageGate): a decode step's
-// fused gates take each its rank values and gated rows, a step's rows each;
-// a prompt chunk's of a decode step's rows at most take theirs from a
-// chunk's single rows, which hold those of the most rows the fused gates
-// take; a longer chunk's tiled gates keep each gate's gated rows in its own
-// of the forget, gain and concatenation rows, fp32 rows of hiddenSize each.
+// fused gates take each its rank values, partial sums and gated rows, a step's
+// rows each; a prompt chunk's of a decode step's rows at most take theirs from
+// a chunk's single rows and kFusedRows rank rows, which never overlap the
+// tiled gates' concatenation rows; a longer chunk's tiled gates keep each
+// gate's gated rows in its own of the forget, gain and concatenation rows,
+// fp32 rows of hiddenSize each.
 static_assert(kMixerQueries <= ops::MessageGate::kMaximumGates, "a layer's mixer gates run as one call");
+static_assert(decodeStorageRows(ExecutionLimits::maximumBatchWidth) <= ops::MessageGate::kFusedRows,
+              "every decode step runs the fused message gates");
 static_assert(kChunkRows >= kMixerQueries * ops::MessageGate::kFusedRows,
               "a prompt chunk's gated rows hold its fused gates' of their most rows");
+static_assert(kChunkRows * sizeof(float) >=
+                  ops::MessageGate::partialSumsBytes(kMixerQueries, 1, ops::MessageGate::kFusedRows),
+              "a prompt chunk's gain rows hold its fused gates' partial sums");
 
 template <class T> constexpr uint64_t bytesFor(uint64_t elements) noexcept { return elements * sizeof(T); }
 
-// A scratch tensor (Inkling2LoopScratch): its bytes per row of a step and its
-// fixed bytes, and whether a prefill group's chunks each hold their own: the
-// block stack and the pass before's states, which outlive a command, and the
-// residual, which a layer's FFN reads after the group's load of the layer's
-// experts (QwenTarget::addPrefillLayers). The rest a chunk uses within its
-// part of a layer, one chunk after another.
-struct Tensor final {
-  metal::MetalBuffer Inkling2LoopScratch::*field;
-  uint64_t rowBytes;
-  uint64_t fixedBytes;
-  bool carried;
-};
+uint32_t stepRows(const QwenTargetGeometry &g, bool decode) {
+  return decode ? decodeStorageRows(g.lanes) : kChunkRows;
+}
 
-// A prefill chunk's or a decode step's tensors. A prompt chunk's attention
-// stages its relative states and row sinks in the queries' staged rows: a
-// step's rows and, each sequence's rows taking whole KV blocks, the rest of a
-// block per lane (RuntimeArenas.cpp targetTensorBytes); a decode step's
-// prepares them in its single pass.
-std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape &shape, bool decode) {
+// Places a prefill chunk's or a decode step's scratch tensors. Persistent
+// tensors keep disjoint bytes: carried tensors (stack, previous, residual)
+// take one aligned slice per prefill chunk, read-only or reset-to-zero buffers
+// (zeros, gateCounters, attentionCounters) and decode's tape stay untouched,
+// messages live across attention into the FFN gate, and keyInput/valueInput
+// bridge mixer inputs into attention projections. Two mutually exclusive
+// transient phases — Gate (block mixes and message gates, with prefill's
+// tiled gateConcat and fused gateLow overlaid) and Attention (keys/values or
+// decode's paired keyValues, dynamic taps, convolved K/V and prefill's
+// relative staging) — share one page-aligned region after them (saving 20.6
+// MiB of prefill scratch on Inkling-2-Mini).
+std::vector<Inkling2LoopSteps::Placed> place(const QwenTargetGeometry &g, const Inkling2LoopShape &shape, bool decode,
+                                             uint32_t chunks, uint64_t &bytes) {
   const Inkling2LoopSchedule schedule(shape);
   const uint64_t hidden = g.hiddenSize, kv = shape.kvWidth;
   // A full layer's dynamic taps, as their projection writes them: whole
@@ -58,59 +63,79 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
       GGUF_TILE_COLUMNS;
   const uint64_t relative = uint64_t{g.attentionQueryHeads} * shape.relativeRank;
   const uint64_t stagedLaneRows = uint64_t{g.lanes} * (kv::kPageTokens - 1);
-  std::vector<Tensor> result{
-      {&Inkling2LoopScratch::stack, bytesFor<uint16_t>(schedule.stackPlanes() * hidden), 0, true},
-      {&Inkling2LoopScratch::previous, bytesFor<uint16_t>(schedule.previousPlanes() * hidden), 0, true},
-      {&Inkling2LoopScratch::residual, bytesFor<float>(hidden), 0, true},
-      {&Inkling2LoopScratch::mixed, bytesFor<float>(kMixerQueries * hidden), 0, false},
-      {&Inkling2LoopScratch::messages, bytesFor<float>(kMessages * hidden), 0, false},
-      {&Inkling2LoopScratch::keyInput, bytesFor<uint16_t>(hidden), 0, false},
-      {&Inkling2LoopScratch::valueInput, bytesFor<uint16_t>(hidden), 0, false},
-      {&Inkling2LoopScratch::keys, bytesFor<uint16_t>(kv), 0, false},
-      {&Inkling2LoopScratch::values, bytesFor<uint16_t>(kv), 0, false},
-      {&Inkling2LoopScratch::keyTaps, bytesFor<uint16_t>(taps), 0, false},
-      {&Inkling2LoopScratch::valueTaps, bytesFor<uint16_t>(taps), 0, false},
-      {&Inkling2LoopScratch::convolvedKeys, bytesFor<uint16_t>(kv), 0, false},
-      {&Inkling2LoopScratch::convolvedValues, bytesFor<uint16_t>(kv), 0, false},
-      {&Inkling2LoopScratch::gateConcat, bytesFor<uint16_t>(2 * hidden), 0, false},
-      {&Inkling2LoopScratch::gateLow, bytesFor<uint16_t>(kMixerQueries * shape.gateRank), 0, false},
-      {&Inkling2LoopScratch::gateForget, bytesFor<float>((decode ? kMixerQueries : 1) * hidden), 0, false},
-      {&Inkling2LoopScratch::gateGain, bytesFor<float>(hidden), 0, false},
-      {&Inkling2LoopScratch::gateCounters, 0, ops::MessageGate::kCountersBytes, false},
-      {&Inkling2LoopScratch::zeros, bytesFor<uint16_t>(hidden), 0, false},
-  };
-  // A decode step's key and value projections of one row side by side, its
-  // convolution inputs of every application, which its commit reads after
-  // the last (ops::ShortConvolution::addCommit), and its relative attention's
-  // counters (ops::RelativeAttention::addDecode).
-  if (decode) {
-    result.push_back({&Inkling2LoopScratch::keyValues, bytesFor<uint16_t>(2 * kv), 0, false});
-    result.push_back({&Inkling2LoopScratch::tape, bytesFor<uint16_t>(schedule.stateColumns()), 0, false});
-    result.push_back({&Inkling2LoopScratch::attentionCounters, 0, ops::RelativeAttention::kCountersBytes, false});
-  } else {
-    result.push_back({&Inkling2LoopScratch::relativeStates, bytesFor<float>(relative),
-                      bytesFor<float>(stagedLaneRows * relative), false});
-    result.push_back({&Inkling2LoopScratch::rowSinks, bytesFor<float>(g.attentionQueryHeads),
-                      bytesFor<float>(stagedLaneRows * g.attentionQueryHeads), false});
-  }
-  return result;
-}
+  const uint32_t rows = stepRows(g, decode);
 
-uint64_t bytesOf(const Tensor &tensor, uint64_t rows) noexcept { return tensor.rowBytes * rows + tensor.fixedBytes; }
-
-uint32_t stepRows(const QwenTargetGeometry &g, bool decode) {
-  return decode ? decodeStorageRows(g.lanes) : kChunkRows;
-}
-
-// The tensors placed one after another, a carried one's once per chunk.
-std::vector<Inkling2LoopSteps::Placed> place(const QwenTargetGeometry &g, const Inkling2LoopShape &shape, bool decode,
-                                             uint32_t chunks, uint64_t &bytes) {
   std::vector<Inkling2LoopSteps::Placed> placed;
-  bytes = 0;
-  for (const Tensor &tensor : tensors(g, shape, decode)) {
-    placed.push_back({tensor.field, tensor.rowBytes, tensor.fixedBytes, tensor.carried, bytes});
-    bytes += alignUp(bytesOf(tensor, stepRows(g, decode))) * (tensor.carried && !decode ? chunks : 1);
+  const auto add = [&](metal::MetalBuffer Inkling2LoopScratch::*field, uint64_t rowBytes, uint64_t fixedBytes,
+                       bool carried, uint64_t offset) -> uint64_t {
+    placed.push_back({field, rowBytes, fixedBytes, carried, offset});
+    const uint64_t perSlice = alignUp(checkedAdd(checkedMultiply(rowBytes, rows, "Inkling-2-Mini scratch"), fixedBytes,
+                                                 "Inkling-2-Mini scratch"));
+    return checkedMultiply(perSlice, carried && !decode ? chunks : 1, "Inkling-2-Mini scratch");
+  };
+  const auto append = [&](uint64_t &cursor, metal::MetalBuffer Inkling2LoopScratch::*field, uint64_t rowBytes,
+                          uint64_t fixedBytes, bool carried) {
+    cursor = checkedAdd(cursor, add(field, rowBytes, fixedBytes, carried, cursor), "Inkling-2-Mini scratch");
+  };
+
+  uint64_t cursor = 0;
+  append(cursor, &Inkling2LoopScratch::stack, bytesFor<uint16_t>(schedule.stackPlanes() * hidden), 0, true);
+  append(cursor, &Inkling2LoopScratch::previous, bytesFor<uint16_t>(schedule.previousPlanes() * hidden), 0, true);
+  append(cursor, &Inkling2LoopScratch::residual, bytesFor<float>(hidden), 0, true);
+  append(cursor, &Inkling2LoopScratch::messages, bytesFor<float>(kMessages * hidden), 0, false);
+  append(cursor, &Inkling2LoopScratch::keyInput, bytesFor<uint16_t>(hidden), 0, false);
+  append(cursor, &Inkling2LoopScratch::valueInput, bytesFor<uint16_t>(hidden), 0, false);
+  append(cursor, &Inkling2LoopScratch::gateCounters, 0, ops::MessageGate::kCountersBytes, false);
+  append(cursor, &Inkling2LoopScratch::zeros, bytesFor<uint16_t>(hidden), 0, false);
+  if (decode) {
+    append(cursor, &Inkling2LoopScratch::tape, bytesFor<uint16_t>(schedule.stateColumns()), 0, false);
+    append(cursor, &Inkling2LoopScratch::attentionCounters, 0, ops::RelativeAttention::kCountersBytes, false);
   }
+
+  const uint64_t transient = cursor;
+  uint64_t gate = transient;
+  append(gate, &Inkling2LoopScratch::mixed, bytesFor<float>(kMixerQueries * hidden), 0, false);
+  append(gate, &Inkling2LoopScratch::gateForget, bytesFor<float>((decode ? kMixerQueries : 1) * hidden), 0, false);
+  if (decode) {
+    append(gate, &Inkling2LoopScratch::gateGain, 0, ops::MessageGate::partialSumsBytes(kMixerQueries, hidden, rows),
+           false);
+    append(gate, &Inkling2LoopScratch::gateLow, bytesFor<uint16_t>(kMixerQueries * shape.gateRank), 0, false);
+  } else {
+    append(gate, &Inkling2LoopScratch::gateGain, bytesFor<float>(hidden), 0, false);
+    // In prefill, gateConcat is read only past kFusedRows and gateLow only up
+    // to kFusedRows (ops::MessageGate::add).
+    const uint64_t concatBytes = add(&Inkling2LoopScratch::gateConcat, bytesFor<uint16_t>(2 * hidden), 0, false, gate);
+    const uint64_t lowBytes =
+        add(&Inkling2LoopScratch::gateLow, 0,
+            bytesFor<uint16_t>(kMixerQueries * shape.gateRank) * ops::MessageGate::kFusedRows, false, gate);
+    gate = checkedAdd(gate, std::max(concatBytes, lowBytes), "Inkling-2-Mini scratch");
+  }
+
+  uint64_t attention = transient;
+  const uint64_t keysBytes = add(&Inkling2LoopScratch::keys, bytesFor<uint16_t>(kv), 0, false, attention);
+  const uint64_t valuesBytes =
+      add(&Inkling2LoopScratch::values, bytesFor<uint16_t>(kv), 0, false, checkedAdd(attention, keysBytes, "Inkling-2-Mini scratch"));
+  uint64_t kvBytes = checkedAdd(keysBytes, valuesBytes, "Inkling-2-Mini scratch");
+  // In decode, a layer projects either paired keyValues or separate keys and
+  // values, never both (Inkling2LoopTarget::addAttention).
+  if (decode) kvBytes = std::max(kvBytes, add(&Inkling2LoopScratch::keyValues, bytesFor<uint16_t>(2 * kv), 0, false, attention));
+  attention = checkedAdd(attention, kvBytes, "Inkling-2-Mini scratch");
+  append(attention, &Inkling2LoopScratch::keyTaps, bytesFor<uint16_t>(taps), 0, false);
+  append(attention, &Inkling2LoopScratch::valueTaps, bytesFor<uint16_t>(taps), 0, false);
+  append(attention, &Inkling2LoopScratch::convolvedKeys, bytesFor<uint16_t>(kv), 0, false);
+  append(attention, &Inkling2LoopScratch::convolvedValues, bytesFor<uint16_t>(kv), 0, false);
+  // A prompt chunk's attention stages its relative states and row sinks in the
+  // queries' staged rows: a step's rows and, each sequence's rows taking whole
+  // KV blocks, the rest of a block per lane (RuntimeArenas.cpp
+  // targetTensorBytes); a decode step's prepares them in its single pass.
+  if (!decode) {
+    append(attention, &Inkling2LoopScratch::relativeStates, bytesFor<float>(relative),
+           bytesFor<float>(stagedLaneRows * relative), false);
+    append(attention, &Inkling2LoopScratch::rowSinks, bytesFor<float>(g.attentionQueryHeads),
+           bytesFor<float>(stagedLaneRows * g.attentionQueryHeads), false);
+  }
+
+  bytes = std::max(gate, attention);
   return placed;
 }
 
