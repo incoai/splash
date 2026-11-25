@@ -128,6 +128,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // Whether the blocks' experts take the int8 prefill passes: their routing
   // and formats (ops::moeInt8Experts), and resident (RuntimeGeometry::from).
   bool moeInt8Experts = false;
+  uint32_t loopCDAmateurPass = 0;
   // The blocks' shape as their plans take it.
   [[nodiscard]] ops::MoeShape moeShape() const noexcept {
     ops::MoeShape shape = moeBlockShape();
@@ -290,6 +291,7 @@ struct QwenTargetPrefillSequence final {
   metal::MetalBuffer auxiliaryIn;
   metal::MetalBuffer auxiliaryOut;
   std::span<const QwenTargetImageRows> imageRows;
+  metal::MetalBuffer amateurPromptRow{};
 };
 
 struct QwenTargetPrefillBuffers final {
@@ -525,6 +527,10 @@ public:
   // them, and starts reading ahead the rows of the prompt rows after them:
   // the command is submitted once it returns, while no other command
   // reading the target's prefill scratch is in flight.
+  [[nodiscard]] virtual metal::MetalBuffer loopCDPromptRow(uint32_t) const { return {}; }
+  [[nodiscard]] virtual metal::MetalBuffer loopCDLogits() const { return {}; }
+  virtual void addLoopCDPromptHead(metal::CommandGraph &, uint32_t, ops::LinearScratch) const {}
+
   [[nodiscard]] virtual std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
                                                                    std::span<const QwenTargetPrefillChunk> chunks,
                                                                    const kv::PageStorage &kv, SpilledKvReads &spilled,

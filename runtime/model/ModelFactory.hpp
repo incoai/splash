@@ -145,6 +145,7 @@ struct RuntimeContext final {
   // The lanes its arenas hold, the most requests it runs at once, as its
   // start chose them (QwenTargetGeometry::lanes).
   uint32_t lanes = ExecutionLimits::defaultLanes;
+  bool loopCD = false;
 };
 
 // What the step costs a start's decode warmups measure follow
@@ -229,7 +230,7 @@ struct StreamedParts final {
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
                      kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts,
-                     uint32_t lanes = ExecutionLimits::defaultLanes);
+                     uint32_t lanes = ExecutionLimits::defaultLanes, bool loopCD = false);
 // Those of a model of `descriptor` whose target's files give `target`
 // (plannedTargetGeometry) with `parts` streaming, before it loads: they plan
 // the stores of every part that may stream (engine::planStreamedMemory).
@@ -237,7 +238,7 @@ plannedRuntimeMemory(const LoadedModel &model,
                                                    const QwenTargetGeometry &target,
                                                    const ops::ExecutionPlans &operators, kv::Format kvFormat,
                                                    ops::GdnStateFormat stateFormat, StreamedParts parts,
-                                                   uint32_t lanes = ExecutionLimits::defaultLanes);
+                                                   uint32_t lanes = ExecutionLimits::defaultLanes, bool loopCD = false);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

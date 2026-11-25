@@ -3578,6 +3578,44 @@ void penaltyLifecycle() {
   }
 }
 
+void loopCD(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 32;
+  const Batch batch = makeBatch(backend, vocabulary, 2);
+  const auto amateur = allocate(backend, 2 * vocabulary * sizeof(float));
+  const auto reset = [&] {
+    std::fill_n(batch.logits(), 2 * vocabulary, -20.0F);
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      batch.row(lane)[0] = 10.0F;
+      batch.row(lane)[1] = 9.0F;
+      batch.row(lane)[2] = 7.0F;
+    }
+    auto *early = static_cast<float *>(amateur.contents());
+    std::fill_n(early, 2 * vocabulary, 0.0F);
+    early[0] = 10.0F;
+    early[2] = -30.0F; // wins only if the plausibility gate is missing
+  };
+  std::array<SamplingPolicy, 2> policies{};
+  const Sampling sampling(vocabulary);
+  const auto select = [&] {
+    CommandGraph graph;
+    sampling.addInitial(graph, policies, batch.buffers, initialRows(2, 0, 1), {}, {},
+                        {amateur, 1, 0.2F, -2.302585093F});
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  };
+  reset();
+  select();
+  require(batch.outputTokens()[0] == 1 && batch.outputTokens()[1] == 0 &&
+              batch.row(1)[0] == 10.0F && batch.row(1)[2] == 7.0F,
+          "LoopCD should rerank plausible tokens only on its generation lanes");
+
+  reset();
+  policies[0].constrained = true;
+  batch.masks()[0] = 1u << 2;
+  select();
+  require(batch.outputTokens()[0] == 2 && batch.row(0)[2] == 7.0F,
+          "LoopCD should preserve the expert row if the grammar admits no plausible tokens");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -3594,6 +3632,8 @@ int main(int argc, char **argv) {
     stage = "recursive rejection sampling";
     recursiveRejectionSampling();
     MetalBackend backend(argv[1]);
+    stage = "LoopCD";
+    loopCD(backend);
     stage = "invalid penalties";
     invalidPenalties(backend);
     stage = "buffer extents";

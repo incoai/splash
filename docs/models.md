@@ -481,6 +481,26 @@ inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
 20-core M5 Pro), which `--activations bf16` turns off
 ([server options](server.md#server-options)).
 
+## Loop-wise contrastive decoding
+
+Add `--loop-cd` to your `splash serve` command to opt in to
+[LoopCD](https://arxiv.org/html/2609.24196v1). It is off by default and
+currently supports only Thinking Machines' Inkling-2-Mini (including its
+supported quantizations).
+
+The full target is the expert. The amateur reads Inkling's residual stack
+and output head after the first of its three loop passes, skipping the coda.
+Generation subtracts 0.2 times the amateur logits from the expert logits,
+keeping only tokens with at least 10% of the expert's most likely token's
+probability. If grammar or stop-token exclusions leave none, it falls back
+to the ordinary expert distribution under those constraints. Drafting and
+score-only requests are unchanged.
+
+Inkling was not evaluated in the paper. This experimental setting can change
+outputs and uses an extra vocabulary projection per verification step.
+Model profiles are listed in `runtime/model/ModelDescriptor.hpp`; a new
+architecture also needs to implement its early readout.
+
 ## Drafts
 
 Every model decodes with a DFlash2 draft. Each family names the repository

@@ -615,7 +615,7 @@ RuntimeResources::RuntimeResources(
     AneFfnStart aneFfn, kv::Format kvFormat, std::string buildId, std::function<bool()> cancelled,
     std::unique_ptr<model::KvBlockCache> blockCache,
     std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-    model::VerifyRows verifyRows)
+    model::VerifyRows verifyRows, bool loopCD)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), readers_(std::move(readers)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -635,7 +635,7 @@ RuntimeResources::RuntimeResources(
                                                   if (aneFfn_) aneFfn_->restore();
                                                 }}),
       aneFfnOutcome_(aneFfn.outcome), kvFormat_(kvFormat), buildId_(std::move(buildId)),
-      cancelled_(std::move(cancelled)), spillAlways_(spillAlways), verifyRows_(verifyRows) {
+      cancelled_(std::move(cancelled)), spillAlways_(spillAlways), verifyRows_(verifyRows), loopCD_(loopCD) {
   if (aneFfn.outcome.kind == AneFfnOutcome::Kind::Pending) aneFfnPending_ = std::move(aneFfn);
 }
 
@@ -668,6 +668,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         "host memory and volume probes, build id and a merge-aligned image "
         "patch limit no larger than the protocol's are required");
   }
+  if (config.loopCD && !model::loopCDProfile(config.model))
+    throw RuntimeResourcesError(RuntimeResourceStage::Configuration, "--loop-cd is unsupported for this model");
   std::unique_ptr<metal::MetalBackend> backend;
   try {
     backend = std::make_unique<metal::MetalBackend>(config.metallibPath.string(),
@@ -866,7 +868,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     try {
       const auto arenas = [&](model::StreamedParts parts) {
         const model::ModelMemoryPlan streamed = model::plannedRuntimeMemory(
-            config.model, target, operators, config.kvFormat, config.stateFormat, parts, lanes);
+            config.model, target, operators, config.kvFormat, config.stateFormat, parts, lanes, config.loopCD);
         return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
       };
       for (const bool table : {false, true}) {
@@ -944,10 +946,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   model::ModelMemoryPlan modelMemoryPlan, spillModelMemoryPlan;
   const auto planRuntime = [&] {
     modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                  model::StreamedParts::loaded(loaded), lanes);
+                                                  model::StreamedParts::loaded(loaded), lanes, config.loopCD);
     if (kvMaySpill)
       spillModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                         model::StreamedParts::loaded(loaded, true), lanes);
+                                                         model::StreamedParts::loaded(loaded, true), lanes, config.loopCD);
   };
   // Loads the model as loadOptions says, `again` where a store the plan sized
   // is laid out again (below), and plans its runtime memory as it loaded.
@@ -1352,7 +1354,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(memoryGovernor), startClaim, std::move(startScope), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
         std::move(aneFfn), config.kvFormat, config.buildId, config.cancelled, std::move(blockCache),
-        std::move(historyStream), config.kvSpillAlways, config.verifyRows));
+        std::move(historyStream), config.kvSpillAlways, config.verifyRows, config.loopCD));
     result->adoptPersistentCache();
     return result;
   } catch (const RuntimeResourcesError &) {
@@ -1479,12 +1481,12 @@ bool RuntimeResources::closePersistentCache() {
 model::RuntimeContext RuntimeResources::modelContext() {
   // A start's measured step costs stay beside the split's calibrations.
   const std::string key =
-      model::stepCostsKey(model_, *kvPages_, *stateStorage_, operators_, *backend_, cacheIdentity_.buildId);
+      model::stepCostsKey(model_, *kvPages_, *stateStorage_, operators_, *backend_, cacheIdentity_.buildId) + (loopCD_ ? ":loop-cd:" : "");
   return {*backend_, model_, *kvPages_, *stateStorage_, operators_, aneFfn_.get(), blockCache_.get(),
           historyStream_.get(), verifyRows_, [key](uint32_t lanes) { return ane::recall(key + std::to_string(lanes)); },
           [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); },
           [key](uint32_t lanes) { ane::forget(key + std::to_string(lanes)); },
-          memoryPlan_.breakdown().maximumBatchWidth};
+          memoryPlan_.breakdown().maximumBatchWidth, loopCD_};
 }
 
 EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
