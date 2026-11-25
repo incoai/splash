@@ -17,16 +17,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+from dev.tests.server import test_videos
 from dev.tests.server_fixtures import (
     console_written,
     keep_stop_signals,
     server_arguments,
 )
 from install import launcher
-from server import serve_options, serve_record
+from install.families import H3
+from server import serve_options, serve_record, videos
 from server import server as api
 
 MODEL_ID = "community/custom-splash"
+MODEL = test_videos.MODEL
+SEVEN = test_videos.SEVEN
 
 
 def with_stop_held(command, number):
@@ -1460,6 +1464,210 @@ class LauncherTests(unittest.TestCase):
             served = api.parse_args(server_arguments(execute.call_args.args[1]))
             self.assertEqual(served.model_root, str(selection))
 
+    def test_generate_installs_as_serve_does_and_starts_the_server_serve_would(self):
+        model = "MiniMaxAI/MiniMax-H3"
+        with (
+            tempfile.TemporaryDirectory() as runtime,
+            contextlib.chdir(runtime),
+            mock.patch.object(launcher, "RUNTIME_DIR", Path(runtime)),
+            mock.patch.object(launcher, "_check_port") as probe,
+            mock.patch.object(launcher, "_ensure_installed") as install,
+            mock.patch.object(launcher, "_holds_video_model", return_value=True),
+            mock.patch.object(
+                launcher, "_spawn_server", side_effect=OSError("not here")
+            ) as spawn,
+            mock.patch.object(launcher.os, "execve") as execute,
+            mock.patch("sys.stderr", io.StringIO()) as stderr,
+        ):
+            status = launcher.main([
+                "generate", "--model", model, "--prompt", "a cat", "--out", "clip.mp4",
+            ])  # fmt: skip
+            console_written()
+            held = [file.name for file in spawn.call_args.args[2]]
+        self.assertEqual(status, 1)
+        self.assertIn(H3.license, stderr.getvalue())
+        probe.assert_not_called()
+        execute.assert_not_called()
+        selection = install.call_args.args[0]
+        command, environment, _ = spawn.call_args.args
+        self.assertEqual(command[4:8], ["server.server", str(selection.link), "--model", model])  # fmt: skip
+        served = api.parse_args(server_arguments(command))
+        self.assertEqual((served.model, served.host), (model, "127.0.0.1"))
+        self.assertEqual(served.serve_record.name, f"serve-{served.port}.json")
+        # The server stops itself once generate has exited.
+        self.assertEqual(environment["SPLASH_APP_PID"], str(os.getpid()))
+        self.assertEqual(held, [str(Path(runtime) / "serve.lock")])
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            launcher.parse_args(["generate", "--model", model])
+        # --duration, ComfyUI's name, is --seconds.
+        command = ["generate", "--model", model, "--prompt", "a cat", "--out", "a.mp4"]
+        lengths = [
+            launcher.parse_args([*command, flag, "9"]).seconds
+            for flag in ("--seconds", "--duration")
+        ]
+        self.assertEqual(lengths, ["9", "9"])
+
+    def test_generate_defaults_to_10_seconds_at_832x480(self):
+        self.assertEqual((H3.default_seconds, H3.size), ("10", "832x480"))
+        with (
+            mock.patch("sys.stdout", io.StringIO()) as help_text,
+            self.assertRaises(SystemExit),
+        ):
+            launcher.parse_args(["generate", "--help"])
+        text = " ".join(help_text.getvalue().split())
+        self.assertIn("From the prompt alone: 10 s at 832x480", text)
+        self.assertIn("(10 by default)", text)
+        self.assertIn("480p 832x480 (the default)", text)
+
+    def test_generate_refuses_a_command_line_that_cannot_make_a_clip_at_once(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(contextlib.chdir(directory))
+        Path("first.png").touch()
+        Path("cat.png").touch()
+        for arguments, message in (
+            (["--last-frame", "first.png"], "--last-frame needs --first-frame"),
+            (["--first-frame", "first.png", "--reference", "cat.png"],
+             "--reference cannot be used with --first-frame or --last-frame"),
+            (["--first-frame", "nope.png"], "--first-frame nope.png: no such file"),
+            (["--reference", "."], "--reference . is a directory"),
+            (["--reference", "cat.png"] * 13, "--reference: at most 12 files"),
+            (["--out", "."], "--out . is a directory: name the mp4, such as clip.mp4"),
+            (["--out", "nodir/clip.mp4"], "--out nodir/clip.mp4: nodir is not a directory"),
+            (["--model", f"{MODEL}:pika-ref2va-6"],
+             f"{MODEL}:pika-ref2va-6 takes --reference FILE"),
+            (["--model", f"{MODEL}:vdn-8", "--reference", "cat.png"],
+             f"--reference takes the pika-ref2va-6 variant: --model {MODEL}:pika-ref2va-6"),
+        ):  # fmt: skip
+            arguments = [
+                "generate",
+                "--prompt",
+                "a cat",
+                "--out",
+                "clip.mp4",
+                *arguments,
+            ]
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch("sys.stderr", io.StringIO()) as error,
+                self.assertRaises(SystemExit) as refused,
+            ):
+                launcher.parse_args(arguments)
+            self.assertEqual(refused.exception.code, 2)
+            self.assertIn(message, error.getvalue())
+        # A pipe, such as <(curl ...), is an input.
+        os.mkfifo("pipe")
+        piped = launcher.parse_args([
+            "generate", "--prompt", "a cat", "--out", "clip.mp4", "--first-frame", "pipe",
+        ])  # fmt: skip
+        self.assertEqual(piped.first_frame, Path("pipe"))
+        os.remove("pipe")
+        # A write that fails leaves no temporary file behind.
+        with self.assertRaises(IsADirectoryError):
+            launcher._write_whole(Path(directory), b"mp4")
+        self.assertEqual(sorted(os.listdir(directory)), ["cat.png", "first.png"])
+
+    def test_generate_refuses_before_installing_what_the_clip_would_refuse(self):
+        models = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(launcher.paths, "MODELS", models))
+        self.enterContext(mock.patch.object(launcher, "RUNTIME_DIR", models))
+        cat = models / "cat.png"
+        cat.touch()
+        for arguments, message in (
+            (["--prompt", " "], "--prompt: prompt must be a non-empty string"),
+            (["--seed", "4294967296"], "--seed 4294967296: seed must be an integer in [0, 4294967295]"),
+            (["--seed", "x"], "--seed x: seed must be an integer"),
+            (["--seconds", "20"], "--seconds 20: seconds must be a whole number from 4 to 15"),
+            (["--duration", "20"], "--duration 20: seconds must be a whole number"),
+            (["--size", "1920x1080"], "--size 1920x1080: size must be WIDTHxHEIGHT"),
+            # MiniMax-H3 without a variant installs pika-6, which takes none.
+            (["--reference", str(cat)], f"--model {MODEL}:pika-ref2va-6"),
+        ):  # fmt: skip
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch("sys.stderr", io.StringIO()) as error,
+            ):
+                status = launcher.main(["generate", "--port", "1", "--model", MODEL,
+                                        "--prompt", "a cat", "--out", "clip.mp4",
+                                        *arguments])  # fmt: skip
+                console_written()
+            self.assertEqual(status, 1)
+            self.assertIn(message, error.getvalue())
+            install.assert_not_called()
+        # Another model's length is the clip program's to refuse (a language
+        # model's as one).
+        language = launcher.model_artifacts.Selection.of(models, "Qwen/Qwen3-8B")
+        launcher._refuse_before_install(
+            launcher.argparse.Namespace(seconds="20", size=None, reference=[]), language
+        )
+        # The launcher refuses what server/videos.py refuses, and no more.
+        for seconds, size in (("4", "768x768"), ("15", "1536x768"), ("3", "480x960"),
+                              ("05", "832x480"), ("16", "864x480"), ("5", "800x480"),
+                              ("5", "1568x768"), ("5", "640x320"), ("5", "832X480")):  # fmt: skip
+            args = launcher.argparse.Namespace(
+                prompt="a cat", seed=None, seconds=seconds, size=size, reference=[]
+            )
+            selection = launcher.model_artifacts.Selection.of(models, MODEL)
+            try:
+                videos.canvas(size)
+                videos.clip_seconds(seconds)
+                accepted = True
+            except videos.APIError:
+                accepted = False
+            with self.subTest(seconds=seconds, size=size):
+                try:
+                    launcher._refuse_before_install(args, selection)
+                    self.assertTrue(accepted)
+                except launcher.LauncherError:
+                    self.assertFalse(accepted)
+
+    def test_install_installs_as_serve_does_and_starts_nothing(self):
+        model = "MiniMaxAI/MiniMax-H3:my-finetune"
+        spec = Path(self.enterContext(tempfile.TemporaryDirectory())) / "spec.json"
+        spec.write_text("{}")
+        for extra, forwarded in (
+            ([], None),
+            (["--spec", str(spec)], str(spec.resolve())),
+        ):
+            with (
+                self.subTest(extra=extra),
+                mock.patch.object(launcher, "_check_port") as probe,
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                self.assertEqual(launcher.main(["install", model, *extra]), 0)
+            probe.assert_not_called()
+            execute.assert_not_called()
+            want = launcher.model_artifacts.Selection.of(launcher.paths.MODELS, model)
+            install.assert_called_once_with(want, forwarded)
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            launcher.parse_args(["install"])
+
+    def test_arguments_after_the_separator_are_refused_after_each_commands_own(self):
+        # serve refuses them last, after SPLASH_PORT and its own options;
+        # install, which reads no port, at once.
+        for environment, arguments, message in (
+            ({"SPLASH_PORT": "bad"}, ["serve", "--model", MODEL_ID], "SPLASH_PORT: "),
+            ({}, ["serve", "--model", MODEL_ID, "--mmproj", "x"],
+             "--mmproj requires --model-dir"),
+            ({}, ["serve", "--model", MODEL_ID], "only supported for coding clients"),
+            ({"SPLASH_PORT": "bad"}, ["generate", "--prompt", "p", "--out", "o.mp4"],
+             "SPLASH_PORT: "),
+            ({}, ["generate", "--prompt", "p", "--out", "o.mp4"],
+             "only supported for coding clients"),
+            ({"SPLASH_PORT": "bad"}, ["install", MODEL_ID],
+             "only supported for coding clients"),
+        ):  # fmt: skip
+            with (
+                self.subTest(arguments=arguments, environment=environment),
+                mock.patch.dict(os.environ, environment),
+                mock.patch("sys.stderr", io.StringIO()) as error,
+                self.assertRaises(SystemExit) as failed,
+            ):
+                launcher.parse_args([*arguments, "--", "z"])
+            self.assertEqual(failed.exception.code, 2)
+            self.assertIn(message, error.getvalue())
+
     def test_serve_takes_the_stop_signals_and_holds_them_across_the_exec(self):
         # A non-interactive shell starts background jobs with SIGINT ignored.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -2116,6 +2324,361 @@ class LauncherTests(unittest.TestCase):
                 fcntl.flock(released, fcntl.LOCK_EX | fcntl.LOCK_NB)
         install.assert_not_called()
         execute.assert_not_called()
+
+
+class FakeServer:
+    """A server program generate starts (_spawn_server), served in this
+    process: its pid, and whether a SIGTERM stopped it."""
+
+    pids = iter(range(1 << 20, 1 << 21))
+
+    def __init__(self, stop=None, returncode=None):
+        self.pid = next(self.pids)
+        self.stop = stop
+        self.returncode = returncode
+        self.terminated = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        if self.stop is not None:
+            self.stop()
+        self.returncode = -signal.SIGTERM
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.terminate()
+
+
+class GenerateOnServerTests(unittest.TestCase):
+    """splash generate sends its clip over HTTP: as a job of the splash serve
+    of a video model on its port, or else of a server it starts on a free
+    port and stops once the clip ends (server/videos.py over the fake
+    engine)."""
+
+    def setUp(self):
+        self.enterContext(mock.patch.dict(os.environ, {"SPLASH_API_KEY": "key"}))
+        os.environ.pop("SPLASH_PORT", None)
+        keep_stop_signals(self)
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(launcher, "RUNTIME_DIR", self.directory))
+        self.enterContext(mock.patch.object(launcher, "POLL_SECONDS", 0.02))
+        self.log = self.directory / "log"
+        # The servers generate starts, each (command, environment, process,
+        # app), and a port no server holds.
+        self.spawned = []
+        self.port = launcher._free_port()
+
+    def app(self, variants, step_seconds, fail):
+        engine = test_videos.engine(self.log, step_seconds, fail)
+        variants = {n: H3.variants[n] for n in variants}
+        return videos.VideoApp(MODEL, (), engine, test_videos.tokenize, variants)
+
+    def listen(self, app, port):
+        """Serve app on 127.0.0.1:port: the server, and what stops it."""
+        server = api.FrontendServer(("127.0.0.1", port), app, api_key="key")
+        server.RequestHandlerClass = videos.handler(api.FrontendHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        stopped = threading.Event()
+
+        def stop():
+            if not stopped.is_set():
+                stopped.set()
+                server.shutdown()
+                server.server_close()
+                app.close()
+
+        self.addCleanup(stop)
+        return server, stop
+
+    def serve(self, variants=("pika-6",), step_seconds=0.0, fail=False):
+        self.served = app = self.app(variants, step_seconds, fail)
+        self.server, _ = self.listen(app, 0)
+        self.port = self.server.server_port
+        # The lock splash serve holds on its port, with its owner record.
+        lock = self.enterContext((self.directory / f"serve-{self.port}.lock").open("w"))
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        json.dump({"pid": os.getpid(), "model": MODEL, "port": self.port}, lock)
+        lock.flush()
+
+    def spawn(self, step_seconds=0.0, fail=False, refused=0):
+        """_spawn_server serving the clip in this process as server.server
+        would, on the command's --port, ready in its --serve-record; the
+        first `refused` find their port taken."""
+
+        def spawn(command, environment, held):
+            port = int(command[command.index("--port") + 1])
+            record = Path(command[command.index("--serve-record") + 1])
+            if len(self.spawned) < refused:
+                process, app = FakeServer(returncode=1), None
+                failure = serve_record.failure(serve_record.PORT, f"{port} is taken")
+                state = {"pid": process.pid, "phase": "failed", "failure": failure}
+            else:
+                app = self.app(("pika-6",), step_seconds, fail)
+                process = FakeServer(self.listen(app, port)[1])
+                state = {"pid": process.pid, "phase": "ready"}
+            record.write_text(json.dumps(state))
+            self.spawned.append((command, environment, process, app))
+            return process
+
+        return mock.patch.object(launcher, "_spawn_server", side_effect=spawn)
+
+    def generate(self, *arguments, spawn=None):
+        with (
+            mock.patch.object(launcher, "_ensure_installed") as install,
+            mock.patch.object(launcher, "_holds_video_model", return_value=True),
+            spawn or mock.patch.object(launcher, "_spawn_server") as started,
+            mock.patch.object(launcher.os, "execve") as execute,
+            mock.patch("sys.stderr", io.StringIO()) as stderr,
+        ):
+            status = launcher.main([
+                "generate", "--port", str(self.port), "--prompt", "a cat",
+                "--out", str(self.directory / "clip.mp4"), *arguments,
+            ])  # fmt: skip
+            console_written()
+        execute.assert_not_called()
+        if spawn is None:
+            # The clip went to the server on the port: nothing installed or
+            # started.
+            install.assert_not_called()
+            started.assert_not_called()
+        return status, stderr.getvalue()
+
+    def own(self, *arguments, **spawn):
+        """generate --model with no server on its port: status and stderr."""
+        return self.generate("--model", MODEL, *arguments, spawn=self.spawn(**spawn))
+
+    def started(self, spawn):
+        """_spawn_server returning spawn's process for each command."""
+
+        def started(command, environment, held):
+            self.spawned.append((command, environment, spawn(), None))
+            return self.spawned[-1][2]
+
+        return mock.patch.object(launcher, "_spawn_server", side_effect=started)
+
+    def assert_stopped(self):
+        """Every server generate started has stopped, its engine with it."""
+        self.assertTrue(self.spawned)
+        for _, _, process, app in self.spawned:
+            self.assertIsNotNone(process.poll())
+            if app is not None:
+                self.assertTrue(process.terminated)
+                self.assertTrue(app.videos.closing)
+                self.assertFalse(app.videos.engine.alive())
+                self.assertIsNotNone(app.videos.engine.process.poll())
+
+    def test_the_clip_and_its_preview_are_a_job_of_the_running_server(self):
+        self.serve(step_seconds=0.05)
+        first = self.directory / "first.png"
+        first.write_bytes(test_videos.png(832, 480, bytes(832 * 480 * 3)))
+        status, stderr = self.generate(
+            "--seed", "7", "--size", "832x480", "--preview", "--first-frame", str(first)
+        )
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual((self.directory / "clip.mp4").read_bytes(), SEVEN)
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(
+            (self.directory / "clip.mp4").stat().st_mode & 0o777, 0o666 & ~umask
+        )
+        preview = (self.directory / "clip.preview.mp4").read_bytes()
+        self.assertEqual(preview, b"preview" + SEVEN)
+        (taken,) = test_videos.taken(self.log)
+        self.assertEqual((taken["size"], taken["seed"]), ("832x480", 7))
+        self.assertIn("first_frame", taken)
+        # Each progress line with the time since the job was queued.
+        self.assertRegex(stderr, r"Video · denoise · \d+% · \d+ s\n")
+        self.assertRegex(
+            stderr.splitlines()[-1], r"Video · .*clip.mp4 · 243 frames · 0.0 s$"
+        )
+        self.assertNotIn(H3.license, stderr)
+
+    def test_another_model_a_variant_not_installed_or_a_failure_stop_in_one_line(self):
+        self.serve(fail=True)
+        for arguments, message in (
+            (["--model", "community/other"], f"Splash serves {MODEL} on port {self.port}, not community/other"),
+            (["--model", f"{MODEL}:vdn-8"], "the vdn-8 variant of MiniMaxAI/MiniMax-H3 is not installed"),
+            ([], "the video VAE failed"),
+        ):  # fmt: skip
+            with self.subTest(arguments=arguments):
+                status, stderr = self.generate(*arguments)
+                self.assertEqual(status, 1)
+                self.assertEqual(len(stderr.splitlines()[-1:]), 1)
+                self.assertIn(message, stderr.splitlines()[-1])
+                self.assertEqual(list(self.directory.glob("*.mp4*")), [])
+                self.assertEqual(list(self.directory.glob("tmp*")), [])
+
+    def listing(self, models):
+        """_request_json answering /v1/models with `models` from the server
+        on the port alone."""
+        request = launcher._request_json
+
+        def answer(path, timeout=2, *, port=launcher.serve_options.DEFAULT_PORT):
+            return models if port == self.port else request(path, timeout, port=port)
+
+        return mock.patch.object(launcher, "_request_json", side_effect=answer)
+
+    def test_a_language_model_server_is_refused_and_model_starts_one_beside_it(self):
+        self.serve()
+        language = {"data": [{"id": "community/llm", "owned_by": "splash"}]}
+        with self.listing(language):
+            status, stderr = self.generate()
+            self.assertEqual(status, 1)
+            self.assertIn(
+                f"community/llm on port {self.port}, a language model", stderr
+            )
+            status, stderr = self.own()
+        self.assertEqual(status, 0, stderr)
+        ((command, _, _, _),) = self.spawned
+        self.assertEqual(command[4], "server.server")
+        self.assertNotEqual(api.parse_args(server_arguments(command)).port, self.port)
+        self.assertEqual((self.directory / "clip.mp4").read_bytes(), bytes(8))
+        self.assert_stopped()
+
+    def test_a_server_still_starting_is_refused_unless_it_starts_a_language_model(self):
+        self.serve()
+        with self.listing(None):
+            status, stderr = self.generate("--model", MODEL)
+            self.assertEqual(status, 1)
+            self.assertIn(f"Splash is starting on port {self.port} (PID", stderr)
+            lock = self.directory / f"serve-{self.port}.lock"
+            lock.write_text(
+                json.dumps(
+                    {"pid": os.getpid(), "model": "community/llm", "port": self.port}
+                )
+            )
+            self.assertEqual(self.generate()[0], 1)
+            status, stderr = self.own()
+        self.assertEqual((status, len(self.spawned)), (0, 1), stderr)
+        self.assert_stopped()
+
+    def test_a_server_that_stops_answering_ends_the_wait(self):
+        self.serve(step_seconds=0.5)
+        threading.Timer(
+            0.2, lambda: (self.server.shutdown(), self.server.server_close())
+        ).start()
+        with mock.patch.object(launcher, "SILENCE_SECONDS", 0.2):
+            status, stderr = self.generate()
+        self.assertEqual(status, 1)
+        self.assertIn("stopped answering", stderr)
+        self.assertFalse((self.directory / "clip.mp4").exists())
+
+    def test_a_stop_deletes_the_job_and_ends_with_the_status_of_its_signal(self):
+        self.serve(step_seconds=0.5)
+        stop = launcher.StopSignal(signal.SIGTERM)
+        with mock.patch.object(launcher.time, "sleep", side_effect=stop):
+            status, stderr = self.generate()
+        self.assertEqual(status, 143)
+        self.assertIn("Video · cancelling", stderr)
+        self.assertEqual(self.served.videos.list({})["data"], [])
+        self.assertFalse((self.directory / "clip.mp4").exists())
+
+    def test_without_a_server_generate_starts_one_on_a_free_port_and_stops_it(self):
+        status, stderr = self.own(
+            "--seconds", "15", "--size", "864x480", "--seed", "7", "--no-audio"
+        )
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual((self.directory / "clip.mp4").read_bytes(), SEVEN)
+        self.assertIn(H3.license, stderr)
+        ((command, environment, _, _),) = self.spawned
+        port = api.parse_args(server_arguments(command)).port
+        self.assertNotEqual(port, self.port)
+        self.assertIn(f"Splash serves {MODEL} on port {port}", stderr)
+        self.assertEqual(environment["SPLASH_APP_PID"], str(os.getpid()))
+        (taken,) = test_videos.taken(self.log)
+        self.assertEqual((taken["frames"], taken["size"], taken["seed"], taken["outputs"]),
+                         (362, "864x480", 7, 0))  # fmt: skip
+        self.assert_stopped()
+        # Nothing listens on its port any more.
+        with socket.socket() as client:
+            self.assertNotEqual(client.connect_ex(("127.0.0.1", port)), 0)
+
+    def test_the_own_servers_clip_takes_the_defaults(self):
+        status, stderr = self.own()
+        self.assertEqual(status, 0, stderr)
+        (taken,) = test_videos.taken(self.log)
+        self.assertEqual((taken["frames"], taken["size"]), (243, "832x480"))
+        self.assertRegex(stderr.splitlines()[-1], r"clip.mp4 · 243 frames")
+        self.assert_stopped()
+
+    def test_the_own_server_is_stopped_after_a_failed_job(self):
+        status, stderr = self.own(fail=True)
+        self.assertEqual(status, 1)
+        self.assertIn("the video VAE failed", stderr.splitlines()[-1])
+        self.assertFalse((self.directory / "clip.mp4").exists())
+        self.assert_stopped()
+
+    def test_the_own_server_is_stopped_after_a_stop(self):
+        # The stop arrives as generate waits for the job; the server's own
+        # waits keep the time module's sleep.
+        stop = launcher.StopSignal(signal.SIGINT)
+        clock = mock.Mock(wraps=launcher.time, sleep=mock.Mock(side_effect=stop))
+        with mock.patch.object(launcher, "time", clock):
+            status, stderr = self.own(step_seconds=0.5)
+        self.assertEqual(status, 130)
+        self.assertIn("Video · cancelling", stderr)
+        ((_, _, _, app),) = self.spawned
+        self.assertEqual(app.videos.list({})["data"], [])
+        self.assertFalse((self.directory / "clip.mp4").exists())
+        self.assert_stopped()
+
+    def test_a_stop_while_the_own_server_starts_stops_it(self):
+        stop = launcher.StopSignal(signal.SIGINT)
+        with mock.patch.object(launcher.time, "sleep", side_effect=stop):
+            status, _ = self.generate("--model", MODEL, spawn=self.started(FakeServer))
+        self.assertEqual(status, 130)
+        ((_, _, process, _),) = self.spawned
+        self.assertTrue(process.terminated)
+
+    def test_a_port_taken_before_the_own_server_binds_it_is_tried_again(self):
+        status, stderr = self.own(refused=1)
+        self.assertEqual((status, len(self.spawned)), (0, 2), stderr)
+        self.assert_stopped()
+        self.spawned.clear()
+        status, _ = self.own(refused=launcher.PORT_ATTEMPTS)
+        self.assertEqual((status, len(self.spawned)), (1, launcher.PORT_ATTEMPTS))
+        self.assert_stopped()
+
+    def test_a_server_that_exits_before_it_is_ready_fails_the_clip(self):
+        exited = self.started(lambda: FakeServer(returncode=1))
+        status, stderr = self.generate("--model", MODEL, spawn=exited)
+        self.assertEqual(status, 1)
+        self.assertIn("the video server exited with status 1", stderr)
+
+    def test_a_language_model_is_refused_once_installed(self):
+        with (
+            mock.patch.object(launcher, "_ensure_installed"),
+            mock.patch.object(launcher, "_spawn_server") as spawn,
+            mock.patch("sys.stderr", io.StringIO()) as stderr,
+        ):
+            status = launcher.main(["generate", "--port", str(self.port), "--model",
+                                    "Qwen/Qwen3-8B", "--prompt", "a cat", "--out",
+                                    str(self.directory / "clip.mp4")])  # fmt: skip
+            console_written()
+        self.assertEqual(status, 1)
+        self.assertIn("Qwen/Qwen3-8B is a language model: splash generate takes a video model",
+                      stderr.getvalue())  # fmt: skip
+        spawn.assert_not_called()
+        link = self.directory / "link"
+        link.mkdir()
+        (link / "model.json").write_text(
+            json.dumps({"target_format": H3.target_format})
+        )
+        self.assertTrue(launcher._holds_video_model(link))
+
+    def test_without_a_server_or_a_model_generate_refuses(self):
+        with mock.patch("sys.stderr", io.StringIO()) as stderr:
+            status = launcher.main(["generate", "--port", str(self.port), "--prompt",
+                                    "a cat", "--out", str(self.directory / "clip.mp4")])  # fmt: skip
+            console_written()
+        # The status argparse gives a missing argument.
+        self.assertEqual(status, 2)
+        self.assertIn("--model is required", stderr.getvalue())
 
 
 if __name__ == "__main__":
