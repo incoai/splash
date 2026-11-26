@@ -39,12 +39,14 @@ def _read_key(path):
     return key
 
 
+def _default_key_path():
+    if data_dir := os.environ.get("SPLASH_DATA_DIR"):
+        return Path(data_dir).expanduser() / "thinking.key"
+    return Path.home() / "Library/Application Support/Splash/thinking.key"
+
+
 def load_thinking_key(path=None):
-    path = (
-        Path.home() / "Library/Application Support/Splash/thinking.key"
-        if path is None
-        else Path(path)
-    )
+    path = _default_key_path() if path is None else Path(path)
     try:
         try:
             return _read_key(path)

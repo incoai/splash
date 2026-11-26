@@ -4,7 +4,13 @@ set -eu
 
 completion_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)
 root=$(CDPATH= cd -P "$completion_dir/../.." && pwd -P)
-if [ -f "$root/release.json" ]; then
+if [ -n "${SPLASH_DATA_DIR-}" ]; then
+    case $SPLASH_DATA_DIR in
+        '~') models_dir="$HOME/models" ;;
+        '~/'*) models_dir="$HOME/${SPLASH_DATA_DIR#\~/}/models" ;;
+        *) models_dir="$SPLASH_DATA_DIR/models" ;;
+    esac
+elif [ -f "$root/release.json" ]; then
     models_dir="$HOME/Library/Application Support/Splash/models"
 else
     models_dir="$root/install/models"
