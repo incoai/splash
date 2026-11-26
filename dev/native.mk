@@ -100,6 +100,7 @@ TEST_FAMILY_VALUES := $(ENGINE_TEST_BUILD)/family-values
 TEST_WEIGHT_SOURCE := $(ENGINE_TEST_BUILD)/weight-source
 TEST_LEGACY_WEIGHT_CACHE := $(ENGINE_TEST_BUILD)/legacy-weight-cache
 TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
+TEST_GLP_VECTOR := $(ENGINE_TEST_BUILD)/glp-vector
 TEST_GGUF_PROJECTION := $(ENGINE_TEST_BUILD)/gguf-projection
 TEST_ANE_FFN := $(ENGINE_TEST_BUILD)/ane-ffn
 TEST_ANE_FFN_CALIBRATION := $(ENGINE_TEST_BUILD)/ane-ffn-calibration
@@ -250,6 +251,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READER
 	$(TEST_MODEL_CONFIGURATION) $(TEST_FAMILY_VALUES) \
 	$(TEST_KV_SLOT_FORMAT) $(TEST_KV_PAGE_TIER_HOST) \
 	$(TEST_GGUF_FILE) \
+	$(TEST_GLP_VECTOR) \
 	$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_ANE_FFN_CALIBRATION) $(TEST_ANE_FFN_BREAKER) \
@@ -394,6 +396,8 @@ $(TEST_LOOKUP_PROPOSALS): dev/tests/engine/lookup_proposals_test.cpp runtime/mod
 $(TEST_EXPERT_CHUNK_LAYOUT): dev/tests/engine/expert_chunk_layout_test.cpp
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp \
 		runtime/model/WeightSource.cpp
+$(TEST_GLP_VECTOR): dev/tests/engine/glp_vector_test.cpp runtime/model/GlpVector.cpp \
+		runtime/model/GgufFile.cpp runtime/model/WeightSource.cpp
 $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 		runtime/engine/KvCache.cpp \
 		dev/tests/engine/kv_page_cache_test.cpp
@@ -413,7 +417,7 @@ $(TEST_MEMORY_LEDGER) $(TEST_MEMORY_LEDGER_ASAN): runtime/metal/DeviceCapabiliti
 $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
 $(TEST_LEGACY_WEIGHT_CACHE): dev/tests/engine/legacy_weight_cache_test.cpp
 
-$(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
+$(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_GLP_VECTOR) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
 		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) $(TEST_MODEL_BOUNDARY_TEST) \
 		$(TEST_WEIGHT_RESIDENCY) \
 		$(TEST_ELASTIC_KV_TEST) $(TEST_NATIVE_LOOP_TEST) $(TEST_ENGINE_SIM) $(TEST_METRICS_TEST) \
@@ -716,6 +720,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_FAMILY_VALUES) dev/tests/engine/family_values_golden.txt
 	$(ENGINE_CPU_STEP) $(TEST_WEIGHT_SOURCE)
 	$(ENGINE_CPU_STEP) $(TEST_GGUF_FILE)
+	$(ENGINE_CPU_STEP) $(TEST_GLP_VECTOR) dev/tests/fixtures/glp/synthetic-glp.gguf
 	$(ENGINE_CPU_STEP) $(TEST_GGUF_REFERENCE) $(WEIGHT_GOLDENS) $(MLX_QUANTIZATION_FIXTURE)
 	$(ENGINE_CPU_STEP) $(TEST_GGUF_PLANNER)
 	$(ENGINE_CPU_STEP) $(TEST_LINEAR_PLAN) --cpu

@@ -323,6 +323,11 @@ void testRefusals() {
             "--max-concurrent-requests requires an integer in [1, 8]");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
+  for (const char *alpha : {"nan", "inf", "half", ""})
+    refuses({"auto", "auto", "--steer-alpha", alpha}, "--steer-alpha requires a finite number");
+  refuses({"auto", "auto", "--steer-path", ""}, "--steer-path requires a file");
+  refuses({"auto", "auto", "--steer-path", "/a.gguf", "--steer-path", "/b.gguf"},
+          "--steer-path names one control vector");
   // The server passes bytes, auto or off.
   for (const char *size : {"0", "2G", "OFF", ""})
     refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count, auto or off");
@@ -403,6 +408,27 @@ void testRefusals() {
                  "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
 }
 
+// --steer-path and --steer-alpha, and the environment they fall back to.
+void testSteering() {
+  const ModelDirectory model;
+  const NativeArguments given =
+      parse(model, {"auto", "auto", "--steer-path", "/srv/glp.gguf", "--steer-alpha", "2.5"});
+  require(given.steerPath == std::filesystem::path("/srv/glp.gguf") && given.steerAlpha == 2.5F,
+          "--steer-path or --steer-alpha did not reach the arguments as given");
+  // The environment fills an absent flag, and a flag outranks it.
+  setenv("WEIGHTLESS_STEER_PATH", "/srv/env.gguf", 1);
+  setenv("WEIGHTLESS_STEER_ALPHA", "1.5", 1);
+  const NativeArguments environment = parse(model, {"auto", "auto"});
+  require(environment.steerPath == std::filesystem::path("/srv/env.gguf") && environment.steerAlpha == 1.5F,
+          "the GLP environment did not reach the arguments");
+  const NativeArguments flag = parse(model, {"auto", "auto", "--steer-alpha", "3"});
+  require(flag.steerPath == std::filesystem::path("/srv/env.gguf") && flag.steerAlpha == 3.0F,
+          "a flag did not outrank the GLP environment");
+  unsetenv("WEIGHTLESS_STEER_PATH");
+  unsetenv("WEIGHTLESS_STEER_ALPHA");
+  require(!parse(model, {"auto", "auto"}).steerAlpha, "an unset GLP environment set an alpha");
+}
+
 } // namespace
 
 // A relaunch of a server started with --max-context keeps it as MAX_CONTEXT
@@ -428,6 +454,9 @@ int main(int argc, char **argv) {
   }
   modelConfigs = argv[2];
   try {
+    // The GLP environment must not leak into the golden command lines.
+    unsetenv("WEIGHTLESS_STEER_PATH");
+    unsetenv("WEIGHTLESS_STEER_ALPHA");
     testServerCommandLines(argv[1]);
     testNeuralEngine();
     testInt8Activations();
@@ -435,6 +464,7 @@ int main(int argc, char **argv) {
     testStreamedMemoryAndSpill();
     testWindowTrim();
     testRefusals();
+    testSteering();
     testARelaunchKeepsItsFirstEnginesMaxContext();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

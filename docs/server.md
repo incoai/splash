@@ -202,6 +202,8 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--recalibrate-ane` | Off | Calibrate the Neural Engine's share of long prompts again at this start instead of taking the one this Mac kept, as after a start beside another client of the Neural Engine; needs the Neural Engine, which `--disable-ane` turns off. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
 | `--activations` | `auto` | On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, `auto` rounds activations to int8 where that is faster and leaves the others bf16: prefill chunks of more than 64 rows through a target's MLX 4- and 5-bit weights in groups of 64 and its Q8_0 weights (a GGUF's attention and GDN projections), a resident MoE model's MLX 4- and 5-bit experts too in chunks of six or more routes an expert (192 rows on Qwen3.6-35B-A3B), rounded per row and 64 inputs, about a quarter less time to the first token on Qwen3.8-27B MLX 4-bit; a Ternary-Bonsai (rotated PQ2_0) model's decode, its vocabulary heads included, in every projection plan of 16 rows or more whatever its lanes, 13-16% less time a cycle on a 20-core M5 Pro; and attention over the INT8 KV cache where a split reads 8 pages or more, 4-7% sooner first tokens at 32K-64K (see [KV cache precision](#kv-cache-precision)). `bf16` is a precision opt-out for evaluations and bf16 parity: every activation stays bf16, though a [persistent cache](#persistent-cache) keeps what an `auto` run prefilled, so a parity run starts in a fresh `--cache-dir`. What `auto` costs, as next-token KL against bf16: about 2.2e-3 for Qwen3.8-27B MLX 4-bit's prefill on the GPU alone, 2.8e-4 for Bonsai's decode, and with INT8 queries 1.37x the KL the INT8 KV cache alone gives Qwen3.8-27B. The Neural Engine split, which multiplies its part in int8 whatever this option, has its own switch, `--disable-ane`. See [kernel selection](internals.md#kernel-selection). |
 | `--verify-rows` | `auto` | The rows decode cycles verify: `auto` gives each cycle the step of the most expected accepted tokens per cost, by the costs the Mac measured at a start and what its cycles show a long history adds to them (on a target whose experts stream, the rows whose chance of a token is worth their time by its cycles' cost line, within a step of the expert store's 32 rows), which is faster but makes greedy and seeded outputs vary from run to run; `all` verifies every row of a draft's block a lane the output limit leaves, so those outputs repeat when a request runs alone with the same cached prefixes; on a target whose experts stream, its steps of five lanes or more pass the expert store's 32 rows and load their experts in two rounds. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
+| `--steer-path` | `WEIGHTLESS_STEER_PATH` or none | A GLP control vector (GGUF, `glp.mode=project`, `glp.spec_version=1`) applied at every layer's post-layer residual stream, `h <- h - alpha (h . d) d`. A file this build cannot apply is refused at start, never approximated. See [GLP steering](#glp-steering). |
+| `--steer-alpha` | `WEIGHTLESS_STEER_ALPHA` or the file's `glp.alpha_default` | Projection strength, over the file's own. See [GLP steering](#glp-steering). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -217,6 +219,53 @@ and `--max-cache-disk-writes 0`, its default, sets no write budget. Durations
 (`--idle-release`, `--request-timeout`) are seconds, or a number with an `s`,
 `m` or `h` suffix, such as `90s`, `30m` or `1.5h`; `--idle-release off` turns
 the timer off, and only `POST /v1/memory/release` then frees the weights.
+
+### GLP steering
+
+`--steer-path FILE` (or `WEIGHTLESS_STEER_PATH`) attaches a **GLP control
+vector**: a few hundred KB of per-layer directions that change a model's
+behaviour at inference time without touching its weights. The file is a GGUF
+v3 container whose `glp.*` metadata says which operation the data is for, and
+Splash applies the projective one at every layer's post-layer residual stream:
+
+```
+h <- h - alpha * (h . d_hat) * d_hat
+```
+
+`d_hat` is the layer's unit-norm direction (`direction.N` applies at layer
+`N`, no offset) and `alpha` is `glp.alpha_default`, overridden by
+`--steer-alpha` (or `WEIGHTLESS_STEER_ALPHA`). The strength is never folded
+into the data: projection is quadratic in the direction's norm, so a baked-in
+strength would not mean what a caller expects. The operation travels with the
+data because an additive consumer loading a projective direction applies
+cleanly and is silently wrong.
+
+The reader is fail-closed. It implements one contract — `glp.spec_version 1`,
+`glp.mode project`, `glp.hook_point residual_stream_post_layer`, `glp.rank 1`
+— and refuses everything else at start with an error naming the rule and the
+value:
+
+- no `glp.mode` (a legacy llama.cpp additive control vector), `glp.mode add`,
+  or any mode other than `project`;
+- a missing `glp.spec_version`, or a version other than 1 (rank-k and the
+  alpha-scaling keys are version 2, hc fold sites version 3);
+- a `glp.hook_point` other than `residual_stream_post_layer`, including
+  `hc_fold_pre_engram` and the `*_pre_residual` writer sites;
+- `glp.rank` other than 1, a `direction.N.j` tensor, or `glp.dir_scales` /
+  `glp.layer_scales`;
+- `direction.0`, a layer past the model's layer count, a tensor that is not
+  F32 or not 1-D, a width other than the model's hidden size, a zero or
+  non-finite direction, or a tensor that is not `direction.N`;
+- a target whose residual is hyper-connection streams (Qwen3.8-Flash-Next,
+  Inkling-2-Mini), where `residual_stream_post_layer` names no stream between
+  layers: the file is refused rather than applied at another site.
+
+A project file is never merged with another control vector: two projections
+do not compose into a projection along the sum of their directions, so name
+one file. The format and its reader contract are specified in
+[GLP.md](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md),
+and the producer is the [weightless](https://github.com/msuiche/weightless)
+repository.
 
 ### Network and authentication
 

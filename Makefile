@@ -282,6 +282,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/KvSlotFormat.cpp \
 	runtime/ops/RoPE.cpp \
 	runtime/ops/RowCopy.cpp \
+	runtime/ops/Steering.cpp \
 	runtime/ops/Sampling.cpp \
 	runtime/ops/StateCodec.cpp \
 	runtime/ops/Vision.cpp \
@@ -314,6 +315,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/Status.cpp \
 	runtime/model/WeightStore.cpp \
 	runtime/model/GgufFile.cpp \
+	runtime/model/GlpVector.cpp \
 	runtime/model/GgufImage.cpp \
 	runtime/model/GgufTarget.cpp \
 	runtime/model/SafetensorsImage.cpp \

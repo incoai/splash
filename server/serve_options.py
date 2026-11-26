@@ -391,6 +391,24 @@ def parse_thinking_token_budget(value):
     return tokens
 
 
+def parse_steer_path(value):
+    """--steer-path: a GLP file's path, ~ expanded."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must name a file")
+    return Path(value).expanduser()
+
+
+def parse_steer_alpha(value):
+    """--steer-alpha: a finite projection strength."""
+    try:
+        alpha = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a finite number") from None
+    if not math.isfinite(alpha):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    return alpha
+
+
 # The help's option groups, in the order `splash serve --help` lists them:
 # each group's key and title. The launcher's own model options and --port
 # join "model" and "network".
@@ -926,6 +944,35 @@ SERVE_OPTIONS = (
             "bf16, for evaluations and bf16 parity (default: auto)",
         ),
         engine=EngineArgument("--activations"),
+    ),
+    ServeOption(
+        "--steer-path",
+        "requests",
+        dict(
+            type=parse_steer_path,
+            default=None,
+            metavar="FILE",
+            help="GLP control vector (GGUF, glp.mode=project, spec_version 1) "
+            "applied at every layer's post-layer residual stream, "
+            "h <- h - alpha (h . d) d; a file this build cannot apply is "
+            "refused at start, never approximated (default: none; "
+            "WEIGHTLESS_STEER_PATH)",
+        ),
+        environment="WEIGHTLESS_STEER_PATH",
+        engine=EngineArgument("--steer-path"),
+    ),
+    ServeOption(
+        "--steer-alpha",
+        "requests",
+        dict(
+            type=parse_steer_alpha,
+            default=None,
+            metavar="ALPHA",
+            help="projection strength, over the file's glp.alpha_default "
+            "(default: the file's; WEIGHTLESS_STEER_ALPHA)",
+        ),
+        environment="WEIGHTLESS_STEER_ALPHA",
+        engine=EngineArgument("--steer-alpha"),
     ),
     ServeOption(
         "--verify-rows",

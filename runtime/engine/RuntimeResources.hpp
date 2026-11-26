@@ -172,6 +172,13 @@ struct RuntimeResourcesConfig {
   // where an int8-activation path takes them, or keep every activation bf16
   // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  // --steer-path: a GLP control vector (model/GlpVector.hpp) applied at every
+  // layer's post-layer residual stream, h <- h - alpha (h . d) d; empty for
+  // none. A target whose residual is hyper-connection streams refuses it at
+  // start rather than apply it at another site.
+  std::filesystem::path steerPath;
+  // --steer-alpha: the projection strength, over the file's glp.alpha_default.
+  std::optional<float> steerAlpha;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -428,6 +435,9 @@ private:
   bool spillAlways_ = false;
   // --verify-rows, which modelContext() passes on.
   model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
+  // --steer-path's vector, read and validated against the model as it loaded;
+  // modelContext() passes it on.
+  std::shared_ptr<const model::GlpVector> steering_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

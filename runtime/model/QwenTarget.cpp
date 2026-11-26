@@ -10,6 +10,7 @@
 #include "ops/Normalization.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/RowCopy.hpp"
+#include "ops/Steering.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -96,6 +97,21 @@ void QwenTarget::addInsideCapture(metal::CommandGraph &, metal::MetalBuffer, met
 void QwenTarget::prepareVerifyLane(uint32_t, uint64_t, const QwenTargetRequest &) {}
 
 std::vector<uint32_t> QwenTarget::verifyTableRows(const ops::LaneRows &) const { return {}; }
+
+void QwenTarget::setSteering(const GlpVector &) {
+  throw std::invalid_argument(
+      "GLP steering: this target's residual is hyper-connection streams, where residual_stream_post_layer "
+      "does not exist; a v1 GLP project file is refused rather than applied at another site");
+}
+
+void QwenTarget::addSteerRows(PrefillStep &step, uint32_t index, metal::MetalBuffer rows) const {
+  if (!steering_ || index >= steering_->steered.size() || !steering_->steered[index]) return;
+  const metal::MetalBuffer direction =
+      backend_.view(steering_->directions, uint64_t{index} * geometry_.hiddenSize * sizeof(float),
+                    uint64_t{geometry_.hiddenSize} * sizeof(float));
+  ops::Steering::addProject(step.graph, std::move(rows), direction, steering_->alpha, step.rows,
+                            geometry_.hiddenSize);
+}
 
 void QwenTarget::addVerifyInput(metal::CommandGraph &, const QwenVerifyInput &) const {}
 
@@ -552,6 +568,35 @@ private:
     addReadRows(step, b.hidden[index & 1], b.hidden[(index & 1) ^ 1]);
     // The draft reads its layers' output rows.
     addDraftCapture(step, index, b.hidden[(index & 1) ^ 1]);
+  }
+  // The layer's output rows are the other hidden buffer (addPrefillLayer,
+  // addPrefillExperts), which a GLP projection steers in place. The draft's
+  // capture of those rows (addDraftCapture) ran before this, so the draft
+  // reads the unsteered stream.
+  void addSteer(PrefillStep &step, uint32_t index) const {
+    addSteerRows(step, index, step.buffers.hidden[(index & 1) ^ 1]);
+  }
+  // A GLP vector's directions, one fp32 row a layer, zero for a layer the
+  // file does not steer, which the layer loop applies after its experts.
+  void setSteering(const GlpVector &vector) override {
+    if (vector.hidden != geometry_.hiddenSize || vector.layers != geometry_.layers)
+      throw std::invalid_argument("GLP vector does not match the target's hidden size and layers");
+    Steering steering;
+    steering.alpha = vector.alpha;
+    steering.steered.assign(geometry_.layers, false);
+    const uint64_t values = uint64_t{geometry_.layers} * geometry_.hiddenSize;
+    steering.directions = backend_.allocateBuffer(values * sizeof(float), metal::BufferStorage::Shared,
+                                                  "glp/directions");
+    auto *destination = static_cast<float *>(steering.directions.contents());
+    if (!destination) throw std::logic_error("GLP directions buffer is not shared");
+    std::fill(destination, destination + values, 0.0F);
+    for (uint32_t layer = 0; layer < geometry_.layers; ++layer) {
+      const std::vector<float> &direction = vector.directions[layer];
+      if (direction.empty()) continue;
+      std::copy(direction.begin(), direction.end(), destination + uint64_t{layer} * geometry_.hiddenSize);
+      steering.steered[layer] = true;
+    }
+    steering_ = std::move(steering);
   }
   // A decode step's head reads every row's final norm.
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const {

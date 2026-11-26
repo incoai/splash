@@ -1,5 +1,6 @@
 #pragma once
 
+#include "GlpVector.hpp"
 #include "Model.hpp"
 #include "QwenHybridLayout.hpp"
 #include "RopeScaling.hpp"
@@ -599,6 +600,12 @@ public:
   // table.
   [[nodiscard]] virtual std::vector<uint32_t> verifyTableRows(const ops::LaneRows &rows) const;
 
+  // Applies `vector` at every layer's post-layer residual stream (GLP project
+  // mode, model/GlpVector.hpp): h <- h - alpha (h . d) d. A target whose
+  // residual is hyper-connection streams has no such stream between layers,
+  // so it refuses the file rather than apply it at another site.
+  virtual void setSteering(const GlpVector &vector);
+
 protected:
   QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
              const ops::ExecutionPlans &operators);
@@ -713,6 +720,10 @@ protected:
       for (size_t at = 0; at < steps.size(); ++at) {
         if (streams && at) ops::MoE::addResident(steps[at].graph, steps[at].ffn, *ffn, *steps[at].moe);
         layers.addPrefillExperts(steps[at], index);
+        // The layer's residual stream is complete only after its routed work
+        // (addPrefillExperts), so a GLP projection applies here, at the
+        // post-layer stream.
+        layers.addSteer(steps[at], index);
       }
     }
     std::vector<metal::MetalBuffer> outputs;
@@ -834,6 +845,19 @@ protected:
                                           uint32_t width) const {
     return backend_.view(buffer, uint64_t{begin} * width * sizeof(T), uint64_t{count} * width * sizeof(T));
   }
+
+  // The GLP vector a target applies (setSteering): every layer's unit
+  // direction in one fp32 [layers][hidden] buffer, zero for a layer the file
+  // does not steer, and the strength.
+  struct Steering final {
+    metal::MetalBuffer directions;
+    std::vector<bool> steered;
+    float alpha = 1.0F;
+  };
+  // Projects layer `index`'s residual `rows` off its direction, when the
+  // vector steers it. A layer the file does not steer is untouched.
+  void addSteerRows(PrefillStep &step, uint32_t index, metal::MetalBuffer rows) const;
+  std::optional<Steering> steering_;
 
   const QwenTargetWeightsBase &weightsBase_;
   QwenTargetGeometry geometry_;

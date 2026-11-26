@@ -100,6 +100,13 @@ struct NativeArguments final {
   // an int8-activation path takes them
   // (RuntimeResourcesConfig::int8Activations).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  // --steer-path FILE: a GLP control vector applied at every layer's
+  // post-layer residual stream (model/GlpVector.hpp), or WEIGHTLESS_STEER_PATH
+  // when the flag is absent; empty for none.
+  std::filesystem::path steerPath;
+  // --steer-alpha ALPHA: the projection strength, over the file's
+  // glp.alpha_default, or WEIGHTLESS_STEER_ALPHA when the flag is absent.
+  std::optional<float> steerAlpha;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
