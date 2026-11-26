@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -203,10 +204,32 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
                          std::to_string(model::ExecutionLimits::maximumBatchWidth) + "]");
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
+    } else if (option == "--steer-path") {
+      if (value.empty()) throw UsageError("--steer-path requires a file");
+      if (!result.steerPath.empty())
+        throw UsageError("--steer-path names one control vector: a project file is never merged with another");
+      result.steerPath = std::filesystem::absolute(std::filesystem::path(value));
+    } else if (option == "--steer-alpha") {
+      double alpha = 0.0;
+      if (!parseFinite(value, alpha) || std::abs(alpha) > std::numeric_limits<float>::max())
+        throw UsageError("--steer-alpha requires a finite number");
+      result.steerAlpha = static_cast<float>(alpha);
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
   }
+  // The GLP vector's environment, which the server's options read too: a flag
+  // outranks it, and an absent flag leaves it to the environment.
+  if (result.steerPath.empty())
+    if (const char *path = std::getenv("WEIGHTLESS_STEER_PATH"); path && *path)
+      result.steerPath = std::filesystem::absolute(std::filesystem::path(path));
+  if (!result.steerAlpha)
+    if (const char *text = std::getenv("WEIGHTLESS_STEER_ALPHA"); text && *text) {
+      double alpha = 0.0;
+      if (!parseFinite(text, alpha) || std::abs(alpha) > std::numeric_limits<float>::max())
+        throw UsageError("WEIGHTLESS_STEER_ALPHA requires a finite number");
+      result.steerAlpha = static_cast<float>(alpha);
+    }
   if (result.persistentCache && !result.maxCacheDisk.automatic && !result.maxCacheDisk.bytes)
     throw UsageError("--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
   if (result.maxCacheDiskWritesBytes && !result.maxCacheDisk.automatic && !result.maxCacheDisk.bytes)

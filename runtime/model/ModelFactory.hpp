@@ -3,6 +3,7 @@
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
 #include "ExpertChunkLayout.hpp"
+#include "GlpVector.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -145,6 +146,10 @@ struct RuntimeContext final {
   // The lanes its arenas hold, the most requests it runs at once, as its
   // start chose them (QwenTargetGeometry::lanes).
   uint32_t lanes = ExecutionLimits::defaultLanes;
+  // The GLP control vector the start applies at every layer's post-layer
+  // residual stream (--steer-path), or null. A target whose residual is
+  // hyper-connection streams refuses it (QwenTarget::setSteering).
+  const GlpVector *steering = nullptr;
 };
 
 // What the step costs a start's decode warmups measure follow

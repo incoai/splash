@@ -759,6 +759,9 @@ struct Runtime::Impl {
                    geometry.target.draftVocabulary, geometry.target.logitFinish()),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
+    // A GLP vector applies at every layer's post-layer residual stream; a
+    // target without one refuses it here, before any request runs.
+    if (value.steering) targetModel->setSteering(*value.steering);
     if (states.layout() != model.stateLayout(states.layout().target.format, states.layout().target.cachedCodes) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
       throw std::invalid_argument(

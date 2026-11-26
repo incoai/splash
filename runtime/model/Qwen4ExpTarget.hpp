@@ -82,6 +82,10 @@ private:
                          metal::MetalBuffer auxiliaryIn, const QwenTargetStateCapture &capture) const;
   [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t index) const;
   void addPrefillExperts(PrefillStep &step, uint32_t index) const;
+  // GLP steering is refused for this target (QwenTarget::setSteering): its
+  // residual is hyper-connection streams, where residual_stream_post_layer
+  // does not exist, so the layer loop applies nothing.
+  void addSteer(PrefillStep &step, uint32_t index) const;
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const;
 
   // A step's mix of the streams through `hyper` into `output` and, when it

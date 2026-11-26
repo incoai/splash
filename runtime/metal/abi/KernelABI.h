@@ -14,6 +14,7 @@
 #include "metal/abi/RowCopy.h"
 #include "metal/abi/StateCodec.h"
 #include "metal/abi/Sampling.h"
+#include "metal/abi/Steering.h"
 #include "metal/abi/VerifyTree.h"
 #include "metal/abi/Vision.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>

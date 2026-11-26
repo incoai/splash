@@ -436,6 +436,8 @@ void Inkling2LoopTarget::addPrefillExperts(PrefillStep &step, uint32_t applicati
                  ops::ShortConvOutput::RoundedSum);
 }
 
+void Inkling2LoopTarget::addSteer(PrefillStep &, uint32_t) const {}
+
 // A decode step's every row, and a prompt chunk's rows of its sequences'
 // captures (forEachPrefillCapture).
 // A decode step's head reads every row of the final norm.

@@ -243,6 +243,8 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.verifyRows = arguments.verifyRows;
   config.resources.lanes = arguments.lanes;
   config.resources.int8Activations = arguments.int8Activations;
+  config.resources.steerPath = arguments.steerPath;
+  config.resources.steerAlpha = arguments.steerAlpha;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

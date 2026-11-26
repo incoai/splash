@@ -235,6 +235,8 @@ void Qwen4ExpTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const 
   });
 }
 
+void Qwen4ExpTarget::addSteer(PrefillStep &, uint32_t) const {}
+
 // A decode step's head reads every row of the final mix, which takes the
 // table the head's plan reads where it runs in one pass (addHead).
 metal::MetalBuffer Qwen4ExpTarget::addPrefillEnd(PrefillStep &step) const {

@@ -126,6 +126,17 @@ OPTIONS = {
     "--activations": values(
         "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")
     ),
+    "--steer-path": values(
+        "--steer-path",
+        {
+            "/srv/glp.gguf": Path("/srv/glp.gguf"),
+            "~/glp.gguf": Path.home() / "glp.gguf",
+        },
+        ("", " "),
+    ),
+    "--steer-alpha": values(
+        "--steer-alpha", {"0": 0.0, "2.5": 2.5, "-1": -1.0}, ("nan", "inf", "many")
+    ),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},

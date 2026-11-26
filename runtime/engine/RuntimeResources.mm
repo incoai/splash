@@ -1003,6 +1003,26 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
   load(false);
 
+  // The GLP control vector, if the start names one: read and validated against
+  // the model as it loaded, before any request runs. A target whose residual
+  // is hyper-connection streams refuses it when the runtime is made
+  // (QwenTarget::setSteering).
+  std::shared_ptr<const model::GlpVector> steering;
+  if (!config.steerPath.empty()) {
+    try {
+      const auto [hidden, layers] = std::visit(
+          [](const auto &layout) { return std::pair<uint32_t, uint32_t>{layout.hiddenSize, layout.layers}; },
+          loaded.descriptor.target);
+      steering = std::make_shared<const model::GlpVector>(
+          model::GlpVector::load(config.steerPath, hidden, layers, config.steerAlpha));
+      logLine("GLP vector ", config.steerPath.string(), ": ", steering->steeredLayers().size(), " layers, alpha ",
+              steering->alpha, ".");
+    } catch (const std::exception &error) {
+      throw RuntimeResourcesError(RuntimeResourceStage::Configuration,
+                                  std::string("--steer-path: ") + error.what());
+    }
+  }
+
   // The engine's memory plan, with `stagingBytes` set aside for the disk
   // tier's state staging and `aneFfnBytes` for the prefill FFN's Neural Engine
   // split, each part as it loaded, whole or through its store, and the spill
@@ -1353,6 +1373,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
         std::move(aneFfn), config.kvFormat, config.buildId, config.cancelled, std::move(blockCache),
         std::move(historyStream), config.kvSpillAlways, config.verifyRows));
+    result->steering_ = std::move(steering);
     result->adoptPersistentCache();
     return result;
   } catch (const RuntimeResourcesError &) {
@@ -1484,7 +1505,7 @@ model::RuntimeContext RuntimeResources::modelContext() {
           historyStream_.get(), verifyRows_, [key](uint32_t lanes) { return ane::recall(key + std::to_string(lanes)); },
           [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); },
           [key](uint32_t lanes) { ane::forget(key + std::to_string(lanes)); },
-          memoryPlan_.breakdown().maximumBatchWidth};
+          memoryPlan_.breakdown().maximumBatchWidth, steering_.get()};
 }
 
 EngineSpillConfig RuntimeResources::spillConfig() const noexcept {

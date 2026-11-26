@@ -97,6 +97,10 @@ private:
   // Its routed work and the FFN's convolution onto the residual into its
   // output rows, a decode step's run by the MoE combine.
   void addPrefillExperts(PrefillStep &step, uint32_t application) const;
+  // GLP steering is refused for this target (QwenTarget::setSteering): its
+  // residual is hyper-connection streams, where residual_stream_post_layer
+  // does not exist, so the layer loop applies nothing.
+  void addSteer(PrefillStep &step, uint32_t application) const;
   // The final mix and output norm into buffers.hidden[1], a decode step's
   // into its final hidden rows, which the draft captures at id
   // applications() and its head then reads.

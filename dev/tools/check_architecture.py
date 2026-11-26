@@ -262,8 +262,10 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 99 for the tails behind a lane, which a windowed cache gives up where the
 # budget refuses: the states that pin them leave, oldest first, and a Full
 # extent their trims empty beyond the lanes' floors pays for the Slim ones
-# (Cache::releaseTails).
-ENGINE_LINE_BUDGET = 31_209
+# (Cache::releaseTails). 31,270 adds 61 for GLP steering: the start's vector,
+# its validation against the model as it loaded, and the two flags that name
+# it (--steer-path, --steer-alpha), a second --steer-path refused.
+ENGINE_LINE_BUDGET = 31_270
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
