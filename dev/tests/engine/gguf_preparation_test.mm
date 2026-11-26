@@ -1739,7 +1739,8 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
     }
     return digests;
   };
-  std::vector<std::string> release;
+  std::vector<std::string> release, mlxVlm;
+  std::vector<uint64_t> releaseBytes;
   const std::array<const char *, kNamings> namings{"its release's", "oMLX's", "mlx-vlm's", "mlx-lm's"};
   for (int naming = 0; naming < kNamings; ++naming) {
     const auto root = directory / ("inkling2-" + std::to_string(naming));
@@ -1747,10 +1748,30 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
     const model::SafetensorsCheckpoint checkpoint(root / "target");
     const std::vector<model::gguf::Image> plans = model::safetensorsTargetPlan(g).images(checkpoint, {}).images;
     const std::vector<std::string> digests = written(plans);
-    if (naming == Release) release = digests;
-    check(digests.size() == g.weightLayers + 2 && digests == release,
-          std::string("an Inkling-2-Mini checkpoint in ") + namings[naming] +
-              " names and layouts writes the release's images");
+    std::vector<uint64_t> imageBytes;
+    for (const model::gguf::Image &plan : plans) imageBytes.push_back(plan.bytes);
+    if (naming == Release) {
+      release = digests;
+      releaseBytes = imageBytes;
+    }
+    if (naming == MlxVlm) {
+      // mlx-vlm keeps each gate's down projection BF16 beside F32 forget and
+      // gain (ops::MessageGate takes a call's down format apart from its
+      // forget and gain format), so its loop layers stay smaller than the
+      // all-F32 release's while every other image matches bit for bit.
+      mlxVlm = digests;
+      bool matches = digests.size() == release.size();
+      for (size_t image = 0; matches && image < digests.size(); ++image)
+        matches = image < g.weightLayers && g.schedule().isLoopLayer(static_cast<uint32_t>(image))
+                      ? digests[image] != release[image] && imageBytes[image] < releaseBytes[image]
+                      : digests[image] == release[image];
+      check(matches, "an Inkling-2-Mini checkpoint in mlx-vlm's names keeps BF16 down projections beside F32 forget "
+                     "and gain");
+    } else {
+      check(digests.size() == g.weightLayers + 2 && digests == release,
+            std::string("an Inkling-2-Mini checkpoint in ") + namings[naming] +
+                " names and layouts writes the release's images");
+    }
     // A model of it, with a draft, is sized as its plan loads it
     // (streamableWeights), as the server sizes the model it serves.
     if (naming != Release) continue;
@@ -1812,20 +1833,43 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
             (image < g.weightLayers && image + g.blockResidualPeriod >= g.weightLayers);
   check(keeps, "an Inkling-2-Mini checkpoint of BF16 gates keeps them, as its GGUF does");
 
-  // A GGUF whose calls of gates mix BF16 and other formats, as some quantized
-  // GGUFs keep BF16 gates beside Q8_0 ones: its BF16 gates widen to F32,
-  // exactly, so it writes the F32 GGUF's images.
-  std::vector<Tensor> mixedGguf = gguf;
-  for (Tensor &tensor : mixedGguf)
+  // A GGUF whose gates keep down in BF16 and forget/gain in F32 keeps each
+  // group as stored, writing mlx-vlm's images (but its MXFP8 experts').
+  std::vector<Tensor> mixedDownGguf = gguf;
+  for (Tensor &tensor : mixedDownGguf)
     if (const auto found = bfloatDowns.find(tensor.name); found != bfloatDowns.end()) {
       tensor.type = model::ggml::kBF16;
       tensor.data = found->second;
     }
-  const auto mixedPath = directory / "inkling2-mixed-gates.gguf";
-  splash::test::writeFile(mixedPath, test_gguf::file(inkling2Metadata(g), mixedGguf));
-  model::WeightSource mixedSource(mixedPath);
-  check(written(model::ggufTargetPlan(g).images(model::GgufFile(mixedSource), {})) == converted,
-        "an Inkling-2-Mini GGUF whose gates mix BF16 and F32 widens them to its F32 GGUF's images");
+  const auto mixedDownPath = directory / "inkling2-bf16-down-gates.gguf";
+  splash::test::writeFile(mixedDownPath, test_gguf::file(inkling2Metadata(g), mixedDownGguf));
+  model::WeightSource mixedDownSource(mixedDownPath);
+  const std::vector<std::string> mixedDown =
+      written(model::ggufTargetPlan(g).images(model::GgufFile(mixedDownSource), {}));
+  bool keepsMixed = mixedDown != converted && mixedDown.size() == mlxVlm.size();
+  for (size_t image = 0; keepsMixed && image < mixedDown.size(); ++image)
+    keepsMixed = mixedDown[image] == mlxVlm[image] ||
+                 (image < g.weightLayers && image + g.blockResidualPeriod >= g.weightLayers);
+  check(keepsMixed, "an Inkling-2-Mini GGUF of BF16 down beside F32 forget/gain keeps them, as mlx-vlm's does");
+
+  // A GGUF whose calls mix BF16 and other formats within down (q BF16 beside
+  // k/v F32) or within forget/gain (forget BF16 beside gain F32) widens each
+  // mixed group's BF16 tensors to F32, writing the all-F32 GGUF's images.
+  std::vector<Tensor> mixedGroupGguf = gguf;
+  for (Tensor &tensor : mixedGroupGguf)
+    if (tensor.name.ends_with("loop_q_ctrl_down.weight") || tensor.name.ends_with("loop_q_ctrl_forget.weight") ||
+        tensor.name.ends_with("loop_ffn_ctrl_forget.weight")) {
+      const auto found = bfloatGates.find(tensor.name);
+      if (found != bfloatGates.end()) {
+        tensor.type = model::ggml::kBF16;
+        tensor.data = found->second;
+      }
+    }
+  const auto mixedGroupPath = directory / "inkling2-mixed-group-gates.gguf";
+  splash::test::writeFile(mixedGroupPath, test_gguf::file(inkling2Metadata(g), mixedGroupGguf));
+  model::WeightSource mixedGroupSource(mixedGroupPath);
+  check(written(model::ggufTargetPlan(g).images(model::GgufFile(mixedGroupSource), {})) == converted,
+        "an Inkling-2-Mini GGUF mixing BF16 and F32 within down or forget/gain widens the mixed group to F32");
 }
 
 } // namespace

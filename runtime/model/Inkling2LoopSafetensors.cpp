@@ -197,12 +197,13 @@ std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint,
   // down projection rows of its loop_down and its gain and forget the column
   // windows of its rows of loop_gain_forget; the others' tensors, by the
   // release's names (which mlx-lm's earlier conversions keep) or mlx-vlm's
-  // and mlx-lm's. The fused kernels take a call's gates in one format
+  // and mlx-lm's. The fused kernels take a call's down projections in one
+  // format and its forget and gain projections in one format
   // (ops::MessageGate): the mixer's q, k and v gates, or the FFN's
-  // (kInkling2LoopGateCalls). A call whose projections mix BF16 and F32
-  // (mlx-community's conversions keep a gate's forget and gain F32 and its
-  // down projection BF16) takes its BF16 rows widened to F32, exactly; one of
-  // a single format keeps it.
+  // (kInkling2LoopGateCalls). A group whose projections mix BF16 and F32
+  // takes its BF16 rows widened to F32, exactly; mlx-community's conversions
+  // (BF16 down, F32 forget and gain) keep each group in its stored format,
+  // saving 27.0 MiB on Inkling-2-Mini.
   const auto controller = [&](size_t gate, size_t projection) {
     return p + "controllers." + std::string(kControllers[gate]) + "." + std::string(kGateProjections[projection]) +
            "_weight";
@@ -212,11 +213,12 @@ std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint,
     return p + (gate == 3 ? std::string("mlp") : std::string(kGateInputs[gate])) + "_message_gate." +
            std::string(kMessageGateProjections[projection]) + ".weight";
   };
-  const auto mixedCall = [&](size_t gate) {
+  const auto mixedGroup = [&](size_t gate, bool down) {
     bool bfloat16 = false, float32 = false;
     const Inkling2LoopGateCall call = inkling2LoopGateCall(gate);
+    const size_t first = down ? 0 : 1, end = down ? 1 : kGateProjections.size();
     for (size_t other = call.first; other < call.end; ++other)
-      for (size_t projection = 0; projection < kGateProjections.size(); ++projection)
+      for (size_t projection = first; projection < end; ++projection)
         if (const SourceTensor *tensor = checkpoint.find(gateTensor(other, projection))) {
           bfloat16 = bfloat16 || tensor->dtype == "BF16";
           float32 = float32 || tensor->dtype == "F32";
@@ -239,7 +241,7 @@ std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint,
                  .window = projection == 1 ? 1u : 0u,
                  .transposed = true}};
       }
-      return {{.name = gateTensor(gate, projection), .widened = mixedCall(gate)}};
+      return {{.name = gateTensor(gate, projection), .widened = mixedGroup(gate, projection == 0)}};
     }
   // Every other section by its aliases, oMLX's projections as its fused rows.
   for (const Alias &alias : kLayerAliases) {

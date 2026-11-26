@@ -508,8 +508,9 @@ struct Inkling2LoopMessageWeights final {
 
 // A call of fused message gates (ops::MessageGate), gates [first, end) of a
 // loop layer's (Inkling2LoopMessageWeights::gates): the kernels take a call's
-// weights in one format, so a source that stores them in two is planned with
-// the call's BF16 rows widened to F32.
+// down projections in one format and its forget and gain projections in one
+// format, so a group that stores them in two is planned with its BF16 rows
+// widened to F32.
 struct Inkling2LoopGateCall final {
   uint32_t first = 0;
   uint32_t end = 0;

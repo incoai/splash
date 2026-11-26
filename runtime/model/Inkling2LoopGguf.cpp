@@ -157,14 +157,19 @@ void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout, con
 // (F32, or a quantized gate's F32 values), by the names of the file's layout.
 // The small F32 tensors as stored.
 // Whether a loop layer's call of message gates, its q, k and v gates or its
-// FFN gate (kInkling2LoopGateCalls), mixes formats as its image would store
-// them, BF16 as stored and any other as F32: the fused kernels take a call's
-// gates in one format, so such a call's BF16 gates widen to F32, exactly (some
-// quantized GGUFs keep BF16 gates beside Q8_0 ones).
-bool mixedCall(const GgufFile &file, const std::string &layer, const GgufLayout &gguf, Inkling2LoopGateCall call) {
+// FFN gate (kInkling2LoopGateCalls), mixes formats within its down projections
+// (`down`) or within its forget and gain projections as its image would store
+// them, BF16 as stored and any other as F32: the fused kernels take each group
+// in one format, so a mixed group's BF16 projections widen to F32, exactly
+// (some quantized GGUFs keep BF16 gates beside Q8_0 ones).
+bool mixedGroup(const GgufFile &file, const std::string &layer, const GgufLayout &gguf, Inkling2LoopGateCall call,
+                bool down) {
   bool bfloat16 = false, other = false;
+  static constexpr std::array<const char *, 1> kDown{"down"};
+  static constexpr std::array<const char *, 2> kUp{"forget", "gain"};
+  const std::span<const char *const> projections = down ? std::span<const char *const>(kDown) : std::span<const char *const>(kUp);
   for (size_t gate = call.first; gate < call.end; ++gate)
-    for (const char *projection : {"down", "forget", "gain"})
+    for (const char *projection : projections)
       if (const GgufTensor *tensor = file.find(layer + std::string(gguf.gates[gate]) + projection + ".weight"))
         (tensor->type == ggml::kBF16 ? bfloat16 : other) = true;
   return bfloat16 && other;
@@ -212,12 +217,16 @@ std::vector<gguf::Section> layerImage(const Inkling2LoopLayout &layout, const Gg
   sections.push_back(messageQueries(layout, gguf, index));
   for (size_t gate = 0; gate < gguf.gates.size(); ++gate) {
     const std::string stem(gguf.gates[gate]);
-    const bool widened = file && mixedCall(*file, p, gguf, inkling2LoopGateCall(gate));
+    const Inkling2LoopGateCall call = inkling2LoopGateCall(gate);
+    const bool widenDown = file && mixedGroup(*file, p, gguf, call, true);
+    const bool widenUp = file && mixedGroup(*file, p, gguf, call, false);
     const size_t first = sections.size();
     add(Kind::FloatTensor, stem + "down.weight", layout.loopGateRank, 2 * hidden);
     add(Kind::FloatTensor, stem + "forget.weight", hidden, layout.loopGateRank);
     add(Kind::FloatTensor, stem + "gain.weight", hidden, layout.loopGateRank);
-    for (size_t at = first; at < sections.size(); ++at) sections[at].widened = widened;
+    sections[first].widened = widenDown;
+    sections[first + 1].widened = widenUp;
+    sections[first + 2].widened = widenUp;
   }
   return sections;
 }
