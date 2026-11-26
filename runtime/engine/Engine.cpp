@@ -1295,9 +1295,9 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
   // The head's end, so that the next conversation sharing the head resumes there on first use. An ordinary state,
-  // which a reclaim writes to the SSD as any other; it keeps the lane's last checkpoint before it cached
-  // (keepsCheckpoint) for a conversation whose head differs inside its last page.
-  if (const uint32_t head = headBoundary(active); head >= stateBoundary + kMinimumJunctionGain)
+  // which a reclaim writes to the SSD as any other; it keeps the lane's last checkpoint cached (keepsCheckpoint) for
+  // a head differing inside its last page. Its gain is the whole head, so a head under the 2048-token window keeps one.
+  if (const uint32_t head = headBoundary(active); head > stateBoundary)
     addStateBoundary(active, stateBoundary, head, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);

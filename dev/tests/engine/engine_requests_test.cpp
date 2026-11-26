@@ -1025,10 +1025,11 @@ void testEndedReplyKeepsItsLastCheckpoint() {
 
 // A conversation whose prompt starts with a head of 3,000 tokens, a system prompt and tools the server marks
 // (headTokens), keeps an ordinary state at the head's end: a second conversation sharing the head, the first to
-// follow, resumes at the head's last whole page. A prompt without a head, or with one shorter than the draft window
-// a state's capture costs (kMinimumJunctionGain), keeps none: the second conversation starts from 0.
+// follow, resumes at the head's last whole page. A head shorter than a draft window keeps one too (#874): a small
+// harness's system prompt and tools can lie under one, and it would otherwise never resume past the head. A
+// prompt without a head keeps none: the second conversation starts from 0.
 void testASecondConversationResumesAtASharedHead() {
-  for (const uint32_t headTokens : {3000U, 0U, 1024U}) {
+  for (const uint32_t headTokens : {3000U, 1024U, 512U, 0U}) {
     test::EngineHarness h({.pages = 1024});
     Events &events = h.events;
     engine::Engine &engine = h.engine;
@@ -1045,8 +1046,7 @@ void testASecondConversationResumesAtASharedHead() {
     tickUntil(h, now, [&] { return idle(engine); }, "the first conversation did not complete");
     engine.submit(conversation(2, 30'000));
     tickUntil(h, now, [&] { return idle(engine); }, "the second conversation did not complete");
-    const bool kept = headTokens >= model::ExecutionLimits::draftContextTokens;
-    const uint32_t head = kept ? headTokens / KvCache::pageTokens * KvCache::pageTokens : 0;
+    const uint32_t head = headTokens / KvCache::pageTokens * KvCache::pageTokens;
     require(events.starts.back() == head, "head " + std::to_string(headTokens) +
                                               ": the second conversation resumed from " +
                                               std::to_string(events.starts.back()) + ", not " + std::to_string(head));
