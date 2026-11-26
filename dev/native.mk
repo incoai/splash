@@ -189,6 +189,7 @@ TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_TEACHER_LOGITS := $(ENGINE_TEST_BUILD)/teacher-logits
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
+TEST_GRAPH_ENCODE_BENCHMARK := $(ENGINE_TEST_BUILD)/graph-encode-benchmark
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
 TEST_VISION_TOWER_BENCHMARK := $(ENGINE_TEST_BUILD)/vision-tower-benchmark
 TEST_DENSE_LINEAR_BENCHMARK := $(ENGINE_TEST_BUILD)/dense-linear-benchmark
@@ -339,7 +340,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
-	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
+	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) $(TEST_GRAPH_ENCODE_BENCHMARK) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) $(TEST_STATE_CODEC_AIR) \
@@ -580,6 +581,8 @@ $(TEST_TEACHER_LOGITS): dev/benchmarks/teacher_logits.mm \
 $(TEST_ATTENTION_SWEEP): dev/benchmarks/attention_sweep.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_GRAPH_ENCODE_BENCHMARK): dev/benchmarks/graph_encode_benchmark.mm \
+		$(ENGINE_LIBRARY) $(TEST_METAL_BACKEND_LIB)
 $(TEST_GGUF_PROJECTION_BENCHMARK): dev/benchmarks/gguf_projection_benchmark.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
@@ -606,7 +609,7 @@ $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(
 		$(TEST_RELATIVE_ATTENTION) $(TEST_ROPE_TABLES) \
 		$(TEST_METAL_BACKEND_TEST) $(TEST_HANDOFF_TEST) $(TEST_PRESSURE_SERVING) $(TEST_VISION_ENCODER_TEST) \
 		$(TEST_MODEL_RUNTIME_ORACLE) \
-		$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
+		$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) $(TEST_GRAPH_ENCODE_BENCHMARK) \
 		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
@@ -863,7 +866,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --lanes 8 --siblings-only $(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \
-	benchmark-decode-profile benchmark-attention-sweep \
+	benchmark-decode-profile benchmark-attention-sweep benchmark-graph-encode \
 	benchmark-gguf-projection benchmark-gguf-moe teacher-logits
 # decode-profile replays the installed model's prefill and decode commands as
 # separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles,
@@ -882,6 +885,12 @@ teacher-logits: preflight $(TARGET) $(TEST_TEACHER_LOGITS) $(LIB)
 # lengths; ATTENTION_SWEEP_ARGS passes --histories/--shapes/--lanes/--repeat.
 benchmark-attention-sweep: $(TEST_ATTENTION_SWEEP) $(LIB)
 	$(TEST_ATTENTION_SWEEP) $(LIB) $(ATTENTION_SWEEP_ARGS)
+
+# The host side of a command, weight-free: building a CommandGraph by the
+# dispatch's binding count, submitting it and freeing it, and a decode
+# arena's batch views; GRAPH_ENCODE_ARGS passes --dispatches/--repeat.
+benchmark-graph-encode: $(TEST_GRAPH_ENCODE_BENCHMARK) $(TEST_METAL_BACKEND_LIB)
+	$(TEST_GRAPH_ENCODE_BENCHMARK) $(TEST_METAL_BACKEND_LIB) $(GRAPH_ENCODE_ARGS)
 
 # One GGUF projection on both decode tiles at every lane count and K split
 # (the split tiers of runtime/ops/LinearGguf.cpp), or with prefill=R[,R...]

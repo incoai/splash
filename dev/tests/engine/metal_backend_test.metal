@@ -74,3 +74,7 @@ kernel void address_table_check_u32(device atomic_uint *mismatches [[buffer(0)]]
 // A host_step_wait that ends at once, without seeing its release: a test
 // of the backend's spin check names this library host-step.metallib.
 kernel void host_step_wait() {}
+
+// The one kernel of dev/benchmarks/graph_encode_benchmark.mm, whose
+// dispatches time the host side alone.
+kernel void graph_encode_benchmark_noop_dispatch() {}
