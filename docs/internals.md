@@ -2761,8 +2761,10 @@ copy, perhaps an older conversation's restore point.
 
 A prompt's head, its system prompt and tools up to where the template opens
 another message (`head_tokens` in the request frame), gets an ordinary state at
-its end on first prefill when it lies at least a draft window past where the
-request resumes, as a junction must save that much. It is kept and evicted as
+its end on first prefill whenever it lies past where the request resumes,
+however short: unlike a junction's, its gain is the whole head on every later
+conversation that shares it, so a head under a draft window (a small harness's
+system prompt and tools) keeps a state too. It is kept and evicted as
 any ordinary state, so the next conversation sharing the head resumes there,
 from RAM or from the SSD, instead of prefilling the head again. A persistent
 SSD cache copies it ahead as it copies a replay point, though its conversation
