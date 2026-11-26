@@ -208,6 +208,35 @@ def parse_chat_template_file(value):
     return Path(value).expanduser().absolute()
 
 
+def parse_control_vector(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must name a GGUF file")
+    return Path(value).expanduser().absolute()
+
+
+def parse_control_vector_scale(value):
+    try:
+        scale = float(value)
+    except ValueError:
+        scale = math.nan
+    if not math.isfinite(scale):
+        raise argparse.ArgumentTypeError("must be a finite number such as 0.8")
+    return scale
+
+
+def parse_control_vector_layer_range(value):
+    first, dash, last = value.partition("-")
+    if not dash or not first.isdigit() or not last.isdigit() or int(first) > int(last):
+        raise argparse.ArgumentTypeError(
+            "must be FIRST-LAST, two layers in order, such as 4-44"
+        )
+    return int(first), int(last)
+
+
+def control_vector_layer_range_text(layers):
+    return f"{layers[0]}-{layers[1]}"
+
+
 def parse_request_size(value):
     try:
         size = parse_max_memory(value)
@@ -469,6 +498,59 @@ class ServeOption:
 
 
 SERVE_OPTIONS = (
+    ServeOption(
+        "--control-vector",
+        "model",
+        dict(
+            type=parse_control_vector,
+            default=None,
+            metavar="FILE",
+            help="GGUF control vector, as llama.cpp's --control-vector reads it "
+            "(a direction.L tensor per steered layer L), applied to the "
+            "residual after each layer it steers in every request; "
+            "Qwen3.8-Flash-Next, Qwen3.8-27B and Qwen3.6-35B-A3B only "
+            "(default: none)",
+        ),
+        engine=EngineArgument("--control-vector"),
+    ),
+    ServeOption(
+        "--control-vector-scale",
+        "model",
+        dict(
+            type=parse_control_vector_scale,
+            default=1.0,
+            metavar="SCALE",
+            help="scale of the control vector's directions (default: 1.0)",
+        ),
+        engine=EngineArgument("--control-vector-scale"),
+    ),
+    ServeOption(
+        "--control-vector-layer-range",
+        "model",
+        dict(
+            type=parse_control_vector_layer_range,
+            default=None,
+            metavar="FIRST-LAST",
+            help="the layers the control vector steers, both included, e.g. "
+            "4-44 (default: every layer the file holds)",
+        ),
+        text=control_vector_layer_range_text,
+        engine=EngineArgument(
+            "--control-vector-layer-range", text=control_vector_layer_range_text
+        ),
+    ),
+    ServeOption(
+        "--control-vector-mode",
+        "model",
+        dict(
+            choices=("add", "project"),
+            default="add",
+            help="add adds the scaled direction to the residual, as llama.cpp "
+            "does; project removes the scaled component of the residual along "
+            "the direction (default: add)",
+        ),
+        engine=EngineArgument("--control-vector-mode"),
+    ),
     ServeOption(
         "--host",
         "network",
@@ -1001,6 +1083,15 @@ def check_serve_arguments(parser, args):
             "--default-reasoning-effort (SPLASH_DEFAULT_REASONING_EFFORT) sets "
             "the effort of requests that set none, and --reasoning-effort "
             "(SPLASH_REASONING_EFFORT) leaves none: it sets every request's"
+        )
+    if args.control_vector is None and (
+        args.control_vector_scale != 1.0
+        or args.control_vector_layer_range is not None
+        or args.control_vector_mode != "add"
+    ):
+        parser.error(
+            "--control-vector-scale, --control-vector-layer-range and "
+            "--control-vector-mode need --control-vector"
         )
 
 

@@ -16,6 +16,15 @@
 
 namespace splash::ops {
 
+// A control vector's change after a steered layer (addSteer): row `layer`
+// of its table of directions, added `scale` times, or, with project, the
+// streams' component along that unit direction taken off `scale` times.
+struct HyperSteer final {
+  uint32_t layer = 0;
+  bool project = false;
+  float scale = 1.0F;
+};
+
 // `streams` streams of `hidden` values per row, and a mix's low rank.
 struct HyperShape final {
   uint32_t hidden = 0;
@@ -51,6 +60,11 @@ struct HyperConnection final {
   // The mean of each of `rows` rows' streams, as bf16 into `destination` at
   // `to`: Qwen3.8-Flash-Next's capture of a layer's output for its DFlash2
   // draft.
+  // A control vector's change to every stream of `rows` rows after a
+  // steered layer, from `directions`, fp32 rows of `hidden` values
+  // (model/ControlVector.hpp).
+  static void addSteer(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer directions,
+                       HyperSteer steer, HyperShape shape, uint32_t rows);
   static void addStreamMean(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer destination,
                             RowRegion to, HyperShape shape, uint32_t rows);
 };
