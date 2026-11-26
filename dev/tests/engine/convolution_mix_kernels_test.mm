@@ -888,12 +888,17 @@ struct GateCase {
     }
   }
   [[nodiscard]] uint32_t column(uint32_t g) const { return sharedX ? 0 : g; }
-  [[nodiscard]] ops::MessageGateWeights weights(MetalBackend &backend, uint32_t g, bool bfloat16) const {
-    const auto rows = [&](const std::vector<float> &values, uint32_t outputs, uint32_t inputs) {
+  [[nodiscard]] ops::MessageGateWeights weights(MetalBackend &backend, uint32_t g, bool downBfloat16,
+                                                bool upBfloat16) const {
+    const auto rows = [&](const std::vector<float> &values, uint32_t outputs, uint32_t inputs, bool bfloat16) {
       return bfloat16 ? ops::QuantizedSegment::rows(GGUF_FMT_BF16, outputs, inputs, upload(backend, bf16s(values)))
                       : ops::QuantizedSegment::floats(outputs, inputs, upload(backend, values));
     };
-    return {rows(down[g], rank, 2 * hidden), rows(forget[g], hidden, rank), rows(gain[g], hidden, rank)};
+    return {rows(down[g], rank, 2 * hidden, downBfloat16), rows(forget[g], hidden, rank, upBfloat16),
+            rows(gain[g], hidden, rank, upBfloat16)};
+  }
+  [[nodiscard]] ops::MessageGateWeights weights(MetalBackend &backend, uint32_t g, bool bfloat16) const {
+    return weights(backend, g, bfloat16, bfloat16);
   }
   // Gate g's row r against fp64, with the source's bf16 roundings of the
   // down projection's input and output, before the norm's weights' rounding.
@@ -1021,23 +1026,25 @@ void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX
   for (uint32_t g = 0; g < gates; ++g) norms.push_back(upload(backend, c.norm[g]));
   const MetalBuffer counters = scratch(backend, ops::MessageGate::kCountersBytes);
   std::memset(counters.contents(), 0, counters.sizeBytes());
-  // Each format's outputs, gate after gate.
-  std::vector<std::vector<uint16_t>> got[2];
+  // Each (down, up) format combination's outputs, gate after gate.
+  constexpr std::array<std::pair<bool, bool>, 4> kFormats{{{false, false}, {true, true}, {true, false}, {false, true}}};
+  std::array<std::vector<std::vector<uint16_t>>, kFormats.size()> got;
   bool ok = true;
-  for (const bool bfloat16 : {false, true}) {
+  for (size_t combo = 0; combo < kFormats.size(); ++combo) {
+    const auto [downBf16, upBf16] = kFormats[combo];
     std::vector<ops::MessageGateWeights> weights;
     std::vector<MetalBuffer> outputs;
     for (uint32_t g = 0; g < gates; ++g) {
-      weights.push_back(c.weights(backend, g, bfloat16));
+      weights.push_back(c.weights(backend, g, downBf16, upBf16));
       outputs.push_back(scratch(backend, size_t{rows} * hidden * 2));
     }
     runGates(backend, c, x, message, weights, norms, outputs, counters, 0, rows, path);
     for (uint32_t g = 0; g < gates; ++g) {
-      got[bfloat16].push_back(download<uint16_t>(outputs[g], size_t{rows} * hidden));
+      got[combo].push_back(download<uint16_t>(outputs[g], size_t{rows} * hidden));
       for (uint32_t r = 0; r < rows; ++r) {
         const auto want = c.reference(g, r);
         for (uint32_t d = 0; d < hidden; ++d)
-          ok &= closeBf16(f32(got[bfloat16][g][size_t{r} * hidden + d]), want[d], 2e-3);
+          ok &= closeBf16(f32(got[combo][g][size_t{r} * hidden + d]), want[d], 2e-3);
       }
     }
   }
@@ -1046,10 +1053,11 @@ void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX
   const std::string shape = hidden == GateCase::kHidden && rank == GateCase::kRank
                                 ? ""
                                 : ", hidden " + std::to_string(hidden) + " and rank " + std::to_string(rank);
-  check(ok && got[0] == got[1] && std::all_of(zeros.begin(), zeros.end(), [](uint32_t value) { return value == 0; }),
+  const bool bitwise = got[0] == got[1] && got[0] == got[2] && got[0] == got[3];
+  check(ok && bitwise && std::all_of(zeros.begin(), zeros.end(), [](uint32_t value) { return value == 0; }),
         "message gates, " + std::to_string(gates) + " a call" + kind + ", of " + std::to_string(rows) + " rows (" +
             gateKernels(rows, path) + shape +
-            ") through their norms, x and the messages at columns of wider rows, F32 and BF16 weights alike");
+            ") through their norms, x and the messages at columns of wider rows, F32, BF16 and mixed down/up weights alike");
 }
 
 // The gates' three paths on the same rows: a call of three gates of more rows
@@ -1137,10 +1145,12 @@ void gatePathsTest(MetalBackend &backend) {
 
 // MessageGate::add refuses, saying why, the calls the fused kernels do not
 // take, which no Inkling-2-Mini checkpoint makes (its target checks a layer's
-// gates at load): gates of F32 and BF16 rows in one call, a rank short of a
-// run of 8, and a hidden short of a 64-value step.
+// gates at load): mixed formats within a call's down projections or within its
+// forget and gain projections, a rank short of a run of 8, and a hidden short
+// of a 64-value step.
 void gateRefusalTest(MetalBackend &backend) {
-  const auto refused = [&](uint32_t hidden, uint32_t rank, bool mixed, const std::string &why) {
+  enum class Mix { None, AcrossGates, ForgetGain };
+  const auto refused = [&](uint32_t hidden, uint32_t rank, Mix mix, const std::string &why) {
     std::mt19937 rng(41);
     const GateCase c(rng, 13, 3, false, hidden, rank);
     const MetalBuffer x = upload(backend, c.x), message = upload(backend, c.message),
@@ -1148,7 +1158,9 @@ void gateRefusalTest(MetalBackend &backend) {
     std::vector<ops::MessageGateWeights> weights;
     std::vector<MetalBuffer> norms, outputs;
     for (uint32_t g = 0; g < c.gates; ++g) {
-      weights.push_back(c.weights(backend, g, mixed && g > 0));
+      ops::MessageGateWeights w = c.weights(backend, g, mix == Mix::AcrossGates && g > 0);
+      if (mix == Mix::ForgetGain) w.forget = c.weights(backend, g, true).forget;
+      weights.push_back(std::move(w));
       norms.push_back(upload(backend, c.norm[g]));
       outputs.push_back(scratch(backend, size_t{c.rows} * hidden * 2));
     }
@@ -1159,11 +1171,12 @@ void gateRefusalTest(MetalBackend &backend) {
     }
     return false;
   };
-  check(refused(GateCase::kHidden, GateCase::kRank, true, "all of one format") &&
-            refused(GateCase::kHidden, 4, false, "a rank of 8 to 64") &&
-            refused(96, GateCase::kRank, false, "whole 64-value steps"),
-        "message gates the fused kernels do not take refused, saying why: F32 and BF16 in one call, a rank of 4, a "
-        "hidden of 96");
+  check(refused(GateCase::kHidden, GateCase::kRank, Mix::AcrossGates, "all of one format") &&
+            refused(GateCase::kHidden, GateCase::kRank, Mix::ForgetGain, "all of one format") &&
+            refused(GateCase::kHidden, 4, Mix::None, "a rank of 8 to 64") &&
+            refused(96, GateCase::kRank, Mix::None, "whole 64-value steps"),
+        "message gates the fused kernels do not take refused, saying why: mixed down or forget/gain in one call, a "
+        "rank of 4, a hidden of 96");
 }
 
 // The finish of rows of logits: the softcap below `tokens`, -inf past it.

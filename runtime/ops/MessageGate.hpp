@@ -11,10 +11,11 @@
 // the weights themselves (metal/abi/MessageGate.h): a decode step's rows at
 // most (kFusedRows) in three kernels, each row normalized once for its down
 // projection, more rows, a prompt chunk's, in one tiled kernel, a tile of
-// rows a threadgroup. They take weights of F32 or BF16
-// rows, all of a call's of one format, a rank of 8 to MESSAGE_GATE_MAXIMUM_RANK
-// in runs of 8 and a hidden of whole 64-value steps, x and the messages in
-// whole float4s, and add refuses any other call (requireWeights says why).
+// rows a threadgroup. They take weights of F32 or BF16 rows, a call's down
+// projections of one format and its forget and gain projections of one format,
+// a rank of 8 to MESSAGE_GATE_MAXIMUM_RANK in runs of 8 and a hidden of whole
+// 64-value steps, x and the messages in whole float4s, and add refuses any
+// other call (requireWeights says why).
 // Inkling-2-Mini's gates are such rows whatever their checkpoint holds: its
 // loaders keep F32 and BF16 tensors as stored and decode a quantized or F16
 // one, as some GGUFs keep the gates, to F32 (FloatTensor sections,

@@ -610,13 +610,17 @@ __attribute__((noinline)) void message_gate_rows_norm(device const float *gated,
 
 // A gate's gated rows of a tile of MESSAGE_GATE_TILE_ROWS rows a threadgroup,
 // gate g's gated rows' scratch `gated` g. Grid: (tiles, 1, gates).
-template <typename Weight>
+template <typename DownWeight, typename UpWeight>
 kernel void message_gate_rows(device const float *x [[buffer(0)]], device const float *message [[buffer(1)]],
-                              device const Weight *down0 [[buffer(2)]], device const Weight *down1 [[buffer(3)]],
-                              device const Weight *down2 [[buffer(4)]], device const Weight *forget0 [[buffer(5)]],
-                              device const Weight *forget1 [[buffer(6)]], device const Weight *forget2 [[buffer(7)]],
-                              device const Weight *gain0 [[buffer(8)]], device const Weight *gain1 [[buffer(9)]],
-                              device const Weight *gain2 [[buffer(10)]], device const float *norm0 [[buffer(11)]],
+                              device const DownWeight *down0 [[buffer(2)]],
+                              device const DownWeight *down1 [[buffer(3)]],
+                              device const DownWeight *down2 [[buffer(4)]],
+                              device const UpWeight *forget0 [[buffer(5)]],
+                              device const UpWeight *forget1 [[buffer(6)]],
+                              device const UpWeight *forget2 [[buffer(7)]],
+                              device const UpWeight *gain0 [[buffer(8)]],
+                              device const UpWeight *gain1 [[buffer(9)]],
+                              device const UpWeight *gain2 [[buffer(10)]], device const float *norm0 [[buffer(11)]],
                               device const float *norm1 [[buffer(12)]], device const float *norm2 [[buffer(13)]],
                               device float *gated0 [[buffer(14)]], device float *gated1 [[buffer(15)]],
                               device float *gated2 [[buffer(16)]], device bfloat *output0 [[buffer(17)]],
@@ -638,8 +642,17 @@ kernel void message_gate_rows(device const float *x [[buffer(0)]], device const 
                          p, first, count, tid, shared);
 }
 
-// The instances: F32 weights (_f32) and BF16 (_bf16), as a GGUF stores the
-// gates' projections.
+// The instances: F32 weights (_f32) and BF16 (_bf16), as a GGUF or checkpoint
+// stores a gate's projections; message_gate_rows also takes a down format
+// apart from forget and gain's (_bf16_f32 and _f32_bf16).
+#define MESSAGE_GATE_ROWS_INSTANCE(DownWeight, UpWeight, suffix)                                                   \
+  template [[host_name("message_gate_rows" suffix)]] kernel void message_gate_rows<DownWeight, UpWeight>(          \
+      device const float *, device const float *, device const DownWeight *, device const DownWeight *,            \
+      device const DownWeight *, device const UpWeight *, device const UpWeight *, device const UpWeight *,        \
+      device const UpWeight *, device const UpWeight *, device const UpWeight *, device const float *,             \
+      device const float *, device const float *, device float *, device float *, device float *,                  \
+      device bfloat *, device bfloat *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint,     \
+      uint);
 #define MESSAGE_GATE_INSTANCES(Weight, suffix)                                                                    \
   template [[host_name("message_gate_down" suffix)]] kernel void message_gate_down<Weight>(                       \
       device const bfloat *, device const Weight *, device const Weight *, device const Weight *, device bfloat *, \
@@ -650,13 +663,10 @@ kernel void message_gate_rows(device const float *x [[buffer(0)]], device const 
       device const bfloat *, device const float *, device const float *, device const float *,                    \
       device coherent(device) float *, device coherent(device) float *, device atomic_uint *, device bfloat *,    \
       device bfloat *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint, uint);              \
-  template [[host_name("message_gate_rows" suffix)]] kernel void message_gate_rows<Weight>(                       \
-      device const float *, device const float *, device const Weight *, device const Weight *,                   \
-      device const Weight *, device const Weight *, device const Weight *, device const Weight *,                 \
-      device const Weight *, device const Weight *, device const Weight *, device const float *,                  \
-      device const float *, device const float *, device float *, device float *, device float *,                 \
-      device bfloat *, device bfloat *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint,     \
-      uint);
+  MESSAGE_GATE_ROWS_INSTANCE(Weight, Weight, suffix)
 MESSAGE_GATE_INSTANCES(float, "_f32")
 MESSAGE_GATE_INSTANCES(bfloat, "_bf16")
+MESSAGE_GATE_ROWS_INSTANCE(bfloat, float, "_bf16_f32")
+MESSAGE_GATE_ROWS_INSTANCE(float, bfloat, "_f32_bf16")
 #undef MESSAGE_GATE_INSTANCES
+#undef MESSAGE_GATE_ROWS_INSTANCE
