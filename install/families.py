@@ -84,6 +84,11 @@ class ModelFamily:
     # conversions hold no tower, and which 1.7.2 served as text only. Another
     # family's such source asks for --language-only.
     text_fallback: bool = False
+    # Whether the family's models serve without a draft (--draft-model none).
+    # Flint's do not: its mask token is its draft's and its target keeps no
+    # GDN state, so a state cached without a draft would hold nothing
+    # (ModelDescriptor.mm inspectModelRoot).
+    draftless: bool = True
 
 
 FAMILIES = (
@@ -102,8 +107,15 @@ FAMILIES = (
         QWEN,
         QWEN_SAMPLING,
     ),
-    # It has no vision tower.
-    ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
+    # It has no vision tower, and serves only with a draft.
+    ModelFamily(
+        "Flint",
+        "incoai/Flint-DFlash2",
+        FLINT,
+        FLINT_SAMPLING,
+        vision=False,
+        draftless=False,
+    ),
     # Its vision tower is its release's and its MLX conversions' own, and an
     # inkling2v projector beside its GGUFs: Unsloth publishes it in BF16, F16
     # and F32, ggml-org in BF16 and Q8_0.

@@ -877,9 +877,9 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
   else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
-  // Without a draft config the descriptor names the family but has no draft
-  // (inspectSourceConfiguration), and is not valid; a model root always
-  // holds its draft's.
+  // Without a draft config the descriptor has no draft: the model of a root
+  // installed without one (--draft-model none), or a target checked before
+  // its draft is chosen (inspectSourceConfiguration).
   DFlashDraftLayout dflashLayout;
   std::visit([&](auto &layout) {
     validateTextConfig(text, layout, targetSource);
@@ -943,7 +943,7 @@ bool ModelDescriptor::valid() const noexcept {
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
-      vision.outputHiddenSize != draft.hiddenSize) {
+      (!draft.present() && draft != DFlashDraftLayout{})) {
     return false;
   }
   return std::visit(
@@ -960,9 +960,10 @@ bool ModelDescriptor::valid() const noexcept {
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
                vision.tower == layout.visionTower && vision.outputHiddenSize == layout.hiddenSize &&
                capabilities.imagePatchPixels == vision.patchSize &&
-               layout.hiddenSize == draft.hiddenSize &&
-               draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.draftReadableLayers() &&
+               (!draft.present() ||
+                (layout.hiddenSize == draft.hiddenSize && draft.targetLayerCount &&
+                 draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
+                 draft.targetLayers[draft.targetLayerCount - 1] < layout.draftReadableLayers())) &&
                // A family whose drafts choose the mask token holds its draft's.
                (!layout.draftChoosesMaskToken() ||
                 (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
@@ -1015,12 +1016,24 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // Every family decodes with its DFlash2 draft, in draft/.
-    if (!std::filesystem::exists(root / "draft"))
-      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
-    NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
+    // A model decodes with its DFlash2 draft, in draft/, unless its record
+    // names no draft source (--draft-model none) and its root holds none.
+    NSDictionary *sources = record[@"sources"];
+    const bool drafted =
+        ![sources isKindOfClass:[NSDictionary class]] || sources[@"draft"] != [NSNull null];
+    if (drafted != std::filesystem::exists(root / "draft"))
+      throw std::invalid_argument(drafted ? "the model's root holds no draft/ for its DFlash2 draft"
+                                          : "the model's root holds a draft/ its record does not name");
+    NSDictionary *draft = drafted ? readObject(root / "draft" / "config.json", "draft config") : nil;
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
     result.sourceIdentity = std::move(sourceIdentity);
+    // Without a draft a cached state is its GDN cell alone, its window
+    // holding nothing, and a family whose drafts choose the mask token has
+    // none: one whose target keeps no GDN state or whose mask token is its
+    // draft's (Flint) serves only with its draft.
+    if (!drafted && (!result.stateLayout.cachedBytes() ||
+                     std::visit([](const auto &layout) { return layout.draftChoosesMaskToken(); }, result.target)))
+      throw std::invalid_argument(std::string(result.family()) + " serves only with a DFlash2 draft");
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;
   }

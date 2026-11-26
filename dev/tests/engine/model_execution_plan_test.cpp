@@ -42,7 +42,8 @@ model::DFlashDraftLayout draftOf() {
 }
 
 // A target of Weights' architecture at the sizes of `family`, its first
-// family's by default, its projections in `format`, paired with `draft`.
+// family's by default, its projections in `format`, paired with `draft` --
+// an empty layout installs no draft (--draft-model none).
 template <class Weights>
 model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
                                const model::DFlashDraftLayout &draft = draftOf<Weights>(),
@@ -277,13 +278,16 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
                                                      model::StreamedParts::loaded(loaded), runtimeLanes);
   const auto &d = geometry.draft;
   const auto &target = geometry.target;
-  // Each matrix with the rows a lane gives it.
-  std::vector<std::pair<ops::LinearMatrix, uint32_t>> matrices{
-      {{d.dynamicSize, d.hiddenSize}, model::kDraftRows},       {{d.qkvSize, d.hiddenSize}, model::kDraftRows},
-      {{d.hiddenSize, d.attentionSize}, model::kDraftRows},     {{d.intermediateSize, d.hiddenSize}, model::kDraftRows},
-      {{d.hiddenSize, d.intermediateSize}, model::kDraftRows},  {{d.selectorRank, d.hiddenSize}, model::kDraftRows},
-      {{d.contextKvSize(), d.hiddenSize}, model::kDecodeRows}, {{d.hiddenSize, d.targetHiddenSize()}, model::kDecodeRows},
-      {{target.draftVocabulary.columns(target.vocabularySize), target.hiddenSize}, model::kDraftRows}};
+  // Each matrix with the rows a lane gives it; a model without a draft has
+  // the target's alone.
+  std::vector<std::pair<ops::LinearMatrix, uint32_t>> matrices;
+  if (d.present())
+    matrices = {
+        {{d.dynamicSize, d.hiddenSize}, model::kDraftRows},       {{d.qkvSize, d.hiddenSize}, model::kDraftRows},
+        {{d.hiddenSize, d.attentionSize}, model::kDraftRows},     {{d.intermediateSize, d.hiddenSize}, model::kDraftRows},
+        {{d.hiddenSize, d.intermediateSize}, model::kDraftRows},  {{d.selectorRank, d.hiddenSize}, model::kDraftRows},
+        {{d.contextKvSize(), d.hiddenSize}, model::kDecodeRows}, {{d.hiddenSize, d.targetHiddenSize()}, model::kDecodeRows},
+        {{target.draftVocabulary.columns(target.vocabularySize), target.hiddenSize}, model::kDraftRows}};
   for (const auto &p : target.decodeProjections)
     matrices.push_back({{p.outputSize, p.inputSize}, model::kDecodeRows});
   for (uint32_t family : {9U, 10U, 11U})
@@ -539,6 +543,42 @@ void checkIndexTables() {
           "a lane's index table is not its block index's alone");
 }
 
+// A model without a draft has a geometry without one: it captures no target
+// layer, and its decode arena holds none of a draft's rows nor its RoPE,
+// while what the target verifies stays as it is with a draft.
+template <class Weights>
+void checkWithoutDraft() {
+  const auto drafted = model::RuntimeGeometry::from(loadedModel<Weights>(), kv::Format::Int8,
+                                                    ops::GdnStateFormat::Float32);
+  const auto undrafted = model::RuntimeGeometry::from(loadedModel<Weights>({}, model::DFlashDraftLayout{}), kv::Format::Int8,
+                                                      ops::GdnStateFormat::Float32);
+  require(undrafted.draft == model::DFlashDraftLayout{} && !undrafted.target.captureLayerCount &&
+              drafted.target.captureLayerCount,
+          "a geometry without a draft captured target layers");
+  for (const auto tensor : {model::DecodeTensor::DraftHidden0, model::DecodeTensor::DraftProposalQkv,
+                            model::DecodeTensor::DraftFinalHidden, model::DecodeTensor::DraftRopeCos})
+    require(decodeBytes(drafted, tensor) && !decodeBytes(undrafted, tensor),
+            "a decode arena without a draft holds a draft's rows");
+  // Its lanes' trees, each its anchor alone, and the step's rows the
+  // selector lays out from them, which the target's verify reads.
+  for (const auto tensor : {model::DecodeTensor::InputTokens, model::DecodeTensor::TreeRows,
+                            model::DecodeTensor::LaneLayout, model::DecodeTensor::VerifySources,
+                            model::DecodeTensor::DraftTreeTokens, model::DecodeTensor::DraftTrees,
+                            model::DecodeTensor::DraftTreeScores, model::DecodeTensor::DraftTreeSizes,
+                            model::DecodeTensor::Logits})
+    require(decodeBytes(undrafted, tensor) && decodeBytes(undrafted, tensor) == decodeBytes(drafted, tensor),
+            "a decode arena without a draft verifies otherwise");
+  // Its decode tensors hold its lanes alone: no draft step binds more.
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+  require(model::decodeArenaLanes(undrafted, plans) == undrafted.target.lanes &&
+              model::plannedDecodeBytes(undrafted, plans) < model::plannedDecodeBytes(drafted, plans) &&
+              model::plannedPrefillBytes(undrafted, plans) <= model::plannedPrefillBytes(drafted, plans),
+          "the arenas of a model without a draft hold a draft's lanes or more than a drafted one's");
+}
+
 // A runtime whose K/V spills (one given the readers of spilled K/V,
 // model::RuntimeContext) runs its prefill commands as groups, which read an
 // attention layer's spilled history once each, and its decode arena holds
@@ -776,6 +816,9 @@ int main() {
     checkArenasWithoutGdnLayers();
     checkDenseHalves();
     checkPrefillInt8Scratch();
+    checkWithoutDraft<model::Qwen3_8Weights>();
+    checkWithoutDraft<model::Qwen3_6MoeWeights>();
+    checkWithoutDraft<model::Qwen4ExpWeights>();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
@@ -785,15 +828,17 @@ int main() {
                               {539'017'216, 533'610'496, 533'446'656});
     checkArenasHoldTheirLanes("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>(),
                               {409'796'608, 403'963'904}, {1'124'614'144, 1'118'781'440, 1'118'781'440});
+    checkLaneScratch(loadedModel<model::Qwen3_8Weights>({}, model::DFlashDraftLayout{}));
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>({}, model::DFlashDraftLayout{}));
     checkDecodeStepRows(loadedModel<model::Qwen3_8Weights>());
     checkDecodeStepRows(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>());
     checkMoeInt8Passes(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkDecodeStepMoe(loadedModel<model::Qwen4ExpWeights>());
-    std::cout << "model execution plans: PASS (three paired geometries)\n";
+    std::cout << "model execution plans: PASS (three paired geometries, three without a draft)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

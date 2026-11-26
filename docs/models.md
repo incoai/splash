@@ -483,7 +483,8 @@ inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
 
 ## Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
+A model decodes with a DFlash2 draft unless it is installed without one
+(below). Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
@@ -758,6 +759,32 @@ that model, 1.5% and 1.0% on its UD-Q4_K_M GGUF, 2.3% and 1.7% on
 Qwen3.6-35B-A3B UD-Q4_K_M. Flint's vocabulary mixes its scripts through all
 its tokens (its first 98,304 hold 98.1% of English text's tokens and 88.5% of
 Russian text's), so its drafts propose from all of them.
+
+`--draft-model none` installs the target alone: the installer asks the Hub for
+no draft, downloads none and links no `draft/`, and the installation's
+`model.json` records its draft source as `null`, so it is an installation of
+its own beside the drafted one ([Model cache](server.md#model-cache)). The engine then
+loads no draft weights and allocates neither the draft's rings, its context
+windows nor its block's rows (`DFlashDraftLayout{}`, whose `present()` is
+false), and every decode cycle selects one token: each lane's tree is its
+anchor alone, which the selector lays out as the step's one row a lane (a
+lane cap of one row, `ops::StepRows{lanes, lanes, 1}`), and the target
+verifies that row, sampled from its whole distribution as a request without
+speculation samples it (`Sampling::addVerify` tests no draft children). No
+lane proposes a host chain either: a prompt-lookup chain, a grammar's forced
+tokens and a thinking end each take a cycle a token, the thinking end's
+cutoff selecting it at the anchor's row. `--verify-rows` has no use there:
+the cycles learn no acceptance and measure no step costs, the startup log
+says they select one token each, and `/status` reports `verify_rows` as
+`anchor`. Greedy and seeded outputs then repeat from run to run, on a MoE
+target too, and the memory the draft and its state took goes to the KV
+cache. Inkling-2-Mini serves without its draft, as its target keeps its own
+mask token and a state of its own, its convolutions'. Flint serves only with
+its draft: its mask token is its draft's and its target keeps no GDN state,
+so without one its cached states would hold nothing, and the installer
+refuses it before any download (`families.FAMILIES`), as the engine does.
+[Local model files](#local-model-files) are always prepared with a draft:
+`--draft-model none` cannot be used with `--model-dir`.
 
 ## Vision
 

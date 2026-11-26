@@ -834,8 +834,11 @@ struct ModelTelemetry final {
   uint64_t aneFfnReruns = 0;
   // Whether decode cycles' rows follow the step costs and the verify
   // budget's acceptance (--verify-rows auto): the rows of the steps they
-  // choose, rather than every row of a draft's block a lane.
+  // choose, rather than every row of a draft's block a lane; and whether they
+  // verify a draft's at all: a model installed without one verifies its
+  // anchors.
   bool verifyBudget = false;
+  bool drafted = true;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
   double totalConstrainedTargetForwardGpuSeconds = 0.0;
   double lastConstrainedMaskWaitSeconds = 0.0;

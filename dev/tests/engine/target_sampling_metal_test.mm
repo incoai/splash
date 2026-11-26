@@ -809,6 +809,81 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
   }
 }
 
+// Without a draft (--draft-model none), a decode step holds each lane's
+// anchor alone, a lane cap of one row, and its verify tests no draft
+// children (Sampling::addVerify without `drafted`): whatever children,
+// candidates and estimates an earlier cycle's draft left in the buffers,
+// here a child of the mask token that its test would accept surely, a
+// sampled lane draws from the target's whole distribution with its uniform
+// 0, as a decode without speculation does, a greedy lane takes its argmax,
+// and acceptance keeps that one token and no proposal.
+void withoutDraft(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr uint32_t lanes = 2;
+  constexpr uint32_t kMask = 4;
+  Random random(0x6e6f6472);
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, lanes);
+  const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, lanes);
+  const std::vector<SamplingPolicy> policies{{32, 0.9F, 0.95F, false}, {1, 0.0F, 1.0F, false}};
+  std::vector<Distribution> targets(lanes);
+  auto *laneRows = static_cast<LaneRows *>(batch.buffers.laneRows.contents());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    // Lane l's one row, packed at row l.
+    laneRows[lane] = {lane, 1};
+    batch.inputTokens()[lane] = 5 + lane;
+    static_cast<TreeRow *>(batch.buffers.treeRows.contents())[lane] = chainRow(0);
+    fillRow(batch.row(lane), vocabulary, random);
+    // The mask token is the likeliest, which a stale child test accepts.
+    batch.row(lane)[kMask] = 12.0F;
+    static_cast<uint32_t *>(batch.buffers.verifySources.contents())[lane] = 0;
+    std::fill_n(static_cast<uint32_t *>(batch.buffers.candidates.contents()) + lane * kPositions * kCandidates,
+                kCandidates, kMask);
+    auto *draws = static_cast<uint8_t *>(batch.buffers.treeDraws.contents()) + lane * kBlock * kChildren;
+    std::fill_n(draws, kChildren, uint8_t{0xff});
+    draws[0] = 0;
+    auto *next = static_cast<float *>(batch.buffers.treeNext.contents()) + lane * kBlock * kCandidates;
+    std::fill_n(next, kCandidates, 0.0F);
+    next[0] = 1.0F;
+    float *uniforms = batch.uniforms() + lane * kUniforms;
+    for (uint32_t uniform = 0; uniform < kUniforms; ++uniform)
+      uniforms[uniform] = 0.0F;
+    if (policies[lane].samples()) {
+      targets[lane] = referenceDistribution(batch.row(lane), vocabulary, policies[lane]);
+      // Its draw lands on the likeliest token but the mask token, which a
+      // child test would have kept instead.
+      const std::vector<double> &weights = targets[lane].probabilities;
+      uint32_t best = kMask == 0 ? 1 : 0;
+      for (uint32_t token = 0; token < vocabulary; ++token)
+        if (token != kMask && weights[token] > weights[best])
+          best = token;
+      uniforms[0] = intervalMiddle(weights, best);
+    }
+  }
+
+  batch.poison();
+  const StepRows step{lanes, lanes, 1};
+  CommandGraph graph;
+  sampling.addVerify(graph, policies, batch.buffers, step, kStopTokens, {}, false);
+  const std::array<uint32_t, lanes> maximumRetained{1, 1};
+  sampling.addAcceptance(graph, acceptance, step, maximumRetained, kStopTokens);
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  const auto *retained = static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+  const auto *accepted = static_cast<const uint32_t *>(acceptance.acceptedCounts.contents());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const std::string label = "lane " + std::to_string(lane) + " without a draft";
+    const uint32_t token = batch.outputTokens()[lane];
+    require(accepted[lane] == 0 && retained[lane] == 1, label + ": accepted a proposal");
+    if (policies[lane].samples()) {
+      require(token != kMask, label + ": tested its draft's stale child");
+      requireDraw(token, targets[lane].probabilities, batch.uniforms()[lane * kUniforms],
+                  targets[lane].ambiguousMass, label + " draw");
+    } else {
+      require(token == referenceArgmax(batch.row(lane), vocabulary, {}), label + ": lost its argmax");
+    }
+  }
+}
+
 // Extreme repetition penalties saturate instead of overflowing: every
 // candidate the penalty drives to the same float limit ties, greedy takes the
 // lowest id among them, and sampling draws evenly among the lowest ids top-k
@@ -3605,6 +3680,8 @@ int main(int argc, char **argv) {
               std::to_string(samplingMask);
       speculativeExactness(backend, samplingMask);
     }
+    stage = "without a draft";
+    withoutDraft(backend);
     stage = "non-finite rows";
     nonFiniteRowsSelectTheSentinel(backend);
     stage = "ties";

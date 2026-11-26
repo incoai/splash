@@ -199,13 +199,13 @@ void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
                          SamplingBuffers buffers, const StepRows &step,
                          const StopTokens &stopTokens,
-                         const PenaltyTable &penalties) const {
+                         const PenaltyTable &penalties, bool drafted) const {
   requireStepRows(step);
   if (policies.size() != step.lanes)
     throw std::invalid_argument("invalid sampling batch width");
   // Verify row r of a lane reads mask row r + 1, and a sampled one tests its
-  // draft's children.
-  const TargetRows selected{step.rows, step.laneCap, 1, true};
+  // draft's children, which a model without a draft has none of.
+  const TargetRows selected{step.rows, step.laneCap, 1, drafted};
   const TargetSamplingParams params = selection(policies, buffers, selected, stopTokens);
   addPenalties(graph, buffers, penalties, penaltyParams(policies, buffers, penalties, selected));
   addSelection(graph, params, policies, buffers, selected);
