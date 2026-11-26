@@ -162,6 +162,8 @@ void ShortConvolution::addConvolution(metal::CommandGraph &graph, const ShortCon
     }
     // Rows past a sequence's: its state after them, then each capture's.
     const uint32_t stateRows = kStateRows * (count ? 1 + uint32_t(count) : writeState ? 1 : 0);
+    static_assert(1 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH + 7 + SHORT_CONVOLUTION_CAPTURES <= metal::kInlineBufferBindings,
+                  "short convolution bindings outgrow the inline binding capacity");
     graph.add(sum ? "short_convolution_sum" : "short_convolution",
               {buffers.input, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], out[0], out[1], out[2], out[3],
                out[4], out[5], out[6], out[7], taps, shape.dynamic() ? buffers.dynamicTaps : taps,

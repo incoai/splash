@@ -109,7 +109,8 @@ GraphFigures timeGraphs(metal::MetalBackend &backend, const Buffers &buffers, ui
   std::vector<double> build, submit, destroy;
   for (uint32_t graphIndex = 0; graphIndex < kWarmupGraphs + repeat; ++graphIndex) {
     const Clock::time_point start = Clock::now();
-    auto graph = std::make_unique<CommandGraph>();
+    // Sized as the runtime sizes a graph at a site it built before.
+    auto graph = std::make_unique<CommandGraph>(dispatches);
     addDispatches(bindings, *graph, buffers, dispatches);
     const Clock::time_point built = Clock::now();
     metal::CommandTicket ticket = backend.submitCommandAsync(graph->dispatches());

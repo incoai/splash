@@ -1,5 +1,6 @@
 #include "../../../runtime/Supervision.hpp"
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
+#include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -42,6 +43,7 @@ using splash::metal::AllocationFailure;
 using splash::metal::BackendInstrumentation;
 using splash::metal::MetalAllocationError;
 using splash::metal::BufferBinding;
+using splash::metal::BufferList;
 using splash::metal::BufferReach;
 using splash::metal::BufferStorage;
 using splash::metal::BytesBinding;
@@ -110,6 +112,71 @@ std::promise<void> completionReturned;
 std::shared_future<void> releaseMemoryQuery;
 std::atomic<unsigned> completionMemoryQueries{0};
 std::atomic<unsigned> memoryQueries{0};
+
+// A graph dispatch with the production maximum of buffers and one parameter
+// struct keeps every binding inside the dispatch, each payload keeps its
+// address and alignment as the graph grows, and a list past the inline
+// capacity moves to the heap with its bindings intact, copied or moved.
+void dispatchBindingsStayInline(const MetalBuffer &buffer) {
+    constexpr size_t kBindings = splash::metal::kInlineBufferBindings;
+    constexpr uint32_t kFirstValue = 7;
+    constexpr uint32_t kLaterDispatches = 2048;
+    struct alignas(16) WideParams {
+        uint32_t values[5];
+    };
+    BufferList buffers;
+    for (size_t index = 0; index < kBindings; ++index) buffers.push_back(buffer);
+    require(buffers.isInline() && buffers.size() == kBindings,
+            "a production-sized buffer list left its inline storage");
+
+    CommandGraph graph;
+    graph.add("test_add_u32", buffers, kFirstValue, {1, 1, 1});
+    const void *payload = graph.dispatches().front().bytes[0].data;
+    {
+        const ComputeDispatch &first = graph.dispatches().front();
+        require(first.buffers.isInline() && first.buffers.size() == kBindings &&
+                    first.bytes.isInline() && first.bytes.size() == 1 &&
+                    first.bytes[0].index == kBindings,
+                "a production-sized dispatch did not keep its bindings inline");
+        for (uint32_t index = 0; index < kBindings; ++index) {
+            require(first.buffers[index].index == index &&
+                        first.buffers[index].buffer.sameView(buffer),
+                    "an inline buffer binding lost its index or buffer");
+        }
+    }
+    for (uint32_t value = 0; value < kLaterDispatches; ++value) {
+        if (value % 3)
+            graph.add("test_add_u32", {buffer}, value, {1, 1, 1});
+        else
+            graph.add("test_add_u32", {buffer}, WideParams{{value}}, {1, 1, 1});
+    }
+    uint32_t stored = 0;
+    std::memcpy(&stored, graph.dispatches().front().bytes[0].data, sizeof(stored));
+    require(graph.dispatches().front().bytes[0].data == payload &&
+                stored == kFirstValue,
+            "a parameter payload moved as the graph grew");
+    for (uint32_t value = 0; value < kLaterDispatches; ++value) {
+        const splash::metal::BytesBinding &bytes = graph.dispatches()[value + 1].bytes[0];
+        std::memcpy(&stored, bytes.data, sizeof(stored));
+        require(stored == value, "a parameter payload was not stored");
+        require(value % 3 || (reinterpret_cast<uintptr_t>(bytes.data) % alignof(WideParams) == 0 &&
+                              bytes.sizeBytes == sizeof(WideParams)),
+                "a parameter payload lost its alignment");
+    }
+
+    buffers.push_back(buffer);
+    require(!buffers.isInline() && buffers.size() == kBindings + 1 &&
+                buffers.back().sameView(buffer),
+            "a buffer list past its inline capacity lost a binding");
+    const BufferList copied = buffers;
+    require(!copied.isInline() && copied.size() == kBindings + 1 && buffers.size() == kBindings + 1 &&
+                copied.back().sameView(buffer),
+            "copying a heap buffer list lost a binding");
+    const BufferList moved = std::move(buffers);
+    require(!moved.isInline() && moved.size() == kBindings + 1 &&
+                buffers.empty() && buffers.isInline(),
+            "moving a heap buffer list did not hand over its storage");
+}
 
 void observeCompletion(id command, SEL selector, MTLCommandBufferHandler handler) {
     reinterpret_cast<void (*)(id, SEL, MTLCommandBufferHandler)>(
@@ -3360,6 +3427,7 @@ void run(const std::string &metallibPath) {
         first.threadsPerThreadgroup = {kViewElementCount, 1, 1};
         std::vector<ComputeDispatch> command{first, first};
         (void)backend.submitCommandAsync(command).wait();
+        dispatchBindingsStayInline(view);
     }
     require(BackendInstrumentation::submittedCommands(backend) == 3,
             "explicit operation list did not use one command buffer");
