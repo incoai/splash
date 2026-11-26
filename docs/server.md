@@ -163,6 +163,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place. See [drafts](models.md#drafts). |
+| `--draft-revision` | The draft's default branch | Select the draft repository's branch, tag, or commit. See [revisions](#revisions). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -1151,18 +1152,23 @@ Agents keep their sessions in their own homes
 Each start follows the model's default branch, or the branch or tag
 `--revision` names: one Hub request of at most 5 seconds asks for its current
 commit, and when the Hub answered, another asks for the commit of the draft
-repository's default branch ([Drafts](models.md#drafts)). A new commit downloads only
+repository's default branch, or the branch, tag or commit `--draft-revision`
+names ([Drafts](models.md#drafts)). A new commit downloads only
 the files that changed and replaces the installed model once it is installed,
 freeing the earlier commit's files, unless another tool's files share its
 snapshot. An older `--revision` downloads them again, as a new commit that then
 fails to load would need. There is no update flag; to stay on one commit,
-pass it as `--revision`. A 40-hex `--revision` never moves, nor does its draft,
-and `--offline` (or
+pass it as `--revision`. A 40-hex `--revision` never moves, nor does the draft
+its installation records, and `--offline` (or
 `HF_HUB_OFFLINE=1`) forbids the Hub: both start the installed model without a
-request. The one exception is a text-only installation of a family that serves
-images, as Inkling-2-Mini's from 1.7.2: under a 40-hex `--revision` its start
-asks the Hub for that commit's listing, to take its tower in, until it has the
-tower or the listing has none Splash serves ([Vision](models.md#vision)).
+request. The first installation of a pinned target resolves the draft once, at
+its default branch unless `--draft-revision` names a branch, tag or commit; a
+40-hex `--draft-revision` pins it across installations too, a local draft
+directory being the alternative. The one exception is a text-only
+installation of a family that serves images, as Inkling-2-Mini's from 1.7.2:
+under a 40-hex `--revision` its start asks the Hub for that commit's listing,
+to take its tower in, until it has the tower or the listing has none Splash
+serves ([Vision](models.md#vision)).
 
 When the Hub does not answer, or a new commit cannot be installed, the
 installed model starts, with a line naming the reason. Without the Hub, Splash

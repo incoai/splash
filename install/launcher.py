@@ -192,6 +192,7 @@ def _ensure_installed(selection):
     for flag, value in (
         ("--revision", selection.revision),
         ("--draft-model", selection.draft_model),
+        ("--draft-revision", selection.draft_revision),
     ):
         if value is not None:
             command[-1:-1] = [flag, value]
@@ -385,6 +386,7 @@ def _prepare_start(args):
         revision=args.revision,
         language_only=args.language_only,
         draft_model=args.draft_model,
+        draft_revision=args.draft_revision,
     )
     _ensure_installed(selection)
     return selection.link
@@ -730,6 +732,11 @@ def parse_args(argv=None):
         "automatically selected one (a local directory with --model-dir)",
     )
     model.add_argument(
+        "--draft-revision",
+        metavar="REVISION",
+        help="draft repository branch, tag or commit (default: its default branch)",
+    )
+    model.add_argument(
         "--language-only",
         action="store_true",
         help="skip vision preparation and loading; image and PDF input is refused",
@@ -774,12 +781,22 @@ def parse_args(argv=None):
         if args.model_dir is not None:
             if args.revision is not None:
                 parser.error("--revision cannot be used with --model-dir")
+            if args.draft_revision is not None:
+                parser.error("--draft-revision cannot be used with --model-dir")
             if args.draft_model is not None and not Path(args.draft_model).is_dir():
                 parser.error(
                     "--draft-model must be a local DFlash2 draft directory with --model-dir"
                 )
         elif args.mmproj is not None:
             parser.error("--mmproj requires --model-dir")
+        if (
+            args.draft_revision is not None
+            and args.draft_model is not None
+            and Path(args.draft_model).is_dir()
+        ):
+            parser.error(
+                "--draft-revision cannot be used with a local --draft-model directory"
+            )
         if args.mmproj is not None and args.language_only:
             parser.error("--mmproj cannot be used with --language-only")
         serve_options.check_serve_arguments(parser, args)

@@ -47,8 +47,8 @@ Makefiles and the real-model harnesses).
 The real-model targets run against an installation in this checkout's
 `install/models`: run `make install` with the same options first, or in the
 same command, as above. They take `MODEL` exactly as `splash serve --model`
-does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
-`--draft-model` and `--language-only`:
+does, and `REVISION`, `DRAFT_MODEL`, `DRAFT_REVISION` and `LANGUAGE_ONLY=1` as
+its `--revision`, `--draft-model`, `--draft-revision` and `--language-only`:
 
 | Target | Runs |
 | --- | --- |
@@ -176,9 +176,10 @@ make install verify-models MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
 make test-agent-real MODEL=mlx-community/Qwen3.6-35B-A3B-4bit REVISION=<commit> AGENT_SCENARIO=smoke AGENT_CLIENTS=...
 ```
 
-Pin each upstream model to one commit, the same on both Macs. Without a Hub
-token for a private draft repository, set `DRAFT_MODEL` to a local copy of the
-draft's checkpoint ([Drafts](models.md#drafts)). The Metal suite depends on the GPU
+Pin each upstream model to one commit, the same on both Macs, and set
+`DRAFT_REVISION=<commit>` to pin its draft too. Without a Hub token for a
+private draft repository, set `DRAFT_MODEL` to a local copy of the draft's
+checkpoint ([Drafts](models.md#drafts)). The Metal suite depends on the GPU
 family, so it runs once on each Mac: within `make check` on the first, alone on
 the other. Per model, `release-check`:
 

@@ -225,14 +225,24 @@ def json_bytes(value) -> bytes:
 
 
 def selection_link(
-    models: Path, model_id: str, *, revision=None, language_only=False, draft_model=None
+    models: Path,
+    model_id: str,
+    *,
+    revision=None,
+    language_only=False,
+    draft_model=None,
+    draft_revision=None,
 ) -> Path:
     """The selection link of model_id with these source options:
     OWNER/REPO[:VARIANT] under models for the model alone, else
-    .selections/<hash of the selection>."""
+    .selections/<hash of the selection>. draft_revision joins the hash only
+    when set, so a selection without one keeps the link it had."""
     repo_id, variant = split_model_id(model_id)
-    if revision or language_only or draft_model:
-        return _hashed_link(models, [model_id, revision, language_only, draft_model])
+    if revision or language_only or draft_model or draft_revision:
+        selection = [model_id, revision, language_only, draft_model]
+        if draft_revision is not None:
+            selection.append(draft_revision)
+        return _hashed_link(models, selection)
     if variant is None:
         return models / repo_id
     return models / f"{repo_id}{serve_options.VARIANT_SEPARATOR}{variant}"
@@ -274,12 +284,20 @@ class Selection:
     revision: str | None
     language_only: bool
     draft_model: str | None
+    draft_revision: str | None
     models_root: Path
     link: Path
 
     @classmethod
     def of(
-        cls, models_root, model, *, revision=None, language_only=False, draft_model=None
+        cls,
+        models_root,
+        model,
+        *,
+        revision=None,
+        language_only=False,
+        draft_model=None,
+        draft_revision=None,
     ):
         repo_id, variant = split_model_id(model)
         models_root = Path(models_root).resolve()
@@ -289,6 +307,7 @@ class Selection:
             revision=revision,
             language_only=language_only,
             draft_model=draft_model,
+            draft_revision=draft_revision,
         )
         return cls(
             model,
@@ -297,6 +316,7 @@ class Selection:
             revision,
             language_only,
             draft_model,
+            draft_revision,
             models_root,
             link,
         )
@@ -389,6 +409,10 @@ def parse_args(argv=None):
         "family's released one",
     )
     parser.add_argument(
+        "--draft-revision",
+        help="optional draft repository branch, tag or commit",
+    )
+    parser.add_argument(
         "--language-only",
         action="store_true",
         help="skip vision preparation and loading",
@@ -405,7 +429,16 @@ def parse_args(argv=None):
         "remove",
         help="remove the model's installations and the Hub cache files no other uses",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if (
+        args.draft_revision is not None
+        and args.draft_model
+        and Path(args.draft_model).is_dir()
+    ):
+        parser.error(
+            "--draft-revision cannot be used with a local --draft-model directory"
+        )
+    return args
 
 
 def main(argv=None):
@@ -416,6 +449,7 @@ def main(argv=None):
         revision=args.revision,
         language_only=args.language_only,
         draft_model=args.draft_model,
+        draft_revision=args.draft_revision,
     )
     if args.command == "link":
         print(selection.link)

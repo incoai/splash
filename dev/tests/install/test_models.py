@@ -228,6 +228,26 @@ class InstallerTest(unittest.TestCase):
             installer.selection_link(models, "owner/repo"), models / "owner/repo"
         )
 
+    def test_a_draft_revision_names_a_separate_selection(self):
+        models = self.root / "models"
+        pinned = installer.selection_link(models, "owner/repo", draft_revision="e" * 40)
+        self.assertEqual(
+            pinned,
+            installer.selection_link(models, "owner/repo", draft_revision="e" * 40),
+        )
+        self.assertNotEqual(
+            pinned,
+            installer.selection_link(models, "owner/repo", draft_revision="f" * 40),
+        )
+        self.assertNotEqual(pinned, installer.selection_link(models, "owner/repo"))
+        # A selection without one keeps the link it had.
+        self.assertEqual(
+            installer.selection_link(models, "owner/repo", revision="b" * 40),
+            installer.selection_link(
+                models, "owner/repo", revision="b" * 40, draft_revision=None
+            ),
+        )
+
     def test_link_prints_the_selection_link_of_the_source_options(self):
         # make's MODEL_ROOT is this output; a relative draft folder names the
         # installation splash serve --draft-model selects from the same folder.
@@ -243,6 +263,14 @@ class InstallerTest(unittest.TestCase):
                     "revision": "b" * 40,
                     "language_only": True,
                     "draft_model": str(draft.resolve()),
+                },
+            ),
+            (
+                ["--model", "owner/repo", "--draft-model", "owner/draft"]
+                + ["--draft-revision", "e" * 40],
+                {
+                    "draft_model": "owner/draft",
+                    "draft_revision": "e" * 40,
                 },
             ),
         ):

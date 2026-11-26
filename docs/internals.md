@@ -169,7 +169,9 @@ beside what it ships.
 - A 40-hex `--revision`, or `--offline`: a verified installation starts
   without a request, but for one that lacks its family's tower and has not
   recorded why: under a 40-hex `--revision` its start asks for that commit's
-  listing (`upstream._start_installed`).
+  listing (`upstream._start_installed`). The draft follows the branch, tag or
+  commit `--draft-revision` names, or its default branch; a 40-hex one starts
+  from the commit the installation records, without a request.
 
 A missing assembly, or one that no longer verifies, is built again. Without the
 Hub it is built from a cached snapshot, of the commit the `--revision` names,

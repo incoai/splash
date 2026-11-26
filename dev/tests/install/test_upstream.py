@@ -1471,6 +1471,72 @@ class UpstreamTest(unittest.TestCase):
         )
         self.assertEqual(pins(self.cache), sorted(["a" * 40, "e" * 40]))
 
+    def test_a_draft_revision_pins_the_draft_commit(self):
+        fake = fake_hub(self, self.cache)
+        # A preview commit beside the draft's default branch.
+        fake.publish(
+            DENSE.draft_repo,
+            "e" * 40,
+            lambda p: draft_dir(p, DENSE),
+            branch="preview",
+        )
+        chosen = selection(self.root, revision="a" * 40, draft_revision="e" * 40)
+        self.prepare(chosen)
+        self.assertEqual(
+            fake.requests, [(MODEL, "a" * 40), (DENSE.draft_repo, "e" * 40)]
+        )
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"],
+            {
+                "target": {"repo": MODEL, "revision": "a" * 40},
+                "draft": {"repo": DENSE.draft_repo, "revision": "e" * 40},
+            },
+        )
+        # The draft's default branch moving leaves the pinned draft alone.
+        fake.publish(DENSE.draft_repo, "f" * 40, lambda p: draft_dir(p, DENSE))
+        fake.requests.clear(), fake.downloads.clear()
+        output, _ = self.prepare(chosen)
+        self.assertIn("is already installed", output)
+        self.assertEqual(fake.requests, [])
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["draft"]["revision"], "e" * 40
+        )
+
+    def test_a_pinned_draft_holds_while_the_target_branch_moves(self):
+        fake = fake_hub(self, self.cache)
+        fake.publish(
+            DENSE.draft_repo,
+            "e" * 40,
+            lambda p: draft_dir(p, DENSE),
+            branch="preview",
+        )
+        chosen = selection(self.root, draft_revision="e" * 40)
+        self.prepare(chosen)
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        fake.requests.clear(), fake.downloads.clear()
+        self.prepare(chosen)
+        # The target's branch is asked again; the pinned draft is not.
+        self.assertEqual(fake.requests, [(MODEL, None)])
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"],
+            {
+                "target": {"repo": MODEL, "revision": "b" * 40},
+                "draft": {"repo": DENSE.draft_repo, "revision": "e" * 40},
+            },
+        )
+
+    def test_a_draft_revision_applies_to_a_chosen_draft_repository(self):
+        fake = fake_hub(self, self.cache)
+        repository = "someone/other-draft"
+        fake.publish(repository, "c" * 40, lambda p: draft_dir(p, DENSE))
+        chosen = selection(self.root, draft_model=repository, draft_revision="c" * 40)
+        self.prepare(chosen)
+        self.assertEqual(fake.requests, [(MODEL, None), (repository, "c" * 40)])
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["draft"],
+            {"repo": repository, "revision": "c" * 40},
+        )
+
     def test_an_installation_of_another_draft_repository_moves_to_the_familys(self):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)

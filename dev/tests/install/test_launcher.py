@@ -671,6 +671,7 @@ class LauncherTests(unittest.TestCase):
             "--offline",
             "--revision",
             "--draft-model",
+            "--draft-revision",
             "--mmproj",
             "--chat-template-file",
             "--reasoning-effort",
@@ -1342,6 +1343,7 @@ class LauncherTests(unittest.TestCase):
                 "revision": "v2",
                 "language_only": True,
                 "draft_model": str(draft.resolve()),
+                "draft_revision": None,
             }
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
@@ -1399,6 +1401,40 @@ class LauncherTests(unittest.TestCase):
                 ),
                 ("prepare", MODEL_ID, "v2", True, options["draft_model"]),
             )
+
+    def test_a_draft_revision_reaches_installation_and_served_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            revision = "e" * 40
+            with (
+                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch.object(
+                    launcher.model_artifacts,
+                    "selection_link",
+                    return_value=runtime / "selected",
+                ),
+                mock.patch.object(launcher.os, "execve"),
+            ):
+                launcher.main(
+                    [
+                        "serve",
+                        "--model",
+                        MODEL_ID,
+                        "--draft-revision",
+                        revision,
+                    ]
+                )
+            (chosen,) = install.call_args.args
+            self.assertEqual(chosen.draft_revision, revision)
+            with (
+                mock.patch.object(launcher, "_ensure_runtime"),
+                mock.patch.object(launcher, "_run_held", return_value=0) as run,
+            ):
+                launcher._ensure_installed(chosen)
+            parsed = launcher.model_artifacts.parse_args(run.call_args.args[0][2:])
+            self.assertEqual(parsed.draft_revision, revision)
 
     def test_offline_serve_forbids_the_hub_to_installer_and_server(self):
         for offline in (False, True):
@@ -1611,6 +1647,30 @@ class LauncherTests(unittest.TestCase):
                 ["serve", "--model", MODEL_ID, "--draft-model", repository]
             )
             self.assertEqual(args.draft_model, repository)
+            args = launcher.parse_args(
+                ["serve", "--model", MODEL_ID, "--draft-revision", "e" * 40]
+            )
+            self.assertEqual(args.draft_revision, "e" * 40)
+            with (
+                mock.patch("sys.stderr", io.StringIO()) as error,
+                self.assertRaises(SystemExit) as failed,
+            ):
+                launcher.parse_args(
+                    [
+                        "serve",
+                        "--model",
+                        MODEL_ID,
+                        "--draft-model",
+                        "drafts/local",
+                        "--draft-revision",
+                        "e" * 40,
+                    ]
+                )
+            self.assertEqual(failed.exception.code, 2)
+            self.assertIn(
+                "--draft-revision cannot be used with a local --draft-model directory",
+                error.getvalue(),
+            )
             for value in ("./missing", "missing", "", "drafts/local/../../missing/"):
                 with (
                     self.subTest(value=value),

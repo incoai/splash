@@ -1135,10 +1135,11 @@ def _changes(installed, family, draft):
 
 def _resolve_draft(family, selection, installed, target):
     """The draft's repository, --draft-model or else the family's DFlash2
-    release, at its default branch's commit: one Hub request, made only when
-    the Hub answered for the target. Otherwise, or when it cannot be
-    resolved, the installed draft stands in; without one, a commit the Hub
-    cache holds, else it fails with the target's reason and class."""
+    release, at the commit --draft-revision names, or its default branch's
+    commit: one Hub request, made only when the Hub answered for the target.
+    Otherwise, or when it cannot be resolved, the installed draft stands in;
+    without one, a commit the Hub cache holds, else it fails with the
+    target's reason and class."""
     name = selection.draft_model or family.draft_repo
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
@@ -1148,6 +1149,7 @@ def _resolve_draft(family, selection, installed, target):
     try:
         return hub.Repository.resolve(
             name,
+            selection.draft_revision,
             installation=selection.link,
             installed=commit,
             unreachable=None

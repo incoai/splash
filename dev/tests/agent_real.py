@@ -1229,6 +1229,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--draft-model", type=launcher.model_artifacts.parse_draft_model
     )
+    parser.add_argument("--draft-revision")
     parser.add_argument("--language-only", action="store_true")
     parser.add_argument("--model-root", type=Path)
     parser.add_argument("--max-context", default="100K")
@@ -1248,6 +1249,7 @@ def parse_args(argv=None):
             revision=args.revision,
             language_only=args.language_only,
             draft_model=args.draft_model,
+            draft_revision=args.draft_revision,
         ).link
     return args
 
@@ -1313,6 +1315,11 @@ def main(argv=None):
                 args.model,
                 *(("--revision", args.revision) if args.revision else ()),
                 *(("--draft-model", args.draft_model) if args.draft_model else ()),
+                *(
+                    ("--draft-revision", args.draft_revision)
+                    if args.draft_revision
+                    else ()
+                ),
                 *(("--language-only",) if args.language_only else ()),
             ]
             with (directory / "server.log").open("x") as log:

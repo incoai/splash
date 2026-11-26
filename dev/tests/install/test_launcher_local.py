@@ -182,6 +182,10 @@ class LocalServeTests(unittest.TestCase):
                 "--revision cannot be used with --model-dir",
             ),
             (
+                ["--model-dir", "model", "--draft-revision", "e" * 40],
+                "--draft-revision cannot be used with --model-dir",
+            ),
+            (
                 ["--model-dir", "model", "--draft-model", "owner/draft"],
                 "--draft-model must be a local DFlash2 draft directory",
             ),

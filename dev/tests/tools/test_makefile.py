@@ -57,6 +57,7 @@ INHERITED = (
     "MODEL",
     "REVISION",
     "DRAFT_MODEL",
+    "DRAFT_REVISION",
     "LANGUAGE_ONLY",
     "PYTHON_CANDIDATES",
 )
@@ -265,6 +266,7 @@ class MakefileTests(unittest.TestCase):
                 "MODEL=owner/repo",
                 "REVISION=main",
                 "DRAFT_MODEL=owner/draft",
+                "DRAFT_REVISION=main",
                 "LANGUAGE_ONLY=1",
                 f"MODEL_ROOT={model_root}",
                 f"BASELINE={baseline}",

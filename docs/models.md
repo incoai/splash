@@ -78,9 +78,10 @@ splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
 splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
-A model ID with `--revision`, `--language-only` or `--draft-model` is a
-separate installation from the same ID without them. The app downloads and
-updates a model with Text only on as its `--language-only` installation, and
+A model ID with `--revision`, `--language-only`, `--draft-model` or
+`--draft-revision` is a separate installation from the same ID without them.
+The app downloads and updates a model with Text only on as its
+`--language-only` installation, and
 lists the model installed so alone as it lists one installed without it;
 deleting it in the app removes every installation of the model.
 
@@ -487,10 +488,12 @@ Every model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
-release ships its mask token's embedding. Installation downloads only those files and follows the repository's default
-branch as it follows the target's ([Revisions](server.md#revisions)); `--draft-model`
-accepts another repository, followed the same way, or a local directory that
-holds them. A checkpoint is installed only when the engine accepts its
+release ships its mask token's embedding. Installation downloads only those
+files and follows the repository's default branch as it follows the target's
+([Revisions](server.md#revisions)); `--draft-revision` names a branch, tag or
+commit of that repository; and `--draft-model` accepts another repository,
+followed the same way with its own `--draft-revision`, or a local directory
+that holds them. A checkpoint is installed only when the engine accepts its
 configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads.
 
@@ -1123,10 +1126,12 @@ implicitly.
 `--mmproj` supplies a local BF16, F32 or F16 GGUF vision projector (or Q8_0,
 for Inkling 2). Without
 one, a GGUF serves text only. An MLX target uses its own vision tower unless
-`--language-only` is set. `--revision` cannot be combined with `--model-dir`,
-and `--mmproj` requires `--model-dir` and cannot be combined with
-`--language-only`. Files are linked, and each start prepares them again under
-the same validation, publication and lifetime rules described below.
+`--language-only` is set. `--revision` and `--draft-revision` cannot be
+combined with `--model-dir`; `--draft-revision` cannot be combined with a
+local `--draft-model` directory; and `--mmproj` requires `--model-dir` and
+cannot be combined with `--language-only`. Files are linked, and each start
+prepares them again under the same validation, publication and lifetime rules
+described below.
 
 An application that downloads models itself prepares them for the server
 with `install.local.prepare_local_model`, the installer's one public
@@ -1153,8 +1158,9 @@ PYTHONPATH="$ROOT" "$ROOT/python/bin/python3" -P -m server.server "$MODEL" \
 `--model` is the ID the API reports, in `OWNER/REPO` form, and `--binary` the
 engine of the same checkout or release (`build/splash` in a checkout). The
 server takes the [server options](server.md#server-options) of `splash serve`; the
-model's source options (`--revision`, `--draft-model`, `--language-only`,
-`--offline`) are `prepare_local_model`'s arguments instead, or have no use.
+model's source options (`--revision`, `--draft-model`, `--draft-revision`,
+`--language-only`, `--offline`) are `prepare_local_model`'s arguments instead,
+or have no use.
 
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else
