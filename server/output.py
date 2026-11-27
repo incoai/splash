@@ -761,10 +761,12 @@ class StreamingToolCallProjector:
                     continue
                 if self.state == "body_arguments":
                     # The object's own close, the last character before the
-                    # call's, waits for the text after it.
+                    # call's but for whitespace, waits with that whitespace
+                    # for the text after it.
                     ready, held = hold_partial(self.pending, syntax.call_close)
-                    if ready.endswith("}"):
-                        ready, held = ready[:-1], "}" + held
+                    close = len(ready.rstrip()) - 1
+                    if close >= 0 and ready[close] == "}":
+                        ready, held = ready[:close], ready[close:] + held
                     if ready:
                         self._emit_argument(ready, events)
                     self.pending = held
