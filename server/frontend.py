@@ -79,6 +79,7 @@ class Prompt:
     messages: list
     tools: list | None
     tool_policy: ToolPolicy | None
+    head_tool_count: int
     reasoning_effort: str | None
     response_schema: dict | bool | None = None
     response_validator: object = None
@@ -663,12 +664,27 @@ class Frontend:
             template_kwargs.pop("reasoning_effort", None)
         template_effort = template_kwargs.get("reasoning_effort")
         messages = normalize_messages(body.get("messages"), vision=self.vision)
+        head_tools = body.get("tools")
+        if head_tools is not None and not isinstance(head_tools, list):
+            raise APIError(400, "tools must be an array")
+        head_count = len(head_tools or [])
+        declarations = [message for message in messages if "tools" in message]
+        offered = head_tools
+        if declarations:
+            offered = list(head_tools or [])
+            for message in declarations:
+                offered.extend(message["tools"])
         tools, tool_policy = normalize_tools(
-            body.get("tools"),
+            offered,
             body.get("tool_choice"),
             body.get("parallel_tool_calls", True),
             tool_namespaces,
         )
+        offset = head_count
+        for message in declarations:
+            end = offset + len(message["tools"])
+            message["tools"] = tools[offset:end]
+            offset = end
         response_schema, response_validator = normalize_response_format(
             body.get("response_format")
         )
@@ -681,6 +697,7 @@ class Frontend:
             messages,
             tools,
             tool_policy,
+            head_count,
             reasoning_effort,
             response_schema,
             response_validator,
@@ -690,7 +707,7 @@ class Frontend:
             body.get("reasoning_effort"),
             template_effort
             if template_effort in REASONING_EFFORTS
-            and self.chat_templates.select(tools).reads_effort
+            and self.chat_templates.select(head_tools).reads_effort
             else None,
         )
 
@@ -719,14 +736,25 @@ class Frontend:
     def _render_prompt(
         self, prompt, deadline, *, check_context=True, add_generation_prompt=True
     ):
-        chat_template = self.chat_templates.select(prompt.tools)
+        has_declarations = prompt.tools and prompt.head_tool_count < len(prompt.tools)
+        head_tools = (
+            prompt.tools[: prompt.head_tool_count] if has_declarations else prompt.tools
+        )
+        chat_template = self.chat_templates.select(head_tools)
+        source = chat_template.source
+        if has_declarations:
+            source = chat_template.message_tools_source
+            if source is None:
+                raise APIError(
+                    400, "this chat template does not support system message tools"
+                )
         if not chat_template.accepts(prompt.messages):
             raise APIError(400, LATER_SYSTEM_UNSUPPORTED)
         options = {
             **template_options(
                 reasoning_effort=prompt.reasoning_effort,
                 preserve_thinking=prompt.preserve_thinking,
-                tools=prompt.tools,
+                tools=head_tools,
                 add_generation_prompt=add_generation_prompt,
                 enable_thinking=prompt.enable_thinking,
             ),
@@ -738,9 +766,7 @@ class Frontend:
             )
         remaining_request_time(deadline)
         try:
-            rendered = self._apply_chat_template(
-                prompt.messages, chat_template.source, options
-            )
+            rendered = self._apply_chat_template(prompt.messages, source, options)
             with self.latencies.measure("tokenization"):
                 tokens = self.prompt_tokenizer.encode(rendered)
         except APIError:
@@ -788,7 +814,7 @@ class Frontend:
                 self.chat_format,
             )
         head_tokens = _head_tokens(
-            prompt.messages, prompt.tools, tokens, self.turn_openings
+            prompt.messages, head_tools, tokens, self.turn_openings
         )
         return RenderedPrompt(
             rendered,

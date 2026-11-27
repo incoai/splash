@@ -205,6 +205,7 @@ class ChatTemplate:
     # can set over Splash's own: one that reads only enable_thinking, as
     # Qwen3.6's does, renders without it.
     reads_effort: bool
+    message_tools_source: str | None
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -382,7 +383,78 @@ def _prepare(render, encode, source, opens_own_message):
         *_reasoning(render, source),
         _thinking_end(render, source),
         _reads_effort(source),
+        _message_tools_source(render, source),
     )
+
+
+def _message_tools_source(render, source):
+    """Reuse Inkling's own declaration block inside its message loop. Only
+    requests with message tools use this source. A canary must move the
+    entire declaration without changing a byte of the surrounding turns."""
+    header = "<|message_system|>tool_declare<|content_xml|>"
+    if header not in source:
+        return None
+    source = source.replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        tree = _ENVIRONMENT.parse(source)
+    except TemplateSyntaxError:
+        return None
+    guards = [
+        n
+        for n in tree.body
+        if isinstance(n, nodes.If) and n.test == nodes.Name("tools", "load")
+    ]
+    loops = [(loop, var) for loop, var in _message_loops(tree) if loop in tree.body]
+    if len(guards) != 1 or len(loops) != 1:
+        return None
+    loop, variable = loops[0]
+    guard = guards[0]
+    spans = _tag_spans(source)
+    start = spans[guard.lineno][0]
+    _, loop_body = spans[loop.lineno]
+    depth = 0
+    for left, right in spans[guard.lineno : loop.lineno]:
+        tag = source[left:right]
+        if re.match(r"\{%[-+]?\s*if\b", tag):
+            depth += 1
+        elif re.match(r"\{%[-+]?\s*endif\b", tag):
+            depth -= 1
+            if not depth:
+                break
+    else:
+        return None
+    block = source[start:right]
+    # Scoped tools let the template serialize and quote the same schema in
+    # either position. A declaration with text keeps its ordinary system turn.
+    insert = (
+        f"{{%- if {variable}.role == 'system' and {variable}.tools -%}}"
+        f"{{%- with tools={variable}.tools -%}}{block}{{%- endwith -%}}"
+        f"{{%- if not {variable}.content -%}}{{%- continue -%}}{{%- endif -%}}{{%- endif -%}}"
+    )
+    candidate = source[:loop_body] + insert + source[loop_body:]
+    history = [_ASK, _ANSWER]
+    options = {"add_generation_prompt": False}
+    try:
+        plain = render(source, history + [_NEXT], options)
+        before = render(source, history, options)
+        headed = render(source, history + [_NEXT], {**options, "tools": _TOOLS})
+        late = render(
+            candidate,
+            history + [{"role": "system", "content": "", "tools": _TOOLS}, _NEXT],
+            options,
+        )
+    except Exception:
+        return None
+    declaration = headed.removesuffix(plain)
+    if not (
+        plain.startswith(before)
+        and headed.endswith(plain)
+        and declaration.startswith(header)
+        and declaration.endswith("<|end_message|>")
+        and _TOOLS[0]["function"]["name"] in declaration
+    ):
+        return None
+    return candidate if late == before + declaration + plain[len(before) :] else None
 
 
 def _reads_effort(source):

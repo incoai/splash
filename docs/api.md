@@ -74,6 +74,14 @@ Completions, text completions, Responses and Messages share these fields:
   which it may take from one cache the runtime keeps for every request, keyed
   by the image and not the salt.
 
+With Inkling 2, a system message can introduce functions during a conversation:
+`{"role":"system","tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]}`.
+Append this message after the earlier turns and before the next user message.
+Splash renders the declaration there and keeps the earlier prompt tokens reusable.
+Keep the original top-level `tools` and prior messages when sending the history
+again. Tools from both locations share the same name checks and `tool_choice`
+policy. A template without a supported in-place tool declaration returns HTTP 400.
+
 Chat Completions also takes `messages`, `tools`, `tool_choice` and
 `parallel_tool_calls` ([tool calls](#tool-calls)), `response_format`
 ([structured output](#structured-output)), `reasoning_effort` and

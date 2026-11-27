@@ -128,7 +128,14 @@ def normalize_messages(messages, *, vision):
         role = message.get("role")
         if role in ("system", "developer"):
             text = _text_content(message.get("content"))
-            if len(normalized) == 1 and normalized[0]["role"] == "system":
+            declarations = message.get("tools", [])
+            if not isinstance(declarations, list):
+                raise APIError(400, "system message tools must be an array")
+            if declarations:
+                normalized.append(
+                    {"role": "system", "content": text, "tools": declarations}
+                )
+            elif len(normalized) == 1 and normalized[0]["role"] == "system":
                 # Responses instructions and developer items, or an Anthropic
                 # system and a system message, lead as one system message.
                 normalized[0]["content"] = "\n\n".join(
