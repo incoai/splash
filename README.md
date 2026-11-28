@@ -82,7 +82,9 @@ up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
 not supported: the installer refuses a GGUF whose projections and experts are
 all BF16, F16 or F32.
 [Prism ML Ternary Bonsai 2](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
-is also supported in PQ2_0 (7.2 GB), including vision. Inkling-2-Mini also loads
+and [2.5](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF) are also
+supported in PQ2_0 (7.2 GB), including vision; 2.5's PQ2_0 `-mtp` file loads
+with its draft head unused. Inkling-2-Mini also loads
 from its release, `thinkingmachines/Inkling-2-Mini`. Pass
 `OWNER/REPO:VARIANT` to `--model`, as in the quick start. MLX targets can be
 affine 2–8-bit, including mixed precision, mxfp4, mxfp8 or nvfp4. NVIDIA's and
