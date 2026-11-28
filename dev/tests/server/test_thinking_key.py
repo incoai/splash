@@ -42,6 +42,12 @@ class ThinkingKeyTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(path.stat().st_uid, os.getuid())
 
+    def test_splash_data_dir_overrides_default_thinking_key_path(self):
+        isolated = self.home / "isolated-data"
+        with mock.patch.dict(os.environ, {"SPLASH_DATA_DIR": str(isolated)}):
+            key = load_thinking_key()
+        self.assertEqual((isolated / "thinking.key").read_bytes(), key)
+
     def test_concurrent_first_start_publishes_one_complete_key(self):
         barrier = threading.Barrier(12)
 

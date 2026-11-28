@@ -79,6 +79,7 @@ class CompletionTests(unittest.TestCase):
         }
         self.env.pop("BASH_ENV", None)
         self.env.pop("ENV", None)
+        self.env.pop("SPLASH_DATA_DIR", None)
         self.addCleanup(self.assert_no_runtime)
 
     def assert_no_runtime(self):
@@ -236,6 +237,24 @@ class CompletionTests(unittest.TestCase):
                 self.assertEqual(self.run_helper(directory, "community/l"), [LOCAL[1]])
                 self.assertEqual(self.run_helper(directory, "community/*"), [])
                 self.assertEqual(self.run_helper(directory, "["), [])
+
+    def test_model_helper_respects_splash_data_dir(self):
+        for release in (False, True):
+            with self.subTest(release=release):
+                _, directory = self.layout(f"override-{release}", release=release)
+                model_root = (
+                    self.home / f"custom-{release}/models/community/override-only"
+                )
+                model_root.mkdir(parents=True)
+                (model_root / "model.json").write_text("{}")
+                self.env["SPLASH_DATA_DIR"] = f"~/custom-{release}"
+                try:
+                    self.assertEqual(
+                        self.run_helper(directory, "community/"),
+                        ["community/override-only"],
+                    )
+                finally:
+                    self.env.pop("SPLASH_DATA_DIR", None)
 
     def test_actual_bash_completion(self):
         _, directory = self.layout()
