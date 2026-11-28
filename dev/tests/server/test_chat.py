@@ -1,9 +1,12 @@
+import re
 import shutil
 import subprocess
 import unittest
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit
 
 from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase
+from server import server
 
 NODE = shutil.which("node")
 CHAT = Path(__file__).resolve().parents[3] / "server" / "chat.html"
@@ -114,7 +117,7 @@ function createChat(storage = new Map(), writable = true, models = null,
     atob: value => Buffer.from(value, 'base64').toString('binary'),
     crypto,
     fetch(url, options) {
-      if (url === '/v1/models') {
+      if (url === 'v1/models') {
         modelRequests.push(options.headers);
         // models answers from the request headers; without it the server is offline.
         return models ? Promise.resolve(models(options.headers))
@@ -640,7 +643,7 @@ for (const [name, overrides, shouldSend] of [
   assert.equal(prevented, shouldSend, name);
   assert.equal(elements.input.value, shouldSend ? '' : 'hello', name);
   if (shouldSend) {
-    assert.equal(requests[0].url, '/v1/chat/completions');
+    assert.equal(requests[0].url, 'v1/chat/completions');
     assert.deepEqual(requests[0].body.messages, [{role: 'user', content: 'hello'}]);
   }
 }
@@ -1143,12 +1146,30 @@ assert.deepEqual(chat.requests[0].body.messages, [{role:'user', content:'new pro
 
 
 class ChatPageTest(HarnessTestCase):
+    def test_a_proxy_can_serve_the_page_under_a_path(self):
+        # A proxy that serves the server under a path strips the path from what
+        # it forwards, so every URL the page names must resolve under that path
+        # to a route the server serves.
+        harness = self.harness(FakeRuntime())
+        page = harness.request("GET", "/")[2].decode()
+        calls = re.findall(r"fetch\((['\"`])(.*?)\1", page)
+        # Every request the script makes names its URL as a literal.
+        self.assertEqual(len(calls), page.count("fetch("))
+        urls = re.findall(r'(?:src|href)="([^"]+)"', page) + [url for _, url in calls]
+        self.assertTrue(calls and len(urls) > len(calls))
+        for url in urls:
+            with self.subTest(url=url):
+                path = urlsplit(urljoin("https://proxy.example/splash/", url)).path
+                self.assertTrue(path.startswith("/splash/"))
+                route, _ = server.find_route(path.removeprefix("/splash"))
+                self.assertIsNotNone(route)
+
     def test_root_serves_the_chat_page(self):
         harness = self.harness(FakeRuntime())
         status, content_type, payload = harness.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertEqual(content_type, "text/html; charset=utf-8")
-        self.assertIn(b"/v1/chat/completions", payload)
+        self.assertIn(b"v1/chat/completions", payload)
         for effort in (b"", b"none"):
             self.assertIn(b'value="' + effort + b'"', payload)
         for label in (b"Auto", b"Off"):
