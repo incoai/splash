@@ -1,0 +1,6 @@
+name: splash-patch-feedback
+version: "0.1.0"
+description: "Opt-in visible-test feedback attached to a successful Hermes patch."
+provides_hooks:
+  - transform_tool_result
+  - on_session_end
