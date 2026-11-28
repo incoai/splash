@@ -3,9 +3,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Splash</title>
-<link rel="icon" href="/favicon.ico" type="image/svg+xml">
-<link rel="stylesheet" href="/chat-assets/github-11.12.0.min.css">
-<link rel="stylesheet" href="/chat-assets/github-dark-11.12.0.min.css" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="favicon.ico" type="image/svg+xml">
+<link rel="stylesheet" href="chat-assets/github-11.12.0.min.css">
+<link rel="stylesheet" href="chat-assets/github-dark-11.12.0.min.css" media="(prefers-color-scheme: dark)">
 <style>
   * { box-sizing: border-box }
   :root {
@@ -178,7 +178,7 @@
 
 <aside id="sidebar">
   <div class="brand">
-    <img src="/favicon.ico" alt="">
+    <img src="favicon.ico" alt="">
     Splash
     <button id="sidebar-close" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-controls="sidebar" aria-expanded="true">
       <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18m7-12-3 3 3 3"/></svg>
@@ -226,9 +226,9 @@
   </div>
 </form>
 
-<script src="/chat-assets/markdown-it-15.0.2.min.js"></script>
-<script src="/chat-assets/highlight-11.12.0.min.js"></script>
-<script src="/chat-assets/markdown-links.js"></script>
+<script src="chat-assets/markdown-it-15.0.2.min.js"></script>
+<script src="chat-assets/highlight-11.12.0.min.js"></script>
+<script src="chat-assets/markdown-links.js"></script>
 <script>
   const $ = selector => document.querySelector(selector);
   const chat = $('#chat');
@@ -314,7 +314,7 @@
   // text alone, what a request may carry, and the efforts it tells apart.
   async function loadModel() {
     try {
-      const response = await fetch('/v1/models', {headers: authorization()});
+      const response = await fetch('v1/models', {headers: authorization()});
       askForKeyIfUnauthorized(response);
       if (!response.ok) return;
       const model = (await response.json()).data?.[0];
@@ -929,7 +929,7 @@
     controller = new AbortController();
     setRunning(true);
     try {
-      const response = await fetch('/v1/chat/completions', {
+      const response = await fetch('v1/chat/completions', {
         method: 'POST',
         headers: {'Content-Type': 'application/json', ...authorization()},
         body: JSON.stringify({messages: requestMessages(), stream: true, stream_options: {include_usage: true}, ...(effort.value ? {reasoning_effort: effort.value} : {})}),

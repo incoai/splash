@@ -416,7 +416,7 @@ class ServerAccessTests(unittest.TestCase):
         self.assertNotIn(b"test-server-key", html)
         # The page's icon, which browsers fetch without the key.
         self.assertIn(
-            b'<link rel="icon" href="/favicon.ico" type="image/svg+xml">', html
+            b'<link rel="icon" href="favicon.ico" type="image/svg+xml">', html
         )
         status, content_type, icon = protected.request("GET", "/favicon.ico")
         self.assertEqual((status, content_type), (200, "image/svg+xml"))

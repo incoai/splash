@@ -251,7 +251,10 @@ Connect to the server's LAN IP. `--host` selects the IPv4 bind address;
 listener or allowlist client IPs. A request that names the server any other way
 gets 403 with the `--allowed-host` flag that would accept it; the check keeps out
 web pages that rebind a DNS name to this address. The chat page works over plain
-HTTP from another machine too.
+HTTP from another machine too, and behind a proxy that serves it under a path,
+such as `https://example.com/splash/`, and strips the path from what it
+forwards: the page names its files and the API relative to its own address, so
+it is opened at the path with its trailing slash.
 
 `--host unix:PATH` listens on a UNIX socket at `PATH` instead of a TCP port, so
 that the server listens on no IP address and file permissions decide who
