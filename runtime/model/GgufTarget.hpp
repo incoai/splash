@@ -48,10 +48,12 @@ public:
   // (table.cacheBytes), the rows of a table the family's GGUF holds stream
   // through it (streamTable()) instead of loading (table()). With expert
   // memory (experts.memoryBytes), a MoE target's routed experts stream
-  // (streamedExperts()) instead of loading with their layers.
+  // (streamedExperts()) instead of loading with their layers. 16-bit
+  // projections load as `weights` says (gguf::float16Planes).
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                    const std::vector<std::filesystem::path> &paths, const GgufTargetPlan &plan,
-                   SparseRowStoreOptions table = {}, ExpertStoreOptions experts = {});
+                   SparseRowStoreOptions table = {}, ExpertStoreOptions experts = {},
+                   gguf::Float16Weights weights = gguf::Float16Weights::Published);
 
   // The streamed table, its store reading the open file the metadata was
   // parsed from; none when the table loads.
@@ -71,7 +73,8 @@ private:
     std::vector<gguf::Image> images;
   };
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images, std::shared_ptr<Planned> planned,
-                   const GgufTargetPlan &plan, SparseRowStoreOptions table, ExpertStoreOptions experts);
+                   const GgufTargetPlan &plan, SparseRowStoreOptions table, ExpertStoreOptions experts,
+                   gguf::Float16Weights weights);
 
   std::shared_ptr<Planned> planned_;
 };

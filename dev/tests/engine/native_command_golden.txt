@@ -30,7 +30,7 @@ idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
 recalibrate_ane | --recalibrate-ane | auto auto --ane-calibration again
 activations_bf16 | --activations bf16 | auto auto --activations bf16
-activations_auto | --activations auto | auto auto
+activations_auto | --activations auto | auto auto --activations auto
 verify_rows_all | --verify-rows all | auto auto --verify-rows all
 verify_rows_auto | --verify-rows auto | auto auto
 max_concurrent_requests | --max-concurrent-requests 8 | auto auto --max-concurrent-requests 8
@@ -39,6 +39,8 @@ kv_format_default | --kv-format int8 | auto auto
 state_format_default | --state-format fp32 | auto auto
 cached_states_exact | --cached-states exact | auto auto --cached-states exact
 cached_states_default | --cached-states int8 | auto auto
+weights_auto | --weights auto | auto auto --weights auto
+weights_default | --weights original | auto auto
 relaunch |  | auto auto --relaunch-context 61433
 relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368 --relaunch-context 61433
 yarn | --max-context 1M | 1000000 auto

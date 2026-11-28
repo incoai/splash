@@ -32,7 +32,7 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
   RuntimeBootstrapReport report;
   report.resourceStage = error.stage();
   report.resourceFailure = error.failure();
-  report.message = error.what();
+  report.message = error.commandOutOfMemory() ? startMemoryRefusal(error.what()) : error.what();
   report.budgetDescription = error.budgetDescription();
   report.shortfall = error.shortfall();
   report.commandFailed = error.commandFailed();
@@ -43,7 +43,7 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
 [[noreturn]] void fail(RuntimeBootstrapReport report,
                        RuntimeBootstrapStage stage, std::string message) {
   report.stage = stage;
-  report.message = std::move(message);
+  report.message = report.commandOutOfMemory ? startMemoryRefusal(message) : std::move(message);
   throw RuntimeBootstrapError(std::move(report));
 }
 
@@ -230,6 +230,7 @@ std::string ServingRuntime::statusJson() {
                       .loopMaxTickMilliseconds = loopMaxTick_(),
                       .streamedTable = resources_->streamedTableStats(),
                       .streamedExperts = resources_->streamedExpertStats()};
+  sample.cacheDamage = model::slotFileDamage();
   if (std::optional<KvSpillSnapshot> spill = resources_->kvSpillSnapshot())
     sample.kvSpill = StatusSample::KvSpill{.cache = std::move(*spill),
                                            .blockCache = resources_->kvBlockCacheStats(),
@@ -265,6 +266,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
                  auto &&operation, bool optional = false) {
     model::WarmupStepResult result;
+    const std::string name(runtimeBootstrapStageName(stage));
     try {
       result = operation();
     } catch (const metal::MetalAllocationError &error) {
@@ -274,27 +276,18 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
         return model::WarmupStepResult{};
       }
       report.resourceFailure = resourceAllocationFailure(error.failure());
-      fail(report, stage,
-           std::string(runtimeBootstrapStageName(stage)) +
-               " threw: " + error.what());
+      fail(report, stage, name + " threw: " + error.what());
     } catch (const metal::MetalBackendError &error) {
       report.commandFailed = true;
       report.commandOutOfMemory = error.outOfMemory();
-      fail(report, stage,
-           std::string(runtimeBootstrapStageName(stage)) +
-               " threw: " + error.what());
+      fail(report, stage, name + " threw: " + error.what());
     } catch (const std::exception &error) {
-      fail(report, stage,
-           std::string(runtimeBootstrapStageName(stage)) +
-               " threw: " + error.what());
+      fail(report, stage, name + " threw: " + error.what());
     } catch (...) {
-      fail(report, stage,
-           std::string(runtimeBootstrapStageName(stage)) +
-               " threw an unknown exception");
+      fail(report, stage, name + " threw an unknown exception");
     }
     if (!(result.wallSeconds > 0.0) || !std::isfinite(result.wallSeconds)) {
-      std::string message = std::string(runtimeBootstrapStageName(stage)) +
-                            " did not complete a real measured path";
+      std::string message = name + " did not complete a real measured path";
       if (!result.detail.empty())
         message += ": " + result.detail;
       fail(report, stage, std::move(message));
@@ -330,19 +323,32 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     const uint32_t affordableWidth = static_cast<uint32_t>(std::min<uint64_t>(
         budget.maximumBatchWidth,
         (budget.dynamicBudgetBytes -
-         model::ExecutionLimits::runwayPages(budget.kvExtentPages, budget.maximumBatchWidth) * budget.kvPageBytes) /
+         uint64_t{kvPool.runwayPages()} * budget.kvPageBytes) /
             budget.laneStateBytes));
     for (uint32_t width = 1; width <= budget.maximumBatchWidth; ++width) {
+      WarmupStepStatus &status = report.warmup.decodeBatches[width - 1];
       if (width > affordableWidth ||
           (width > 1 && report.warmup.decodeBatches[width - 2] ==
                             WarmupStepStatus::MemoryLimited)) {
-        report.warmup.decodeBatches[width - 1] = WarmupStepStatus::MemoryLimited;
+        status = WarmupStepStatus::MemoryLimited;
         ended();
-        continue;
+      } else {
+        run(RuntimeBootstrapStage::DecodeWarmup, status,
+            [&] { return modelRuntime.warmupDecodeBatch(width); }, width > 1);
       }
-      run(RuntimeBootstrapStage::DecodeWarmup,
-          report.warmup.decodeBatches[width - 1],
-          [&] { return modelRuntime.warmupDecodeBatch(width); }, width > 1);
+      // The engine still admits a width memory kept from its warmup, whose
+      // first cycle would create its kernels while its requests waited (a
+      // cold 48- or 64-row tile took 0.9-1.6 s on a 24 GB M6): its cycles'
+      // pipelines are created here, with no step run and no lane of its own
+      // (RuntimeModel::prepareDecodeBatch). Where that fails the width
+      // creates them as it serves, as it did without it.
+      if (status != WarmupStepStatus::MemoryLimited)
+        continue;
+      try {
+        static_cast<void>(modelRuntime.prepareDecodeBatch(width));
+      } catch (const std::exception &error) {
+        logWarning("The decode pipelines of ", width, " lanes were not created at the start: ", error.what());
+      }
     }
     run(RuntimeBootstrapStage::CompositeStateRestore,
         report.warmup.compositeStateRestore,
@@ -380,7 +386,8 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     run(RuntimeBootstrapStage::AneFfnSetUp, status, [&] {
       const auto started = AwakeClock::now();
       if (const uint32_t rows = setUp(mostRowsMilliseconds)) {
-        const KvPool::RunwayHold runway(kvPool, (rows + kv::kPageTokens - 1) / kv::kPageTokens);
+        const KvPool::RunwayHold runway(kvPool, (rows + kv::kPageTokens - 1) / kv::kPageTokens *
+                                                    memoryPlan.model().targetKvLayout.blockPages());
         return modelRuntime.warmupPrefill(rows);
       }
       // A set-up that left the GPU alone took at least the clock's tick (1 ns), even where the clock read none.
@@ -453,6 +460,12 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
   config.nativeLoop.engine.maxImagePatches =
       config.resources.model.hasVision() ? config.resources.maximumImagePatches
                                          : 0;
+  // An image start whose vision memory and prompt cannot fit together is
+  // refused before it takes any (Engine::imagesFit).
+  if (config.nativeLoop.engine.maxImagePatches)
+    config.nativeLoop.engine.residentTokensBeside = [plan = resources->memoryPlan()](uint64_t bytes) {
+      return plan.residentTokensBeside(bytes);
+    };
 
   std::unique_ptr<model::RuntimeModel> modelRuntime;
   try {
@@ -566,6 +579,18 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
         return report;
       },
       aneFfn);
+  // The precision the runtime runs at, once warmup has planned every class of
+  // chunk and step: how the target's 16-bit projections loaded, then its KV
+  // cache, cached states and activations.
+  const DeviceCapabilities &device = resources->backend().capabilities();
+  logLine("Runtime precision on GPU family ", device.appleGpuFamily, " with ", device.gpuCoreCount, " cores: weights ",
+          config.resources.weights == model::gguf::Float16Weights::Q8_0 ? "auto, 16-bit projections as Q8_0"
+                                                                        : "original, as their files store them",
+          " (--weights), KV cache ", kv::formatName(resources->cacheIdentity().kvLayout.format),
+          " (--kv-format), cached states ",
+          resources->cacheIdentity().cachedStates, " (--cached-states), activations ",
+          modelRuntime->activationsDescription(config.nativeLoop.engine.maxContext), " (--activations)",
+          resources->aneFfnMinimumRows() ? "; the Neural Engine FFN split multiplies its share in int8" : "", ".");
   // The pools start at their floors and grow before Ready into the room the
   // host's rule for growth leaves (MemoryGovernor::growToTargets), which
   // serving's control passes keep to, at macOS's pressure now: a warning that

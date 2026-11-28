@@ -1,6 +1,7 @@
 import copy
 import json
 from itertools import product
+from unittest import mock
 
 from llguidance import LLMatcher
 
@@ -131,7 +132,8 @@ class SchemaFallbackTests(HarnessTestCase):
             {"id": "ORD-1234"},
         )
         # An unanchored pattern keeps its search semantics; look-around cannot
-        # compile and a response format checks it on the complete output.
+        # compile, so a grammar leaves it out and a response format holding
+        # it is refused.
         schema = {
             "type": "object",
             "properties": {
@@ -158,15 +160,167 @@ class SchemaFallbackTests(HarnessTestCase):
                     self.assertTrue(matcher.consume_tokens(tokens))
                     accepted = matcher.is_accepting()
                 self.assertEqual(accepted, valid)
-        _, validator = tool_schema.normalize_response_format(
-            {"type": "json_schema", "json_schema": {"schema": schema}}
-        )
         with self.assertRaises(api.APIError) as caught:
-            model_output.validate_response_content(
-                json.dumps({"order": "ORD-1234", "code": "ABC", "path": "../x"}),
-                validator,
+            tool_schema.normalize_response_format(
+                {
+                    "type": "json_schema",
+                    "json_schema": {"schema": schema, "strict": True},
+                }
             )
-        self.assertEqual(caught.exception.code, "invalid_model_output")
+        self.assertEqual(caught.exception.status, 400)
+        self.assertIn("pattern at #/properties/path", caught.exception.message)
+
+    def test_every_keyword_the_grammar_drops_refuses_a_strict_response_format(self):
+        # Each is refused, under strict, naming the keyword and where it is; a
+        # value that asks nothing, and a keyword the schema's dialect does
+        # not assert, are accepted, as are the keywords the grammar enforces.
+        draft7 = "http://json-schema.org/draft-07/schema#"
+        draft3 = "http://json-schema.org/draft-03/schema#"
+        refused = (
+            ("not", {"not": {"type": "string"}}, None),
+            ("if", {"if": {"type": "string"}, "then": {"maxLength": 2}}, None),
+            (
+                "dependentSchemas",
+                {"dependentSchemas": {"a": {"required": ["b"]}}},
+                None,
+            ),
+            ("dependentRequired", {"dependentRequired": {"a": ["b"]}}, None),
+            ("dependencies", {"dependencies": {"a": ["b"]}}, draft7),
+            ("propertyNames", {"propertyNames": {"pattern": "^a"}}, None),
+            ("unevaluatedProperties", {"unevaluatedProperties": False}, None),
+            ("unevaluatedItems", {"unevaluatedItems": False}, None),
+            ("contains", {"contains": {"type": "string"}, "minContains": 2}, None),
+            ("uniqueItems", {"uniqueItems": True}, None),
+            ("$dynamicRef", {"$dynamicRef": "#"}, None),
+            ("extends", {"extends": {"type": "string"}}, draft3),
+            ("disallow", {"disallow": "string"}, draft3),
+            ("divisibleBy", {"divisibleBy": 2}, draft3),
+        )
+        for keyword, value, dialect in refused:
+            schema = {"type": "object", "properties": {"a": value}}
+            if dialect:
+                schema["$schema"] = dialect
+            with self.subTest(keyword=keyword):
+                with self.assertRaises(api.APIError) as caught:
+                    tool_schema.normalize_response_format(
+                        {
+                            "type": "json_schema",
+                            "json_schema": {"schema": schema, "strict": True},
+                        }
+                    )
+                self.assertEqual(
+                    (caught.exception.status, caught.exception.message),
+                    (
+                        400,
+                        f"unsupported output schema: {keyword} at #/properties/a "
+                        "is not enforced by the output grammar",
+                    ),
+                )
+                # Where llguidance names what it drops, it names this one; the
+                # server drops propertyNames before it, and llguidance ignores
+                # draft 3's keywords without a word.
+                warnings = LLMatcher.validate_grammar_with_warnings(
+                    tool_schema.json_grammar(schema, False, chat_format=QWEN)
+                )[1]
+                if dialect != draft3 and keyword != "propertyNames":
+                    self.assertIn(keyword, " ".join(warnings))
+        for keyword, value in (
+            ("maxItems", {"type": "array", "maxItems": 257}),
+            ("minItems", {"type": "array", "minItems": 1000}),
+            ("multipleOf", {"type": "integer", "multipleOf": 1000}),
+            ("oneOf", {"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+        ):
+            schema = {"type": "object", "properties": {"a": value}}
+            with (
+                self.subTest(keyword=keyword),
+                self.assertRaises(api.APIError) as caught,
+            ):
+                tool_schema.normalize_response_format(
+                    {
+                        "type": "json_schema",
+                        "json_schema": {"schema": schema, "strict": True},
+                    }
+                )
+            self.assertIn(f"{keyword} ", caught.exception.message)
+            self.assertIn("at #/properties/a ", caught.exception.message)
+        for value in (
+            {"uniqueItems": False},
+            {"propertyNames": {}},
+            {"unevaluatedProperties": True},
+            {"if": {"type": "string"}},
+            {"dependencies": {"a": ["b"]}},
+            {"minProperties": 1, "maxProperties": 3},
+            {"type": "array", "maxItems": 256, "minItems": 100},
+            {"type": "number", "multipleOf": 0.5, "exclusiveMinimum": 0},
+            {"type": "string", "pattern": "^[a-z]+$", "format": "date-time"},
+            {"properties": {"not": {"type": "string"}}},
+        ):
+            schema = {"type": "object", "properties": {"a": value}}
+            with self.subTest(accepted=value):
+                _, validator = tool_schema.normalize_response_format(
+                    {
+                        "type": "json_schema",
+                        "json_schema": {"schema": schema, "strict": True},
+                    }
+                )
+                self.assertFalse(hasattr(validator, "unenforced"))
+
+    def test_a_schema_not_asked_strict_is_best_effort(self):
+        # OpenAI's default, strict false: the grammar enforces what it can,
+        # and an answer that breaks only a keyword it did not enforce is
+        # returned; one that breaks an enforced keyword is still invalid.
+        schema = {
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "uniqueItems": True,
+                },
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "maxItems": 1000,
+                },
+                "pick": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
+                "code": {"type": "string", "pattern": "^(?!x)[a-z]+$"},
+                "n": {"type": "integer", "minimum": 0},
+            },
+            "required": ["tags", "n"],
+            "not": {"required": ["forbidden"]},
+        }
+        for strict in (None, False):
+            wrapper = {"schema": schema} | (
+                {} if strict is None else {"strict": strict}
+            )
+            _, validator = tool_schema.normalize_response_format(
+                {"type": "json_schema", "json_schema": wrapper}
+            )
+            with self.subTest(strict=strict):
+                self.assertEqual(
+                    sorted(keyword for keyword, _ in validator.unenforced),
+                    ["maxItems", "not", "oneOf", "pattern", "uniqueItems"],
+                )
+                model_output.validate_response_content(
+                    json.dumps(
+                        {
+                            "tags": ["a", "a"],
+                            "ids": list(range(1001)),
+                            "pick": 1,
+                            "code": "xy",
+                            "n": 1,
+                            "forbidden": True,
+                        }
+                    ),
+                    validator,
+                )
+                with self.assertRaises(api.APIError) as caught:
+                    model_output.validate_response_content(
+                        json.dumps({"tags": ["a"], "n": -1}), validator
+                    )
+                self.assertEqual(caught.exception.code, "invalid_model_output")
+        # The schema itself is left as sent: its grammar is built from it.
+        self.assertIn("uniqueItems", json.dumps(schema))
 
     def test_reference_with_array_constraint_keeps_json_type(self):
         schema = {
@@ -177,10 +331,10 @@ class SchemaFallbackTests(HarnessTestCase):
         }
         self.verify(schema, '["red"]', ['["red","blue"]', "[7]", '"red"'], ["red"])
 
-    def test_unsupported_generation_constraints_remain_enforced_on_answers(self):
+    def test_unsupported_generation_constraints_are_refused_for_answers(self):
         # A grammar leaves out what it cannot compile. A response format
-        # checks it on the complete answer; a strict tool's arguments go
-        # without it.
+        # holding it is refused before generation, which would otherwise fail
+        # after the whole answer; a strict tool's arguments go without it.
         schema = {
             "type": "object",
             "properties": {
@@ -194,8 +348,20 @@ class SchemaFallbackTests(HarnessTestCase):
         }
         original = copy.deepcopy(schema)
         policy = self.policy(schema)
-        _, validator = tool_schema.normalize_response_format(
-            {"type": "json_schema", "json_schema": {"schema": schema}}
+        with self.assertRaises(api.APIError) as caught:
+            tool_schema.normalize_response_format(
+                {
+                    "type": "json_schema",
+                    "json_schema": {"schema": schema, "strict": True},
+                }
+            )
+        self.assertEqual(
+            (caught.exception.status, caught.exception.message),
+            (
+                400,
+                "unsupported output schema: uniqueItems at #/properties/value "
+                "is not enforced by the output grammar",
+            ),
         )
         optional = tool_schema.normalize_tools(
             [{"type": "function", "function": {"name": "test", "parameters": schema}}],
@@ -221,10 +387,6 @@ class SchemaFallbackTests(HarnessTestCase):
                 matcher = LLMatcher(self.guidance, grammar)
                 self.assertTrue(matcher.consume_tokens(self.tokenizer.encode(text).ids))
                 self.assertTrue(matcher.is_accepting())
-        model_output.validate_response_content('{"value":["red","blue"]}', validator)
-        with self.assertRaises(api.APIError) as caught:
-            model_output.validate_response_content('{"value":["red","red"]}', validator)
-        self.assertEqual(caught.exception.code, "invalid_model_output")
         projector = model_output.StreamingToolCallProjector(
             policy, "owned", syntax=QWEN_XML
         )
@@ -302,9 +464,12 @@ class SchemaFallbackTests(HarnessTestCase):
                 )
                 self.assertEqual(accepted, bound > limit)
 
-    def test_deferred_assertions_check_answers_but_not_calls(self):
-        # A response format checks what its grammar left out on the complete
-        # answer; a tool's arguments go unchecked.
+    def test_unenforced_assertions_refuse_strict_answers_only(self):
+        # A strict response format whose grammar would leave a keyword out
+        # is refused before generation, in each dialect's error shape (Chat
+        # and Responses when asked strict, Messages always); one not asked
+        # strict is best effort, its answer returned as the model wrote it,
+        # counted and logged; a tool's arguments go unchecked.
         guidance = self.guidance
 
         class CompilingFactory(FakeConstraintFactory):
@@ -314,12 +479,15 @@ class SchemaFallbackTests(HarnessTestCase):
                     raise AssertionError(error)
                 return super().create(grammar)
 
-        for path, tool, stream in product(
+        for path, tool, stream, strict in product(
             ("/v1/chat/completions", "/v1/responses", "/v1/messages"),
             (False, True),
             (False, True),
+            (False, True),
         ):
-            with self.subTest(path=path, tool=tool, stream=stream):
+            if path == "/v1/messages" and not strict:
+                continue
+            with self.subTest(path=path, tool=tool, stream=stream, strict=strict):
                 field = "city" if tool else "x"
                 schema = {
                     "type": "object",
@@ -354,6 +522,7 @@ class SchemaFallbackTests(HarnessTestCase):
                                 "type": "json_schema",
                                 "name": "answer",
                                 "schema": schema,
+                                "strict": strict,
                             }
                         }
                 else:
@@ -377,25 +546,44 @@ class SchemaFallbackTests(HarnessTestCase):
                         else:
                             body["response_format"] = {
                                 "type": "json_schema",
-                                "json_schema": {"schema": schema},
+                                "json_schema": {"schema": schema, "strict": strict},
                             }
+                runtime = FakeRuntime(Plan([[5 if tool else 10]]))
                 harness = Harness(
-                    FakeRuntime(Plan([[5 if tool else 10]])),
+                    runtime,
                     constraint_factory=CompilingFactory(),
                     tokenizer=tokenizer,
                 )
                 try:
-                    status, _, payload = harness.request("POST", path, body)
+                    with mock.patch.object(api, "print_status") as printed:
+                        status, _, payload = harness.request("POST", path, body)
                     if tool:
                         self.assertEqual(status, 200, payload)
                         self.assertNotIn(b"invalid", payload)
                         self.assertIn(b"Paris", payload)
                         continue
-                    self.assertEqual(status, 200 if stream else 500, payload)
-                    self.assertIn(b"invalid", payload)
-                    self.assertNotIn(b'"type":"message_stop"', payload)
-                    self.assertNotIn(b'"type":"response.completed"', payload)
-                    self.assertNotIn(b'"finish_reason":"tool_calls"', payload)
+                    if not strict:
+                        self.assertEqual(status, 200, payload)
+                        self.assertIn(b"Paris", payload)
+                        self.assertNotIn(b"invalid", payload)
+                        self.assertIn(
+                            "Schema keywords not enforced · request 1 · uniqueItems",
+                            [args[0] for args, _ in printed.call_args_list],
+                        )
+                        self.assertEqual(
+                            harness.app.status()["structured_output"],
+                            {"keywords_not_enforced": {"uniqueItems": 1}},
+                        )
+                        continue
+                    self.assertEqual(status, 400, payload)
+                    error = json.loads(payload)["error"]
+                    self.assertEqual(
+                        error["message"],
+                        "unsupported output schema: uniqueItems at #/properties/x "
+                        "is not enforced by the output grammar",
+                    )
+                    self.assertEqual(error["type"], "invalid_request_error")
+                    self.assertEqual(runtime.requests, [])
                 finally:
                     harness.close()
 
@@ -484,16 +672,21 @@ class SchemaFallbackTests(HarnessTestCase):
                         normalize()
                     self.assertEqual(caught.exception.status, 400)
                     self.assertIn("remote", caught.exception.message)
+        # A local one is read, but draft 3's extends is not enforced by the
+        # output grammar, so a response format holding it is refused.
         schema = {
             "$schema": "http://json-schema.org/draft-03/schema#",
             "definitions": {"text": {"type": "string"}},
             "properties": {"value": {"extends": {"$ref": "#/definitions/text"}}},
         }
-        _, validator = tool_schema.normalize_response_format(
-            {"type": "json_schema", "json_schema": {"schema": schema}}
-        )
-        self.assertTrue(validator.is_valid({"value": "x"}))
-        self.assertFalse(validator.is_valid({"value": 1}))
+        with self.assertRaises(api.APIError) as caught:
+            tool_schema.normalize_response_format(
+                {
+                    "type": "json_schema",
+                    "json_schema": {"schema": schema, "strict": True},
+                }
+            )
+        self.assertIn("extends at #/properties/value", caught.exception.message)
 
     def test_schemas_validation_cannot_evaluate_are_request_errors(self):
         # Draft 4 leaves $ref unchecked and draft 3 accepts any type name;

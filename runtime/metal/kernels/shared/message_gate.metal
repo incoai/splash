@@ -22,21 +22,22 @@ constant constexpr uint kGateSimdgroups = kGateThreads / 32;
 // Each kernel runs in phases, functions out of line, which hand over through
 // threadgroup memory alone: every sum is reduced by simd_sum into its own slot
 // a simdgroup and then by one thread over the simdgroups in order; loops over
-// a group's rows run to MESSAGE_GATE_GROUP_ROWS, the rows past the group's
-// storing nothing; no thread keeps an array across a barrier (as
+// a group's rows run to its kernel's Rows (a power of two, at most
+// MESSAGE_GATE_GROUP_ROWS), the rows past the call's storing nothing; no
+// thread keeps an array across a barrier (as
 // block_residual_mix.metal: an array indexed by a runtime bound and alive
 // across a barrier lost one simdgroup's values now and then under shader
 // validation). The sums are those of message_gate_test_prepare, the float
 // projections' and message_gate_test_norm's, in their order within a thread and
 // over the simdgroups. A dispatch runs MessageGateFusedParams::gates gates
 // (grid z), gate g reading its weights, norm and output at slot g of their
-// kernel's MESSAGE_GATE_MAXIMUM_GATES bindings and its rows of the scratch
-// after gate g - 1's: normalized concatenations [gates][rows][2 hidden], rank
-// values [gates][rows][rank], gated rows [gates][rows][hidden], partial sums
-// [gates][groups][slices][rows of a group] and counters [gates][groups].
-// Weights: the gates' float rows as stored, F32 or BF16 (the _f32 and _bf16
-// instances), each value widened to fp32.
-constant constexpr uint kGroupRows = MESSAGE_GATE_GROUP_ROWS;
+// kernel's MESSAGE_GATE_MAXIMUM_GATES bindings, its x and message, and their
+// normalized rows, which the mixes writing them wrote beside them
+// (kernels/common/message_gate_normalize.h), at its columns, and its rows of
+// the scratch after gate g - 1's: rank values [gates][rows][rank], gated rows
+// [gates][rows][hidden], partial sums [gates][groups][slices][rows of a group]
+// and counters [gates][groups]. Weights: the gates' float rows as stored, F32
+// or BF16 (the _f32 and _bf16 instances), each value widened to fp32.
 constant constexpr uint kDownOutputs = MESSAGE_GATE_DOWN_OUTPUTS;
 
 // Quad i of a row of weights, in fp32.
@@ -62,162 +63,110 @@ inline device const float *message_gate_row(device const float *x, device const 
   return own ? x + row * p.x_stride + p.x_columns[g] : message + row * p.message_stride + p.message_columns[g];
 }
 
-// What message_gate_normalize's phases share: a partial a simdgroup of the
-// row's and of the message's squares, and their inverse RMS.
-struct MessageGateNormalizeShared {
-  float partials[2 * kGateSimdgroups];
-  float scales[2];
-};
-
-// Phase one: the inverse RMS of the row and of its message, scales 0 and 1,
-// from quads: a thread's quads tid + MESSAGE_GATE_THREADS i in order, each
-// quad's squares added in order (a sum of the same terms as
-// message_gate_test_prepare's in another order: it reads a value a thread at
-// a time).
-__attribute__((noinline)) void message_gate_normalize_scales(device const float4 *row, device const float4 *message,
-                                                             uint hidden, uint tid, uint lane, uint sg,
-                                                             threadgroup MessageGateNormalizeShared &shared) {
-  for (uint i = 0; i < 2; ++i) {
-    device const float4 *vector = i == 0 ? row : message;
-    float squares = 0.0f;
-    for (uint d = tid; d < hidden / 4; d += kGateThreads) {
-      const float4 v = vector[d];
-      squares += v.x * v.x;
-      squares += v.y * v.y;
-      squares += v.z * v.z;
-      squares += v.w * v.w;
-    }
-    squares = simd_sum(squares);
-    if (lane == 0) shared.partials[i * kGateSimdgroups + sg] = squares;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid < 2) {
-    float total = 0.0f;
-    for (uint s = 0; s < kGateSimdgroups; ++s) total += shared.partials[tid * kGateSimdgroups + s];
-    shared.scales[tid] = rsqrt(total / hidden + kRmsEpsilon);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-
-// The down projection's input of a row of each gate, a threadgroup each: the
-// row's x and its message, each RMS-normalized without weights
-// (message_gate_normalize_scales) and rounded to bf16 as
-// message_gate_test_prepare rounds it, side by side into the row's 2 hidden
-// values of `concat` [gates][rows][2 hidden], once for every threadgroup of
-// message_gate_down that reads the row. Grid: (rows, 1, gates).
-kernel void message_gate_normalize(device const float *x [[buffer(0)]], device const float *message [[buffer(1)]],
-                                   device bfloat *concat [[buffer(2)]],
-                                   constant MessageGateFusedParams &p [[buffer(3)]],
-                                   uint3 group [[threadgroup_position_in_grid]],
-                                   uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-                                   uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup MessageGateNormalizeShared shared;
-  const uint row = group.x, g = group.z;
-  if (row >= p.rows || g >= p.gates) return;
-  device const float4 *xr = reinterpret_cast<device const float4 *>(x + ulong(row) * p.x_stride + p.x_columns[g]);
-  device const float4 *mr =
-      reinterpret_cast<device const float4 *>(message + ulong(row) * p.message_stride + p.message_columns[g]);
-  message_gate_normalize_scales(xr, mr, p.hidden, tid, lane, sg, shared);
-  const uint quads = p.hidden / 4;
-  device bfloat4 *out = reinterpret_cast<device bfloat4 *>(concat + (ulong(g) * p.rows + row) * 2 * p.hidden);
-  for (uint i = tid; i < 2 * quads; i += kGateThreads)
-    out[i] = i < quads ? bfloat4(xr[i] * shared.scales[0]) : bfloat4(mr[i - quads] * shared.scales[1]);
-}
-
 // The group's rank values k0 .. k0 + kDownOutputs - 1, each the dot of the
-// weights' row (`down`, [rank][2 hidden]) with the normalized concatenation
-// (message_gate_normalize's `concat` [rows][2 hidden], the gate's), the
-// threads striding its quads, a partial a simdgroup of each output's value of
-// each row; rounded to bf16 into `low` [rows][rank], the gate's.
-template <typename Weight>
-__attribute__((noinline)) void message_gate_down_values(device const bfloat *concat, device const Weight *down,
-                                                        device bfloat *low, constant MessageGateFusedParams &p,
-                                                        uint first, uint count, uint k0, uint tid, uint lane, uint sg,
+// weights' row (`down`, [rank][2 hidden]) with the row's normalized x and
+// then its normalized message, side by side (the gate's columns of
+// `normalized_x` and `normalized_message`, the rows of x and the messages
+// normalized), the threads striding the concatenation's quads, a partial a
+// simdgroup of each output's value of each row; rounded to bf16 into `low`
+// [rows][rank], the gate's.
+template <typename Weight, uint Rows>
+__attribute__((noinline)) void message_gate_down_values(device const bfloat *normalized_x,
+                                                        device const bfloat *normalized_message,
+                                                        device const Weight *down, device bfloat *low,
+                                                        constant MessageGateFusedParams &p, uint g, uint first,
+                                                        uint count, uint k0, uint tid, uint lane, uint sg,
                                                         threadgroup float *partials) {
-  const uint quads = p.hidden / 2;
-  float sums[kDownOutputs * kGroupRows];
-  for (uint j = 0; j < kDownOutputs * kGroupRows; ++j) sums[j] = 0.0f;
+  // The concatenation's quads, x's the first of them; the last row held.
+  const uint quads = p.hidden / 2, own = p.hidden / 4, last = count - 1;
+  float sums[kDownOutputs * Rows];
+  for (uint j = 0; j < kDownOutputs * Rows; ++j) sums[j] = 0.0f;
   for (uint i = tid; i < quads; i += kGateThreads) {
     float4 w[kDownOutputs];
     for (uint o = 0; o < kDownOutputs; ++o)
       w[o] = k0 + o < p.rank ? message_gate_quad(down + ulong(k0 + o) * 2 * p.hidden, i) : float4(0.0f);
-    for (uint r = 0; r < kGroupRows; ++r) {
-      const float4 normalized = message_gate_quad(concat + ulong(first + min(r, count - 1)) * 2 * p.hidden, i);
-      for (uint o = 0; o < kDownOutputs; ++o) sums[o * kGroupRows + r] += dot(w[o], normalized);
+    for (uint r = 0; r < Rows; ++r) {
+      const ulong row = first + min(r, last);
+      const float4 normalized =
+          i < own ? message_gate_quad(normalized_x + row * p.x_stride + p.x_columns[g], i)
+                  : message_gate_quad(normalized_message + row * p.message_stride + p.message_columns[g], i - own);
+      for (uint o = 0; o < kDownOutputs; ++o) sums[o * Rows + r] += dot(w[o], normalized);
     }
   }
-  for (uint j = 0; j < kDownOutputs * kGroupRows; ++j) {
+  for (uint j = 0; j < kDownOutputs * Rows; ++j) {
     const float sum = simd_sum(sums[j]);
     if (lane == 0) partials[j * kGateSimdgroups + sg] = sum;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid < kDownOutputs * kGroupRows) {
+  if (tid < kDownOutputs * Rows) {
     float total = 0.0f;
     for (uint s = 0; s < kGateSimdgroups; ++s) total += partials[tid * kGateSimdgroups + s];
-    const uint o = tid / kGroupRows, r = tid % kGroupRows;
+    const uint o = tid / Rows, r = tid % Rows;
     if (r < count && k0 + o < p.rank) low[ulong(first + r) * p.rank + k0 + o] = bfloat(total);
   }
 }
 
-// The rank values of a group of MESSAGE_GATE_GROUP_ROWS rows of each gate, of
+// The rank values of a group of Rows rows of each gate, of
 // MESSAGE_GATE_DOWN_OUTPUTS of them a threadgroup, each output's weights' row
-// read once for every row of the group, from the rows' normalized
-// concatenations (message_gate_normalize). Grid: (rank /
-// MESSAGE_GATE_DOWN_OUTPUTS, groups, gates).
-template <typename Weight>
-kernel void message_gate_down(device const bfloat *concat [[buffer(0)]], device const Weight *down0 [[buffer(1)]],
-                              device const Weight *down1 [[buffer(2)]], device const Weight *down2 [[buffer(3)]],
-                              device bfloat *low [[buffer(4)]], constant MessageGateFusedParams &p [[buffer(5)]],
+// read once for every row of the group, from the rows' normalized x and
+// messages, which their mixes wrote. Grid: (rank / MESSAGE_GATE_DOWN_OUTPUTS,
+// groups, gates).
+template <typename Weight, uint Rows>
+kernel void message_gate_down(device const bfloat *normalized_x [[buffer(0)]],
+                              device const bfloat *normalized_message [[buffer(1)]],
+                              device const Weight *down0 [[buffer(2)]], device const Weight *down1 [[buffer(3)]],
+                              device const Weight *down2 [[buffer(4)]], device bfloat *low [[buffer(5)]],
+                              constant MessageGateFusedParams &p [[buffer(6)]],
                               uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float partials[kDownOutputs * kGroupRows * kGateSimdgroups];
-  const uint first = group.y * kGroupRows, g = group.z;
+  threadgroup float partials[kDownOutputs * Rows * kGateSimdgroups];
+  const uint first = group.y * Rows, g = group.z;
   if (first >= p.rows || g >= p.gates) return;
-  const uint count = min(kGroupRows, p.rows - first);
-  message_gate_down_values(concat + ulong(g) * p.rows * 2 * p.hidden, message_gate_pick(g, down0, down1, down2),
-                           low + ulong(g) * p.rows * p.rank, p, first, count, group.x * kDownOutputs, tid, lane, sg,
-                           partials);
+  const uint count = min(Rows, p.rows - first);
+  message_gate_down_values<Weight, Rows>(normalized_x, normalized_message, message_gate_pick(g, down0, down1, down2),
+                                         low + ulong(g) * p.rows * p.rank, p, g, first, count, group.x * kDownOutputs,
+                                         tid, lane, sg, partials);
 }
 
 // What message_gate_apply's phases share: the group's rank values (zero past
 // its rows), a partial a simdgroup of each row's squares, the arrival of
 // split_arrive_last, and the last slice's inverse RMS of each row.
-struct MessageGateApplyShared {
-  float4 lows[kGroupRows * MESSAGE_GATE_MAXIMUM_RANK / 4];
-  float partials[kGroupRows * kGateSimdgroups];
+template <uint Rows> struct MessageGateApplyShared {
+  float4 lows[Rows * MESSAGE_GATE_MAXIMUM_RANK / 4];
+  float partials[Rows * kGateSimdgroups];
   uint arrival;
-  float inverses[kGroupRows];
+  float inverses[Rows];
 };
 
-// Phase one: value d of each row of the group, a thread each: forget and gain
-// from the rank values and the weights' rows ([hidden][rank]), the gated
+// Phase one: value d of each of the group's rows, a thread each: forget and
+// gain from the rank values and the weights' rows ([hidden][rank]), the gated
 // value in fp32 (message_gated's) to `values` [rows][hidden], and the slice's
-// squares of each row, by thread 0 to its slot of `partials`
-// [slice][MESSAGE_GATE_GROUP_ROWS] (the group's).
-template <typename Weight>
+// squares of each row, by thread 0 to its slot of `partials` [slice][Rows].
+// Of the group's rows `count` are the call's, `first` the first.
+template <typename Weight, uint Rows>
 __attribute__((noinline)) void message_gate_apply_values(device const float *x, device const float *message,
                                                          device const Weight *forget, device const Weight *gain,
                                                          device coherent(device) float *values,
                                                          device coherent(device) float *partials,
                                                          constant MessageGateFusedParams &p, uint g, uint first,
                                                          uint count, uint slice, uint tid, uint lane, uint sg,
-                                                         threadgroup MessageGateApplyShared &shared) {
+                                                         threadgroup MessageGateApplyShared<Rows> &shared) {
   const uint d = slice * kGateThreads + tid, quarters = p.rank / 4;
   const bool active = d < p.hidden;
-  float f[kGroupRows], e[kGroupRows];
-  for (uint r = 0; r < kGroupRows; ++r) f[r] = e[r] = 0.0f;
+  float f[Rows], e[Rows];
+  for (uint r = 0; r < Rows; ++r) f[r] = e[r] = 0.0f;
   if (active) {
     device const Weight *f4 = forget + ulong(d) * p.rank, *e4 = gain + ulong(d) * p.rank;
     for (uint j = 0; j < quarters; ++j) {
       const float4 a = message_gate_quad(f4, j), b = message_gate_quad(e4, j);
-      for (uint r = 0; r < kGroupRows; ++r) {
+      for (uint r = 0; r < Rows; ++r) {
         const float4 l = shared.lows[r * quarters + j];
         f[r] += dot(a, l);
         e[r] += dot(b, l);
       }
     }
   }
-  for (uint r = 0; r < kGroupRows; ++r) {
+  for (uint r = 0; r < Rows; ++r) {
     float squares = 0.0f;
     if (active && r < count) {
       const float xv = x[ulong(first + r) * p.x_stride + p.x_columns[g] + d];
@@ -234,23 +183,24 @@ __attribute__((noinline)) void message_gate_apply_values(device const float *x, 
     for (uint r = 0; r < count; ++r) {
       float total = 0.0f;
       for (uint s = 0; s < kGateSimdgroups; ++s) total += shared.partials[r * kGateSimdgroups + s];
-      partials[slice * kGroupRows + r] = total;
+      partials[slice * Rows + r] = total;
     }
 }
 
 // Phase two, by the slice that arrives last: each row's squares over the
 // slices in slice order, by a thread a row, then the group's rows through the
 // weighted RMS norm into bf16, as message_gate_test_norm writes each value, the
-// threads striding the rows' quads.
+// threadgroup's threads striding the rows' quads.
+template <uint Rows>
 __attribute__((noinline)) void message_gate_apply_norm(device coherent(device) float *values,
                                                        device coherent(device) float *partials,
                                                        device const float *norm, device bfloat *output,
                                                        constant MessageGateFusedParams &p, uint first, uint count,
                                                        uint slices, uint tid,
-                                                       threadgroup MessageGateApplyShared &shared) {
+                                                       threadgroup MessageGateApplyShared<Rows> &shared) {
   if (tid < count) {
     float total = 0.0f;
-    for (uint s = 0; s < slices; ++s) total += partials[s * kGroupRows + tid];
+    for (uint s = 0; s < slices; ++s) total += partials[s * Rows + tid];
     shared.inverses[tid] = rsqrt(total / p.hidden + kRmsEpsilon);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -270,7 +220,7 @@ __attribute__((noinline)) void message_gate_apply_norm(device coherent(device) f
 // read once for the group's rows; the slice that arrives last
 // (kernels/common/split_reduce.h, the group's counter, zero before and after)
 // writes the group's normalized rows. Grid: (slices, groups, gates).
-template <typename Weight>
+template <typename Weight, uint Rows>
 kernel void message_gate_apply(device const float *x [[buffer(0)]], device const float *message [[buffer(1)]],
                                device const Weight *forget0 [[buffer(2)]], device const Weight *forget1 [[buffer(3)]],
                                device const Weight *forget2 [[buffer(4)]], device const Weight *gain0 [[buffer(5)]],
@@ -284,24 +234,24 @@ kernel void message_gate_apply(device const float *x [[buffer(0)]], device const
                                constant MessageGateFusedParams &p [[buffer(18)]],
                                uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup MessageGateApplyShared shared;
-  const uint first = group.y * kGroupRows, g = group.z;
+  threadgroup MessageGateApplyShared<Rows> shared;
+  const uint first = group.y * Rows, g = group.z;
   if (first >= p.rows || g >= p.gates) return;
-  const uint count = min(kGroupRows, p.rows - first), slices = (p.hidden + kGateThreads - 1) / kGateThreads;
-  const uint groups = (p.rows + kGroupRows - 1) / kGroupRows;
+  const uint count = min(Rows, p.rows - first), slices = (p.hidden + kGateThreads - 1) / kGateThreads;
+  const uint groups = (p.rows + Rows - 1) / Rows;
   device const bfloat *gateLow = low + ulong(g) * p.rows * p.rank;
   threadgroup float *lows = reinterpret_cast<threadgroup float *>(shared.lows);
-  for (uint i = tid; i < kGroupRows * p.rank; i += kGateThreads)
+  for (uint i = tid; i < Rows * p.rank; i += kGateThreads)
     lows[i] = i < count * p.rank ? float(gateLow[ulong(first) * p.rank + i]) : 0.0f;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   device coherent(device) float *gateValues = values + ulong(g) * p.rows * p.hidden;
-  device coherent(device) float *groupPartials = partials + (ulong(g) * groups + group.y) * slices * kGroupRows;
+  device coherent(device) float *groupPartials = partials + (ulong(g) * groups + group.y) * slices * Rows;
   device atomic_uint *counter = counters + g * groups + group.y;
-  message_gate_apply_values(x, message, message_gate_pick(g, forget0, forget1, forget2),
-                            message_gate_pick(g, gain0, gain1, gain2), gateValues, groupPartials, p, g, first, count,
-                            group.x, tid, lane, sg, shared);
+  message_gate_apply_values<Weight, Rows>(x, message, message_gate_pick(g, forget0, forget1, forget2),
+                                          message_gate_pick(g, gain0, gain1, gain2), gateValues, groupPartials, p, g,
+                                          first, count, group.x, tid, lane, sg, shared);
   if (!split_arrive_last(counter, slices, tid, &shared.arrival)) return;
-  message_gate_apply_norm(gateValues, groupPartials, message_gate_pick(g, norm0, norm1, norm2),
+  message_gate_apply_norm<Rows>(gateValues, groupPartials, message_gate_pick(g, norm0, norm1, norm2),
                           message_gate_pick(g, output0, output1, output2), p, first, count, slices, tid, shared);
   split_release(counter, tid);
 }
@@ -639,17 +589,22 @@ kernel void message_gate_rows(device const float *x [[buffer(0)]], device const 
 }
 
 // The instances: F32 weights (_f32) and BF16 (_bf16), as a GGUF stores the
-// gates' projections.
-#define MESSAGE_GATE_INSTANCES(Weight, suffix)                                                                    \
-  template [[host_name("message_gate_down" suffix)]] kernel void message_gate_down<Weight>(                       \
-      device const bfloat *, device const Weight *, device const Weight *, device const Weight *, device bfloat *, \
-      constant MessageGateFusedParams &, uint3, uint, uint, uint);                                                \
-  template [[host_name("message_gate_apply" suffix)]] kernel void message_gate_apply<Weight>(                     \
+// gates' projections; a decode step's kernels for each group of 1, 2 and 4
+// rows (_r1, _r2, _r4, ops::MessageGate::groupRows).
+#define MESSAGE_GATE_GROUP_INSTANCES(Weight, suffix, rows)                                                        \
+  template [[host_name("message_gate_down" suffix "_r" #rows)]] kernel void message_gate_down<Weight, rows>(      \
+      device const bfloat *, device const bfloat *, device const Weight *, device const Weight *,                 \
+      device const Weight *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint, uint);        \
+  template [[host_name("message_gate_apply" suffix "_r" #rows)]] kernel void message_gate_apply<Weight, rows>(    \
       device const float *, device const float *, device const Weight *, device const Weight *,                   \
       device const Weight *, device const Weight *, device const Weight *, device const Weight *,                 \
       device const bfloat *, device const float *, device const float *, device const float *,                    \
       device coherent(device) float *, device coherent(device) float *, device atomic_uint *, device bfloat *,    \
-      device bfloat *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint, uint);              \
+      device bfloat *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint, uint);
+#define MESSAGE_GATE_INSTANCES(Weight, suffix)                                                                    \
+  MESSAGE_GATE_GROUP_INSTANCES(Weight, suffix, 1)                                                                 \
+  MESSAGE_GATE_GROUP_INSTANCES(Weight, suffix, 2)                                                                 \
+  MESSAGE_GATE_GROUP_INSTANCES(Weight, suffix, 4)                                                                 \
   template [[host_name("message_gate_rows" suffix)]] kernel void message_gate_rows<Weight>(                       \
       device const float *, device const float *, device const Weight *, device const Weight *,                   \
       device const Weight *, device const Weight *, device const Weight *, device const Weight *,                 \
@@ -660,3 +615,4 @@ kernel void message_gate_rows(device const float *x [[buffer(0)]], device const 
 MESSAGE_GATE_INSTANCES(float, "_f32")
 MESSAGE_GATE_INSTANCES(bfloat, "_bf16")
 #undef MESSAGE_GATE_INSTANCES
+#undef MESSAGE_GATE_GROUP_INSTANCES

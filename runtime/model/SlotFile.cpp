@@ -29,6 +29,8 @@ namespace splash::model {
 
 struct SlotFile::Backing {
   int descriptor = -1;
+  // A persistent file's path, which the log names when it is damaged.
+  std::string path;
   uint64_t slotBytes = 0;
   std::shared_ptr<DiskBudget> budget;
   std::atomic<bool> failed{false};
@@ -219,6 +221,19 @@ void reportPunchFailure(int error) noexcept {
   if (!reported.exchange(true, std::memory_order_relaxed))
     logLine("The SSD cache's volume returns no blocks of its files (", ErrnoMessage{error},
             "): each copy counts a whole slot, and disk use may exceed the cache's limit.");
+}
+
+std::atomic<uint64_t> checksumFailures{0};
+std::atomic<uint64_t> cutCopies{0};
+
+// Once per slot: a read of an adopted copy that fails its record's
+// checksums, which the caller gives up and its request recomputes.
+void reportDamage(const std::string &path, uint32_t index, std::atomic<bool> &damaged) noexcept {
+  if (damaged.exchange(true, std::memory_order_relaxed))
+    return;
+  checksumFailures.fetch_add(1, std::memory_order_relaxed);
+  logLine("Persistent cache file ", path, ": the copy in slot ", index,
+          " fails its checksum; the server gives it up, and the request that needed it recomputes what it held.");
 }
 
 // Once per file: the write that stopped it.
@@ -618,6 +633,7 @@ void SlotFile::open(const Persistence &persistence) {
   backing.clearedRecord.assign(backing.recordBytes, std::byte{0});
   const std::vector<std::byte> header =
       recordsHeader(backing.slotBytes, backing.labelBytes, persistence.tag, backing.segmentEnds);
+  backing.path = persistence.slots.string();
   backing.descriptor = openPersistent(persistence.slots, "open slot file");
   uncache();
   askVolume();
@@ -642,16 +658,37 @@ void SlotFile::open(const Persistence &persistence) {
   if (std::max(slots, recorded) > std::numeric_limits<uint32_t>::max())
     throw std::runtime_error("slot file holds more slots than it can index");
   adopted_.assign(std::max(slots, recorded), 0);
-  std::vector<std::byte> records(std::min(slots, recorded) * backing.recordBytes);
+  // Every record is read, those past the slot file's end too: a file cut
+  // short says what it left behind.
+  std::vector<std::byte> records(recorded * backing.recordBytes);
   if (!readAll(backing.records, records, kRecordsHeaderBytes))
     throw std::system_error(errno, std::generic_category(), "read slot records");
+  CutShort cut{.path = backing.path, .fileBytes = slotFileBytes};
   for (uint64_t index = 0; index < records.size() / backing.recordBytes; ++index) {
     const auto record = std::span(records).subspan(index * backing.recordBytes, backing.recordBytes);
-    if (auto slot = decodeRecord(record, static_cast<uint32_t>(index), backing.labelBytes, backing.segments(),
-                                 backing.slotBytes, backing.segmentEnds.empty() ? 0 : backing.segmentEnds.back());
-        slot && slotOffset(index, backing.slotBytes) + slotBytesFor(slot->payloadBytes) <= slotFileBytes)
+    auto slot = decodeRecord(record, static_cast<uint32_t>(index), backing.labelBytes, backing.segments(),
+                             backing.slotBytes, backing.segmentEnds.empty() ? 0 : backing.segmentEnds.back());
+    if (!slot)
+      continue;
+    ++cut.records;
+    const uint64_t end = slotOffset(index, backing.slotBytes) + slotBytesFor(slot->payloadBytes);
+    if (end <= slotFileBytes) {
       records_.push_back(std::move(*slot));
+    } else {
+      ++cut.cut;
+      cut.reachBytes = std::max(cut.reachBytes, end);
+    }
   }
+  // The file was cut short (a copy, a full volume, a crash of the volume):
+  // the records past its end are left behind, which the start says.
+  if (cut.cut) {
+    cutCopies.fetch_add(cut.cut, std::memory_order_relaxed);
+    cutShort_ = std::move(cut);
+  }
+}
+
+SlotFileDamage slotFileDamage() noexcept {
+  return {checksumFailures.load(std::memory_order_relaxed), cutCopies.load(std::memory_order_relaxed)};
 }
 
 void SlotFile::Free::operator()(std::byte *memory) const noexcept { std::free(memory); }
@@ -714,9 +751,9 @@ bool SlotFile::writable() const noexcept {
   return !backing_->failed.load(std::memory_order_relaxed);
 }
 
-bool SlotFile::takesWrite(bool inUse) const noexcept {
+bool SlotFile::takesWrite() const noexcept {
   const DiskBudget &budget = *backing_->budget;
-  return writable() && budget.limitBytes() >= backing_->slotBytes && budget.admits(inUse);
+  return writable() && budget.limitBytes() >= backing_->slotBytes && budget.admits();
 }
 
 bool SlotFile::stop(Backing &backing) noexcept {
@@ -942,9 +979,9 @@ void SlotFile::punchHole(uint32_t index) noexcept {
 }
 
 // A write gathers its spans into the worker's buffer one chunk at a time and
-// zeros the rest of their last host page, and no more: a shorter payload
-// (a trimmed KV page, a third of a full one) leaves the slot past it
-// unwritten, which nothing reads, and a hole (Backing::stored); a read moves
+// zeros the rest of their last host page, and no more: a payload shorter
+// than its slot leaves the slot past it unwritten, which nothing reads, and
+// a hole (Backing::stored); a read moves
 // the chunks its spans reach and scatters each into them, ignoring the slot
 // past them. A chunk of a span the file can move straight skips the buffer.
 // Every pwrite and pread is an aligned range of the slot, and cancellation is
@@ -1082,7 +1119,10 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
       done += chunk.size();
     }
     if (checksums) {
-      if (checksums->take() != slot->checksums_) return false;
+      if (checksums->take() != slot->checksums_) {
+        reportDamage(backing.path, slot->index_, slot->damaged_);
+        return false;
+      }
       slot->verify_.store(false, std::memory_order_relaxed);
     }
     return true;
@@ -1119,8 +1159,10 @@ std::optional<std::span<const std::byte>> SlotFile::readAt(const Slot &slot, uin
   for (size_t index = first; verify && index <= last; ++index) {
     const uint64_t start = backing.segmentStart(index);
     if (crc32c(buffer.subspan(start - from, backing.segmentEnd(index, payloadBytes) - start)) !=
-        slot.checksums_[index])
+        slot.checksums_[index]) {
+      reportDamage(backing.path, slot.index_, slot.damaged_);
       return std::nullopt;
+    }
   }
   if (verify && first == 0 && last + 1 == backing.segments())
     slot.verify_.store(false, std::memory_order_relaxed);

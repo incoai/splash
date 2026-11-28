@@ -1,7 +1,8 @@
 #pragma once
-// The int8-activation tile for MLX affine 4- and 5-bit weights in groups of 64 (af4g64, af5g64) and Q8_0, which the
-// dense prefill GEMMs (kernels/prefill/gguf_prefill_int8.metal) and the MoE experts' prefill passes
-// (kernels/shared/moe_int8.metal) run: see gguf_prefill_int8.metal for its arithmetic and fragment schedules.
+// The int8-activation tile for the formats it decodes (QUANT_PREFILL_INT8_FORMATS: MLX affine 4-, 5- and 8-bit weights
+// in groups of 64 and Q8_0), which the dense prefill GEMMs (kernels/prefill/gguf_prefill_int8.metal) and the MoE
+// experts' prefill passes (kernels/shared/moe_int8.metal) run: see gguf_prefill_int8.metal for its arithmetic and
+// fragment schedules.
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/gguf_tile.h"
 
@@ -33,14 +34,17 @@ inline uint prefill_int8_fifth(uint b) {
 }
 
 // A tile of GGUF_PREFILL_INT8_SIMDGROUPS simdgroups, each 32 rows (two 16-row fragments) by 32 columns, at (column
-// tile, row tile) `tile`, its sums times `scale` (an expert pass's expert scale, moe_int8.metal) before the epilogue.
-// BITS is the weights' code width: 4 or 5 for af4g64 and af5g64, 8 for Q8_0.
-template <int BITS, GgufEpilogue Ep>
+// tile, row tile) `tile`, its sums times `scale` (an expert pass's expert scale, moe_int8.metal) before the epilogue,
+// of weights in format F (GGUF_FMT_*, one of QUANT_PREFILL_INT8_FORMATS).
+template <uint F, GgufEpilogue Ep>
 inline void prefill_int8_tile(device const char *codes, device const float2 *scales, device const uchar *w0,
                               device const uchar *w1, device const uchar *meta, device bfloat *output,
                               device const bfloat *aux, PrefillInt8Shape p, uint2 tile, ushort lane,
                               ushort simd_group, float scale = 1.0f) {
   using namespace mpp::tensor_ops;
+  // The codes' width; an affine format's group of 64 holds one s and z, Q8_0's 32-groups a d each.
+  constexpr bool kAffine = quant_affine_format(F);
+  constexpr int BITS = kAffine ? int(quant_affine_bits(F)) : 8;
   constexpr int BM = kInt8RowFrags * kInt8FragM, BN = GGUF_TILE_COLUMNS;
   static_assert(BN == kInt8FragN * GGUF_PREFILL_INT8_SIMDGROUPS, "the simdgroups cover the column tile");
   static_assert(BM == GGUF_PREFILL_INT8_ROWS, "a simdgroup holds the tile's rows");
@@ -81,29 +85,55 @@ inline void prefill_int8_tile(device const char *codes, device const float2 *sca
   const uint n_run = uint(col_base + coord.x);
   device const uint *ml = (device const uint *)(meta) + ulong(n_run / T) * plane_units * T + n_run % T;
   const int m_base = row_base + coord.y;
+  // An affine format's fold of group g: its int32 sums times s and the scales of the lane's four rows, plus z times
+  // their scales times their codes' sums, with the s, z of the lane's two runs of four columns. The tile multiplies
+  // 8-bit codes q as q - 128, so theirs take z + 128 s: s q + z = s (q - 128) + (z + 128 s).
+  const auto affine_fold = [&](int g) __attribute__((always_inline)) {
+    const uint4 mv0 = *((device const uint4 *)(ml + ulong(g) * T));
+    const uint4 mv1 = *((device const uint4 *)(ml + ulong(g) * T + 16));
+    float2 sa[kInt8RowFrags][2];
+#pragma unroll
+    for (int i = 0; i < kInt8RowFrags; ++i)
+#pragma unroll
+      for (int r = 0; r < 2; ++r)
+        sa[i][r] = scales[ulong(g) * p.storage_rows + min(m_base + i * kInt8FragM + r * 8, M - 1)];
+#pragma unroll
+    for (int e = 0; e < kInt8Elements; ++e) {
+      const int r = (e & 7) >> 2;
+      const uint mt = (e >> 3) ? mv1[e & 3] : mv0[e & 3];
+      const float s = float(as_type<bfloat>(ushort(mt & 0xFFFF))), bias = float(as_type<bfloat>(ushort(mt >> 16)));
+      const float z = BITS == 8 ? fma(128.0f, s, bias) : bias;
+      cf[0][e] = fma(sa[0][r].x * s, float(acc0[e]), fma(z, sa[0][r].y, cf[0][e]));
+      cf[1][e] = fma(sa[1][r].x * s, float(acc1[e]), fma(z, sa[1][r].y, cf[1][e]));
+    }
+  };
 
   if constexpr (BITS == 8) {
-    // Q8_0: plane0 records of 32 int8 codes, chunk c at bytes 8c .. 8c + 7 (slots 8c .. 8c + 7), meta a half d per
-    // 32-group. Steps 2h and 2h + 1 of a 64-input group take its 32-group h alone, lane column x its chunk x, chunk
-    // slots {0, 4, 1, 5} in the even step and {2, 6, 3, 7} in the odd one, which the quantizer's order holds at
-    // 32h + 8x + 4 (t & 1) (prefill_int8_position): the steps' int32 sums are one 32-group's, folded into fp32 with
-    // its d.
+    // Q8_0's planes, which af8g64 keeps its codes in: records of 32 codes, chunk c at bytes 8c .. 8c + 7 (slots
+    // 8c .. 8c + 7). Steps 2h and 2h + 1 of a 64-input group take its 32-group h alone, lane column x its chunk x,
+    // chunk slots {0, 4, 1, 5} in the even step and {2, 6, 3, 7} in the odd one, which the quantizer's order holds at
+    // 32h + 8x + 4 (t & 1) (prefill_int8_position). Q8_0's codes are int8, and each 32-group's int32 sums fold into
+    // fp32 with its half d; af8g64's are unsigned, run as q - 128 (their top bit flipped), and the group's four steps
+    // sum before its affine fold.
     device const uchar *wq = w0 + record0 * 32 + 8 * cx;
     device const half *mq = (device const half *)(meta) + ulong(n_run / T) * plane_groups32 * T + n_run % T;
+    constexpr uint flip = kAffine ? 0x80808080u : 0u;
     for (int g = 0; g < groups; ++g) {
       float sa[kInt8RowFrags][2];
+      if constexpr (!kAffine) {
 #pragma unroll
-      for (int i = 0; i < kInt8RowFrags; ++i)
+        for (int i = 0; i < kInt8RowFrags; ++i)
 #pragma unroll
-        for (int r = 0; r < 2; ++r)
-          sa[i][r] = scales[ulong(g) * p.storage_rows + min(m_base + i * kInt8FragM + r * 8, M - 1)].x;
+          for (int r = 0; r < 2; ++r)
+            sa[i][r] = scales[ulong(g) * p.storage_rows + min(m_base + i * kInt8FragM + r * 8, M - 1)].x;
+      }
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const ulong g32 = ulong(2 * g + h) * T;
         uint2 wv[4];
 #pragma unroll
         for (int q = 0; q < 4; ++q)
-          wv[q] = *((device const uint2 *)(wq + (g32 + (q & 1) * 8 + (q >> 1) * 16) * 32));
+          wv[q] = *((device const uint2 *)(wq + (g32 + (q & 1) * 8 + (q >> 1) * 16) * 32)) ^ flip;
 #pragma unroll
         for (int t = 0; t < 2; ++t) {
 #pragma unroll
@@ -122,20 +152,27 @@ inline void prefill_int8_tile(device const char *codes, device const float2 *sca
               const char4 quad = as_type<char4>(*((device const uint *)(codes + at)));
               ct_a[r * 4 + 0] = quad.x; ct_a[r * 4 + 1] = quad.y; ct_a[r * 4 + 2] = quad.z; ct_a[r * 4 + 3] = quad.w;
             }
-            if (t == 0) { if (hf == 0) op_set.run(ct_a, ct_b, acc0); else op_set.run(ct_a, ct_b, acc1); }
-            else { if (hf == 0) op.run(ct_a, ct_b, acc0); else op.run(ct_a, ct_b, acc1); }
+            // A fold's first step sets its sums: each Q8_0 32-group's, an affine group's first.
+            if (t == 0 && (!kAffine || h == 0)) {
+              if (hf == 0) op_set.run(ct_a, ct_b, acc0); else op_set.run(ct_a, ct_b, acc1);
+            } else {
+              if (hf == 0) op.run(ct_a, ct_b, acc0); else op.run(ct_a, ct_b, acc1);
+            }
           }
         }
-        // The 32-group's d of the lane's two runs of four columns.
-        const half4 d0 = *((device const half4 *)(mq + g32)), d1 = *((device const half4 *)(mq + g32 + 16));
+        if constexpr (!kAffine) {
+          // The 32-group's d of the lane's two runs of four columns.
+          const half4 d0 = *((device const half4 *)(mq + g32)), d1 = *((device const half4 *)(mq + g32 + 16));
 #pragma unroll
-        for (int e = 0; e < kInt8Elements; ++e) {
-          const int r = (e & 7) >> 2;
-          const float d = float((e >> 3) ? d1[e & 3] : d0[e & 3]);
-          cf[0][e] = fma(sa[0][r] * d, float(acc0[e]), cf[0][e]);
-          cf[1][e] = fma(sa[1][r] * d, float(acc1[e]), cf[1][e]);
+          for (int e = 0; e < kInt8Elements; ++e) {
+            const int r = (e & 7) >> 2;
+            const float d = float((e >> 3) ? d1[e & 3] : d0[e & 3]);
+            cf[0][e] = fma(sa[0][r] * d, float(acc0[e]), cf[0][e]);
+            cf[1][e] = fma(sa[1][r] * d, float(acc1[e]), cf[1][e]);
+          }
         }
       }
+      if constexpr (kAffine) affine_fold(g);
     }
   } else {
     for (int g = 0; g < groups; ++g) {
@@ -171,23 +208,7 @@ inline void prefill_int8_tile(device const char *codes, device const float2 *sca
           else { if (hf == 0) op.run(ct_a, ct_b, acc0); else op.run(ct_a, ct_b, acc1); }
         }
       }
-      // The group's correction: s, z of the lane's two runs of four columns, and the scales of its four rows.
-      const uint4 mv0 = *((device const uint4 *)(ml + ulong(g) * T));
-      const uint4 mv1 = *((device const uint4 *)(ml + ulong(g) * T + 16));
-      float2 sa[kInt8RowFrags][2];
-#pragma unroll
-      for (int i = 0; i < kInt8RowFrags; ++i)
-#pragma unroll
-        for (int r = 0; r < 2; ++r)
-          sa[i][r] = scales[ulong(g) * p.storage_rows + min(m_base + i * kInt8FragM + r * 8, M - 1)];
-#pragma unroll
-      for (int e = 0; e < kInt8Elements; ++e) {
-        const int r = (e & 7) >> 2;
-        const uint mt = (e >> 3) ? mv1[e & 3] : mv0[e & 3];
-        const float s = float(as_type<bfloat>(ushort(mt & 0xFFFF))), z = float(as_type<bfloat>(ushort(mt >> 16)));
-        cf[0][e] = fma(sa[0][r].x * s, float(acc0[e]), fma(z, sa[0][r].y, cf[0][e]));
-        cf[1][e] = fma(sa[1][r].x * s, float(acc1[e]), fma(z, sa[1][r].y, cf[1][e]));
-      }
+      affine_fold(g);
     }
   }
 #pragma unroll

@@ -27,7 +27,9 @@
 //   tile; the rows so compared are counted) and at every repeat of a run (a
 //   set's first plan also on fresh scratch, where every row must compare), the
 //   output of the live tiles' grids bitwise that of every tile's with the gate
-//   and up passes apart (gguf_moe_test.metal, on the down pass's expert tile),
+//   and up passes apart (gguf_moe_test.metal, on the down pass's expert tile;
+//   a narrow step's, whose gate/up pass reads its rows in place, on the rows a
+//   gather writes),
 //   and the grouping: tiles as each expert's routes fill them, their rows
 //   packed in tile order, every route's grouped row naming it back in a tile
 //   of its expert, and the rows past the tiles' unwritten, though a last
@@ -702,9 +704,13 @@ std::string_view withoutSlices(std::string_view name) {
 // could fill, with a gate/up pass split into the gate and up passes
 // (gguf_moe_test.metal's gguf_moe_test_m<rows>_gate and _up, on the down
 // pass's expert tile), the gate parked in `gate`, of the intermediate's size;
-// the passes' parameters live in `passes`.
+// the passes' parameters live in `passes`. A narrow step's gate/up pass reads
+// its rows in place (MoeGgufGateUpParams::input_rows): its two passes read
+// the tiles' grouped rows, which a gather (moe_gather_rows, of `gathers`)
+// writes into `grouped` before them.
 std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const MetalBuffer &gate,
-                                                std::deque<MoeGgufExpertParams> &passes) {
+                                                std::deque<MoeGgufExpertParams> &passes, CommandGraph &gathers,
+                                                const MetalBuffer &grouped) {
   constexpr std::string_view kMerged = "moe_expert_gguf_m";
   std::vector<ComputeDispatch> dispatches;
   for (ComputeDispatch dispatch : graph.dispatches()) {
@@ -715,12 +721,22 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       continue;
     }
     // Input, tiles, tile count, gate's and up's shared planes, output, slot
-    // table, expert scales, parameters and the routed experts' chunks (an
-    // address table); a pass binds one projection's shared planes, its
-    // output, the gate, the slot table and the expert scales, and reaches the
-    // same chunks for its projection.
+    // table, expert scales, grouped routes, parameters and the routed
+    // experts' chunks (an address table); a pass binds one projection's
+    // shared planes, its output, the gate, the slot table and the expert
+    // scales, and reaches the same chunks for its projection.
     require(dispatch.pipelineName.starts_with(kMerged), "a gate/up pass is not the GGUF experts'");
     const std::string rows = dispatch.pipelineName.substr(kMerged.size(), merged - kMerged.size());
+    MoeGgufGateUpParams both;
+    std::memcpy(&both, dispatch.bytes[0].data, sizeof(both));
+    if (both.input_rows) {
+      gathers.add("moe_gather_rows",
+                  {dispatch.buffers[0].buffer, dispatch.buffers[12].buffer, dispatch.buffers[1].buffer,
+                   dispatch.buffers[2].buffer, grouped},
+                  MoeGatherParams{both.input_size, both.routes_per_row},
+                  {dispatch.threadgroups.y, both.input_size / 256, 1});
+      dispatches.push_back(gathers.dispatches().back());
+    }
     for (const bool up : {false, true}) {
       ComputeDispatch pass = dispatch;
       pass.pipelineName = "gguf_moe_test_m" + rows + (up ? "_up" : "_gate") +
@@ -729,6 +745,7 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       // The reference decodes every format, of no function constants.
       pass.constants.clear();
       pass.buffers.resize(3);
+      if (both.input_rows) pass.buffers[0].buffer = grouped;
       for (uint32_t plane = 0; plane < 3; ++plane)
         pass.buffers.push_back({3 + plane, dispatch.buffers[(up ? 6 : 3) + plane].buffer});
       pass.buffers.push_back({6, up ? dispatch.buffers[9].buffer : gate});
@@ -737,8 +754,6 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       pass.buffers.push_back({9, dispatch.buffers[11].buffer});
       // The pass's own parameters: the passes' sizes, floor and chunk slots, and
       // this pass's formats (its projection is its kernel's).
-      MoeGgufGateUpParams both;
-      std::memcpy(&both, dispatch.bytes[0].data, sizeof(both));
       const MoeGgufExpertParams &params = passes.emplace_back(MoeGgufExpertParams{
           both.input_size, both.output_size, both.experts, up ? both.up_routed_format : both.gate_routed_format,
           up ? both.up_shared_format : both.gate_shared_format, both.floor_slots, both.chunk_slots, both.tiles});
@@ -1112,7 +1127,11 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   if (!twoPasses) return result;
   std::deque<MoeGgufExpertParams> passes;
   const MetalBuffer gate = zeros(backend, b.moe.scratch.expertIntermediate.sizeBytes(), "moe-two-pass-gate");
-  const std::vector<ComputeDispatch> reference = fullGridsTwoPasses(graph, gate, passes);
+  // The grouped rows of the steps' tiles, as many as a gather writes into a grouped input.
+  const MetalBuffer grouped = zeros(backend, b.moe.scratch.expertIntermediate.sizeBytes() / kIntermediate * kHidden,
+                                    "moe-two-pass-grouped");
+  CommandGraph gathers;
+  const std::vector<ComputeDispatch> reference = fullGridsTwoPasses(graph, gate, passes, gathers, grouped);
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   static_cast<void>(backend.submitCommandAsync(reference).wait());
   require(!std::memcmp(result.output.data(), output, result.output.size() * 2),
@@ -1427,7 +1446,7 @@ int moe(MetalBackend &backend) {
     MoeRun widest;
     uint32_t compared = 0, acrossKinds = 0;
     // The rows of a run that differ from the widest dispatch's where their routes ran the same tile kinds.
-    const auto compareWidest = [&](const MoeRun &run, const std::string &label) {
+    const auto compareTo = [&](const MoeRun &run, const MoeRun &widest, const std::string &label) {
       const RowComparison c =
           compareRows(run, widest, uint32_t(std::min(run.output.size(), widest.output.size()) / kHidden));
       compared += c.compared;
@@ -1437,6 +1456,7 @@ int moe(MetalBackend &backend) {
         ++failures;
       }
     };
+    const auto compareWidest = [&](const MoeRun &run, const std::string &label) { compareTo(run, widest, label); };
     for (uint32_t lanes = SPLASH_MAXIMUM_BATCH_WIDTH; lanes >= 1; --lanes) {
       const MoePlan plan = MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8});
       const std::string label = formats + " staged decode B" + std::to_string(lanes);
@@ -1458,7 +1478,37 @@ int moe(MetalBackend &backend) {
       const std::string label = formats + " staged prefill rows=" + std::to_string(chunk);
       compareWidest(runPlan(backend, m, b, plan, products, stats, label), label);
     }
-    printf("%-20s staged   decode B1-%u, prefill 263/27/9/8: gate/up %.2f%% and down %.2f%% of outputs differ from "
+    // Decode steps in two K partitions (MoeConfig::gateUpPartitions, downPartitions), which sum a row's products in another order than
+    // one partition: each pass inside its fp64 interval and bitwise the passes apart in two partitions (runPlan), and
+    // a row's output bitwise at every lane count, against the widest step in two partitions.
+    MoeRun widestSplit;
+    for (uint32_t lanes = 4; lanes >= 1; --lanes) {
+      MoeConfig split{MoeExpertTile::M8};
+      split.gateUpPartitions = split.downPartitions = 2;
+      const MoePlan plan = MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, split);
+      const std::string label = formats + " staged decode B" + std::to_string(lanes) + " in two K partitions";
+      const MoeRun run = runPlan(backend, m, b, plan, products, stats, label);
+      if (widestSplit.output.empty())
+        widestSplit = run;
+      else
+        compareTo(run, widestSplit, label);
+    }
+    // Steps of 16 and 12 rows on 16-row tiles (selectMoe's decode tile past 8 rows): each pass inside its fp64
+    // interval and bitwise the passes apart (runPlan, gguf_moe_test_m16_*), a row bitwise where its routes ran the
+    // same tile kinds as in the widest step.
+    MoeRun widest16;
+    for (const uint32_t rows : {16u, 12u}) {
+      const MoePlan plan = MoE::plan(shape, rows, MoeConfig{MoeExpertTile::M16});
+      const std::string label = formats + " decode rows=" + std::to_string(rows) + " on 16-row tiles";
+      const MoeRun run = runPlan(backend, m, b, plan, products, stats, label);
+      if (widest16.output.empty())
+        widest16 = run;
+      else
+        compareTo(run, widest16, label);
+    }
+    printf("%-20s staged   decode B1-%u (B1-4 also in two K partitions, 12 and 16 rows on 16-row tiles), prefill "
+           "263/27/9/8: gate/up %.2f%% and down "
+           "%.2f%% of outputs differ from "
            "bf16(fp64), errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across tile kinds %s\n",
            formats.c_str(), SPLASH_MAXIMUM_BATCH_WIDTH, 100.0 * stats.gateUpFlips / (stats.outputs / 2),
            100.0 * stats.downFlips / stats.outputs,

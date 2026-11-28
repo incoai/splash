@@ -164,6 +164,22 @@ laneOutcomeWire(LaneOutcome outcome) noexcept {
   }
 }
 
+// What a request that cannot fit even alone (CapacityExhausted, KvDiskQuota)
+// lacked: memory, memory beside its images, an SSD cache that takes no
+// writes, or the SSD cache's quota of active KV. The values are on the wire
+// (Error), by which the server answers it as a prompt over the context.
+enum class CapacityLimit : uint8_t { None = 0, Memory = 1, ImageMemory = 2, ClosedDisk = 3, DiskQuota = 4 };
+
+// A capacity failure's limit, and the most prompt tokens that limit holds
+// this request alone now, with its first output token: 0 where the engine
+// cannot say.
+struct CapacityShortfall {
+  CapacityLimit limit = CapacityLimit::None;
+  uint32_t fitsTokens = 0;
+
+  bool operator==(const CapacityShortfall &) const = default;
+};
+
 inline constexpr std::string_view kDeadlineExceededMessage =
     "request deadline exceeded";
 
@@ -182,15 +198,28 @@ using TtftParts = std::array<double, kTtftParts>;
 // copy, or the SSD cache's copy alone. The values are on the wire (Start).
 enum class StateSource : uint8_t { None = 0, Memory = 1, Disk = 2 };
 
+// Why a start's reuse stopped where it did, from its final lookup: no block
+// of its prompt matched; the prompt parts from the cache at the matched KV's
+// end, every matched token reused; KV matched past the state it resumed from,
+// read again; or a read from the SSD failed on an earlier attempt, which then
+// matched less. The values are on the wire (Start).
+enum class ReuseEnd : uint8_t { NothingMatched = 0, PrefixEnd = 1, KvWithoutState = 2, DiskReadFailed = 3 };
+inline constexpr size_t kReuseEnds = 4;
+
 // What a request's start found in the cache: the tokens of the state it
 // resumes from, zero for a cold start; the prompt's tokens whose KV the cache
-// matched, the state's included; where that state was; and whether a matched
-// block past the state once held a state that is gone from both tiers.
+// matched, the state's included; where that state was; whether a matched
+// block past the state once held a state that is gone from both tiers; and
+// why its reuse stopped, with that end's tokens: the matched KV's end at a
+// prefix end, the KV past the state read again, the tokens the failed read
+// would have restored, none where nothing matched.
 struct StartFound {
   uint32_t matchedPromptTokens = 0;
   uint32_t prefixTokens = 0;
   StateSource stateSource = StateSource::None;
   bool lostState = false;
+  ReuseEnd reuseEnd = ReuseEnd::NothingMatched;
+  uint32_t reuseEndTokens = 0;
 };
 
 class EngineEventSink {
@@ -223,9 +252,11 @@ public:
                          std::span<const float> optionLogits,
                          const SpeculativeCounts &speculation) = 0;
   // retryAfterSeconds: for a retryable outcome, when a retry may succeed;
-  // 0 for at once.
+  // 0 for at once. capacity: for a request that cannot fit even alone, what
+  // it lacked and what fits.
   virtual void failed(uint64_t requestId, LaneOutcome outcome,
-                      std::string message, uint32_t retryAfterSeconds) = 0;
+                      std::string message, uint32_t retryAfterSeconds,
+                      CapacityShortfall capacity) = 0;
 };
 
 } // namespace splash::engine

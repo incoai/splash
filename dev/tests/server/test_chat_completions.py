@@ -34,6 +34,9 @@ class ChatCompletionTests(HarnessTestCase):
                 "prefix_tokens": 2,
                 "state_source": "disk",
                 "lost_state": True,
+                # Matched KV past the state it resumed from.
+                "reuse_end": "kv_without_state",
+                "reuse_end_tokens": 1,
             },
         )
 
@@ -59,6 +62,8 @@ class ChatCompletionTests(HarnessTestCase):
                     "prefix_tokens": 1,
                     "state_source": "memory",
                     "lost_state": False,
+                    "reuse_end": "prefix_end",
+                    "reuse_end_tokens": 1,
                 },
                 "completion_tokens_details": {"reasoning_tokens": 3},
             },

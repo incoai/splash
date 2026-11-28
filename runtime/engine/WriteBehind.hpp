@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <unordered_set>
+#include <vector>
 
 namespace splash::engine {
 
@@ -26,18 +28,22 @@ struct WriteBehindSnapshot final {
 // Gives the newest restore points their copies on the disk tier while they
 // stay in RAM, ahead of need (Cache::persist): a reclaim then frees their
 // memory at once instead of waiting for writes, and a persistent tier's next
-// process takes them back. An ordinary point published or reused at least
-// kMinimumTokens deep is copied once it has waited kDelayMilliseconds,
-// unless its conversation has gone on from it by then: a point newest only
-// briefly, like a tool-loop step, costs no write, and a shorter one
-// recomputes faster than its state writes.
+// process takes them back. Only an ordinary point published or reused at
+// least kMinimumTokens deep is copied: a shorter one recomputes faster than
+// its state writes. A temporary tier copies one once it has waited
+// kDelayMilliseconds, unless its conversation has gone on from it by then: a
+// point newest only briefly, like a tool-loop step, costs no write.
 //
-// A persistent tier copies every point, in use or not, so a later start,
-// after a crash too, takes it back. A temporary tier's copies serve reclaims
-// alone, so there a point is copied only on the memory's demand for copies
-// (run): while claims recently reached cache a copy would have let go at
-// once, and only as far as the cache's victims that go at once do not cover
-// the claims ahead. A point is copied only once its request has ended, since
+// A persistent tier copies points in use or not, by progress rather than by
+// quiet, so that a start after a crash loses at most kMinimumTokens: a point
+// (a head at once) falls due when kMinimumTokens deeper than its chain's
+// deepest point a restart would take back, measured each step, and is
+// copied though its conversation goes on; one not due waits for a clean
+// stop. A temporary tier's copies serve reclaims alone, so there a point is
+// copied only on the memory's demand for copies (run): while claims
+// recently reached cache a copy would have let go at once, and only as far
+// as the cache's victims that go at once do not cover the claims ahead. A
+// point is copied only once its request has ended, since
 // until then the request may go on from its chain and reclaims take the
 // point last. Without demand nothing is written ahead. Points waiting for
 // demand keep their turn while they stay the newest of their conversations:
@@ -48,9 +54,8 @@ struct WriteBehindSnapshot final {
 // that wait, and none while a claim waits for memory on its way back: what
 // it waits for (a demotion, a restore, the state write) comes first, and a
 // copy started as one lands could take the state write from it again. Like
-// every tier write they draw on the write budget when one is set
-// (model::DiskBudget): a point waits while the budget holds its state back,
-// which is written before its chain.
+// every cache write they wait while the write budget is spent
+// (Cache::takesCacheWrites).
 class WriteBehind final {
 public:
   static constexpr double kDelayMilliseconds = 10'000.0;
@@ -81,9 +86,9 @@ public:
   // given up; a write it starts wakes the engine when it lands.
   [[nodiscard]] bool run(double now, uint64_t demandBytes, bool claimWaiting);
   // At a clean stop: in a persistent tier, steps every waiting point, the
-  // newest first, due or not and in use or not, whatever the write budget
-  // (Cache::liftDiskWriteBudget). True once none is left, and at once in a
-  // temporary tier, whose copies go with the process.
+  // newest first, due or not and in use or not, and refuses those left while
+  // the write budget is spent (Cache::takesCacheWrites). True once none is
+  // left, and at once in a temporary tier, whose copies go with the process.
   [[nodiscard]] bool flush();
   // When run() next has work no landing write will wake it for: the next
   // point not in use falling due, or when the write budget admits a step it
@@ -98,10 +103,18 @@ private:
   struct Point final {
     uint64_t block = 0;
     double due = 0.0;
+    // A persistent tier's base when last found (fallsDue), and the point's
+    // chain, root first, whose blocks' copies the base stands on.
+    uint64_t base = 0;
+    std::vector<uint64_t> chain;
     bool head = false;
   };
+  // A persistent tier's point falls due kMinimumTokens past its chain's
+  // deepest point a restart would take back (Cache::deepestTakenBack).
+  [[nodiscard]] bool fallsDue(Point &point) const;
   // Counts a step that settled its point; false while it is in progress.
-  bool settle(PersistStatus status);
+  bool settle(uint64_t block, PersistStatus status);
+  static constexpr double kNever = std::numeric_limits<double>::infinity();
   // Steps the due points not in use, while copies are made (copying_) and
   // `copies` says the next one is.
   [[nodiscard]] bool step(double now, bool claimWaiting, const std::function<bool()> &copies);

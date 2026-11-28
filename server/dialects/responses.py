@@ -706,6 +706,7 @@ def stream(exchange, job, *, conversation):
         collected = exchange.collect(
             job,
             on_start=begin,
+            streaming=True,
             on_text=sequencer.text,
             on_tool_delta=sequencer.tool,
             on_idle=keepalive,

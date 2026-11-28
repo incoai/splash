@@ -100,6 +100,7 @@ class RequestLifetimeTests(unittest.TestCase):
                             False,
                             b"capacity_exhausted",
                             b"could not allocate KV target: engine budget",
+                            capacity_limit=wire.CapacityLimit.MEMORY,
                         )
                     )
                 elif outcome == "shutdown":

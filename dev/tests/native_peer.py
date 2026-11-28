@@ -88,13 +88,15 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             )
         case wire.StartEvent():
             return wire.FrameType.START, struct.pack(
-                "<QIIIBB",
+                "<QIIIBBBI",
                 event.request_id,
                 event.lane,
                 event.matched_prompt_tokens,
                 event.prefix_tokens,
                 event.state_source,
                 event.lost_state,
+                event.reuse_end,
+                event.reuse_end_tokens,
             )
         case wire.PromptProgressEvent():
             return wire.FrameType.PROMPT_PROGRESS, struct.pack(
@@ -138,11 +140,13 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             )
         case wire.ErrorEvent():
             return wire.FrameType.ERROR, struct.pack(
-                f"<BBIQII{len(event.code)}s{len(event.message)}s",
+                f"<BBIQBIII{len(event.code)}s{len(event.message)}s",
                 event.failure_class,
                 event.retryable,
                 event.retry_after_seconds,
                 event.request_id,
+                event.capacity_limit,
+                event.fits_tokens,
                 len(event.code),
                 len(event.message),
                 event.code,

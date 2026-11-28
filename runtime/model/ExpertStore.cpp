@@ -1211,6 +1211,9 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     // floor's chunks take their memory now, the elastic chunks as
     // growTowardCap takes them.
     const ExpertSlotPlanes slotPlanes{size.layout[0].planes, size.layout[1].planes, size.layout[2].planes};
+    if (size.streams)
+      impl.counters.slotBytes.push_back(detail::expertSlotGroup(slotPlanes).bytes /
+                                        detail::expertSlotGroup(slotPlanes).slots);
     size.chunkLayout = size.streams ? streamedExpertChunkLayout(slotPlanes, size.slots, floorSlots, shape.experts,
                                                                 largest, options.elasticChunkBytes, options.floorShare)
                                     : wholeExpertChunkLayout(slotPlanes, size.slots, largest);

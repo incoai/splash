@@ -14,7 +14,7 @@
 // print the same digests, whatever their storage.
 //
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--rows 2048,...]
-//                        [--shapes 27b,35b,122b,fn,flint-window,flint-full]
+//                        [--shapes 27b,35b,122b,fn,flint-window,flint-full,inkling-window,inkling-full]
 //                        [--lanes 1,4] [--verify-rows 8,16] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
@@ -24,6 +24,15 @@
 // over 4 KV heads of 128 dimensions with a learned sink per query head, 35
 // that attend a window of the 512 keys before each row and 14 that attend
 // the whole history (ops::AttentionVariant).
+//
+// inkling-window and inkling-full are Inkling-2-Mini's relative attention
+// (ops::RelativeAttention): 24 query heads over 8 KV heads of 128
+// dimensions, a sliding application's window of 1023 keys and a full
+// application's whole, position-scaled history. Each case runs the kernels
+// the model runs, planned as it plans them: a prefill chunk's prepare and its
+// direct kernel or split and reduce, a decode step's single pass of each
+// lane's block of rows; its rows' projections, the layer's weights and the
+// rows' K/V are synthetic, its history the fixture's.
 //
 // fn is Qwen3.8-Flash-Next's GQA-12 attention, whose rows attend past 512
 // complete blocks of four tokens only to the 512 blocks their QSA bitmap
@@ -67,6 +76,7 @@
 #include "ops/ExecutionPlans.hpp"
 #include "ops/LaneRows.hpp"
 #include "ops/PagedAttention.hpp"
+#include "ops/RelativeAttention.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -109,7 +119,7 @@ constexpr uint32_t kLayer = 1;
 // The memory plan's extents of the full models: 16, 10, 12, 12 and 49
 // attention layers.
 constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayers122b = 12, kModelLayersFn = 12,
-                   kModelLayersFlint = 49;
+                   kModelLayersFlint = 49, kModelLayersInkling = 48;
 // Qwen3.8-Flash-Next's QSA: the indexer's top_k of 2048 tokens in blocks of 4.
 constexpr uint32_t kQsaTopBlocks = 512, kQsaBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 // --qsa overlapping: the blocks a tile's rows choose theirs from, three times
@@ -118,8 +128,19 @@ constexpr uint32_t kQsaTopBlocks = 512, kQsaBlockTokens = SPLASH_ATTENTION_BLOCK
 constexpr uint32_t kQsaOverlapBlocks = 3 * kQsaTopBlocks;
 
 bool isFlint(const std::string &shape) { return shape == "flint-window" || shape == "flint-full"; }
+bool isInkling(const std::string &shape) { return shape == "inkling-window" || shape == "inkling-full"; }
+
+// An Inkling-2-Mini shape's application: a sliding one's window, or a full
+// one's whole history, position-scaled (Inkling2LoopLayout).
+RelativeAttentionVariant relativeVariant(const std::string &shape) {
+  return shape == "inkling-window" ? RelativeAttentionVariant{RelativeAttention::kWindowTokens, false}
+                                   : RelativeAttentionVariant{0, true};
+}
 
 AttentionShape shapeOf(const std::string &shape, kv::Format format) {
+  if (isInkling(shape))
+    return AttentionShape{RelativeAttention::kQueryHeads, RelativeAttention::kKvHeads, RelativeAttention::kHeadDimension,
+                          format};
   if (shape == "flint-window") return AttentionShape{32, 4, 128, format, false, {.rotated = true, .windowTokens = 512}};
   if (shape == "flint-full") return AttentionShape{32, 4, 128, format, false, {.rotated = false, .windowTokens = 0}};
   if (shape == "fn") return AttentionShape{24, 2, 256, format, true};
@@ -133,6 +154,7 @@ uint32_t modelLayers(const std::string &shape) {
          : shape == "35b"  ? kModelLayers35b
          : shape == "122b" ? kModelLayers122b
          : isFlint(shape)  ? kModelLayersFlint
+         : isInkling(shape) ? kModelLayersInkling
                            : kModelLayersFn;
 }
 
@@ -140,7 +162,7 @@ std::string modelName(const std::string &shape) {
   return shape == "27b"    ? "qwen3.8-27b"
          : shape == "35b"  ? "qwen3.6-35b-a3b"
          : shape == "122b" ? "qwen3.5-122b-a10b"
-         : isFlint(shape)  ? shape
+         : isFlint(shape) || isInkling(shape) ? shape
                            : "qwen3.8-flash-next";
 }
 
@@ -203,15 +225,16 @@ std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::st
 // A prefill chunk of `rows` rows on one lane, or `lanes` lanes of `rows`
 // verify rows each, all after `history` tokens, with the workspace the
 // runtime's arena holds for it: a prompt chunk's, or a decode step's of a
-// lane's tiles at the most splits each.
-AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
-                              uint32_t history, uint32_t extentPages, uint32_t rows, const ExecutionPlans &plans) {
+// lane's tiles at the most splits each, the paged attention's or, `relative`,
+// relative attention's (which relativeCase allocates itself).
+AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes, uint32_t history,
+                              uint32_t extentPages, uint32_t rows, const ExecutionPlans &plans, bool relative) {
   const kv::Layout layout = test::attentionLayout(shape);
   const uint32_t caseLanes = prefill ? 1 : lanes;
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);
-  AttentionWorkspace scratch = plans.sequenceAttentionWorkspace(shape.queryHeads, layout);
-  if (!prefill) {
+  AttentionWorkspace scratch = relative ? AttentionWorkspace{} : plans.sequenceAttentionWorkspace(shape.queryHeads, layout);
+  if (!prefill && !relative) {
     const AttentionWorkspace lane = plans.laneAttentionWorkspace(shape.queryHeads, layout);
     scratch = {lane.partialsBytes * caseLanes, lane.statisticsBytes * caseLanes};
   }
@@ -469,12 +492,111 @@ std::span<const uint8_t> outputBytes(const AttentionFixture &fixture) {
   return {static_cast<const uint8_t *>(output.contents()), output.sizeBytes()};
 }
 
-// FNV-1a of the attention output.
-uint64_t outputDigest(const AttentionFixture &fixture) {
+// FNV-1a of an attention output.
+uint64_t outputDigest(std::span<const uint8_t> bytes) {
   uint64_t digest = 0xcbf29ce484222325ULL;
-  for (const uint8_t byte : outputBytes(fixture))
+  for (const uint8_t byte : bytes)
     digest = (digest ^ byte) * 0x100000001b3ULL;
   return digest;
+}
+uint64_t outputDigest(const AttentionFixture &fixture) { return outputDigest(outputBytes(fixture)); }
+
+// What Inkling-2-Mini's relative attention reads besides the fixture's
+// pages: its rows' projection rows (queries, gates, relative states, sinks)
+// and convolved K/V rows, the layer's weights, the prepare's staging, the
+// workspace and counters, and the rows it writes.
+struct RelativeCase final {
+  RelativeAttentionRows rows;
+  RelativeAttentionWeights weights;
+  RelativeAttentionStaging staging;
+  RelativeAttentionWorkspace workspace;
+  metal::MetalBuffer output;
+  metal::CommandGraph graph;
+
+  [[nodiscard]] std::span<const uint8_t> outputBytes() const {
+    return {static_cast<const uint8_t *>(output.contents()), output.sizeBytes()};
+  }
+};
+
+template <class T> T *contents(const metal::MetalBuffer &buffer) { return static_cast<T *>(buffer.contents()); }
+
+// bf16 values of `count` elements of a buffer under `seed`, times `scale`.
+void fillNoise(const metal::MetalBuffer &buffer, uint64_t count, uint32_t seed, float scale) {
+  for (uint64_t index = 0; index < count; ++index) contents<uint16_t>(buffer)[index] = bfloat16(scale * noise(index, seed));
+}
+
+// A relative attention case over a fixture's pages, planned and encoded as
+// Inkling2LoopTarget plans and encodes a layer: a prompt chunk's prepare and
+// attention over the runtime's sequence workspace, or a decode step's single
+// pass over its lanes' workspaces.
+RelativeCase relativeCase(metal::MetalBackend &backend, const AttentionFixture &fixture, bool prefill,
+                          RelativeAttentionVariant variant, const ExecutionPlans &plans) {
+  const AttentionFixturePlan &plan = fixture.plan();
+  const kv::Layout layout = plan.layout();
+  const uint64_t rows = uint64_t{plan.lanes} * plan.rows;
+  const uint64_t kvElements = rows * RelativeAttention::kKvHeads * RelativeAttention::kHeadDimension;
+  const auto chunks = fixture.sequences();
+  const std::span<const kv::ChunkedPrefillParams> sequences = std::span(chunks).first(plan.lanes);
+  RelativeCase result;
+  result.rows = {sharedBuffer<uint16_t>(backend, rows * RelativeAttention::kProjectionStride, "inkling-projection"),
+                 sharedBuffer<uint16_t>(backend, kvElements, "inkling-keys"),
+                 sharedBuffer<uint16_t>(backend, kvElements, "inkling-values")};
+  // Queries, gates and relative states of unit scale, sinks at zero, the
+  // padding columns zero.
+  std::memset(result.rows.projection.contents(), 0, result.rows.projection.sizeBytes());
+  for (uint64_t row = 0; row < rows; ++row)
+    for (uint64_t column = 0; column < RelativeAttention::kProjectionWidth - RelativeAttention::kQueryHeads; ++column)
+      contents<uint16_t>(result.rows.projection)[row * RelativeAttention::kProjectionStride + column] =
+          bfloat16(noise(row * RelativeAttention::kProjectionWidth + column, 5));
+  fillNoise(result.rows.keys, kvElements, 6, 1.0f);
+  fillNoise(result.rows.values, kvElements, 7, 1.0f);
+  constexpr uint32_t states = SPLASH_RELATIVE_ATTENTION_STATES;
+  result.weights = {sharedBuffer<float>(backend, RelativeAttention::kQueryHeads * RelativeAttention::kHeadDimension,
+                                        "inkling-query-scale"),
+                    sharedBuffer<float>(backend, RelativeAttention::kQueryHeads * states, "inkling-relative-scale"),
+                    sharedBuffer<float>(backend, uint64_t{SPLASH_RELATIVE_ATTENTION_EXTENT} * states, "inkling-bias")};
+  std::fill_n(contents<float>(result.weights.queryScale), RelativeAttention::kQueryHeads * RelativeAttention::kHeadDimension,
+              1.0f);
+  std::fill_n(contents<float>(result.weights.relativeScale), RelativeAttention::kQueryHeads * states, 1.0f);
+  for (uint32_t index = 0; index < SPLASH_RELATIVE_ATTENTION_EXTENT * states; ++index)
+    contents<float>(result.weights.bias)[index] = 0.5f * noise(index, 8);
+  result.output = sharedBuffer<uint16_t>(
+      backend, rows * RelativeAttention::kQueryHeads * RelativeAttention::kHeadDimension, "inkling-output");
+  const AttentionWorkspace capacity =
+      prefill ? RelativeAttention::sequenceWorkspace(layout)
+              : AttentionWorkspace{RelativeAttention::laneWorkspace(layout).partialsBytes * plan.lanes,
+                                   RelativeAttention::laneWorkspace(layout).statisticsBytes * plan.lanes};
+  const RelativeAttentionPlan attention =
+      RelativeAttention::plan(sequences, layout, plans.calibration().attention, Int8Activations::On, capacity, variant,
+                              prefill ? StepKind::Prefill : StepKind::Decode);
+  const AttentionWorkspace workspace = attention.workspace();
+  result.workspace = {backend.allocateBuffer(workspace.partialsBytes, metal::BufferStorage::Private, "inkling-partials"),
+                      backend.allocateBuffer(workspace.statisticsBytes, metal::BufferStorage::Private,
+                                             "inkling-statistics"),
+                      sharedBuffer<uint32_t>(backend, RelativeAttention::kCountersBytes / sizeof(uint32_t),
+                                             "inkling-counters")};
+  std::memset(result.workspace.counters.contents(), 0, result.workspace.counters.sizeBytes());
+  const SplashKvLayer layer = fixture.pool().layer(plan.geometry.layer);
+  std::vector<metal::MetalBuffer> tables;
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane) tables.push_back(fixture.buffer(AttentionFixturePlan::table(lane)));
+  const AttentionOutputRows output{result.rows.projection, result.output};
+  if (!prefill) {
+    (void)RelativeAttention::addDecode(result.graph, attention, result.rows, result.weights, layer, tables, sequences,
+                                       fixture.rows(), result.workspace, output);
+    return result;
+  }
+  const RelativeAttentionStagingBytes staged = RelativeAttention::stagingBytes(sequences, layout);
+  result.staging = {backend.allocateBuffer(staged.queries, metal::BufferStorage::Private, "inkling-queries"),
+                    backend.allocateBuffer(staged.states, metal::BufferStorage::Private, "inkling-states"),
+                    backend.allocateBuffer(staged.sinks, metal::BufferStorage::Private, "inkling-sinks")};
+  RelativeAttention::addProjection(result.graph, result.rows, result.weights, result.staging, layer, tables, sequences,
+                                   fixture.rows(), layout, variant);
+  std::vector<AttentionHistory> histories;
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane) histories.push_back({layer, tables[lane]});
+  (void)RelativeAttention::addAttention(result.graph, attention, result.staging, result.weights,
+                                        result.workspace.partials, result.workspace.statistics, sequences, histories,
+                                        fixture.rows(), output);
+  return result;
 }
 
 struct Case final {
@@ -496,10 +618,14 @@ double median(std::vector<double> values) {
 // and must give the same output reading them through their locations.
 std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
                           const AttentionFixturePlan &plan, bool prefill, uint32_t repeat,
-                          double warmupSeconds, const std::string &qsa, bool located, const ExecutionPlans &plans) {
+                          double warmupSeconds, const std::string &qsa, bool located, const ExecutionPlans &plans,
+                          std::optional<RelativeAttentionVariant> relative = std::nullopt) {
   std::vector<std::unique_ptr<AttentionFixture>> fixtures;
   std::vector<QsaBlocks> blocks;
   std::vector<metal::CommandGraph> graphs;
+  std::vector<RelativeCase> relatives;
+  // A relative case's output is its own rows, a paged one's the fixture's.
+  const auto output = [&](size_t i) { return relative ? relatives[i].outputBytes() : outputBytes(*fixtures[i]); };
   std::vector<Case> results(backends.size());
   // The indexer writes its own bitmaps.
   const uint32_t words = qsa.empty() ? 0 : qsaWords(plan);
@@ -510,7 +636,12 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
         std::make_unique<AttentionFixture>(*backends[i], plan, "attention-sweep-fixture"));
     fixtures.back()->fill();
     blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words, qsa == "indexer", located));
-    graphs.push_back(caseGraph(*fixtures.back(), blocks.back(), plans));
+    if (relative) {
+      relatives.push_back(relativeCase(*backends[i], *fixtures.back(), prefill, *relative, plans));
+      graphs.push_back(std::move(relatives.back().graph));
+    } else {
+      graphs.push_back(caseGraph(*fixtures.back(), blocks.back(), plans));
+    }
     if (located) {
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       const uint64_t paged = outputDigest(*fixtures.back());
@@ -528,10 +659,10 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
     for (size_t i = 0; i < backends.size(); ++i)
       warmup += backends[i]->submitCommandAsync(graphs[i].dispatches()).wait().gpuSeconds;
   for (size_t i = 1; i < fixtures.size(); ++i)
-    if (!std::ranges::equal(outputBytes(*fixtures[0]), outputBytes(*fixtures[i])))
+    if (!std::ranges::equal(output(0), output(i)))
       throw std::runtime_error("comparison metallib changed attention output bits");
   for (size_t i = 0; i < fixtures.size(); ++i) {
-    results[i].outputDigest = outputDigest(*fixtures[i]);
+    results[i].outputDigest = outputDigest(output(i));
     results[i].listEntries = listEntries(blocks[i]);
   }
   std::vector<std::vector<double>> fused(backends.size());
@@ -616,7 +747,7 @@ int main(int argc, const char *argv[]) {
   try {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--rows LIST] "
-                   "[--shapes 27b,35b,122b,fn,flint-window,flint-full] "
+                   "[--shapes 27b,35b,122b,fn,flint-window,flint-full,inkling-window,inkling-full] "
                    "[--lanes LIST] [--verify-rows LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
@@ -678,8 +809,10 @@ int main(int argc, const char *argv[]) {
           const size_t comma = value.find(',', start);
           const std::string shape =
               value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-          if (shape != "27b" && shape != "35b" && shape != "122b" && shape != "fn" && !isFlint(shape))
-            throw std::invalid_argument("--shapes takes 27b, 35b, 122b, fn, flint-window or flint-full");
+          if (shape != "27b" && shape != "35b" && shape != "122b" && shape != "fn" && !isFlint(shape) &&
+              !isInkling(shape))
+            throw std::invalid_argument(
+                "--shapes takes 27b, 35b, 122b, fn, flint-window, flint-full, inkling-window or inkling-full");
           shapes.push_back(shape);
           if (comma == std::string::npos) break;
           start = comma + 1;
@@ -730,8 +863,9 @@ int main(int argc, const char *argv[]) {
           // Only a verify with lists reads its blocks through locations.
           const bool caseLocated = located && !prefill && !shapeQsa.empty();
           const auto cases =
-              measure(backends, casePlan(geometry, prefill, lane, history, shapeExtentPages, rows, plans),
-                      prefill, repeat, warmupSeconds, shapeQsa, caseLocated, plans);
+              measure(backends, casePlan(geometry, prefill, lane, history, shapeExtentPages, rows, plans, isInkling(shape)),
+                      prefill, repeat, warmupSeconds, shapeQsa, caseLocated, plans,
+                      isInkling(shape) ? std::optional(relativeVariant(shape)) : std::nullopt);
           warmupSeconds = 0.1;
           for (size_t i = 0; i < cases.size(); ++i) {
             std::cout << (firstCase ? "" : ",")

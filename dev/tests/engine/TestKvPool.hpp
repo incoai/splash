@@ -18,9 +18,9 @@
 namespace splash::test {
 
 // Extents of extentPages pages, none allocated until the pool allocates
-// them (its runway first), as PageStorage, of bytesPerPage bytes a Full page,
-// indexBytesPerPage an Index page and slimBytesPerPage a Slim one; without
-// index bytes no page is Index, and without slim bytes none is Slim. Growth
+// them (its runway first), as PageStorage, of bytesPerPage bytes a Full page
+// and indexBytesPerPage an Index page; without index bytes no page is Index.
+// Growth
 // is refused with allocationFailure (EngineBudget, the governor's cause,
 // unless a test names another) past the bytes of budgetPages Full pages,
 // while growthBlocked, or when growthAllowed(extent) says no; a
@@ -35,10 +35,8 @@ namespace splash::test {
 // the pool moves.
 class TestKvStorage final : public kv::ExtentStorage {
 public:
-    TestKvStorage(uint32_t pages, uint64_t bytesPerPage, uint32_t extentPages,
-                  uint64_t indexBytesPerPage = 0, uint64_t slimBytesPerPage = 0)
-        : content(pages), pageCount_(pages), bytesPerPage_(bytesPerPage),
-          indexBytesPerPage_(indexBytesPerPage), slimBytesPerPage_(slimBytesPerPage),
+    TestKvStorage(uint32_t pages, uint64_t bytesPerPage, uint32_t extentPages, uint64_t indexBytesPerPage = 0)
+        : content(pages), pageCount_(pages), bytesPerPage_(bytesPerPage), indexBytesPerPage_(indexBytesPerPage),
           extentPages_(extentPages) {
         if (!pages || !bytesPerPage || !extentPages || pages % extentPages) {
             throw std::invalid_argument("invalid test KV extent storage");
@@ -48,12 +46,7 @@ public:
 
     uint32_t pageCount() const noexcept override { return pageCount_; }
     uint64_t bytesPerPage(kv::PageForm form) const noexcept override {
-        switch (form) {
-        case kv::PageForm::Full: return bytesPerPage_;
-        case kv::PageForm::Index: return indexBytesPerPage_;
-        case kv::PageForm::Slim: return slimBytesPerPage_;
-        }
-        return 0;
+        return form == kv::PageForm::Full ? bytesPerPage_ : indexBytesPerPage_;
     }
     uint32_t extentPages() const noexcept override { return extentPages_; }
     metal::AllocationResult allocateExtent(uint32_t extent, kv::PageForm form) override {
@@ -62,8 +55,6 @@ public:
             throw std::logic_error("test KV extent is already allocated");
         if (form == kv::PageForm::Index && !indexBytesPerPage_)
             throw std::invalid_argument("test KV pages without an index are all Full");
-        if (form == kv::PageForm::Slim && !slimBytesPerPage_)
-            throw std::invalid_argument("test KV pages without a window keep every layer");
         if (memory) {
             const uint64_t bytes = extentPages_ * bytesPerPage(form);
             if (const metal::AllocationResult result = admission(bytes, [&] {
@@ -176,7 +167,6 @@ private:
     uint32_t pageCount_ = 0;
     uint64_t bytesPerPage_ = 0;
     uint64_t indexBytesPerPage_ = 0;
-    uint64_t slimBytesPerPage_ = 0;
     uint32_t extentPages_ = 0;
     // The form of each allocated extent.
     std::vector<std::optional<kv::PageForm>> forms_;

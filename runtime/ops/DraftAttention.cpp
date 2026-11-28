@@ -22,7 +22,7 @@ constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 constexpr uint32_t kWindowThreads = SPLASH_DRAFT_CONTEXT_SIMDGROUPS * 32;
 // Each split leaves a partial of its attention rows x (head dimensions + max
 // + sum) fp32 values behind the grouped queries.
-constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
+constexpr uint32_t kMostSplits = SPLASH_DRAFT_ATTENTION_MOST_SPLITS;
 constexpr uint64_t kPartialBytes = uint64_t{SPLASH_DRAFT_ATTENTION_ROWS} *
                                    (SPLASH_DRAFT_HEAD_DIMENSION + 2) * sizeof(float);
 
@@ -97,16 +97,17 @@ DraftAttentionWorkspace DraftAttentionPlan::workspace() const noexcept {
   const uint64_t rows = uint64_t{lanes_} * kRows;
   const uint64_t kvBytes = rows * shape_.kvHeads * shape_.headDimension * 2;
   const uint64_t partialBytes =
-      uint64_t{lanes_} * shape_.kvHeads * kSplits * kPartialBytes;
+      uint64_t{lanes_} * shape_.kvHeads * splits_ * kPartialBytes;
   return {rows * shape_.hiddenSize * 2, rows * shape_.qkvSize * 2,
           rows * shape_.attentionSize * 2 + partialBytes, kvBytes, kvBytes};
 }
 
-DraftAttentionPlan DraftAttention::plan(DraftAttentionShape shape,
-                                        uint32_t lanes) {
+DraftAttentionPlan DraftAttention::plan(DraftAttentionShape shape, uint32_t lanes, uint32_t splits) {
   requireLanes(lanes);
   requireCompiledShape(shape);
-  return {shape, lanes};
+  if (!splits || splits > kMostSplits)
+    throw std::invalid_argument("a draft attention plan splits a ring into 1 to its tiles");
+  return {shape, lanes, splits};
 }
 
 void DraftAttention::addConvolution(metal::CommandGraph &graph,
@@ -188,7 +189,7 @@ void DraftAttention::addDecode(
     requireBytes(buffers.persistentKeys[lane], ringBytes(shape), "draft key ring");
     requireBytes(buffers.persistentValues[lane], ringBytes(shape), "draft value ring");
   }
-  DraftAttentionBatchParams params{kWindow, lanes, {}};
+  DraftAttentionBatchParams params{kWindow, lanes, plan.splits(), {}};
   std::copy(cacheLengths.begin(), cacheLengths.end(),
             std::begin(params.cache_length));
   metal::BufferList bindings{buffers.groupedQueries};
@@ -197,7 +198,7 @@ void DraftAttention::addDecode(
   bindings.push_back(buffers.queryKeys);
   bindings.push_back(buffers.queryValues);
   graph.add("draft_attention_bf16_split", std::move(bindings), params,
-            {shape.kvHeads, lanes, kSplits});
+            {shape.kvHeads, lanes, plan.splits()});
   graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params,
             {shape.kvHeads, lanes, 1});
 }

@@ -9,6 +9,7 @@
 #include "model/SlotFile.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -73,8 +74,8 @@ public:
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
   bool writable() const noexcept override { return !disk_; }
-  bool canOffload(bool inUse) const noexcept override {
-    return !disk_ && (!control_->writeBudget || control_->writeBudget->admits(inUse));
+  bool canOffload() const noexcept override {
+    return !disk_ && (!control_->writeBudget || control_->writeBudget->admits());
   }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     return writeState(control_);
@@ -383,12 +384,18 @@ void testProbeRefreshFollowsTheGraph() {
 void testProbeRechecksStateChanges() {
   CacheFixture fixture;
   fixture.publish(3);
+  fixture.publish(2);
   fixture.publish(0);
   const CacheProbe probe = fixture.cache.probe(fixture.prompt, {});
-  require(probe.cachedTokens() == 128 && test::stateStep(fixture.cache).gave(),
-          "state eviction fixture did not remove the deepest state");
+  // The state at the first block is history behind the one at the third, which a request went on from to the
+  // deepest, and goes first.
+  require(probe.cachedTokens() == 128 && test::stateStep(fixture.cache).gave() &&
+              fixture.cache.lookup(fixture.prompt, {}, &probe).resumeBoundary() == 128,
+          "state eviction fixture did not remove the superseded state first");
+  require(test::stateStep(fixture.cache).gave() && test::stateStep(fixture.cache).gave(),
+          "state eviction fixture did not remove the other states");
   auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
-  require(lookup.kvBoundary == 128 && lookup.resumeBoundary() == 32,
+  require(lookup.kvBoundary == 128 && lookup.resumeBoundary() == 0,
           "admission probe reused an evicted state");
   lookup.state.reset();
 
@@ -769,6 +776,8 @@ void testDuplicateProbePromotesStateWithoutLookupAccounting() {
   require(probed.lookup.kvHitTokens == before.lookup.kvHitTokens &&
               probed.lookup.stateDiskHits == before.lookup.stateDiskHits,
           "publication probe polluted restore hit/miss accounting");
+  // A request went on from the state at the second block: the first two are history, the older by use first.
+  fixture.publish(2, 250);
   require(reclaimStateBytes(fixture.cache) == 200,
           "publication probe did not promote the existing state in LRU");
 }
@@ -977,13 +986,16 @@ void testCheckpointPinsAndBoundaryUpgrade() {
               fixture.lookup(97).resumeBoundary() == 64 &&
               fixture.cache.snapshot().stateCache.checkpointEntries == 0,
           "pinned boundary upgrade corrupted the eviction queues");
-  require(test::stateStep(fixture.cache).gave() &&
-              fixture.cache.lookup(fixture.prompt, {}).resumeBoundary() == 64,
-          "upgraded checkpoint did not join ordinary LRU");
-
   require(fixture.cache.reuseCompositeState(fixture.blocks[1], true) &&
               !fixture.cache.checkpointState(fixture.blocks[1]),
           "optional publication downgraded an ordinary boundary");
+  // Ordinary now, it joins the ordinary states in their order of use. The chain's newest state below it is a
+  // finished request's last point, which supersedes nothing (it may be a side question's), so neither is history:
+  // the one used first goes first, the newest, and the upgraded one stays.
+  require(test::stateStep(fixture.cache).gave() &&
+              fixture.cache.lookup(fixture.prompt, {}).resumeBoundary() == 64 &&
+              fixture.lookup(65).resumeBoundary() == 64,
+          "upgraded checkpoint did not join the ordinary states in their order of use");
 }
 
 void testCheckpointPressurePreservesHotPrefix() {
@@ -1119,10 +1131,13 @@ void testDiskQuotaKeepsTheOnlyCopyAQueuedRequestRestores() {
 }
 
 // A full temporary quota still demotes a needed leaf by replacing its oldest copy, the slot the
-// take finds as freeDiskSpace does.
+// take finds as freeDiskSpace does: the point of the conversation used longest ago, its state and
+// then its K/V, which no state needs any more. The conversations are used in turn, each a lookup
+// that reads its K/V and then lets its state go, so that each one's K/V and state were used
+// after the conversation before it.
 void testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy() {
   test::TestKvTier tier;
-  auto budget = std::make_shared<model::DiskBudget>(2 * tier.slotBytes(kv::PageForm::Full));
+  auto budget = std::make_shared<model::DiskBudget>(2 * tier.slotBytes());
   tier.budget = budget;
   Prefixes prefixes(&tier, true, budget);
   auto control = std::make_shared<TransferControl>();
@@ -1130,6 +1145,8 @@ void testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy() {
   control->capacity = 8;
   for (const uint64_t block : prefixes.blocks)
     prefixes.cache.publishCompositeState(block, std::make_shared<TieredState>(control), false);
+  for (uint32_t index = 0; index < prefixes.blocks.size(); ++index)
+    static_cast<void>(prefixes.lookup(index));
   const auto step = [&] {
     const bool progress =
         test::evictStep(prefixes.cache).gave();
@@ -1142,7 +1159,7 @@ void testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy() {
     require(step(), "the cache did not leave RAM");
   const uint64_t demotions = tier.demotions;
   const uint64_t diskBlocks = prefixes.cache.snapshot().kvTier.diskBlocks;
-  require(budget->usedBytes() + tier.slotBytes(kv::PageForm::Full) > budget->limitBytes() && diskBlocks == 2 &&
+  require(budget->usedBytes() + tier.slotBytes() > budget->limitBytes() && diskBlocks == 2 &&
               !prefixes.cache.stateResident(prefixes.blocks[2]),
           "the quota was not full of two disk-only leaves beside a state on disk");
   const uint32_t freePages = prefixes.pool.freePageCount();
@@ -1155,6 +1172,194 @@ void testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy() {
   tier.complete();
   static_cast<void>(prefixes.cache.pollTransfers());
   require(prefixes.pool.freePageCount() == freePages + 1, "the leaf's page did not free once its copy landed");
+}
+
+// Conversations of `blocks` blocks each, a state at the tip, beside a
+// temporary tier whose quota holds `slots` K/V copies; the states' file
+// holds what TransferControl's capacity says.
+struct Conversations {
+  static constexpr uint32_t blocks = 4;
+  test::TestKvTier tier;
+  std::shared_ptr<model::DiskBudget> budget;
+  test::TestKvStorage storage{64, 100, 1};
+  KvPool pool{storage, 0};
+  engine::Cache cache;
+  std::shared_ptr<TransferControl> control = std::make_shared<TransferControl>();
+  std::vector<std::vector<uint32_t>> chains;
+  std::vector<uint64_t> tips;
+  uint64_t request = 0;
+
+  explicit Conversations(uint32_t slots)
+      : budget(std::make_shared<model::DiskBudget>(slots * test::TestKvTier().slotBytes())),
+        cache(pool, (tier.budget = budget, &tier), budget) {
+    control->ready = true;
+    control->capacity = 64;
+  }
+  // A new conversation in memory, the newest, with a state at its tip or at
+  // every block; returns its index.
+  size_t add(uint32_t length = blocks, bool everyBlock = false) {
+    const size_t index = chains.size();
+    std::vector<uint32_t> &chain = chains.emplace_back(length * KvCache::pageTokens + 1);
+    std::iota(chain.begin(), chain.end(), 1000 + 1000 * static_cast<uint32_t>(index));
+    cache.beginRequest(++request);
+    require(admitTokens(cache, request, length * KvCache::pageTokens).granted(), "a conversation's pages were denied");
+    tips.push_back(test::publishBlocks(cache, request, chain, length * KvCache::pageTokens));
+    std::vector<uint64_t> points{tips.back()};
+    for (uint32_t block = 1; everyBlock && block < length; ++block)
+      points.push_back(cache.blockAt(request, block * KvCache::pageTokens));
+    cache.endRequest(request);
+    for (const uint64_t point : points)
+      cache.publishCompositeState(point, std::make_shared<TieredState>(control), false);
+    return index;
+  }
+  // Memory lets go of what it holds, a step at a time, each write landing
+  // before the next step.
+  void release() {
+    for (bool gave = true; gave;) {
+      gave = test::evictStep(cache).gave();
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+  }
+  // The tokens a request for the conversation's next turn finds cached.
+  uint64_t resumes(size_t index) { return cache.probe(chains[index], {}).cachedTokens(); }
+  // The conversation is used: a lookup reads its chain and lets it go.
+  void use(size_t index) { static_cast<void>(cache.lookup(chains[index], {})); }
+};
+
+// A full temporary quota and a queued restore, the shape of the 35B's
+// three conversations: two conversations in memory let go of everything,
+// each a write per block. Their writes take room by use, the conversation
+// used longest ago that no request waits for first, then the older of the
+// two writers, only as much as they need: the queued conversation, though
+// used longer ago still, keeps its state and its whole chain, and the one
+// used last keeps everything.
+void testAFullTemporaryQuotaGivesWayByUseAndKeepsAQueuedRestore() {
+  constexpr uint32_t whole = Conversations::blocks * KvCache::pageTokens;
+  Conversations c(3 * Conversations::blocks);
+  for (int each = 0; each < 3; ++each) {
+    c.add();
+    c.release();
+  }
+  require(c.budget->usedBytes() == c.budget->limitBytes() && c.resumes(0) == whole && c.resumes(1) == whole &&
+              c.resumes(2) == whole,
+          "the quota was not full of three whole conversations");
+  const CacheProbe queued = c.cache.probe(c.chains[0], {});
+  c.cache.setWantedChains({queued.restoredChain()});
+  const size_t first = c.add(), second = c.add();
+  c.use(2);
+  c.release();
+  require(c.resumes(0) == whole, "the quota gave up the state or chain of the conversation a request waits for");
+  require(c.resumes(1) == 0, "the conversation used longest ago that no request waits for did not give way");
+  require(c.resumes(2) == whole, "a write took room from a conversation used later than its own");
+  require(c.resumes(first) == 0, "the next conversation by use did not give way to a newer one's writes");
+  require(c.resumes(second) == whole, "the newer conversation's writes found no room");
+  c.cache.setWantedChains({});
+}
+
+// Never to a conversation used longer ago: once only newer conversations'
+// points are left, a write is refused and its item leaves without a copy.
+void testAFullTemporaryQuotaRefusesAWriteOfAConversationUsedLonger() {
+  constexpr uint32_t whole = Conversations::blocks * KvCache::pageTokens;
+  Conversations c(2 * Conversations::blocks);
+  for (int each = 0; each < 2; ++each) {
+    c.add();
+    c.release();
+  }
+  const size_t older = c.add();
+  c.use(0);
+  c.use(1);
+  c.release();
+  require(c.resumes(0) == whole && c.resumes(1) == whole,
+          "a write of a conversation used longer ago took the room of newer ones");
+  require(c.resumes(older) == 0, "the conversation used longest ago kept a point the quota could not hold");
+}
+
+// A side request from a conversation's tip, whose own state lands on the
+// SSD, supersedes nothing on the main branch: at a full quota the tip is
+// still a point, the conversation used longest ago gives way before it, and
+// the conversation's next turn resumes from it.
+void testASideBranchsStateOnTheSsdLeavesTheTipAPoint() {
+  constexpr uint32_t whole = Conversations::blocks * KvCache::pageTokens;
+  Conversations c(2 * Conversations::blocks + 1);
+  c.add();
+  c.release();
+  const size_t main = c.add();
+  std::vector<uint32_t> side(c.chains[main].begin(), c.chains[main].begin() + whole);
+  side.insert(side.end(), KvCache::pageTokens + 1, 7777);
+  {
+    auto lookup = c.cache.lookup(side, {});
+    c.cache.beginRequest(++c.request);
+    require(admitRestore(c.cache, c.request, lookup).granted() &&
+                admitTokens(c.cache, c.request, whole + KvCache::pageTokens).granted(),
+            "the side request's pages were denied");
+  }
+  const uint64_t sideTip = test::publishBlocks(c.cache, c.request, side, whole + KvCache::pageTokens);
+  c.cache.endRequest(c.request);
+  c.cache.publishCompositeState(sideTip, std::make_shared<TieredState>(c.control), false);
+  c.release();
+  require(c.budget->usedBytes() == c.budget->limitBytes() && c.resumes(main) == whole &&
+              c.cache.probe(side, {}).cachedTokens() == whole + KvCache::pageTokens,
+          "the quota did not hold the conversation, its side branch and the one before");
+  const size_t newer = c.add();
+  c.release();
+  require(c.resumes(0) == 0, "the conversation used longest ago did not give way first");
+  require(c.resumes(main) == whole, "the side branch's state on the SSD made the tip history");
+  require(c.resumes(newer) == whole, "the newer conversation's writes found no room");
+}
+
+// A refused write costs one search of the SSD's only copies: memory lets go
+// of the K/V of conversations used before every point on the SSD, each
+// with its state there already, a write each, each refused. Each further
+// conversation costs the walk's steps and one search of the orders.
+void testARefusedWriteSearchesTheOrdersOnce() {
+  constexpr int held = 24;
+  const auto run = [](int older) {
+    Conversations c(held * Conversations::blocks);
+    for (int each = 0; each < held; ++each) {
+      c.add();
+      c.release();
+    }
+    for (int each = 0; each < older; ++each)
+      c.add(1);
+    while (c.cache.snapshot().stateCache.bytes) {
+      require(test::stateStep(c.cache).gave(), "a state of an older conversation was not written");
+      static_cast<void>(c.cache.pollTransfers());
+    }
+    for (int each = 0; each < held; ++each)
+      c.use(each);
+    const uint64_t refused = c.cache.snapshot().kvTier.demotionsRefused, before = c.cache.reachVisits();
+    c.release();
+    const uint64_t visits = c.cache.reachVisits() - before;
+    require(c.resumes(held) == 0 && c.resumes(0) == Conversations::blocks * KvCache::pageTokens &&
+                c.cache.snapshot().kvTier.demotionsRefused - refused == static_cast<uint64_t>(older),
+            "the writes of the conversations used longest ago were not refused");
+    return visits;
+  };
+  // One search: the SSD's only copies (the held conversations' states and
+  // tips, the older ones' states), each with its history search.
+  constexpr uint64_t search = 3 * (2 * held + 16);
+  const uint64_t fewer = run(2), more = run(16);
+  require(more - fewer <= 14 * search, "a refused write searched the orders more than once: " +
+                                             std::to_string(fewer) + " visits for 2 refusals, " +
+                                             std::to_string(more) + " for 16");
+}
+
+// Conversations taking turns at a quota a little too small for all of them:
+// each turn comes back to its previous turn's point; none starts from zero.
+void testConversationsTakingTurnsAtAFullTemporaryQuotaResume() {
+  constexpr uint32_t whole = Conversations::blocks * KvCache::pageTokens;
+  Conversations c(3 * Conversations::blocks);
+  for (int each = 0; each < 3; ++each) {
+    c.add();
+    c.release();
+  }
+  for (int turn = 0; turn < 9; ++turn) {
+    const size_t index = turn % 3;
+    require(c.resumes(index) == whole, "turn " + std::to_string(turn) + " found no point of its conversation");
+    c.use(index);
+    c.release();
+  }
 }
 
 // A take never stops at a leaf it can neither write nor drop: with the quota
@@ -1223,7 +1428,7 @@ void testALeafWhoseWriteFindsNoSlotGoesWithItsSubtree() {
 void testAWaitingClaimDemotesAWholeChainRunAtOnce() {
   test::TestKvTier tier;
   tier.transferLimit = 64;
-  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes(kv::PageForm::Full));
+  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes());
   tier.budget = budget;
   test::TestKvStorage storage{12, 100, 4};
   KvPool pool{storage, 4};
@@ -1268,8 +1473,7 @@ void testAWaitingClaimDemotesAWholeChainRunAtOnce() {
 }
 
 // Certain reuse per claim class: Optional takes the resume point but never a queued chain;
-// Growth takes neither; Start and InService take them oldest first, as vLLM and SGLang
-// evict any block no running request holds.
+// Growth takes neither; Start and InService take them oldest first.
 void testCertainReuseByClass() {
   struct Case final {
     ClaimSpec spec;
@@ -1277,7 +1481,7 @@ void testCertainReuseByClass() {
     bool keepsQueued;
     bool keepsResumePoint;
   };
-  for (const Case each : {Case{{.cls = ClaimClass::Start}, true, false, true},
+  for (const Case &each : {Case{{.cls = ClaimClass::Start}, true, false, true},
                           Case{{.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate}, true, true, false},
                           Case{{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}, false, true, true},
                           Case{{.cls = ClaimClass::InService}, true, false, true},
@@ -1493,8 +1697,11 @@ void testPromotionNeverDropsAUniqueState() {
 
 // An opportunistic reply's state frees for nothing: of the oldest
 // checkpoint, the first claim takes its RAM copy with no write, before that
-// of a state the SSD holds. Kept, it is written as any checkpoint, after that
-// RAM copy. No claim takes the newer checkpoint or the resume point.
+// of a state the SSD holds; no claim takes the newer checkpoint, history its
+// leaving would write, or the resume point. Kept, the reply's state is
+// written as any point once it leaves, so the newer checkpoint, history 64
+// tokens past it, leaves unwritten (sparse history), first, then that RAM
+// copy; the kept reply's state stays.
 void testOpportunisticReplyGoesWithoutAWrite() {
   for (const bool kept : {false, true}) {
     CacheFixture fixture;
@@ -1520,16 +1727,21 @@ void testOpportunisticReplyGoesWithoutAWrite() {
       ledger.close(claim);
       return freed.outcome == FreeOutcome::Met;
     };
-    require(grow() && fixture.cache.stateResident(fixture.blocks[0]) == kept &&
-                fixture.cache.stateResident(fixture.blocks[2]) != kept,
-            kept ? "a kept reply's state went before a state that frees for nothing"
-                 : "an opportunistic reply's state did not go first");
-    require(grow() && !fixture.cache.stateResident(fixture.blocks[0]) &&
-                !fixture.cache.stateResident(fixture.blocks[2]) && fixture.cache.stateResident(fixture.blocks[1]) &&
-                fixture.cache.stateResident(fixture.blocks[3]),
-            "the second claim did not take the other of the two alone");
-    require(fixture.cache.snapshot().stateCache.offloads - offloads == (kept ? 1U : 0U),
-            kept ? "a kept reply's state went without a write" : "an opportunistic reply's state was written");
+    if (kept) {
+      require(grow() && fixture.cache.stateResident(fixture.blocks[0]) && !fixture.cache.stateResident(fixture.blocks[1]) &&
+                  fixture.cache.stateResident(fixture.blocks[2]),
+              "the newer checkpoint, history past a kept reply's state, did not leave unwritten first");
+      require(grow() && fixture.cache.stateResident(fixture.blocks[0]) && !fixture.cache.stateResident(fixture.blocks[2]) &&
+                  fixture.cache.stateResident(fixture.blocks[3]),
+              "a kept reply's state went before a state that frees for nothing");
+    } else {
+      require(grow() && !fixture.cache.stateResident(fixture.blocks[0]) && fixture.cache.stateResident(fixture.blocks[2]),
+              "an opportunistic reply's state did not go first");
+      require(grow() && !fixture.cache.stateResident(fixture.blocks[2]) && fixture.cache.stateResident(fixture.blocks[1]) &&
+                  fixture.cache.stateResident(fixture.blocks[3]),
+              "the second claim did not take the other of the two alone");
+    }
+    require(fixture.cache.snapshot().stateCache.offloads == offloads, "a claim that frees for nothing wrote a state");
   }
 }
 
@@ -1966,7 +2178,7 @@ void testTierOnlyAddsToTierOff() {
 void testAMemoryClaimForAPageTakesACachedPageInPlace() {
   test::TestKvTier tier;
   tier.transferLimit = 64;
-  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes(kv::PageForm::Full));
+  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes());
   tier.budget = budget;
   test::TestKvStorage storage{12, 100, 4};
   KvPool pool{storage, 4};
@@ -2152,9 +2364,11 @@ void testKvDemotionAndRestoreLifecycle() {
           "a block with a disk copy was written again or lost its state");
 }
 
-// Pressure writes every state it evicts to the SSD cache, which keeps them by its own LRU: a
-// prompt's last checkpoint, which another conversation with the same long system prompt resumes
-// from, and a point its conversation went on from. Both stay restorable from their disk copies.
+// Pressure writes the states it evicts to the SSD cache, which keeps them by its own LRU, but the
+// history sparse history leaves: a prompt's last checkpoint, which another conversation with the
+// same long system prompt resumes from, is written; the point its conversation went on from, 64
+// tokens past that checkpoint's copy (within 8,192), leaves unwritten, and the conversation's
+// earlier turn resumes from the checkpoint's copy.
 void testEvictedCheckpointsAndSupersededPointsStayOnTheSsd() {
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
@@ -2163,9 +2377,11 @@ void testEvictedCheckpointsAndSupersededPointsStayOnTheSsd() {
   control->capacity = 4;
   // The system prompt ends at the first block, with its last checkpoint; the
   // conversation's point at the second block is superseded by the one at its
-  // last.
+  // third, which a request went on from to its last (a finished request's
+  // last point alone supersedes nothing: it may be a side question's).
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), true);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
+  fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
   require(!fixture.cache.newestPoint(fixture.blocks[1]) && fixture.cache.newestPoint(fixture.blocks[3]),
           "the conversation's points are not as the test needs");
@@ -2178,7 +2394,7 @@ void testEvictedCheckpointsAndSupersededPointsStayOnTheSsd() {
   require(fixture.cache.snapshot().stateCache.offloads == 3 && !fixture.cache.stateResident(fixture.blocks[0]) &&
               !fixture.cache.stateResident(fixture.blocks[1]) && !fixture.cache.stateResident(fixture.blocks[3]) &&
               tier.demotions == 4 && !fixture.pool.allocatedBytes(),
-          "pressure did not write every state it evicted and the KV they restore through");
+          "pressure did not write every state it evicted but the sparse history, and the KV they restore through");
 
   // Another conversation with the same system prompt resumes from the
   // checkpoint's disk copy.
@@ -2198,13 +2414,122 @@ void testEvictedCheckpointsAndSupersededPointsStayOnTheSsd() {
             "the system prompt's restore did not complete");
   }
   fixture.cache.endRequest(2);
-  // The conversation's earlier turn resumes from the superseded point's.
+  // The conversation's earlier turn resumes from the checkpoint's copy, at
+  // most 8,192 tokens back.
   {
     CacheLookup lookup = fixture.lookup(2 * KvCache::pageTokens + 1);
-    require(lookup.state && lookup.state->kvBlock() == fixture.blocks[1] && !lookup.state->state()->residentBytes() &&
-                lookup.resumeBoundary() == 2 * KvCache::pageTokens,
-            "the conversation's earlier turn did not find the superseded point on the SSD");
+    require(lookup.state && lookup.state->kvBlock() == fixture.blocks[0] && !lookup.state->state()->residentBytes() &&
+                lookup.resumeBoundary() == KvCache::pageTokens,
+            "the conversation's earlier turn did not resume from the nearest copy below it");
   }
+  fixture.cache.checkInvariants();
+}
+
+// Sparse history: of a long conversation's history leaving memory, one point in about every 8,192 tokens is written,
+// the first of each run. A conversation of twelve turns of 2,048 tokens, a point at each, every one but the newest
+// history, leaves memory as claims take its states one at a time, each write landing before the next claim, with an
+// SSD cache that takes writes. Each turn's go-back then resumes at most 8,192 tokens below it, from the SSD; the
+// points written lie more than 8,192 tokens apart, each written once: the 1st, 6th and 11th turns' of eleven. The
+// newest stays. On a dense and a windowed layout alike: a point sparse history keeps on a windowed layout has its
+// tail's window parts written as transfers are polled (Cache::writeWindowsAhead), not left to a walk.
+void testSparseHistoryWritesAPointEveryEightThousandTokens() {
+  constexpr uint32_t kTurn = 2048 / KvCache::pageTokens, kTurns = 12;
+  constexpr uint32_t kSpacing = engine::Cache::kSparseHistoryTokens;
+  for (const bool windowed : {false, true}) {
+    test::TestKvTier tier{false, windowed ? 200u : 0u};
+    tier.capacity = 4096;
+    test::TestKvStorage storage{4096, 100, 64};
+    KvPool pool{storage, 4};
+    engine::Cache cache{pool, &tier, nullptr, std::nullopt,
+                        windowed ? std::optional(CacheWindowPolicy{32, 2}) : std::nullopt};
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    control->capacity = 64;
+    std::vector<uint32_t> prompt(kTurn * kTurns * KvCache::pageTokens + 1);
+    std::iota(prompt.begin(), prompt.end(), 7000u);
+    std::vector<uint64_t> points;
+    cache.beginRequest(1);
+    require(admitTokens(cache, 1, kTurn * kTurns * KvCache::pageTokens + 1).granted(),
+            "fixture: the conversation was refused");
+    for (uint32_t turn = 1; turn <= kTurns; ++turn) {
+      cache.publishCommittedBlocks(1, prompt, turn * kTurn * KvCache::pageTokens, {});
+      points.push_back(cache.blockAt(1, turn * kTurn * KvCache::pageTokens));
+      cache.publishCompositeState(points.back(), std::make_shared<TieredState>(control), false, 1);
+    }
+    cache.endRequest(1);
+    const ClaimSpec growth{.cls = ClaimClass::Growth};
+    for (int step = 0; step < 64 && std::any_of(points.begin(), points.end() - 1, [&](uint64_t point) {
+                         return cache.stateResident(point);
+                       });
+         ++step) {
+      static_cast<void>(test::freeFromCache(cache, growth, {.stateBuffers = 1}));
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    const std::string layout = windowed ? "windowed: " : "dense: ";
+    require(std::none_of(points.begin(), points.end() - 1, [&](uint64_t point) { return cache.stateResident(point); }) &&
+                cache.stateResident(points.back()),
+            layout + "the history did not leave memory, or the newest point did");
+    uint32_t written = 0, last = 0;
+    for (uint32_t turn = 1; turn < kTurns; ++turn) {
+      const uint32_t at = turn * kTurn * KvCache::pageTokens;
+      const uint32_t resumed = cache.lookup(std::span<const uint32_t>(prompt).first(at + 1), {}).resumeBoundary();
+      require(resumed <= at && at - resumed <= kSpacing,
+              layout + "turn " + std::to_string(turn) + "'s go-back resumed at token " + std::to_string(resumed) +
+                  " of " + std::to_string(at));
+      if (resumed != at)
+        continue;
+      require(!last || at - last > kSpacing, layout + "two written points lie " + std::to_string(at - last) +
+                                                 " tokens apart, within sparse history's spacing");
+      last = at;
+      ++written;
+    }
+    require(written == 3 && control->slots == 3 && cache.snapshot().stateCache.offloads == 3,
+            layout + std::to_string(written) + " history points are on the SSD, " +
+                std::to_string(cache.snapshot().stateCache.offloads) + " writes made");
+    cache.checkInvariants();
+  }
+}
+
+// A write sparse history makes for a history point has the worth of history: at a full quota it takes no point's
+// only copy. An idle conversation's newest point fills the state copies' room with its only copy; a second
+// conversation's oldest point, history behind the two a request went on to, with no copy within 8,192 tokens below
+// it, is written only as far as the quota takes that worth, so it leaves memory unwritten, and the idle point's copy
+// stays.
+void testAHistoryWriteTakesNoPointsOnlyCopy() {
+  test::TestKvTier tier;
+  CacheFixture fixture(&tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->capacity = 1;
+  const auto conversation = [&](uint64_t id, uint32_t first, uint32_t pages) {
+    std::vector<uint32_t> tokens(pages * KvCache::pageTokens + 1);
+    std::iota(tokens.begin(), tokens.end(), first);
+    fixture.cache.beginRequest(id);
+    require(admitTokens(fixture.cache, id, pages * KvCache::pageTokens).granted(), "fixture: a conversation was refused");
+    std::vector<uint64_t> points;
+    for (uint32_t page = 1; page <= pages; ++page) {
+      fixture.cache.publishCommittedBlocks(id, tokens, page * KvCache::pageTokens, {});
+      points.push_back(fixture.cache.blockAt(id, page * KvCache::pageTokens));
+      fixture.cache.publishCompositeState(points.back(), std::make_shared<TieredState>(control), false);
+    }
+    fixture.cache.endRequest(id);
+    return std::pair{tokens, points};
+  };
+  const auto [idle, idlePoints] = conversation(10, 50'000, 1);
+  require(test::stateStep(fixture.cache).gave() && fixture.cache.pollTransfers() &&
+              !fixture.cache.stateResident(idlePoints[0]) && control->slots == 1,
+          "fixture: the idle conversation's point was not written");
+  const auto [busy, busyPoints] = conversation(11, 90'000, 3);
+  require(test::freeFromCache(fixture.cache, {.cls = ClaimClass::Growth}, {.stateBuffers = 1}).gave() &&
+              !fixture.cache.stateResident(busyPoints[0]) && fixture.cache.stateResident(busyPoints[2]),
+          "the claim did not take the history point");
+  static_cast<void>(fixture.cache.pollTransfers());
+  require(control->slots == 1 &&
+              fixture.cache.lookup(idle, {}).resumeBoundary() == KvCache::pageTokens &&
+              fixture.cache.lookup(std::span<const uint32_t>(busy).first(KvCache::pageTokens + 1), {})
+                      .resumeBoundary() == 0,
+          "a history write displaced an idle conversation's newest point's only copy");
   fixture.cache.checkInvariants();
 }
 
@@ -2374,59 +2699,102 @@ void testUnusableTierDropsTheLeafInstead() {
   deep.cache.endRequest(2);
 }
 
-// While the write budget is spent a state not in use goes without a copy; one in use is still
-// written.
-void testSpentWriteBudgetHoldsBackStatesNotInUse() {
+// While the write budget is spent no state is written, in use or not: each goes as without a
+// tier. Once the budget has refilled a state is written again.
+void testSpentWriteBudgetWritesNoState() {
   test::WriteBudget writes;
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   control->writeBudget = writes.budget;
   writes.spend();
-  {
+  for (const bool used : {false, true}) {
     test::TestKvTier tier;
-    CacheFixture fixture(&tier);
+    CacheFixture fixture(&tier, false, writes.budget);
+    std::optional<StateUse> use;
+    if (used)
+      use.emplace(fixture.cache.useState(fixture.blocks[3]));
     fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control),
                                         false);
-    require(reclaimStateBytes(fixture.cache) == 100 && control->slots == 0 &&
-                !fixture.cache.snapshot().stateCache.entries,
-            "a state not in use was written, or kept, while the write budget was spent");
+    require(reclaimStateBytes(fixture.cache) == 100 && !fixture.cache.pollTransfers() &&
+                control->slots == 0 && !fixture.cache.snapshot().stateCache.entries,
+            "a state was written, or kept, while the write budget was spent");
   }
+  writes.refill();
   test::TestKvTier tier;
-  CacheFixture fixture(&tier);
-  const StateUse use = fixture.cache.useState(fixture.blocks[3]);
+  CacheFixture fixture(&tier, false, writes.budget);
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control),
                                       false);
   require(reclaimStateBytes(fixture.cache) == 100 && fixture.cache.pollTransfers() &&
               control->slots == 1,
-          "a state in use was not written while the write budget was spent");
+          "a state was not written once the write budget had refilled");
 }
 
-// A state written while the budget had room keeps its whole chain after the budget runs out.
-void testSpentWriteBudgetKeepsTheChainsOfWrittenStates() {
+// While the write budget is spent the cache writes no KV either and keeps to memory: a state
+// written before keeps its chain only as far as it is on the SSD, so when a leaf it needs leaves
+// RAM the state goes with it, as without a tier, and nothing is written.
+void testSpentWriteBudgetKeepsToMemory() {
   test::WriteBudget writes;
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   control->writeBudget = writes.budget;
   test::TestKvTier tier;
   tier.capacity = 8;
-  CacheFixture fixture(&tier);
+  CacheFixture fixture(&tier, false, writes.budget);
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control),
                                       false);
   require(reclaimStateBytes(fixture.cache) == 100 && fixture.cache.pollTransfers() &&
               control->slots == 1,
           "the state was not written while the budget had room");
   writes.spend();
-  for (uint32_t leaf = 0; leaf < 4; ++leaf) {
-    require(test::evictStep(fixture.cache).gave() &&
-                tier.demotions == leaf + 1,
-            "a page the written state needs was not written while the budget was spent");
-    tier.complete();
-    require(fixture.cache.pollTransfers(), "the page did not land");
-  }
+  const std::optional<double> reopens = writes.budget->admitsAgainAt();
+  while (test::evictStep(fixture.cache).gave())
+    static_cast<void>(fixture.cache.pollTransfers());
   const CacheSnapshot held = fixture.cache.snapshot();
-  require(held.kvTier.diskBlocks == 4 && held.stateCache.entries == 1 && control->slots == 1 &&
-              !held.kvTier.demotionsRefused && fixture.lookup(129).state.has_value(),
-          "the written state lost its chain when the budget ran out");
+  require(!tier.demotions && !held.kvTier.diskBlocks && !held.stateCache.entries && control->slots == 0 &&
+              !fixture.lookup(129).state.has_value() && held.kvTier.writesGated == DiskWritesGate::Budget,
+          "a page was written while the write budget was spent, or the state outlived its chain");
+  require(reopens && writes.budget->admitsAgainAt() == reopens,
+          "the cache moved the time the write budget admits writes again");
+}
+
+// While the write budget is spent the cache keeps to memory as without a
+// tier (Cache::takesCacheWrites), so a claim for a state's buffers takes the same state in both: a running lane's
+// recovery point before an idle conversation's newest state, which would be lost (Cache::phaseAfter's rule).
+void testASpentWriteBudgetOrdersRecoveryPointsAsNoTierDoes() {
+  const auto idleStateStays = [](bool tiered) {
+    test::WriteBudget writes;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    control->writeBudget = writes.budget;
+    writes.spend();
+    test::TestKvTier tier;
+    test::TestKvStorage storage{8, 100, 1};
+    KvPool pool{storage, 4};
+    engine::Cache cache(pool, tiered ? &tier : nullptr, tiered ? writes.budget : nullptr);
+    const auto run = [&](uint64_t id, uint32_t first) {
+      std::vector<uint32_t> prompt(2 * KvCache::pageTokens + 1);
+      std::iota(prompt.begin(), prompt.end(), first);
+      cache.beginRequest(id);
+      require(admitTokens(cache, id, 2 * KvCache::pageTokens + 1).granted(), "fixture: KV was refused");
+      cache.publishCommittedBlocks(id, prompt, 2 * KvCache::pageTokens, {});
+      return cache.blockAt(id, 2 * KvCache::pageTokens);
+    };
+    const uint64_t idle = run(1, 1000);
+    cache.publishCompositeState(idle, std::make_shared<TieredState>(control), false);
+    cache.endRequest(1);
+    const uint64_t lane = run(2, 5000);
+    cache.publishCompositeState(lane, std::make_shared<TieredState>(control), true);
+    require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).gave() &&
+                cache.snapshot().stateCache.entries == 1 && control->slots == 0,
+            "fixture: the claim did not take one state, unwritten");
+    const bool stays = cache.stateResident(idle);
+    cache.checkInvariants();
+    cache.endRequest(2);
+    return stays;
+  };
+  require(idleStateStays(false), "fixture: with no tier the lane's recovery point did not go before the idle state");
+  require(idleStateStays(true), "with the write budget spent, a claim took an idle conversation's newest state, lost, "
+                                "before the running lane's recovery point; with no tier it takes the recovery point");
 }
 
 // A limit that cannot hold one slot makes no room: a leaf a written state
@@ -2449,7 +2817,7 @@ void testLimitBelowASlotMakesNoRoom() {
           "the deepest page the state needs was not written");
   tier.complete();
   require(fixture.cache.pollTransfers(), "the page did not land");
-  budget->setLimitBytes(tier.slotBytes(kv::PageForm::Full) - 1);
+  budget->setLimitBytes(tier.slotBytes() - 1);
   static_cast<void>(test::evictStep(fixture.cache));
   const CacheSnapshot held = fixture.cache.snapshot();
   require(tier.demotions == 1 && !held.kvTier.diskBlocks && !fixture.lookup(129).state,
@@ -2986,7 +3354,9 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
   }
   require(tier.restores == 2 && tier.inFlight() == 0 && cache.snapshot().pool.pagesPrefix == 3,
           "the cancelled restore dropped the page under a state in RAM");
-  control->capacity = control->slots;
+  // Room for its write: the state at the tip, used later than it and
+  // deeper on its chain, is worth more than it and does not give way.
+  control->capacity = control->slots + 1;
   require(reclaimStateBytes(cache) == 100 &&
               cache.pollTransfers(),
           "the state in RAM was not written");
@@ -4596,7 +4966,7 @@ void testAnUnspillLeavesTheHeldFreePages() {
   spill.cache.beginRequest(2);
   const uint32_t free = spill.pool.freePageCount(kv::PageForm::Full);
   spill.storage.growthBlocked = true;
-  require(free >= 4 && spill.cache.restoreRequest(2, lookup, {free, 0, 0}).failure == TokenAdmissionFailure::Denied &&
+  require(free >= 4 && spill.cache.restoreRequest(2, lookup, {free, 0}).failure == TokenAdmissionFailure::Denied &&
               spill.pool.freePageCount(kv::PageForm::Full) == free && spill.cache.spillSnapshot().unspills == 0,
           "a Resident restore moved spilled blocks onto free pages waiting claims hold");
   spill.storage.growthBlocked = false;
@@ -5297,18 +5667,19 @@ void testPoisonedBlockLeavesOnceItsWriteLands() {
   fixture.cache.checkInvariants();
 }
 
-// A windowed layout's cache, of a window of two pages, over pages of 100
-// bytes, Slim ones of 30, in extents of four: requests run the prompt's
-// pages as commands do, publishing the blocks they commit, and states land
-// at the blocks they name.
+// A windowed layout's cache, of a window of two pages and a window unit of
+// two pages beside each block's base page, over pages of 100 bytes in
+// extents of four: requests run the prompt's pages as commands do,
+// publishing the blocks they commit, and states land at the blocks they
+// name.
 struct Windowed final {
-  static constexpr uint32_t kWindowPages = 2;
-  test::TestKvStorage storage{64, 100, 4, 0, 30};
+  static constexpr uint32_t kWindowPages = 2, kUnitPages = 2, kBlockPages = 1 + kUnitPages;
+  test::TestKvStorage storage{192, 100, 4};
   KvPool pool{storage, 4};
   engine::Cache cache;
 
-  explicit Windowed(engine::KvTier *tier = nullptr, bool trim = true)
-      : cache(pool, tier, nullptr, std::nullopt, CacheWindowPolicy{kWindowPages, trim}) {}
+  explicit Windowed(engine::KvTier *tier = nullptr)
+      : cache(pool, tier, nullptr, std::nullopt, CacheWindowPolicy{kWindowPages, kUnitPages}) {}
 
   // `pages` pages of distinct tokens from `first`, and one token past them.
   static std::vector<uint32_t> prompt(uint32_t first, uint32_t pages) {
@@ -5321,231 +5692,502 @@ struct Windowed final {
     require(admitTokens(cache, id, pages * KvCache::pageTokens + 1).granted(), "windowed KV was refused");
     cache.publishCommittedBlocks(id, tokens, pages * KvCache::pageTokens, {});
   }
-  void publish(uint64_t id, uint32_t pages, bool checkpoint = false) {
-    cache.publishCompositeState(cache.blockAt(id, pages * KvCache::pageTokens), std::make_shared<TestState>(100),
-                                checkpoint);
+  // The same a page a command, each cutting the lane's tables first, as a
+  // lane runs: its window lets go of the units it passed.
+  void step(uint64_t id, const std::vector<uint32_t> &tokens, uint32_t pages) {
+    for (uint32_t page = static_cast<uint32_t>(cache.pageTable(id).pages.size() ? cache.pageTable(id).pages.size() : 1);
+         page <= pages; ++page) {
+      static_cast<void>(cache.cutPageTable(id));
+      run(id, tokens, page);
+    }
   }
-  // The forms of the request's pages, F for Full and S for Slim.
-  std::string forms(uint64_t id) const {
-    std::string result;
-    for (const uint32_t page : cache.pageTable(id).pages)
-      result += pool.form(page) == kv::PageForm::Slim ? 'S' : 'F';
-    return result;
+  // A state at the request's block `pages`, which it returns.
+  uint64_t publish(uint64_t id, uint32_t pages, bool checkpoint = false) {
+    const uint64_t block = cache.blockAt(id, pages * KvCache::pageTokens);
+    cache.publishCompositeState(block, std::make_shared<TestState>(100), checkpoint, id);
+    return block;
   }
-  [[nodiscard]] uint32_t slimPages() const {
-    const KvPoolSnapshot snapshot = pool.snapshot();
-    return snapshot.slim.pagesAllocated - snapshot.slim.pagesFree;
+  // Of these states' blocks, those that hold a point a conversation still
+  // resumes from (Cache::newestPoint).
+  [[nodiscard]] uint32_t newestPoints(std::span<const uint64_t> blocks) const {
+    return static_cast<uint32_t>(std::ranges::count_if(blocks, [&](uint64_t block) { return cache.newestPoint(block); }));
   }
 };
 
-// A page drops its windowed layers' K/V once every holder is two blocks past it; trimming off keeps
-// every page Full.
-void testWindowsTrimWhatEveryHolderPassed() {
+// A publication to the SSD makes room for its write before it pins its tail (KvCache::DeferredReleases): the state
+// it gives up for that room leaves the last pin of a block the new state pins a moment later, and the block keeps
+// its unit through the publication; the block only the state given up held gives its unit up at the end.
+void testARoomMadeForAWriteKeepsTheUnitsTheNewTailPins() {
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 16;
+  Windowed windowed(&tier);
+  engine::Cache &cache = windowed.cache;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->capacity = 1;
+  const std::vector<uint32_t> prompt = Windowed::prompt(8100, 6);
+  cache.beginRequest(1);
+  windowed.step(1, prompt, 3);
+  cache.publishCompositeState(cache.blockAt(1, 3 * KvCache::pageTokens), std::make_shared<TieredState>(control), false,
+                              1);
+  require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
+              control->slots == 1 && cache.pollTransfers() && cache.snapshot().stateCache.bytes == 0 &&
+              cache.snapshot().stateCache.diskBytes == 100 && cache.snapshot().window->windowUnits == 2,
+          "fixture: the state did not go to the SSD alone, its tail's units held");
+  windowed.step(1, prompt, 4);
+  const StateWriter write = [&](std::function<void()>) { return writeState(control); };
+  require(cache.publishStateToDisk(cache.blockAt(1, 4 * KvCache::pageTokens), write, false, 1),
+          "the publication was refused");
+  require(cache.snapshot().stateCache.entries == 1 && cache.snapshot().window->windowUnits == 2,
+          "the room made for the write took a unit the new tail pins, or kept one nothing holds");
+  cache.checkInvariants();
+  cache.endRequest(1);
+}
+
+// A writer that computes cached blocks again keeps its own pages, which its window reads, and the blocks take them,
+// as K/V another command computed can differ in its last bits; whoever held the blocks' pages before keeps those
+// until it lets them go. With no state's tail on them the blocks keep their base pages alone.
+void testWritersKeepTheirPages() {
   Windowed windowed;
   engine::Cache &cache = windowed.cache;
-  const std::vector<uint32_t> prompt = Windowed::prompt(5000, 8);
+  const std::vector<uint32_t> prompt = Windowed::prompt(9000, 12);
+  cache.beginRequest(1);
+  windowed.run(1, prompt, 8);
+  const std::vector<uint32_t> first(cache.pageTable(1).pages.begin(), cache.pageTable(1).pages.end());
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 8 * KvCache::pageTokens + 1).granted(), "the second request was refused");
+  const std::vector<uint32_t> own(cache.pageTable(2).pages.begin(), cache.pageTable(2).pages.end());
+  require(cache.publishCommittedBlocks(2, prompt, 8 * KvCache::pageTokens, {}) == 0 &&
+              std::ranges::equal(cache.pageTable(2).pages, own) && std::ranges::equal(cache.pageTable(1).pages, first) &&
+              cache.blockAt(2, 8 * KvCache::pageTokens) == cache.blockAt(1, 8 * KvCache::pageTokens) &&
+              cache.snapshot().window->upgrades == 8,
+          "a writer moved onto the pages of the blocks it computed again, or they kept theirs");
+  cache.checkInvariants();
+  cache.endRequest(1);
+  cache.endRequest(2);
+  const CacheSnapshot idle = cache.snapshot();
+  require(idle.pool.pagesPrefix == 8 && idle.pool.pagesActive == 0 && idle.pool.pagesFree == idle.pool.pagesAllocated - 8,
+          "the blocks did not keep the writer's base pages alone");
+  cache.checkInvariants();
+}
+
+// A windowed block's window unit lives while a state's tail holds it: a request's growth takes a base page and a
+// window unit a block, its tables name them by logical page, a published block owns its base page, and its unit
+// only within a state's tail; a request that resumes holds the units of the tail alone; a demotion writes the parts
+// of its copy a block holds, a base part of 100 bytes and a window part of 200, which the disk counts, and a restore
+// reads back what each block then holds, its window part for the tail alone.
+void testWindowUnitsGoWithTheirBlocks() {
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 16;
+  tier.transferLimit = 8;
+  Windowed windowed(&tier);
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> prompt = Windowed::prompt(4000, 3);
   cache.beginRequest(1);
   windowed.run(1, prompt, 3);
-  require(cache.trimWindows() == 1 && windowed.forms(1) == "SFFF", "three published pages did not trim the first");
-  windowed.run(1, prompt, 8);
-  require(cache.trimWindows() == 5 && windowed.forms(1) == "SSSSSSFFF" &&
-              cache.snapshot().window->trimmedPages == 6 && cache.trimWindows() == 0,
-          "the pages the window passed were not trimmed, or trimmed twice");
-  static_cast<void>(cache.cutPageTable(1));
-
-  // A second request computes the first three blocks again: it takes them
-  // back Full, while the first keeps the Slim pages, and only what it has
-  // passed itself trims.
-  cache.beginRequest(2);
-  windowed.run(2, prompt, 3);
-  const PageTableState first = cache.pageTable(1), second = cache.pageTable(2);
-  require(cache.snapshot().window->upgrades == 3 && windowed.forms(2) == "FFFF" &&
-              windowed.forms(1) == "SSSSSSFFF" && cache.blockAt(2, 32) == cache.blockAt(1, 32) &&
-              first.pages[0] != second.pages[0],
-          "a writer did not give the Slim blocks it computed again its own Full pages");
-  require(cache.trimWindows() == 1 && windowed.forms(2) == "SFFF", "the writer's pages did not trim on its window");
-  cache.checkInvariants();
-  cache.endRequest(2);
+  const PageTableState table = cache.pageTable(1);
+  std::vector<uint32_t> held(table.pages.begin(), table.pages.end());
+  for (const std::vector<uint32_t> &window : table.windows)
+    held.insert(held.end(), window.begin(), window.end());
+  std::ranges::sort(held);
+  require(table.windows.size() == Windowed::kUnitPages &&
+              std::ranges::all_of(table.windows, [&](const auto &window) { return window.size() == 4; }) &&
+              std::ranges::adjacent_find(held) == held.end() &&
+              cache.snapshot().pool.pagesActive == 4 * Windowed::kBlockPages,
+          "a request's growth did not take a base page and a window unit of its own a block");
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  cache.publishCompositeState(cache.blockAt(1, 3 * KvCache::pageTokens), std::make_shared<TieredState>(control),
+                              false, 1);
+  const std::vector<uint32_t> base(table.pages.begin(), table.pages.begin() + 3);
+  const std::vector<std::vector<uint32_t>> windows{{table.windows[0].begin(), table.windows[0].begin() + 3},
+                                                   {table.windows[1].begin(), table.windows[1].begin() + 3}};
   cache.endRequest(1);
-  require(cache.trimWindows() == 4 && windowed.slimPages() == 8 && cache.snapshot().pool.pagesActive == 0,
-          "the pages no request holds kept their windowed layers");
+  // Three base pages, and the units of the tail's two blocks.
+  require(cache.snapshot().pool.pagesPrefix == 3 + 2 * Windowed::kUnitPages && cache.snapshot().window->windowUnits == 2,
+          "the cache does not hold every block's base page and the units of the state's tail alone");
   cache.checkInvariants();
-
-  Windowed full(nullptr, false);
-  full.cache.beginRequest(1);
-  full.run(1, prompt, 8);
-  require(full.cache.trimWindows() == 0 && full.forms(1) == "FFFFFFFFF" && !full.cache.snapshot().window->trim,
-          "a cache with trimming off trimmed");
-  full.cache.endRequest(1);
-}
-
-// A writer recomputing trimmed or untrimmed blocks keeps its own pages; reads are the same with
-// trimming on or off.
-void testWritersKeepTheirPagesTrimmedOrNot() {
-  for (const bool trim : {true, false}) {
-    Windowed windowed(nullptr, trim);
-    engine::Cache &cache = windowed.cache;
-    const std::vector<uint32_t> prompt = Windowed::prompt(9000, 12);
-    cache.beginRequest(1);
-    windowed.run(1, prompt, 8);
-    require(cache.trimWindows() == (trim ? 6u : 0u), "the first request's passed pages did not trim");
-    const std::vector<uint32_t> first(cache.pageTable(1).pages.begin(), cache.pageTable(1).pages.end());
-
-    // The second request computes the eight blocks again beside the first,
-    // whose window holds the last two.
-    cache.beginRequest(2);
-    require(admitTokens(cache, 2, 8 * KvCache::pageTokens + 1).granted(), "the second request was refused");
-    const std::vector<uint32_t> own(cache.pageTable(2).pages.begin(), cache.pageTable(2).pages.end());
-    require(cache.publishCommittedBlocks(2, prompt, 8 * KvCache::pageTokens, {}) == 0 &&
-                std::ranges::equal(cache.pageTable(2).pages, own) &&
-                std::ranges::equal(cache.pageTable(1).pages, first) &&
-                cache.blockAt(2, 8 * KvCache::pageTokens) == cache.blockAt(1, 8 * KvCache::pageTokens) &&
-                cache.snapshot().window->upgrades == 8,
-            "a writer moved onto the pages of the blocks it computed again, or they kept theirs");
-    cache.checkInvariants();
-
-    // Once the first has passed the two pages it kept, they trim, beside
-    // the second's six and the two the first passed of its own.
-    windowed.run(1, prompt, 12);
-    require(cache.trimWindows() == (trim ? 10u : 0u) &&
-                windowed.forms(1) == (trim ? "SSSSSSSSSSFFF" : "FFFFFFFFFFFFF") &&
-                windowed.forms(2) == (trim ? "SSSSSSFFF" : "FFFFFFFFF"),
-            "the pages a request kept beside its blocks did not trim once it passed them");
-    cache.checkInvariants();
-    cache.endRequest(1);
-    cache.endRequest(2);
-    cache.checkInvariants();
+  // A request that resumes at the state holds each block's base page, the
+  // writer's, and the units of the state's tail, none before it.
+  {
+    cache.beginRequest(3);
+    CacheLookup resident = cache.lookup(prompt, {});
+    require(resident.state && admitRestore(cache, 3, resident).granted(), "the resident chain did not restore");
+    const PageTableState again = cache.pageTable(3);
+    bool tail = true;
+    for (uint32_t unit = 0; unit < Windowed::kUnitPages; ++unit)
+      tail = tail && again.windows[unit][0] == kv::kAbsentPage && again.windows[unit][1] == windows[unit][1] &&
+             again.windows[unit][2] == windows[unit][2];
+    require(std::ranges::equal(again.pages, base) && tail && tier.restores == 0,
+            "a resumed request does not hold the units of its state's tail alone, those its writer computed");
+    resident = {};
+    cache.endRequest(3);
   }
+  // Everything leaves memory, each block written from the pages it holds.
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "the state was not written to the SSD");
+  for (bool landed = true; landed;) {
+    const FreeResult step = test::releaseStep(cache);
+    tier.complete();
+    landed = cache.pollTransfers() || step.gave();
+  }
+  std::vector<size_t> written;
+  for (const std::vector<uint32_t> &pages : tier.blocks)
+    written.push_back(pages.size());
+  std::ranges::sort(written);
+  require(tier.demotions == 3 && written == std::vector<size_t>{1, Windowed::kBlockPages, Windowed::kBlockPages} &&
+              cache.snapshot().pool.pagesPrefix == 0,
+          "a demotion did not write the pages its block holds, or the pages stayed (" +
+              std::to_string(tier.demotions) + " demotions, " + std::to_string(cache.snapshot().pool.pagesPrefix) +
+              " cached pages)");
+  require(std::ranges::count_if(tier.writes, [](const auto &write) { return write.parts == 3; }) == 2 &&
+              std::ranges::count_if(tier.writes, [](const auto &write) { return write.parts == 1; }) == 1 &&
+              cache.snapshot().kvTier.diskBlocks == 3 && cache.snapshot().kvTier.diskBytes == 100 + 2 * 300,
+          "a demotion did not write the parts its block holds, or the disk does not count them");
+  cache.checkInvariants();
+  // A restore takes each block's base page, and its tail's units, and reads
+  // them back.
+  tier.blocks.clear();
+  cache.beginRequest(2);
+  CacheLookup lookup = cache.lookup(prompt, {});
+  require(lookup.state && lookup.resumeBoundary() == 3 * KvCache::pageTokens && admitRestore(cache, 2, lookup).granted(),
+          "the chain did not restore");
+  const PageTableState restored = cache.pageTable(2);
+  require(tier.blocks.size() == 3 && tier.blocks[0].size() == 1 && tier.blocks[1].size() == Windowed::kBlockPages &&
+              restored.windows.size() == Windowed::kUnitPages && restored.windows[1].size() == 3 &&
+              restored.windows[1][0] == kv::kAbsentPage &&
+              tier.blocks[2] == std::vector<uint32_t>{restored.pages[2], restored.windows[0][2], restored.windows[1][2]} &&
+              cache.snapshot().pool.pagesActive == 3 + 2 * Windowed::kUnitPages &&
+              tier.restoredParts == std::vector<kv::Components>{1, 3, 3},
+          "a restore did not take and read each block's base page and its tail's units (" +
+              std::to_string(tier.blocks.size()) + " reads, " + std::to_string(cache.snapshot().pool.pagesActive) +
+              " pages held)");
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  static_cast<void>(cache.cutPageTable(2));
+  cache.checkInvariants();
+  lookup = {};
+  cache.endRequest(2);
+  cache.checkInvariants();
 }
 
-// A state pins its two-block tail Full; an evicted state unpins it for the next trim.
-void testStateTailsPinTheirWindows() {
+// A state's tail, the two blocks that end at its block, counts on each of them: adjacent states share theirs, a
+// state that goes takes its count with it, and a resume at a state finds every block of its chain.
+void testStateTailsCountOnTheirBlocks() {
   Windowed windowed;
   engine::Cache &cache = windowed.cache;
   const std::vector<uint32_t> prompt = Windowed::prompt(6000, 8);
   cache.beginRequest(1);
   windowed.run(1, prompt, 8);
-  windowed.publish(1, 4);
+  const uint64_t earlier = windowed.publish(1, 4);
   windowed.publish(1, 5);
   require(cache.snapshot().window->pinnedBlocks == 3, "adjacent states did not share their tails");
   cache.endRequest(1);
-  require(cache.trimWindows() == 5, "the pages no tail holds were not trimmed");
   cache.checkInvariants();
-
-  CacheLookup lookup = cache.lookup(std::span<const uint32_t>(prompt).first(4 * KvCache::pageTokens + 1), {});
-  require(lookup.state && lookup.resumeBoundary() == 4 * KvCache::pageTokens, "the earlier state was not found");
-  const uint64_t earlier = lookup.state->kvBlock();
-  lookup = {};
   cache.invalidateState(earlier);
-  require(cache.snapshot().window->pinnedBlocks == 2 && cache.trimWindows() == 1,
-          "an evicted state's tail was not trimmed once unpinned");
-
+  require(cache.snapshot().window->pinnedBlocks == 2, "a state that went kept its tail's count");
   cache.beginRequest(2);
   CacheLookup resume = cache.lookup(prompt, {});
   require(resume.state && resume.resumeBoundary() == 5 * KvCache::pageTokens &&
-              admitRestore(cache, 2, resume).granted() && windowed.forms(2) == "SSSFF",
-          "a restore did not find its tail Full and its history Slim");
+              admitRestore(cache, 2, resume).granted() && cache.pageTable(2).pages.size() == 5,
+          "a resume at the later state did not find its chain");
   static_cast<void>(cache.cutPageTable(2));
   cache.checkInvariants();
+  resume = {};
   cache.endRequest(2);
 }
 
-// A state whose tail is not Full is refused (a logic error), and the refusal is counted.
-void testStatesNeedTheirTailFull() {
+// A unit lives while a lane's window or a state's tail holds it. A lane lets go of a block's unit at the cut that
+// passes it, its table entry absent; a block keeps only its base page until a state's tail holds it; a writer that
+// computes blocks again gives them its base pages and keeps its units; and once no lane and no state holds a unit,
+// it is free.
+void testAUnitLeavesWhenNoLaneOrPointHoldsIt() {
   Windowed windowed;
   engine::Cache &cache = windowed.cache;
-  const std::vector<uint32_t> prompt = Windowed::prompt(7000, 6);
+  constexpr uint32_t kUnit = Windowed::kUnitPages;
+  const std::vector<uint32_t> prompt = Windowed::prompt(5000, 12);
   cache.beginRequest(1);
-  windowed.run(1, prompt, 6);
-  require(cache.trimWindows() == 4, "the window's past was not trimmed");
-  const uint64_t passed = cache.blockAt(1, 3 * KvCache::pageTokens);
-  require(!cache.stateTailFull(passed) && cache.stateTailFull(cache.blockAt(1, 6 * KvCache::pageTokens)) &&
-              cache.snapshot().window->refusedStates == 1,
-          "a tail past the window was taken for Full, or the window's for less");
-  rejects([&] { cache.publishCompositeState(passed, std::make_shared<TestState>(100), false); },
-          "tail holds only the layers no window bounds", "a state was published on a Slim tail");
-  windowed.publish(1, 6);
-  cache.checkInvariants();
+  windowed.run(1, prompt, 3);
+  require(cache.snapshot().pool.pagesActive == 4 * Windowed::kBlockPages && cache.snapshot().pool.pagesPrefix == 3 &&
+              cache.snapshot().window->windowUnits == 0,
+          "a lane's growth did not hold its blocks' units, or a published block took one with no state's tail on it");
+  static_cast<void>(cache.cutPageTable(1));
+  require(cache.pageTable(1).windows[0][0] == kv::kAbsentPage && cache.pageTable(1).windows[0][1] != kv::kAbsentPage &&
+              cache.snapshot().pool.pagesActive == 4 * Windowed::kBlockPages - kUnit,
+          "the cut did not let go of the unit of the one block the window passed");
+  windowed.run(1, prompt, 8);
+  static_cast<void>(cache.cutPageTable(1));
+  // Nine base pages, and the units of the window's two blocks and the open page's.
+  require(cache.snapshot().pool.pagesActive == 9 + 3 * kUnit, "the lane holds the units of other blocks than its window's");
+  const uint64_t state = windowed.publish(1, 8);
+  require(cache.snapshot().window->windowUnits == 2 && cache.snapshot().pool.pagesPrefix == 8 + 2 * kUnit,
+          "a state's tail did not give its two blocks their units");
+  cache.beginRequest(2);
+  windowed.run(2, prompt, 3);
+  require(cache.snapshot().window->upgrades == 3 && cache.snapshot().window->windowUnits == 2,
+          "a writer that computed blocks again gave them units no state's tail holds");
+  cache.endRequest(2);
   cache.endRequest(1);
+  CacheSnapshot idle = cache.snapshot();
+  require(idle.pool.pagesActive == 0 && idle.pool.pagesPrefix == 8 + 2 * kUnit &&
+              idle.pool.pagesFree == idle.pool.pagesAllocated - idle.pool.pagesPrefix,
+          "the lanes' units did not leave with them, or the tail's stayed short");
+  cache.checkInvariants();
+  cache.invalidateState(state);
+  idle = cache.snapshot();
+  require(idle.window->windowUnits == 0 && idle.pool.pagesPrefix == 8 && idle.pool.pagesFree == idle.pool.pagesAllocated - 8,
+          "the units of a state's tail did not go free with the state");
+  cache.checkInvariants();
 }
 
-// A Full shortfall in a windowed cache trims first, then takes states (checkpoint first); all KV
-// stays cached Slim.
-void testFullShortfallsTrimBeforeAnyLeafGoes() {
+// A state is published only where each block of its tail holds its unit or takes it, in the same step, from a lane
+// that holds the block's base page with the unit's pages in its tables. A tail the lane's window passed is refused,
+// counted, and attaches nothing; a publication to the SSD that starts no write attaches nothing either. Two lanes
+// that hold a block, its writer and a lane that resumed onto it, hold the same unit, which the block takes again
+// once the state that held it went.
+void testStatesNeedTheUnitsOfTheirTail() {
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 16;
+  Windowed windowed(&tier);
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> prompt = Windowed::prompt(7000, 8);
+  cache.beginRequest(1);
+  windowed.run(1, prompt, 6);
+  static_cast<void>(cache.cutPageTable(1));
+  const uint64_t passed = cache.blockAt(1, 3 * KvCache::pageTokens), newest = cache.blockAt(1, 6 * KvCache::pageTokens);
+  require(!cache.stateTailPresent(passed, 1) && cache.stateTailPresent(newest, 1) && !cache.stateTailPresent(newest) &&
+              cache.snapshot().window->refusedStates == 2,
+          "a tail the window passed was taken for present, or the window's for absent, or one without its lane");
+  rejects([&] { cache.publishCompositeState(passed, std::make_shared<TestState>(100), false, 1); },
+          "tail holds a block without its window unit", "a state was published on a tail without its units");
+  rejects([&] { cache.publishCompositeState(newest, std::make_shared<TestState>(100), false); },
+          "tail holds a block without its window unit", "a windowed state was published without its lane");
+  require(!cache.publishStateToDisk(newest, [](std::function<void()>) { return std::unique_ptr<StateOffload>{}; },
+                                    false, 1) &&
+              cache.snapshot().window->windowUnits == 0 && cache.snapshot().stateCache.entries == 0,
+          "a publication that wrote nothing attached a unit, or published a state");
+  cache.checkInvariants();
+  cache.checkInvariants();
+  windowed.publish(1, 6);
+  require(cache.snapshot().window->windowUnits == 2, "the state's tail did not take the lane's units");
+  cache.beginRequest(2);
+  {
+    CacheLookup resume = cache.lookup(std::span<const uint32_t>(prompt).first(6 * KvCache::pageTokens + 1), {});
+    require(resume.state && resume.resumeBoundary() == 6 * KvCache::pageTokens && admitRestore(cache, 2, resume).granted(),
+            "fixture: the second lane did not resume at the state");
+  }
+  cache.invalidateState(newest);
+  const PageTableState writer = cache.pageTable(1), resumed = cache.pageTable(2);
+  require(cache.snapshot().window->windowUnits == 0 && resumed.windows[0][4] == writer.windows[0][4] &&
+              resumed.windows[1][5] == writer.windows[1][5],
+          "the lane that resumed onto the blocks does not hold the units their writer does, or the blocks kept theirs");
+  cache.checkInvariants();
+  windowed.publish(1, 6);
+  require(cache.snapshot().window->windowUnits == 2 && cache.pageTable(2).windows[0][5] == cache.pageTable(1).windows[0][5],
+          "the blocks did not take back the unit both lanes hold");
+  cache.checkInvariants();
+  cache.endRequest(2);
+  cache.endRequest(1);
+  cache.checkInvariants();
+}
+
+// Two superseded states whose tails share a block, which neither frees alone, and below them a state a request went on
+// from to the newest (a finished request's last point alone supersedes nothing). The history's states take no write,
+// so both leave as history with no write: a need of pages is offered both, counts the shared unit once, at the
+// second, takes each, the first giving its own unit, and frees exactly what it counted; the newer states and every
+// block's base page stay.
+void testHistoryThatSharesAUnitLeavesTogether() {
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 16;
+  Windowed windowed(&tier);
+  engine::Cache &cache = windowed.cache;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const std::vector<uint32_t> prompt = Windowed::prompt(9000, 7);
+  cache.beginRequest(1);
+  windowed.run(1, prompt, 7);
+  for (const uint32_t pages : {2u, 3u, 6u, 7u}) {
+    const std::shared_ptr<const CompositeState> state =
+        pages < 6 ? std::shared_ptr<const CompositeState>(std::make_shared<TestState>(100))
+                  : std::make_shared<TieredState>(control);
+    cache.publishCompositeState(cache.blockAt(1, pages * KvCache::pageTokens), state, false, 1);
+  }
+  cache.endRequest(1);
+  require(cache.snapshot().window->windowUnits == 6 && cache.snapshot().stateCache.entries == 4,
+          "fixture: the four tails do not hold six blocks' units");
+  const uint32_t freeBefore = windowed.pool.freePageCount(kv::PageForm::Full);
+  const VictimQuery query = test::query(test::kInServiceGrowth, {.pages = 8});
+  const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
+  require(unit && unit->pages == 3 * Windowed::kUnitPages && !unit->write,
+          "the shared unit was not counted once, beside each state's own (" +
+              std::to_string(unit ? unit->pages : 0) + " pages counted)");
+  uint32_t freed = 0;
+  for (std::optional<engine::Victim> each = unit; each && !each->write; each = cache.peek(query, nullptr)) {
+    const FreeResult taken = cache.take(query, *each);
+    require(taken.gave(), "a unit offered gave nothing at its take");
+    freed += taken.pages;
+  }
+  require(freed == 3 * Windowed::kUnitPages &&
+              windowed.pool.freePageCount(kv::PageForm::Full) == freeBefore + 3 * Windowed::kUnitPages &&
+              cache.snapshot().stateCache.entries == 2,
+          "the walk did not free what it counted of the history's tails (" + std::to_string(freed) + " pages)");
+  const CacheLookup newest = cache.lookup(prompt, {});
+  require(newest.state && newest.resumeBoundary() == 7 * KvCache::pageTokens &&
+              newest.kvBoundary == 7 * KvCache::pageTokens && cache.snapshot().pool.pagesPrefix == 7 + 3 * Windowed::kUnitPages,
+          "the newest state, or a block's base page, left with the history");
+  cache.checkInvariants();
+}
+
+// A shortfall in a windowed cache takes the units of the states' tails before any leaf goes: of a chain of eight
+// blocks run a page a command, with a checkpoint at four and a state at eight, both tails' units held (16 pages)
+// beside 8 free pages of a budget of 24, a request's five blocks (15 pages) take the checkpoint first, then the
+// state, and every block's base page stays: the prefix stays cached for a recompute from its root.
+void testFullShortfallsTakeTheTailsBeforeAnyLeafGoes() {
   Windowed windowed;
-  windowed.storage.budgetPages = 16;
+  windowed.storage.budgetPages = 24;
   engine::Cache &cache = windowed.cache;
   const std::vector<uint32_t> cached = Windowed::prompt(8000, 8);
   cache.beginRequest(1);
-  windowed.run(1, cached, 8);
+  windowed.step(1, cached, 4);
   windowed.publish(1, 4, true);
+  windowed.step(1, cached, 8);
   windowed.publish(1, 8);
   cache.endRequest(1);
-  require(cache.trimWindows() == 4 && windowed.slimPages() == 4, "the unpinned pages were not trimmed");
-
-  // Twelve Full pages are three Full extents, which leave the Slim ones no
-  // room in the budget: the eight free pages need four more.
+  require(cache.snapshot().pool.pagesPrefix == 8 + 4 * Windowed::kUnitPages && cache.snapshot().pool.pagesFree == 8,
+          "fixture: the cache does not hold the base pages and the two tails' units beside 8 free pages (" +
+              std::to_string(cache.snapshot().pool.pagesPrefix) + " cached, " +
+              std::to_string(cache.snapshot().pool.pagesFree) + " free)");
   cache.beginRequest(2);
-  const TokenAdmission refused = cache.ensureTokens(2, 12 * KvCache::pageTokens);
-  require(!refused.granted() && refused.form == kv::PageForm::Full, "the shortfall setup was granted");
-  // The refusal's units until a state went.
+  const TokenAdmission refused = cache.ensureTokens(2, 5 * KvCache::pageTokens);
+  require(!refused.granted(), "fixture: the shortfall was granted");
   while (cache.snapshot().stateCache.entries == 2)
     require(test::takeFirst(cache, test::kInServiceGrowth, {.pages = refused.additionalPages}).outcome ==
                 FreeOutcome::Met,
             "the refusal took no state");
-  require(windowed.slimPages() == 6 &&
-              cache.snapshot().stateCache.entries == 1 && cache.snapshot().stateCache.checkpointEntries == 0,
-          "the checkpoint did not go first, or its tail was not trimmed");
-  require(admitTokens(cache, 2, 12 * KvCache::pageTokens).granted() && windowed.slimPages() == 8 &&
-              cache.snapshot().stateCache.entries == 0,
+  require(cache.snapshot().stateCache.entries == 1 && cache.snapshot().stateCache.checkpointEntries == 0,
+          "the checkpoint did not go first");
+  require(admitTokens(cache, 2, 5 * KvCache::pageTokens).granted() && cache.snapshot().stateCache.entries == 0,
           "the shortfall was not met by the states' tails");
   const CacheLookup kept = cache.lookup(cached, {});
-  require(kept.kvBoundary == 8 * KvCache::pageTokens && !kept.state, "a KV leaf went for Full pages");
+  require(kept.kvBoundary == 8 * KvCache::pageTokens && !kept.state, "a KV leaf went for a shortfall the tails met");
   cache.checkInvariants();
   cache.endRequest(2);
 }
 
-// A state the SSD keeps on a chain no request runs on still pins its tail Full, and the shortfall moves on to the
-// ordinary state: only the tails behind a lane leave for it (testRefusedLanesTakeTheTailsBehindThem).
-void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
-  Windowed windowed;
-  windowed.storage.budgetPages = 16;
+// A state the SSD keeps goes on holding its tail's units only while it is its conversation's newest: once a deeper
+// state a request went on from superseded it, a shortfall lets it go before anything else, with its copy, and its
+// tail's units free; the newer states and every block stay. (A finished request's last point alone supersedes
+// nothing: the conversation goes on here from the state at eight to the one at nine.)
+void testFullShortfallsTakeTheHistoryTheSsdKeeps() {
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 16;
+  Windowed windowed(&tier);
+  windowed.storage.budgetPages = 28;
   engine::Cache &cache = windowed.cache;
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
-  const std::vector<uint32_t> cached = Windowed::prompt(8000, 8);
+  const std::vector<uint32_t> cached = Windowed::prompt(8000, 9);
   cache.beginRequest(1);
-  windowed.run(1, cached, 8);
-  const uint64_t checkpoint = cache.blockAt(1, 4 * KvCache::pageTokens);
-  cache.publishCompositeState(checkpoint, std::make_shared<TieredState>(control), true);
-  windowed.publish(1, 8);
-  cache.endRequest(1);
-  require(cache.trimWindows() == 4 && windowed.slimPages() == 4, "the unpinned pages were not trimmed");
-
-  // A claim for a state's buffers writes the checkpoint first.
+  windowed.step(1, cached, 4);
+  const uint64_t earlier = cache.blockAt(1, 4 * KvCache::pageTokens);
+  cache.publishCompositeState(earlier, std::make_shared<TieredState>(control), false, 1);
+  // A claim for a state's buffers writes it while it is the newest.
   require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
-              control->slots == 1 && cache.pollTransfers(),
-          "the checkpoint was not written to the SSD");
+              control->slots == 1 && cache.pollTransfers() && cache.snapshot().stateCache.diskBytes == 100,
+          "fixture: the newest state was not written to the SSD");
+  windowed.step(1, cached, 8);
+  windowed.publish(1, 8);
+  windowed.step(1, cached, 9);
+  windowed.publish(1, 9);
+  cache.endRequest(1);
+  require(cache.snapshot().pool.pagesPrefix == 9 + 5 * Windowed::kUnitPages && cache.snapshot().pool.pagesFree == 5,
+          "fixture: the history the SSD keeps did not hold its tail's units in memory (" +
+              std::to_string(cache.snapshot().pool.pagesPrefix) + " cached pages, " +
+              std::to_string(cache.snapshot().pool.pagesFree) + " free)");
+  // Four blocks, twelve pages: the five free, the extent the budget still allows and the four the history's tail
+  // holds.
   cache.beginRequest(2);
-  const TokenAdmission refused = cache.ensureTokens(2, 12 * KvCache::pageTokens);
-  require(!refused.granted() && refused.form == kv::PageForm::Full, "the shortfall setup was granted");
-  static_cast<void>(test::takeFirst(cache, test::kInServiceGrowth, {.pages = refused.additionalPages}));
+  require(admitTokens(cache, 2, 4 * KvCache::pageTokens).granted(), "the pages were refused");
   const auto states = cache.snapshot().stateCache;
-  require(states.entries == 1 && states.checkpointEntries == 1 && states.diskBytes == 100 && control->slots == 1 &&
-              windowed.slimPages() == 6 && cache.stateTailFull(checkpoint),
-          "the checkpoint the SSD keeps lost its entry, or its tail was trimmed");
+  const CacheLookup newest = cache.lookup(cached, {});
+  require(states.entries == 2 && states.diskBytes == 0 && control->slots == 0 && newest.state &&
+              newest.resumeBoundary() == 9 * KvCache::pageTokens && newest.kvBoundary == 9 * KvCache::pageTokens,
+          "history the SSD keeps kept its tail's units, or a newer state or a block went for them");
   cache.checkInvariants();
   cache.endRequest(2);
 }
 
+// A point sparse history keeps holds its tail's units only until its window parts land, written as transfers are
+// polled (Cache::writeWindowsAhead): after that no claim takes an idle conversation's newest point for them. The
+// fixture of testFullShortfallsTakeTheHistoryTheSsdKeeps, but its earlier point leaves memory as history, the
+// chain's first point, which sparse history writes: a claim for a state's buffers takes it at no loss, before the
+// newer states its leaving would lose, its write and its window parts' land, and the history stays on the SSD. Then
+// the same four blocks, by a request's admission (a page need, which no walk writes for) or by a claim that cannot
+// wait, find the units free: every newer state and block stays.
+void testAKeptPointsLandedPartsCostNoNewerPoint() {
+  for (const bool immediate : {false, true}) {
+    test::TestKvTier tier(false, 200);
+    tier.capacity = 16;
+    Windowed windowed(&tier);
+    windowed.storage.budgetPages = 28;
+    engine::Cache &cache = windowed.cache;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    const std::vector<uint32_t> cached = Windowed::prompt(8000, 9);
+    cache.beginRequest(1);
+    windowed.step(1, cached, 4);
+    const uint64_t earlier = cache.blockAt(1, 4 * KvCache::pageTokens);
+    cache.publishCompositeState(earlier, std::make_shared<TieredState>(control), false, 1);
+    windowed.step(1, cached, 8);
+    windowed.publish(1, 8);
+    windowed.step(1, cached, 9);
+    windowed.publish(1, 9);
+    cache.endRequest(1);
+    require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
+                control->slots == 1 && !cache.stateResident(earlier),
+            "fixture: the history was not written as it left memory");
+    for (int poll = 0; poll < 4; ++poll) {
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    require(cache.snapshot().stateCache.diskBytes == 100 && cache.snapshot().pool.pagesFree == 9,
+            "fixture: the kept point's window parts did not land and free its tail's units (" +
+                std::to_string(cache.snapshot().pool.pagesFree) + " free pages)");
+    // The admission as the engine makes it, its claim for what it lacks one that waits, or one that cannot.
+    cache.beginRequest(2);
+    const ClaimSpec claim{.cls = ClaimClass::InService,
+                          .reach = ReclaimClass::InUse,
+                          .timing = immediate ? NeedTiming::Immediate : NeedTiming::CanWait};
+    TokenAdmission admission = cache.ensureTokens(2, 4 * KvCache::pageTokens);
+    for (int attempt = 0; attempt < 8 && !admission.granted(); ++attempt) {
+      const uint32_t lacking = admission.additionalPages - std::min(admission.additionalPages, admission.availablePages);
+      if (test::freeFromCache(cache, claim, {.pages = lacking, .form = admission.form}).outcome != FreeOutcome::Met)
+        break;
+      admission = cache.ensureTokens(2, 4 * KvCache::pageTokens);
+    }
+    require(admission.granted(), "the pages were refused");
+    const auto states = cache.snapshot().stateCache;
+    const CacheLookup newest = cache.lookup(cached, {});
+    const CacheLookup back = cache.lookup(std::span<const uint32_t>(cached).first(4 * KvCache::pageTokens + 1), {});
+    require(states.entries == 3 && states.diskBytes == 100 && newest.state &&
+                newest.resumeBoundary() == 9 * KvCache::pageTokens && newest.kvBoundary == 9 * KvCache::pageTokens &&
+                back.resumeBoundary() == 4 * KvCache::pageTokens,
+            std::string(immediate ? "a claim that cannot wait" : "an admission") +
+                " took a newer state or a block, or the kept history, for units the kept point's landing freed");
+    cache.checkInvariants();
+    cache.endRequest(2);
+  }
+}
+
 // A conversation of one-page turns, each ending in a state, on the SSD or in RAM: the tails, closer than a window,
-// hold every page Full. With memory to spare no state leaves; refused Full pages, the lane takes the tails behind it,
-// oldest first, and grows to the pages the plan counts, its head's state, its newest and its KV kept; refused at the
-// plan's bound it leaves no page waiting for a trim and no state behind it but those.
+// hold every block's unit. Its lane runs on a page at a time at a memory limit, cut by cut as commands go: it takes
+// the units of the states its later turns superseded, oldest first, and grows past what holding every unit allows,
+// its newest state and every block kept, and no state behind it but its newest.
 void testRefusedLanesTakeTheTailsBehindThem() {
   for (const bool ssd : {true, false}) {
-    Windowed windowed;
-    windowed.storage.budgetPages = 16;
+    test::TestKvTier tier(false, 200);
+    tier.capacity = 64;
+    Windowed windowed(ssd ? &tier : nullptr);
+    windowed.storage.budgetPages = 32;
     engine::Cache &cache = windowed.cache;
     auto control = std::make_shared<TransferControl>();
     control->ready = true;
@@ -5553,15 +6195,15 @@ void testRefusedLanesTakeTheTailsBehindThem() {
     const std::vector<uint32_t> prompt = Windowed::prompt(9000, 48);
     cache.beginRequest(1);
     const auto turn = [&](uint32_t pages) {
-      static_cast<void>(cache.trimWindows());
+      static_cast<void>(cache.cutPageTable(1));
       if (!admitTokens(cache, 1, pages * KvCache::pageTokens + 1).granted())
         return false;
       cache.publishCommittedBlocks(1, prompt, pages * KvCache::pageTokens, {});
       const uint64_t block = cache.blockAt(1, pages * KvCache::pageTokens);
       if (!ssd)
-        cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
+        cache.publishCompositeState(block, std::make_shared<TestState>(100), false, 1);
       else {
-        cache.publishCompositeState(block, std::make_shared<TieredState>(control), false);
+        cache.publishCompositeState(block, std::make_shared<TieredState>(control), false, 1);
         require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
                     cache.pollTransfers() && cache.snapshot().stateCache.bytes == 0,
                 "a turn's state was not written to the SSD");
@@ -5570,39 +6212,2016 @@ void testRefusedLanesTakeTheTailsBehindThem() {
       return true;
     };
     uint32_t pages = 0;
-    while (pages < 8 && turn(pages + 1))
+    while (pages < 4 && turn(pages + 1))
       ++pages;
-    require(pages == 8 && cache.snapshot().stateCache.entries == 8 && windowed.forms(1) == "FFFFFFFFF",
-            "a state left, or a page was trimmed, with memory to spare");
+    require(pages == 4 && cache.snapshot().stateCache.entries == 4, "a state left with memory to spare");
     while (pages < 47 && turn(pages + 1))
       ++pages;
-    const std::string forms = windowed.forms(1);
-    const auto full = static_cast<uint32_t>(std::ranges::count(forms, 'F'));
-    require(pages >= 24 && full <= 8 && windowed.slimPages() == forms.size() - full,
-            "the lane did not grow to the pages the plan counts on Slim pages");
-    // A walk takes a head's state in RAM for its tail, as any state in RAM.
-    const auto head = std::span<const uint32_t>(prompt).first(KvCache::pageTokens + 1);
+    // Holding every block's unit, 32 pages hold 10 blocks; holding the
+    // units of its window and of its two newest states' tails, 22 or more.
     const auto whole = std::span<const uint32_t>(prompt).first(pages * KvCache::pageTokens + 1);
     const CacheLookup newest = cache.lookup(whole, {});
-    require((!ssd || (forms.front() == 'F' && cache.lookup(head, {}).state)) && newest.state &&
-                newest.resumeBoundary() == pages * KvCache::pageTokens &&
-                newest.kvBoundary == pages * KvCache::pageTokens,
-            "the head's state or the lane's newest left, or a block of its history");
-    require(cache.trimWindows() == 0 && cache.snapshot().stateCache.entries <= 3,
-            "refused, the lane left a page waiting for a trim, or a state behind it");
+    require(pages >= 22 && newest.state && newest.resumeBoundary() == pages * KvCache::pageTokens &&
+                newest.kvBoundary == pages * KvCache::pageTokens && cache.snapshot().stateCache.entries <= 2,
+            std::string(ssd ? "with" : "without") + " an SSD cache the lane reached " + std::to_string(pages) +
+                " pages, " + std::to_string(cache.snapshot().stateCache.entries) +
+                " states behind it: it did not take the tails behind it, or lost its newest state or a block");
     cache.checkInvariants();
     cache.endRequest(1);
   }
 }
 
+// A client whose prompt does not only grow at its end (retrieved text or a reminder in the last message alone, tools
+// rendered before the last turn). Each turn leaves the conversation's chain at a new page: a state where it left
+// (the junction the next turn publishes) and, on the page it left by, the turn's own replay point, which nothing
+// ever goes on from. The replay points are never superseded: each is what a return to its turn resumes at. A
+// junction is history once the conversation went on past it twice (a finished turn's replay point beside it
+// supersedes nothing). Eleven such turns, then the conversation's lane runs on at the memory limit a command at a
+// time: it reaches its 39 pages, which the memory holds only once it takes back units those states' tails hold on
+// the blocks its window has passed (#842), the history first, as many as it lacks and never the head-most state's
+// on its chain. Without an SSD cache it gives the replay points up; with one it demotes them, each still a point,
+// its window K/V on the SSD.
+void laneTakesBackTheTailsOfTurnsThatLeftItsChain(bool ssd) {
+  constexpr uint32_t kTurns = 12;
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 128;
+  tier.transferLimit = 16;
+  Windowed windowed(ssd ? &tier : nullptr);
+  engine::Cache &cache = windowed.cache;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->capacity = 64;
+  const auto publish = [&](uint64_t id, uint32_t pages) {
+    cache.publishCompositeState(cache.blockAt(id, pages * KvCache::pageTokens),
+                                ssd ? std::shared_ptr<const CompositeState>(std::make_shared<TieredState>(control))
+                                    : std::make_shared<TestState>(100),
+                                false, id);
+  };
+  const std::vector<uint32_t> chain = Windowed::prompt(8000, 40);
+  for (uint32_t turn = 1; turn <= kTurns; ++turn) {
+    std::vector<uint32_t> prompt(chain.begin(), chain.begin() + turn * KvCache::pageTokens);
+    for (uint32_t token = 0; token <= KvCache::pageTokens; ++token)
+      prompt.push_back(70'000 + turn * 100 + token);
+    cache.beginRequest(turn);
+    if (turn > 1) {
+      CacheLookup lookup = cache.lookup(prompt, {});
+      require(lookup.state && lookup.resumeBoundary() == (turn - 1) * KvCache::pageTokens &&
+                  admitRestore(cache, turn, lookup).granted(),
+              "fixture: a turn did not resume where the turn before it left the chain");
+    }
+    windowed.run(turn, prompt, turn);
+    publish(turn, turn);
+    if (turn < kTurns) {
+      windowed.run(turn, prompt, turn + 1);
+      publish(turn, turn + 1);
+    }
+    cache.endRequest(turn);
+  }
+  cache.beginRequest(100);
+  CacheLookup lookup = cache.lookup(chain, {});
+  require(lookup.state && lookup.resumeBoundary() == kTurns * KvCache::pageTokens &&
+              admitRestore(cache, 100, lookup).granted(),
+          "fixture: the lane did not resume at the chain's newest state");
+  lookup = {};
+  windowed.storage.budgetPages = static_cast<uint32_t>(windowed.storage.allocatedBytes() / 100);
+  const uint32_t before = cache.snapshot().stateCache.entries;
+  uint32_t pages = kTurns;
+  for (uint32_t attempt = 0; attempt < 512 && pages < 39; ++attempt) {
+    static_cast<void>(cache.cutPageTable(100));
+    const TokenAdmission admission = cache.ensureTokens(100, (pages + 1) * KvCache::pageTokens + 1);
+    if (admission.granted()) {
+      cache.publishCommittedBlocks(100, chain, (pages + 1) * KvCache::pageTokens, {});
+      ++pages;
+      continue;
+    }
+    const FreeResult freed = askLedger(cache, admission);
+    tier.complete();
+    if (!cache.pollTransfers() && !freed.gave())
+      break;
+  }
+  // The turns' replay points behind its window that a return to their turns still resumes at.
+  uint32_t kept = 0;
+  for (uint32_t at = 2; at + Windowed::kWindowPages <= kTurns; ++at) {
+    std::vector<uint32_t> prompt(chain.begin(), chain.begin() + at * KvCache::pageTokens);
+    for (uint32_t token = 0; token <= KvCache::pageTokens; ++token)
+      prompt.push_back(70'000 + at * 100 + token);
+    kept += cache.lookup(prompt, {}).resumeBoundary() == (at + 1) * KvCache::pageTokens;
+  }
+  const bool head = cache.lookup(std::span<const uint32_t>(chain).first(KvCache::pageTokens + 1), {}).resumeBoundary() ==
+                    KvCache::pageTokens;
+  const uint32_t after = cache.snapshot().stateCache.entries;
+  const bool lost = ssd ? after < before && kept == kTurns - Windowed::kWindowPages - 1
+                        : after < before && kept < kTurns - Windowed::kWindowPages - 1;
+  // Its head-most junction went on twice too: history, not kept for the lane.
+  static_cast<void>(head);
+  require(pages == 39 && lost,
+          std::string(ssd ? "with" : "without") + " an SSD cache, at the memory limit the lane reached " +
+              std::to_string(pages) + " pages, " + std::to_string(after) + " of " + std::to_string(before) +
+              " states left, " + std::to_string(kept) +
+              " replay points of turns that left its chain still points behind its window, its head-most " +
+              (head ? "kept" : "gone"));
+  cache.checkInvariants();
+  cache.endRequest(100);
+}
+
+void testALaneTakesBackTheTailsOfTurnsThatLeftItsChain() {
+  for (const bool ssd : {true, false})
+    laneTakesBackTheTailsOfTurnsThatLeftItsChain(ssd);
+}
+
+// A lane's release against a persistent tier's durable point. A lane with a head at page 2, a durable point at page
+// 4 and its newest state, in RAM alone, at page 8 runs on a command at a time at the memory limit, with no history
+// and no other state behind it. The plan counts no tail for a lane beyond its window, so it does not end at the
+// wall for one: it reaches 23 pages, taking the points behind it by recency, the head first, and never its newest
+// state; the durable point, whose copies are whole on the SSD, keeps its copy whatever leaves memory, and the
+// conversation resumes there. With memory to spare nothing leaves memory.
+void testALaneAtTheWallTakesThePointsBehindItAndKeepsItsDurableCopy() {
+  for (const uint32_t budget : {40u, 64u}) {
+    test::TestKvTier tier(true, 200);
+    tier.capacity = 16;
+    Windowed windowed(&tier);
+    windowed.storage.budgetPages = budget;
+    engine::Cache &cache = windowed.cache;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    const std::vector<uint32_t> prompt = Windowed::prompt(8000, 24);
+    cache.beginRequest(1);
+    windowed.step(1, prompt, 2);
+    windowed.publish(1, 2);
+    cache.noteHead(cache.blockAt(1, 2 * KvCache::pageTokens));
+    windowed.step(1, prompt, 4);
+    const uint64_t durable = cache.blockAt(1, 4 * KvCache::pageTokens);
+    cache.publishCompositeState(durable, std::make_shared<TieredState>(control), false, 1);
+    PersistStatus status = PersistStatus::Started;
+    for (int step = 0; step < 16 && status != PersistStatus::Durable; ++step) {
+      status = cache.persist(durable);
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    require(status == PersistStatus::Durable && cache.snapshot().stateCache.diskBytes == 100,
+            "fixture: the point was not made durable");
+    windowed.step(1, prompt, 8);
+    windowed.publish(1, 8);
+    uint32_t pages = 8;
+    while (pages < 23) {
+      static_cast<void>(cache.cutPageTable(1));
+      if (!admitTokens(cache, 1, (pages + 1) * KvCache::pageTokens + 1).granted())
+        break;
+      cache.publishCommittedBlocks(1, prompt, (pages + 1) * KvCache::pageTokens, {});
+      ++pages;
+    }
+    const auto states = cache.snapshot().stateCache;
+    const auto resumes = [&](uint32_t at) {
+      return cache.lookup(std::span<const uint32_t>(prompt).first(at * KvCache::pageTokens + 1), {})
+                 .resumeBoundary() == at * KvCache::pageTokens;
+    };
+    const bool head = resumes(2), newest = resumes(8);
+    const std::string held = std::to_string(pages) + " pages, " + std::to_string(states.entries) + " states, " +
+                             std::to_string(states.diskBytes) + " B of them on the SSD, the head " +
+                             (head ? "kept" : "gone") + ", the newest " + (newest ? "kept" : "gone");
+    require(pages == 23 && newest, "a lane at the memory limit ended short of its target or lost its newest state: " +
+                                       held);
+    require(states.diskBytes == 100 && resumes(4) &&
+                (budget == 40 ? states.entries == 2 && !head : states.entries == 3 && head && cache.stateResident(durable)),
+            budget == 40 ? "the lane did not take the head behind it, or its durable point lost its copy: " + held
+                         : "with memory to spare the lane gave up a state: " + held);
+    cache.endRequest(1);
+  }
+}
+
+// Two conversations of short turns, three pages a turn ending in a state, taking turns with no SSD cache (#824). The
+// tails, closer than a window, would hold every block's unit, 24 pages a conversation beside its 24 base pages;
+// memory holds 72 pages, the two conversations' base pages, their newest tails and a lane. Each conversation's
+// history gives its tails up as the other runs, and after eight turns each both resume at their newest state with
+// their whole K/V cached: nothing is lost but units.
+void testIdleConversationsKeepTheirBasePagesBeforeTheyLoseAnything() {
+  constexpr uint32_t kTurns = 8, kTurn = 3;
+  Windowed windowed;
+  windowed.storage.budgetPages = 72;
+  engine::Cache &cache = windowed.cache;
+  const std::array conversations{Windowed::prompt(10'000, kTurns * kTurn), Windowed::prompt(30'000, kTurns * kTurn)};
+  uint64_t id = 0;
+  const auto turn = [&](const std::vector<uint32_t> &chain, uint32_t pages) {
+    const std::vector<uint32_t> prompt(chain.begin(), chain.begin() + pages * KvCache::pageTokens + 1);
+    cache.beginRequest(++id);
+    {
+      CacheLookup lookup = cache.lookup(prompt, {});
+      require(pages == kTurn || (lookup.state && lookup.resumeBoundary() == (pages - kTurn) * KvCache::pageTokens &&
+                                 admitRestore(cache, id, lookup).granted()),
+              "a turn did not resume at its conversation's newest state with its K/V");
+    }
+    windowed.step(id, chain, pages);
+    windowed.publish(id, pages);
+    cache.endRequest(id);
+    cache.checkInvariants();
+  };
+  for (uint32_t pages = kTurn; pages <= kTurns * kTurn; pages += kTurn)
+    for (const std::vector<uint32_t> &chain : conversations)
+      turn(chain, pages);
+  for (const std::vector<uint32_t> &chain : conversations) {
+    const CacheLookup newest = cache.lookup(chain, {});
+    require(newest.state && newest.resumeBoundary() == kTurns * kTurn * KvCache::pageTokens &&
+                newest.kvBoundary == kTurns * kTurn * KvCache::pageTokens,
+            "an idle conversation lost its newest state or K/V where giving up its history's units sufficed");
+  }
+  require(cache.snapshot().window->windowUnits <= 2 * 2 * Windowed::kWindowPages,
+          "the idle conversations kept more units than their newest tails'");
+}
+
+// Lanes hold window units together and let go of them at different times. Two lanes resume at a state of a
+// cached prefix and run past it at different speeds, cut by cut; one ends while the other still holds the tail's
+// units; a third resumes onto units the second is about to pass, after the state that pinned them went, and
+// publishes a point there again from the units it holds; two lanes on one chain publish points whose tails
+// overlap. After each step the cache keeps its invariants (a block holds its unit exactly while a tail holds it
+// or a transfer moves it; a lane holds the units its window reads and no other), and the next request finds the
+// points as they stand.
+void testLanesHoldAndLetGoOfUnitsTogether() {
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> chain = Windowed::prompt(12'000, 16);
+  const auto resumesAt = [&](uint32_t pages) {
+    return cache.lookup(std::span<const uint32_t>(chain).first(pages * KvCache::pageTokens + 1), {}).resumeBoundary() ==
+           pages * KvCache::pageTokens;
+  };
+  const auto resume = [&](uint64_t id, uint32_t pages) {
+    cache.beginRequest(id);
+    CacheLookup lookup = cache.lookup(std::span<const uint32_t>(chain).first(pages * KvCache::pageTokens + 1), {});
+    require(lookup.state && lookup.resumeBoundary() == pages * KvCache::pageTokens &&
+                admitRestore(cache, id, lookup).granted(),
+            "fixture: a lane did not resume at the state");
+  };
+  // The cached prefix: four blocks and a state at their end.
+  cache.beginRequest(1);
+  windowed.step(1, chain, 4);
+  const uint64_t prefix = windowed.publish(1, 4);
+  cache.endRequest(1);
+  // Two lanes on it, one a page a command, the other two.
+  resume(2, 4);
+  resume(3, 4);
+  for (uint32_t pages = 5; pages <= 10; ++pages) {
+    windowed.step(2, chain, pages);
+    if (pages % 2 == 0)
+      windowed.step(3, chain, 4 + pages / 2);
+    cache.checkInvariants();
+  }
+  require(cache.snapshot().window->windowUnits == 2 && resumesAt(4),
+          "lanes running past a shared state took or dropped its tail's units");
+  // One ends while the other holds its window's units, the shared tail's no
+  // longer; the state's units stay with the state.
+  cache.endRequest(2);
+  cache.checkInvariants();
+  require(resumesAt(4) && cache.snapshot().window->windowUnits == 2, "a lane's end took a unit a state holds");
+  // The other publishes a point in its window; the state at the prefix
+  // goes; a third lane resumes at the new point, whose tail the second is
+  // about to pass, and then that point goes too.
+  const uint64_t point = windowed.publish(3, 9);
+  cache.checkInvariants();
+  resume(4, 9);
+  windowed.step(3, chain, 12);
+  cache.invalidateState(prefix);
+  cache.invalidateState(point);
+  cache.checkInvariants();
+  require(cache.snapshot().window->windowUnits == 0, "units outlived the states that held them");
+  // The third lane publishes there again from the units it holds; then a
+  // point a block on, whose tail overlaps it.
+  windowed.publish(4, 9);
+  windowed.step(4, chain, 10);
+  windowed.publish(4, 10);
+  cache.checkInvariants();
+  require(cache.snapshot().window->windowUnits == 3 && resumesAt(9) && resumesAt(10),
+          "points whose tails overlap did not share their units");
+  // Two lanes on one chain publish points whose tails overlap: the second
+  // lane at page 12, the third at 11 once it got there.
+  windowed.publish(3, 12);
+  windowed.step(4, chain, 11);
+  windowed.publish(4, 11);
+  cache.checkInvariants();
+  cache.endRequest(3);
+  cache.endRequest(4);
+  cache.checkInvariants();
+  require(resumesAt(10) && resumesAt(11) && resumesAt(12) && cache.snapshot().pool.pagesActive == 0 &&
+              cache.snapshot().window->windowUnits == 5,
+          "two lanes' points whose tails overlap did not hold their blocks' units between them");
+}
+
+// A head's state serves the next conversation that shares the head. Two conversations resume from it and part below
+// it, at its own block's child (four shared pages) or a page further down (five, as when their first messages begin
+// alike); each ends in a state of its own. Two conversations that parted below it supersede it no more than one
+// does: it stays a point the next conversation resumes from.
+void testAHeadConversationsPartBelowStaysAPoint() {
+  for (const uint32_t shared : {4u, 5u}) {
+    Windowed windowed;
+    engine::Cache &cache = windowed.cache;
+    const std::vector<uint32_t> a = Windowed::prompt(8000, 8);
+    std::vector<uint32_t> b = Windowed::prompt(20000, 8), c = Windowed::prompt(40000, 8);
+    std::copy_n(a.begin(), shared * KvCache::pageTokens, b.begin());
+    std::copy_n(a.begin(), 4 * KvCache::pageTokens, c.begin());
+    cache.beginRequest(1);
+    windowed.run(1, a, 4);
+    const uint64_t head = windowed.publish(1, 4);
+    windowed.run(1, a, 8);
+    windowed.publish(1, 8);
+    cache.endRequest(1);
+    cache.beginRequest(2);
+    CacheLookup resumed = cache.lookup(b, {});
+    require(resumed.state && resumed.resumeBoundary() == 4 * KvCache::pageTokens &&
+                admitRestore(cache, 2, resumed).granted(),
+            "fixture: the second conversation did not resume at the head");
+    resumed = {};
+    windowed.run(2, b, 8);
+    windowed.publish(2, 8);
+    cache.endRequest(2);
+    const CacheLookup next = cache.lookup(c, {});
+    require(cache.snapshot().stateCache.entries == 3 && cache.newestPoint(head) && next.state &&
+                next.resumeBoundary() == 4 * KvCache::pageTokens,
+            "conversations that part " + std::to_string(shared - 4) +
+                " page(s) below their head superseded the head's state, and the next conversation with that head "
+                "resumes at " + std::to_string(next.resumeBoundary()));
+    cache.checkInvariants();
+  }
+}
+
+// A conversation judged to render its replies back whose client renders six replies otherwise: each next prompt
+// leaves the reply at its first page, by a block its prefill publishes. Each reply's end state is ordinary
+// (Engine::finish), a leaf nothing renders through, and is history once that prompt's replay point lies beside it;
+// each replay point is history once a request went on from the next below it. The conversation's newest replay
+// point and reply end stay points, and the replay point before it, which the next request resumes at if the newest
+// turn was a side question, a retry or an edit: three states a conversation path.
+void testReplyStatesNoPromptRenderedThroughAreHistory() {
+  constexpr uint32_t kTurns = 6;
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> prompts = Windowed::prompt(8000, kTurns + 1);
+  std::vector<uint64_t> states;
+  for (uint32_t turn = 1; turn <= kTurns; ++turn) {
+    cache.beginRequest(turn);
+    if (turn > 1) {
+      CacheLookup lookup =
+          cache.lookup(std::span<const uint32_t>(prompts).first(turn * KvCache::pageTokens + 1), {});
+      require(lookup.state && lookup.resumeBoundary() == (turn - 1) * KvCache::pageTokens &&
+                  admitRestore(cache, turn, lookup).granted(),
+              "fixture: a turn did not resume at the replay point before it");
+    }
+    windowed.run(turn, prompts, turn);
+    states.push_back(windowed.publish(turn, turn));
+    // The reply: a page of its own after the prompt, whose last state ends ordinary.
+    std::vector<uint32_t> reply(prompts.begin(), prompts.begin() + turn * KvCache::pageTokens);
+    for (uint32_t token = 0; token <= KvCache::pageTokens; ++token)
+      reply.push_back(50'000 + turn * 100 + token);
+    require(admitTokens(cache, turn, (turn + 1) * KvCache::pageTokens + 1).granted(), "fixture: the reply was refused");
+    cache.publishCommittedBlocks(turn, reply, (turn + 1) * KvCache::pageTokens, {});
+    cache.noteReply(turn, turn);
+    states.push_back(windowed.publish(turn, turn + 1));
+    cache.endRequest(turn);
+  }
+  require(cache.snapshot().stateCache.entries == 2 * kTurns, "fixture: a state left with memory to spare");
+  require(windowed.newestPoints(states) == 3 && cache.newestPoint(states.back()) &&
+              cache.newestPoint(states[states.size() - 4]),
+          std::to_string(windowed.newestPoints(states)) + " of " + std::to_string(states.size()) +
+              " states stay points of a conversation of " + std::to_string(kTurns) +
+              " turns: the reply states no prompt rendered through are nobody's history");
+  cache.checkInvariants();
+}
+
+// A conversation whose client renders its replies back, a turn a request: each prompt resumes at the point before it,
+// publishes its replay point at its last page and decodes a reply of a page whose end state is ordinary. Returns the
+// replay point's block and the reply end's.
+struct RenderedTurns final {
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  std::pair<uint64_t, uint64_t> turn(uint64_t request, std::vector<uint32_t> &tokens, uint32_t replyFirst) {
+    const auto pages = static_cast<uint32_t>(tokens.size() / KvCache::pageTokens);
+    cache.beginRequest(request);
+    std::vector<uint32_t> asked = tokens;
+    asked.push_back(1);
+    CacheLookup lookup = cache.lookup(asked, {});
+    if (lookup.state)
+      require(admitRestore(cache, request, lookup).granted(), "fixture: a turn's restore was refused");
+    lookup = {};
+    asked.pop_back();
+    windowed.run(request, asked = tokens, pages);
+    const uint64_t replay = cache.blockAt(request, pages * KvCache::pageTokens);
+    if (!cache.stateResident(replay))
+      windowed.publish(request, pages);
+    for (uint32_t token = 0; token < KvCache::pageTokens; ++token)
+      tokens.push_back(replyFirst + token);
+    asked = tokens;
+    asked.push_back(1);
+    require(admitTokens(cache, request, (pages + 1) * KvCache::pageTokens + 1).granted(), "fixture: a reply was refused");
+    cache.publishCommittedBlocks(request, asked, (pages + 1) * KvCache::pageTokens, {});
+    cache.noteReply(request, pages);
+    const uint64_t end = windowed.publish(request, pages + 1);
+    cache.endRequest(request);
+    return {replay, end};
+  }
+  // `pages` pages of a user message from `first`.
+  static void say(std::vector<uint32_t> &tokens, uint32_t first, uint32_t pages) {
+    for (uint32_t token = 0; token < pages * KvCache::pageTokens; ++token)
+      tokens.push_back(first + token);
+  }
+  // Where a prompt resumes: the boundary of the state it finds, 0 for none.
+  uint32_t resumes(const std::vector<uint32_t> &tokens) {
+    std::vector<uint32_t> asked = tokens;
+    asked.push_back(1);
+    const CacheLookup lookup = cache.lookup(asked, {});
+    return lookup.state ? lookup.resumeBoundary() : 0;
+  }
+  // A claim of as many state buffers as there are states history, which the walk takes first.
+  void releaseHistory(std::span<const uint64_t> states) {
+    const auto history =
+        static_cast<uint32_t>(std::ranges::count_if(states, [&](uint64_t block) { return !cache.newestPoint(block); }));
+    if (history)
+      static_cast<void>(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = history}));
+  }
+};
+
+// The measured loss (Inkling-2-Mini, a conversation of about 100K tokens, a side question from its tip: its next turn
+// recomputed 42K tokens in 31.7 s where release 1.7.3 resumed it in 4.4 s): a side request from a conversation's tip
+// (a recall question, a title, a summary) goes on from the tip's replay point and publishes its own below it. It is
+// a prompt no later prompt went on from, so it supersedes nothing: the tip stays a point, and under a shortage that
+// takes all history, the conversation's next turn, which renders its last reply back, resumes at the tip.
+void testASideRequestFromTheTipLeavesTheTipAPoint() {
+  RenderedTurns turns;
+  std::vector<uint32_t> tokens;
+  RenderedTurns::say(tokens, 10'000, 4);
+  const auto [first, firstEnd] = turns.turn(1, tokens, 20'000);
+  RenderedTurns::say(tokens, 11'000, 2);
+  const auto [tip, tipEnd] = turns.turn(2, tokens, 21'000);
+  // The recall: the conversation to the tip's prompt and a question of a page, beside its reply.
+  std::vector<uint32_t> recall(tokens.begin(), tokens.begin() + 7 * KvCache::pageTokens);
+  RenderedTurns::say(recall, 30'000, 1);
+  const auto [side, sideEnd] = turns.turn(3, recall, 31'000);
+  const std::vector<uint64_t> states{first, firstEnd, tip, tipEnd, side, sideEnd};
+  require(turns.cache.newestPoint(tip), "the tip's replay point went history once a side request went on from it");
+  turns.releaseHistory(states);
+  std::vector<uint32_t> next = tokens;
+  RenderedTurns::say(next, 12'000, 1);
+  require(turns.resumes(next) >= 7 * KvCache::pageTokens,
+          "the conversation's next turn resumed at " + std::to_string(turns.resumes(next)) +
+              " tokens, not at the tip's replay point, after a side request and a shortage");
+  turns.cache.checkInvariants();
+}
+
+// The measured shape at its own token offsets, a page standing for a block: the tip's prompt ends 20 tokens into
+// its last page, its reply of 16 tokens fills that page's rest; a side question goes on from the tip's replay point
+// 25 tokens past the tip's prompt and answers in 3 tokens, so no block of a reply lies below its point. A finished
+// request's last point supersedes nothing whatever its reply's length: the tip stays a point, and the conversation's
+// next turn resumes there after a shortage that takes all history.
+void testAShortSideAnswerFromTheTipLeavesTheTipAPoint() {
+  constexpr uint32_t kTail = 20, kReply = 16, kQuestion = 25, kAnswer = 3;
+  RenderedTurns turns;
+  engine::Cache &cache = turns.cache;
+  std::vector<uint32_t> tip;
+  RenderedTurns::say(tip, 10'000, 4);
+  for (uint32_t token = 0; token < kTail; ++token)
+    tip.push_back(11'000 + token);
+  cache.beginRequest(1);
+  turns.windowed.run(1, tip, 4);
+  const uint64_t point = turns.windowed.publish(1, 4);
+  std::vector<uint32_t> replied = tip;
+  for (uint32_t token = 0; token < kReply; ++token)
+    replied.push_back(21'000 + token);
+  replied.push_back(1);
+  require(admitTokens(cache, 1, 5 * KvCache::pageTokens + 1).granted(), "fixture: the tip's reply was refused");
+  cache.publishCommittedBlocks(1, replied, 5 * KvCache::pageTokens, {});
+  cache.noteReply(1, 4);
+  cache.noteReplyStart(1, static_cast<uint32_t>(tip.size()));
+  cache.endRequest(1);
+  replied.pop_back();
+  std::vector<uint32_t> side = tip;
+  for (uint32_t token = 0; token < kQuestion; ++token)
+    side.push_back(30'000 + token);
+  cache.beginRequest(2);
+  CacheLookup lookup = turns.cache.lookup(side, {});
+  require(lookup.state && lookup.resumeBoundary() == 4 * KvCache::pageTokens && admitRestore(cache, 2, lookup).granted(),
+          "fixture: the side question did not resume at the tip's replay point");
+  lookup = {};
+  turns.windowed.run(2, side, 5);
+  const uint64_t sidePoint = turns.windowed.publish(2, 5);
+  for (uint32_t token = 0; token < kAnswer; ++token)
+    side.push_back(31'000 + token);
+  cache.endRequest(2);
+  require(cache.newestPoint(point), "the tip's replay point went history once a side question with a short answer "
+                                    "went on from it");
+  const std::vector<uint64_t> states{point, sidePoint};
+  turns.releaseHistory(states);
+  std::vector<uint32_t> next = replied;
+  RenderedTurns::say(next, 12'000, 1);
+  require(turns.resumes(next) >= 4 * KvCache::pageTokens,
+          "the conversation's next turn resumed at " + std::to_string(turns.resumes(next)) +
+              " tokens, not at the tip's replay point, after a side question with a short answer and a shortage");
+  cache.checkInvariants();
+}
+
+// An edit of the conversation's last user message (or a retry, which decodes a sibling reply) goes on from the reply's
+// end before that message: the replay point of the message it replaces has not gone on, so that reply's end stays a
+// point until the next turn renders the last reply back. A retry's reply is no request going on either.
+void testAnEditOfTheLastMessageResumesAtThePreviousReplysEnd() {
+  RenderedTurns turns;
+  std::vector<uint32_t> tokens;
+  RenderedTurns::say(tokens, 10'000, 4);
+  const auto [first, firstEnd] = turns.turn(1, tokens, 20'000);
+  std::vector<uint32_t> before = tokens;
+  RenderedTurns::say(tokens, 11'000, 2);
+  std::vector<uint32_t> asked = tokens;
+  const auto [last, lastEnd] = turns.turn(2, tokens, 21'000);
+  // A retry of the last turn: its prompt again, a sibling reply.
+  const auto [retried, retryEnd] = turns.turn(3, asked, 22'000);
+  require(retried == last && turns.cache.newestPoint(firstEnd),
+          "a retry's sibling reply made its prompt a point a request went on from");
+  const std::vector<uint64_t> states{first, firstEnd, last, lastEnd, retryEnd};
+  turns.releaseHistory(states);
+  std::vector<uint32_t> edit = before;
+  RenderedTurns::say(edit, 13'000, 2);
+  require(turns.resumes(edit) == 5 * KvCache::pageTokens,
+          "an edit of the last message resumed at " + std::to_string(turns.resumes(edit)) +
+              " tokens, not at the reply's end before it");
+  turns.cache.checkInvariants();
+}
+
+// The main line going on: the reply's end before a turn's prompt is history once the next turn renders that turn's
+// reply back; a side branch that went on several requests deep (a sub-conversation) supersedes the main line's point
+// it left, as two requests going on from it show a conversation that moved on there, and that point is kept again,
+// as two conversations parted, once the main line goes on too. Neither is a defect: the main line's point is kept
+// while only one request went on from it, and the cache holds, per conversation path, its newest replay point, its
+// reply's end and the reply's end before that prompt.
+void testAConversationGoingOnTwiceMakesItsPointsHistory() {
+  RenderedTurns turns;
+  std::vector<uint32_t> tokens;
+  RenderedTurns::say(tokens, 10'000, 4);
+  const auto [first, firstEnd] = turns.turn(1, tokens, 20'000);
+  RenderedTurns::say(tokens, 11'000, 1);
+  const auto [second, secondEnd] = turns.turn(2, tokens, 21'000);
+  require(turns.cache.newestPoint(firstEnd) && !turns.cache.newestPoint(first),
+          "fixture: one turn on, the reply's end before it went history or its prompt's point stayed");
+  // A sub-conversation from the second turn's replay point, two requests deep.
+  std::vector<uint32_t> side(tokens.begin(), tokens.begin() + 6 * KvCache::pageTokens);
+  RenderedTurns::say(side, 30'000, 1);
+  const auto [sideFirst, sideFirstEnd] = turns.turn(3, side, 31'000);
+  RenderedTurns::say(side, 32'000, 1);
+  static_cast<void>(turns.turn(4, side, 33'000));
+  require(!turns.cache.newestPoint(second) && turns.cache.newestPoint(sideFirstEnd),
+          "a sub-conversation that went on two requests deep did not supersede the main line's point it left");
+  RenderedTurns::say(tokens, 12'000, 1);
+  const auto [third, thirdEnd] = turns.turn(5, tokens, 22'000);
+  require(turns.cache.newestPoint(secondEnd) && !turns.cache.newestPoint(firstEnd),
+          "the main line's next turn did not make the reply's end before the last prompt history");
+  RenderedTurns::say(tokens, 13'000, 1);
+  static_cast<void>(turns.turn(6, tokens, 23'000));
+  require(turns.cache.newestPoint(second) || turns.cache.newestPoint(secondEnd),
+          "two conversations that both went on from one point left it history");
+  require(!turns.cache.newestPoint(secondEnd) && turns.cache.newestPoint(thirdEnd) && !turns.cache.newestPoint(third),
+          "the main line going on twice past a point kept it");
+  turns.cache.checkInvariants();
+}
+
+// A head that moves with its conversation. A client whose system message grows each turn (a transcript, notes or
+// tool results kept in it) has its head end a page further each turn, and the engine publishes a head's state at
+// each (Engine::publishStateBoundary, Cache::noteHead). Each later head supersedes the one before it as any turn
+// does: the conversation of 8 pages keeps one point.
+void testAHeadThatMovesWithItsConversationIsHistoryBehindIt() {
+  constexpr uint32_t kTurns = 8;
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> prompt = Windowed::prompt(8000, kTurns);
+  std::vector<uint64_t> heads;
+  cache.beginRequest(1);
+  for (uint32_t turn = 1; turn <= kTurns; ++turn) {
+    windowed.run(1, prompt, turn);
+    heads.push_back(windowed.publish(1, turn));
+    cache.noteHead(heads.back());
+  }
+  cache.endRequest(1);
+  require(windowed.newestPoints(heads) == 1 && cache.newestPoint(heads.back()),
+          std::to_string(windowed.newestPoints(heads)) + " of the conversation's " + std::to_string(kTurns) +
+              " heads stay points: every head it passed is kept for good");
+  cache.checkInvariants();
+}
+
+// Two conversations from one prompt (a fork, n samples of one request, a canned first message) part inside their
+// replies, and each goes on from its own: a sibling reply shows nothing about the other's conversation. The
+// second has gone on a turn; the first has not yet. Neither reply's end is an orphan: the first conversation's next
+// turn, which renders its reply back, resumes at that reply's end, or at least at the prompt's replay point above it.
+void testASiblingReplyIsNoOrphanWhileItsConversationMayGoOn() {
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> prompt = Windowed::prompt(8000, 4);
+  // Conversation `id`: the prompt's four pages, then a reply of a page of its own, then `more` pages of a next turn.
+  const auto tokens = [&](uint32_t id, uint32_t more) {
+    std::vector<uint32_t> all(prompt.begin(), prompt.begin() + 4 * KvCache::pageTokens);
+    for (uint32_t token = 0; token < (1 + more) * KvCache::pageTokens + 1; ++token)
+      all.push_back(50'000 + id * 1000 + token);
+    return all;
+  };
+  cache.beginRequest(1);
+  windowed.run(1, prompt, 4);
+  const uint64_t replay = windowed.publish(1, 4);
+  const auto reply = [&](uint64_t request, uint32_t id) {
+    const std::vector<uint32_t> all = tokens(id, 0);
+    require(admitTokens(cache, request, 5 * KvCache::pageTokens + 1).granted(), "fixture: a reply was refused");
+    cache.publishCommittedBlocks(request, all, 5 * KvCache::pageTokens, {});
+    cache.noteReply(request, 4);
+    const uint64_t end = windowed.publish(request, 5);
+    cache.endRequest(request);
+    return end;
+  };
+  const uint64_t firstReply = reply(1, 1);
+  cache.beginRequest(2);
+  CacheLookup again = cache.lookup(prompt, {});
+  require(again.state && again.resumeBoundary() == 4 * KvCache::pageTokens && admitRestore(cache, 2, again).granted(),
+          "fixture: the second conversation did not resume at the prompt's replay point");
+  again = {};
+  static_cast<void>(reply(2, 2));
+  // The second conversation's next turn renders its reply back and goes on two pages.
+  cache.beginRequest(3);
+  const std::vector<uint32_t> second = tokens(2, 2);
+  CacheLookup next = cache.lookup(second, {});
+  require(next.state && next.resumeBoundary() == 5 * KvCache::pageTokens && admitRestore(cache, 3, next).granted(),
+          "fixture: the second conversation's next turn did not resume at its reply's end");
+  next = {};
+  windowed.run(3, second, 7);
+  windowed.publish(3, 7);
+  cache.endRequest(3);
+  const CacheLookup first = cache.lookup(tokens(1, 2), {});
+  require((cache.newestPoint(firstReply) || cache.newestPoint(replay)) && first.state &&
+              first.resumeBoundary() >= 4 * KvCache::pageTokens,
+          "the first conversation's reply's end and its prompt's replay point both went history once its sibling had "
+          "gone on");
+  cache.checkInvariants();
+}
+
+// Two apps on one server: the second's system message is the first's and more (the same instructions plus tools,
+// or plus a role), so its head lies below the first's on the same chain. Each has a conversation, so the first
+// app's head is where two paths part, and still a point its next conversation resumes from.
+void testAHeadWithAnotherAppsHeadBelowItStaysAHead() {
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> longer = Windowed::prompt(8000, 8);
+  std::vector<uint32_t> shorter = Windowed::prompt(30'000, 8), another = Windowed::prompt(60'000, 8);
+  std::copy_n(longer.begin(), 3 * KvCache::pageTokens, shorter.begin());
+  std::copy_n(longer.begin(), 3 * KvCache::pageTokens, another.begin());
+  // The first app: a head of three pages, a conversation to page 6.
+  cache.beginRequest(1);
+  windowed.run(1, shorter, 3);
+  const uint64_t head = windowed.publish(1, 3);
+  cache.noteHead(head);
+  windowed.run(1, shorter, 6);
+  windowed.publish(1, 6);
+  cache.endRequest(1);
+  // The second app: its head at page 5, on the first's chain as far as page 3, and a conversation to page 8.
+  cache.beginRequest(2);
+  CacheLookup resumed = cache.lookup(longer, {});
+  require(resumed.state && resumed.resumeBoundary() == 3 * KvCache::pageTokens &&
+              admitRestore(cache, 2, resumed).granted(),
+          "fixture: the second app did not resume at the first's head");
+  resumed = {};
+  windowed.run(2, longer, 5);
+  cache.noteHead(windowed.publish(2, 5));
+  windowed.run(2, longer, 8);
+  windowed.publish(2, 8);
+  cache.endRequest(2);
+  const CacheLookup next = cache.lookup(another, {});
+  require(cache.newestPoint(head) && next.state && next.resumeBoundary() == 3 * KvCache::pageTokens,
+          "the first app's head went history because another app's head lies below it");
+  cache.checkInvariants();
+}
+
+// A head one conversation has used so far. Its later turns supersede each other, not the head: the head and the
+// newest turn stay points.
+void testAHeadOneConversationUsedOutlastsItsTurns() {
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> first = Windowed::prompt(8000, 8);
+  std::vector<uint32_t> second = Windowed::prompt(40'000, 8);
+  std::copy_n(first.begin(), 3 * KvCache::pageTokens, second.begin());
+  std::vector<uint64_t> states;
+  cache.beginRequest(1);
+  windowed.run(1, first, 3);
+  states.push_back(windowed.publish(1, 3));
+  cache.noteHead(states.back());
+  for (const uint32_t pages : {5u, 6u, 8u}) {
+    windowed.run(1, first, pages);
+    states.push_back(windowed.publish(1, pages));
+  }
+  cache.endRequest(1);
+  const CacheLookup next = cache.lookup(second, {});
+  const CacheLookup newest = cache.lookup(first, {});
+  // The request has ended: its last point supersedes nothing (it may be a side question's), so the one before it
+  // stays a point too.
+  require(windowed.newestPoints(states) == 3 && cache.newestPoint(states.front()) && cache.newestPoint(states.back()) &&
+              cache.newestPoint(states[2]) &&
+              next.state && next.resumeBoundary() == 3 * KvCache::pageTokens && newest.state &&
+              newest.resumeBoundary() == 8 * KvCache::pageTokens,
+          "of a head one conversation used and its turns, " + std::to_string(windowed.newestPoints(states)) +
+              " stay points (the head and the newest two turns should)");
+  cache.checkInvariants();
+}
+
+// The same where a prompt ends inside a page: a reply's mark starts at the first block wholly past the prompt, so
+// the block a reply shares with its prompt's tail is not a reply's (Cache::noteReplyStart). A prompt ends half a
+// page past its replay point; its reply fills that page and one more, whose end state is ordinary; the next prompt
+// renders the reply otherwise from its first token, so it leaves inside the shared page. Six such turns: each
+// reply's end is history, and the conversation keeps its newest points alone.
+void testAReplyLeftInsideTheBlockItSharesWithItsPromptIsHistory() {
+  constexpr uint32_t kTurns = 6, kHalf = KvCache::pageTokens / 2;
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> chain = Windowed::prompt(8000, kTurns + 2);
+  std::vector<uint64_t> states;
+  for (uint32_t turn = 1; turn <= kTurns; ++turn) {
+    const std::vector<uint32_t> prompt(chain.begin(), chain.begin() + turn * KvCache::pageTokens + kHalf);
+    cache.beginRequest(turn);
+    if (turn > 1) {
+      CacheLookup lookup = cache.lookup(prompt, {});
+      require(lookup.state && lookup.resumeBoundary() == (turn - 1) * KvCache::pageTokens &&
+                  admitRestore(cache, turn, lookup).granted(),
+              "fixture: a turn did not resume at the replay point before it");
+    }
+    require(admitTokens(cache, turn, prompt.size()).granted(), "fixture: the prompt was refused");
+    cache.publishCommittedBlocks(turn, prompt, turn * KvCache::pageTokens, {});
+    states.push_back(windowed.publish(turn, turn));
+    // The reply: the other half of the prompt's last page, a page of its own, and a token.
+    std::vector<uint32_t> reply = prompt;
+    for (uint32_t token = 0; token <= kHalf + KvCache::pageTokens; ++token)
+      reply.push_back(50'000 + turn * 100 + token);
+    require(admitTokens(cache, turn, reply.size()).granted(), "fixture: the reply was refused");
+    cache.publishCommittedBlocks(turn, reply, (turn + 2) * KvCache::pageTokens, {});
+    cache.noteReply(turn, turn + 1);
+    cache.noteReplyStart(turn, static_cast<uint32_t>(prompt.size()));
+    states.push_back(windowed.publish(turn, turn + 2));
+    cache.endRequest(turn);
+  }
+  require(cache.snapshot().stateCache.entries == 2 * kTurns, "fixture: a state left with memory to spare");
+  // The newest replay point and reply end, and the replay point before it, which the next request resumes at if
+  // the newest turn was a side question, a retry or an edit.
+  require(windowed.newestPoints(states) == 3 && cache.newestPoint(states.back()),
+          std::to_string(windowed.newestPoints(states)) + " of " + std::to_string(states.size()) +
+              " states stay points of a conversation whose replies were left inside the page they share with their "
+              "prompts");
+  cache.checkInvariants();
+}
+
+// A point that leaves memory for the SSD, its state reclaimed through a write or published there straight from its
+// lane, writes no window K/V then: its tail's units stay in memory, held for it alone, until a need of pages takes
+// them by writing their window parts, and then it holds no unit and is still a point. Its blocks' base pages stay,
+// and a resume reads back its tail's window parts alone, into the lane's own pages.
+void testAPointOnTheSsdHoldsItsWindowAsPartsOrUnits() {
+  constexpr kv::Components window = kv::componentBit(kv::Component::Window);
+  constexpr kv::Components both = kv::componentBit(kv::Component::Base) | window;
+  for (const bool straight : {false, true}) {
+    const std::string how = straight ? "published straight to the SSD: " : "reclaimed to the SSD: ";
+    test::TestKvTier tier(false, 200);
+    tier.capacity = 16;
+    tier.transferLimit = 8;
+    Windowed windowed(&tier);
+    engine::Cache &cache = windowed.cache;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    const std::vector<uint32_t> prompt = Windowed::prompt(4100, 4);
+    cache.beginRequest(1);
+    windowed.run(1, prompt, 4);
+    const uint64_t point = cache.blockAt(1, 4 * KvCache::pageTokens);
+    if (straight)
+      require(cache.publishStateToDisk(point, [&](std::function<void()>) { return writeState(control); }, false, 1),
+              how + "the publication was refused");
+    else
+      cache.publishCompositeState(point, std::make_shared<TieredState>(control), false, 1);
+    cache.endRequest(1);
+    if (!straight)
+      require(test::stateStep(cache).gave(), how + "the state did not leave memory");
+    static_cast<void>(cache.pollTransfers());
+    require(tier.demotions == 0 && cache.snapshot().stateCache.bytes == 0 &&
+                cache.snapshot().stateCache.diskBytes == 100 && cache.snapshot().window->windowUnits == 2,
+            how + "the point's state did not go to the SSD alone, its tail's units held in memory (" +
+                std::to_string(tier.demotions) + " K/V writes, " +
+                std::to_string(cache.snapshot().window->windowUnits) + " units)");
+    cache.checkInvariants();
+    // A need of the units' pages writes their window parts, and their base
+    // parts with them, and once they land the units are free.
+    for (int step = 0; step < 8 && cache.snapshot().window->windowUnits; ++step) {
+      static_cast<void>(test::takeStep(cache, test::kInServiceGrowth, {.pages = 2 * Windowed::kUnitPages}));
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    const CacheSnapshot demoted = cache.snapshot();
+    require(demoted.window->windowUnits == 0 && demoted.pool.pagesPrefix == 4 &&
+                demoted.stateCache.entries == 1 && demoted.stateCache.diskBytes == 100 &&
+                std::ranges::count_if(tier.writes, [&](const auto &write) { return write.parts == both; }) == 2 &&
+                tier.writes.size() == 2,
+            how + "the need did not take the units by writing their window parts, the point and the base pages kept (" +
+                std::to_string(demoted.window->windowUnits) + " units, " + std::to_string(demoted.pool.pagesPrefix) +
+                " cached pages, " + std::to_string(demoted.stateCache.entries) + " states, " +
+                std::to_string(tier.writes.size()) + " writes)");
+    cache.checkInvariants();
+    // The resume reads the state and the tail's window parts alone.
+    cache.beginRequest(2);
+    CacheLookup resume = cache.lookup(prompt, {});
+    require(resume.state && resume.resumeBoundary() == 4 * KvCache::pageTokens &&
+                admitRestore(cache, 2, resume).granted(),
+            how + "the demoted point did not resume");
+    const PageTableState table = cache.pageTable(2);
+    require(tier.restoredParts == std::vector<kv::Components>{window, window} &&
+                table.windows[0][1] == kv::kAbsentPage && table.windows[0][2] != kv::kAbsentPage &&
+                table.windows[1][3] != kv::kAbsentPage && cache.kvRestoreStatus(2) == KvRestoreStatus::Pending,
+            how + "the resume did not read its tail's window parts alone into the lane's pages (" +
+                std::to_string(tier.restoredParts.size()) + " reads)");
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+    require(cache.kvRestoreStatus(2) == KvRestoreStatus::None && cache.snapshot().window->windowUnits == 0,
+            how + "the window parts' reads did not land, or the blocks took the lane's units with no point in memory");
+    static_cast<void>(cache.cutPageTable(2));
+    cache.checkInvariants();
+    resume = {};
+    cache.endRequest(2);
+    cache.checkInvariants();
+  }
+}
+
+// A read of a tail block's window part into the lane's own pages holds every page it touches until it lands: the
+// unit pages it fills, and the block's base page, whose extent the tier reads for the block's spans. A device need
+// meanwhile compacts no extent that holds one, though the base page of the deepest block is alone in its extent; once
+// the read lands the next need empties that extent, and the request's pages follow.
+void testACompactionLeavesThePagesAWindowPartsReadTouches() {
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 16;
+  tier.transferLimit = 8;
+  Windowed windowed(&tier);
+  engine::Cache &cache = windowed.cache;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  // A point on the SSD whose tail's window parts are there too, its blocks' base pages in memory.
+  const std::vector<uint32_t> prompt = Windowed::prompt(4100, 4);
+  cache.beginRequest(1);
+  windowed.run(1, prompt, 4);
+  cache.publishCompositeState(cache.blockAt(1, 4 * KvCache::pageTokens), std::make_shared<TieredState>(control), false,
+                              1);
+  cache.endRequest(1);
+  require(test::stateStep(cache).gave(), "fixture: the state did not leave memory");
+  static_cast<void>(cache.pollTransfers());
+  for (int step = 0; step < 8 && cache.snapshot().window->windowUnits; ++step) {
+    static_cast<void>(test::takeStep(cache, test::kInServiceGrowth, {.pages = 2 * Windowed::kUnitPages}));
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  require(!cache.snapshot().window->windowUnits && cache.snapshot().pool.pagesPrefix == 4,
+          "fixture: the tail's units did not leave for their window parts");
+  cache.beginRequest(2);
+  CacheLookup resume = cache.lookup(prompt, {});
+  require(resume.state && admitRestore(cache, 2, resume).granted() &&
+              cache.kvRestoreStatus(2) == KvRestoreStatus::Pending,
+          "fixture: the resume did not read its tail's window parts");
+  const PageTableState table = cache.pageTable(2);
+  std::set<uint32_t> touched;
+  for (uint32_t index = 2; index < 4; ++index) {
+    touched.insert(table.pages[index]);
+    for (const std::vector<uint32_t> &window : table.windows)
+      touched.insert(window[index]);
+  }
+  const uint32_t deepest = table.pages[3];
+  for (bool gave = true; gave;)
+    gave = test::releaseStep(cache).gave();
+  require(std::ranges::none_of(windowed.storage.copies, [&](const kv::PageCopy &copy) { return touched.contains(copy.from); }),
+          "a compaction moved a page a window part's read touches");
+  tier.complete();
+  require(cache.pollTransfers() && cache.kvRestoreStatus(2) == KvRestoreStatus::None, "the reads did not land");
+  const size_t moved = windowed.storage.copies.size();
+  require(test::releaseStep(cache).gave() && windowed.storage.copies.size() == moved + 1 &&
+              windowed.storage.copies.back().from == deepest &&
+              cache.pageTable(2).pages[3] == windowed.storage.copies.back().to,
+          "once the reads landed, a need did not empty the extent of the deepest block's base page");
+  cache.checkInvariants();
+  resume = {};
+  cache.endRequest(2);
+  cache.checkInvariants();
+}
+
+// A promotion's copy is a claim that may reclaim (Engine::promotedCopy): here it moves another state to the SSD,
+// whose tail shared a block with the promoted state's, and that block gives its unit up, its window part on the
+// SSD. The promoted state's tail takes the units it needs once its copy is made, the lane's for that block too:
+// a tail taken before the copy offered none for a block that held its unit then.
+void testAPromotionTakesItsTailAfterItsCopyReclaims() {
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 32;
+  tier.transferLimit = 16;
+  Windowed windowed(&tier);
+  engine::Cache &cache = windowed.cache;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const auto settle = [&] {
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  };
+  const std::vector<uint32_t> prompt = Windowed::prompt(4500, 5);
+  std::vector<uint32_t> four(prompt.begin(), prompt.begin() + 4 * KvCache::pageTokens + 1);
+  // A point at the fourth block goes to the SSD, and its tail's window parts after it.
+  cache.beginRequest(1);
+  windowed.run(1, prompt, 4);
+  const uint64_t point = cache.blockAt(1, 4 * KvCache::pageTokens);
+  cache.publishCompositeState(point, std::make_shared<TieredState>(control), false, 1);
+  cache.endRequest(1);
+  require(test::stateStep(cache).gave(), "fixture: the point did not leave memory");
+  settle();
+  for (int step = 0; step < 8 && cache.snapshot().window->windowUnits; ++step) {
+    static_cast<void>(test::takeStep(cache, test::kInServiceGrowth, {.pages = 2 * Windowed::kUnitPages}));
+    settle();
+  }
+  require(cache.snapshot().window->windowUnits == 0, "fixture: the point's units were not written");
+  // A conversation resumes there, the point promoted, and goes on a block; its state at the fifth block holds the
+  // fourth block's unit. The point leaves memory again: its copy stands, and the third block's unit goes.
+  PromotionTicket ticket;
+  cache.beginRequest(2);
+  CacheLookup resume = cache.lookup(four, {});
+  require(resume.state && admitRestore(cache, 2, resume).granted(), "fixture: the point did not resume");
+  settle();
+  cache.promoteState(resume, [&] { return ticket.snapshot(); }, 2);
+  resume = {};
+  windowed.run(2, prompt, 5);
+  cache.publishCompositeState(cache.blockAt(2, 5 * KvCache::pageTokens), std::make_shared<TieredState>(control), false,
+                              2);
+  cache.endRequest(2);
+  require(test::stateStep(cache).gave() && !cache.stateResident(point), "fixture: the point did not leave memory");
+  settle();
+  // A second conversation resumes at the point. Its promotion's copy moves the deeper state to the SSD.
+  cache.beginRequest(3);
+  resume = cache.lookup(four, {});
+  require(resume.state && admitRestore(cache, 3, resume).granted(), "the point did not resume again");
+  settle();
+  cache.promoteState(resume, [&] {
+    require(test::stateStep(cache).gave(), "the copy's claim took no state");
+    settle();
+    return ticket.snapshot();
+  }, 3);
+  require(cache.stateResident(point), "the point was not promoted");
+  cache.checkInvariants();
+  resume = {};
+  cache.endRequest(3);
+  cache.checkInvariants();
+}
+
+// A write into a block's copy makes room on a full quota from other copies, never from the copy it adds its part
+// to, which the write holds: room from it would free nothing, and the write would count as a rewrite. A point
+// copied ahead (its state and its chain's base parts) leaves memory with its tail's units held; a newer
+// conversation is copied ahead too, and the quota holds just what both hold. A need of one unit's pages writes its
+// window part into the oldest copy: the room comes from the next copies, and nothing is written again.
+void testAWriteMakesNoRoomFromItsOwnCopy() {
+  constexpr kv::Components window = kv::componentBit(kv::Component::Window);
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 32;
+  tier.transferLimit = 16;
+  const auto budget = std::make_shared<model::DiskBudget>(1 << 20);
+  tier.budget = budget;
+  Windowed windowed(&tier);
+  engine::Cache &cache = windowed.cache;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const auto copyAhead = [&](uint64_t id, const std::vector<uint32_t> &prompt, uint32_t pages) {
+    cache.beginRequest(id);
+    windowed.run(id, prompt, pages);
+    const uint64_t point = cache.blockAt(id, pages * KvCache::pageTokens);
+    cache.publishCompositeState(point, std::make_shared<TieredState>(control), false, id);
+    PersistStatus status = PersistStatus::Started;
+    for (int step = 0; step < 16 && status != PersistStatus::Durable; ++step) {
+      status = cache.persist(point);
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    cache.endRequest(id);
+    require(status == PersistStatus::Durable, "fixture: a point was not copied ahead");
+    return point;
+  };
+  const uint64_t point = copyAhead(1, Windowed::prompt(4700, 2), 2);
+  require(test::stateStep(cache).gave() && !cache.stateResident(point) && cache.snapshot().window->windowUnits == 2,
+          "fixture: the point did not leave memory, its tail's units held");
+  static_cast<void>(copyAhead(2, Windowed::prompt(4800, 4), 4));
+  budget->setLimitBytes(budget->usedBytes());
+  const size_t writes = tier.writes.size();
+  static_cast<void>(test::takeStep(cache, test::kInServiceGrowth, {.pages = Windowed::kUnitPages}));
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  require(tier.writes.size() == writes + 1 && tier.writes.back().parts == window &&
+              cache.snapshot().kvTier.rewrites == 0 && cache.snapshot().stateCache.entries == 2,
+          "the write of a window part into its block's copy took room from that copy (" +
+              std::to_string(tier.writes.size() - writes) + " writes, " +
+              std::to_string(cache.snapshot().kvTier.rewrites) + " rewrites)");
+  cache.checkInvariants();
+}
+
+// A copy ahead copies a point: on a persistent tier its state, its chain's base parts and its own tail's window
+// parts, which a restart needs, and no other block's window part although another point's tail holds that block's
+// unit; on a temporary tier its state and its chain's base parts alone, the window K/V written only when its units
+// must leave memory.
+void testACopyAheadWritesItsOwnTailOnAPersistentTierAlone() {
+  constexpr kv::Components base = kv::componentBit(kv::Component::Base);
+  constexpr kv::Components both = base | kv::componentBit(kv::Component::Window);
+  for (const bool persistent : {true, false}) {
+    const std::string tierName = persistent ? "persistent: " : "temporary: ";
+    test::TestKvTier tier(persistent, 200);
+    tier.capacity = 32;
+    tier.transferLimit = 16;
+    Windowed windowed(&tier);
+    engine::Cache &cache = windowed.cache;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    const std::vector<uint32_t> prompt = Windowed::prompt(4300, 8);
+    cache.beginRequest(1);
+    windowed.run(1, prompt, 8);
+    cache.publishCompositeState(cache.blockAt(1, 4 * KvCache::pageTokens), std::make_shared<TieredState>(control),
+                                false, 1);
+    const uint64_t point = cache.blockAt(1, 8 * KvCache::pageTokens);
+    cache.publishCompositeState(point, std::make_shared<TieredState>(control), false, 1);
+    PersistStatus status = PersistStatus::Started;
+    for (int step = 0; step < 16 && status != PersistStatus::Durable; ++step) {
+      status = cache.persist(point);
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    require(status == PersistStatus::Durable, tierName + "the point was not copied ahead");
+    std::vector<kv::Components> parts(9, 0);
+    for (size_t index = 0; index < tier.writes.size(); ++index)
+      for (uint32_t pages = 1; pages <= 8; ++pages)
+        if (tier.blocks[index].front() == cache.pageTable(1).pages[pages - 1])
+          parts[pages] |= tier.writes[index].parts;
+    const std::vector<kv::Components> expected =
+        persistent ? std::vector<kv::Components>{0, base, base, base, base, base, base, both, both}
+                   : std::vector<kv::Components>{0, base, base, base, base, base, base, base, base};
+    require(parts == expected, tierName +
+                                   "the copy ahead did not write the chain's base parts and, on a persistent tier "
+                                   "alone, its own tail's window parts");
+    cache.endRequest(1);
+    cache.checkInvariants();
+  }
+}
+
+// A lane at the memory wall takes the units of the points behind it on its chain that are not history, which it
+// demotes to the SSD rather than delete: here its head-most point, where another branch of the conversation parted.
+// The point's state is written, its window K/V once its units must leave memory, and a return to that turn resumes
+// from the SSD. Nothing of the lane's own newest point, whose units its window shares, is written.
+void testALaneAtTheWallDemotesThePointsBehindIt() {
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 32;
+  tier.transferLimit = 16;
+  Windowed windowed(&tier);
+  windowed.storage.budgetPages = 28;
+  engine::Cache &cache = windowed.cache;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->capacity = 8;
+  const auto branch = [](uint32_t from, uint32_t pages) {
+    std::vector<uint32_t> tokens = Windowed::prompt(4700, 4);
+    tokens.pop_back();
+    const std::vector<uint32_t> rest = Windowed::prompt(from, pages - 4);
+    tokens.insert(tokens.end(), rest.begin(), rest.end());
+    return tokens;
+  };
+  const std::vector<uint32_t> parted = branch(20000, 6), running = branch(30000, 12);
+  cache.beginRequest(2);
+  windowed.run(2, parted, 4);
+  const uint64_t turn = cache.blockAt(2, 4 * KvCache::pageTokens);
+  cache.publishCompositeState(turn, std::make_shared<TieredState>(control), false, 2);
+  // The parted branch went on from a point of its own (a finished request's last point alone supersedes nothing):
+  // two points, which the SSD takes too.
+  for (const uint32_t pages : {5u, 6u}) {
+    windowed.run(2, parted, pages);
+    cache.publishCompositeState(cache.blockAt(2, pages * KvCache::pageTokens), std::make_shared<TieredState>(control),
+                                false, 2);
+  }
+  cache.endRequest(2);
+  cache.beginRequest(1);
+  windowed.step(1, running, 8);
+  static_cast<void>(cache.cutPageTable(1));
+  require(cache.blockAt(1, 4 * KvCache::pageTokens) == turn, "fixture: the lane does not share the parting turn");
+  const uint64_t newest = cache.blockAt(1, 8 * KvCache::pageTokens);
+  cache.publishCompositeState(newest, std::make_shared<TieredState>(control), false, 1);
+  require(!cache.newestPoint(newest) || cache.newestPoint(turn), "fixture: the parting turn is history");
+  bool granted = false;
+  for (int step = 0; step < 32 && !granted; ++step) {
+    const TokenAdmission admission = cache.ensureTokens(1, 10 * KvCache::pageTokens + 1);
+    granted = admission.granted();
+    if (!granted)
+      static_cast<void>(test::takeStep(cache, test::kInServiceGrowth, {.pages = admission.additionalPages}));
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  require(granted, "the lane's growth was not met");
+  require(cache.stateResident(newest), "the lane's own newest point left memory");
+  cache.checkInvariants();
+  cache.endRequest(1);
+  cache.beginRequest(3);
+  std::vector<uint32_t> again(parted.begin(), parted.begin() + 4 * KvCache::pageTokens + 1);
+  CacheLookup back = cache.lookup(again, {});
+  require(back.state && back.resumeBoundary() == 4 * KvCache::pageTokens,
+          "the turn behind the lane was deleted, not demoted to the SSD (" + std::to_string(back.resumeBoundary()) +
+              " tokens resumed)");
+  back = {};
+  cache.endRequest(3);
+  cache.checkInvariants();
+}
+
+// With the write budget spent, units held for a point on the SSD whose window parts are not written cannot leave
+// through a write: a need of their pages gives that point up, and its units free with no write.
+void testASpentWriteBudgetGivesUpAnSsdPointsUnwrittenUnits() {
+  test::WriteBudget writes;
+  test::TestKvTier tier(false, 200);
+  tier.budget = writes.budget;
+  tier.transferLimit = 8;
+  test::TestKvStorage storage{192, 100, 4};
+  KvPool pool{storage, 4};
+  engine::Cache cache(pool, &tier, writes.budget, std::nullopt,
+                      CacheWindowPolicy{Windowed::kWindowPages, Windowed::kUnitPages});
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->writeBudget = writes.budget;
+  const std::vector<uint32_t> prompt = Windowed::prompt(4900, 4);
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, 4 * KvCache::pageTokens + 1).granted(), "fixture: the pages were refused");
+  cache.publishCommittedBlocks(1, prompt, 4 * KvCache::pageTokens, {});
+  const uint64_t point = cache.blockAt(1, 4 * KvCache::pageTokens);
+  cache.publishCompositeState(point, std::make_shared<TieredState>(control), false, 1);
+  cache.endRequest(1);
+  require(test::stateStep(cache).gave() && cache.pollTransfers() && control->slots == 1 &&
+              cache.snapshot().window->windowUnits == 2,
+          "fixture: the point did not go to the SSD with its tail's units in memory");
+  writes.spend();
+  for (int step = 0; step < 8 && cache.snapshot().window->windowUnits; ++step) {
+    static_cast<void>(test::takeStep(cache, test::kInServiceGrowth, {.pages = Windowed::kUnitPages}));
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  const CacheSnapshot after = cache.snapshot();
+  require(after.window->windowUnits == 0 && tier.demotions == 0 && after.stateCache.entries == 0,
+          "a spent budget wrote the units, or kept the point on units it cannot write (" +
+              std::to_string(after.window->windowUnits) + " units, " + std::to_string(tier.demotions) + " writes, " +
+              std::to_string(after.pool.pagesPrefix) + " cached pages)");
+  cache.checkInvariants();
+}
+
+// The work of the walk on a full persistent tier of a windowed layout holding three conversations of 26K, 34K and
+// 42K tokens (chains of 812 to 1,312 blocks), a restore point every 2,048 tokens copied ahead, the last
+// conversation's lane running, and the same at twice and three times the size (up to 148 points): one peek and one
+// take of a lane's need, and a whole claim as the ledger makes it (count, take, count again), visit in blocks and
+// states (reachVisits: the counts' chains, the states, the searches of the tail releases and of history, the walks
+// of a point's chain to see it landed) at most a constant times what the cache holds, its blocks and its states'
+// tails. A count that judged every release of a stage afresh at each, each asking of history down a whole chain,
+// grew as the square of the points (a claim of 4.5 s at three times this size), and an engine's tick with it; a
+// search that walked each counted release's chain at each block of the history search visited 53 million here and
+// stalled an engine for 30 s.
+void testTheWalkOfAFullPersistentCacheCostsWhatItHolds() {
+  constexpr uint32_t kWindow = 32, kUnit = 2;
+  for (const uint32_t scale : {1u, 2u, 3u}) {
+    test::TestKvTier tier(true, 200);
+    auto budget = std::make_shared<model::DiskBudget>(uint64_t{1} << 20);
+    tier.budget = budget;
+    tier.transferLimit = 64;
+    test::TestKvStorage storage{16384 * scale, 100, 64};
+    KvPool pool{storage, 4};
+    engine::Cache cache(pool, &tier, budget, std::nullopt, CacheWindowPolicy{kWindow, kUnit});
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    control->capacity = 1000;
+    uint32_t blocks = 0, states = 0;
+    for (uint64_t id = 1; id <= 3; ++id) {
+      const uint32_t pages = scale * (26'000 + 8'000 * static_cast<uint32_t>(id - 1)) / KvCache::pageTokens;
+      const std::vector<uint32_t> prompt = Windowed::prompt(static_cast<uint32_t>(id) * 100'000, pages);
+      cache.beginRequest(id);
+      require(admitTokens(cache, id, pages * KvCache::pageTokens + 1).granted(), "fixture: a conversation was refused");
+      for (uint32_t at = 64; at <= pages; at += 64) {
+        cache.publishCommittedBlocks(id, prompt, at * KvCache::pageTokens, {});
+        const uint64_t point = cache.blockAt(id, at * KvCache::pageTokens);
+        cache.publishCompositeState(point, std::make_shared<TieredState>(control), false, id);
+        ++states;
+        for (int step = 0; step < 64 && cache.persist(point) == PersistStatus::Started; ++step) {
+          tier.complete();
+          static_cast<void>(cache.pollTransfers());
+        }
+      }
+      cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens, {});
+      blocks += pages;
+      if (id < 3)
+        cache.endRequest(id);
+    }
+    const uint64_t holds = blocks + uint64_t{states} * kWindow;
+    const VictimQuery query = test::query(test::kInServiceGrowth, {.pages = 64});
+    const uint64_t before = cache.reachVisits();
+    std::optional<engine::Victim> unit = cache.peek(query, nullptr);
+    const uint64_t peeked = cache.reachVisits() - before;
+    require(unit.has_value(), "fixture: the full cache offered nothing");
+    static_cast<void>(cache.take(query, *unit));
+    const uint64_t taken = cache.reachVisits() - before - peeked;
+    const uint64_t claimFrom = cache.reachVisits();
+    static_cast<void>(test::freeFromCache(cache, test::kInServiceGrowth, {.pages = 64}));
+    const uint64_t claimed = cache.reachVisits() - claimFrom;
+    // A claim of 64 pages takes up to that many units, each counted again.
+    require(peeked <= 16 * holds && taken <= 16 * holds && claimed <= 16 * 64 * holds,
+            "a peek visited " + std::to_string(peeked) + ", a take " + std::to_string(taken) + " and a claim " +
+                std::to_string(claimed) + " blocks and states of a cache that holds " + std::to_string(blocks) +
+                " blocks and " + std::to_string(states) + " tails of " + std::to_string(kWindow));
+    std::cout << "walk of a full persistent cache holding " << holds << ": peek " << peeked << ", take " << taken
+              << ", claim " << claimed << " visits\n";
+    for (; tier.inFlight(); static_cast<void>(cache.pollTransfers()))
+      tier.complete();
+    cache.endRequest(3);
+    cache.checkInvariants();
+  }
+}
+
+// The count of a windowed cache with no SSD, where every release evicts its state: three conversations of 3,000,
+// 5,000 and 8,000 blocks (100K to 260K tokens), a state every 64 blocks (250 states), the last conversation's lane
+// running, and claims of 64 pages as a tick makes them (count, take, count again). A count stops once it covers the
+// need (Cache::reach), so a claim visits what it frees, not what the cache holds: the same claims with twice and four
+// times the states (a state every 32 and 16 blocks) visit no more than a constant per page claimed, and no more than
+// twice what they visit at the first size. Its time is held to a tenth of stage 3's (32887698: 91 ms a claim in this
+// shape; 70 to 84 ms on the M6 beside this branch's 0.1 to 0.25 ms). A count whose state-below test walked up from
+// every evicted state at each block its history search visited stalled an engine's loop for 30 s in this shape; one
+// that simulated every release the cache could make at every peek cost 176 ms a claim.
+void testTheCountOfADeepCacheWithNoSsdCostsWhatItHolds() {
+  constexpr uint32_t kWindow = 32, kUnit = 2, kClaim = 64;
+  uint64_t first = 0;
+  for (const uint32_t stride : {64u, 32u, 16u}) {
+    test::TestKvStorage storage{48'000, 100, 64};
+    KvPool pool{storage, 4};
+    engine::Cache cache(pool, nullptr, nullptr, std::nullopt, CacheWindowPolicy{kWindow, kUnit});
+    uint32_t blocks = 0, states = 0;
+    const uint32_t lengths[] = {3'000, 5'000, 8'000};
+    for (uint64_t id = 1; id <= 3; ++id) {
+      const uint32_t pages = lengths[id - 1];
+      const std::vector<uint32_t> prompt = Windowed::prompt(static_cast<uint32_t>(id) * 1'000'000, pages);
+      cache.beginRequest(id);
+      require(admitTokens(cache, id, pages * KvCache::pageTokens + 1).granted(),
+              "fixture: a conversation was refused");
+      for (uint32_t at = stride; at <= pages; at += stride) {
+        cache.publishCommittedBlocks(id, prompt, at * KvCache::pageTokens, {});
+        cache.publishCompositeState(cache.blockAt(id, at * KvCache::pageTokens), std::make_shared<TestState>(100),
+                                    false, id);
+        ++states;
+      }
+      cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens, {});
+      blocks += pages;
+      if (id < 3)
+        cache.endRequest(id);
+    }
+    double worst = 0;
+    uint64_t most = 0;
+    for (int claim = 0; claim < 4; ++claim) {
+      const uint64_t from = cache.reachVisits();
+      const auto start = std::chrono::steady_clock::now();
+      const FreeResult freed = test::freeFromCache(cache, test::kInServiceGrowth, {.pages = kClaim});
+      worst =
+          std::max(worst, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+      most = std::max(most, cache.reachVisits() - from);
+      require(freed.pages >= kClaim, "fixture: a claim was not met");
+    }
+    first = first ? first : most;
+    require(most <= 64 * kClaim && most <= 2 * first + 1024 && worst <= test::timeBound(9.1),
+            "a claim visited " + std::to_string(most) + " blocks and states (" + std::to_string(first) +
+                " at a state every 64 blocks) and took " + std::to_string(worst) + " ms in a cache that holds " +
+                std::to_string(blocks) + " blocks and " + std::to_string(states) + " tails of " +
+                std::to_string(kWindow));
+    std::cout << "claims of a deep cache with no SSD holding " << states << " states: at most " << most
+              << " visits, " << worst << " ms\n";
+    cache.endRequest(3);
+    cache.checkInvariants();
+  }
+}
+
+// A source beside the cache that counts the ledger's peeks of the cache and its takes, and a second source that
+// offers units of the ledger's first stage, a page each, logging each take with the cache's free pages then.
+struct CountingSource final : engine::VictimSource {
+  engine::Cache &cache;
+  mutable uint64_t peeks = 0;
+  uint64_t takes = 0;
+  explicit CountingSource(engine::Cache &each) : cache(each) {}
+  std::string_view name() const noexcept override { return "counted cache"; }
+  std::optional<engine::Victim> peek(const VictimQuery &query, const engine::Victim *after) const override {
+    ++peeks;
+    return cache.peek(query, after);
+  }
+  FreeResult take(const VictimQuery &query, const engine::Victim &victim) override {
+    ++takes;
+    return cache.take(query, victim);
+  }
+  std::array<uint32_t, kv::kPageForms> movesInto(const VictimQuery &query) const override {
+    return cache.movesInto(query);
+  }
+};
+struct PageSource final : engine::VictimSource {
+  const KvPool &pool;
+  uint32_t left;
+  std::vector<uint32_t> taken;
+  PageSource(const KvPool &each, uint32_t pages) : pool(each), left(pages) {}
+  std::string_view name() const noexcept override { return "pages"; }
+  std::optional<engine::Victim> peek(const VictimQuery &, const engine::Victim *after) const override {
+    if (after || !left)
+      return std::nullopt;
+    return engine::Victim{.key = left, .pages = 1};
+  }
+  FreeResult take(const VictimQuery &, const engine::Victim &) override {
+    --left;
+    taken.push_back(pool.freePageCount(kv::PageForm::Full));
+    return {.outcome = FreeOutcome::Met, .pages = 1};
+  }
+};
+
+// A claim of many pages on a full persistent cache (the walk's cost test's shape at three times its size) counts
+// once for its unit, not once a page: the ledger peeks a few times however many pages it claims, as a take of the
+// cache's first phase takes reclaims up to the claim's lack within its unit's count, and the claim visits what it
+// frees. Taken a step at a time, a claim of 1,280 pages peeked 1,286 times and held an engine's tick 523 ms on the
+// 48 GB Mac. The ledger's order across sources is the same as a step at a time: a source of units of the same first
+// stage given after the cache is taken from only once the cache's first phase gives nothing, and given before it,
+// first, whichever way the cache takes.
+void testAClaimOfManyPagesCountsOnceForItsUnit() {
+  constexpr uint32_t kWindow = 32, kUnit = 2, kScale = 3;
+  struct Shape final {
+    test::TestKvTier tier{true, 200};
+    std::shared_ptr<model::DiskBudget> budget = std::make_shared<model::DiskBudget>(uint64_t{1} << 20);
+    test::TestKvStorage storage{16384 * kScale, 100, 64};
+    KvPool pool{storage, 4};
+    engine::Cache cache{pool, &tier, budget, std::nullopt, CacheWindowPolicy{kWindow, kUnit}};
+    explicit Shape(uint32_t stride = 64) {
+      tier.budget = budget;
+      tier.transferLimit = 64;
+      auto control = std::make_shared<TransferControl>();
+      control->ready = true;
+      control->capacity = 1000;
+      for (uint64_t id = 1; id <= 3; ++id) {
+        const uint32_t pages = kScale * (26'000 + 8'000 * static_cast<uint32_t>(id - 1)) / KvCache::pageTokens;
+        const std::vector<uint32_t> prompt = Windowed::prompt(static_cast<uint32_t>(id) * 100'000, pages);
+        cache.beginRequest(id);
+        require(admitTokens(cache, id, pages * KvCache::pageTokens + 1).granted(),
+                "fixture: a conversation was refused");
+        for (uint32_t at = stride; at <= pages; at += stride) {
+          cache.publishCommittedBlocks(id, prompt, at * KvCache::pageTokens, {});
+          const uint64_t point = cache.blockAt(id, at * KvCache::pageTokens);
+          cache.publishCompositeState(point, std::make_shared<TieredState>(control), false, id);
+          for (int step = 0; step < 64 && cache.persist(point) == PersistStatus::Started; ++step) {
+            tier.complete();
+            static_cast<void>(cache.pollTransfers());
+          }
+        }
+        cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens, {});
+        if (id < 3)
+          cache.endRequest(id);
+      }
+    }
+    ~Shape() {
+      for (; tier.inFlight(); static_cast<void>(cache.pollTransfers()))
+        tier.complete();
+      cache.endRequest(3);
+      cache.checkInvariants();
+    }
+  };
+  constexpr uint32_t kClaim = 1280;
+  // A claim as the engine makes it, through a ledger whose sources are the counted cache and, when given, a source
+  // of pages before or after it.
+  const auto claim = [](Shape &shape, CountingSource &counted, PageSource *pages, bool pagesFirst,
+                         const engine::Need &need = {.pages = kClaim}) {
+    engine::MemoryLedger ledger;
+    if (pages && pagesFirst)
+      ledger.addSource(*pages);
+    ledger.addSource(counted);
+    if (pages && !pagesFirst)
+      ledger.addSource(*pages);
+    ledger.setReturning([&shape] { return shape.cache.returning(); },
+                        [&shape](std::span<const uint64_t> ids) { return shape.cache.returningFor(ids); });
+    const engine::ClaimId id = ledger.open(test::kInServiceGrowth);
+    const FreeResult freed = ledger.free(id, need, 0, engine::MemoryPressure::Normal);
+    ledger.close(id);
+    return freed;
+  };
+  {
+    Shape shape;
+    CountingSource counted{shape.cache};
+    const uint64_t from = shape.cache.reachVisits();
+    const FreeResult freed = claim(shape, counted, nullptr, false);
+    const uint64_t visits = shape.cache.reachVisits() - from;
+    require(freed.pages >= kClaim && counted.peeks <= 16 && visits <= uint64_t{512} * kClaim,
+            "a claim of " + std::to_string(kClaim) + " pages freed " + std::to_string(freed.pages) + " in " +
+                std::to_string(counted.takes) + " takes, peeking " + std::to_string(counted.peeks) +
+                " times and visiting " + std::to_string(visits));
+    std::cout << "a claim of " << kClaim << " pages: " << counted.peeks << " peeks, " << counted.takes << " takes, "
+              << visits << " visits\n";
+  }
+  // A device need in place (memory the engine refused for pages of the need's form), the claim of the 48 GB Mac's
+  // 1,004-round tick: on a windowed cache with no SSD, each step a leaf, its steps go on by pages. And the same with a
+  // window of 1,024 pages on a cache whose spare is less than one step's most (2,051 pages, a window's units), as
+  // Inkling's on the 48 GB Mac: with one step's most as the margin of every step, each take stopped after a step, as
+  // the next one could free a window of units past the count, and the claim went round the ledger once a step (357
+  // peeks); each step past the first now takes a unit only if what that unit frees fits what is left of the count.
+  for (const bool wide : {false, true}) {
+    test::TestKvStorage storage{48'000, 100, 64};
+    KvPool pool{storage, 4};
+    engine::Cache cache(pool, nullptr, nullptr, std::nullopt, CacheWindowPolicy{wide ? 1024u : kWindow, kUnit});
+    for (uint64_t id = 1; id <= 3; ++id) {
+      const uint32_t pages = wide ? (id < 3 ? 300 : 200) : 3'000 + 2'000 * static_cast<uint32_t>(id - 1);
+      const std::vector<uint32_t> prompt = Windowed::prompt(static_cast<uint32_t>(id) * 1'000'000, pages);
+      cache.beginRequest(id);
+      require(admitTokens(cache, id, pages * KvCache::pageTokens + 1).granted(), "fixture: a conversation was refused");
+      for (uint32_t at = 64; at <= pages; at += 64) {
+        cache.publishCommittedBlocks(id, prompt, at * KvCache::pageTokens, {});
+        cache.publishCompositeState(cache.blockAt(id, at * KvCache::pageTokens), std::make_shared<TestState>(100),
+                                    false, id);
+      }
+      cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens, {});
+      if (id < 3)
+        cache.endRequest(id);
+    }
+    CountingSource counted{cache};
+    engine::MemoryLedger ledger;
+    ledger.addSource(counted);
+    ledger.setReturning([&cache] { return cache.returning(); },
+                        [&cache](std::span<const uint64_t> ids) { return cache.returningFor(ids); });
+    const engine::ClaimId id = ledger.open(test::kInServiceGrowth);
+    const uint64_t from = cache.reachVisits();
+    const FreeResult freed =
+        ledger.free(id, {.bytes = uint64_t{kClaim} * storage.bytesPerPage(kv::PageForm::Full), .pages = kClaim}, 0,
+                    engine::MemoryPressure::Normal);
+    ledger.close(id);
+    const uint64_t visits = cache.reachVisits() - from;
+    require(freed.outcome == FreeOutcome::Met && counted.peeks <= 16 && visits <= uint64_t{512} * kClaim,
+            "in place, a claim of " + std::to_string(kClaim) + " pages freed " + std::to_string(freed.pages) +
+                " pages and " + std::to_string(freed.nowBytes) + " bytes in " + std::to_string(counted.takes) +
+                " takes, peeking " + std::to_string(counted.peeks) + " times and visiting " + std::to_string(visits));
+    std::cout << "a claim of " << kClaim << " pages in place" << (wide ? ", a wide window" : "") << ": "
+              << counted.peeks << " peeks, " << counted.takes << " takes, " << visits << " visits, " << freed.pages
+              << " pages\n";
+    cache.endRequest(3);
+    cache.checkInvariants();
+  }
+  // In place on the full persistent shape, with a point every 64 blocks and every 16 (four times the points, each
+  // copied to the SSD): a step's walk resumes past the phases a leaf's going leaves as they were (takeOldest), so a
+  // claim visits a bounded number a page, whatever the points. Walking each step from the head, it visited every
+  // point's tail release a step, 32K visits a step on the 48 GB Mac. The rc's 140 and 90 a page held the denser
+  // points to twice the sparser's; sparse history, which keeps windowed history too (Cache::writeWindowsAhead), asks
+  // at each step how the history it meets leaves, down its chain to the copy it spaces from: 184 and 1,028 a page,
+  // bounded at 256 and 1,280; its 1,280-page claim takes 3.2 and 13.5 ms on the M6 (1.7.5: cache those answers).
+  {
+    std::array<uint64_t, 2> perPage{};
+    for (const uint32_t stride : {64u, 16u}) {
+      Shape shape{stride};
+      // The points' RAM copies go first, their copies on the SSD staying: the claim's steps are leaves, as on the
+      // 48 GB Mac.
+      for (int step = 0; step < 4096 && test::takeStep(shape.cache, test::kInServiceGrowth, {.stateBuffers = 1}).gave();
+           ++step) {
+      }
+      CountingSource counted{shape.cache};
+      const uint64_t from = shape.cache.reachVisits();
+      // Its bytes more than the cache holds: its pages meet it.
+      const auto started = std::chrono::steady_clock::now();
+      const FreeResult freed = claim(shape, counted, nullptr, false, {.bytes = uint64_t{1} << 40, .pages = kClaim});
+      const double ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+      const uint64_t visits = shape.cache.reachVisits() - from;
+      perPage[stride == 16] = visits / std::max<uint32_t>(freed.pages, 1);
+      require(freed.outcome == FreeOutcome::Met && counted.peeks <= 16,
+              "in place on the persistent shape, a claim peeked " + std::to_string(counted.peeks) + " times");
+      std::cout << "a claim of " << kClaim << " pages in place, a point every " << stride << " blocks: "
+                << counted.peeks << " peeks, " << counted.takes << " takes, " << visits << " visits, "
+                << freed.pages << " pages, " << ms << " ms\n";
+    }
+    require(perPage[0] <= 256 && perPage[1] <= 1280,
+            "in place, a claim visited " + std::to_string(perPage[0]) + " a page with a point every 64 blocks and " +
+                std::to_string(perPage[1]) + " with one every 16");
+  }
+  for (const bool pagesFirst : {false, true}) {
+    std::array<std::vector<uint32_t>, 2> logs;
+    std::array<uint32_t, 2> freedPages{};
+    for (const bool bounded : {true, false}) {
+      Shape shape;
+      shape.cache.boundCounts(bounded);
+      CountingSource counted{shape.cache};
+      PageSource pages{shape.pool, 8};
+      freedPages[bounded] = claim(shape, counted, &pages, pagesFirst).pages;
+      logs[bounded] = pages.taken;
+    }
+    require(logs[0] == logs[1] && freedPages[0] == freedPages[1],
+            std::string("the source of pages given ") + (pagesFirst ? "before" : "after") +
+                " the cache was taken from " + std::to_string(logs[1].size()) + " times as the cache took steps up "
+                "to the lack, " + std::to_string(logs[0].size()) + " times a step at a time");
+  }
+}
+
+// A tail release's search costs a window a candidate, not a window of windows: three conversations of 3,100 blocks
+// with a state every 64 blocks, on a window of 32 pages (Inkling's 1,024 tokens) and of 128, with a temporary tier
+// and the states in RAM, and with a persistent one, the states copied and their RAM copies gone. (Sparse history
+// writes one history point in 256 pages, whose tail's units wait for their window parts: a window past 256 pages
+// would hold every unit so.) A claim of 1,280 pages in place
+// visits a bounded number a page it frees, and a device claim's count of what it reaches (its peeks) a window and
+// sparse history's reach (Cache::kSparseHistoryTokens of its chain, 128 blocks) a state at most, whatever the
+// window. Judging each block of a tail by the states within a window below it walked afresh
+// (unitPoints) cost a window of windows a candidate: at 1,024 pages, 21,114 visits a page and 20.6 million a peek
+// on the temporary shape, where this search visits 298 and 714K (the M6's Inkling ticks of 246 to 598 ms at the
+// memory wall, 40 to 133 million visits each).
+void testATailSearchCostsItsWindow() {
+  constexpr uint32_t kUnit = 2, kChain = 3'100, kStride = 64, kClaim = 1280;
+  for (const uint32_t window : {32u, 128u})
+    for (const bool persistent : {false, true}) {
+      test::TestKvTier tier{persistent, 200};
+      auto budget = std::make_shared<model::DiskBudget>(uint64_t{1} << 20);
+      tier.budget = budget;
+      tier.transferLimit = 64;
+      test::TestKvStorage storage{49'152, 100, 64};
+      KvPool pool{storage, 4};
+      engine::Cache cache{pool, &tier, budget, std::nullopt, CacheWindowPolicy{window, kUnit}};
+      auto control = std::make_shared<TransferControl>();
+      control->ready = true;
+      control->capacity = 1000;
+      uint32_t states = 0;
+      for (uint64_t id = 1; id <= 3; ++id) {
+        const std::vector<uint32_t> prompt = Windowed::prompt(static_cast<uint32_t>(id) * 1'000'000, kChain);
+        cache.beginRequest(id);
+        require(admitTokens(cache, id, kChain * KvCache::pageTokens + 1).granted(), "fixture: a conversation was refused");
+        for (uint32_t at = kStride; at <= kChain; at += kStride, ++states) {
+          cache.publishCommittedBlocks(id, prompt, at * KvCache::pageTokens, {});
+          const uint64_t point = cache.blockAt(id, at * KvCache::pageTokens);
+          cache.publishCompositeState(point, std::make_shared<TieredState>(control), false, id);
+          for (int step = 0; persistent && step < 64 && cache.persist(point) == PersistStatus::Started; ++step) {
+            tier.complete();
+            static_cast<void>(cache.pollTransfers());
+          }
+        }
+        cache.publishCommittedBlocks(id, prompt, kChain * KvCache::pageTokens, {});
+        if (id < 3)
+          cache.endRequest(id);
+      }
+      for (int step = 0; persistent && step < 4096 &&
+                         test::takeStep(cache, test::kInServiceGrowth, {.stateBuffers = 1}).gave();
+           ++step) {
+      }
+      // The count of a device claim by bytes, as the ledger peeks it.
+      const VictimQuery bytes = test::query(test::kInServiceGrowth, {.bytes = uint64_t{kClaim} * 6400});
+      uint64_t from = cache.reachVisits();
+      uint32_t peeks = 0;
+      for (std::optional<engine::Victim> unit = cache.peek(bytes, nullptr); unit; unit = cache.peek(bytes, &*unit))
+        ++peeks;
+      const uint64_t counted = (cache.reachVisits() - from) / std::max<uint32_t>(peeks, 1);
+      CountingSource source{cache};
+      engine::MemoryLedger ledger;
+      ledger.addSource(source);
+      ledger.setReturning([&cache] { return cache.returning(); },
+                          [&cache](std::span<const uint64_t> ids) { return cache.returningFor(ids); });
+      const engine::ClaimId id = ledger.open(test::kInServiceGrowth);
+      from = cache.reachVisits();
+      const FreeResult freed =
+          ledger.free(id, {.bytes = uint64_t{1} << 40, .pages = kClaim}, 0, engine::MemoryPressure::Normal);
+      ledger.close(id);
+      const uint64_t perPage = (cache.reachVisits() - from) / std::max<uint32_t>(freed.pages, 1);
+      std::cout << "a tail search on a window of " << window << (persistent ? ", persistent" : ", temporary") << ": "
+                << counted << " visits a peek of " << states << " states, " << perPage << " a page of "
+                << freed.pages << " in place\n";
+      const uint64_t reach = window + engine::Cache::kSparseHistoryTokens / KvCache::pageTokens;
+      require(freed.pages >= kClaim && perPage <= 2048 && counted <= uint64_t{8} * states * reach + 65'536,
+              "a tail search on a window of " + std::to_string(window) + " visited " + std::to_string(counted) +
+                  " a peek and " + std::to_string(perPage) + " a page");
+      for (; tier.inFlight(); static_cast<void>(cache.pollTransfers()))
+        tier.complete();
+      cache.endRequest(3);
+      cache.checkInvariants();
+    }
+}
+
+// A full quota gives up first the window parts no point on the SSD needs: of a durable point given up on the SSD,
+// its tail's window parts go before any copy of a block, whose base parts stay.
+void testAFullQuotaGivesUpUnneededWindowPartsFirst() {
+  test::TestKvTier tier(true, 200);
+  auto budget = std::make_shared<model::DiskBudget>(1000);
+  tier.budget = budget;
+  tier.transferLimit = 16;
+  test::TestKvStorage storage{192, 100, 4};
+  KvPool pool{storage, 4};
+  engine::Cache cache(pool, &tier, budget, std::nullopt,
+                      CacheWindowPolicy{Windowed::kWindowPages, Windowed::kUnitPages});
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const auto pointAt = [&](uint64_t id, uint32_t first, uint32_t pages) {
+    const std::vector<uint32_t> prompt = Windowed::prompt(first, pages);
+    cache.beginRequest(id);
+    require(admitTokens(cache, id, pages * KvCache::pageTokens + 1).granted(), "fixture: the pages were refused");
+    cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens, {});
+    const uint64_t point = cache.blockAt(id, pages * KvCache::pageTokens);
+    cache.publishCompositeState(point, std::make_shared<TieredState>(control), false, id);
+    PersistStatus status = PersistStatus::Started;
+    for (int step = 0; step < 16 && status == PersistStatus::Started; ++step) {
+      status = cache.persist(point);
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    cache.endRequest(id);
+    return std::pair{point, status};
+  };
+  const auto [first, durable] = pointAt(1, 4500, 4);
+  require(durable == PersistStatus::Durable && cache.snapshot().kvTier.diskBytes == 4 * 100 + 2 * 200,
+          "fixture: the first point was not copied whole (" + std::to_string(cache.snapshot().kvTier.diskBytes) +
+              " bytes)");
+  cache.invalidateState(first);
+  const auto [second, written] = pointAt(2, 9500, 2);
+  const CacheSnapshot after = cache.snapshot();
+  // The second point, two blocks in two parts each, takes the room of the
+  // first point's two window parts.
+  require(written == PersistStatus::Durable && after.kvTier.diskBlocks == 6 && after.kvTier.diskBytes == 1000 &&
+              budget->usedBytes() == after.kvTier.diskBytes,
+          "the quota did not give up an unneeded window part first, every block's copy kept (" +
+              std::to_string(after.kvTier.diskBlocks) + " copies, " + std::to_string(after.kvTier.diskBytes) +
+              " bytes)");
+  cache.checkInvariants();
+}
+
+// A persistent tier's durable point is history only once the point below it has landed whole, at each point of that
+// point's copy, so that a crash always leaves a point a restart takes back. A head at page 2, a Durable point at page
+// 4, the next point at page 8: (0) in RAM alone; (1) its state's write in flight; (2) its state landed; (3) its four
+// pages' copies in flight; (4) two of them landed; (5) all landed. The point at page 4 stays a point until the one
+// at page 8 has landed whole.
+void testADurablePointIsHistoryOnlyOnceTheNextHasLandedWhole() {
+  std::string failures;
+  for (uint32_t point = 0; point <= 5; ++point) {
+    test::TestKvTier tier(true, 200);
+    tier.capacity = 32;
+    Windowed windowed(&tier);
+    engine::Cache &cache = windowed.cache;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    auto later = std::make_shared<TransferControl>();
+    const std::vector<uint32_t> prompt = Windowed::prompt(8000, 24);
+    cache.beginRequest(1);
+    windowed.run(1, prompt, 2);
+    cache.noteHead(windowed.publish(1, 2));
+    windowed.run(1, prompt, 4);
+    const uint64_t durable = cache.blockAt(1, 4 * KvCache::pageTokens);
+    cache.publishCompositeState(durable, std::make_shared<TieredState>(control), false, 1);
+    PersistStatus status = PersistStatus::Started;
+    for (int step = 0; step < 16 && status != PersistStatus::Durable; ++step) {
+      status = cache.persist(durable);
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    require(status == PersistStatus::Durable, "fixture: the first point was not made durable");
+    windowed.run(1, prompt, 8);
+    const uint64_t deeper = cache.blockAt(1, 8 * KvCache::pageTokens);
+    cache.publishCompositeState(deeper, std::make_shared<TieredState>(later), false, 1);
+    const size_t writes = tier.transfers.size();
+    if (point >= 1) {
+      status = cache.persist(deeper);
+      static_cast<void>(cache.pollTransfers());
+    }
+    if (point >= 2) {
+      later->ready = true;
+      static_cast<void>(cache.pollTransfers());
+    }
+    if (point >= 3) {
+      tier.transferLimit = 8;
+      for (int step = 0; step < 3; ++step) {
+        status = cache.persist(deeper);
+        static_cast<void>(cache.pollTransfers());
+      }
+      require(tier.transfers.size() == writes + 4 && tier.inFlight() == 4,
+              "fixture: the deeper point's four page copies are not in flight");
+    }
+    for (size_t landed = 0; point >= 4 && landed < (point == 4 ? 2u : 4u); ++landed)
+      tier.transfers[writes + landed]->ready = true;
+    if (point >= 4)
+      static_cast<void>(cache.pollTransfers());
+    if (point == 5)
+      require(cache.persist(deeper) == PersistStatus::Durable, "fixture: the deeper point did not land whole");
+    // The lane runs on: its chain reaches the deeper point, its own.
+    if (cache.newestPoint(durable) != (point < 5))
+      failures += "point " + std::to_string(point) + ": the durable point is " +
+                  (point < 5 ? "history before the next has landed whole; " : "still a point once the next landed; ");
+    cache.endRequest(1);
+    for (; tier.inFlight(); static_cast<void>(cache.pollTransfers()))
+      tier.complete();
+  }
+  require(failures.empty(), failures);
+}
+
+// With no SSD cache, two conversations that take turns in a full pool of 12 pages, each needing a page the other
+// holds. A page need takes the other's leaf and the state on it, and no history state: on a layout without windows
+// a history state holds no page, so taking it frees nothing the need lacks and costs its conversation the state it
+// falls back to. Each turn then resumes at the state nearest below the tip it lost.
+void testAPageNeedTakesNoHistoryThatHoldsNoPage() {
+  test::TestKvStorage storage{16, 100, 1};
+  KvPool pool{storage, 4};
+  engine::Cache cache(pool, nullptr, nullptr);
+  storage.budgetPages = 12;
+  uint64_t id = 0;
+  // One turn, admitted the way the engine admits it; returns the tokens it resumed from.
+  const auto turn = [&](const std::vector<uint32_t> &prompt) {
+    std::vector<uint32_t> asked = prompt;
+    asked.push_back(7);
+    cache.beginRequest(++id);
+    uint32_t resumed = 0;
+    {
+      CacheLookup lookup = cache.lookup(asked, {});
+      resumed = lookup.resumeBoundary();
+      require(!lookup.state || admitLikeEngine(cache, [&] { return cache.restoreRequest(id, lookup); }).granted(),
+              "fixture: a restore was refused");
+    }
+    const auto pages = static_cast<uint32_t>(prompt.size());
+    require(admitLikeEngine(cache, [&] { return cache.ensureTokens(id, pages); }).granted(),
+            "a turn's page was refused");
+    cache.publishCommittedBlocks(id, prompt, pages, {});
+    const uint64_t block = cache.blockAt(id, pages);
+    cache.endRequest(id);
+    if (!cache.reuseStoredState(block))
+      cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
+    return resumed;
+  };
+  const auto pagesFrom = [](uint32_t first, uint32_t pages) {
+    std::vector<uint32_t> tokens(pages * KvCache::pageTokens);
+    std::iota(tokens.begin(), tokens.end(), first);
+    return tokens;
+  };
+  std::vector<uint32_t> first = pagesFrom(1000, 4), second = pagesFrom(5000, 4);
+  static_cast<void>(turn(first));
+  static_cast<void>(turn(second));
+  for (uint32_t step = 0; step < 6; ++step) {
+    std::vector<uint32_t> &prompt = step % 2 ? second : first;
+    const auto before = static_cast<uint32_t>(prompt.size());
+    const std::vector<uint32_t> more = pagesFrom(9000 + 100 * step, 1);
+    prompt.insert(prompt.end(), more.begin(), more.end());
+    const uint32_t resumed = turn(prompt);
+    require(step < 2 || resumed + KvCache::pageTokens >= before,
+            "turn " + std::to_string(step) + " resumed at token " + std::to_string(resumed) +
+                ", not at the state nearest below its lost tip (" + std::to_string(before - KvCache::pageTokens) +
+                ")");
+  }
+  cache.checkInvariants();
+}
+
+// With no SSD cache, a conversation whose second turn renders the first reply otherwise, in a full pool of 5 pages.
+// The second turn holds its prompt's state in use, as the engine does; the first reply's end state is then history,
+// the newest state no request uses, and it sits on a leaf: the pool's one page no request holds. The second turn's
+// next page takes that leaf with the state on it, as the ledger counts it, rather than be refused with the page in
+// memory.
+void testAPageNeedTakesTheLeafUnderHistoryThatHoldsNoPage() {
+  test::TestKvStorage storage{16, 100, 1};
+  KvPool pool{storage, 4};
+  engine::Cache cache(pool, nullptr, nullptr);
+  storage.budgetPages = 5;
+  const auto pagesFrom = [](uint32_t first, uint32_t pages) {
+    std::vector<uint32_t> tokens(pages * KvCache::pageTokens);
+    std::iota(tokens.begin(), tokens.end(), first);
+    return tokens;
+  };
+  const auto publish = [&](uint64_t id, const std::vector<uint32_t> &tokens) {
+    require(admitTokens(cache, id, tokens.size()).granted(), "fixture: a turn's pages were refused");
+    cache.publishCommittedBlocks(id, tokens, tokens.size(), {});
+    cache.publishCompositeState(cache.blockAt(id, tokens.size()), std::make_shared<TestState>(100), false);
+  };
+  // The first turn: a prompt of 2 pages and a reply of one, with a state at the end of each.
+  const std::vector<uint32_t> prompt = pagesFrom(1000, 2);
+  std::vector<uint32_t> reply = prompt;
+  const std::vector<uint32_t> replied = pagesFrom(50'000, 1);
+  reply.insert(reply.end(), replied.begin(), replied.end());
+  cache.beginRequest(1);
+  publish(1, prompt);
+  publish(1, reply);
+  cache.noteReply(1, static_cast<uint32_t>(prompt.size() / KvCache::pageTokens));
+  cache.endRequest(1);
+  // The second turn renders the reply otherwise, resuming at the prompt's end.
+  std::vector<uint32_t> next = prompt;
+  const std::vector<uint32_t> rendered = pagesFrom(60'000, 2);
+  next.insert(next.end(), rendered.begin(), rendered.end());
+  std::vector<uint32_t> asked = next;
+  asked.push_back(7);
+  cache.beginRequest(2);
+  CacheLookup lookup = cache.lookup(asked, {});
+  require(lookup.state && lookup.resumeBoundary() == prompt.size() && admitRestore(cache, 2, lookup).granted(),
+          "fixture: the second turn did not resume at the prompt's end");
+  publish(2, next);
+  const StateUse replayPoint = cache.useState(cache.blockAt(2, next.size()));
+  require(cache.snapshot().stateCache.entries == 3 && storage.allocatedBytes() == 5 * 100,
+          "fixture: the pool is not full of 5 pages under 3 states");
+  const Admitted grown = admitTokens(cache, 2, next.size() + 1);
+  require(grown.granted(), "a turn's next page was refused (ledger outcome " +
+                               std::to_string(static_cast<int>(grown.ledger)) +
+                               ") while the pool's one page no request holds is a leaf under a history state");
+  cache.checkInvariants();
+  cache.endRequest(2);
+}
+
+// A state whose disk copy draws on the quota the KV copies draw on, as the state file's slots do.
+class QuotaState final : public CompositeState {
+public:
+  QuotaState(std::shared_ptr<model::DiskBudget> budget, bool disk) : budget_(std::move(budget)), disk_(disk) {}
+  ~QuotaState() override {
+    if (disk_)
+      budget_->release(bytes());
+  }
+  uint64_t bytes() const noexcept override { return 18; }
+  uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
+  bool writable() const noexcept override { return !disk_; }
+  bool canOffload() const noexcept override { return !disk_; }
+  std::unique_ptr<StateOffload> offload(std::function<void()>) const override { return shelve(); }
+  std::unique_ptr<StateOffload> persist(std::function<void()>) const override { return shelve(); }
+
+private:
+  std::unique_ptr<StateOffload> shelve() const {
+    if (!budget_->reserve(bytes()))
+      return {};
+    struct Written final : StateOffload {
+      std::shared_ptr<const CompositeState> disk;
+      bool ready() const noexcept override { return true; }
+      bool finish() override { return true; }
+      const std::shared_ptr<const CompositeState> &state() const noexcept override { return disk; }
+    };
+    auto written = std::make_unique<Written>();
+    written->disk = std::make_shared<QuotaState>(budget_, true);
+    return written;
+  }
+  std::shared_ptr<model::DiskBudget> budget_;
+  bool disk_;
+};
+
+// A full quota of 168 B, shared by the KV copies (100 B a slot) and the states' (18 B each), holds the copy of a
+// chain a queued request restores and a conversation's state, on the SSD alone, whose leaf waits for a copy. Another
+// state's write is in flight. A request's page reaches that leaf: making room for its copy gives up the state the
+// leaf was kept for and still finds no slot. Nothing needs the leaf any more, so it goes now and the request has its
+// page, rather than wait for a write that frees nothing it lacks.
+void testALeafWhoseStateLeftMakingRoomForItsCopyGoesNow() {
+  test::TestKvTier tier;
+  auto budget = std::make_shared<model::DiskBudget>(168);
+  tier.budget = budget;
+  test::TestKvStorage storage{4, 100, 1};
+  storage.budgetPages = 3;
+  KvPool pool{storage, 0};
+  engine::Cache cache(pool, &tier, budget);
+  const auto conversation = [&](uint64_t id, uint32_t first, uint32_t pages, std::shared_ptr<CompositeState> state) {
+    std::vector<uint32_t> tokens(pages * KvCache::pageTokens + 1);
+    std::iota(tokens.begin(), tokens.end(), first);
+    cache.beginRequest(id);
+    require(admitTokens(cache, id, pages * KvCache::pageTokens).granted(), "fixture: a conversation was refused");
+    const uint64_t tail = test::publishBlocks(cache, id, tokens, pages * KvCache::pageTokens);
+    cache.endRequest(id);
+    cache.publishCompositeState(tail, std::move(state), false);
+    return tokens;
+  };
+  // The queued request's chain: its state and its leaf's copy on the SSD.
+  auto written = std::make_shared<TransferControl>();
+  written->ready = true;
+  const std::vector<uint32_t> queued = conversation(1, 1000, 1, std::make_shared<TieredState>(written));
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "fixture: the queued chain's state was not written");
+  demoteLeaves(cache, tier, 1);
+  cache.setWantedChains({cache.probe(queued, {}).restoredChain()});
+  // The conversation whose state the quota holds, and one whose state's write stays in flight.
+  static_cast<void>(conversation(2, 5000, 2, std::make_shared<QuotaState>(budget, false)));
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "fixture: the conversation's state was not written");
+  auto pending = std::make_shared<TransferControl>();
+  static_cast<void>(conversation(3, 9000, 1, std::make_shared<TieredState>(pending)));
+  static_cast<void>(test::stateStep(cache));
+  require(cache.writesInFlight() && budget->usedBytes() == 118 &&
+              pool.freePageCount() == 0,
+          "fixture: the quota, the pool or the write in flight is not as described (" +
+              std::to_string(budget->usedBytes()) + " B used, " + std::to_string(pool.freePageCount()) +
+              " pages free)");
+  cache.beginRequest(4);
+  const Admitted page = admitTokens(cache, 4, KvCache::pageTokens);
+  require(page.granted(), "a request's page waited (ledger outcome " + std::to_string(static_cast<int>(page.ledger)) +
+                              ") for a write in flight while the leaf it reached was needed by nothing");
+  cache.endRequest(4);
+  cache.setWantedChains({});
+  cache.checkInvariants();
+}
+
+// A host claim for an extent's bytes, which waits for no landing, beside a demotion in flight whose page would
+// complete an extent with 3 of the 7 free pages: its take frees a page of a conversation and releases an extent. The
+// ledger never counted that landing for the host, so the release counts in full and the claim takes nothing more:
+// one extent leaves, and the other conversations stay cached.
+void testAReleaseCountsAgainstNoLandingTheClaimWasNotCredited() {
+  test::TestKvTier tier;
+  tier.capacity = 8;
+  test::TestKvStorage storage{16, 100, 4};
+  storage.budgetPages = 16;
+  KvPool pool{storage, 0};
+  engine::Cache cache(pool, &tier, nullptr);
+  const auto conversation = [&](uint64_t id, uint32_t first, uint32_t pages, uint32_t extra,
+                                std::shared_ptr<CompositeState> state) {
+    std::vector<uint32_t> tokens(pages * KvCache::pageTokens + 1);
+    std::iota(tokens.begin(), tokens.end(), first);
+    cache.beginRequest(id);
+    require(admitTokens(cache, id, (pages + extra) * KvCache::pageTokens).granted(),
+            "fixture: a conversation was refused");
+    const uint64_t tail = test::publishBlocks(cache, id, tokens, pages * KvCache::pageTokens);
+    cache.endRequest(id);
+    cache.publishCompositeState(tail, std::move(state), false);
+    return tokens;
+  };
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const std::vector<uint32_t> written = conversation(1, 1000, 1, 0, std::make_shared<TieredState>(control));
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "fixture: the first state was not written");
+  const FreeResult demoting = test::evictStep(cache);
+  require(demoting.outcome == FreeOutcome::Pending && tier.demotions == 1,
+          "fixture: the first leaf's demotion did not start");
+  const std::vector<uint32_t> later = conversation(2, 5000, 4, 11, std::make_shared<TestState>(100));
+  const std::vector<uint32_t> newest = conversation(3, 9000, 4, 0, std::make_shared<TestState>(100));
+  require(pool.freePageCount() == 7 && pool.allocatedExtents(kv::PageForm::Full) == 4,
+          "fixture: the pool does not hold 7 free pages in 4 extents (" + std::to_string(pool.freePageCount()) + ")");
+  const uint64_t before = storage.allocatedBytes();
+  const FreeResult freed = test::freeFromCache(cache, {.cls = ClaimClass::Host}, {.bytes = 400});
+  const uint64_t released = before - storage.allocatedBytes();
+  require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 400 && released == 400 && pool.freePageCount() == 4,
+          "a host claim for one extent's bytes released " + std::to_string(released) + " B and was credited " +
+              std::to_string(freed.nowBytes) + " B now (outcome " + std::to_string(static_cast<int>(freed.outcome)) +
+              "), leaving " + std::to_string(pool.freePageCount()) + " free pages: it took more cache than it lacked");
+  static_cast<void>(written);
+  static_cast<void>(later);
+  static_cast<void>(newest);
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  cache.checkInvariants();
+}
+
+// A start's claim for bytes keeps its free Full pages to take them in place (Need::keptPages, Cache::growthNeed): the
+// pages its take's demotions land complete an extent the claim gets only past those pages, as its count says. A
+// conversation of 5 pages whose state is on the SSD, its leaves leaving through demotions, beside 7 free pages: the
+// landing the claim is credited is an extent's worth of pages landing, not one page beside the 7 (take restore seed
+// 3001019: a landing beside the 7 kept pages credited 400 B where the count gave 80).
+void testALandingBesideTheKeptPagesCreditsNothing() {
+  test::TestKvTier tier;
+  tier.capacity = 8;
+  test::TestKvStorage storage{16, 100, 4};
+  storage.budgetPages = 16;
+  KvPool pool{storage, 0};
+  engine::Cache cache(pool, &tier, nullptr);
+  std::vector<uint32_t> tokens(5 * KvCache::pageTokens + 1);
+  std::iota(tokens.begin(), tokens.end(), 1000);
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, 12 * KvCache::pageTokens).granted(), "fixture: the conversation was refused");
+  const uint64_t tail = test::publishBlocks(cache, 1, tokens, 5 * KvCache::pageTokens);
+  cache.endRequest(1);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  cache.publishCompositeState(tail, std::make_shared<TieredState>(control), false);
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "fixture: the state was not written");
+  const uint32_t free = pool.freePageCount();
+  require(free == 7 && pool.allocatedExtents(kv::PageForm::Full) == 3,
+          "fixture: the pool does not hold 7 free pages in 3 extents (" + std::to_string(free) + ")");
+  // Eight blocks: an extent's bytes beside the 7 free pages it keeps.
+  engine::Need need = cache.growthNeed(8);
+  need.afterStart = true;
+  require(need.keptPages[static_cast<size_t>(kv::PageForm::Full)] == free && need.bytes == 400,
+          "fixture: the claim does not keep the free pages for an extent's bytes");
+  const FreeResult freed = test::freeFromCache(cache, {.cls = ClaimClass::Start, .reach = ReclaimClass::InUse}, need);
+  const uint32_t landing = cache.demotedPages()[static_cast<size_t>(kv::PageForm::Full)];
+  require(freed.laterBytes <= uint64_t{landing / 4} * 400,
+          "a start's claim keeping the 7 free pages was credited " + std::to_string(freed.laterBytes) +
+              " B landing for " + std::to_string(landing) + " pages landing beside them");
+  for (; tier.inFlight(); static_cast<void>(cache.pollTransfers()))
+    tier.complete();
+  cache.checkInvariants();
+}
+
+// What leaves at no loss goes before what is lost, in every mode: a state in RAM the SSD holds a copy of goes before an
+// older one whose leaving loses it, here one the tier cannot write. Three conversations: the first's state written to
+// the SSD and published again in RAM after the second's state, which has no copy and cannot have one; the third's
+// newest, the resume point. Whether the file takes writes or not, a claim for a state's buffer takes the first's RAM
+// copy, its SSD copy staying, and keeps the second's state.
+void testWhatLeavesAtNoLossGoesFirstWhereNothingIsWritten() {
+  for (const bool writable : {false, true}) {
+    test::TestKvTier tier;
+    tier.capacity = 8;
+    test::TestKvStorage storage{16, 100, 4};
+    KvPool pool{storage, 0};
+    engine::Cache cache(pool, &tier, nullptr);
+    const auto conversation = [&](uint64_t id, uint32_t first) {
+      std::vector<uint32_t> tokens(KvCache::pageTokens + 1);
+      std::iota(tokens.begin(), tokens.end(), first);
+      cache.beginRequest(id);
+      require(admitTokens(cache, id, KvCache::pageTokens).granted(), "fixture: a conversation was refused");
+      const uint64_t tail = test::publishBlocks(cache, id, tokens, KvCache::pageTokens);
+      cache.endRequest(id);
+      return tail;
+    };
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    const uint64_t copied = conversation(1, 1000);
+    cache.publishCompositeState(copied, std::make_shared<TieredState>(control), false);
+    require(test::stateStep(cache).gave() && cache.pollTransfers() && !cache.stateResident(copied),
+            "fixture: the first state was not written");
+    const uint64_t only = conversation(2, 5000);
+    cache.publishCompositeState(only, std::make_shared<TestState>(100), false);
+    cache.publishCompositeState(copied, std::make_shared<TieredState>(control), false);
+    cache.publishCompositeState(conversation(3, 9000), std::make_shared<TestState>(100), false);
+    require(cache.stateResident(copied) && cache.stateResident(only), "fixture: a state is not in RAM");
+    tier.writableFile = writable;
+    require(test::stateStep(cache).gave(), "a claim for a state's buffer took nothing");
+    require(cache.stateResident(only) && !cache.stateResident(copied),
+            std::string(writable ? "where the tier takes writes" : "where the tier takes no writes") +
+                ", a state with no copy went before one the SSD holds");
+    cache.checkInvariants();
+  }
+}
+
 // At the memory wall a Full shortfall takes dead leaves first, keeping the states a resume needs.
 void testFullShortfallsAtTheWallTakeDeadLeavesFirst() {
-  for (const bool trim : {true, false}) {
-    Windowed windowed(nullptr, trim);
-    windowed.storage.budgetPages = 12;
+  {
+    // Two states' chains of two blocks, each block in a tail, and a dead
+    // chain of sixteen run two blocks a command, whose lane holds the units
+    // of four blocks at most: 36 pages, and an extent's more, the budget;
+    // twelve pages free once its units go.
+    Windowed windowed;
+    windowed.storage.budgetPages = 2 * 2 * Windowed::kBlockPages + 16 + 4 * Windowed::kUnitPages + 4;
     engine::Cache &cache = windowed.cache;
     const std::vector<uint32_t> first = Windowed::prompt(1000, 2), second = Windowed::prompt(2000, 2),
-                                dead = Windowed::prompt(3000, 6);
+                                dead = Windowed::prompt(3000, 16);
     cache.beginRequest(1);
     windowed.run(1, first, 2);
     windowed.publish(1, 2);
@@ -5612,16 +8231,20 @@ void testFullShortfallsAtTheWallTakeDeadLeavesFirst() {
     windowed.publish(2, 2);
     cache.endRequest(2);
     cache.beginRequest(3);
-    windowed.run(3, dead, 6);
+    for (uint32_t pages = 2; pages <= 16; pages += 2) {
+      static_cast<void>(cache.cutPageTable(3));
+      windowed.run(3, dead, pages);
+    }
     cache.endRequest(3);
-    require(cache.trimWindows() == 0 && windowed.slimPages() == 0 && cache.snapshot().pool.pagesFree == 2,
-            "the Full extents left room in the budget");
+    require(cache.snapshot().stateCache.entries == 2 && cache.snapshot().pool.pagesFree == 12,
+            "a state left, or the extents left other room in the budget");
 
-    // Four pages, two of them free: two of the dead chain's leaves go.
+    // Six blocks, eighteen pages, twelve of them free: six of the dead
+    // chain's leaves go.
     cache.beginRequest(4);
-    require(admitTokens(cache, 4, 4 * KvCache::pageTokens).granted() && cache.snapshot().stateCache.entries == 2 &&
+    require(admitTokens(cache, 4, 6 * KvCache::pageTokens).granted() && cache.snapshot().stateCache.entries == 2 &&
                 cache.lookup(first, {}).state && cache.lookup(second, {}).state &&
-                cache.lookup(dead, {}).kvBoundary == 4 * KvCache::pageTokens,
+                cache.lookup(dead, {}).kvBoundary == 10 * KvCache::pageTokens,
             "a Full shortfall at the wall took a state before the dead leaves");
     cache.checkInvariants();
     cache.endRequest(4);
@@ -5649,8 +8272,8 @@ void testRestoresReturnNothing() {
   require(admitRestore(fixture.cache, 2, lookup).granted() && fixture.cache.transfersInFlight(),
           "the restore did not start");
   const Returning restoring = fixture.cache.returning();
-  require(!restoring.transfers && restoring.landingPages == std::array<uint32_t, 3>{} && !restoring.landingBytes &&
-              fixture.cache.returningFor(std::vector<uint64_t>{2}).landingPages == std::array<uint32_t, 3>{},
+  require(!restoring.transfers && restoring.landingPages == std::array<uint32_t, kv::kPageForms>{} && !restoring.landingBytes &&
+              fixture.cache.returningFor(std::vector<uint64_t>{2}).landingPages == std::array<uint32_t, kv::kPageForms>{},
           "a restore counted as memory on its way back");
   tier.complete();
   static_cast<void>(fixture.cache.pollTransfers());
@@ -5815,8 +8438,7 @@ void testPeekHasNoSideEffects() {
 }
 
 // The resume point and wanted chains come in their place to in-service work, a start and the host's pass
-// for a start it refused, as vLLM and SGLang evict any block no running request holds; Growth and the
-// host's pass for its margin alone are never offered them.
+// for a start it refused; Growth and the host's pass for its margin alone are never offered them.
 void testResumePointAndWantedChainsAreCertainReuse() {
   test::TestKvStorage storage{16, 100, 1};
   KvPool pool{storage, 16};
@@ -6188,14 +8810,15 @@ void testAStateNeedCountsTheStagingBufferOnce() {
 }
 
 void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
-  CacheFixture fixture;
+  // A lane publishing its states: its running request's chain reaches each.
+  CacheFixture fixture(nullptr, true);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   control->capacity = 4;
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), false);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
-  // A state the tier takes no write of, which goes at once, and the resume
-  // point.
+  // A state the tier takes no write of, history beside the resume point below it: it goes at once and before
+  // any other state. Then the resume point.
   fixture.publish(2);
   fixture.publish(3);
   const auto unitsOf = [&](ClaimClass cls, NeedTiming timing) {
@@ -6212,52 +8835,35 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
     return left.key == right.key && left.write == right.write && left.later == right.later &&
            left.stateBuffers == right.stateBuffers && left.pages == right.pages;
   };
-  // The staging buffer writes one state at a time: the first that needs a
-  // write frees now through it, the next waits for it, which a claim that
-  // cannot wait passes over and one that can is held back behind.
+  // History that leaves with no write leads, oldest first: the point 64
+  // tokens past the one sparse history writes, and the state the tier takes
+  // no write of. Then that point, the first that needs a write, frees now
+  // through the idle staging buffer; a claim that can wait is offered the
+  // same.
   for (const ClaimClass cls : {ClaimClass::InService, ClaimClass::Growth}) {
     const std::vector<engine::Victim> atOnce = unitsOf(cls, NeedTiming::Immediate);
-    require(atOnce.size() >= 3 && blockOf(atOnce[0]) == fixture.blocks[0] && atOnce[0].write &&
-                !atOnce[0].later && atOnce[0].stateBuffers == 1 && blockOf(atOnce[1]) == fixture.blocks[1] &&
-                atOnce[1].write && atOnce[1].later && !atOnce[1].stateBuffers &&
-                blockOf(atOnce[2]) == fixture.blocks[2] && !atOnce[2].write && !atOnce[2].later,
-            "the first state that needs a write was not offered as freeing now through the staging buffer, or "
-            "the next as waiting for it");
+    require(atOnce.size() >= 3 && blockOf(atOnce[0]) == fixture.blocks[1] && !atOnce[0].write &&
+                !atOnce[0].later && blockOf(atOnce[1]) == fixture.blocks[2] && !atOnce[1].write &&
+                !atOnce[1].later && blockOf(atOnce[2]) == fixture.blocks[0] && atOnce[2].write &&
+                !atOnce[2].later && atOnce[2].stateBuffers == 1,
+            "history that needs no write did not lead, or the first state that needs a write was not offered as "
+            "freeing now through the staging buffer");
     const std::vector<engine::Victim> canWait = unitsOf(cls, NeedTiming::CanWait);
-    require(canWait.size() == 2 && same(canWait[0], atOnce[0]) && same(canWait[1], atOnce[1]),
-            "a claim that can wait was not held back behind the state that waits for the staging buffer");
+    require(canWait.size() == atOnce.size() && same(canWait[0], atOnce[0]) && same(canWait[2], atOnce[2]),
+            "a claim that can wait was offered other units than one that cannot");
   }
   const ClaimSpec cannotWait{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   require(test::freeFromCache(fixture.cache, cannotWait, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
-              control->slots == 1 && !fixture.cache.stateResident(fixture.blocks[0]) &&
-              fixture.cache.stateResident(fixture.blocks[1]) && fixture.cache.stateResident(fixture.blocks[2]),
-          "a claim that cannot wait did not write the oldest state through the idle staging buffer");
-
-  // That write holds the staging buffer: the next state waits for it.
-  const std::vector<engine::Victim> busy = unitsOf(ClaimClass::Growth, NeedTiming::Immediate);
-  require(busy.size() == 2 && blockOf(busy[0]) == fixture.blocks[1] && busy[0].write && busy[0].later &&
-              !busy[0].stateBuffers && blockOf(busy[1]) == fixture.blocks[2] && !busy[1].later,
-          "a claim that cannot wait was not offered the state that waits for the staging buffer marked later, "
-          "then the newer state");
-  const std::vector<engine::Victim> waits = unitsOf(ClaimClass::Growth, NeedTiming::CanWait);
-  require(waits.size() == 1 && blockOf(waits[0]) == fixture.blocks[1] && waits[0].later,
-          "a claim that can wait was offered the newer states past the state that waits for the staging buffer");
-  require(fixture.cache.take(test::query(cannotWait, {.stateBuffers = 1}), busy[0]).outcome == FreeOutcome::Short &&
-              fixture.cache.take(test::query({.cls = ClaimClass::Growth}, {.stateBuffers = 1}), waits[0]).outcome ==
-                  FreeOutcome::Pending &&
-              fixture.cache.stateResident(fixture.blocks[1]) && control->slots == 1,
-          "a claim that cannot wait waited for the staging buffer, or one that can did not");
-  require(test::freeFromCache(fixture.cache, cannotWait, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
-              fixture.cache.stateResident(fixture.blocks[1]) && !fixture.cache.stateResident(fixture.blocks[2]) &&
-              control->slots == 1,
-          "a claim that cannot wait did not pass over the state that waits for the staging buffer");
-
-  // The write lands, and the staging buffer takes the next.
-  require(fixture.cache.pollTransfers() &&
               test::freeFromCache(fixture.cache, cannotWait, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
-              !fixture.cache.stateResident(fixture.blocks[1]) && control->slots == 2 &&
+              control->slots == 0 && !fixture.cache.stateResident(fixture.blocks[1]) &&
+              !fixture.cache.stateResident(fixture.blocks[2]) && fixture.cache.stateResident(fixture.blocks[0]),
+          "a claim did not take the history that needs no write first");
+  require(test::freeFromCache(fixture.cache, cannotWait, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
+              control->slots == 1 && !fixture.cache.stateResident(fixture.blocks[0]) &&
               fixture.cache.stateResident(fixture.blocks[3]),
-          "the staging buffer did not take the next state once the write landed, or growth took the resume point");
+          "a claim that cannot wait did not write the point through the idle staging buffer, or took the resume "
+          "point");
+  static_cast<void>(fixture.cache.pollTransfers());
   fixture.cache.checkInvariants();
 
   // The leaf a state on disk restores through, without a copy while the
@@ -6383,13 +8989,13 @@ uint64_t cacheConversation(engine::Cache &cache, uint64_t id, uint32_t pages,
 // Counting what a reclaim frees costs as much in a cache of many conversations as in one of few: every phase of a
 // page need and a device need, of what is in use too, beside states that need a write, a state in use and a waiting
 // request's chain, looks at the same blocks, states and request pages (Cache::reachVisits) and gives the same units.
-// So does it in a windowed cache that trims, beside a running request's window (the Trim unit and trimmableCount),
-// and in a spilling one (the Extent unit), where a page need counts the other forms' empty extents first.
+// So does it in a windowed cache, beside a running request's window, and in a spilling one (the Extent unit), where a
+// page need counts the other forms' empty extents first.
 void testReclaimCountsDoNotGrowWithTheCache() {
   enum class Kind { Plain, Windowed, Spilling };
   const auto count = [](uint32_t conversations, Kind kind) {
     const uint32_t pages = conversations * 4 + 16;
-    test::TestKvStorage storage{pages, 100, 4, kind == Kind::Spilling ? 30u : 0u, kind == Kind::Windowed ? 30u : 0u};
+    test::TestKvStorage storage{pages, 100, 4, kind == Kind::Spilling ? 30u : 0u};
     storage.budgetPages = pages;
     KvPool pool{storage, 4};
     test::TestKvTier tier;
@@ -6409,7 +9015,7 @@ void testReclaimCountsDoNotGrowWithTheCache() {
     std::iota(prompt.begin(), prompt.end(), 1000 * conversations);
     const CacheProbe waiting = cache.probe(prompt, {});
     cache.setWantedChains({waiting.restoredChain()});
-    // A running request whose window the counts of a windowed cache read.
+    // A running request.
     const uint64_t running = conversations + 1;
     cache.beginRequest(running);
     require(admitTokens(cache, running, 3 * KvCache::pageTokens).granted(), "the running request's pages were denied");
@@ -6575,8 +9181,10 @@ void testPageWalkOffersEachDeadLeafOnce() {
           "the walk counted " + std::to_string(counted) + " pages, taking its units freed " + std::to_string(freed));
 }
 
-// A need the engine's limit refused is a device need: each take releases whole extents, or gives
-// up a state.
+// A need the engine's limit refused is a device need: each take releases whole extents, gives up a state or, for
+// the pages it was refused in place, keeps a page of their form free for its attempt, which takes it there rather
+// than allocate again an extent a take released (MemoryLedger's Need; since 1.6.1 the count promised that, while the
+// take released those extents).
 void testEngineRefusedPageNeedIsADeviceNeed() {
   test::TestKvStorage storage{16, 100, 1};
   KvPool pool{storage, 16};
@@ -6588,10 +9196,10 @@ void testEngineRefusedPageNeedIsADeviceNeed() {
   uint32_t takes = 0;
   for (FreeResult step; (step = test::takeFirst(cache, claim, {.bytes = 100, .pages = 2})).outcome == FreeOutcome::Met;
        ++takes)
-    require(step.nowBytes % 100 == 0 && (step.nowBytes || step.stateBuffers == 1),
-            "a take released no whole extent and gave up no state");
-  require(takes == 9 && !pool.allocatedBytes() && !cache.snapshot().stateCache.entries,
-          "the takes left extents or states");
+    require(step.nowBytes % 100 == 0 && (step.nowBytes || step.stateBuffers == 1 || step.pages),
+            "a take released no whole extent, gave up no state and kept no page");
+  require(takes == 9 && pool.freePageCount(kv::PageForm::Full) == 6 && !cache.snapshot().stateCache.entries,
+          "the takes left pages cached or states");
 }
 
 // A page need's walk reaches parents that become leaves and leaves under states; its takes free
@@ -6832,7 +9440,8 @@ void testATakeCountsTheLandingItLetsFree() {
   cache.publishCompositeState(leaf, std::make_shared<TestState>(100), false);
   require(pool.freePageCount() == 3 && tier.demotions == 1 && cache.returning().landingBytes == 0,
           "fixture geometry changed");
-  const VictimQuery query = test::query(test::kInServiceGrowth, {.bytes = 400, .stateBuffers = 1});
+  const VictimQuery query =
+      test::query(test::kInServiceGrowth, {.bytes = 400, .stateBuffers = 1});
   const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
   require(unit && !unit->write && !unit->later && unit->stateBuffers == 1, "the state was not offered first");
   const FreeResult taken = cache.take(query, *unit);
@@ -6843,6 +9452,330 @@ void testATakeCountsTheLandingItLetsFree() {
               std::to_string(taken.nowBytes + taken.laterBytes));
   tier.complete();
   static_cast<void>(cache.pollTransfers());
+  cache.checkInvariants();
+}
+
+// A release nets the landing an earlier take of its claim was credited (take plain seed 1226654). A
+// demotion lands beside two free pages, completing nothing, and a deep conversation's chain stays
+// for its state on the SSD, which a reclaim that cannot wait does not let go. A claim of two extents
+// that can wait takes the later unit first: making room for the leaf's copy gives the state up, and
+// its chain goes, until the free pages and the landing complete an extent, credited later. Its
+// first block left, the unit that frees now counts the extent its release empties, which takes the
+// free pages the landing was to complete an extent with: that take nets the landing and reports
+// nothing new, and the claim, credited all it freed, waits; no unit repeats.
+void testAReleaseNetsTheLandingAnEarlierTakeCredited() {
+  test::TestKvStorage storage{20, 100, 4};
+  KvPool pool{storage, 1};
+  test::TestKvTier tier;
+  auto budget = std::make_shared<model::DiskBudget>(10000);
+  tier.budget = budget;
+  engine::Cache cache(pool, &tier, budget);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const uint64_t leaf = cacheConversation(cache, 1, 1, std::make_shared<TieredState>(control));
+  const uint64_t deep = cacheConversation(cache, 2, 6, std::make_shared<QuotaState>(budget, false));
+  for (int state = 0; state < 2; ++state)
+    require(test::stateStep(cache).gave() && cache.pollTransfers(), "the states were not written to the SSD");
+  require(!cache.stateResident(deep) && !cache.stateResident(leaf), "a state stayed in RAM");
+  require(test::evictStep(cache).gave() && tier.demotions == 1, "the leaf was not demoted");
+  cache.beginRequest(3);
+  require(admitTokens(cache, 3, 11 * KvCache::pageTokens).granted(), "the request's pages were denied");
+  budget->setLimitBytes(budget->usedBytes());
+  require(pool.freePageCount() == 2 && pool.allocatedExtents(kv::PageForm::Full) == 5 && !cache.stateResident(deep) &&
+              !cache.stateResident(leaf),
+          "fixture geometry changed");
+  // As the ledger takes (MemoryLedger::take): each take passes the landing the takes before it credited
+  // and no release netted since.
+  const VictimQuery query = test::query({.cls = ClaimClass::Growth, .requestId = 1}, {.bytes = 800});
+  const std::optional<engine::Victim> later = cache.peek(query, nullptr);
+  require(later && later->write && later->later && later->bytes == 400, "the unit that writes was not offered first");
+  const FreeResult credited = cache.take(query, *later);
+  require(credited.laterBytes == 400 && !credited.nowBytes && !credited.nettedBytes && pool.freePageCount() == 7 &&
+              !cache.snapshot().stateCache.entries,
+          "the later unit's take did not let the landing complete an extent");
+  const std::optional<engine::Victim> now = cache.peek(query, nullptr);
+  require(now && !now->write && !now->later && now->bytes == 400, "the unit that frees now did not count the extent");
+  VictimQuery taking = query;
+  taking.landingCredited = credited.laterBytes;
+  const uint64_t before = pool.allocatedBytes();
+  const FreeResult netted = cache.take(taking, *now);
+  require(before - pool.allocatedBytes() == 400 && netted.outcome == FreeOutcome::Met && !netted.nowBytes &&
+              !netted.laterBytes && netted.nettedBytes == 400 && netted.nettedCredited == 400 && pool.freePageCount() == 4,
+          "the release did not net the landing it cancelled: " + std::to_string(netted.nowBytes) + " now, " +
+              std::to_string(netted.laterBytes) + " later, " + std::to_string(netted.nettedBytes) + " netted");
+  // Credited all it freed, the claim has no unit left: it waits, and no unit repeats.
+  require(!cache.peek(query, nullptr), "a unit was offered after the release netted the landing");
+  cache.endRequest(3);
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  cache.checkInvariants();
+}
+
+// A device need in place takes past its first step no landing its count left to the ledger (take plain seed 644947).
+// Two demotions land beside six free Full pages of four extents, completing an extent past the runway: the count
+// leaves that extent to the ledger's count of what lands, and counts 400 bytes for the release of the free pages and
+// five Full leaves. The claim lacks Index pages and 1,200 bytes. Its first step evicts two leaves and releases an
+// extent, which takes the free pages the landing was to complete an extent with; its next steps evict Full leaves
+// before the Index ones. A step past the first that credited the landing those leaves' pages complete again gave
+// 400 more later: 800 against the unit's 400. Such steps keep every page they free.
+void testAnInPlaceTakeCreditsNoLandingPastItsFirstStep() {
+  Spilling spill;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  auto second = std::make_shared<TransferControl>();
+  second->ready = true;
+  static_cast<void>(cacheConversation(spill.cache, 1, 1, std::make_shared<TieredState>(control)));
+  static_cast<void>(cacheConversation(spill.cache, 11, 1, std::make_shared<TieredState>(second)));
+  // A chain whose state on the SSD keeps its pages, which free only later, sharing its first block with the
+  // conversation whose pages spill below.
+  static_cast<void>(cacheConversation(spill.cache, 3, 3, std::make_shared<TieredState>(control)));
+  std::vector<uint32_t> prompt = Spilling::prompt(3000, 6);
+  for (size_t at = KvCache::pageTokens; at < prompt.size(); ++at)
+    prompt[at] += 500'000;
+  spill.start(2, prompt, 6);
+  require(spill.cache.writeThrough() == 6, "fixture: the spill's pages were not written through");
+  spill.tier.complete();
+  require(spill.cache.pollTransfers() && spill.cache.spillWritten(SpilledExtents::KeepRunway).granted(),
+          "fixture: the spill's pages did not move to the Index form");
+  for (int state = 0; state < 3; ++state)
+    require(test::stateStep(spill.cache).gave() && spill.cache.pollTransfers(), "fixture: a state was not written");
+  // The two leaves' demotions, the spilling request's pages held.
+  for (int leaf = 0; leaf < 2; ++leaf)
+    require(test::evictStep(spill.cache, ReclaimClass::Ordinary).gave(), "fixture: a leaf was not demoted");
+  for (const uint64_t id : {4, 6, 7, 8})
+    static_cast<void>(cacheConversation(spill.cache, id, 1));
+  spill.cache.endRequest(2);
+  spill.cache.beginRequest(10);
+  require(admitTokens(spill.cache, 10, 5 * KvCache::pageTokens).granted(), "fixture: the pages were refused");
+  spill.cache.endRequest(10);
+  require(spill.pool.freePageCount(kv::PageForm::Full) == 6 && spill.pool.allocatedExtents(kv::PageForm::Full) == 4 &&
+              spill.tier.demotions == 8 && spill.cache.returning().landingBytes == 400,
+          "fixture geometry changed");
+  const VictimQuery query =
+      test::query({.cls = ClaimClass::Host}, {.bytes = 1200, .pages = 5, .form = kv::PageForm::Index});
+  const std::optional<engine::Victim> unit = spill.cache.peek(query, nullptr);
+  require(unit && !unit->write && unit->bytes == 400 && unit->pages == 4, "the unit that frees now was not counted");
+  VictimQuery taking = query;
+  taking.lackingBytes = 1200;
+  taking.lackingPages = 5;
+  const uint64_t before = spill.pool.allocatedBytes();
+  const FreeResult taken = spill.cache.take(taking, *unit);
+  require(taken.nowBytes + taken.laterBytes <= unit->bytes && before - spill.pool.allocatedBytes() == 400 &&
+              taken.pages == 4,
+          "in place, a take freed " + std::to_string(taken.nowBytes) + " bytes now and " +
+              std::to_string(taken.laterBytes) + " later, and " + std::to_string(taken.pages) +
+              " pages, where its unit counted 400 bytes");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.cache.checkInvariants();
+}
+
+// A leaf a disk subtree depends on, which a tier that takes no writes lets go with that subtree, goes
+// while a state's write is in flight elsewhere, as the count reaches its page; it stays while the state
+// being written lies in that subtree, until that write lands (take-used tight seed 60576: a claim waited
+// for a write it did not need, and took a state in use for nothing).
+void testADiskSubtreeGoesBesideAStateWriteElsewhere() {
+  for (const bool inside : {false, true}) {
+    test::TestKvTier tier;
+    CacheFixture fixture(&tier);
+    auto landed = std::make_shared<TransferControl>();
+    landed->ready = true;
+    auto held = std::make_shared<TransferControl>();
+    fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(inside ? held : landed),
+                                        false);
+    require(reclaimStateBytes(fixture.cache) == 100, "the deep state was not written");
+    static_cast<void>(fixture.cache.pollTransfers());
+    require(test::evictStep(fixture.cache).gave() && tier.demotions == 1, "the leaf under the state was not written");
+    tier.complete();
+    static_cast<void>(fixture.cache.pollTransfers());
+    if (!inside) {
+      fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(held), false);
+      require(reclaimStateBytes(fixture.cache) == 100, "the state above was not written");
+    }
+    tier.writableFile = false;
+    require(fixture.cache.snapshot().pool.pagesPrefix == 3 && fixture.cache.snapshot().kvTier.diskBlocks == 1,
+            "fixture geometry changed");
+    const FreeResult freed = test::evictStep(fixture.cache);
+    if (!inside) {
+      require(freed.gave() && fixture.cache.snapshot().pool.pagesPrefix == 2 &&
+                  fixture.cache.snapshot().kvTier.diskBlocks == 0,
+              "a state's write elsewhere kept the leaf and its disk subtree");
+    } else {
+      require(!freed.gave() && fixture.cache.snapshot().pool.pagesPrefix == 3 &&
+                  fixture.cache.snapshot().kvTier.diskBlocks == 1,
+              "the disk subtree went under the state being written");
+    }
+    held->ready = true;
+    static_cast<void>(fixture.cache.pollTransfers());
+    if (inside)
+      require(test::evictStep(fixture.cache).gave() && fixture.cache.snapshot().pool.pagesPrefix == 2 &&
+                  fixture.cache.snapshot().kvTier.diskBlocks == 0,
+              "the disk subtree stayed once the write had landed");
+    fixture.cache.checkInvariants();
+  }
+}
+
+// A demotion frees its page as it lands only once nothing in RAM holds its block: one started before
+// its child's demotion lands with its child still resident, so no claim counts its page as landing
+// (take-used forked seed 66773: a phase that frees with no write counted an extent that only a later
+// reclaim frees). A leaf's demotion starts; a request then extends the chain past it, and the new
+// leaf, below which a state was written, is demoted too.
+void testADemotionStartedBeforeItsChildsCountsNoLanding() {
+  test::TestKvTier tier;
+  tier.transferLimit = 64;
+  CacheFixture fixture(&tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
+  require(reclaimStateBytes(fixture.cache) == 100 && fixture.cache.pollTransfers() &&
+              test::evictStep(fixture.cache).gave() && tier.demotions == 1,
+          "the leaf's demotion did not start");
+  constexpr uint32_t extended = 5 * KvCache::pageTokens;
+  std::vector<uint32_t> longer = fixture.prompt;
+  longer.pop_back();
+  for (uint32_t row = 0; row <= KvCache::pageTokens; ++row)
+    longer.push_back(5000 + row);
+  fixture.storage.budgetPages = 5;
+  auto lookup = fixture.lookup(129);
+  fixture.cache.beginRequest(2);
+  require(admitRestore(fixture.cache, 2, lookup).granted() && admitTokens(fixture.cache, 2, extended).granted(),
+          "the request did not extend the chain being demoted");
+  lookup = {};
+  fixture.cache.publishCommittedBlocks(2, longer, extended, {});
+  const uint64_t child = fixture.cache.blockAt(2, extended);
+  fixture.cache.endRequest(2);
+  fixture.cache.publishCompositeState(child, std::make_shared<TieredState>(control), false);
+  require(reclaimStateBytes(fixture.cache) == 100 && fixture.cache.pollTransfers(), "the child's state was not written");
+  require(test::evictStep(fixture.cache).gave() && tier.demotions == 2, "the child's demotion did not start");
+  // Every unit a claim that can wait is offered as freeing with no write frees what it counted.
+  const VictimQuery query = test::query(test::kInServiceGrowth, {.bytes = 200});
+  for (std::optional<engine::Victim> unit = fixture.cache.peek(query, nullptr); unit && !unit->write;
+       unit = fixture.cache.peek(query, nullptr)) {
+    const FreeResult taken = fixture.cache.take(query, *unit);
+    require(taken.nowBytes + taken.laterBytes >= unit->bytes,
+            "a unit counted " + std::to_string(unit->bytes) + " bytes with no write; its take freed " +
+                std::to_string(taken.nowBytes + taken.laterBytes));
+    if (!taken.gave())
+      break;
+  }
+  tier.complete();
+  static_cast<void>(fixture.cache.pollTransfers());
+  fixture.cache.checkInvariants();
+}
+
+// A take whose write makes room at a full quota may give up a point on the SSD; a point that and another
+// conversation's point superseded together is history then, and the same take releases it with no write. No count
+// foresees what the quota gives up, so the units that release frees count with the quota's (Cache::
+// unitsFreedElsewhere), as those of the state given up do (take-used forked seed 21777). Three conversations part
+// at a point on the SSD whose units a running lane passed: one on the SSD wholly, the oldest point; one the lane
+// runs on, its point on the SSD; and one apart whose leaves' demotions find the quota full.
+void testAPointTheQuotaLeftHistoryCountsWithTheQuota() {
+  test::TestKvTier tier(false, 200);
+  tier.capacity = 64;
+  tier.transferLimit = 16;
+  auto budget = std::make_shared<model::DiskBudget>(100000);
+  tier.budget = budget;
+  test::TestKvStorage storage{192, 100, 4};
+  KvPool pool{storage, 4};
+  engine::Cache cache(pool, &tier, budget, std::nullopt, CacheWindowPolicy{Windowed::kWindowPages, Windowed::kUnitPages});
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->capacity = 8;
+  const auto toDisk = [&](uint64_t block, uint64_t lane) {
+    require(cache.publishStateToDisk(block, [&](std::function<void()>) { return writeState(control); }, false, lane),
+            "fixture: a publication to the SSD was refused");
+    static_cast<void>(cache.pollTransfers());
+  };
+  // Writes the units of the points on the SSD whose pages are idle, then drops `leaves` copied leaves.
+  const auto writeAndDrop = [&](uint32_t leaves, uint32_t others) {
+    for (int step = 0; step < 8 && cache.snapshot().window->windowUnits > others; ++step) {
+      static_cast<void>(test::takeStep(cache, test::kInServiceGrowth, {.pages = 2 * Windowed::kUnitPages}));
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    for (uint32_t leaf = 0; leaf < leaves; ++leaf)
+      require(test::evictStep(cache).gave(), "fixture: a copied leaf was not dropped");
+  };
+  const std::vector<uint32_t> shared = Windowed::prompt(1000, 2);
+  const auto branch = [&](uint32_t first) {
+    std::vector<uint32_t> tokens(shared.begin(), shared.end() - 1);
+    for (uint32_t row = 0; row <= 2 * KvCache::pageTokens; ++row)
+      tokens.push_back(first + row);
+    return tokens;
+  };
+  // The oldest point, on the SSD wholly, one its conversation went on from to a point of its own (a finished
+  // request's last point alone supersedes nothing).
+  const std::vector<uint32_t> gone = branch(20'000);
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, gone.size()).granted(), "fixture: the first branch was refused");
+  cache.publishCommittedBlocks(1, gone, 3 * KvCache::pageTokens, {});
+  const uint64_t goneAt = cache.blockAt(1, 3 * KvCache::pageTokens);
+  toDisk(goneAt, 1);
+  cache.publishCommittedBlocks(1, gone, 4 * KvCache::pageTokens, {});
+  toDisk(cache.blockAt(1, 4 * KvCache::pageTokens), 1);
+  cache.endRequest(1);
+  writeAndDrop(2, 0);
+  // The lane's conversation: the point where they part and its own, both on the SSD.
+  const std::vector<uint32_t> running = branch(30'000);
+  cache.beginRequest(2);
+  CacheLookup lookup = cache.lookup(running, {});
+  require(admitRestore(cache, 2, lookup).granted(), "fixture: the lane did not take the shared pages");
+  lookup = {};
+  for (uint32_t pages = 1; pages <= 4; ++pages) {
+    static_cast<void>(cache.cutPageTable(2));
+    require(admitTokens(cache, 2, pages * KvCache::pageTokens + 1).granted(), "fixture: the lane was refused");
+    cache.publishCommittedBlocks(2, running, pages * KvCache::pageTokens, {});
+    if (pages == 2 || pages == 4)
+      toDisk(cache.blockAt(2, pages * KvCache::pageTokens), 2);
+  }
+  const uint64_t point = cache.blockAt(2, 2 * KvCache::pageTokens);
+  // A conversation apart, its point's tail written and dropped, its first blocks without copies.
+  const uint32_t lanes = cache.snapshot().window->windowUnits;
+  const std::vector<uint32_t> apart = Windowed::prompt(50'000, 4);
+  cache.beginRequest(3);
+  require(admitTokens(cache, 3, apart.size()).granted(), "fixture: the conversation apart was refused");
+  cache.publishCommittedBlocks(3, apart, 4 * KvCache::pageTokens, {});
+  toDisk(cache.blockAt(3, 4 * KvCache::pageTokens), 3);
+  cache.endRequest(3);
+  writeAndDrop(2, lanes);
+  const std::vector<uint32_t> other = Windowed::prompt(70'000, 3);
+  cache.beginRequest(5);
+  require(admitTokens(cache, 5, other.size()).granted(), "fixture: the other conversation was refused");
+  cache.publishCommittedBlocks(5, other, 3 * KvCache::pageTokens, {});
+  toDisk(cache.blockAt(5, 3 * KvCache::pageTokens), 5);
+  cache.endRequest(5);
+  writeAndDrop(2, lanes);
+  // A state in RAM on the lane's chain, newer than those leaves, that waits for a write.
+  cache.publishCompositeState(cache.blockAt(2, 3 * KvCache::pageTokens), std::make_shared<TestState>(100), false, 2);
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  budget->setLimitBytes(budget->usedBytes());
+  // A request holds free pages, so that a demotion's landing beside the one left completes no extent.
+  cache.beginRequest(4);
+  require(admitTokens(cache, 4, 3 * KvCache::pageTokens).granted(), "fixture: the holder was refused");
+  require(pool.freePageCount() == 1 && cache.snapshot().stateCache.entries == 7 && cache.newestPoint(point) &&
+              cache.newestPoint(goneAt),
+          "fixture geometry changed: " + std::to_string(pool.freePageCount()) + " free pages, " +
+              std::to_string(cache.snapshot().stateCache.entries) + " states");
+  const VictimQuery query = test::query(test::kInServiceGrowth, {.bytes = 400, .stateBuffers = 1});
+  // Takes as the ledger takes them, of what lands later, until the quota gives the oldest point up.
+  for (int step = 0; step < 6 && cache.newestPoint(goneAt); ++step) {
+    const uint64_t elsewhere = cache.unitsFreedElsewhere();
+    std::optional<engine::Victim> unit = cache.peek(query, nullptr);
+    while (unit && !unit->later)
+      unit = cache.peek(query, &*unit);
+    require(unit.has_value(), "fixture: no unit was offered");
+    static_cast<void>(cache.take(query, *unit));
+    if (!cache.newestPoint(goneAt))
+      require(!cache.newestPoint(point) && cache.unitsFreedElsewhere() > elsewhere,
+              "a take whose write gave a point up released the point that left history with no write, and counted "
+              "its units as the walk's releases");
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  require(!cache.newestPoint(goneAt), "fixture: the quota gave no point up");
+  static_cast<void>(cache.cutPageTable(2));
+  cache.endRequest(2);
+  cache.endRequest(4);
   cache.checkInvariants();
 }
 
@@ -6980,12 +9913,14 @@ int main() {
     testOrdinaryPublicationUpgradesDiskCheckpoint();
     testKvDemotionAndRestoreLifecycle();
     testEvictedCheckpointsAndSupersededPointsStayOnTheSsd();
+    testSparseHistoryWritesAPointEveryEightThousandTokens();
+    testAHistoryWriteTakesNoPointsOnlyCopy();
     testTailsDropAndParentsFollowToDisk();
     testDiskCopiesNoStateNeedsGoWithTheLeaf();
     testRefusedDemotionKeepsTheLeafWhileTransfersLand();
     testUnusableTierDropsTheLeafInstead();
-    testSpentWriteBudgetHoldsBackStatesNotInUse();
-    testSpentWriteBudgetKeepsTheChainsOfWrittenStates();
+    testSpentWriteBudgetWritesNoState();
+    testSpentWriteBudgetKeepsToMemory();
     testLimitBelowASlotMakesNoRoom();
     testSecondStateWaitsForTheWrite();
     testWaitingCheckpointHoldsBackNothingElse();
@@ -7012,6 +9947,11 @@ int main() {
     testDiskQuotaKeepsTheOnlyCopyAQueuedRequestRestores();
     testCertainReuseByClass();
     testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy();
+    testAFullTemporaryQuotaGivesWayByUseAndKeepsAQueuedRestore();
+    testAFullTemporaryQuotaRefusesAWriteOfAConversationUsedLonger();
+    testConversationsTakingTurnsAtAFullTemporaryQuotaResume();
+    testASideBranchsStateOnTheSsdLeavesTheTipAPoint();
+    testARefusedWriteSearchesTheOrdersOnce();
     testALeafWhoseWriteFindsNoSlotGoesWithItsSubtree();
     testAWaitingClaimDemotesAWholeChainRunAtOnce();
     testAMemoryClaimForAPageTakesACachedPageInPlace();
@@ -7096,13 +10036,21 @@ int main() {
     testRecomputedBlocksSpillToCopiesOfTheirPages();
     testUnreadableCopyLeavesWithItsHolders();
     testPoisonedBlockLeavesOnceItsWriteLands();
-    testWindowsTrimWhatEveryHolderPassed();
-    testWritersKeepTheirPagesTrimmedOrNot();
-    testStateTailsPinTheirWindows();
-    testStatesNeedTheirTailFull();
-    testFullShortfallsTrimBeforeAnyLeafGoes();
-    testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps();
+    testWritersKeepTheirPages();
+    testWindowUnitsGoWithTheirBlocks();
+    testStateTailsCountOnTheirBlocks();
+    testAUnitLeavesWhenNoLaneOrPointHoldsIt();
+    testStatesNeedTheUnitsOfTheirTail();
+    testHistoryThatSharesAUnitLeavesTogether();
+    testFullShortfallsTakeTheTailsBeforeAnyLeafGoes();
+    testFullShortfallsTakeTheHistoryTheSsdKeeps();
+    testAKeptPointsLandedPartsCostNoNewerPoint();
+    testARoomMadeForAWriteKeepsTheUnitsTheNewTailPins();
     testRefusedLanesTakeTheTailsBehindThem();
+    testALaneTakesBackTheTailsOfTurnsThatLeftItsChain();
+    testALaneAtTheWallTakesThePointsBehindItAndKeepsItsDurableCopy();
+    testIdleConversationsKeepTheirBasePagesBeforeTheyLoseAnything();
+    testLanesHoldAndLetGoOfUnitsTogether();
     testFullShortfallsAtTheWallTakeDeadLeavesFirst();
     testRestoresReturnNothing();
     testHeldDemotionReturnsNoPage();
@@ -7131,9 +10079,45 @@ int main() {
     testDemotionsStopWhereTheyCompleteAnExtent();
     testAReleaseOfWhatALandingCompletesCountsOnce();
     testATakeCountsTheLandingItLetsFree();
+    testAReleaseNetsTheLandingAnEarlierTakeCredited();
+    testAnInPlaceTakeCreditsNoLandingPastItsFirstStep();
+    testADiskSubtreeGoesBesideAStateWriteElsewhere();
+    testADemotionStartedBeforeItsChildsCountsNoLanding();
+    testAPointTheQuotaLeftHistoryCountsWithTheQuota();
     testGrowthCountsNoPageInTransfer();
     testGrowthCountsNoStateThatWaitsForAWrite();
     testStagedStateFreesItsCopiedChain();
+    testASpentWriteBudgetOrdersRecoveryPointsAsNoTierDoes();
+    testAHeadConversationsPartBelowStaysAPoint();
+    testReplyStatesNoPromptRenderedThroughAreHistory();
+    testASideRequestFromTheTipLeavesTheTipAPoint();
+    testAShortSideAnswerFromTheTipLeavesTheTipAPoint();
+    testAnEditOfTheLastMessageResumesAtThePreviousReplysEnd();
+    testAConversationGoingOnTwiceMakesItsPointsHistory();
+    testAHeadThatMovesWithItsConversationIsHistoryBehindIt();
+    testASiblingReplyIsNoOrphanWhileItsConversationMayGoOn();
+    testAHeadWithAnotherAppsHeadBelowItStaysAHead();
+    testAHeadOneConversationUsedOutlastsItsTurns();
+    testAReplyLeftInsideTheBlockItSharesWithItsPromptIsHistory();
+    testADurablePointIsHistoryOnlyOnceTheNextHasLandedWhole();
+    testAPointOnTheSsdHoldsItsWindowAsPartsOrUnits();
+    testACompactionLeavesThePagesAWindowPartsReadTouches();
+    testAPromotionTakesItsTailAfterItsCopyReclaims();
+    testAWriteMakesNoRoomFromItsOwnCopy();
+    testACopyAheadWritesItsOwnTailOnAPersistentTierAlone();
+    testAFullQuotaGivesUpUnneededWindowPartsFirst();
+    testALaneAtTheWallDemotesThePointsBehindIt();
+    testTheWalkOfAFullPersistentCacheCostsWhatItHolds();
+    testTheCountOfADeepCacheWithNoSsdCostsWhatItHolds();
+    testAClaimOfManyPagesCountsOnceForItsUnit();
+    testATailSearchCostsItsWindow();
+    testASpentWriteBudgetGivesUpAnSsdPointsUnwrittenUnits();
+    testAPageNeedTakesNoHistoryThatHoldsNoPage();
+    testAPageNeedTakesTheLeafUnderHistoryThatHoldsNoPage();
+    testALeafWhoseStateLeftMakingRoomForItsCopyGoesNow();
+    testAReleaseCountsAgainstNoLandingTheClaimWasNotCredited();
+    testALandingBesideTheKeptPagesCreditsNothing();
+    testWhatLeavesAtNoLossGoesFirstWhereNothingIsWritten();
     std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

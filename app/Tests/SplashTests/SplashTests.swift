@@ -194,8 +194,17 @@ struct ServeSettingsTests {
         #expect(settings.differs(from: other, model: "a/b", family: .unknown))
         // The card leaves them out, and the bands of parts left empty.
         #expect(LaunchOptions.options(.memory, for: Self.flint).map(\.flag)
-            == ["--kv-format", "--expert-memory"])
-        #expect(LaunchOptions.options(.memory, for: .unknown).count == 6)
+            == ["--weights", "--kv-format", "--expert-memory"])
+        // Weights is kept only for a model some of whose weights Auto would load otherwise: left
+        // out for one that has none and for one whose record doesn't say, which starts without it.
+        for quantizable in [false, nil] as [Bool?] {
+            #expect(LaunchOptions.options(.memory, for: Self.flint.weights(quantizable: quantizable)).map(\.flag)
+                == ["--kv-format", "--expert-memory"])
+            #expect(ServeSettings(values: ["--weights": "auto"], apiKey: "k")
+                .usable(by: Self.flint.weights(quantizable: quantizable)).values.isEmpty)
+        }
+        #expect(Self.flint.weights(quantizable: true) == Self.flint)
+        #expect(LaunchOptions.options(.memory, for: .unknown).count == 7)
         // Recalibrating the Neural Engine goes with the Neural Engine.
         #expect(LaunchOptions.options(.requests, for: Self.moe).map(\.flag).filter { $0.hasSuffix("-ane") } == [])
         #expect(LaunchOptions.options(.requests, for: .unknown).map(\.flag).filter { $0.hasSuffix("-ane") }
@@ -240,6 +249,87 @@ struct ServeSettingsTests {
         #expect(!ContextLength.message(Self.flint).contains("YaRN"))
         #expect(ContextLength.message(Self.moe).contains("at most 1,010,000. Past the model’s own window, 256K, it stretches it with YaRN"))
         #expect(ContextLength.message(.unknown).contains("YaRN"))
+    }
+
+    /// The Activations menu names the family's own default as its default item and offers the
+    /// other value; a start passes neither that default nor a value kept that equals it.
+    @Test func theActivationsMenuNamesTheFamilysDefault() throws {
+        let activations = try #require(LaunchOption.all.first { $0.flag == "--activations" })
+        var inkling = Self.moe
+        inkling.activations = "bf16"
+        var qwen = Self.moe
+        qwen.activations = "auto"
+        #expect(activations.standard(for: inkling) == "16-bit" && activations.choices(for: inkling).map(\.value) == ["auto"])
+        #expect(activations.standard(for: qwen) == "Auto" && activations.choices(for: qwen).map(\.value) == ["bf16"])
+        #expect(activations.standard(for: .unknown) == "Auto" && activations.choices(for: .unknown).map(\.value) == ["bf16"])
+        let kept = ServeSettings(values: ["--activations": "bf16"], apiKey: nil)
+        #expect(!kept.usable(by: inkling).serveArguments(model: "a/b").contains("--activations"))
+        #expect(kept.usable(by: qwen).serveArguments(model: "a/b").contains("bf16"))
+        let family = try JSONDecoder().decode(ModelFamily.self, from: Data(#"{"unusable": [], "context_tokens": 1, "max_context_tokens": 1, "activations": "bf16"}"#.utf8))
+        #expect(family.activations == "bf16" && family.standard("--weights") == nil)
+    }
+
+    /// Thinking offers what the model picked's own chat template renders, as its record says: its
+    /// default named and left out of the choices, No Thinking, and only the efforts it tells
+    /// apart; one whose efforts all render alike has thinking on and off. An effort the model
+    /// doesn't have is not passed. A model whose record doesn't say has every effort.
+    @Test func thinkingOffersTheEffortsTheModelHas() throws {
+        let thinking = try #require(LaunchOption.all.first { $0.flag == "--default-reasoning-effort" })
+        let levels = Self.moe.thinking(ModelReasoning(thinks: true, efforts: ["low", "medium", "xhigh"], standard: "xhigh"))
+        #expect(thinking.standard(for: levels) == "Extra High")
+        // In the Chat's order, most to least and No Thinking last, the default in its own place.
+        #expect(thinking.choices(for: levels).map(\.title) == ["Medium", "Low", "No Thinking"] && levels.standardIndex("--default-reasoning-effort") == 0)
+        let inkling = Self.moe.thinking(ModelReasoning(thinks: true, efforts: ["minimal", "low", "medium", "high", "xhigh"], standard: "high"))
+        #expect(thinking.choices(for: inkling).map(\.title) == ["Extra High", "Medium", "Low", "Minimal", "No Thinking"])
+        #expect(inkling.standardIndex("--default-reasoning-effort") == 1 && Self.moe.standardIndex("--default-reasoning-effort") == 0)
+        let kept = ServeSettings(values: ["--default-reasoning-effort": "max"], apiKey: nil)
+        #expect(!kept.usable(by: levels).serveArguments(model: "a/b").contains("--default-reasoning-effort"))
+        #expect(ServeSettings(values: ["--default-reasoning-effort": "xhigh"], apiKey: nil).usable(by: levels).values.isEmpty)
+        #expect(ServeSettings(values: ["--default-reasoning-effort": "low"], apiKey: nil).usable(by: levels).values.count == 1)
+        let on = Self.moe.thinking(ModelReasoning(thinks: true, efforts: [], standard: nil))
+        #expect(thinking.standard(for: on) == "Thinking" && thinking.choices(for: on).map(\.title) == ["No Thinking"])
+        #expect(kept.usable(by: on).values.isEmpty)
+        let off = Self.moe.thinking(ModelReasoning(thinks: false, efforts: [], standard: nil))
+        #expect(thinking.standard(for: off) == "No Thinking")
+        #expect(thinking.choices(for: off).map(\.value) == ["medium"] && thinking.choices(for: off).map(\.title) == ["Thinking"])
+        #expect(off.standardIndex("--default-reasoning-effort") == 1 && on.standardIndex("--default-reasoning-effort") == 0)
+        #expect(thinking.standard(for: Self.moe) == "Model’s Default" && thinking.choices(for: Self.moe).count == 7)
+        #expect(kept.usable(by: Self.moe).values.count == 1)
+        let record = try JSONDecoder().decode(ModelReasoning.self, from: Data(#"{"thinks": true, "efforts": ["low"], "default": "low"}"#.utf8))
+        #expect(record == ModelReasoning(thinks: true, efforts: ["low"], standard: "low"))
+    }
+
+    /// The sampling fields keep their settings as the option keeps them, so that what 1.7.3's one
+    /// field kept reads into them and a start passes each; an empty field passes nothing. Each
+    /// takes the server's forms and ranges, and shows what the model picked's requests get.
+    @Test func theSamplingFieldsKeepTheOptionsPairs() throws {
+        let old = "temperature=0.6, top_k=20"
+        #expect(Sampling.values(old) == ["temperature": "0.6", "top_k": "20"])
+        var values = Sampling.values(old)
+        values["min_p"] = "0.05"
+        values["temperature"] = nil
+        #expect(Sampling.stored(values) == "top_k=20, min_p=0.05")
+        #expect(Sampling.stored([:]) == nil && Sampling.values(nil).isEmpty)
+        let kept = ServeSettings(values: ["--sampling-default": try #require(Sampling.stored(values))], apiKey: nil)
+        let arguments = kept.serveArguments(model: "a/b")
+        #expect(arguments.contains("top_k=20") && arguments.contains("min_p=0.05"))
+        #expect(arguments.filter { $0 == "--sampling-default" }.count == 2)
+        let all = Dictionary(uniqueKeysWithValues: (Sampling.main + Sampling.more).map { ($0.name, $0) })
+        let temperature = try #require(all["temperature"]), topP = try #require(all["top_p"]), topK = try #require(all["top_k"])
+        let repetition = try #require(all["repetition_penalty"]), minP = try #require(all["min_p"])
+        #expect(Sampling.parse(temperature, " 0.7 ") == "0.7" && Sampling.parse(temperature, "2.5") == nil)
+        #expect(Sampling.parse(topP, "0") == nil && Sampling.parse(topP, "1") == "1")
+        #expect(Sampling.parse(topK, "20") == "20" && Sampling.parse(topK, "0.5") == nil)
+        #expect(Sampling.parse(repetition, "0") == nil && Sampling.parse(minP, "x") == nil)
+        var qwen = Self.moe, inkling = Self.moe
+        qwen.sampling = ["temperature": 1.0, "top_p": 0.95, "top_k": 20]
+        inkling.sampling = ["temperature": 1.0, "top_p": 1.0, "top_k": 0]
+        #expect(Sampling.main.map { Sampling.placeholder($0, qwen) } == ["1", "0.95", "20"])
+        #expect(Sampling.main.map { Sampling.placeholder($0, inkling) } == ["1", "1", "Off"])
+        #expect(Sampling.placeholder(topK, .unknown) == "Model’s Default")
+        #expect(Sampling.more.map { Sampling.placeholder($0, qwen) } == ["0", "0", "1", "0"])
+        let family = try JSONDecoder().decode(ModelFamily.self, from: Data(#"{"unusable": [], "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}}"#.utf8))
+        #expect(family.sampling?["top_k"] == 20)
     }
 
     /// The context menu offers the lengths the model picked serves, 1M tokens where YaRN stretches
@@ -1412,7 +1502,7 @@ struct ModelFamilyTests {
         state.addLocal(file)
         await state.listed()
         #expect(state.installed.last == InstalledModel(id: file.path, bytes: 1000, gguf: true) && state.selection == file.path)
-        #expect(state.family(of: file.path) == .unknown)
+        #expect(state.family(of: file.path) == ModelFamily.unknown.weights(quantizable: nil))
         state.options["--port"] = String(fake.port)
         state.start(file.path)
         // The start prepares the files under a selection link of its options, as `splash serve` does,
@@ -1443,7 +1533,7 @@ struct ModelFamilyTests {
         try fake.install(other, family: "Other")
         let state = fake.state()
         defer { state.quit() }
-        #expect(state.family(of: flint) == .unknown)
+        #expect(state.family(of: flint) == ModelFamily.unknown.weights(quantizable: nil))
         await state.launch()
         #expect(state.isInstalled(flint) && state.isInstalled(other))
         // The options the card shows the model picked.
@@ -1460,7 +1550,7 @@ struct ModelFamilyTests {
         #expect(state.selection == other)
         await state.listed()
         #expect(state.selection == file.path)
-        #expect(state.family(of: file.path) == .unknown && shown(file.path).contains("--state-format"))
+        #expect(state.family(of: file.path) == ModelFamily.unknown.weights(quantizable: nil) && shown(file.path).contains("--state-format"))
         state.removeLocal(file.path)
         state.options["--port"] = String(fake.port)
         state.options["--state-format"] = "bf16"

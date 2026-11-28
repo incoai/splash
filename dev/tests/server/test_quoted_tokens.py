@@ -8,10 +8,12 @@ tokenizer and template of every model installed in this checkout
 
 import functools
 import json
+import tempfile
 import unittest
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
+from unittest import mock
 
 from jinja2 import meta
 from tokenizers import (
@@ -29,6 +31,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
 from install import assembly, paths
+from install.models import ModelError
 from server import chat_templates
 from server.chat_format import FLINT, INKLING2, QWEN, ChatFormat
 from server.chat_templates import template_options
@@ -244,13 +247,20 @@ def laid_out(name, chat_format, special, tags, splits, *, nfc, vision):
     )
 
 
-def installed():
+@functools.cache
+def installations():
     """The tokenizer and template of each model installed in this checkout,
-    served as its family is."""
-    served = []
+    served as its family is; and, apart, each installation that does not
+    verify, as one whose Hub cache was cleaned since, which the tests leave
+    out and name (test_installations_are_whole)."""
+    served, broken = [], []
     for root in sorted((paths.MODELS / ".resolved").glob("*/tokenizer")):
+        try:
+            record = assembly.verify(root.parent)
+        except (ModelError, OSError) as error:
+            broken.append(f"{root.parent.name} ({error})")
+            continue
         family = assembly.family(root.parent)
-        record = json.loads((root.parent / "model.json").read_text())
         served.append(
             Served(
                 f"installed {record['model']}",
@@ -261,7 +271,7 @@ def installed():
                 family.vision and record["vision_format"] != "none",
             )
         )
-    return served
+    return served, broken
 
 
 @functools.cache
@@ -291,7 +301,7 @@ def served():
             nfc=False,
             vision=False,
         ),
-        *installed(),
+        *installations()[0],
     )
 
 
@@ -406,6 +416,28 @@ def texts(before="", after=""):
 
 
 class QuotedTokenTests(unittest.TestCase):
+    def test_installations_are_whole(self):
+        broken = installations()[1]
+        if broken:
+            self.skipTest("left out, not verified: " + "; ".join(broken))
+
+    def test_an_installation_that_does_not_verify_is_left_out(self):
+        # Its links name files a cleaned Hub cache no longer holds.
+        with tempfile.TemporaryDirectory() as temporary:
+            entry = Path(temporary) / ".resolved" / "gone"
+            entry.mkdir(parents=True)
+            (entry / "tokenizer").symlink_to(Path(temporary) / "cleaned")
+            (entry / "model.json").write_text('{"model": "owner/gone"}')
+            installations.cache_clear()
+            try:
+                with mock.patch.object(paths, "MODELS", Path(temporary)):
+                    served, broken = installations()
+            finally:
+                installations.cache_clear()
+        self.assertEqual(served, [])
+        self.assertEqual(len(broken), 1)
+        self.assertTrue(broken[0].startswith("gone ("), broken)
+
     def each(self):
         for family in served():
             with self.subTest(family.name):

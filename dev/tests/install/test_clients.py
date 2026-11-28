@@ -258,11 +258,13 @@ class ClientTests(unittest.TestCase):
 
     def test_claude_launch_selects_the_local_server_for_every_model_alias(self):
         # A shell configured for a cloud provider keeps its unrelated
-        # settings, and compaction stays on with the served window.
+        # settings, and compaction stays on with the served window. Auto
+        # mode's review stays with the client, whatever the shell asked for.
         command, env = self.command(
             "claude",
             env={
                 "ANTHROPIC_API_KEY": "unrelated-key",
+                "CLAUDE_CODE_AUTO_MODE_SERVER": "1",
                 "CLAUDE_CODE_USE_VERTEX": "1",
                 "CLAUDE_CONFIG_DIR": "/custom/claude",
                 "PATH": "/bin",
@@ -297,6 +299,7 @@ class ClientTests(unittest.TestCase):
                 "CLAUDE_CODE_USE_BEDROCK": "0",
                 "CLAUDE_CODE_USE_VERTEX": "0",
                 "CLAUDE_CODE_USE_FOUNDRY": "0",
+                "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
             },
         )
 

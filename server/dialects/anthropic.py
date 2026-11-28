@@ -293,7 +293,12 @@ def _response_format(body, output_config):
         or not isinstance(output_format.get("schema"), (dict, bool))
     ):
         raise APIError(400, "output format must be a json_schema object with a schema")
-    return {"type": "json_schema", "json_schema": {"schema": output_format["schema"]}}
+    # Messages structured outputs are always strict: a schema keyword the
+    # grammar cannot enforce is refused, as Anthropic's API refuses one.
+    return {
+        "type": "json_schema",
+        "json_schema": {"schema": output_format["schema"], "strict": True},
+    }
 
 
 def _message(message, thinking_resolver):
@@ -452,12 +457,15 @@ def _tools(tools):
             or not isinstance(field_value(tool, "input_schema", {}), (dict, bool))
         ):
             raise APIError(400, "invalid Anthropic tool")
-        function = {
-            "name": tool["name"],
-            "parameters": field_value(tool, "input_schema", {}),
-        }
+        # The keys in the order Chat clients send them, name, description,
+        # parameters, strict, which a template that prints a tool's JSON as
+        # it is keeps: the same tool renders the same tokens through either
+        # dialect, and Responses, so one dialect's cached prompt serves the
+        # others.
+        function = {"name": tool["name"]}
         if isinstance(tool.get("description"), str):
             function["description"] = tool["description"]
+        function["parameters"] = field_value(tool, "input_schema", {})
         if "strict" in tool:
             function["strict"] = tool["strict"]
         functions.append({"type": "function", "function": function})
@@ -561,9 +569,6 @@ def complete(exchange, job, *, omitted):
     )
     result = collected.result
     blocks = sequencer.finish(collected.cut, collected.reasoning_open)
-    if collected.cut_call is not None:
-        # A complete message leaves out the call the output cut.
-        blocks = [block for block in blocks if block.call_id != collected.cut_call]
     signature = (
         app.thinking_codec.encode(collected.reasoning)
         if collected.reasoning and omitted
@@ -656,6 +661,7 @@ def stream(exchange, job, *, omitted):
         collected = exchange.collect(
             job,
             on_start=start,
+            streaming=True,
             on_text=sequencer.text,
             on_tool_delta=sequencer.tool,
             on_idle=keepalive,
@@ -724,10 +730,10 @@ def message_usage(prompt_tokens, output_tokens, cache, thinking_tokens=None):
 def content_block(block, omitted, signature=""):
     """The Messages content block of `block` as a complete response shows it
     or, while it is in progress, as a stream starts it, before its text or
-    input. Reasoning whose display is `omitted` shows only `signature`. A call
-    no longer in progress has complete arguments: the projector writes each
-    call it closes as JSON, and a complete response leaves out a call the
-    token limit or a stop sequence cut."""
+    input. Reasoning whose display is `omitted` shows only `signature`. A
+    complete response's call has closed with arguments that read as a JSON
+    object, as the projector returns one there; a stream starts each call
+    in progress, and one that streamed ends with the input it sent."""
     if block.kind == "reasoning":
         thinking = "" if omitted else block.text
         return {"type": "thinking", "thinking": thinking, "signature": signature}
@@ -780,12 +786,7 @@ class AnthropicErrors(ErrorDialect):
     def payload(self, error):
         message = error.message
         if isinstance(error, ContextLengthError):
-            message = (
-                f"prompt is too long: {error.input_tokens} tokens > "
-                f"{error.maximum_input_tokens} maximum input tokens"
-            )
-            if error.image_tokens_only:
-                message += " (image tokens alone; text not yet counted)"
+            message = error.anthropic_message()
         error_type = self.TYPES.get(
             error.status,
             "api_error" if error.status >= 500 else "invalid_request_error",

@@ -67,6 +67,8 @@ class RequestFailed(EngineRuntimeError):
         *,
         retryable: bool = False,
         retry_after_seconds: int = 0,
+        capacity_limit: wire.CapacityLimit = wire.CapacityLimit.NONE,
+        fits_tokens: int = 0,
     ):
         self.request_id = request_id
         self.code = code
@@ -74,6 +76,11 @@ class RequestFailed(EngineRuntimeError):
         self.retryable = retryable
         # When a retry may succeed, in seconds; 0 for at once.
         self.retry_after_seconds = retry_after_seconds
+        # For a request that cannot fit even alone, what it lacked and the
+        # prompt tokens that fit, 0 where the engine cannot say
+        # (wire.ErrorEvent).
+        self.capacity_limit = capacity_limit
+        self.fits_tokens = fits_tokens
         text = message.decode("utf-8", errors="replace")
         machine_code = code.decode("ascii", errors="replace")
         super().__init__(f"request {request_id} failed [{machine_code}]: {text}")
@@ -85,6 +92,8 @@ class RequestFailed(EngineRuntimeError):
             self.message_bytes,
             retryable=self.retryable,
             retry_after_seconds=self.retry_after_seconds,
+            capacity_limit=self.capacity_limit,
+            fits_tokens=self.fits_tokens,
         )
 
 
@@ -168,10 +177,14 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
-def _wire_deadline(remaining: float) -> tuple[int, int]:
-    """(absolute unix µs, remaining µs) for a deadline `remaining` seconds
-    away; an infinite one saturates at the wire's u64 maximum."""
+def _wire_deadline(deadline: float) -> tuple[int, int]:
+    """(absolute unix µs, remaining µs) for `deadline` on the monotonic clock;
+    an infinite one saturates at the wire's u64 maximum. The wall clock is
+    read first, so the absolute deadline is never later than `deadline`: the
+    engine, which reads its clocks the other way round, then counts a cancel
+    at `deadline` as a timeout."""
     wall = time.time_ns() // 1000
+    remaining = _remaining(deadline)
     limit = _MAX_U64 - wall
     micros = (
         limit if remaining >= limit / 1_000_000 else max(1, int(remaining * 1_000_000))
@@ -593,12 +606,17 @@ class MultiplexedRuntime:
 
     @staticmethod
     def _spawn(command: Sequence[str]) -> ProcessLike:
+        # The engine shares the server's process group, so that a stop of the
+        # group (Ctrl+C, the app, a supervisor) or its kill takes it too; it
+        # then ends on the server's own SIGTERM alone, which follows the
+        # server's drain (--shutdown-timeout), or once the server is gone.
         return subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=dict(os.environ, SPLASH_ENGINE_STOPPED_BY_PARENT="1"),
         )
 
     @property
@@ -694,7 +712,7 @@ class MultiplexedRuntime:
         call: RuntimeCall | None = None
         try:
             # Admission must precede serialization, which copies image payloads.
-            absolute, remaining = _wire_deadline(_remaining(deadline))
+            absolute, remaining = _wire_deadline(deadline)
             frame = replace(
                 request.frame,
                 request_id=request_id,
@@ -1392,6 +1410,8 @@ class MultiplexedRuntime:
                     event.message,
                     retryable=event.retryable,
                     retry_after_seconds=event.retry_after_seconds,
+                    capacity_limit=event.capacity_limit,
+                    fits_tokens=event.fits_tokens,
                 ),
             )
             return

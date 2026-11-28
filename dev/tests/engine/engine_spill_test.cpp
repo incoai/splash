@@ -97,8 +97,8 @@ void testAdmissionSpillsWhatMemoryCannotHold() {
   require(modes == std::vector<KvMode>{KvMode::Resident, KvMode::Spill, KvMode::Resident} &&
               counts.resident == 2 && counts.spill == 1,
           "admission did not keep in memory exactly the requests whose projection memory holds");
-  spill.engine.cancel(1);
-  spill.engine.cancel(2);
+  spill.engine.cancel(1, 0.0);
+  spill.engine.cancel(2, 0.0);
   spill.runUntilIdle();
   require(spill.committedSlots() == 0, "a request kept its commitment");
 }
@@ -177,7 +177,7 @@ void testConversionSpillsAHistoryWithCopies() {
     static_cast<void>(spill.engine.tick(spill.now++));
     spill.tier.complete();
   }
-  spill.engine.cancel(1);
+  spill.engine.cancel(1, 0.0);
   spill.runUntilIdle();
   require(spill.engine.snapshot().spill.spill == 1 && spill.tier.writes.size() >= 10,
           "the first turn did not spill its prompt's pages");
@@ -206,7 +206,7 @@ void testAConversionWithCopiesRunsInTheCommandItConvertsFor() {
     static_cast<void>(spill.engine.tick(spill.now++));
     spill.tier.complete();
   }
-  spill.engine.cancel(1);
+  spill.engine.cancel(1, 0.0);
   spill.runUntilIdle();
   spill.storage.budgetPages = 14;
   spill.engine.submit(Spilling::prompt(2, 1, 10, 120));
@@ -268,8 +268,8 @@ double convertBesideAPrompt(Spilling &spill) {
 void testAUnitsWaitEndsWithItsLanes() {
   Spilling spill(400, false, 1'000'000, 0, {4}, {}, {}, false, {.count = 2048});
   static_cast<void>(convertBesideAPrompt(spill));
-  spill.engine.cancel(1);
-  spill.engine.cancel(2);
+  spill.engine.cancel(1, 0.0);
+  spill.engine.cancel(2, 0.0);
   static_cast<void>(spill.engine.tick(spill.now));
   std::optional<double> wakeup = spill.engine.nextWakeupMilliseconds();
   require(!wakeup || *wakeup > spill.now, "the wait's end outlived its lanes: the engine asks to be woken at once");
@@ -304,10 +304,10 @@ void testAUnitsWaitRunsOutWithoutACommand() {
               " ticks that did nothing the engine asked to be woken at a time already past");
   // The wall goes and the copies land: the decoder goes on.
   spill.storage.budgetPages = 4'096;
-  spill.engine.cancel(2);
+  spill.engine.cancel(2, 0.0);
   spill.runUntil([&] { return spill.events.outputs[1].size() >= 400; },
                  "the decoder did not go on once its copies landed");
-  spill.engine.cancel(1);
+  spill.engine.cancel(1, 0.0);
   spill.runUntilIdle();
 }
 
@@ -325,8 +325,8 @@ void testAUnitsWaitCountsInItsPromptsTtft() {
   require(counted >= waitEnd - converted,
           "the prompt's TTFT counted " + std::to_string(counted) + " ms of its unit's " +
               std::to_string(waitEnd - converted) + " ms wait for the decoder");
-  spill.engine.cancel(1);
-  spill.engine.cancel(2);
+  spill.engine.cancel(1, 0.0);
+  spill.engine.cancel(2, 0.0);
   spill.runUntilIdle();
 }
 
@@ -803,7 +803,8 @@ bool namesTheMemoryShortfall(const std::string &message) {
 // A start alone that cannot spill and whose prompt memory does not hold now is refused at its start,
 // naming what memory and the SSD cache have for it, rather than start Resident and fail partway through
 // its prefill: kv_disk_quota for a short quota, capacity_exhausted for a closed tier, kv_write_budget
-// with the 6 hours until the budget covers what spilling requests were promised for a spent one.
+// with the 6 hours until the budget covers what spilling requests were promised for a spent one. The two
+// that cannot fit even alone say what they lacked and that fewer prompt tokens than its 65,473 fit.
 void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
   for (const Unspillable way : kUnspillable) {
     ShortOfBoth both(400ULL << 20);
@@ -815,9 +816,15 @@ void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
     const std::string code = way == Unspillable::Quota    ? "kv_disk_quota"
                              : way == Unspillable::Closed ? "capacity_exhausted"
                                                           : "kv_write_budget";
+    const CapacityLimit limit = way == Unspillable::Quota    ? CapacityLimit::DiskQuota
+                                : way == Unspillable::Closed ? CapacityLimit::ClosedDisk
+                                                             : CapacityLimit::None;
+    const CapacityShortfall capacity =
+        spill.events.capacities.empty() ? CapacityShortfall{} : spill.events.capacities.front();
     require(spill.events.failures == std::vector<std::string>{code} && spill.model.prefillChunks[1] == 0 &&
                 spill.events.retryAfters == std::vector<uint32_t>{way == Unspillable::WriteBudget ? 21'600U : 0U} &&
-                namesTheMemoryShortfall(message),
+                namesTheMemoryShortfall(message) && capacity.limit == limit &&
+                capacity.fitsTokens < (limit == CapacityLimit::None ? 1U : 65'473U),
             "a start alone that neither memory nor the SSD cache holds was not refused at its start naming both" +
                 unspillable(way) + failureDetail(spill.events));
   }
@@ -1275,8 +1282,8 @@ void testADeclinedQuotaRefusalKeepsItsScope() {
   // retry gets the quota.
   std::vector<uint64_t> tried;
   spill.model.beginObserver = [&] { tried.push_back(spill.model.lastBeginId); };
-  spill.engine.cancel(5);
-  spill.engine.cancel(1);
+  spill.engine.cancel(5, 0.0);
+  spill.engine.cancel(1, 0.0);
   spill.runUntil([&] { return !tried.empty(); }, "nothing started once the higher priority ended");
   require(tried == std::vector<uint64_t>{2, 3} && spill.events.failedCount == 0,
           "a declined quota refusal held back a Resident start, or let a Spill start be tried");
@@ -1327,8 +1334,8 @@ void testAResidentStartDoesNotHoldAQuotaWaitOpen() {
   require(spill.now <= startedAt + kResourceWaitTimeoutMilliseconds && !spill.events.usage.contains(3) &&
               spill.events.outputs.at(1).size() == held,
           "the wait did not expire at its limit, or the quota's holder ran meanwhile");
-  spill.engine.cancel(1);
-  spill.engine.cancel(3);
+  spill.engine.cancel(1, 0.0);
+  spill.engine.cancel(3, 0.0);
   spill.runUntilIdle();
   require(spill.committedSlots() == 0, "the quota was not returned");
 }
@@ -1378,7 +1385,7 @@ void testALaneHoldingCopiesHoldsAQuotaWaitOpen() {
           "a quota wait expired while a lane holding copies of active KV worked");
   require(spill.events.startIds == std::vector<uint64_t>{1, 3, 2} && mode(2) == KvMode::Spill,
           "the Spill start did not run once the lane holding the copies ended");
-  spill.engine.cancel(2);
+  spill.engine.cancel(2, 0.0);
   spill.runUntilIdle();
   require(spill.committedSlots() == 0, "the quota was not returned");
 }
@@ -1443,8 +1450,8 @@ void testAQuotaRefusalHoldsBackAStartRestoringUnheldCopies() {
   spill.cache.checkInvariants();
   require(started(2) < started(3) && spill.events.failedCount == 0,
           "the start held back did not start after the Spill start");
-  spill.engine.cancel(4);
-  spill.engine.cancel(2);
+  spill.engine.cancel(4, 0.0);
+  spill.engine.cancel(2, 0.0);
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.committedSlots() == 0, "the quota was not returned");
 }
@@ -1489,7 +1496,7 @@ void testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal() {
               spill.cache.spillSnapshot().heldBytes == 1'000,
           "a quota refusal held back a start whose chain's copies lanes hold already");
   for (const uint64_t id : {2, 3})
-    spill.engine.cancel(id);
+    spill.engine.cancel(id, 0.0);
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.committedSlots() == 0, "the quota was not returned");
 }
@@ -1578,7 +1585,7 @@ void testAQuotaRefusalReadsOnlyTheChainAStartKeeps() {
           "the starts did not wait on beside a chain the cache took");
   spill.model.beginGrowthBlocked = {};
   for (const uint64_t id : {1, 2, 3})
-    spill.engine.cancel(id);
+    spill.engine.cancel(id, 0.0);
   spill.runUntilIdle();
   require(spill.committedSlots() == 0, "the quota was not returned");
 }
@@ -1685,7 +1692,7 @@ void testWriteBudgetRefusalSaysWhenToRetry() {
               spill.events.retryAfters == std::vector<uint32_t>{21'600} &&
               spill.engine.snapshot().spill.refusedWriteBudget == 1,
           "the write budget's refusal did not say when a retry may succeed");
-  spill.engine.cancel(1);
+  spill.engine.cancel(1, 0.0);
   spill.runUntilIdle();
   require(spill.committedSlots() == 0, "the first request kept its commitment");
 }
@@ -1738,7 +1745,7 @@ void testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups() {
   require(counts.resident == 1 && counts.spill == 1 && spill.events.starts.back() == 0 &&
               spill.model.prefillChunks.at(2) == 2,
           "a Resident lane that took spilled blocks as it prefilled ran the rest a chunk a command");
-  spill.engine.cancel(1);
+  spill.engine.cancel(1, 0.0);
   spill.runUntilIdle();
 }
 
@@ -2380,7 +2387,7 @@ void testALoneLaneWaitsForTheChainANeighbourLeft() {
     if (restored)
       spill.model.decodeFinishes = true;
     else
-      spill.engine.cancel(2);
+      spill.engine.cancel(2, 0.0);
     spill.runUntilIdle();
     require(spill.events.failedCount == 0 && spill.events.outputs.contains(3),
             restored ? "a lone lane refused its floor failed while a finished neighbour's chain was written"
@@ -2747,7 +2754,7 @@ void testAJoinerHeldBackLeavesACommandItsPasses() {
                 std::to_string(passesOf(3, 0)) + " times");
     if (cancelled) {
       step();
-      spill.engine.cancel(3);
+      spill.engine.cancel(3, 0.0);
       require(spill.engine.snapshot().cancelled == 1, "a command's only lane cancelled between its passes stayed");
       for (uint32_t tick = 0; tick < 8; ++tick)
         step();
@@ -2961,7 +2968,7 @@ void testAPageWaitingForItsCopyHoldsBackNoneAfterIt() {
   require(held && spill.pool.form(*held) == kv::PageForm::Full &&
               spill.cache.spillSnapshot().spilledPages >= 9,
           "a page whose copy had not landed held back the pages after it");
-  spill.engine.cancel(1);
+  spill.engine.cancel(1, 0.0);
   for (uint32_t step = 0; step < 2000 && !idle(spill.engine); ++step) {
     static_cast<void>(spill.engine.tick(spill.now++));
     spill.tier.complete();
@@ -4643,7 +4650,7 @@ void testPlacementCountsTheChainItRestoresInMemory() {
     else
       require(counts.resident == 0 && counts.spill == 1, "a prompt with nothing cached started Resident beside room "
                                                           "for less than its projection");
-    spill.engine.cancel(2);
+    spill.engine.cancel(2, 0.0);
     spill.runUntilIdle();
   }
   {
@@ -4671,7 +4678,7 @@ void testPlacementCountsTheChainItRestoresInMemory() {
     const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
     require(counts.resident == 1 && counts.spill == 1 && counts.converted == 0,
             "a follow-up turn started Resident on the room its own chain's copies would free");
-    spill.engine.cancel(2);
+    spill.engine.cancel(2, 0.0);
     spill.runUntilIdle();
   }
 }

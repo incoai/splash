@@ -2,8 +2,8 @@
 
 // The options with which the native tools that load a model (the runtime
 // oracle, weight-digests, decode-profile and teacher-logits) stream parts of
-// its weights from their files, named as splash serve's, and what a load with
-// them holds.
+// its weights from their files and load its 16-bit projections, named as
+// splash serve's, and what a load with them holds.
 
 #include "model/ModelFactory.hpp"
 #include "model/ModelSizing.hpp"
@@ -43,10 +43,17 @@ namespace splash::tools {
 // parseBytes reads it, without the fraction (7.5G) and the spellings (7GB,
 // 7g) splash serve also takes. Unlike splash serve, which loads a part whole
 // where SIZE holds all of it, any SIZE streams. The expert store is SIZE
-// from the load on, all of it its floor, as splash serve's is.
-// Throws std::invalid_argument for a value that is not a size.
+// from the load on, all of it its floor, as splash serve's is. --weights
+// original|auto loads the target's 16-bit projections as splash serve's does.
+// Throws std::invalid_argument for a value that is not a size, or of
+// --weights, neither.
 [[nodiscard]] inline bool takeLoadOption(std::string_view option, std::string_view value,
                                          model::ModelLoadOptions &options) {
+  if (option == "--weights") {
+    if (value != "auto" && value != "original") throw std::invalid_argument("--weights takes original or auto");
+    options.weights = value == "auto" ? model::gguf::Float16Weights::Q8_0 : model::gguf::Float16Weights::Published;
+    return true;
+  }
   const bool experts = option == "--expert-memory";
   if (!experts && option != "--ple-memory") return false;
   const uint64_t bytes = parseBytes(value);
@@ -64,9 +71,11 @@ namespace splash::tools {
 // more than the part whole, which is all a store holds.
 [[nodiscard]] inline uint64_t weightBytes(const std::filesystem::path &root, const model::ModelDescriptor &descriptor,
                                           const model::ModelLoadOptions &options) {
-  const model::StreamableWeights streamable = model::streamableWeights(
-      root, descriptor,
-      {.streamExperts = options.expertMemoryBytes != 0, .streamTable = options.streamedTableBytes != 0});
+  const model::StreamableWeights streamable =
+      model::streamableWeights(root, descriptor,
+                               {.streamExperts = options.expertMemoryBytes != 0,
+                                .streamTable = options.streamedTableBytes != 0,
+                                .weights = options.weights});
   return streamable.loadedBytes + std::min(options.expertMemoryBytes, streamable.expertBytes) +
          std::min(options.streamedTableBytes, streamable.tableBytes);
 }

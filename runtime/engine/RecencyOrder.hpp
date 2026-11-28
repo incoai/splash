@@ -72,6 +72,16 @@ public:
     return CacheEvictionCandidate{order_.rbegin()->second, order_.rbegin()->first};
   }
 
+  // The member before `before` in the order, for a scan from the newest.
+  [[nodiscard]] std::optional<CacheEvictionCandidate>
+  previous(const CacheEvictionCandidate &before) const noexcept {
+    auto position = order_.lower_bound({before.lastUsed, before.id});
+    if (position == order_.begin())
+      return std::nullopt;
+    --position;
+    return CacheEvictionCandidate{position->second, position->first};
+  }
+
   [[nodiscard]] size_t size() const noexcept { return order_.size(); }
 
 private:

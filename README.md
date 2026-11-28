@@ -56,8 +56,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Reasoning follows the model default; `"reasoning_effort": "none"` turns it off
-in Chat. Anthropic Messages requests reason only when they set `thinking`.
-Some models decide for themselves whether to reason.
+in Chat. Anthropic Messages requests ask for reasoning with `thinking`.
+Flint and Inkling-2-Mini decide for themselves whether to reason: Inkling-2-Mini
+still reasons briefly when asked for none.
 [Reasoning settings](docs/server.md#default-reasoning-effort) ·
 [Tool calls](docs/api.md#tool-calls) ·
 [API details](docs/api.md)

@@ -108,7 +108,9 @@ void blockIndexReader() {
 // shared slice, which fills one tile per tileRows rows. A route takes a
 // grouped row, and the grouped input and intermediate hold the tileRows - 1
 // rows past them that a tile's matmul may read. The grouped input first holds
-// the router's fp32 scores, one row of 256 per token.
+// the router's fp32 scores, one row of 256 per token, and a narrow step's (at
+// most MOE_NARROW_ROWS rows) them alone: its gate/up pass reads its rows in
+// place.
 void checkMoe(splash::ops::MoeWorkspace workspace,
               splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
@@ -126,8 +128,9 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
               workspace.groupedRoutesBytes == routes * sizeof(uint32_t) &&
               workspace.routeRowsBytes == routes * sizeof(uint32_t) &&
               workspace.expertSlotsBytes == uint64_t{shape.experts} * sizeof(uint32_t) &&
-              workspace.groupedInputBytes == std::max(read * shape.hiddenSize * kBFloat16Bytes,
-                                                      uint64_t{rows} * kRouterScores * sizeof(float)) &&
+              workspace.groupedInputBytes ==
+                  std::max(rows <= MOE_NARROW_ROWS ? 0 : read * shape.hiddenSize * kBFloat16Bytes,
+                           uint64_t{rows} * kRouterScores * sizeof(float)) &&
               workspace.expertIntermediateBytes == read * shape.expertIntermediateSize * kBFloat16Bytes &&
               workspace.expertOutputBytes == routes * shape.hiddenSize * kBFloat16Bytes,
           "MoE workspace changed from baseline");
@@ -150,7 +153,9 @@ void moe() {
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto workspace = MoE::plan(shape, lanes * 8, {MoeExpertTile::M8}).workspace();
       checkMoe(workspace, shape, lanes * 8, 8);
-      require(workspace.groupedInputBytes <= lanes * single.groupedInputBytes &&
+      // The grouped rows, which a lane's narrow step reads in place but its
+      // passes write, are the intermediate's.
+      require(workspace.expertIntermediateBytes <= lanes * single.expertIntermediateBytes &&
                   workspace.tileDescriptorsBytes <=
                       lanes * single.tileDescriptorsBytes,
               "batched decode workspace exceeds per-lane allocation bound");
@@ -195,12 +200,13 @@ void sampling() {
     const auto workspace = DraftSelector::workspace(positions);
     const uint64_t count = positions;
     // Partial values carry the 16 x 16 edge table of every position behind
-    // the eight shard partials.
-    require(workspace.partialIdsBytes == count * 8 * 16 * 4 &&
-                workspace.partialValuesBytes == count * (8 + 16) * 16 * 4 &&
+    // the partials of the most shards a row takes (32: DraftSelector::shards
+    // picks 2 to 32 of them by the GPU's cores).
+    require(workspace.partialIdsBytes == count * 32 * 16 * 4 &&
+                workspace.partialValuesBytes == count * (32 + 16) * 16 * 4 &&
                 workspace.candidatesBytes == count * 16 * 4 &&
                 workspace.unaryBytes == count * 16 * 4,
-            "draft sampling workspace changed from the shipped 8-shard ABI");
+            "draft sampling workspace changed from the 32-shard ABI");
   }
   rejects([] { (void)Sampling::workspace(0); }, "invalid sampling workspace row count",
           "a sampling workspace of no rows was sized");

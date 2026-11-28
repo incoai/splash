@@ -82,6 +82,63 @@ void testUnifiedElasticBudget() {
           "memory status did not name the working-set margin");
 }
 
+// What the budget holds a lone request beside more than its lane's state is
+// its KV capacity less the speculative scratch beside nothing, and an extent's
+// tokens less beside an extent's bytes, windowed or not.
+void testTheContextBesideMoreIsTheCapacityLessWhatItTakes() {
+  ModelMemoryProfile windowed = model();
+  windowed.targetKvLayout = {49, 4, 128, kv::Format::Int8, 0, false, 512, 0xffffull};
+  for (const ModelMemoryProfile &profile : {model(), windowed}) {
+    const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
+    const EngineMemoryBreakdown &budget = plan.breakdown();
+    const uint64_t scratch = model::ExecutionLimits::speculativeScratchTokens;
+    require(plan.residentTokensBeside(0) == budget.kvCapacityTokens - scratch &&
+                plan.residentTokensBeside(budget.dynamicBudgetBytes) == 0,
+            "the context beside nothing is not the KV capacity less the scratch");
+    const uint64_t lessExtent = plan.residentTokensBeside(budget.kvExtentBytes + budget.kvExtentPages * 32 *
+                                                                                     model::kLookupIndexTokenBytes);
+    require(lessExtent < budget.kvCapacityTokens - scratch &&
+                lessExtent + uint64_t{budget.kvExtentPages} * 32 >= budget.kvCapacityTokens - scratch,
+            "the context beside an extent more is not an extent's tokens less: " + std::to_string(lessExtent) +
+                " of " + std::to_string(budget.kvCapacityTokens));
+  }
+}
+
+// The requests a budget runs at once beside one of its served context are the
+// lanes whose states fit beside that request's KV: all of them beside a short
+// context; fewer beside a tight budget's whole context, with the most context
+// and the fewest bytes more that hold one more, each just enough.
+void testTheRequestsRunAtOnceAreTheLanesWhoseStatesFitBesideOne() {
+  const EngineMemoryPlan roomy = test::requireMemoryPlan(device(), model());
+  const EngineMemoryBreakdown &automatic = roomy.breakdown();
+  EngineMemoryPlan tight = test::requireMemoryPlan(
+      device(), model(), automatic.minimumRequiredBytes + 3 * automatic.laneStateBytes + automatic.kvExtentBytes / 2);
+  for (EngineMemoryPlan *plan : {&tight}) {
+    const EngineMemoryBreakdown &budget = plan->breakdown();
+    const uint32_t width = budget.maximumBatchWidth;
+    require(plan->noteConcurrentRequests(256) == width && budget.moreRequestsBytes == 0 &&
+                budget.moreRequestsContextTokens == 0,
+            "a short context did not leave every lane its state");
+    const uint32_t served = plan->maximumContextTokens();
+    const uint32_t requests = plan->noteConcurrentRequests(served);
+    const uint64_t beside = uint64_t{requests} * budget.laneStateBytes;
+    require(requests >= 1 && requests < width && budget.concurrentRequests == requests &&
+                plan->residentTokensBeside(beside) < served &&
+                budget.moreRequestsContextTokens == plan->residentTokensBeside(beside) &&
+                plan->residentTokensBeside(beside - budget.moreRequestsBytes) >= served &&
+                plan->residentTokensBeside(beside - budget.moreRequestsBytes + 1) < served,
+            "a tight budget's whole context did not hold fewer requests than lanes, with what one more needs: " +
+                std::to_string(requests) + " of " + std::to_string(width) + ", " +
+                std::to_string(budget.moreRequestsBytes) + " bytes more, context " +
+                std::to_string(budget.moreRequestsContextTokens));
+    require(plan->noteConcurrentRequests(budget.moreRequestsContextTokens) > requests,
+            "the context named for one more request did not hold one more");
+    plan->noteConcurrentRequests(served);
+    require(test::jsonOf(*plan).find("\"concurrent_requests\":" + std::to_string(requests)) != std::string::npos,
+            "the status does not report the requests the budget runs at once");
+  }
+}
+
 void testBf16BudgetAndStatus() {
   auto profile = model();
   profile.targetKvLayout.format = kv::Format::BFloat16;
@@ -342,17 +399,13 @@ void testModelProvidedKvGeometry() {
           "model-provided Q8 geometry is missing from status");
 }
 
-// A layout whose pages give up their windowed layers' K/V past every window
-// sizes one request's KV by Slim pages beside the Full ones its lane keeps:
-// its window's, a command's and one more, a group's where the routed
-// experts stream. Flint's 49 layers of 4 heads of 128, 35 of them windowed
-// over 512 keys, so hold about 3.5 times the pages in Slim form, and the
-// status names the Slim page and the floor; a layout without a window plans
-// and reports as it did. An extent holds pages of one form: the capacity's
-// Full pages take a whole Full extent and the rest whole Slim ones, which
-// fit the budget with no room for another, where on the 12 GiB device the
-// pages priced one by one would take 72 MiB more than it has.
-void testWindowedKvCostsSlimPages() {
+// A windowed layout's request holds whole only its lane's floor of blocks, its window's 16, a prefill chunk's 64
+// and one more, 81 blocks of a base page and a window unit, and past them each block's base page: Flint's 49
+// layers of 4 heads of 128, 35 of them windowed over 512 keys, take pages of its 14 layers no window bounds, a
+// window unit of 3 pages (7 slots unused). One request's KV is priced so in whole extents, with each block's
+// tokens' lookup index; it holds more than three times the tokens of pages of every layer, the status names the
+// floor in window pages, and a streamed group's 256 pages make the floor's command.
+void testWindowedKvCostsItsFloorWhole() {
   constexpr uint64_t windowedLayers = [] {
     uint64_t layers = (uint64_t{1} << 48) - 4;
     for (uint32_t layer = 5; layer < 48; layer += 4)
@@ -367,28 +420,31 @@ void testWindowedKvCostsSlimPages() {
   const EngineMemoryPlan windowedPlan = test::requireMemoryPlan(device(), flint);
   const EngineMemoryBreakdown &budget = windowedPlan.breakdown();
   const EngineMemoryBreakdown full = test::requireMemoryPlan(device(), unwindowed).breakdown();
-  const uint64_t fullBytes = 1'655'808, slimBytes = 473'088, extent = 128;
   const uint64_t available = budget.dynamicBudgetBytes - budget.laneStateBytes;
-  const auto extents = [&](uint64_t pages) { return (pages + extent - 1) / extent; };
-  const uint64_t taken =
-      extents(81) * extent * fullBytes + extents(budget.kvCapacityPages - 81) * extent * slimBytes;
-  // With each page's tokens' lookup index on the host.
-  const uint64_t index = 32 * model::kLookupIndexTokenBytes, held = taken + budget.kvCapacityPages * index;
-  require(budget.kvPageBytes == fullBytes && budget.kvSlimPageBytes == slimBytes && budget.kvWindowFloorPages == 81 &&
-              budget.kvExtentPages == extent && (budget.kvCapacityPages - 81) % extent == 0 &&
-              held <= available && available - held < extent * (slimBytes + index) && budget.kvCapacityBytes == taken &&
-              budget.kvCapacityPages > 3 * full.kvCapacityPages,
-          "a windowed layout's KV capacity is not its lane's Full pages and the Slim extents beside them");
-  require(full.kvSlimPageBytes == 0 && full.kvWindowFloorPages == 0 &&
-              full.kvCapacityBytes == uint64_t{full.kvCapacityPages} * fullBytes,
-          "a layout without a window planned Slim pages");
-  require(test::jsonOf(windowedPlan).find("\"kv_window\":{\"slim_page_bytes\":473088,\"floor_pages\":81}") !=
-                  std::string::npos &&
+  const uint64_t index = 32 * model::kLookupIndexTokenBytes, floor = 81, unit = 3;
+  const uint64_t blocks = budget.kvCapacityPages - unit * floor;
+  const uint64_t held = uint64_t{budget.kvCapacityPages} * budget.kvPageBytes + blocks * index;
+  require(budget.kvPageBytes == 473'088 && budget.kvWindowFloorPages == unit * floor &&
+              budget.kvCapacityPages % budget.kvExtentPages == 0 &&
+              budget.kvCapacityBytes == uint64_t{budget.kvCapacityPages} * budget.kvPageBytes &&
+              budget.kvCapacityTokens == blocks * 32 && held <= available &&
+              available - held < uint64_t{budget.kvExtentPages} * (budget.kvPageBytes + index) &&
+              budget.kvCapacityTokens > 3 * full.kvCapacityTokens,
+          "a windowed layout's KV capacity is not its lane's floor of whole blocks and base pages past it, in whole "
+          "extents");
+  const uint64_t runway = model::ExecutionLimits::runwayPages(flint.targetKvLayout.minimumExtentPages(),
+                                                              budget.maximumBatchWidth, 1 + unit);
+  require(budget.minimumDynamicBytes ==
+                  budget.laneStateBytes + runway * budget.kvPageBytes + runway / (1 + unit) * index &&
+              budget.kvSmallestExtentPages == flint.targetKvLayout.minimumExtentPages(),
+          "a windowed runway's window pages were charged a lookup index, or its extent went unreported");
+  require(full.kvWindowFloorPages == 0 &&
+              test::jsonOf(windowedPlan).find("\"kv_window\":{\"floor_pages\":243}") != std::string::npos &&
               test::jsonOf(test::requireMemoryPlan(device(), unwindowed)).find("kv_window") == std::string::npos,
-          "the status did not name the Slim pages of a windowed layout alone");
+          "the status did not name a windowed layout's floor alone, in window pages");
   flint.commandPages = 256;
-  require(test::requireMemoryPlan(device(), flint).breakdown().kvWindowFloorPages == 273,
-          "a streamed group's pages were not kept Full");
+  require(test::requireMemoryPlan(device(), flint).breakdown().kvWindowFloorPages == unit * 273,
+          "a streamed group's pages did not make the floor's command");
 }
 
 // The pool's extents leave the fewest of the budget's pages unused, the size
@@ -704,7 +760,7 @@ void testEightLanesArePlannedAsEight() {
     const EngineMemoryBreakdown &a = four.breakdown(), &b = eight.breakdown();
     const uint32_t extent = target.layout.minimumExtentPages();
     const uint64_t runway =
-        (model::ExecutionLimits::runwayPages(extent, 8) - model::ExecutionLimits::runwayPages(extent, 4)) *
+        (model::ExecutionLimits::runwayPages(extent, 8, 1) - model::ExecutionLimits::runwayPages(extent, 4, 1)) *
         (target.layout.bytesPerModelPage() + kv::kPageTokens * model::kLookupIndexTokenBytes);
     require(a.maximumBatchWidth == 4 && b.maximumBatchWidth == 8 &&
                 b.fixedRuntimeBytes == a.fixedRuntimeBytes + kDecode + kPrefill &&
@@ -773,6 +829,159 @@ void testDenseExplicitContextStreamsExperts() {
   require(context(streamed.expertBytes, 12 * kGiB) >= 65'536 &&
               context(streamed.expertBytes + page, 12 * kGiB) < 65'536,
           "streaming experts did not keep exactly the first 64K tokens resident");
+}
+
+// A windowed target whose experts stream gets the KV its request asked for, in the layout's own extents, and the
+// experts take the rest: its capacity holds the requested context with its speculative rows, and less than one
+// extent of pages more.
+void testAWindowedRequestGetsItsKvAndTheExpertsTheRest() {
+  constexpr uint64_t windowedLayers = [] {
+    uint64_t layers = (uint64_t{1} << 48) - 4;
+    for (uint32_t layer = 5; layer < 48; layer += 4)
+      layers &= ~(uint64_t{1} << layer);
+    return layers;
+  }();
+  Target windowed = k35BQ2;
+  windowed.layout = {49, 4, 128, kv::Format::Int8, 0, false, 512, windowedLayers};
+  // Where the experts stream, a lane's floor holds a streamed group's command (RuntimeResources).
+  const uint32_t group = 4 * 2048 / kv::kPageTokens, floor = kvWindowFloorBlocks(windowed.layout, group);
+  for (const uint32_t context : {4'096u, 8'192u, 16'384u}) {
+    StreamedMemoryInputs tight = windowed.inputs(kM6);
+    tight.hardBudgetBytes = 12 * kGiB;
+    tight.requestedContextTokens = context;
+    const StreamedMemoryPlan plan = requirePlan(tight);
+    require(plan.expertBytes && plan.expertBytes < windowed.experts.allBytes,
+            "the windowed target's experts did not stream");
+    ModelMemoryProfile profile = windowed.profile(plan.expertBytes);
+    profile.commandPages = group;
+    const EngineMemoryBreakdown budget = test::requireMemoryPlan(deviceOf(kM6), profile, 12 * kGiB).breakdown();
+    const uint64_t blocks = pagesOf(context + SPLASH_SPECULATIVE_SCRATCH_TOKENS);
+    const uint64_t pages = kvBlockPages(windowed.layout, blocks, floor);
+    require(budget.kvCapacityTokens >= blocks * kv::kPageTokens && budget.kvCapacityPages >= pages &&
+                budget.kvCapacityPages < pages + 2 * uint64_t{budget.kvExtentPages},
+            "a windowed request did not get the KV it asked for in the layout's extents, or the experts left it more");
+  }
+}
+
+// The 48 GB Mac the harness checks Flint and Inkling-2-Mini on, capped.
+constexpr Mac k48g{"M5 Pro 48 GB", 48 * kGiB, 40'200'896'512, 32 * kGiB};
+
+// A windowed target at the cap and context its capped harness checks run with, one lane, as /status reports it
+// at 85015a6d: its images without the routed experts, its arenas, lane state and KV layout, its experts in their
+// slots, a cached state's bytes and the expert store's slot.
+struct CappedTarget final {
+  Target target;
+  uint64_t capMiB;
+  uint32_t context;
+  uint64_t stateBytes, slotBytes;
+
+  // The stores' plan at `capBytes` with cached states of `stateBytes`, and the engine's beside its store of
+  // exactly the bytes planned, no slot's rounding left over: nullopt where either refuses, with why.
+  [[nodiscard]] std::pair<StreamedMemoryResult, std::optional<EngineMemoryBreakdown>>
+  planned(uint64_t capBytes, uint64_t states, std::string &refusal) const {
+    StreamedMemoryInputs inputs = target.inputs(k48g);
+    inputs.hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(k48g.workingSet, capBytes, k48g.memory);
+    inputs.requestedContextTokens = context;
+    inputs.lanes = 1;
+    inputs.cachedStateBytes = states;
+    StreamedMemoryResult result = planStreamedMemory(inputs);
+    if (!result.plan) {
+      refusal = result.error;
+      return {std::move(result), std::nullopt};
+    }
+    ModelMemoryProfile profile = target.profile(result.plan->expertBytes);
+    profile.commandPages = 4 * 2048 / kv::kPageTokens;
+    profile.footprint.cachedStatesBytes = result.plan->cachedStatesBytes;
+    const EngineMemoryPlanResult engine = evaluateEngineMemoryPlan(deviceOf(k48g), profile, capBytes);
+    if (!engine.plan) {
+      refusal = engine.status.message;
+      return {std::move(result), std::nullopt};
+    }
+    return {std::move(result), engine.plan->breakdown()};
+  }
+};
+
+constexpr uint64_t kFlintWindowed = [] {
+  uint64_t layers = (uint64_t{1} << 48) - 4;
+  for (uint32_t layer = 5; layer < 48; layer += 4)
+    layers &= ~(uint64_t{1} << layer);
+  return layers;
+}();
+const CappedTarget kFlint{
+    {"flint-mixed-3-4bit", 1'290'059'776, 338'116'608, 0, {44'302'336, 643'776'512, 47'972'352, 1},
+     {44'302'336, 643'776'512, 47'972'352, 1}, 0,
+     kv::Layout{49, 4, 128, kv::Format::Int8, 0, false, 512, kFlintWindowed}, 262'144,
+     {.allBytes = 12'032 * 1'376'256ull, .minimumBytes = 2 * kGiB}, {}, std::nullopt},
+    18'674, 4'096, 2'359'296, 1'376'256};
+const CappedTarget kInkling2Mini{
+    {"Inkling-2-Mini", 1'829'076'992, 428'015'616, 639'844'352, {48'431'104, 1'154'072'576, 66'699'264, 1},
+     {48'431'104, 1'154'072'576, 66'699'264, 1}, 0,
+     kv::Layout{48, 8, 128, kv::Format::Int8, 0, false, 1'023, 0x7DF7DF7DF7DFull}, 1'010'000,
+     {.allBytes = 3'072 * 5'016'907ull, .minimumBytes = 2 * kGiB}, {}, std::nullopt},
+    19'222, 8'192, 4'571'136, 5'016'907};
+
+// A windowed target whose experts stream keeps room for cached states beside its exact K/V: as many as its
+// capacity holds the tails of (a tail is the window units of a state's window of blocks), taken from the
+// experts, so that the pool's last extent lands with them held. Without the room the plan left 1,537,008 bytes
+// past Flint's lane state and K/V at 18674M, less than one state of 2,359,296: the K/V reached its capacity
+// only with no cached state held, and a held state kept its third extent of 121,110,528 bytes out
+// (conv:left+nossd@on). The K/V capacity, the context and the floors do not move; the experts give the room.
+// Flint's 768 pages hold 16 tails of 16 blocks' 3 window pages, Inkling's 1,600 pages 10 of 32 blocks' 5.
+void testCachedStatesKeepTheirRoomBesideAnExactKv() {
+  for (const auto &[capped, states, capacityPages] : {std::tuple{kFlint, 16u, 768u}, {kInkling2Mini, 10u, 1'600u}}) {
+    const Target &target = capped.target;
+    std::string refusal;
+    const auto [result, budget] = capped.planned(capped.capMiB * kMiB, capped.stateBytes, refusal);
+    const auto [without, today] = capped.planned(capped.capMiB * kMiB, 0, refusal);
+    require(result.plan && budget && without.plan && today, std::string(target.name) + " refused: " + refusal);
+    const StreamedMemoryPlan &plan = *result.plan;
+    const uint64_t room = states * capped.stateBytes;
+    require(plan.expertBytes && plan.expertBytes < target.experts.allBytes && budget->kvCapacityPages == capacityPages &&
+                capacityPages / (target.layout.windowPages() * target.layout.windowUnitPages()) == states,
+            std::string(target.name) + ": the plan is not the one /status reports, or its tails are miscounted");
+    require(plan.cachedStatesBytes == room && budget->cachedStatesBytes == room &&
+                budget->dynamicBudgetBytes >= budget->laneStateBytes + budget->kvCapacityBytes + room,
+            std::string(target.name) + ": the K/V reaches its capacity only with fewer cached states held than its "
+                                       "capacity holds the tails of");
+    require(budget->kvCapacityPages == today->kvCapacityPages && budget->kvCapacityTokens == today->kvCapacityTokens &&
+                budget->contextBounds.resident == today->contextBounds.resident &&
+                without.plan->expertBytes - plan.expertBytes == room && !without.plan->cachedStatesBytes,
+            std::string(target.name) + ": the states' room moved the K/V or the context, or took other than itself "
+                                       "from the experts");
+  }
+  // Without a window a state pins no K/V: no room.
+  require(!kvCachedStates(k35BQ2.layout, 4'096), "a layout without a window kept room for cached states");
+}
+
+// A streamed request's allowance buys the capacity its requested context needs as the engine's plan finds it,
+// its lookup index priced as that plan prices it (kvPagesCost): the context served is at least the one
+// requested by construction, with no slack from the store's rounding to its slots. Priced for the blocks of
+// its budget pages instead, Inkling-2-Mini's allowance at 19222M fell a share of a block's index short of the
+// 1,600 pages it was to buy: the engine's plan found 1,599, whose largest whole extents are 1,536 pages, 8,192
+// tokens, a context of 8,177 against the 8,192 requested. At every cap a store's slot apart from 300 MiB below
+// to 300 MiB above each target's capped setting, the plan either refuses, saying what fits, or serves at least
+// the requested context.
+void testAStreamedRequestIsServedTheContextItAsked() {
+  for (const CappedTarget &capped : {kFlint, kInkling2Mini}) {
+    const uint64_t setting = capped.capMiB * kMiB;
+    uint32_t served = 0, refused = 0;
+    for (uint64_t cap = setting - 300 * kMiB; cap <= setting + 300 * kMiB; cap += capped.slotBytes) {
+      std::string refusal;
+      const auto [result, budget] = capped.planned(cap, capped.stateBytes, refusal);
+      if (!budget) {
+        require(!refusal.empty(), std::string(capped.target.name) + " refused a cap without saying what fits");
+        ++refused;
+        continue;
+      }
+      require(budget->contextBounds.maximum() >= capped.context,
+              std::string(capped.target.name) + " at " + std::to_string(cap) + " bytes serves " +
+                  std::to_string(budget->contextBounds.maximum()) + " tokens of the " + std::to_string(capped.context) +
+                  " requested");
+      ++served;
+    }
+    require(served > 100, std::string(capped.target.name) + " served too few caps of the sweep to judge it");
+    (void)refused;
+  }
 }
 
 // The 35B's context never shrinks as the budget grows: its experts load
@@ -1275,6 +1484,8 @@ void testDeviceValidationMessageNamesWhatTheMacHas() {
 int main() {
   try {
     testUnifiedElasticBudget();
+    testTheContextBesideMoreIsTheCapacityLessWhatItTakes();
+    testTheRequestsRunAtOnceAreTheLanesWhoseStatesFitBesideOne();
     testBf16BudgetAndStatus();
     testStateFormatStatus();
     testMinimumHoldsTheWarmupRunway();
@@ -1287,7 +1498,7 @@ int main() {
     testHardBudgetBoundaries();
     testTheAutomaticBudgetLeavesATenthUnwired();
     testModelProvidedKvGeometry();
-    testWindowedKvCostsSlimPages();
+    testWindowedKvCostsItsFloorWhole();
     testExtentSizeFollowsThePool();
     testHotBlockCacheIsDefinedOnce();
     testFlashNextOnTheThreeMacs();
@@ -1297,6 +1508,9 @@ int main() {
     testEightLanesArePlannedAsEight();
     testDenseExplicitContextKeepsMainsExperts();
     testDenseExplicitContextStreamsExperts();
+    testAWindowedRequestGetsItsKvAndTheExpertsTheRest();
+    testCachedStatesKeepTheirRoomBesideAnExactKv();
+    testAStreamedRequestIsServedTheContextItAsked();
     testDense35BContextGrowsWithTheBudget();
     testArenasFollowWhatStreams();
     testOverridesAndRefusals();

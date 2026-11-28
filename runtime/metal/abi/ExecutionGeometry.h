@@ -52,11 +52,6 @@
 // SPLASH_ATTENTION_MAXIMUM_SPLITS history splits (ops::PagedAttention).
 #define SPLASH_ATTENTION_TILE_ROWS 8u
 #define SPLASH_ATTENTION_MAXIMUM_SPLITS 128u
-// Draft attention deals the live ring tiles of one (lane, KV head)
-// round-robin to this many groups, the last of which also attends the eight
-// current rows. Fixed rather than derived from the GPU so the combine order,
-// and with it the rounding, is the same on every machine and lane count.
-#define SPLASH_DRAFT_ATTENTION_SPLITS 4u
 #define SPLASH_TARGET_SAMPLING_SHARDS 16u
 // Threads of each group that selects a sampled row over the whole
 // vocabulary (decode_sample_vocabulary*); a bracket of at most this many
@@ -69,7 +64,11 @@
 // the row's groups.
 #define SPLASH_TARGET_VOCABULARY_RANGES                                    \
   (SPLASH_TARGET_VOCABULARY_GROUPS * (SPLASH_TARGET_VOCABULARY_THREADS / 32u))
-#define SPLASH_DRAFT_SAMPLING_SHARDS 8u
+// The most shards a draft proposal row's top-16 takes (SelectorBatchParams,
+// ops::DraftSelector::shards). The merge's simdgroup holds each shard's
+// sixteen in 32 / shards lanes, so a row's shards are a power of two from 2
+// to this.
+#define SPLASH_DRAFT_SAMPLING_MOST_SHARDS 32u
 // Candidates the draft selector keeps per proposal position; acceptance and
 // the sampled draw read them.
 #define SPLASH_DRAFT_CANDIDATES 16u

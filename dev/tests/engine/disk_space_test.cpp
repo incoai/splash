@@ -225,7 +225,7 @@ void testMeasureOfRealFiles() {
               diskLimitBytes(kQuota, volume->availableBytes,
                              space.heldBytes(), diskFloorBytes(volume->sizeBytes)),
           "the limit is not the rule's of what the measure read");
-  require(budget->admits(false) && !budget->writeBudgetBytes() && !budget->admitsAgainAt(),
+  require(budget->admits() && !budget->writeBudgetBytes() && !budget->admitsAgainAt(),
           "a measure set a write budget nobody asked for");
 
   budget->reportFull();

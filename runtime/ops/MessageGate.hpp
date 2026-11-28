@@ -9,15 +9,19 @@
 // read it, into their bf16 input. Its three projections are float segments.
 // A call of up to kMaximumGates gates runs them fused, in kernels that read
 // the weights themselves (metal/abi/MessageGate.h): a decode step's rows at
-// most (kFusedRows) in three kernels, each row normalized once for its down
-// projection, more rows, a prompt chunk's, in one tiled kernel, a tile of
-// rows a threadgroup. They take weights of F32 or BF16
+// most (kFusedRows) in two kernels, from x's and the messages' rows
+// normalized for its down projection, which the mixes writing them wrote
+// beside them (readsNormalized), more rows, a prompt chunk's, in one tiled
+// kernel, a tile of rows a threadgroup, which normalizes its own. They take
+// weights of F32 or BF16
 // rows, all of a call's of one format, a rank of 8 to MESSAGE_GATE_MAXIMUM_RANK
 // in runs of 8 and a hidden of whole 64-value steps, x and the messages in
 // whole float4s, and add refuses any other call (requireWeights says why).
 // Inkling-2-Mini's gates are such rows whatever their checkpoint holds: its
-// loaders keep F32 and BF16 tensors as stored and decode a quantized or F16
-// one, as some GGUFs keep the gates, to F32 (FloatTensor sections,
+// loaders keep F32 and BF16 tensors as stored, an F32 one of BF16's values as
+// BF16 (the same outputs bit for bit at half the bytes,
+// gguf::PlanOptions::exactlyBfloat16), and decode a quantized or F16 one, as
+// some GGUFs keep the gates, to F32 (FloatTensor sections,
 // model/GgufImage.hpp), and its target checks a layer's at load. The gates'
 // reference path, a gate's normalization, its projections through the float
 // tile and its norm, which rounds at the same points as these kernels and
@@ -55,19 +59,24 @@ struct MessageGateInput final {
 };
 
 // The rows a call's gates read: x and the messages, fp32 rows of a stride (a
-// mix's output of several queries, the messages of four); and its scratch. A
-// decode step's rows: the normalized concatenations, bf16
-// [gates][rows][2 hidden], and then over the same bytes the gated rows, fp32
-// [gates][rows][hidden] (forget), the rank values, bf16 [gates][rows][rank]
-// (low), the groups' partial sums (gain) and the counters, one a group of
-// MESSAGE_GATE_GROUP_ROWS rows a gate, zero before and after (kCountersBytes
-// for the most). More rows: the gated rows, fp32 [rows][hidden], of gate 0 in
-// forget, of gate 1 in gain and of gate 2 in concat.
+// mix's output of several queries, the messages of four); a call of at most
+// kFusedRows rows also each of their rows RMS-normalized without weights,
+// bf16 rows of the same strides (normalizedX, normalizedMessage), which the
+// mixes writing them write beside them (ops::BlockResidualMixInput); and its
+// scratch. A decode step's rows: the gated rows, fp32 [gates][rows][hidden]
+// (forget), the rank values, bf16 [gates][rows][rank] (low), the groups'
+// partial sums (gain) and the counters, one a group of rows a gate
+// (groupRows), zero before and after (kCountersBytes for the most); concat
+// unread. More rows: the gated rows, fp32
+// [rows][hidden], of gate 0 in forget, of gate 1 in gain and of gate 2 in
+// concat; the normalized rows unread.
 struct MessageGateBuffers final {
   metal::MetalBuffer x;
   uint32_t xStride = 0;
   metal::MetalBuffer message;
   uint32_t messageStride = 0;
+  metal::MetalBuffer normalizedX;
+  metal::MetalBuffer normalizedMessage;
   metal::MetalBuffer concat;
   metal::MetalBuffer low;
   metal::MetalBuffer forget;
@@ -85,6 +94,17 @@ struct MessageGate final {
   static constexpr uint64_t kCountersBytes = uint64_t{kMaximumGates} *
                                              ((kFusedRows + MESSAGE_GATE_GROUP_ROWS - 1) / MESSAGE_GATE_GROUP_ROWS) *
                                              sizeof(uint32_t);
+  // The rows of a decode step's groups of a call of `rows` rows: the least
+  // power of two that holds them, up to MESSAGE_GATE_GROUP_ROWS.
+  [[nodiscard]] static constexpr uint32_t groupRows(uint32_t rows) noexcept {
+    uint32_t group = 1;
+    while (group < rows && group < MESSAGE_GATE_GROUP_ROWS) group *= 2;
+    return group;
+  }
+  // Whether a call of `rows` rows reads x's and the messages' rows
+  // normalized (MessageGateBuffers::normalizedX, normalizedMessage): one the
+  // decode step's kernels run, which a decode step's every call is.
+  [[nodiscard]] static constexpr bool readsNormalized(uint32_t rows) noexcept { return rows <= kFusedRows; }
   // The gated rows of `rows` rows of `hidden` values, each gate's through its
   // norm into its output. The projections reading the outputs prepare their
   // own tables, so the scratch describes nothing. Throws for a call the fused

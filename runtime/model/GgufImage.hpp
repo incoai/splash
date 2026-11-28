@@ -86,8 +86,8 @@ struct TensorScale {
 // tensor's tensors (safetensors.codes or safetensors.bfloat16 set), from
 // llama.cpp's NVFP4 rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long
 // from `offset` on) or by building a tensor of BF16 or F16 values, a GGUF's
-// or a safetensors checkpoint's, into Q8_0 or, exactly, MXFP8
-// (float16RowBytes set: rows of float16Type values that long from `offset`
+// or a safetensors checkpoint's, into Q8_0 or, exactly, MXFP8 (float16Planes;
+// float16RowBytes set: rows of float16Type values that long from `offset`
 // on). An image row is column window `window` of `windows` equal windows of
 // such a row, whole native blocks: its imageRowBytes() bytes from
 // window * imageRowBytes() on (a shared expert's down projection split into
@@ -200,22 +200,89 @@ struct Image {
   std::optional<StreamedRows> streamedRows;
 };
 
+// How the BF16 and F16 matrices the projection kernels read load (splash
+// serve --weights), from a GGUF or a safetensors checkpoint alike: as the
+// Q8_0 the reference GGUF quantization makes of their values
+// (quantize_row_q8_0_ref), as 1.7.3 loaded them, which --weights auto asks
+// for, or as their files store them, which --weights original does. Every decode
+// cycle reads a projection whole, and Q8_0 holds a value in 1.06 bytes where
+// a 16-bit plane takes 2.02.
+enum class Float16Weights : uint8_t { Q8_0, Published };
+
 // How a target's images are planned: with streamExperts, every MoE layer's
 // routed experts stream (Image::experts) instead of loading with it; with
 // streamTable, the rows of a table the family's GGUF holds after the
 // embedding (Qwen3.8-Flash-Next's PLE n-gram table) stream
-// (Image::streamedRows) instead of loading as its image. exactlyMxfp8 tells
-// whether a tensor of `values` BF16 or F16 values (`type`) at data offset
-// `offset` of `file`, a GGUF's or a checkpoint's, holds MXFP8's values
-// exactly (mxfp8Block), as a release's MXFP8 weights widened do: a start's
-// sizing and loader read them to tell (model/GgufPreparation.hpp
-// exactlyMxfp8), and without it the planner, which reads the header alone,
-// takes no tensor to.
+// (Image::streamedRows) instead of loading as its image; `weights` is how
+// 16-bit projections load (weightForm). exactlyMxfp8 tells whether a tensor
+// of `values` BF16 or F16 values (`type`) at data offset `offset` of `file`,
+// a GGUF's or a checkpoint's, holds MXFP8's values exactly (mxfp8Block), as a
+// release's MXFP8 weights widened do, and exactlyBfloat16 whether a tensor of
+// `values` F32 values holds BF16's values alone, as a BF16 release's float
+// tensors that a GGUF or MLX conversion writes as F32 do: a start's sizing
+// and loader read them to tell (model/GgufPreparation.hpp readingValues), and
+// without them the planner, which reads the header alone, takes no tensor to.
 struct PlanOptions {
   bool streamExperts = false;
   bool streamTable = false;
+  Float16Weights weights = Float16Weights::Published;
   std::function<bool(const WeightSource &file, uint64_t offset, uint64_t values, uint32_t type)> exactlyMxfp8{};
+  std::function<bool(const WeightSource &file, uint64_t offset, uint64_t values)> exactlyBfloat16{};
 };
+
+// The kernels that read a weight: the projection kernels, from planes
+// (projections, routed experts, heads), or a float kernel, from rows (the
+// float projection's routers, message gates, sink and small projections and
+// GDN alpha and beta, which widen BF16 rows to the fp32 values F32 rows hold).
+enum class WeightReader : uint8_t { Planes, FloatKernel };
+
+// The forms a weight loads in: as its file stores it, or built from its
+// values (by the writer, TensorRows::float16RowBytes and
+// Conversion::NarrowToBfloat16).
+enum class WeightForm : uint8_t { Stored, Mxfp8, Q8_0, Bfloat16 };
+
+// The form a weight of `type` that `reader` reads loads in: the one rule both
+// planners take every weight's form from (float16Planes, floatKernelType), in
+// order:
+// - BF16 or F16 values MXFP8 holds exactly (`exactMxfp8`, a routed experts'
+//   tensor's, PlanOptions::exactlyMxfp8): MXFP8, lossless at half the bytes;
+// - other BF16 or F16 values the projection kernels read: Q8_0, the reference
+//   GGUF quantization of the values, or as stored, as `weights` (--weights)
+//   says;
+// - F32 values a float kernel reads, every one a BF16 value (`exactBfloat16`,
+//   PlanOptions::exactlyBfloat16): BF16, lossless at half the bytes, the same
+//   outputs where the tile is unchanged (selectFloatTile takes the neural
+//   accelerator's tile from 3 half tiles a core for BF16 rows against 4 for
+//   F32, so some prefill chunks change tile);
+// - anything else as stored.
+// The two exact forms lose nothing, so they hold under either `weights`.
+[[nodiscard]] WeightForm weightForm(uint32_t type, WeightReader reader, Float16Weights weights, bool exactMxfp8,
+                                    bool exactBfloat16) noexcept;
+
+// The rows the planes of a matrix the projection kernels read take of its
+// BF16 or F16 values, `stored` (every row of the tensor as stored), planes of
+// `columns` inputs, their type the planes' format's: of routed experts
+// (`experts`, a stack of them or one expert's module) whose values MXFP8
+// holds exactly (options.exactlyMxfp8, which reads them), MXFP8's native
+// rows, lossless at half the bytes, whatever options.weights says; else, by
+// options.weights, Q8_0's, the reference GGUF quantization of the values, or
+// the values as stored in the 16-bit form whose blocks tile the planes' rows
+// (quant_float16_form), the form weightForm gives them. The writer builds
+// MXFP8's and Q8_0's native rows from the values
+// (TensorRows::float16RowBytes). Both planners take every 16-bit
+// projection's, expert's and head's planes from here, and nothing else
+// (routers, gates, norms, sinks, tables) reaches it.
+[[nodiscard]] TensorRows float16Planes(TensorRows stored, uint64_t columns, bool experts, const PlanOptions &options);
+
+// The type of the rows a float kernel reads of a weight of `type`, `values`
+// values at data offset `offset` of `file`, by weightForm: BF16 where they
+// are F32 values that are every one a BF16 value (`options.exactlyBfloat16`,
+// which reads them, where given), else `type`. Both planners take every float
+// kernel's weight's type from here (routers, message gates, sink and small
+// projections, GDN alpha and beta); the writer narrows such F32 rows as it
+// copies them (Conversion::NarrowToBfloat16).
+[[nodiscard]] uint32_t floatKernelType(uint32_t type, const PlanOptions &options, const WeightSource &file,
+                                       uint64_t offset, uint64_t values);
 
 // The MXFP8 native block of 32 values (metal/abi/QuantFormat.h: an E8M0
 // exponent e, then 32 E4M3 bytes, each value 2^(e - 127) e4m3) into `block`,
@@ -230,6 +297,13 @@ struct PlanOptions {
 [[nodiscard]] std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers);
 // The bytes an image takes once loaded: none for a table whose rows stream.
 [[nodiscard]] uint64_t loadedBytes(const Image &image);
+// Each tensor an image holds and the format it loads in, one sorted line
+// each: a repack's sources, format and shape, its routed experts' whether
+// they stream or not, and a copy's source, rows and the type it writes. Its
+// record names them (WeightFileRecord::formats), so that a build loading a
+// source in other formats never shares another's persistent cache, while
+// --expert-memory and a streamed table change nothing.
+[[nodiscard]] std::string imageFormats(const Image &image);
 
 // The destination bytes of `sourceBytes` bytes of rows copied with
 // `conversion`: halved when narrowed, doubled when widened (and for the decay

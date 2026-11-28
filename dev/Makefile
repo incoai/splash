@@ -185,8 +185,9 @@ EXACT_STATES_MODEL ?= mlx-community/Qwen3.8-27B-4bit
 # is compared with it on this machine in ABBA order, and so are their weight
 # images (dev/benchmarks/backend_regression.py). Without it, the release
 # scenarios characterize this build alone. ANE_FFN_SHARE, in [0, 1), is the
-# prefill FFN's Neural Engine share every benchmark runs instead of
-# calibrating one (0: the GPU alone).
+# prefill FFN's Neural Engine share every benchmark runs, rounded to whole
+# channel units, instead of the one this build's start calibrates before the
+# rounds (0: the GPU alone).
 BASELINE ?=
 ANE_FFN_SHARE ?=
 ANE_FFN_SHARE_ARGS = $(if $(ANE_FFN_SHARE),--ane-ffn-share "$(ANE_FFN_SHARE)",)

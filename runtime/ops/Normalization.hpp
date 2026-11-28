@@ -1,8 +1,10 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/Normalization.h"
 #include "ops/Linear.hpp"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -26,6 +28,31 @@ struct NormWeights final {
 // `name`_f32 for F32. Throws unless the buffer holds `width` multipliers.
 [[nodiscard]] std::string normKernel(std::string_view name, const NormWeights &weights,
                                      uint32_t width);
+
+// A producer's RMS norm epilogue (kernels/common/rms_norm_epilogue.h): the
+// weighted RMS norm, with `weights`, of the bf16 rows a projection or combine
+// writes, which the last of its output tiles to finish writes into `output`
+// (bf16 rows, as addRms writes them): the norm's dispatch fewer. `partials`
+// and `counter` are its scratch, which a step's dispatches share one after
+// another: a float a tile and row, and a counter at zero before and after.
+struct RmsNormEpilogue final {
+  NormWeights weights;
+  metal::MetalBuffer output;
+  metal::MetalBuffer partials;
+  metal::MetalBuffer counter;
+
+  // The bytes of the partials of `tiles` tiles of `rows` rows, and of the
+  // counter.
+  [[nodiscard]] static constexpr uint64_t partialsBytes(uint32_t tiles, uint32_t rows) noexcept {
+    return uint64_t{tiles} * rows * sizeof(float);
+  }
+  static constexpr uint64_t kCounterBytes = sizeof(uint32_t);
+  // The parameters of a producer of `tiles` output tiles of `rows` rows of
+  // `width` values, each buffer checked to hold them; throws otherwise.
+  [[nodiscard]] RmsNormEpilogueParams params(uint32_t rows, uint32_t width, uint32_t tiles) const;
+  // Its bindings, in the kernels' order: partials, counter, weights, output.
+  [[nodiscard]] std::array<metal::MetalBuffer, 4> bindings() const { return {partials, counter, weights.buffer, output}; }
+};
 
 // A LayerNorm's bf16 weight and bias of every column.
 struct LayerNormWeights final {

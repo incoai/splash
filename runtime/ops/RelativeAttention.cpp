@@ -19,12 +19,45 @@ constexpr uint32_t kMaximumSequences = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kGroup = RelativeAttention::kQueryHeads / RelativeAttention::kKvHeads;
 constexpr uint32_t kStates = SPLASH_RELATIVE_ATTENTION_STATES;
 static_assert(SPLASH_ATTENTION_TILE_PARTS(kGroup) == 1, "a group of three runs whole tiles");
-static_assert(SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS == 2 * kv::kAttentionTileRows &&
-                  SPLASH_TARGET_KV_BLOCK_TOKENS % SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS == 0,
-              "a direct tile is two of the paged attention's, whole within a staged stride");
+// The rows past the last KV head's staged rows whose queries a direct tile
+// may multiply: the 64 fused rows of a tile of
+// SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS, from a tile of whole rows within
+// the chunk, reach at most SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS + 1 rows
+// past the chunk's last (a tile of SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS_R16,
+// whole matmul rows, none).
+constexpr uint32_t kDirectQueryRows = SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS + 1;
+static_assert(SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS * kGroup <= 64 &&
+                  SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS * kGroup > 64 - kGroup,
+              "a direct tile's fused rows fill the 64 a tile's softmax holds as nearly as whole rows can");
+static_assert(SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS_R16 == 2 * kv::kAttentionTileRows,
+              "a narrow direct tile is two of the paged attention's tiles");
+
+// The tile shapes relative_attention.metal compiles, which each family's row
+// (KernelCalibration.hpp) chooses among: direct tiles of either height that
+// rescale every row; the split's and a narrow lane's tiles of one paged
+// tile's fused rows that bound their rescale; a verify block's lanes' of
+// two, in both forms (the single pass's _r16 and _r16_unbounded).
+constexpr uint32_t matmulRows(uint32_t fused) { return (fused + 7) / 8 * 8; }
+constexpr bool compiledShapes(const AttentionCalibration &row) {
+  return (row.directRows == SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS ||
+          row.directRows == SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS_R16) &&
+         matmulRows(row.directRows * kGroup) > row.boundedRescaleRows &&
+         kv::kAttentionTileRows * kGroup <= row.boundedRescaleRows;
+}
+static_assert(compiledShapes(kApple10Attention) && compiledShapes(kApple9Attention) &&
+                  compiledShapes(kApple9SmallAttention),
+              "a family's row chooses relative attention tiles the kernels compile");
 
 void requireLayout(kv::Layout layout) {
   if (!RelativeAttention::stores(layout)) throw std::invalid_argument("no relative attention kernel for layout");
+}
+
+// The most history splits a decode lane's tile of `laneCap` rows repays
+// alone (RelativeAttention::decodeMostSplits): (cores + 16) / 3 of a narrow
+// cap's tile, (cores + 8) / 4 of a verify block's, which also bounds a short
+// history's one split a page (decodeSplits).
+uint64_t laneAloneSplits(uint32_t laneCap, uint32_t cores) {
+  return laneCap > kv::kAttentionTileRows ? (uint64_t{cores} + 8) / 4 : (uint64_t{cores} + 16) / 3;
 }
 
 // A layout's KV path commit kernel.
@@ -70,9 +103,8 @@ metal::DispatchSize RelativeAttentionPlan::reduceGroups(const Dispatch &dispatch
   return {layout.kvHeads, kv::kAttentionTileRows * kGroup, dispatch.tiles};
 }
 
-uint32_t RelativeAttentionPlan::directTiles(const Sequence &sequence) noexcept {
-  return (sequence.rows - sequence.firstTile * kv::kAttentionTileRows + SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS - 1) /
-         SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS;
+uint32_t RelativeAttentionPlan::directTiles(const Sequence &sequence) const noexcept {
+  return (sequence.rows - sequence.firstTile * kv::kAttentionTileRows + directRows_ - 1) / directRows_;
 }
 
 metal::DispatchSize RelativeAttentionPlan::directGroups(const Dispatch &dispatch) const noexcept {
@@ -90,7 +122,8 @@ RelativeAttentionStagingBytes RelativeAttention::stagingBytes(std::span<const kv
                                                               kv::Layout layout) {
   requireLayout(layout);
   const uint64_t fused = commandRows(sequences, layout).staged * kGroup;
-  return {fused * kHeadDimension * 2, fused * kStates * sizeof(float), fused * sizeof(float)};
+  return {(fused + uint64_t{kDirectQueryRows} * kGroup) * kHeadDimension * 2, fused * kStates * sizeof(float),
+          fused * sizeof(float)};
 }
 
 AttentionWorkspace RelativeAttention::workspace(uint32_t slots, kv::Layout layout) {
@@ -102,7 +135,7 @@ AttentionWorkspace RelativeAttention::workspace(uint32_t slots, kv::Layout layou
 RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefillParams> sequences,
                                               kv::Layout layout, const AttentionCalibration &calibration,
                                               Int8Activations int8Activations, AttentionWorkspace capacity,
-                                              RelativeAttentionVariant variant, StepKind step) {
+                                              RelativeAttentionVariant variant, StepKind step, uint32_t laneRows) {
   requireLayout(layout);
   requireVariant(variant);
   static_cast<void>(commandRows(sequences, layout));
@@ -125,14 +158,16 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
   const uint64_t slots = std::min(capacity.partialsBytes / slot.partialsBytes,
                                   capacity.statisticsBytes / slot.statisticsBytes);
   RelativeAttentionPlan plan(layout, step,
-                             static_cast<uint32_t>(std::min<uint64_t>(slots, std::numeric_limits<uint32_t>::max())));
+                             static_cast<uint32_t>(std::min<uint64_t>(slots, std::numeric_limits<uint32_t>::max())),
+                             calibration.directRows);
   uint64_t splitReads = 0;
   for (const kv::ChunkedPrefillParams &chunk : sequences) {
     const uint32_t tiles = kv::attentionTiles(chunk.chunk_tokens);
     const uint64_t pages =
         readPages(uint64_t{chunk.committed_tokens} + chunk.chunk_tokens, variant.windowTokens);
-    const uint32_t splits = decode ? decodeSplits(pages, chunk.chunk_tokens, calibration.cores)
-                                   : attentionSplits(tiles, pages, variant.windowTokens, calibration.pagesPerSplit);
+    const uint32_t splits =
+        decode ? decodeSplits(pages, chunk.chunk_tokens, static_cast<uint32_t>(sequences.size()), calibration)
+               : attentionSplits(tiles, pages, variant.windowTokens, calibration.pagesPerSplit);
     splitReads = std::max(splitReads, (pages + splits - 1) / splits);
     plan.sequences_[plan.sequenceCount_++] = {chunk.chunk_tokens, chunk.committed_tokens, 0, splits};
   }
@@ -141,28 +176,52 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
                            splitReads >= calibration.int8QueriesFromPages;
   const std::string format = int8Queries ? std::string("q8q") : kernelFormat(layout);
   if (decode) {
+    // A lane's tile: under the narrow cap the smallest that holds the step's
+    // most rows a lane (decodeTileRows: _r2, _r5 or the paged-attention
+    // tile), its splits and rescale the paged tile's, so that it writes that
+    // tile's bits; or a verify block's two (_r16), its rescale the family's
+    // for its fused rows (_unbounded: every row).
+    const bool wide = sequences.front().chunk_tokens > kv::kAttentionTileRows;
+    const uint32_t cap = sequences.front().chunk_tokens;
+    const uint32_t mostRows = laneRows && laneRows < cap ? laneRows : cap;
+    const uint32_t tileRows = wide ? SPLASH_TARGET_VERIFY_ROWS : decodeTileRows(mostRows);
+    const bool bounded =
+        (wide ? SPLASH_TARGET_VERIFY_ROWS : kv::kAttentionTileRows) * kGroup <= calibration.boundedRescaleRows;
+    plan.decodeLaneRows_ = wide ? cap : mostRows;
     plan.decodePipeline_ = "relative_attention_" + format + "_decode" +
-                           (sequences.front().chunk_tokens > kv::kAttentionTileRows ? "_r16" : "") + window +
-                           (variant.positionScaled ? "_scaled" : "");
+                           (tileRows == kv::kAttentionTileRows ? std::string() : "_r" + std::to_string(tileRows)) +
+                           (bounded ? "" : "_unbounded") + window + (variant.positionScaled ? "_scaled" : "");
   } else {
     plan.splitPipeline_ = "relative_attention_" + format + "_split" + window;
     plan.reducePipeline_ = "relative_attention_reduce" + window;
-    plan.directPipeline_ = "relative_attention_" + format + "_direct" + window;
+    plan.directPipeline_ = "relative_attention_" + format + "_direct" +
+                           (calibration.directRows == SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS ? "" : "_r16") + window;
   }
   group(plan);
   return plan;
 }
 
-uint32_t RelativeAttention::decodeMostSplits(uint32_t laneCap, uint32_t cores) {
-  const uint32_t most = laneCap > kv::kAttentionTileRows ? (cores + 8) / 4 : (cores + 16) / 3;
-  return std::clamp<uint32_t>(most, 1, SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS);
+uint32_t RelativeAttention::decodeMostSplits(uint32_t laneCap, uint32_t lanes,
+                                             const AttentionCalibration &calibration) {
+  const uint64_t perFourCores = laneCap > kv::kAttentionTileRows ? calibration.decodeWideThreadgroupsPerFourCores
+                                                                 : calibration.decodeThreadgroupsPerFourCores;
+  // The lanes' share of the resident threadgroups, a KV head's of each split,
+  // to the nearest whole split, within the most one lane's combine repays (a
+  // share of kNever every four cores binds none: 2 x kNever x a GPU's cores
+  // fits 64 bits).
+  const uint64_t heads = uint64_t{4} * kKvHeads * std::max(lanes, 1U);
+  const uint64_t share = (2 * perFourCores * calibration.cores + heads) / (2 * heads);
+  return static_cast<uint32_t>(std::clamp<uint64_t>(std::min(share, laneAloneSplits(laneCap, calibration.cores)), 1,
+                                                    SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS));
 }
 
-uint32_t RelativeAttention::decodeSplits(uint64_t pages, uint32_t laneCap, uint32_t cores) {
-  const uint64_t most = decodeMostSplits(laneCap, cores);
-  const uint64_t fewest = std::clamp<uint64_t>(pages, 1, decodeMostSplits(SPLASH_TARGET_VERIFY_ROWS, cores));
-  const uint64_t splits = std::clamp<uint64_t>((pages * cores + kDecodeCorePages - 1) / kDecodeCorePages,
-                                               std::min(fewest, most), most);
+uint32_t RelativeAttention::decodeSplits(uint64_t pages, uint32_t laneCap, uint32_t lanes,
+                                         const AttentionCalibration &calibration) {
+  const uint64_t most = decodeMostSplits(laneCap, lanes, calibration);
+  const uint64_t fewest = std::min<uint64_t>(
+      std::clamp<uint64_t>(pages, 1, laneAloneSplits(SPLASH_TARGET_VERIFY_ROWS, calibration.cores)), most);
+  const uint64_t splits =
+      std::clamp<uint64_t>((pages * calibration.cores + kDecodeCorePages - 1) / kDecodeCorePages, fewest, most);
   const uint64_t perSplit = std::max<uint64_t>((pages + splits - 1) / splits, 1);
   return static_cast<uint32_t>(std::max<uint64_t>((pages + perSplit - 1) / perSplit, 1));
 }
@@ -239,15 +298,18 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
       throw std::invalid_argument("attention tree rows take whole blocks of at most 32 rows");
   }
   requireRows(rows, command, sequences.size());
-  // The tiles read the staging in whole tiles of rows, the direct kernel's of
-  // SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS, which each sequence's stride holds
-  // (a multiple of a KV block's tokens).
+  // The tiles read the staging in whole tiles of the paged attention's rows,
+  // and a direct tile multiplies the queries of 64 fused rows from its first
+  // (relative_attention_page_loop), past its last row by a fused row and past
+  // a sequence's last row by up to kDirectQueryRows (stagingBytes' margin).
+  requireStaging(staging, command, kv::attentionTiles(command.last.chunk_tokens) * kv::kAttentionTileRows);
   const RelativeAttentionPlan::Sequence &lastSequence = planned.back();
-  requireStaging(staging, command,
-                 lastSequence.splits == 1 ? lastSequence.firstTile * kv::kAttentionTileRows +
-                                                RelativeAttentionPlan::directTiles(lastSequence) *
-                                                    SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS
-                                          : kv::attentionTiles(command.last.chunk_tokens) * kv::kAttentionTileRows);
+  if (lastSequence.splits == 1)
+    requireBytes(staging.queries,
+                 command.rowBytes(uint64_t{kGroup} * kHeadDimension,
+                                  lastSequence.firstTile * kv::kAttentionTileRows +
+                                      plan.directTiles(lastSequence) * plan.directRows() + 1),
+                 "attention query");
   requireBytes(weights.bias, uint64_t{SPLASH_RELATIVE_ATTENTION_EXTENT} * kStates * sizeof(float),
                "attention relative bias");
   const bool table = output.input != LinearInput::Plain;
@@ -263,9 +325,8 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
   requireBytes(partials, workspace.partialsBytes, "attention partials");
   requireBytes(statistics, workspace.statisticsBytes, "attention statistics");
   // A dispatch of one split a sequence runs the direct kernel, whose tiles
-  // of SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS rows count first_tile and the
-  // dispatch's tiles, and whose slots, a tile's INT8 query codes, are fewer
-  // than the split's.
+  // of the plan's direct rows count first_tile and the dispatch's tiles, and
+  // whose slots, a tile's INT8 query codes, are fewer than the split's.
   const auto encode = [&](const RelativeAttentionPlan::Dispatch &dispatch, SplashKvLayer layer, uint32_t firstSlot) {
     const bool direct = plan.direct(dispatch);
     kv::AttentionParams params{.sequences = dispatch.sequences,
@@ -288,7 +349,7 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
       entry.split_count = sequence.splits;
       entry.first_tile = tile;
       entry.first_slot = slot;
-      const uint32_t tiles = direct ? RelativeAttentionPlan::directTiles(sequence)
+      const uint32_t tiles = direct ? plan.directTiles(sequence)
                                     : kv::attentionTiles(sequence.rows) - sequence.firstTile;
       tile += tiles;
       slot += tiles * kKvHeads * sequence.splits;
@@ -388,6 +449,8 @@ PreparedInput RelativeAttention::addDecode(metal::CommandGraph &graph, const Rel
       if (s != dispatch.sequence[0] + d) throw std::logic_error("an attention dispatch's sequences are not in order");
       SplashAttentionSequence &entry = params.sequence[d];
       entry = sequenceRows(sequences[s], command, s, 0);
+      // A lane's bound: the step's most rows a lane, which its tile holds.
+      entry.row_bound = plan.decodeLaneRows();
       entry.split_count = planned[s].splits;
       entry.first_tile = d;
       entry.first_slot = slot;
@@ -410,12 +473,12 @@ PreparedInput RelativeAttention::addDecode(metal::CommandGraph &graph, const Rel
   return table ? PreparedInput{output.hidden, output.input} : PreparedInput{};
 }
 
-void RelativeAttention::addPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+void RelativeAttention::addPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t regions, uint32_t extentPages,
                                       std::span<const metal::MetalBuffer> pageTables,
                                       std::span<const uint32_t> committed, uint32_t laneRows,
                                       const metal::MetalBuffer &paths) {
   requireLayout(layout);
-  addKvPathCommit(graph, commitKernel, layout, extentPages, pageTables, committed, laneRows, paths);
+  addKvPathCommit(graph, commitKernel, layout, regions, extentPages, pageTables, committed, laneRows, paths);
 }
 
 } // namespace splash::ops

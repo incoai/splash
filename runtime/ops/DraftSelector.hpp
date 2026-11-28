@@ -4,6 +4,7 @@
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "ops/LaneRows.hpp"
+#include "ops/StopTokens.hpp"
 #include "ops/Weights.hpp"
 
 #include <array>
@@ -128,20 +129,32 @@ struct DraftCodebooks final {
 // host chain, best first by the estimate that the target accepts each row's
 // path (DraftTreeParams), a greedy lane's rows its most likely candidates
 // and a sampled lane's its draws, which its verify rows' rejection sampling
-// tests. A greedy tree of one child a row and no chain is the draft's most
+// tests, no row past a stop token of its target's and a greedy lane's of
+// none. A greedy tree of one child a row and no chain is the draft's most
 // likely chain.
 class DraftSelector final {
 public:
-  explicit DraftSelector(uint32_t vocabulary);
+  // Over a target's `vocabulary`, whose sequences `stopTokens` end.
+  explicit DraftSelector(uint32_t vocabulary, StopTokens stopTokens = {});
 
-  // Exact scratch/output bytes for that many proposal positions.
+  // Exact scratch/output bytes for that many proposal positions, at the
+  // most shards a row (SPLASH_DRAFT_SAMPLING_MOST_SHARDS).
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
+  // The shards of each proposal row's top-16 in a step of `lanes` lanes on
+  // `cores` GPU cores, every four of which keep `threadgroupsPerFourCores`
+  // of its threadgroups resident (KernelCalibration::draft): the power of
+  // two from 2 to SPLASH_DRAFT_SAMPLING_MOST_SHARDS nearest in ratio to the
+  // rows' share of them; the most where no share binds (kNever).
+  [[nodiscard]] static uint32_t shards(uint32_t lanes, uint32_t cores, uint32_t threadgroupsPerFourCores);
 
   // Proposals from `vocabulary`'s tokens, whose logits rows buffers.logits
-  // holds, each candidate's score after its edge softcapped at `softcap`
-  // (DraftTreeParams; 0: none).
+  // holds `stride` floats apart (the head's outputs; a padded head's columns
+  // past the tokens are never read), each row's top-16 over `shards` shards
+  // of them (shards), each candidate's score after its edge softcapped at
+  // `softcap` (DraftTreeParams; 0: none).
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
-           DraftVocabulary vocabulary, std::span<const DraftTreeLane> lanes, float softcap = 0.0F) const;
+           DraftVocabulary vocabulary, uint32_t stride, std::span<const DraftTreeLane> lanes, uint32_t shards,
+           float softcap = 0.0F) const;
   // After add: the rows of a decode step of `step.lanes` lanes
   // (VerifyRowsParams), the trees' best rows that the step's rows and its
   // lane cap hold, none past an anchor estimated below `floor`, each lane's
@@ -151,6 +164,7 @@ public:
 
 private:
   uint32_t vocabulary_ = 0;
+  StopTokens stopTokens_;
 };
 
 } // namespace splash::ops

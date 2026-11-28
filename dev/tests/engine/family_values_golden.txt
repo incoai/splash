@@ -9,8 +9,7 @@
 #     layer dense; and the native window and the most context it serves;
 #   kv: the target's KV layout (kv::Layout) and its sliding window, if it
 #     has one;
-#   kv <format>: a page's bytes, Full and Index (kv::PageForm), and Slim for
-#     a layout whose pages can be Slim (kv::Layout::slimmable), the extent
+#   kv <format>: a page's bytes, Full and Index (kv::PageForm), the extent
 #     alignment and the smallest and largest extent, in pages;
 #   kv <format> extent-pages: the extent of a pool of so many pages
 #     (kv::Layout::extentPagesFor);
@@ -24,7 +23,7 @@
 # line that changes moves its memory plan, or empties its users' persistent
 # caches. Either change must be one on purpose. A new family adds its lines.
 family Qwen3.8-27B
-facts experts 0 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 1 context 262144..1010000
+facts experts 0 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 1 context 262144..1010000 activations auto
 kv layers 16 heads 4 dimension 256 index 0
 kv int8 page 1064960 index-page 0 alignment 128 extents 128..128
 kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:128 129:128 255:128 256:128 257:128 511:128 512:128 1000:128 4095:128 4096:128 10000:128 65535:128 65536:128 100000:128 262144:128 1000000:128
@@ -37,7 +36,7 @@ state bf16 cell 78643200 lane 205127680 cached 49152000
 namespace int8 bf16 88a6a28cadb13dc02b99998aa48baa72
 namespace bf16 bf16 388751d686c33e434f9cd43e8b0a1db4
 family Qwen3.6-35B-A3B
-facts experts 1 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 0 context 262144..1010000
+facts experts 1 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 0 context 262144..1010000 activations auto
 kv layers 10 heads 2 dimension 256 index 0
 kv int8 page 332800 index-page 0 alignment 256 extents 256..512
 kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:256 512:512 1000:256 4095:256 4096:512 10000:256 65535:256 65536:512 100000:512 262144:512 1000000:512
@@ -50,7 +49,7 @@ state bf16 cell 32931840 lane 118554624 cached 20545536
 namespace int8 bf16 172b16eb34bc547c3cdc2ed4141436b5
 namespace bf16 bf16 45c2b31282273f34938991d2731baca4
 family Qwen3.5-122B-A10B
-facts experts 1 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 0 context 262144..1010000
+facts experts 1 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 0 context 262144..1010000 activations auto
 kv layers 12 heads 2 dimension 256 index 0
 kv int8 page 399360 index-page 0 alignment 256 extents 256..256
 kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:256 512:256 1000:256 4095:256 4096:256 10000:256 65535:256 65536:256 100000:256 262144:256 1000000:256
@@ -63,7 +62,7 @@ state bf16 cell 78446592 lane 210763776 cached 46596096
 namespace int8 bf16 e0bf8906e58735563c7b5d2c6e9d18e3
 namespace bf16 bf16 094abc11c2b910b0ff50a15b2953dea0
 family Qwen3.8-Flash-Next
-facts experts 1 recurrent-state 1 ple-table 1 sparse-kv 1 dense-ffn 0 context 262144..1010000
+facts experts 1 recurrent-state 1 ple-table 1 sparse-kv 1 dense-ffn 0 context 262144..1010000 activations auto
 kv layers 12 heads 2 dimension 256 index 128 values-token-major
 kv int8 page 423936 index-page 24576 alignment 256 extents 256..256
 kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:256 512:256 1000:256 4095:256 4096:256 10000:256 65535:256 65536:256 100000:256 262144:256 1000000:256
@@ -76,28 +75,28 @@ state bf16 cell 59179008 lane 146472960 cached 35586048
 namespace int8 bf16 c1558e67db3c3430234d2d25815bf17f
 namespace bf16 bf16 8325839c2ceddbcfc4bed783e2c8078b
 family Flint
-facts experts 1 recurrent-state 0 ple-table 0 sparse-kv 0 dense-ffn 0 context 262144..262144
+facts experts 1 recurrent-state 0 ple-table 0 sparse-kv 0 dense-ffn 0 context 262144..262144 activations auto
 kv layers 49 heads 4 dimension 128 index 0 window 512 layers 0xdddddddddddc
-kv int8 page 1655808 index-page 0 slim-page 473088 alignment 128 extents 128..128
-kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:128 129:128 255:128 256:128 257:128 511:128 512:128 1000:128 4095:128 4096:128 10000:128 65535:128 65536:128 100000:128 262144:128 1000000:128
-kv bf16 page 3211264 index-page 0 slim-page 917504 alignment 2 extents 22..62
-kv bf16 extent-pages 1:0 31:30 32:32 63:62 64:32 127:42 128:32 129:32 255:42 256:32 257:32 511:34 512:32 1000:40 4095:46 4096:32 10000:40 65535:62 65536:32 100000:40 262144:32 1000000:40
+kv int8 page 473088 index-page 0 alignment 128 extents 256..384
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:384 512:256 1000:256 4095:256 4096:256 10000:256 65535:256 65536:256 100000:256 262144:256 1000000:256
+kv bf16 page 917504 index-page 0 alignment 2 extents 74..218
+kv bf16 extent-pages 1:0 31:0 32:0 63:0 64:0 127:126 128:128 129:128 255:126 256:128 257:128 511:170 512:128 1000:100 4095:178 4096:128 10000:100 65535:172 65536:128 100000:160 262144:128 1000000:160
 state fp32 cell 0 lane 10747904 cached 2359296
-namespace int8 fp32 b0dbac8e4f941ecd3e28c87cc3d2c58a
-namespace bf16 fp32 b06e435b51f8c94636cf3a72acdcfc26
+namespace int8 fp32 4d5bf532a40477b69bd3ce79b23ea775
+namespace bf16 fp32 41bc1552960ffaa67620f063ef574e20
 state bf16 cell 0 lane 10747904 cached 2359296
-namespace int8 bf16 b0dbac8e4f941ecd3e28c87cc3d2c58a
-namespace bf16 bf16 b06e435b51f8c94636cf3a72acdcfc26
+namespace int8 bf16 4d5bf532a40477b69bd3ce79b23ea775
+namespace bf16 bf16 41bc1552960ffaa67620f063ef574e20
 family Inkling-2-Mini
-facts experts 1 recurrent-state 0 ple-table 0 sparse-kv 0 dense-ffn 0 context 1010000..1010000
+facts experts 1 recurrent-state 0 ple-table 0 sparse-kv 0 dense-ffn 0 context 1010000..1010000 activations bf16
 kv layers 48 heads 8 dimension 128 index 0 window 1023 layers 0x7df7df7df7df
-kv int8 page 3244032 index-page 0 slim-page 540672 alignment 64 extents 64..64
-kv int8 extent-pages 1:0 31:0 32:0 63:0 64:64 127:64 128:64 129:64 255:64 256:64 257:64 511:64 512:64 1000:64 4095:64 4096:64 10000:64 65535:64 65536:64 100000:64 262144:64 1000000:64
-kv bf16 page 6291456 index-page 0 slim-page 1048576 alignment 1 extents 11..32
-kv bf16 extent-pages 1:0 31:31 32:16 63:21 64:16 127:21 128:16 129:16 255:17 256:16 257:16 511:17 512:16 1000:20 4095:21 4096:16 10000:20 65535:17 65536:16 100000:20 262144:16 1000000:20
+kv int8 page 540672 index-page 0 alignment 64 extents 128..320
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:128 129:128 255:192 256:256 257:256 511:192 512:256 1000:192 4095:192 4096:256 10000:256 65535:192 65536:256 100000:128 262144:256 1000000:320
+kv bf16 page 1048576 index-page 0 alignment 1 extents 64..192
+kv bf16 extent-pages 1:0 31:0 32:0 63:0 64:64 127:127 128:128 129:129 255:85 256:128 257:128 511:73 512:128 1000:125 4095:117 4096:128 10000:125 65535:85 65536:128 100000:125 262144:128 1000000:125
 state fp32 cell 1916928 lane 48431104 cached 4571136
-namespace int8 fp32 697ab6d38b4e814349f83872b8800720
-namespace bf16 fp32 cf06647d2a67707220b24173d561d390
+namespace int8 fp32 a5d94492d551c357d6aa62d113c9b0e3
+namespace bf16 fp32 68b4bf5616adec3de9c42107866c2609
 state bf16 cell 1916928 lane 48431104 cached 4571136
-namespace int8 bf16 697ab6d38b4e814349f83872b8800720
-namespace bf16 bf16 cf06647d2a67707220b24173d561d390
+namespace int8 bf16 a5d94492d551c357d6aa62d113c9b0e3
+namespace bf16 bf16 68b4bf5616adec3de9c42107866c2609

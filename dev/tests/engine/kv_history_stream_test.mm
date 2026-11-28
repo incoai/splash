@@ -140,7 +140,7 @@ struct Sequence final {
     for (uint32_t page = 4; page < kHistoryPages; ++page) {
       if (page % 3 == 0) continue;
       std::vector<std::byte> payload;
-      for (const auto &span : format.transferSpans(pool, pages[page]))
+      for (const auto &span : format.transferSpans(pool, std::array<uint32_t, 1>{pages[page]}))
         payload.insert(payload.end(), span.begin(), span.end());
       copies.push_back(std::make_shared<TestKvCopy>(std::move(payload)));
       sources[page] = {1000 + page, copies.back()};

@@ -85,10 +85,6 @@ PARSES = {
         "</parameter>\n</function>\n</tool_call>",
         [("roll_cut", {"item": "s1"})],
     ),
-    "a tool not offered": (
-        call("search", ("limit", "5"), ("query", "a b")),
-        [("search", {"limit": "5", "query": "a b"})],
-    ),
     "a parameter the tool does not declare": (
         call("roll_cut", ("item", "s1"), ("count", "2")),
         [("roll_cut", {"item": "s1", "count": "2"})],
@@ -247,6 +243,10 @@ class ToolCallReadingTests(unittest.TestCase):
         # A </think> in text is dropped.
         content, calls = self.read("Sure.</think> Here" + call("roll_cut"))
         self.assertEqual((content, calls), ("Sure. Here", [("roll_cut", {})]))
+        # A call of a tool the request does not declare is the text the
+        # model wrote.
+        text = call("search", ("limit", "5"), ("query", "a b"))
+        self.assertEqual(self.read(text), (text, []))
 
     def test_values_convert_by_their_declared_types(self):
         for schema, text, value in CONVERSIONS:
@@ -553,10 +553,9 @@ class ToolCallReadingTests(unittest.TestCase):
         ):
             with self.subTest(closed=closed):
                 self.assertEqual(self.read(closed + "\nDone.")[0].strip(), "Done.")
-        # A call the token limit cuts keeps the arguments it streamed. A value
-        # that is its text streams as it is written: one typed a string, and
-        # one its schema gives no type, as a parameter a tool does not
-        # declare, closed or not.
+        # A call the token limit cuts is no call, and has streamed nothing,
+        # whatever its values: one typed a string, and one its schema gives
+        # no type, as a parameter a tool does not declare, closed or not.
         for function, name in (
             ("roll_cut", "cut_at"),
             ("roll_cut", "count"),
@@ -567,16 +566,11 @@ class ToolCallReadingTests(unittest.TestCase):
                     f"<tool_call>\n<function={function}>\n<parameter=item>\ns1\n"
                     f"</parameter>\n<parameter={name}>\n12:"
                 )
-                _, calls, events = project(cut, tool_policy(SCHEMAS), incomplete=True)
-                arguments = f'{{"item":"s1","{name}":"12:'
-                self.assertEqual(
-                    [
-                        (c["function"]["name"], c["function"]["arguments"])
-                        for c in calls
-                    ],
-                    [(function, arguments)],
+                content, calls, events = project(
+                    cut, tool_policy(SCHEMAS), incomplete=True
                 )
-                self.assertEqual(streamed_arguments(events), arguments)
+                self.assertEqual((content, calls), ("", []))
+                self.assertEqual(streamed_arguments(events), "")
         # Types are read through local references, a parameter's own and the
         # one a model such as pydantic's recursive one puts at the top.
         point = {
@@ -697,17 +691,16 @@ class ToolCallReadingTests(unittest.TestCase):
             2,
         )
 
-    def test_a_value_the_token_limit_cuts_is_no_valid_json(self):
-        # A cut call keeps the arguments it has, unfinished: no client can
-        # run a cut command as if it were whole.
-        _, calls, _ = project(
-            "<tool_call>\n<function=note>\n<parameter=text>\nrm -rf /",
+    def test_a_call_the_token_limit_cuts_is_no_call(self):
+        # No client can run a cut command as if it were whole: the call is
+        # dropped, and the text before it stays.
+        content, calls, events = project(
+            "Deleting.\n<tool_call>\n<function=note>\n<parameter=text>\nrm -rf /",
             tool_policy(SCHEMAS),
             incomplete=True,
         )
-        self.assertEqual(calls[0]["function"]["arguments"], '{"text":"rm -rf /')
-        with self.assertRaises(ValueError):
-            json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual((content, calls), ("Deleting.\n", []))
+        self.assertNotIn("tool", [kind for kind, _ in events])
 
 
 if __name__ == "__main__":

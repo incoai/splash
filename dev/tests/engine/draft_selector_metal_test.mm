@@ -43,6 +43,7 @@
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "ops/DraftSelector.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -85,6 +86,11 @@ constexpr uint32_t kBlock = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kChain = SPLASH_TREE_CHAIN_TOKENS;
 constexpr uint32_t kAgreements = SPLASH_TREE_AGREEMENTS;
 constexpr uint32_t kChildren = SPLASH_TREE_CHILDREN;
+constexpr uint32_t kMostShards = SPLASH_DRAFT_SAMPLING_MOST_SHARDS;
+// Every shard count a row's top-16 takes (DraftSelector::shards), and the one
+// the cases that do not vary it take.
+constexpr std::array<uint32_t, 5> kShardCounts{2, 4, 8, 16, kMostShards};
+constexpr uint32_t kShards = 8;
 
 using splash::test::rejects;
 using splash::test::require;
@@ -178,13 +184,18 @@ struct Fixture final {
   uint32_t vocabulary = 0;
   uint32_t lanes = 0;
   DraftVocabulary subset{};
+  // The logits rows' width: the subset's columns and a padded head's rows
+  // past them.
+  uint32_t stride = 0;
+  // The shards of each row's top-16.
+  uint32_t shards = kShards;
   MetalBuffer logits;
   DraftSelectorBuffers buffers;
   DraftCodebooks codebooks;
 
   [[nodiscard]] const float *logitRow(uint32_t lane, uint32_t position) const {
     return static_cast<const float *>(logits.contents()) +
-           (uint64_t{lane} * kRows + position + 1) * subset.columns(vocabulary);
+           (uint64_t{lane} * kRows + position + 1) * stride;
   }
   [[nodiscard]] const uint32_t *candidates(uint32_t lane) const {
     return static_cast<const uint32_t *>(buffers.candidates.contents()) +
@@ -193,10 +204,11 @@ struct Fixture final {
   [[nodiscard]] const float *unary(uint32_t lane) const {
     return static_cast<const float *>(buffers.unary.contents()) + uint64_t{lane} * kPositions * kCandidates;
   }
-  // The edge table draft_select_edges leaves behind the shard partials.
+  // The edge table draft_select_edges leaves behind room for the most
+  // shards' partials.
   [[nodiscard]] const float *edges(uint32_t lane, uint32_t position, uint32_t predecessor) const {
     return static_cast<const float *>(buffers.partialValues.contents()) +
-           uint64_t{lanes} * kPositions * SPLASH_DRAFT_SAMPLING_SHARDS * kCandidates +
+           uint64_t{lanes} * kPositions * kMostShards * kCandidates +
            ((uint64_t{lane} * kPositions + position) * kCandidates + predecessor) * kCandidates;
   }
   [[nodiscard]] const uint32_t *tokens() const { return static_cast<const uint32_t *>(buffers.treeTokens.contents()); }
@@ -218,20 +230,26 @@ struct Fixture final {
 
 // Each lane's draft rows of `patterns` (by position) over `subset` and its
 // selector hidden rows and the codebooks of scale `edgeScale`: the larger,
-// the more an edge moves a candidate's probability.
+// the more an edge moves a candidate's probability. `pad` columns past the
+// subset's are a padded head's rows of no token, at +infinity, which the
+// selector must never read.
 Fixture makeFixture(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, Random &random,
-                    std::span<const Pattern> patterns, float edgeScale, DraftVocabulary subset = {}) {
+                    std::span<const Pattern> patterns, float edgeScale, DraftVocabulary subset = {},
+                    uint32_t pad = 0) {
   Fixture f;
   f.vocabulary = vocabulary;
   f.lanes = lanes;
   f.subset = subset;
   const uint32_t rows = lanes * kRows, columns = subset.columns(vocabulary);
+  f.stride = columns + pad;
   const auto workspace = DraftSelector::workspace(lanes * kPositions);
-  f.logits = allocate(backend, uint64_t{rows} * columns * sizeof(float));
+  f.logits = allocate(backend, uint64_t{rows} * f.stride * sizeof(float));
   auto *logitRows = static_cast<float *>(f.logits.contents());
-  for (uint32_t row = 0; row < rows; ++row)
-    fillRow(logitRows + uint64_t{row} * columns, columns,
+  for (uint32_t row = 0; row < rows; ++row) {
+    fillRow(logitRows + uint64_t{row} * f.stride, columns,
             patterns[(row / kRows + row % kRows) % patterns.size()], random);
+    std::fill_n(logitRows + uint64_t{row} * f.stride + columns, pad, INFINITY);
+  }
   f.buffers = {f.logits,
                allocate(backend, workspace.partialIdsBytes),
                allocate(backend, workspace.partialValuesBytes),
@@ -260,7 +278,7 @@ Fixture makeFixture(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, 
 void run(MetalBackend &backend, const DraftSelector &selector, const Fixture &f, std::span<const DraftTreeLane> lanes,
          float softcap = 0.0F) {
   CommandGraph graph;
-  selector.add(graph, f.buffers, f.codebooks, f.subset, lanes, softcap);
+  selector.add(graph, f.buffers, f.codebooks, f.subset, f.stride, lanes, f.shards, softcap);
   require(graph.dispatches().size() == 3, "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
@@ -378,8 +396,10 @@ struct Node final {
 // none when two paths' scores, or two of a sampled row's candidates' keys,
 // lie too close for float sums to order (the caller draws other data). A
 // sampled lane's row takes its candidates of the largest log q_T + G, G the
-// Gumbel of its key, which its path's tokens fold from the lane's noise.
-std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTreeLane &lane, const Chain &chain) {
+// Gumbel of its key, which its path's tokens fold from the lane's noise. No
+// row lies past one of `stops`, and a greedy lane holds none of them.
+std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTreeLane &lane, const Chain &chain,
+                                               const StopTokens &stops = {}) {
   struct Entry final {
     std::vector<uint32_t> path;
     double score;
@@ -476,6 +496,12 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
         return std::nullopt;
     }
     const uint32_t position = static_cast<uint32_t>(entry.path.size()) - 1;
+    const auto stop = [&](uint32_t token) { return stops.contains(token); };
+    if (std::any_of(entry.path.begin(), entry.path.end() - 1, stop) ||
+        (lane.temperature == 0.0F && stop(entry.path.back())))
+      continue;
+    // A stop's row is never expanded.
+    const bool leaf = stop(entry.path.back());
     // A token's candidate index at its position, or none.
     const auto candidate = [&](uint32_t at, uint32_t token) -> int {
       if (at >= kPositions)
@@ -496,7 +522,7 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
         row.q = drafted();
         row.cap = entry.cap;
       }
-      if (!entry.chain && row.draws.empty())
+      if (!entry.chain && row.draws.empty() && !leaf)
         expanded(row);
       continue;
     }
@@ -506,7 +532,7 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
     node.estimate = entry.score;
     node.q = entry.chain ? -1.0 : drafted();
     node.cap = entry.chain ? 1.0 : entry.cap;
-    if (!entry.chain)
+    if (!entry.chain && !leaf)
       expanded(node);
     made.emplace(entry.path, static_cast<uint32_t>(rows.size()));
     rows.push_back(node);
@@ -583,11 +609,13 @@ void requireTree(const Fixture &f, uint32_t lane, uint32_t anchor, const std::ve
 // probability the largest of its candidates', the chain's confidence. Over
 // `tokens` of the vocabulary the candidates are the tokens of the rows'
 // largest columns.
-void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, DraftVocabulary tokens = {}) {
-  Random random(0x5e1ec7 + uint64_t{vocabulary} * 8 + lanes * 2 + uint64_t{tokens.leading} * 16);
+void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, uint32_t shards, DraftVocabulary tokens = {},
+               uint32_t pad = 0) {
+  Random random(0x5e1ec7 + uint64_t{vocabulary} * 8 + lanes * 2 + uint64_t{tokens.leading} * 16 + shards * 64);
   const uint32_t columns = tokens.columns(vocabulary);
   const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties, Pattern::Sparse};
-  const Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.1F, tokens);
+  Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.1F, tokens, pad);
+  f.shards = shards;
   const DraftSelector selector(vocabulary);
   std::vector<DraftTreeLane> trees;
   for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -726,6 +754,69 @@ void treesMatchTheReference(MetalBackend &backend, float softcap) {
     }
   }
   require(checked * 4 >= drawn * 3, "most trees were too ambiguous to check");
+}
+
+// A target's stop tokens end its lanes' trees: no row grows under a stop
+// token's row, as acceptance retains nothing past the stop, and a greedy
+// lane takes no row of one, which its parent's argmax selects as well
+// without it, while a sampled lane keeps the stop rows its draft drew, which
+// its parent's rejection sampling tests. The stops are tokens of each lane's
+// tree without them, a first child of the anchor, a deeper row and a chain
+// token, and the trees match the reference's with the stops.
+void stopTokensEndTrees(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  const std::array patterns{Pattern::Peaked};
+  uint32_t checked = 0, greedyStops = 0, sampledStops = 0;
+  for (uint32_t trial = 0; checked < 24; ++trial) {
+    require(trial < 200, "the reference found too few unambiguous trees with stop tokens");
+    Random random(0x73746f70 + trial);
+    const uint32_t lanes = 1 + trial % kLanes;
+    const Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.4F);
+    std::vector<DraftTreeLane> trees;
+    std::vector<Chain> chains(lanes);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      // Greedy and sampled lanes, a chain on every other one.
+      const float temperature = (trial + lane) % 2 ? 0.8F : 0.0F;
+      const uint32_t chain = (trial + lane) % 4 < 2 ? 3 : 0;
+      trees.push_back({random.next() % vocabulary, kBlock - 1, chain, 2 + (trial + lane) % 3, DraftCalibration{},
+                       temperature, uint64_t{random.next()} << 32 | random.next()});
+      chains[lane].tokens.resize(kChain);
+      chains[lane].rates.resize(kChain);
+      for (uint32_t d = 0; d < kChain; ++d) {
+        chains[lane].tokens[d] = random.next() % vocabulary;
+        chains[lane].rates[d].fill(0.6F);
+      }
+      std::copy(chains[lane].tokens.begin(), chains[lane].tokens.end(), f.chainTokens(lane));
+      for (uint32_t d = 0; d < kChain; ++d)
+        std::copy(chains[lane].rates[d].begin(), chains[lane].rates[d].end(), f.chainRates(lane) + d * kAgreements);
+    }
+    run(backend, DraftSelector(vocabulary), f, trees);
+    // Lane 0's first child of its anchor and its fourth row, and the last
+    // lane's second chain token.
+    const StopTokens stops{f.tokens()[1], f.tokens()[std::min(3U, f.rowCount(0) - 1)], chains[lanes - 1].tokens[1]};
+    // A cycle's anchor is no stop token (the runtime emits a stop anchor
+    // without a cycle).
+    if (std::ranges::any_of(trees, [&](const DraftTreeLane &tree) { return stops.contains(tree.anchor); }))
+      continue;
+    run(backend, DraftSelector(vocabulary, stops), f, trees);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t first = lane * kBlock;
+      for (uint32_t row = 1; row < f.rowCount(lane); ++row) {
+        require(!stops.contains(f.tokens()[first + f.tree()[first + row].parent]),
+                "a row grew under a stop token's row");
+        if (stops.contains(f.tokens()[first + row]))
+          ++(trees[lane].temperature == 0.0F ? greedyStops : sampledStops);
+      }
+      const auto reference = referenceTree(latticeOf(f, lane), trees[lane], chains[lane], stops);
+      if (!reference)
+        continue;
+      ++checked;
+      requireTree(f, lane, trees[lane].anchor, *reference,
+                  "stop trial " + std::to_string(trial) + " lane " + std::to_string(lane));
+    }
+  }
+  require(!greedyStops, "a greedy lane's tree held a stop token's row");
+  require(sampledStops, "no sampled lane's tree held the stop row its draft drew");
 }
 
 // A sampled lane's proposal row that is not finite (its logits and its
@@ -1389,9 +1480,8 @@ void bufferExtents(MetalBackend &backend) {
   for (const auto &[member, bytes, element, what] :
        std::initializer_list<std::tuple<MetalBuffer DraftSelectorBuffers::*, uint64_t, uint64_t, const char *>>{
            {&DraftSelectorBuffers::logits, uint64_t{lanes} * kRows * vocabulary * 4, 4, "draft logits"},
-           {&DraftSelectorBuffers::partialIds, candidates * SPLASH_DRAFT_SAMPLING_SHARDS * 4, 4,
-            "draft selector partial id"},
-           {&DraftSelectorBuffers::partialValues, candidates * (SPLASH_DRAFT_SAMPLING_SHARDS + kCandidates) * 4, 4,
+           {&DraftSelectorBuffers::partialIds, candidates * kMostShards * 4, 4, "draft selector partial id"},
+           {&DraftSelectorBuffers::partialValues, candidates * (kMostShards + kCandidates) * 4, 4,
             "draft selector partial value"},
            {&DraftSelectorBuffers::candidates, candidates * 4, 4, "draft candidate"},
            {&DraftSelectorBuffers::unary, candidates * 4, 4, "draft candidate score"},
@@ -1408,7 +1498,7 @@ void bufferExtents(MetalBackend &backend) {
     requireExtent(backend, f.buffers.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
       DraftSelectorBuffers changed = f.buffers;
       changed.*member = buffer;
-      selector.add(graph, changed, f.codebooks, {}, trees);
+      selector.add(graph, changed, f.codebooks, {}, vocabulary, trees, kShards);
     });
   // Over a subset, a logits row holds its columns.
   constexpr DraftVocabulary subset{512, 960};
@@ -1416,7 +1506,7 @@ void bufferExtents(MetalBackend &backend) {
                 [&](CommandGraph &graph, const MetalBuffer &buffer) {
                   DraftSelectorBuffers changed = f.buffers;
                   changed.logits = buffer;
-                  selector.add(graph, changed, f.codebooks, subset, trees);
+                  selector.add(graph, changed, f.codebooks, subset, subset.columns(vocabulary), trees, kShards);
                 });
   for (const auto &[member, what] :
        {std::pair{&DraftCodebooks::predecessor, "draft predecessor codebook"},
@@ -1425,7 +1515,7 @@ void bufferExtents(MetalBackend &backend) {
                   [&](CommandGraph &graph, const MetalBuffer &buffer) {
                     DraftCodebooks changed = f.codebooks;
                     changed.*member = buffer;
-                    selector.add(graph, f.buffers, changed, {}, trees);
+                    selector.add(graph, f.buffers, changed, {}, vocabulary, trees, kShards);
                   });
   // draft_verify_rows reads every lane's tree and writes the step's rows.
   const StepRows step{lanes, 2 * lanes + 1, 3};
@@ -1447,6 +1537,30 @@ void bufferExtents(MetalBackend &backend) {
     });
 }
 
+// The shard law: the power of two nearest the rows' share of the resident
+// threadgroups, at least 2 and at most the most, the most where none binds.
+void shardLaw() {
+  // One lane's 7 rows of a 20-core GPU's 80 (four a core): 11.4 a row, past
+  // 8 sqrt(2), takes 16; four lanes 2.9 a row, past 2 sqrt(2), take 4; eight
+  // lanes 1.4 a row take 2.
+  require(DraftSelector::shards(1, 20, 16) == 16 && DraftSelector::shards(4, 20, 16) == 4 &&
+              DraftSelector::shards(8, 20, 16) == 2,
+          "the shard law missed a 20-core GPU's shares");
+  // A 10-core GPU's 40: 5.7 a row, past 4 sqrt(2), takes 8; 39 resident (one
+  // a core of 39) are 5.6 a row, short of it, and take 4.
+  require(DraftSelector::shards(1, 10, 16) == 8 && DraftSelector::shards(1, 39, 4) == 4,
+          "the shard law missed the nearest power of two");
+  require(DraftSelector::shards(1, 80, 16) == kMostShards && DraftSelector::shards(8, 1, 1) == 2 &&
+              DraftSelector::shards(3, 20, kNever) == kMostShards,
+          "the shard law left its bounds");
+  rejects([] { static_cast<void>(DraftSelector::shards(0, 20, 16)); }, "invalid draft selector batch",
+          "a law of no lanes was accepted");
+  rejects([] { static_cast<void>(DraftSelector::shards(kLanes + 1, 20, 16)); }, "invalid draft selector batch",
+          "a law of more lanes than a batch was accepted");
+  rejects([] { static_cast<void>(DraftSelector::shards(1, 0, 16)); },
+          "a draft selector's shards are of a GPU's cores", "a law of no cores was accepted");
+}
+
 void invalidRequests(MetalBackend &backend) {
   rejects([] { DraftSelector(0); }, "invalid draft selector vocabulary",
           "a selector over no vocabulary was accepted");
@@ -1457,15 +1571,23 @@ void invalidRequests(MetalBackend &backend) {
   const DraftSelector selector(vocabulary);
   CommandGraph graph;
   const auto add = [&](std::span<const DraftTreeLane> lanes) {
-    selector.add(graph, f.buffers, f.codebooks, {}, lanes);
+    selector.add(graph, f.buffers, f.codebooks, {}, vocabulary, lanes, kShards);
   };
   rejects([&] { add({}); }, "invalid draft selector batch", "a selection of no lane was accepted");
   const std::array<DraftTreeLane, kLanes + 1> tooMany{};
   rejects([&] { add(tooMany); }, "invalid draft selector batch", "a selection of more lanes than a batch was accepted");
   // Tokens past the vocabulary, a trailing part before the leading one's end, and no tokens.
   for (const DraftVocabulary tokens : {DraftVocabulary{0, 1025}, DraftVocabulary{600, 500}, DraftVocabulary{0, 1024}})
-    rejects([&] { selector.add(graph, f.buffers, f.codebooks, tokens, std::array{DraftTreeLane{1, 3, 0, 1}}); },
+    rejects([&] { selector.add(graph, f.buffers, f.codebooks, tokens, vocabulary, std::array{DraftTreeLane{1, 3, 0, 1}}, kShards); },
             "a draft's tokens lie in its vocabulary", "a draft vocabulary outside the selector's was accepted");
+  // Logits rows narrower than the tokens' columns.
+  rejects([&] { selector.add(graph, f.buffers, f.codebooks, {}, vocabulary - 1, std::array{DraftTreeLane{1, 3, 0, 1}}, kShards); },
+          "a draft's logits rows hold its tokens' columns", "logits rows narrower than the tokens were accepted");
+  // Shards that are no power of two from 2 to the most.
+  for (const uint32_t bad : {0U, 1U, 3U, 12U, 2 * kMostShards})
+    rejects([&] { selector.add(graph, f.buffers, f.codebooks, {}, vocabulary, std::array{DraftTreeLane{1, 3, 0, 1}}, bad); },
+            "a draft selector's rows take a power of two of shards, 2 to its most",
+            "an impossible shard count was accepted");
   // A tree deeper than a block's rows, a chain past a block's rows after its
   // anchor and more children than the kernel ranks.
   for (const DraftTreeLane &bad : {DraftTreeLane{1, kBlock, 0, 1}, DraftTreeLane{1, 3, kChain + 1, 1},
@@ -1503,18 +1625,33 @@ int main(int argc, char **argv) {
     MetalBackend backend(argv[1]);
     invalidRequests(backend);
     bufferExtents(backend);
-    for (const uint32_t vocabulary : {248320U, 1003U, 270005U})
-      for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
-        chainCase(backend, vocabulary, lanes);
+    shardLaw();
+    for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
+      chainCase(backend, 248320, lanes, kShards);
+    // Every shard count, over rows of many chunks a shard, of fewer columns
+    // than a shard's threads and of an odd count.
+    for (const uint32_t shards : kShardCounts)
+      for (const uint32_t vocabulary : {270005U, 1003U, 249U})
+        for (const uint32_t lanes : {1U, 3U, kLanes})
+          chainCase(backend, vocabulary, lanes, shards);
     // Subsets: the Qwen families', one of 555 columns that misalign the
     // vectors, a leading part alone and a trailing part alone.
-    for (const auto &[vocabulary, tokens] :
-         {std::pair{248320U, DraftVocabulary{148288, 248000}}, std::pair{1003U, DraftVocabulary{512, 960}},
-          std::pair{1003U, DraftVocabulary{517, 1003}}, std::pair{1003U, DraftVocabulary{0, 389}}})
-      for (const uint32_t lanes : {1U, kLanes})
-        chainCase(backend, vocabulary, lanes, tokens);
+    for (const uint32_t shards : {2U, kMostShards})
+      for (const auto &[vocabulary, tokens] :
+           {std::pair{248320U, DraftVocabulary{148288, 248000}}, std::pair{1003U, DraftVocabulary{512, 960}},
+            std::pair{1003U, DraftVocabulary{517, 1003}}, std::pair{1003U, DraftVocabulary{0, 389}}})
+        for (const uint32_t lanes : {1U, kLanes})
+          chainCase(backend, vocabulary, lanes, shards, tokens);
+    // Padded heads: logits rows of whole tiles past the tokens, whose columns
+    // past them hold +infinity and are never read (Inkling-2-Mini's 200,058
+    // tokens in rows of 200,064, and a row padded to a 1,024-column tile).
+    for (const uint32_t shards : {2U, kMostShards})
+      for (const auto &[vocabulary, pad] : {std::pair{200058U, 6U}, std::pair{1003U, 21U}})
+        for (const uint32_t lanes : {1U, kLanes})
+          chainCase(backend, vocabulary, lanes, shards, {}, pad);
     treesMatchTheReference(backend, 0.0F);
     treesMatchTheReference(backend, 30.0F);
+    stopTokensEndTrees(backend);
     sampledChildrenDistribution(backend);
     nonFiniteRowDrawsNothing(backend);
     lowTemperatureDraws(backend);

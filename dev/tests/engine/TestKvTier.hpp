@@ -63,11 +63,12 @@ private:
   mutable std::atomic<uint64_t> reads_{0};
 };
 
-// A KV disk tier without a disk: slots count against a quota of slots (or, in bytes, a DiskBudget:
-// 100 for a Full page's slot and 30 for a Slim page's, standing in for what SlotFile counts of a
-// page of each form, which kv-page-tier-host holds a real tier to), transfers finish when the test
-// says so, and each slot is its own TestKvCopy that readers may outlive. Tests on it check the
-// cache's count of its slots, not the slot file's.
+// A KV disk tier without a disk: copies count against a quota of copies (or, in bytes, a DiskBudget:
+// 100 for a block's base part, standing in for what SlotFile counts of a part, which kv-page-tier-host
+// holds a real tier to, and windowBytes for its window part where the tier has one), transfers finish
+// when the test says so, and each copy is its own TestKvCopy that readers may outlive. Each part has its
+// bytes, presence and label as the real tier's do. Tests on it check the cache's count of its slots, not
+// the slot file's.
 class TestKvTier final : public engine::KvTier {
 public:
   struct Transfer final {
@@ -82,41 +83,67 @@ public:
   };
 
   TestKvTier() = default;
-  explicit TestKvTier(bool persistent) : persistentTier(persistent) {}
+  explicit TestKvTier(bool persistent, uint64_t window = 0) : persistentTier(persistent), windowBytes(window) {}
 
-  uint64_t slotBytes(kv::PageForm form) const override { return form == kv::PageForm::Slim ? 30 : 100; }
+  kv::Components components() const noexcept override {
+    return kv::componentBit(kv::Component::Base) | (windowBytes ? kv::componentBit(kv::Component::Window) : 0);
+  }
+  uint64_t slotBytes(kv::Components parts) const override {
+    return (parts & kv::componentBit(kv::Component::Base) ? 100 : 0) +
+           (parts & kv::componentBit(kv::Component::Window) ? windowBytes : 0);
+  }
+  // A whole copy's.
+  uint64_t slotBytes() const { return slotBytes(components()); }
   bool writable() const noexcept override { return writableFile; }
   bool persistent() const noexcept override { return persistentTier; }
-  void label(const std::shared_ptr<engine::KvDiskSlot> &slot, std::vector<std::byte> label) override {
-    static_cast<Slot &>(*slot).label = std::move(label);
+  void label(const std::shared_ptr<engine::KvDiskSlot> &slot, kv::Components parts,
+             std::vector<std::byte> label) override {
+    for (const kv::Component part : kv::kAllComponents)
+      if (parts & kv::componentBit(part)) static_cast<Slot &>(*slot).labels[static_cast<size_t>(part)] = label;
   }
   bool canDemote(engine::WriteClass write) const noexcept override {
     const auto kind = static_cast<size_t>(write);
     return writableFile && inFlight() < transferLimit && writesInFlight_[kind] < writeLimits[kind];
   }
   bool canRestore() const noexcept override { return inFlight() < transferLimit; }
-  std::shared_ptr<engine::KvDiskSlot> acquireSlot(kv::PageForm form, model::DiskBudget::Draw draw) override {
+  std::shared_ptr<engine::KvDiskSlot> acquireSlot(kv::Components parts, model::DiskBudget::Draw draw,
+                                                  std::shared_ptr<engine::KvDiskSlot> into) override {
     draws.push_back(draw);
-    if (budget ? !budget->reserve(slotBytes(form), draw) : slots >= capacity) return {};
-    return std::make_shared<Slot>(*this, slotBytes(form));
+    if (into ? into->parts() & parts : slots >= capacity && !budget) return {};
+    if (budget && !budget->reserve(slotBytes(parts), draw)) return {};
+    std::shared_ptr<Slot> copy = into ? std::static_pointer_cast<Slot>(into) : std::make_shared<Slot>(*this);
+    for (const kv::Component part : kv::kAllComponents)
+      if (parts & kv::componentBit(part)) copy->hold(part, slotBytes(kv::componentBit(part)));
+    return copy;
   }
   std::unique_ptr<engine::KvTransfer>
-  demote(uint32_t page, std::shared_ptr<engine::KvDiskSlot>, engine::WriteClass write,
-         std::function<void()>) override {
+  demote(std::span<const uint32_t> pages, const std::shared_ptr<engine::KvDiskSlot> &copy, kv::Components parts,
+         engine::WriteClass write, std::function<void()>) override {
     if (!canDemote(write)) return {};
+    requireParts(*copy, parts, engine::KvDiskSlot::Presence::Writing);
     ++demotions;
-    writes.push_back({page, write});
-    return start(write);
+    writes.push_back({pages.front(), write, parts});
+    blocks.emplace_back(pages.begin(), pages.end());
+    return start(write, std::static_pointer_cast<Slot>(copy), parts);
   }
   std::unique_ptr<engine::KvTransfer>
-  restore(std::shared_ptr<engine::KvDiskSlot>, uint32_t page, std::function<void()>) override {
+  restore(const std::shared_ptr<engine::KvDiskSlot> &copy, kv::Components parts, std::span<const uint32_t> pages,
+          std::function<void()>) override {
     ++restoreCalls;
     if (!canRestore()) return {};
+    requireParts(*copy, parts, engine::KvDiskSlot::Presence::Landed);
     ++restores;
-    restoredPages.push_back(page);
+    restoredPages.push_back(pages.front());
+    restoredParts.push_back(parts);
+    blocks.emplace_back(pages.begin(), pages.end());
     std::unique_ptr<engine::KvTransfer> transfer = start(std::nullopt);
     transfers.back()->submitted = false;
     return transfer;
+  }
+  void giveUp(const std::shared_ptr<engine::KvDiskSlot> &copy, kv::Components parts) override {
+    if (!parts || parts & ~copy->parts()) throw std::logic_error("a test tier's copy gave up a part it lacks");
+    for (const kv::Component part : kv::kAllComponents)
+      if (parts & kv::componentBit(part)) static_cast<Slot &>(*copy).release(part);
   }
   void submitRestores() override {
     for (const auto &transfer : transfers)
@@ -166,18 +193,33 @@ public:
   }
   [[nodiscard]] uint32_t inFlight() const noexcept { return inFlight_; }
   // The labels of the slots a persistent tier holds, as the next process
-  // finds them, and a slot that process takes back, of a page of the form
-  // its label names, within the tier's budget if it has one.
-  [[nodiscard]] std::vector<std::vector<std::byte>> labels() const {
+  // finds them, and a slot that process takes back, within the tier's
+  // budget if it has one.
+  [[nodiscard]] std::vector<std::vector<std::byte>> labels(kv::Component part = kv::Component::Base) const {
     std::vector<std::vector<std::byte>> result;
     for (const Slot *slot : live_)
-      if (!slot->label.empty()) result.push_back(slot->label);
+      if (!slot->labels[static_cast<size_t>(part)].empty()) result.push_back(slot->labels[static_cast<size_t>(part)]);
     return result;
   }
-  [[nodiscard]] std::shared_ptr<engine::KvDiskSlot> adopt(kv::PageForm form = kv::PageForm::Full) {
-    if (budget && !budget->reserve(slotBytes(form)))
-      throw std::logic_error("a test tier takes back only what its budget holds");
-    return std::make_shared<Slot>(*this, slotBytes(form));
+  // The labels a crash now leaves: those of the parts that landed, as a slot
+  // file writes a part's record once the part has landed.
+  [[nodiscard]] std::vector<std::vector<std::byte>> landedLabels(kv::Component part = kv::Component::Base) const {
+    std::vector<std::vector<std::byte>> result;
+    for (const Slot *slot : live_)
+      if (!slot->labels[static_cast<size_t>(part)].empty() &&
+          slot->presence(part) == engine::KvDiskSlot::Presence::Landed)
+        result.push_back(slot->labels[static_cast<size_t>(part)]);
+    return result;
+  }
+  [[nodiscard]] std::shared_ptr<engine::KvDiskSlot> adopt(kv::Component part = kv::Component::Base,
+                                                          std::shared_ptr<engine::KvDiskSlot> into = {}) {
+    const uint64_t bytes = slotBytes(kv::componentBit(part));
+    if ((into && into->presence(part) != engine::KvDiskSlot::Presence::None) || (budget && !budget->reserve(bytes)))
+      throw std::logic_error("a test tier takes back only what its budget holds, a part once");
+    std::shared_ptr<Slot> copy = into ? std::static_pointer_cast<Slot>(into) : std::make_shared<Slot>(*this);
+    copy->hold(part, bytes);
+    copy->presences[static_cast<size_t>(part)] = engine::KvDiskSlot::Presence::Landed;
+    return copy;
   }
 
   uint32_t slots = 0;
@@ -195,69 +237,99 @@ public:
   struct Write final {
     uint32_t page = 0;
     engine::WriteClass write = engine::WriteClass::Reclaim;
+    kv::Components parts = 0;
   };
   std::vector<Write> writes;
+  // Every transfer's block's pages, base page first, in the order asked.
+  std::vector<std::vector<uint32_t>> blocks;
   std::vector<model::DiskBudget::Draw> draws;
   // Restores started, every restore() call, and the pages of those started.
   uint32_t restores = 0;
   uint32_t restoreCalls = 0;
   std::vector<uint32_t> restoredPages;
+  std::vector<kv::Components> restoredParts;
   bool writableFile = true;
   bool persistentTier = false;
+  // A window part's bytes; none for a tier of one component.
+  uint64_t windowBytes = 0;
   std::vector<std::shared_ptr<Transfer>> transfers;
   std::optional<double> bytesPerMillisecond;
   std::function<double()> clock;
 
 private:
   struct Slot final : engine::KvDiskSlot, TestKvCopy {
-    Slot(TestKvTier &owner, uint64_t taken) : tier(owner), budget(owner.budget), taken_(taken) {
+    explicit Slot(TestKvTier &owner) : tier(owner), budget(owner.budget) {
       ++tier.slots;
       tier.live_.insert(this);
     }
     ~Slot() override {
       --tier.slots;
       tier.live_.erase(this);
-      if (budget) budget->release(taken_);
+      if (budget) budget->release(bytes());
     }
-    uint64_t bytes() const noexcept override { return taken_; }
+    uint64_t bytes() const noexcept override { return taken[0] + taken[1]; }
+    uint64_t bytes(kv::Component part) const noexcept override { return taken[static_cast<size_t>(part)]; }
+    Presence presence(kv::Component part) const noexcept override { return presences[static_cast<size_t>(part)]; }
+    void hold(kv::Component part, uint64_t bytes) {
+      taken[static_cast<size_t>(part)] = bytes;
+      presences[static_cast<size_t>(part)] = Presence::Writing;
+    }
+    void release(kv::Component part) {
+      if (budget) budget->release(taken[static_cast<size_t>(part)]);
+      taken[static_cast<size_t>(part)] = 0;
+      presences[static_cast<size_t>(part)] = Presence::None;
+      labels[static_cast<size_t>(part)].clear();
+    }
     TestKvTier &tier;
     std::shared_ptr<model::DiskBudget> budget;
-    std::vector<std::byte> label;
-
-  private:
-    uint64_t taken_;
+    std::array<std::vector<std::byte>, kv::kComponents> labels;
+    std::array<uint64_t, kv::kComponents> taken{};
+    std::array<Presence, kv::kComponents> presences{};
   };
+  static void requireParts(const engine::KvDiskSlot &copy, kv::Components parts, engine::KvDiskSlot::Presence presence) {
+    for (const kv::Component part : kv::kAllComponents)
+      if (parts & kv::componentBit(part) && copy.presence(part) != presence)
+        throw std::logic_error("a test tier's copy has not the parts a call needs");
+  }
   class Ticket final : public engine::KvTransfer {
   public:
-    Ticket(TestKvTier &owner, std::shared_ptr<Transfer> transfer,
-           std::optional<engine::WriteClass> write)
-        : tier_(owner), transfer_(std::move(transfer)), write_(write) {}
+    Ticket(TestKvTier &owner, std::shared_ptr<Transfer> transfer, std::optional<engine::WriteClass> write,
+           std::shared_ptr<Slot> copy, kv::Components parts)
+        : tier_(owner), transfer_(std::move(transfer)), write_(write), copy_(std::move(copy)), parts_(parts) {}
     bool ready() const noexcept override { return transfer_->ready; }
     bool finish() override {
       if (!transfer_->finished) {
         transfer_->finished = true;
         --tier_.inFlight_;
         if (write_) --tier_.writesInFlight_[static_cast<size_t>(*write_)];
+        // A written part lands with its write.
+        for (const kv::Component part : kv::kAllComponents)
+          if (copy_ && transfer_->success && parts_ & kv::componentBit(part) && copy_->bytes(part))
+            copy_->presences[static_cast<size_t>(part)] = Presence::Landed;
       }
       return transfer_->success;
     }
 
   private:
+    using Presence = engine::KvDiskSlot::Presence;
     TestKvTier &tier_;
     std::shared_ptr<Transfer> transfer_;
     std::optional<engine::WriteClass> write_;
+    std::shared_ptr<Slot> copy_;
+    kv::Components parts_;
   };
 
-  // A write of its class, or a restore.
-  std::unique_ptr<engine::KvTransfer> start(std::optional<engine::WriteClass> write) {
+  // A write of its class, of the copy's parts, or a restore.
+  std::unique_ptr<engine::KvTransfer> start(std::optional<engine::WriteClass> write,
+                                            std::shared_ptr<Slot> copy = {}, kv::Components parts = 0) {
     auto transfer = std::make_shared<Transfer>();
     transfer->write = write;
     if (bytesPerMillisecond)
-      transfer->dueMilliseconds = clock() + double(slotBytes(kv::PageForm::Full)) / *bytesPerMillisecond;
+      transfer->dueMilliseconds = clock() + double(slotBytes()) / *bytesPerMillisecond;
     transfers.push_back(transfer);
     ++inFlight_;
     if (write) ++writesInFlight_[static_cast<size_t>(*write)];
-    return std::make_unique<Ticket>(*this, std::move(transfer), write);
+    return std::make_unique<Ticket>(*this, std::move(transfer), write, std::move(copy), parts);
   }
 
   // The transfers from the first one not finished on: every one before it

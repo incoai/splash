@@ -4,6 +4,7 @@ import errno
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -228,6 +229,47 @@ class InstallerTest(unittest.TestCase):
             installer.selection_link(models, "owner/repo"), models / "owner/repo"
         )
 
+    def test_a_draft_revision_selects_an_installation_of_its_own(self):
+        # Each draft revision is its own installation; without one, a
+        # selection keeps the link it had before the option.
+        models = self.root / "models"
+        link = installer.selection_link
+        pinned = link(models, "owner/repo", draft_revision="e" * 40)
+        self.assertEqual(pinned, link(models, "owner/repo", draft_revision="e" * 40))
+        self.assertNotIn(
+            pinned,
+            (
+                link(models, "owner/repo", draft_revision="f" * 40),
+                link(models, "owner/repo"),
+            ),
+        )
+        self.assertEqual(
+            link(models, "owner/repo", revision="b" * 40),
+            installer._hashed_link(models, ["owner/repo", "b" * 40, False, None]),
+        )
+
+    def test_a_draft_revision_of_a_local_draft_directory_is_refused(self):
+        draft = self.root / "draft"
+        draft.mkdir()
+        for arguments in (
+            ["--draft-model", str(draft), "--draft-revision", "main"],
+            ["--draft-revision", "main", "--draft-model", str(draft)],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch("sys.stderr", io.StringIO()) as error,
+                self.assertRaises(SystemExit),
+            ):
+                installer.parse_args(["--model", "owner/repo", *arguments, "link"])
+            self.assertIn(installer.DRAFT_REVISION_OF_A_DIRECTORY, error.getvalue())
+        parsed = installer.parse_args(
+            ["--model", "owner/repo", "--draft-model", "owner/draft"]
+            + ["--draft-revision", "main", "link"]
+        )
+        self.assertEqual(
+            (parsed.draft_model, parsed.draft_revision), ("owner/draft", "main")
+        )
+
     def test_link_prints_the_selection_link_of_the_source_options(self):
         # make's MODEL_ROOT is this output; a relative draft folder names the
         # installation splash serve --draft-model selects from the same folder.
@@ -244,6 +286,10 @@ class InstallerTest(unittest.TestCase):
                     "language_only": True,
                     "draft_model": str(draft.resolve()),
                 },
+            ),
+            (
+                ["--model", "owner/repo", "--draft-revision", "e" * 40],
+                {"draft_revision": "e" * 40},
             ),
         ):
             with (
@@ -484,9 +530,10 @@ class ScriptEntryTests(unittest.TestCase):
             "import runpy, time\n"
             "from concurrent.futures import ThreadPoolExecutor\n"
             "from install import upstream\n"
+            "from install import models\n"
             "def prepare(selection):\n"
             "    ThreadPoolExecutor(1).submit(time.sleep, 60)\n"
-            "    raise KeyboardInterrupt\n"
+            "    raise models.Stopped(2)\n"
             "upstream.prepare = prepare\n"
             "runpy.run_path('install/models.py', run_name='__main__')\n"
         )
@@ -511,6 +558,52 @@ class ScriptEntryTests(unittest.TestCase):
         self.assertEqual(
             (result.returncode, result.stdout, result.stderr), (130, "", "")
         )
+
+    def test_a_stopped_installer_removes_its_scratch_folder(self):
+        # Its target's first megabytes wait in $TMPDIR while it downloads:
+        # 11 MB that a SIGTERM left behind.
+        script = (
+            "import runpy, tempfile, time\n"
+            "from install import upstream\n"
+            "def prepare(selection):\n"
+            "    with tempfile.TemporaryDirectory(prefix='splash-target-'):\n"
+            "        print('started', flush=True)\n"
+            "        time.sleep(30)\n"
+            "upstream.prepare = prepare\n"
+            "runpy.run_path('install/models.py', run_name='__main__')\n"
+        )
+        for number in (signal.SIGINT, signal.SIGTERM):
+            with (
+                self.subTest(signal=number.name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                scratch = Path(temporary) / "tmp"
+                scratch.mkdir()
+                with subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        "--models",
+                        temporary,
+                        "--model",
+                        "someone/model",
+                        "prepare",
+                    ],
+                    cwd=Path(installer.__file__).resolve().parents[1],
+                    env={
+                        "HOME": temporary,
+                        "HF_HUB_OFFLINE": "1",
+                        "TMPDIR": str(scratch),
+                    },
+                    stdout=subprocess.PIPE,
+                    text=True,
+                ) as program:
+                    self.assertEqual(program.stdout.readline(), "started\n")
+                    self.assertEqual(len(list(scratch.iterdir())), 1)
+                    program.send_signal(number)
+                    self.assertEqual(program.wait(30), 128 + number)
+                self.assertEqual(list(scratch.iterdir()), [])
 
 
 if __name__ == "__main__":

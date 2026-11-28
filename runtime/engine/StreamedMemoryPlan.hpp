@@ -59,6 +59,9 @@ struct StreamedMemoryInputs final {
   uint64_t kvSlotBytes = 0;
   uint64_t stateSlotBytes = 0;
   uint64_t activeLimitBytes = 0;
+  // A cached state's bytes in memory (model::CompositeStateLayout::
+  // cachedBytes), which the room for cached states is counted in.
+  uint64_t cachedStateBytes = 0;
   // The pages of a prefill group's rows (model::kPrefillGroupChunks chunks).
   uint32_t groupPages = 0;
   // The runtime's lanes, whose floors the hot block cache holds at most and
@@ -79,6 +82,10 @@ struct StreamedMemoryPlan final {
   uint64_t expertFloorBytes = 0;
   double expertFloorShare = model::kExpertFloorShare;
   uint64_t tableBytes = 0;
+  // The room an automatic experts' store that streams leaves cached states
+  // beside the K/V allowance (kvCachedStates), which the engine's plan keeps
+  // from the K/V capacity (ModelMemoryFootprint::cachedStatesBytes).
+  uint64_t cachedStatesBytes = 0;
   KvSpillPlan spill{};
 };
 

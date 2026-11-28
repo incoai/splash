@@ -9,8 +9,10 @@
 // a decode step's rows along their paths of each lane's tree, whose commit
 // writes the state after the path the lane accepts. A verify step's
 // convolution of a MoE block's combined rows runs in the combine's dispatch
-// (MoE::addCombineConvolution, of verifyParams' parameters), and its two
-// convolutions of one shape in one dispatch (addConvolutionPair).
+// (MoE::addCombineConvolution, of verifyParams' parameters), one whose
+// output a block residual mix reads in the mix's (BlockResidualStates::
+// convolution), and its two convolutions of one shape in one dispatch
+// (addConvolutionPair).
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ShortConvolution.h"
@@ -82,6 +84,23 @@ struct ShortConvCapture final {
   metal::MetalBuffer state;
 };
 
+// A verify step's convolution of static taps along the lanes' trees
+// (`layout`, `rows`, `tree`; lane l's state before its rows stateIn[l]),
+// each row's input into the tape at the state's columns, which another
+// operator's kernel runs in its own dispatch (ShortConvolution::
+// verifyParams): a block residual mix's of its current rows, Sum
+// (BlockResidualStates::convolution).
+struct ShortConvVerify final {
+  ShortConvBuffers buffers;
+  ShortConvShape shape;
+  std::span<const metal::MetalBuffer> stateIn;
+  ShortConvState state;
+  metal::MetalBuffer layout;
+  LayoutRows rows;
+  metal::MetalBuffer tree;
+  metal::MetalBuffer tape;
+};
+
 struct ShortConvolution final {
   // The bytes of a state matrix of `columns` columns.
   [[nodiscard]] static constexpr uint64_t stateBytes(uint32_t columns) noexcept {
@@ -118,16 +137,19 @@ struct ShortConvolution final {
                                  std::span<const metal::MetalBuffer> stateIn, metal::MetalBuffer layout,
                                  const LayoutRows &rows, metal::MetalBuffer tree, metal::MetalBuffer tape);
   // The parameters of a verify step's convolution (addConvolution's with
-  // `tree` and `tape`) of static taps, RoundedSum, that another operator's
-  // kernel runs on the rows it computes, in its own dispatch
-  // (MoE::addCombineConvolution): its buffers checked as addConvolution
-  // checks them, but buffers.input, which that kernel does not read; a view
-  // of wider input rows (inputStride, inputColumn) throws.
+  // `tree` and `tape`) of static taps that another operator's kernel runs in
+  // its own dispatch: RoundedSum on the rows that kernel computes
+  // (MoE::addCombineConvolution), its buffers checked as addConvolution
+  // checks them but buffers.input, which that kernel does not read, a view
+  // of wider input rows (inputStride, inputColumn) throwing; or Sum of
+  // buffers.input's rows, checked as addConvolution checks them (a block
+  // residual mix's current rows, BlockResidualStates::convolution).
   [[nodiscard]] static ShortConvolutionParams verifyParams(const ShortConvBuffers &buffers, ShortConvShape shape,
                                                            std::span<const metal::MetalBuffer> stateIn,
                                                            ShortConvState state, metal::MetalBuffer layout,
                                                            const LayoutRows &rows, metal::MetalBuffer tree,
-                                                           metal::MetalBuffer tape);
+                                                           metal::MetalBuffer tape,
+                                                           ShortConvOutput output = ShortConvOutput::RoundedSum);
   // The state after each lane's accepted path (`paths`, a row mask the GPU
   // wrote a lane, metal/abi/VerifyTree.h) of its verify block's rows in the
   // tape the step's convolutions wrote, as the step's layout holds them

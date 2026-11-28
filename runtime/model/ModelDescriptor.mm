@@ -2,6 +2,7 @@
 #include "GgufImage.hpp"
 #include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
+#include "SafetensorsTarget.hpp"
 #include "VisionLoader.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
@@ -170,24 +171,35 @@ void requireBooleans(NSDictionary *object, std::string_view where,
   }
 }
 
-// Each layer's type in a layer_types array: linear_attention for a GDN
-// layer; for an attention layer, sliding_attention where a window bounds it
-// (kv::Layout::windowed), else full_attention.
+// Each of `layers` layers' type in a layer_types array, the one
+// `expected(layer)` names, asked in layer order.
+template <class Expected>
+void requireLayerTypes(NSArray *types, uint32_t layers, Expected expected, std::string_view source,
+                       std::string_view label) {
+  if (types.count != layers)
+    throw std::invalid_argument(std::string(label) + " count mismatch: " + std::string(source) + " " +
+                                std::to_string(types.count) + ", runtime " + std::to_string(layers));
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+    NSString *type = expected(layer);
+    if (![types[layer] isEqual:type])
+      throw std::invalid_argument(std::string(label) + " " + std::to_string(layer) + " must be " + type.UTF8String);
+  }
+}
+
+// A target's: linear_attention for a GDN layer; for an attention layer,
+// sliding_attention where a window bounds it (kv::Layout::windowed), else
+// full_attention.
 void requireLayerTypes(NSArray *types, const QwenHybridLayout &target,
                        std::string_view source, std::string_view label) {
-  if (types.count != target.layers)
-    throw std::invalid_argument(std::string(label) + " count mismatch: " + std::string(source) +
-                                " " + std::to_string(types.count) + ", runtime " +
-                                std::to_string(target.layers));
-  for (uint32_t layer = 0, attention = 0; layer < target.layers; ++layer) {
-    NSString *expected = !target.isFullAttentionLayer(layer)       ? @"linear_attention"
-                         : target.kvLayout().windowed(attention++) ? @"sliding_attention"
-                                                                   : @"full_attention";
-    if (![types[layer] isEqual:expected])
-      throw std::invalid_argument(std::string(label) + " " +
-                                  std::to_string(layer) + " must be " +
-                                  expected.UTF8String);
-  }
+  uint32_t attention = 0;
+  requireLayerTypes(
+      types, target.layers,
+      [&](uint32_t layer) {
+        return !target.isFullAttentionLayer(layer)       ? @"linear_attention"
+               : target.kvLayout().windowed(attention++) ? @"sliding_attention"
+                                                         : @"full_attention";
+      },
+      source, label);
 }
 
 // Each family's native window, which its config's max_position_embeddings
@@ -208,12 +220,22 @@ std::string_view sourceName(TargetSource source) {
   return source == TargetSource::Safetensors ? "safetensors" : "GGUF";
 }
 
+// The model README.md's Models table lists for a family whose name is not
+// the family's, its fine-tune of the family's architecture.
+constexpr std::pair<std::string_view, std::string_view> kListedModels[]{
+    {"Qwen3.5-122B-A10B", "Ornith-1.5-122B"},
+};
+
 // The refusal of a model of none of the families Splash serves: what tells it
-// from the family its config's model type names, or that it names none.
+// from the family its config's model type names, or that it names none. Each
+// family is named, and after it the model the README lists for it where that
+// is another name, so a user finds the model they read of.
 std::invalid_argument unsupportedModel(const std::string &difference) {
   std::string supported;
   forEachFamily([&](const auto &layout) {
     supported += (supported.empty() ? "" : ", ") + std::string(layout.family);
+    for (const auto &[family, listed] : kListedModels)
+      if (family == layout.family) supported += " (" + std::string(listed) + ")";
   });
   return std::invalid_argument("no supported model has this architecture (" + difference + "); supported: " +
                                supported);
@@ -535,7 +557,8 @@ uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
 // module's format from its tensors, as MLX does (model/SafetensorsImage.hpp).
 // An entry that is not an object, false as MLX writes for a module it leaves
 // unquantized, names nothing to check: the images load such a projection as
-// Q8_0 and any other module as they read it unquantized.
+// Q8_0 (as stored under --weights original, gguf::float16Planes) and any
+// other module as they read it unquantized.
 void requireMlxQuantization(NSDictionary *quantization) {
   const auto require = [](NSDictionary *entry, const std::string &label, bool module) {
     NSString *mode = entry[@"mode"] ?: @"affine";
@@ -564,7 +587,7 @@ void requireMlxQuantization(NSDictionary *quantization) {
 // its quantized_layers or else by its quant_algo, holds NVFP4 in groups of 16
 // (NVFP4, W4A16_NVFP4) or FP8 with a scale per tensor (FP8), which the block
 // kernels read weights-only; a projection it leaves unquantized loads as Q8_0
-// (model/SafetensorsImage.hpp). Its activation and KV cache quantization play
+// or as stored, as --weights says (model/SafetensorsImage.hpp). Its activation and KV cache quantization play
 // no part: the kernels read activations in bf16 and keep Splash's own KV
 // formats.
 void requireModelOptimizerQuantization(NSDictionary *quantization) {
@@ -593,8 +616,8 @@ void requireModelOptimizerQuantization(NSDictionary *quantization) {
 // as unsloth's NVFP4 releases are): each config group's weights are NVFP4
 // (nvfp4-pack-quantized: float 4-bit by tensor_group in groups of 16) or FP8
 // (float-quantized: float 8-bit by channel or tensor), symmetric and in their
-// stored column order; a projection no group quantizes loads as Q8_0
-// (model/SafetensorsImage.hpp). Its activation and KV cache schemes play no
+// stored column order; a projection no group quantizes loads as Q8_0 or as
+// stored, as --weights says (model/SafetensorsImage.hpp). Its activation and KV cache schemes play no
 // part.
 void requireCompressedTensorsQuantization(NSDictionary *quantization) {
   NSDictionary *groups = quantization[@"config_groups"];
@@ -764,6 +787,11 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
                   targetLayers);
+  // Every layer slides (layer_types), as the draft kernels attend each
+  // layer's window (sliding_window) alone: a full layer read as sliding
+  // drafts from keys it was not trained on, and decodes slower.
+  requireLayerTypes(requireArray(draft, @"layer_types", "draft config layer_types"), layout.layers,
+                    [](uint32_t) { return @"sliding_attention"; }, "checkpoint", "draft config layer_types");
   return layout;
 }
 
@@ -778,14 +806,20 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
 void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                           TargetSource source) {
   if (layout.tower == ops::VisionTower::Inkling) {
-    requireEqual(requireString(vision, @"model_type", "vision config model_type"), "inkling2_vision",
-                 sourceName(source), "vision config model_type");
+    // Its model type and the width it projects into, its text model's, where
+    // it states them: a vision config that names neither is its checkpoint's
+    // tower, as a text_config that names no model type is its checkpoint's
+    // text model (describeSourceModel; ddalcu/Inkling-2-Mini-MLX-8bit's).
+    if (vision[@"model_type"])
+      requireEqual(requireString(vision, @"model_type", "vision config model_type"), "inkling2_vision",
+                   sourceName(source), "vision config model_type");
+    if (vision[@"text_hidden_size"])
+      requireNumbers(vision, sourceName(source), "vision config", {{"text_hidden_size", layout.outputHiddenSize}});
     requireNumbers(vision, sourceName(source), "vision config",
                    {{"num_hidden_layers", layout.depth},
                     {"hidden_size", layout.hiddenSize},
                     {"num_attention_heads", layout.heads},
                     {"mlp_ratio", double(layout.intermediateSize) / layout.hiddenSize},
-                    {"text_hidden_size", layout.outputHiddenSize},
                     {"projection_hidden_dim", layout.mergedHiddenSize},
                     {"posemb_grid_size", layout.positionGridSide},
                     {"layer_norm_eps", SPLASH_INKLING_VISION_NORM_EPSILON}});
@@ -854,7 +888,13 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   });
   NSDictionary *text = flat ? config : config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
-  const auto type = requireString(text, @"model_type", "text model type");
+  // A text_config that names no model type is its checkpoint's text model,
+  // whose type is the one its config names with _text after it, as every
+  // family's checkpoints name theirs (inkling2_loop_text of inkling2_loop;
+  // ddalcu/Inkling-2-Mini-MLX-8bit's text_config names none, and
+  // install/gguf.py names a GGUF's checkpoint by the same rule).
+  const std::string type = text[@"model_type"] ? requireString(text, @"model_type", "text model type")
+                                               : requireString(config, @"model_type", "model type") + "_text";
   TargetSource targetSource;
   // "mlx-affine" names every safetensors target, as installations record it.
   if (targetFormat == "mlx-affine") targetSource = TargetSource::Safetensors;
@@ -1001,7 +1041,8 @@ std::vector<FamilyFacts> familyFacts() {
                      .sparseKv = sparseKvShape(layout).has_value(),
                      .denseFfn = layout.ffnKind == QwenFfnKind::Dense,
                      .contextTokens = layout.nativeContextTokens,
-                     .maximumContextTokens = layout.maximumContextTokens()});
+                     .maximumContextTokens = layout.maximumContextTokens(),
+                     .activations = layout.activations == ops::Int8Activations::On ? "auto" : "bf16"});
   });
   return facts;
 }
@@ -1028,21 +1069,40 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
 
 std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                                             const std::filesystem::path &config,
-                                            const std::optional<std::filesystem::path> &ggufHeaders,
-                                            const std::optional<std::filesystem::path> &draft) {
+                                            const std::optional<std::filesystem::path> &targetHeaders,
+                                            const std::optional<std::filesystem::path> &draft,
+                                            std::optional<bool> *quantizableWeights) {
   @autoreleasepool {
     NSDictionary *target = readObject(config, "upstream model config");
     NSDictionary *checkpoint = draft ? readObject(*draft, "draft config") : nil;
     // Unnamed: the record names an installation, which this precedes.
     const ModelDescriptor descriptor = describeSourceModel({}, targetFormat, visionFormat, target, checkpoint);
     if (descriptor.targetSource == TargetSource::Gguf) {
-      if (!ggufHeaders) throw std::invalid_argument("a GGUF target is checked with its headers");
-      const OpenGguf headers(findTargetGgufs(*ggufHeaders), GgufContents::Headers);
+      if (!targetHeaders) throw std::invalid_argument("a GGUF target is checked with its headers");
+      const OpenGguf headers(findTargetGgufs(*targetHeaders), GgufContents::Headers);
       std::visit(
           [&](const auto &layout) {
-            static_cast<void>(ggufTargetPlan(layout).images(headers.file(), {}));
+            const auto formats = [&](gguf::Float16Weights weights) {
+              std::vector<std::string> result;
+              for (const gguf::Image &image : ggufTargetPlan(layout).images(headers.file(), {.weights = weights}))
+                result.push_back(gguf::imageFormats(image));
+              return result;
+            };
+            const bool differ = formats(gguf::Float16Weights::Q8_0) != formats(gguf::Float16Weights::Published);
+            if (quantizableWeights) *quantizableWeights = differ;
           },
           descriptor.target);
+    } else if (targetHeaders && quantizableWeights) {
+      // A checkpoint whose headers do not plan is refused when it loads, not
+      // here: what --weights auto does to it stays unsaid.
+      try {
+        const SafetensorsCheckpoint checkpoint(*targetHeaders);
+        *quantizableWeights = std::visit(
+            [&](const auto &layout) { return weightsAutoChanges(safetensorsTargetPlan(layout), checkpoint); },
+            descriptor.target);
+      } catch (const std::exception &) {
+        quantizableWeights->reset();
+      }
     }
     return descriptor.family();
   }

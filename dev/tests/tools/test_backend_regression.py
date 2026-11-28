@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from dev.benchmarks import backend_regression as regression
-from dev.benchmarks import weights
+from dev.benchmarks import chat_prompts, weights
 from dev.tests import smoke_real as smoke
 
 CONTEXT = 262144
@@ -335,6 +335,8 @@ class BackendRegressionTests(unittest.TestCase):
         honours_share=True,
         context=CONTEXT,
         minimum_rows=832,
+        units=None,
+        two_steps=None,
     ):
         """A checkout whose backend-benchmark prints canned output of every
         scenario and logs the scenarios it was given, and whose
@@ -342,8 +344,11 @@ class BackendRegressionTests(unittest.TestCase):
         after its library in digests.log. Its benchmark serves context tokens
         and has the Neural Engine split: it reports share and minimum_rows as
         calibrated, no rows for share 0, or runs the share --ane-ffn-share
-        gives and the rows --ane-ffn-minimum-rows gives, else 512, unless
-        honours_share is false, and logs what it was given."""
+        gives, in whole units of `units` where given, and the rows
+        --ane-ffn-minimum-rows gives, else 512, unless honours_share is
+        false, and logs what it was given. Its start logs its split: a
+        calibrated one of `two_steps`, a share in two steps from 1024 rows,
+        reports the larger share, as RuntimeResources::aneFfnShare."""
         checkout = root / name
         (checkout / "build/engine-tests").mkdir(parents=True)
         (checkout / "build/splash.metallib").write_text("")
@@ -364,6 +369,9 @@ class BackendRegressionTests(unittest.TestCase):
             "scenarios = sys.argv[sys.argv.index('--scenario') + 1].split(',')\n"
             f"with open({str(root / 'calls.jsonl')!r}, 'a') as log:\n"
             f"    log.write(json.dumps([{name!r}, scenarios]) + '\\n')\n"
+            "prompts = sys.argv[sys.argv.index('--prompts') + 1] if '--prompts' in sys.argv else None\n"
+            f"with open({str(root / 'prompts.jsonl')!r}, 'a') as log:\n"
+            f"    log.write(json.dumps([{name!r}, prompts]) + '\\n')\n"
             f"document = json.loads({json.dumps(json.dumps(document))})\n"
             "option = lambda name: sys.argv[sys.argv.index(name) + 1] "
             "if name in sys.argv else None\n"
@@ -371,20 +379,38 @@ class BackendRegressionTests(unittest.TestCase):
             f"with open({str(root / 'shares.jsonl')!r}, 'a') as log:\n"
             f"    log.write(json.dumps([{name!r}, given, rows]) + '\\n')\n"
             "document['ane_ffn_share'] = "
-            + ("float(given) if given else " if honours_share else "")
-            + f"{share!r}\n"
+            + (
+                (
+                    f"round(float(given) * {units}) / {units} if given else "
+                    if units
+                    else "float(given) if given else "
+                )
+                if honours_share
+                else ""
+            )
+            + f"max({share!r}, {two_steps or 0.0!r})\n"
             + "document['ane_ffn_minimum_rows'] = 0 if not document['ane_ffn_share'] "
             + ("else int(rows) if rows else 512 if given " if honours_share else "")
             + f"else {minimum_rows!r}\n"
-            + "print(json.dumps(document))\n"
+            + "share, rows = document['ane_ffn_share'], document['ane_ffn_minimum_rows']\n"
+            + "two = ' and %.2f in two steps from 1024 rows' % "
+            + f"({two_steps!r} or share if not given else share)\n"
+            + "print('12:00:00 Setting up the Neural Engine FFN split.', file=sys.stderr)\n"
+            + "print('12:00:01 ' + ('The GPU runs the prefill FFN alone.' if not share else "
+            "'Neural Engine FFN split at %s%.2f for chunks of %d rows or more%s (0.1 s).' % "
+            + f"('the given share ' if given else 'share ', share if given else {share!r}, "
+            "rows, two)), file=sys.stderr)\n"
+            + "print('12:00:02 Runtime precision: the Neural Engine FFN split multiplies "
+            "its share in int8.', file=sys.stderr)\n" + "print(json.dumps(document))\n"
         )
         script.chmod(0o755)
         return checkout
 
     @staticmethod
-    def run_main(root: Path, *options: str) -> int:
+    def run_main(root: Path, *options: str, prompts=None) -> int:
         """main with these options on the fake checkouts under root and an
-        installed model."""
+        installed model whose tokenizer and chat template give prompts, by
+        default the benchmark's built-in ones."""
         models = root / "models"
         assembly = models / ".resolved/assembly"
         assembly.mkdir(parents=True)
@@ -405,6 +431,11 @@ class BackendRegressionTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(smoke.model_artifacts, "MODELS", models),
+            mock.patch.object(
+                chat_prompts,
+                "model_prompts",
+                return_value=chat_prompts.builtin() if prompts is None else prompts,
+            ),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
@@ -419,8 +450,10 @@ class BackendRegressionTests(unittest.TestCase):
             script.write_text(
                 script.read_text().replace(
                     "print(json.dumps(document))\n",
-                    "print('backend-benchmark: request failed: boom', file=sys.stderr)\n"
-                    "raise SystemExit(1)\n",
+                    "if 'decode' in scenarios:\n"
+                    "    print('backend-benchmark: request failed: boom', file=sys.stderr)\n"
+                    "    raise SystemExit(1)\n"
+                    "print(json.dumps(document))\n",
                 )
             )
             with self.assertRaisesRegex(
@@ -433,10 +466,12 @@ class BackendRegressionTests(unittest.TestCase):
             )
             self.assertFalse(document["pass"])
             self.assertIn("without JSON", document["error"])
-            # The baseline's first round ran; nothing after the failure did.
+            # The candidate's calibration start and the baseline's first
+            # round ran; nothing after the failure did.
             calls = (root / "calls.jsonl").read_text().splitlines()
             self.assertEqual(
-                [json.loads(line)[0] for line in calls], ["baseline", "candidate"]
+                [json.loads(line)[0] for line in calls],
+                ["candidate", "baseline", "candidate"],
             )
 
     def test_main_runs_abba_rounds_and_compares_the_weights(self):
@@ -454,7 +489,8 @@ class BackendRegressionTests(unittest.TestCase):
             ]
             self.assertEqual(
                 calls,
-                [
+                [["candidate", ["short"]]]
+                + [
                     [version, list(regression.SCENARIOS)]
                     for version in regression.ROUNDS
                 ],
@@ -516,6 +552,54 @@ class BackendRegressionTests(unittest.TestCase):
                     errors.getvalue(),
                 )
 
+    def test_every_load_sends_the_models_own_chat_requests(self):
+        # A model whose tokenizer and chat template give the built-in tokens,
+        # Qwen's, loads without --prompts, as before.
+        self.assertEqual(len(chat_prompts.builtin()), len(chat_prompts.TEXTS))
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", "a" * 64)
+            self.fake_checkout(root, "candidate", "a" * 64)
+            self.assertEqual(self.run_main(root), 0)
+            given = [
+                json.loads(line)
+                for line in (root / "prompts.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual({prompts for _name, prompts in given}, {None})
+            self.assertFalse((root / "release/prompts.txt").exists())
+            document = json.loads(
+                (root / "release/backend-regression.json").read_text()
+            )
+            self.assertEqual(document["prompts"], "built-in")
+
+        # Another family's tokens go to the calibration and every round.
+        own = [[1, 2, 3]] + [
+            [4 + index, 5] for index in range(len(chat_prompts.TEXTS) - 1)
+        ]
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", "a" * 64)
+            self.fake_checkout(root, "candidate", "a" * 64)
+            self.assertEqual(self.run_main(root, prompts=own), 0)
+            path = root / "release/prompts.txt"
+            given = [
+                json.loads(line)
+                for line in (root / "prompts.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                given,
+                [["candidate", str(path)]]
+                + [[version, str(path)] for version in regression.ROUNDS],
+            )
+            self.assertEqual(
+                path.read_text().splitlines(),
+                [" ".join(map(str, tokens)) for tokens in own],
+            )
+            document = json.loads(
+                (root / "release/backend-regression.json").read_text()
+            )
+            self.assertEqual(document["prompts"], str(path))
+
     def test_both_builds_load_the_compared_images_as_the_options_say(self):
         # The options stream the routed experts and the PLE table in each
         # build's weight-digests, and only where they are given; the result
@@ -553,14 +637,19 @@ class BackendRegressionTests(unittest.TestCase):
                     regression.report(document)
                 self.assertIn(reported, printed.getvalue().splitlines())
 
-    def test_later_rounds_run_the_first_reported_ane_ffn_split(self):
-        # The baseline calibrates first, and the candidate runs its share and
-        # least chunk rows.
+    def test_every_round_runs_the_split_the_candidate_calibrates(self):
+        # The baseline would calibrate a split of two shares, 0.26 in one
+        # step and 0.44 in two, and report 0.44 from 531 rows; the
+        # candidate's start calibrates 10 of 34 units from 832 rows before
+        # the rounds, and all four rounds, the baseline's first among them,
+        # run that split.
         calibrated = 1 - 24 / 34
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            self.fake_checkout(root, "baseline", "a" * 64, calibrated)
-            self.fake_checkout(root, "candidate", "a" * 64, 0.32, minimum_rows=896)
+            self.fake_checkout(
+                root, "baseline", "a" * 64, 0.26, minimum_rows=531, two_steps=0.44
+            )
+            self.fake_checkout(root, "candidate", "a" * 64, calibrated)
             self.assertEqual(self.run_main(root), 0)
             shares = [
                 json.loads(line)
@@ -568,12 +657,8 @@ class BackendRegressionTests(unittest.TestCase):
             ]
             self.assertEqual(
                 shares,
-                [
-                    ["baseline", None, None],
-                    ["candidate", repr(calibrated), "832"],
-                    ["candidate", repr(calibrated), "832"],
-                    ["baseline", repr(calibrated), "832"],
-                ],
+                [["candidate", None, None]]
+                + [[version, repr(calibrated), "832"] for version in regression.ROUNDS],
             )
             document = json.loads(
                 (root / "release/backend-regression.json").read_text()
@@ -582,11 +667,32 @@ class BackendRegressionTests(unittest.TestCase):
                 (document["ane_ffn_share"], document["ane_ffn_minimum_rows"]),
                 (calibrated, 832),
             )
-        args = SimpleNamespace(
-            ane_ffn_share=0.3,
-            ane_ffn_minimum_rows=832,
-            ane_ffn_share_given=False,
-        )
+            self.assertEqual(
+                [
+                    (record["ane_ffn"]["share"], record["ane_ffn"]["minimum_rows"])
+                    for record in document["rounds"]
+                ],
+                [(calibrated, 832)] * 4,
+            )
+            # The result says the split the calibration chose and each
+            # round ran, as their starts logged them.
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                regression.report(document)
+            lines = printed.getvalue().splitlines()
+            self.assertIn(
+                "Neural Engine split calibrated by the candidate: Neural Engine "
+                "FFN split at share 0.29 for chunks of 832 rows or more and 0.29 "
+                "in two steps from 1024 rows (0.1 s).",
+                lines,
+            )
+            for index, version in enumerate(regression.ROUNDS):
+                self.assertIn(
+                    f"round {index + 1} {version}: Neural Engine FFN split at the "
+                    "given share 0.29 for chunks of 832 rows or more and 0.29 in "
+                    "two steps from 1024 rows (0.1 s).",
+                    lines,
+                )
+        args = SimpleNamespace(ane_ffn_share=0.3, ane_ffn_split=None)
         regression.pin_ane_ffn(
             args, {"ane_ffn_share": 0.3, "ane_ffn_minimum_rows": 832}
         )
@@ -598,9 +704,22 @@ class BackendRegressionTests(unittest.TestCase):
                 args, {"ane_ffn_share": 0.3, "ane_ffn_minimum_rows": 512}
             )
 
-    def test_a_first_round_without_the_split_pins_no_share(self):
-        # After a first round that ran no split, every later round runs as it
-        # is, not as --ane-ffn-share 0, which would serve another context.
+    def test_rounds_of_different_splits_fail_the_comparison(self):
+        rounds = [
+            regression.round_record(version, benchmark_document(build=version))
+            for version in regression.ROUNDS
+        ]
+        rounds[0]["ane_ffn"] = {"share": 0.44, "minimum_rows": 531, "log": None}
+        summary = regression.summarize(rounds, expect_output_change=False)
+        self.assertIn(
+            "rounds ran different Neural Engine splits (share, least rows): "
+            "[(0.0, 0), (0.44, 531)]",
+            summary["failures"],
+        )
+
+    def test_a_calibration_without_the_split_pins_no_share(self):
+        # After a calibration that ran no split, every round runs as it is,
+        # not as --ane-ffn-share 0, which would serve another context.
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             self.fake_checkout(root, "baseline", "a" * 64)
@@ -611,7 +730,9 @@ class BackendRegressionTests(unittest.TestCase):
                 for line in (root / "shares.jsonl").read_text().splitlines()
             ]
             self.assertEqual(
-                shares, [[version, None, None] for version in regression.ROUNDS]
+                shares,
+                [["candidate", None, None]]
+                + [[version, None, None] for version in regression.ROUNDS],
             )
 
     def test_a_round_that_runs_another_ane_ffn_share_fails(self):
@@ -656,6 +777,48 @@ class BackendRegressionTests(unittest.TestCase):
                 r"at share 0.32, not the given 0.0",
             ):
                 self.run_main(root, "--ane-ffn-share", "0")
+
+    def test_a_given_share_runs_at_the_whole_units_it_rounds_to(self):
+        # 0.44 of 34 units runs as 15 of them, 0.4411..., in every round.
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", "a" * 64, 0.26, units=34)
+            self.fake_checkout(root, "candidate", "a" * 64, 0.29, units=34)
+            self.assertEqual(self.run_main(root, "--ane-ffn-share", "0.44"), 0)
+            shares = [
+                json.loads(line)
+                for line in (root / "shares.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                shares, [[version, "0.44", None] for version in regression.ROUNDS]
+            )
+            document = json.loads(
+                (root / "release/backend-regression.json").read_text()
+            )
+            self.assertEqual(
+                (document["ane_ffn_share"], document["ane_ffn_minimum_rows"]),
+                (15 / 34, 512),
+            )
+            self.assertNotIn("ane_ffn_calibration", document)
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                regression.report(document)
+            self.assertIn(
+                "round 1 baseline (given share 0.44): Neural Engine FFN split at "
+                "the given share 0.44 for chunks of 512 rows or more and 0.44 in "
+                "two steps from 1024 rows (0.1 s).",
+                printed.getvalue().splitlines(),
+            )
+        # A build that runs no split for a given share fails.
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", "a" * 64, units=34)
+            self.fake_checkout(root, "candidate", "a" * 64, honours_share=False)
+            with self.assertRaisesRegex(
+                regression.RegressionError,
+                r"round-2-candidate-decode-partial-short-transcripts: ran no Neural "
+                r"Engine split, not the share 0.44 it was given",
+            ):
+                self.run_main(root, "--ane-ffn-share", "0.44")
 
     def test_an_ane_ffn_share_outside_zero_to_one_is_refused(self):
         for value in ("1", "1.5", "-0.1", "nan", "inf", "half"):

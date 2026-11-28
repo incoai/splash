@@ -23,6 +23,9 @@ constexpr uint32_t kMessages = 4;
 // chunk's single rows, which hold those of the most rows the fused gates
 // take; a longer chunk's tiled gates keep each gate's gated rows in its own
 // of the forget, gain and concatenation rows, fp32 rows of hiddenSize each.
+// The fused gates' calls, of at most kFusedRows rows, read their mixes' and
+// messages' normalized rows, which their mixes write
+// (ops::MessageGate::readsNormalized): rows of the most rows they take.
 static_assert(kMixerQueries <= ops::MessageGate::kMaximumGates, "a layer's mixer gates run as one call");
 static_assert(kChunkRows >= kMixerQueries * ops::MessageGate::kFusedRows,
               "a prompt chunk's gated rows hold its fused gates' of their most rows");
@@ -72,7 +75,10 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
       {&Inkling2LoopScratch::valueTaps, bytesFor<uint16_t>(taps), 0, false},
       {&Inkling2LoopScratch::convolvedKeys, bytesFor<uint16_t>(kv), 0, false},
       {&Inkling2LoopScratch::convolvedValues, bytesFor<uint16_t>(kv), 0, false},
-      {&Inkling2LoopScratch::gateConcat, bytesFor<uint16_t>(2 * hidden), 0, false},
+      {&Inkling2LoopScratch::normalizedMixed, 0,
+       bytesFor<uint16_t>(uint64_t{ops::MessageGate::kFusedRows} * kMixerQueries * hidden), false},
+      {&Inkling2LoopScratch::normalizedMessages, 0,
+       bytesFor<uint16_t>(uint64_t{ops::MessageGate::kFusedRows} * kMessages * hidden), false},
       {&Inkling2LoopScratch::gateLow, bytesFor<uint16_t>(kMixerQueries * shape.gateRank), 0, false},
       {&Inkling2LoopScratch::gateForget, bytesFor<float>((decode ? kMixerQueries : 1) * hidden), 0, false},
       {&Inkling2LoopScratch::gateGain, bytesFor<float>(hidden), 0, false},
@@ -88,6 +94,9 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
     result.push_back({&Inkling2LoopScratch::tape, bytesFor<uint16_t>(schedule.stateColumns()), 0, false});
     result.push_back({&Inkling2LoopScratch::attentionCounters, 0, ops::RelativeAttention::kCountersBytes, false});
   } else {
+    // A prompt chunk's of more rows than the fused gates take: the tiled
+    // gates' third gated rows.
+    result.push_back({&Inkling2LoopScratch::gateConcat, bytesFor<uint16_t>(2 * hidden), 0, false});
     result.push_back({&Inkling2LoopScratch::relativeStates, bytesFor<float>(relative),
                       bytesFor<float>(stagedLaneRows * relative), false});
     result.push_back({&Inkling2LoopScratch::rowSinks, bytesFor<float>(g.attentionQueryHeads),

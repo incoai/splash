@@ -31,7 +31,8 @@ static_assert(kTower.headDimension == 64 && kTower.heads * kTower.headDimension 
 
 // Scratch tensor byte sizes for one encoder sized to maximumPatches, whose
 // images have a token more, their class token's. The projections read whole
-// row tiles, attention reads whole key tiles, and the merger reads the patch
+// row tiles, and a Q8_0 one writes them into the residual rows where they
+// hold them (DenseLinear::add), attention reads whole key tiles, and the merger reads the patch
 // rows as (patches / 4, 4096), which the normalized rows (its input) and the
 // q/k/v rows (its hidden rows) hold.
 std::array<uint64_t, 11> scratchLayout(const VisionLayout &layout, uint32_t maximumPatches) {
@@ -45,7 +46,7 @@ std::array<uint64_t, 11> scratchLayout(const VisionLayout &layout, uint32_t maxi
       rows * layout.paddedPatchDimension * kBf16Bytes,                                // Patches
       uint64_t{tokens} * layout.headDimension * kFloatBytes,                          // RopeCos
       uint64_t{tokens} * layout.headDimension * kFloatBytes,                          // RopeSin
-      uint64_t{tokens} * hidden * kFloatBytes,                                        // Hidden
+      rows * hidden * kFloatBytes,                                                    // Hidden
       std::max(rows * hidden, mergedRows * layout.mergedHiddenSize) * kBf16Bytes,     // Normalized
       std::max(rows * 3 * hidden, mergedRows * layout.mergedHiddenSize) * kBf16Bytes, // Qkv
       rows * layout.intermediateSize * kBf16Bytes,                                    // Intermediate
@@ -61,7 +62,8 @@ void requireLayout(const VisionLayout &layout) {
     throw std::invalid_argument("Inkling vision kernels are specialized for its 23-block tower");
 }
 
-// Every weight the kernels read: bf16 [output][input] matrices with a bias
+// Every weight the kernels read: bf16 [output][input] matrices, or Q8_0
+// planes of them (the blocks' and the merger's), with a bias
 // per output (the patch embedding's and the projector's zero), LayerNorm
 // weights and biases, the LayerScales of the blocks' output projections,
 // the class token's two rows and the learned position of every cell of the

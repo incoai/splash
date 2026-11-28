@@ -360,7 +360,7 @@ SyntheticAccounting writeSyntheticModel(const std::filesystem::path &root, const
          return model::safetensors::planImages(checkpoint, target, model::safetensors::normStorage(checkpoint, target));
        }())
     targetBytes += image.bytes;
-  return {targetBytes, model::draftImageBytes(root / "draft", draft), model::visionImageBytes(vision)};
+  return {targetBytes, model::draftImageBytes(root / "draft", draft), model::VisionLoader(root / "vision", model::VisionSource::Safetensors, vision).image().bytes};
 }
 
 } // namespace splash::test

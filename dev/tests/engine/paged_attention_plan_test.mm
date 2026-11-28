@@ -1,6 +1,7 @@
 #include "ChainRows.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "ops/AttentionPlanning.hpp"
 #include "ops/PagedAttention.hpp"
 #include "model/RopeScaling.hpp"
 #include "ops/RoPE.hpp"
@@ -2153,7 +2154,7 @@ void checkPathCommit(metal::MetalBackend &backend, kv::Layout layout) {
   const metal::MetalBuffer pathBuffer = test::sharedBuffer(backend, sizeof(paths));
   std::memcpy(pathBuffer.contents(), paths.data(), sizeof(paths));
   metal::CommandGraph graph;
-  ops::PagedAttention::addPathCommit(graph, layout, pool.extentPages(), tables, committed, kRows, pathBuffer);
+  ops::PagedAttention::addPathCommit(graph, layout, layout.pageSlots(), pool.extentPages(), tables, committed, kRows, pathBuffer);
   (void)backend.submitCommandAsync(graph.dispatches()).wait();
   for (uint32_t extent = 0; extent < pool.extentCount(); ++extent)
     require(std::equal(expected[extent].begin(), expected[extent].end(), pool.bytes(extent).begin()),
@@ -2165,11 +2166,67 @@ void checkPathCommit(metal::MetalBackend &backend, kv::Layout layout) {
       [&] {
         metal::CommandGraph refused;
         const std::array<metal::MetalBuffer, 1> shorter{test::sharedBuffer(backend, sizeof(SplashKvPage))};
-        ops::PagedAttention::addPathCommit(refused, layout, pool.extentPages(), shorter, std::array{31U}, 2,
+        ops::PagedAttention::addPathCommit(refused, layout, layout.pageSlots(), pool.extentPages(), shorter, std::array{31U}, 2,
                                            pathBuffer);
       },
       "page table buffer holds", what + ": a table short of a block's slots was accepted");
   std::cout << what << ": PASS\n";
+}
+
+// The decode law (AttentionPlanning.hpp): a pass's modeled time of strict
+// waves, the bias in the last wave, and the queue past the resident
+// threadgroups, written out; and its picks' bounds over GPUs of 10 to 80
+// cores: within the kernel's most splits, a page's one split, a step of more
+// lanes no faster than one of them alone, one on more cores no slower, with
+// and without the DRAM term and the queue.
+void checkDecodeLaw() {
+  // 6 threadgroups of 2 pages over 4 cores keeping 4: a wave of 4, then one of
+  // 2 with the last splits' bias, then 3 splits' combine.
+  ops::DecodeTileCosts tile{.residentPerFourCores = 4, .splitNs = 10, .pageNs = 100, .int8PageNs = 90, .biasNs = 5,
+                            .corePageNs = 7, .dramSharePermille = 0, .combineNs = 1};
+  // Over 2 cores keeping 4, a wave's busiest core holds 2: a page 7 more.
+  ops::DecodeTileCosts dense = tile;
+  dense.residentPerFourCores = 8;
+  require(ops::decodePassNanoseconds(tile, 4, 0, 0, 6, 3, 2, 1, false) == (10 + 200) + (10 + 200 + 5) + 3 &&
+              ops::decodePassNanoseconds(tile, 4, 0, 0, 6, 3, 2, 1, true) == (10 + 180) + (10 + 180 + 5) + 3 &&
+              ops::decodePassNanoseconds(dense, 2, 0, 0, 4, 2, 2, 1, false) == (10 + 2 * 107 + 5) + 2,
+          "the decode law's strict waves are another time");
+  // The queue of 2 pages: its 6 threadgroups' work over the 4 resident, one
+  // threadgroup more, the bias and the combine, half the step's time.
+  tile.queuePages = 2;
+  require(ops::decodePassNanoseconds(tile, 4, 0, 0, 6, 3, 2, 1, false) == (428 * 2 + (10 + 300 + 200 + 5 + 3) * 2) / 4 &&
+              ops::decodePassNanoseconds(tile, 4, 0, 0, 4, 2, 2, 1, false) == (10 + 200 + 5) + 2,
+          "the decode law's queue is another time");
+  const ops::DecodeTileCosts costs{.residentPerFourCores = 20, .splitNs = 5000, .pageNs = 2400, .int8PageNs = 2100,
+                                   .biasNs = 1500, .corePageNs = 30, .dramSharePermille = 470, .combineNs = 800};
+  const auto pick = [&](const ops::DecodeTileCosts &row, uint64_t pages, uint32_t lanes, uint32_t cores,
+                        uint64_t bytesPerSecond) {
+    const std::vector<uint64_t> all(lanes, pages);
+    const ops::DecodePages step{.lanePages = all, .groupsPerLane = 8, .pageBytes = 8448, .biasedPages = 34,
+                                .mostSplits = 32, .int8FromPages = 8};
+    return ops::decodePagesPerSplit(row, step, cores, bytesPerSecond);
+  };
+  bool capped = true, one = true, lanes = true, more = true;
+  for (const uint32_t queue : {0U, 12U})
+    for (const uint64_t bytesPerSecond : {uint64_t{0}, uint64_t{273'000'000'000}}) {
+      ops::DecodeTileCosts row = costs;
+      row.queuePages = queue;
+      for (const uint32_t cores : {10U, 12U, 16U, 20U, 32U, 40U, 64U, 80U}) {
+        capped = capped && (1025 + pick(row, 1025, 1, cores, bytesPerSecond).per - 1) /
+                                   pick(row, 1025, 1, cores, bytesPerSecond).per <=
+                               32;
+        one = one && pick(row, 1, 1, cores, bytesPerSecond).per == 1;
+        for (const uint64_t pages : {uint64_t{9}, uint64_t{34}, uint64_t{257}, uint64_t{1025}}) {
+          lanes = lanes && pick(row, pages, 4, cores, bytesPerSecond).nanoseconds >=
+                               pick(row, pages, 1, cores, bytesPerSecond).nanoseconds;
+          more = more && pick(row, pages, 1, 2 * cores, bytesPerSecond).nanoseconds <=
+                             pick(row, pages, 1, cores, bytesPerSecond).nanoseconds;
+        }
+      }
+    }
+  require(capped && one && lanes && more, "the decode law's picks break its bounds");
+  rejects([&] { static_cast<void>(pick(ops::DecodeTileCosts{}, 34, 1, 20, 0)); }, "a device's cores",
+          "a decode step of a tile of no costs was planned");
 }
 
 int main(int argc, char **argv) {
@@ -2181,6 +2238,7 @@ int main(int argc, char **argv) {
         checkGrouping(geometry.queryHeads, geometry.layout(format));
         checkInt8Queries(geometry.queryHeads, geometry.layout(format));
       }
+    checkDecodeLaw();
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;

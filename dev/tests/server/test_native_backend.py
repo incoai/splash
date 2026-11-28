@@ -499,7 +499,16 @@ class NativeBackendContractTests(unittest.TestCase):
             transport.submit(job)
             process = factory.processes[0]
             frame = process.stdin.wait_for(wire.RequestFrame)[0]
-            process.send(wire.StartEvent(frame.request_id, 0, 0))
+            process.send(
+                wire.StartEvent(
+                    frame.request_id,
+                    0,
+                    0,
+                    96,
+                    reuse_end=wire.ReuseEnd.KV_WITHOUT_STATE,
+                    reuse_end_tokens=96,
+                )
+            )
             process.send(wire.TokensEvent(frame.request_id, 0, (7,)))
             self.assertEqual(job.events.get(timeout=1.0), ("start", None))
             self.assertEqual(job.events.get(timeout=1.0), ("text", "7"))
@@ -515,7 +524,15 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         # Both name the request as the engine knows it.
         request = f"request {frame.request_id}"
-        self.assertEqual(lines[0], f"Started · {request} · input 4 · cached 0")
+        # The start says why its reuse stopped: KV matched past any state.
+        self.assertEqual(
+            lines[0],
+            f"Started · {request} · input 4 · cached 0"
+            " · reuse ended: KV matched 96 tokens past the last state",
+        )
+        self.assertEqual(
+            (job.cache.reuse_end, job.cache.reuse_end_tokens), ("kv_without_state", 96)
+        )
         self.assertTrue(
             lines[1].startswith(f"Done · {request} · input 4 · cached 0 · output 1")
         )
@@ -699,6 +716,66 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertFalse(submit_thread.is_alive())
         self.assertEqual(self.terminal(job)[0], "error")
         self.assertFalse(transport.active)
+
+    def wait_until(self, done, what):
+        deadline = time.monotonic() + 1.0
+        while not done() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertTrue(done(), what)
+
+    def test_a_drain_lets_started_requests_finish_and_ends_the_rest(self):
+        # The first stop signal's drain: a request the engine runs finishes
+        # with its finish reason and usage; one still waiting, and one that
+        # arrives, get the 503 server_shutdown at once.
+        transport, driven = self.make_transport()
+        running, waiting = make_job(101), make_job(102)
+        transport.submit(running)
+        transport.submit(waiting)
+        run_call, wait_call = driven.calls
+        run_call.emit(wire.StartEvent(run_call.request_id, 0, 0))
+        left = []
+        drainer = threading.Thread(target=lambda: left.append(transport.drain(2.0)))
+        drainer.start()
+        self.wait_until(
+            lambda: wait_call.end_requested, "the waiting request was not ended"
+        )
+        self.assertFalse(run_call.end_requested)
+        wait_call.complete(
+            result=success_result(wait_call, reason=wire.FinishReason.CANCELLED)
+        )
+        kind, error = self.terminal(waiting)
+        self.assertEqual(
+            (kind, error.status, error.code), ("error", 503, "server_shutdown")
+        )
+        refusal = transport.refusal()
+        self.assertEqual((refusal.status, refusal.code), (503, "server_shutdown"))
+        late = make_job(103)
+        transport.submit(late)
+        kind, error = self.terminal(late)
+        self.assertEqual((kind, error.code), ("error", "server_shutdown"))
+        self.assertEqual(len(driven.calls), 2)
+        self.assertTrue(drainer.is_alive())
+        run_call.complete(result=success_result(run_call, tokens=(4, 5)))
+        kind, result = self.terminal(running)
+        self.assertEqual((kind, result.reason), ("done", "stop"))
+        drainer.join(1.0)
+        self.assertEqual(left, [0])
+
+    def test_a_drain_ends_at_its_time_and_the_close_ends_what_still_runs(self):
+        transport, driven = self.make_transport()
+        job = make_job()
+        transport.submit(job)
+        call = driven.calls[0]
+        call.emit(wire.StartEvent(call.request_id, 0, 0))
+        started = time.monotonic()
+        self.assertEqual(transport.drain(0.2), 1)
+        self.assertGreaterEqual(time.monotonic() - started, 0.2)
+        self.assertFalse(call.end_requested)
+        transport.close()
+        kind, error = self.terminal(job)
+        self.assertEqual(
+            (kind, error.status, error.code), ("error", 503, "server_shutdown")
+        )
 
     def test_close_drains_runtime_terminal_before_stopping_finalizer(self):
         transport, _runtime = self.make_transport()
@@ -1218,6 +1295,23 @@ class NativeBackendContractTests(unittest.TestCase):
             with self.subTest(native=native):
                 error = backend_api.NativeBackend._api_error(native)
                 self.assertEqual((error.status, error.code), expected)
+
+    def test_a_deadline_is_worded_alike_wherever_it_is_met(self):
+        # The engine's own wording reached a plain Messages answer, the
+        # server's a stream's.
+        errors = [
+            backend_api.NativeBackend._api_error(native)
+            for native in (
+                runtime.RequestFailed(
+                    1, b"deadline_exceeded", b"request deadline exceeded"
+                ),
+                TimeoutError(),
+            )
+        ]
+        self.assertEqual(
+            {(error.status, error.code, error.message) for error in errors},
+            {(504, "request_timeout", "request timed out")},
+        )
 
     def test_fakes_offer_the_interfaces_they_stand_in_for(self):
         for fake, real in (

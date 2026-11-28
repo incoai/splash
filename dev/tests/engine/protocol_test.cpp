@@ -266,7 +266,8 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
                         {},
                         "a start command ran out of GPU memory"}},
       {"warming", WarmingEvent{3, 9}},
-      {"start", StartEvent{91, 2, 4096, 4160, splash::engine::StateSource::Disk, true}},
+      {"start", StartEvent{91, 2, 4096, 4160, splash::engine::StateSource::Disk, true,
+                           splash::engine::ReuseEnd::KvWithoutState, 64}},
       {"prompt_progress", PromptProgressEvent{91, 2048, 123456}},
       {"tokens", TokensEvent{91, 17, {10, 11, 12}}},
       {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}, {}}},
@@ -284,6 +285,10 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
       {"error_retry_after",
        ErrorEvent{FailureClass::RequestError, 91, true, "kv_write_budget",
                   "the SSD cache's write budget is spent", 21'600}},
+      {"error_capacity",
+       ErrorEvent{FailureClass::RequestError, 91, false, "kv_disk_quota",
+                  "this request's KV needs more of the SSD cache", 0,
+                  {splash::engine::CapacityLimit::DiskQuota, 8191}}},
       {"error_engine", ErrorEvent{FailureClass::EngineUnhealthy, 0, false,
                                   "gpu_fault", "Metal command buffer failed"}},
       {"error_protocol",
@@ -1080,6 +1085,9 @@ void testFailureTaxonomy() {
   for (ErrorEvent expected : {
            ErrorEvent{FailureClass::RequestError, 5, true, "busy",
                       "retry this request"},
+           ErrorEvent{FailureClass::RequestError, 5, false, "capacity_exhausted",
+                      "does not fit alone", 0,
+                      {splash::engine::CapacityLimit::Memory, 4080}},
            ErrorEvent{FailureClass::EngineUnhealthy, 0, false, "metal_error",
                       "replace engine"},
            ErrorEvent{FailureClass::ProtocolFatal, 0, false, "framing_error",
@@ -1116,6 +1124,9 @@ void testFailureTaxonomy() {
   expectEventIssue(test, unknownBound, IssueCode::InvalidEnumValue);
   expectEventIssue(test, StartEvent{8, ExecutionLimits::maximumBatchWidth, 0},
                    IssueCode::InvalidCount);
+  StartEvent unknownEnd{8, 0, 0};
+  unknownEnd.reuseEnd = static_cast<splash::engine::ReuseEnd>(splash::engine::kReuseEnds);
+  expectEventIssue(test, unknownEnd, IssueCode::InvalidEnumValue);
   expectEventIssue(test,
                    TokensEvent{8, std::numeric_limits<uint32_t>::max(), {1}},
                    IssueCode::IntegerOverflow);
@@ -1131,6 +1142,21 @@ void testFailureTaxonomy() {
   // Only a retryable error says when to retry.
   expectEventIssue(test,
                    ErrorEvent{FailureClass::RequestError, 5, false, "bad", "", 60},
+                   IssueCode::InvalidErrorClassification);
+  // Only a request's capacity failure says what it lacked, and what fits
+  // only with what it lacked.
+  using splash::engine::CapacityLimit;
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::RequestError, 5, false, "bad", "", 0,
+                              {static_cast<CapacityLimit>(5), 0}},
+                   IssueCode::InvalidEnumValue);
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::EngineUnhealthy, 0, false, "bad", "", 0,
+                              {CapacityLimit::Memory, 0}},
+                   IssueCode::InvalidErrorClassification);
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::RequestError, 5, false, "bad", "", 0,
+                              {CapacityLimit::None, 64}},
                    IssueCode::InvalidErrorClassification);
 }
 

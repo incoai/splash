@@ -7,15 +7,13 @@
 
 // A grouped expert tile of at most tile_rows rows (kernels/shared/moe.metal)
 // holds `rows` live rows from its first grouped row on (MoeTileDescriptor).
-// An expert pass runs the matmul of the smallest of 8, 16, 32 and tile_rows
-// rows that holds the live rows and stores the live rows alone: the rows it
-// reads past them, the next tile's or rows of no tile, which the scratch holds
-// up to tile_rows - 1 past the routes' (ops::MoeScratch), give results it
-// discards. The staged passes' column tiles (moe_column_tile) read their live
-// rows alone.
-inline uint moe_matmul_rows(uint rows, uint tile_rows) {
-  return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : rows <= 32 ? 32u : tile_rows);
-}
+// An expert pass runs the matmul of moe_matmul_rows(rows, tile_rows) rows
+// (metal/abi/MoE.h) and stores the live rows alone: the rows it reads past
+// them, the next tile's or rows of no tile, which the scratch holds up to
+// tile_rows - 1 past the routes' (ops::MoeScratch), give results it discards.
+// A narrow step's gate/up pass reads its input rows in place, all of them in
+// the matmul of moe_matmul_rows(its rows, MOE_NARROW_ROWS) rows. The staged
+// passes' column tiles (moe_column_tile) read their live rows alone.
 // The staged expert passes run an expert's only tile of at most
 // GGUF_COLUMN_ROWS live rows on the column tile (moe_column_tile in
 // abi/MoE.h). The two tiles sum a row's products in different orders, so a

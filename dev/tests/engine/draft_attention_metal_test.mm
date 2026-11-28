@@ -11,6 +11,7 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/DraftAttention.hpp"
 
@@ -62,9 +63,12 @@ constexpr uint32_t kQueryHeadsPerKv = 4;
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kWindow = 2048;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-// The shipped split count and the fp32 partial one split leaves per (lane,
-// head) behind the grouped queries: 32 rows x (128 + max + sum).
-constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
+// Split counts the core runs every case at: one, the old four, a count of no
+// whole share of the 16 ring tiles and the ring's tiles; and the fp32 partial
+// one split leaves per (lane, head) behind the grouped queries: 32 rows x (128
+// + max + sum).
+constexpr std::array<uint32_t, 5> kSplitCounts{1, 3, 4, 7, SPLASH_DRAFT_ATTENTION_MOST_SPLITS};
+constexpr uint32_t kSplits = 4;
 constexpr uint64_t kPartialBytes = uint64_t{32} * 130 * sizeof(float);
 constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
 constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
@@ -174,13 +178,13 @@ constexpr uint64_t attentionOffset(uint32_t head, uint64_t row) {
 }
 
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
-             const std::array<uint32_t, kLanes> &cacheLengths) {
+             const std::array<uint32_t, kLanes> &cacheLengths, uint32_t splits) {
   Random random(0x5eed0000ULL + cacheLengths[0]);
   const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
   // The grouped-queries tensor is sized by the plan so the split partials
   // behind the query rows end exactly at the allocation under validation.
   MetalBuffer queries = randomBfloat(
-      backend, DraftAttention::plan(shape, lanes).workspace().groupedQueriesBytes / 2,
+      backend, DraftAttention::plan(shape, lanes, splits).workspace().groupedQueriesBytes / 2,
       random, "draft queries");
   std::vector<MetalBuffer> keys;
   std::vector<MetalBuffer> values;
@@ -212,12 +216,12 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   CommandGraph graph;
   DraftAttention::addDecode(graph,
       {queries, keys, values, queryKeys, queryValues},
-      std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
+      std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes, splits));
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
               dispatches[0].threadgroups.x == kKvHeads &&
               dispatches[0].threadgroups.y == lanes &&
-              dispatches[0].threadgroups.z == kSplits &&
+              dispatches[0].threadgroups.z == splits &&
               dispatches[1].threadgroups.x == kKvHeads &&
               dispatches[1].threadgroups.y == lanes &&
               dispatches[1].threadgroups.z == 1,
@@ -230,7 +234,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
         DraftAttention::addDecode(mismatched,
             {queries, keys, values, queryKeys, queryValues},
             std::span(cacheLengths).first(lanes - 1),
-            DraftAttention::plan(shape, lanes));
+            DraftAttention::plan(shape, lanes, splits));
       },
       "invalid draft attention geometry", "fewer cache lengths than lanes were accepted");
   require(mismatched.empty(), "mismatched cache lengths encoded a graph");
@@ -278,34 +282,39 @@ void planGeometry() {
   for (const auto shape : kShapes) {
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
       const uint64_t rows = uint64_t{lanes} * kRows;
-      const auto plan = DraftAttention::plan(shape, lanes);
+      for (const uint32_t splits : kSplitCounts) {
+      const auto plan = DraftAttention::plan(shape, lanes, splits);
       const auto workspace = plan.workspace();
-      require(plan.lanes() == lanes && plan.shape() == shape &&
+      require(plan.lanes() == lanes && plan.shape() == shape && plan.splits() == splits &&
                   workspace.convolutionBytes == rows * shape.hiddenSize * 2 &&
                   workspace.qkvBytes == rows * 6144 * 2 &&
                   workspace.groupedQueriesBytes ==
                       rows * 4096 * 2 +
-                          uint64_t{lanes} * kKvHeads * kSplits * kPartialBytes &&
+                          uint64_t{lanes} * kKvHeads * splits * kPartialBytes &&
                   workspace.queryKeysBytes == rows * 8 * 128 * 2 &&
                   workspace.queryValuesBytes == rows * 8 * 128 * 2,
               "draft plan padded lanes or changed tensor storage");
+      }
     }
-    rejects([&] { (void)DraftAttention::plan(shape, 0); }, "invalid draft batch width",
+    for (const uint32_t splits : {0U, SPLASH_DRAFT_ATTENTION_MOST_SPLITS + 1})
+      rejects([&] { (void)DraftAttention::plan(shape, 1, splits); },
+              "a draft attention plan splits a ring into 1 to its tiles", "an impossible split count was accepted");
+    rejects([&] { (void)DraftAttention::plan(shape, 0, kSplits); }, "invalid draft batch width",
             "a draft plan of no lanes was accepted");
-    rejects([&] { (void)DraftAttention::plan(shape, kLanes + 1); }, "invalid draft batch width",
+    rejects([&] { (void)DraftAttention::plan(shape, kLanes + 1, kSplits); }, "invalid draft batch width",
             "a draft plan wider than a batch was accepted");
   }
   auto unsupported = kShapes[0];
   unsupported.queryHeads = 16;
-  rejects([&] { (void)DraftAttention::plan(unsupported, 1); },
+  rejects([&] { (void)DraftAttention::plan(unsupported, 1, kSplits); },
           "unsupported compiled draft attention shape",
           "a draft shape without a compiled kernel was accepted");
   // A hidden width of a partial convolution group.
   const DraftAttentionShape partialGroup{2056, 512, 6144, 4096, 32, 8, 128};
-  rejects([&] { (void)DraftAttention::plan(partialGroup, 1); },
+  rejects([&] { (void)DraftAttention::plan(partialGroup, 1, kSplits); },
           "unsupported compiled draft attention shape",
           "a draft of a partial convolution group was accepted");
-  rejects([&] { (void)DraftAttention::plan({}, 1); }, "unsupported compiled draft attention shape",
+  rejects([&] { (void)DraftAttention::plan({}, 1, kSplits); }, "unsupported compiled draft attention shape",
           "an empty draft shape was accepted");
 }
 
@@ -317,7 +326,7 @@ void fillDyadic(const MetalBuffer &buffer, uint32_t multiplier, uint32_t modulus
 
 void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
                        uint32_t lanes) {
-  const auto plan = DraftAttention::plan(shape, lanes);
+  const auto plan = DraftAttention::plan(shape, lanes, kSplits);
   const auto workspace = plan.workspace();
   const uint64_t rows = uint64_t{lanes} * kRows;
   auto allocate = [&](uint64_t bytes) {
@@ -984,7 +993,7 @@ void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
 // its draft takes the first kRows.
 void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   constexpr uint32_t lanes = 3, contextTokens = 37;
-  const auto plan = DraftAttention::plan(shape, lanes);
+  const auto plan = DraftAttention::plan(shape, lanes, kSplits);
   const uint64_t rows = uint64_t{lanes} * kRows, hidden = rows * shape.hiddenSize * 2;
   const uint64_t queryRows = rows * kAttention * 2, current = rows * kKvHeads * kHeadDim * 2;
   const uint64_t ring = uint64_t{kKvHeads} * kWindow * kHeadDim * 2, norm = kHeadDim * 2;
@@ -1105,14 +1114,16 @@ int main(int argc, char **argv) {
       contextWindow(backend, shape.hiddenSize);
       contextWindowCapturedInside(backend, shape.hiddenSize);
       contextWindowCommit(backend, shape.hiddenSize);
-      runCase(backend, 1, shape, {0, 0, 0, 0});
-      runCase(backend, 2, shape, {2048, 2047, 0, 0});
-      runCase(backend, 3, shape, {2100, 4094, 6143, 0});
-      runCase(backend, 4, shape, {262137, 4094, 500, 6143});
-      runCase(backend, 4, shape, {512, 513, 1024, 1536});
-      runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
-      runCase(backend, 2, shape, {8191, 262144, 0, 0});
-      runCase(backend, kLanes, shape, {262137, 4094, 500, 6143, 512, 2049, 0, 8191});
+      for (const uint32_t splits : kSplitCounts) {
+        runCase(backend, 1, shape, {0, 0, 0, 0}, splits);
+        runCase(backend, 2, shape, {2048, 2047, 0, 0}, splits);
+        runCase(backend, 3, shape, {2100, 4094, 6143, 0}, splits);
+        runCase(backend, 4, shape, {262137, 4094, 500, 6143}, splits);
+        runCase(backend, 4, shape, {512, 513, 1024, 1536}, splits);
+        runCase(backend, 4, shape, {2046, 2049, 4095, 4096}, splits);
+        runCase(backend, 2, shape, {8191, 262144, 0, 0}, splits);
+        runCase(backend, kLanes, shape, {262137, 4094, 500, 6143, 512, 2049, 0, 8191}, splits);
+      }
     }
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;

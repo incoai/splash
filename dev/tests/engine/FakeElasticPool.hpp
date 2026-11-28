@@ -56,7 +56,7 @@ public:
     return released;
   }
   [[nodiscard]] metal::AllocationResult grow(const metal::AllocationAdmission &admit) override {
-    if (units_ == capUnits_ || !regrows)
+    if (units_ >= capUnits_ || !regrows)
       return {};
     const metal::AllocationResult result = memory_.allocate(admit, name_, unitBytes_);
     if (result) {
@@ -78,6 +78,12 @@ public:
   void hold(uint32_t units) {
     if (units > units_) throw std::invalid_argument("a fake elastic pool holds more units than it has");
     floorUnits_ = units;
+  }
+  // Its cap from now on, below its units too, as a pool whose use ended
+  // reports (model::PoolState::capBytes).
+  void setCap(uint32_t units) {
+    if (units > wholeUnits_ || units < floorUnits_) throw std::invalid_argument("a fake elastic pool's cap is out of range");
+    capUnits_ = units;
   }
   // Units taken and given back.
   uint64_t grows = 0, shrinks = 0;

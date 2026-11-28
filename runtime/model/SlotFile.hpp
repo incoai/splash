@@ -25,8 +25,7 @@ namespace splash::model {
 // Reservations and releases come from the engine thread and from whoever
 // drops the last handle of a slot. A slot counts what it keeps on the volume
 // (SlotFile::quotaBytesFor): the host pages its write stores, which the write
-// budget charges too, so a KV page that kept 14 of its 49 layers counts 464
-// KiB of its 1.59 MiB slot. The budget bounds live slots by its limit: the
+// budget charges too. The budget bounds live slots by its limit: the
 // quota at most, and less while the volume the files live on leaves less
 // (engine::DiskSpace sets it). A limit below what the tier holds is met by
 // the cache giving copies up (Cache::keepDiskLimit), so live slots can exceed
@@ -47,16 +46,15 @@ namespace splash::model {
 // --max-cache-disk-writes); without one, the default, every write passes and
 // nothing is held back. With one, every write a file of the tier submits
 // draws on it: a token bucket of this process, counted at submission in the
-// host pages each write stores, which each start begins full. The budget then
-// decides which states are written: while it is spent, an evicted state is
-// dropped instead and a restore point waits for its copies, unless the state
-// is in use (the state a conversation resumes from), which passes. KV is
-// written only for a state the budget let through, its chain's pages kept
-// reachable or copied after it: those writes pass, counted all the same, so
-// such a state never loses its chain for want of budget, and what a chain
-// costs comes out of later states' share. Writes are submitted on the engine
-// thread, which alone reads the budget (admits), so a write the engine
-// admitted is never refused for it.
+// host pages each write stores, which each start begins full. It is a cap on
+// the cache's writes: while it is spent the cache writes nothing, no state,
+// no KV page and no restore point's copy, and keeps to memory as without a
+// tier until it has refilled (engine::Cache::takesCacheWrites), so a write
+// overdraws it by one write at most; once overdrawn it stays closed until
+// its balance is back at an eighth of its burst (kReopenShare). Only a Spill
+// request's writes, which its admission paid for (admitsSpill), pass it.
+// Writes are submitted on the engine thread, which alone reads the budget
+// (admits), so a write the engine admitted is never refused for it.
 class DiskBudget final {
 public:
   // Milliseconds on the clock the write budget refills by; it does not
@@ -146,18 +144,20 @@ public:
     burstBytes_ = static_cast<double>(bytesPerDay) / 4.0;
     balance_ = burstBytes_;
     balanceTime_ = clock_();
+    spent_ = false;
   }
-  // Whether a state's write may start now: one in use always, another
-  // while the budget is not overdrawn. Engine thread.
-  [[nodiscard]] bool admits(bool inUse) const noexcept {
-    return inUse || lifted_ || !refillPerMillisecond_ || balanceAt(clock_()) >= 0.0;
+  // Whether a cache write may start now: until a write overdraws the
+  // budget, then once it has refilled to an eighth of its burst
+  // (kReopenShare). Engine thread.
+  [[nodiscard]] bool admits() const noexcept {
+    return !refillPerMillisecond_ || writeBudgetAt(clock_()) >= 0.0;
   }
   // Whether a request may start to spill, or convert to it, when Spill
   // requests already committed `outstandingBytes` of writes: without a
   // write budget, or while its balance covers them. Their writes are in use
   // and pass whatever the balance. Engine thread.
   [[nodiscard]] bool admitsSpill(uint64_t outstandingBytes) const noexcept {
-    return lifted_ || !refillPerMillisecond_ || balanceAt(clock_()) >= static_cast<double>(outstandingBytes);
+    return !refillPerMillisecond_ || balanceAt(clock_()) >= static_cast<double>(outstandingBytes);
   }
   // When admitsSpill(outstandingBytes) holds again as the balance refills,
   // on the budget's clock; empty while it holds now. The writes of Spill
@@ -170,26 +170,23 @@ public:
     const double now = clock_();
     return now + (static_cast<double>(outstandingBytes) - balanceAt(now)) / refillPerMillisecond_;
   }
-  // When a state's write not in use may start again, on the budget's clock;
-  // empty while one may start now.
+  // When a cache write may start again, on the budget's clock; empty while
+  // one may start now.
   [[nodiscard]] std::optional<double> admitsAgainAt() const noexcept {
-    if (lifted_ || !refillPerMillisecond_)
+    if (!refillPerMillisecond_)
       return std::nullopt;
     const double now = clock_();
-    const double balance = balanceAt(now);
-    if (balance >= 0.0)
+    const double budget = writeBudgetAt(now);
+    if (budget >= 0.0)
       return std::nullopt;
-    return now - balance / refillPerMillisecond_;
+    return now - budget / refillPerMillisecond_;
   }
-  // What the next state's write not in use may take now: negative once
-  // overdrawn, by the last write's slot or by the writes that pass; zero
+  // What the next cache write may take now; negative while none may start
+  // (admits), by what the balance lacks of the level it reopens at; zero
   // without a budget.
   [[nodiscard]] int64_t writeBudgetBytes() const noexcept {
-    return refillPerMillisecond_ ? static_cast<int64_t>(balanceAt(clock_())) : 0;
+    return refillPerMillisecond_ ? static_cast<int64_t>(writeBudgetAt(clock_())) : 0;
   }
-  // At a clean stop the budget holds nothing back: the newest restore points
-  // reach the disk (WriteBehind::flush).
-  void lift() noexcept { lifted_ = true; }
 
   // The write rate: what the tier's writes took over the last hour and the
   // last day, counted as the write budget counts them, in the host pages
@@ -252,6 +249,11 @@ public:
 private:
   friend class SlotFile;
   static constexpr double kDayMilliseconds = 86'400'000.0;
+  // An overdrawn budget reopens once its balance is back at this share of
+  // its burst, so that a read-only spell ends in writes worth reopening
+  // for, not in one write the next reclaim discards: 45 minutes of refill
+  // at any budget, then 640 MiB at 20 GiB a day.
+  static constexpr double kReopenShare = 1.0 / 8.0;
 
   static constexpr double kMinuteMilliseconds = 60'000.0;
   static constexpr uint64_t kHourMinutes = 60;
@@ -260,6 +262,12 @@ private:
   // The balance at `now` on the budget's clock.
   [[nodiscard]] double balanceAt(double now) const noexcept {
     return std::min(burstBytes_, balance_ + refillPerMillisecond_ * (now - balanceTime_));
+  }
+  // The balance at `now` less the level a spent budget reopens at, while
+  // it is below it: negative while no cache write may start.
+  [[nodiscard]] double writeBudgetAt(double now) const noexcept {
+    const double balance = balanceAt(now), reopen = burstBytes_ * kReopenShare;
+    return spent_ && balance < reopen ? balance - reopen : balance;
   }
   [[nodiscard]] static uint64_t minuteAt(double now) noexcept {
     return static_cast<uint64_t>(now / kMinuteMilliseconds);
@@ -284,8 +292,13 @@ private:
     charged_[minute % kDayMinutes] += bytes;
     if (!refillPerMillisecond_)
       return;
+    // A write admitted at the level a spent budget reopens at ends its
+    // spell; one that overdraws the budget, a Spill request's too, starts
+    // the next.
+    spent_ = writeBudgetAt(now) < 0.0;
     balance_ = balanceAt(now) - static_cast<double>(bytes);
     balanceTime_ = now;
+    spent_ = spent_ || balance_ < 0.0;
   }
 
   uint64_t capacity_;
@@ -307,7 +320,8 @@ private:
   double burstBytes_ = 0.0;
   double balance_ = 0.0;
   double balanceTime_ = 0.0;
-  bool lifted_ = false;
+  // Overdrawn since the balance was last at the level it reopens at.
+  bool spent_ = false;
   // The write rate, on the engine thread: what each of the last day's
   // minutes of the clock was charged, a minute's at its number modulo the
   // day's, and the minute of the last charge.
@@ -351,10 +365,11 @@ struct SlotRecord final {
 //
 // A slot is acquired for a payload and takes of the quota what it keeps on
 // the volume (quotaBytesFor): the payload's host pages, the rest of the slot
-// left a hole. The volume does not leave it one by itself: a write past what
-// the file held has the hole before it allocated (APFS filled gaps of 1 to
-// 16 MiB, so 256 payloads of 462 KiB in 1.59 MiB slots took 407 MiB until
-// their slots were freed and written again, then 116 MiB), so such a write
+// left a hole, as a freed slot is. The volume does not leave a hole by
+// itself: a write past what the file held has the hole before it allocated
+// (APFS filled gaps of 1 to 16 MiB, so 256 payloads of 462 KiB in 1.59 MiB
+// slots, 1.7.3's KV pages past every window, took 407 MiB until their slots
+// were freed and written again, then 116 MiB), so such a write
 // returns that hole, and a file ends with its last slot that holds blocks,
 // since a hole at its end is allocated whole under a write into it. A
 // volume that returns no blocks keeps whole slots, and there a slot counts
@@ -448,6 +463,9 @@ public:
     uint64_t payloadBytes_ = 0;
     std::vector<uint32_t> checksums_;
     mutable std::atomic<bool> verify_{false};
+    // Once a read found it failing its record's checksums, which the log
+    // says once (reportDamage).
+    mutable std::atomic<bool> damaged_{false};
     // Set when a write is submitted: freeing the slot then returns the
     // blocks that write may have taken.
     bool returnsBlocks_ = false;
@@ -496,9 +514,9 @@ public:
   // complete slots stay readable.
   [[nodiscard]] bool writable() const noexcept;
   // The file takes a state's write now: it is writable, the limit holds a
-  // slot, so making room can find one, and the write budget admits the write
-  // (DiskBudget::admits). Engine thread.
-  [[nodiscard]] bool takesWrite(bool inUse) const noexcept;
+  // slot, so making room can find one, and the write budget admits a cache
+  // write (DiskBudget::admits). Engine thread.
+  [[nodiscard]] bool takesWrite() const noexcept;
   [[nodiscard]] bool persistent() const noexcept;
   // The bytes the file's blocks take on its volume, its records' included;
   // zero when they cannot be measured.
@@ -507,6 +525,17 @@ public:
   // The slots earlier processes left in a persistent file, as read when it
   // opened: empty for a temporary or a new one.
   [[nodiscard]] const std::vector<SlotRecord> &records() const noexcept { return records_; }
+  // A persistent file found shorter than its records reach as it opened:
+  // its bytes and where its records reach, its records and those that lay
+  // past its end, which records() leaves out. None for a whole file.
+  struct CutShort final {
+    std::string path;
+    uint64_t fileBytes = 0;
+    uint64_t reachBytes = 0;
+    uint32_t records = 0;
+    uint32_t cut = 0;
+  };
+  [[nodiscard]] const std::optional<CutShort> &cutShort() const noexcept { return cutShort_; }
   // Takes back the slot a record names, before finishAdoption(). It counts
   // against the budget as a slot acquired for the record's payload does,
   // even past the capacity, so that the caller can give up what the quota
@@ -599,9 +628,19 @@ private:
   std::unique_ptr<std::byte, Free> buffer_;
   std::thread worker_;
   std::vector<SlotRecord> records_;
+  std::optional<CutShort> cutShort_;
   // Until finishAdoption(): the host pages of the payload each index was
   // adopted with, in bytes; zero for one not adopted.
   std::vector<uint64_t> adopted_;
 };
+
+// The damage persistent cache files showed in this process: copies whose
+// reads failed their checksums, and records that lay past the end of a file
+// found cut short as it opened (/status disk.damage).
+struct SlotFileDamage final {
+  uint64_t checksumFailures = 0;
+  uint64_t cutCopies = 0;
+};
+[[nodiscard]] SlotFileDamage slotFileDamage() noexcept;
 
 } // namespace splash::model

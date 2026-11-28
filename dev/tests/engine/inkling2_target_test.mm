@@ -65,6 +65,7 @@
 #include "ops/PageStorage.hpp"
 
 #import <Foundation/Foundation.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -84,6 +85,7 @@
 #include <string>
 #include <thread>
 #include <variant>
+#include <deque>
 #include <vector>
 
 using namespace splash;
@@ -197,7 +199,12 @@ public:
     const uint32_t extent = layout.maximumExtentPages();
     lanePages_ = (kPromptRows + 2 * kv::kPageTokens - 1) / kv::kPageTokens;
     const uint32_t lanePages = lanePages_;
-    const uint32_t pageCount = (kLanes * lanePages + extent - 1) / extent * extent;
+    // Each block's window unit lies past every lane's base pages: base page p's
+    // j-th window page is p + (j + 1) x kLanes x lanePages.
+    const uint32_t stride = kLanes * lanePages;
+    const uint32_t pageCount = (stride * layout.blockPages() + extent - 1) / extent * extent;
+    for (uint32_t table = 0; table + 1 < layout.blockPages(); ++table)
+      windowOffsets_.push_back((table + 1) * stride);
     pages_ = std::make_unique<kv::PageStorage>(backend, governor_.allocationAdmission(), layout, pageCount, extent);
     for (uint32_t index = 0; index < pageCount / extent; ++index)
       require(static_cast<bool>(pages_->allocateExtent(index)), "could not allocate the KV extents");
@@ -227,7 +234,7 @@ public:
       std::iota(tables[lane].begin(), tables[lane].end(), lane * lanePages_);
       const auto rows = static_cast<uint32_t>(prompts[lane].size());
       prefill.items.push_back({request.id, rows, 0});
-      ModelBatchItem &item = items.emplace_back(ModelBatchItem{request.id, 0, rows, tables[lane], 1});
+      ModelBatchItem &item = items.emplace_back(windowed(ModelBatchItem{request.id, 0, rows, tables[lane], 1}));
       item.inputTokens = prompts[lane];
     }
     std::vector<std::array<std::vector<float>, 2>> result(lanes);
@@ -240,7 +247,7 @@ public:
       const std::span<const float> logits = model::RuntimeInstrumentation::lastLogits(executor, lane);
       result[lane][0].assign(logits.begin(), logits.begin() + vocabulary_);
       decode.items.push_back({items[lane].requestId, 0});
-      steps.push_back(ModelBatchItem{items[lane].requestId, prompts[lane].size(), 0, tables[lane], 1});
+      steps.push_back(windowed(ModelBatchItem{items[lane].requestId, prompts[lane].size(), 0, tables[lane], 1}));
     }
     const std::vector<ModelStepResult> decoded = executor.decode(decode, steps);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -265,13 +272,13 @@ public:
     executor.beginColdRequest(request.modelView(), 0);
     const auto rows = static_cast<uint32_t>(ids.size());
     BatchPlan prefill{.kind = WorkKind::Prefill, .items = {{request.id, rows, 0}}, .decodeStage = DecodeStage::Regular};
-    ModelBatchItem item{request.id, 0, rows, pageTable_, 1};
+    ModelBatchItem item = windowed(ModelBatchItem{request.id, 0, rows, pageTable_, 1});
     item.inputTokens = ids;
     const std::vector<ModelStepResult> prefilled = executor.prefill(prefill, std::span(&item, 1));
     require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].firstToken,
             "the prompt's prefill failed");
     BatchPlan decode{.kind = WorkKind::Decode, .items = {{request.id, 0}}, .decodeStage = DecodeStage::Regular};
-    ModelBatchItem step{request.id, rows, 0, pageTable_, 1};
+    ModelBatchItem step = windowed(ModelBatchItem{request.id, rows, 0, pageTable_, 1});
     const std::vector<ModelStepResult> decoded = executor.decode(decode, std::span(&step, 1));
     require(decoded.size() == 1 && decoded[0].failure.empty(), "the decode step failed");
     model::RuntimeInstrumentation::DraftLattice lattice = model::RuntimeInstrumentation::lastDraftLattice(executor, 0, 1);
@@ -318,7 +325,7 @@ public:
     executor.beginColdRequest(request.modelView(), 0);
     const auto rows = static_cast<uint32_t>(ids.size());
     BatchPlan prefill{.kind = WorkKind::Prefill, .items = {{request.id, rows, 0}}, .decodeStage = DecodeStage::Regular};
-    ModelBatchItem item{request.id, 0, rows, pageTable_, 1};
+    ModelBatchItem item = windowed(ModelBatchItem{request.id, 0, rows, pageTable_, 1});
     item.inputTokens = ids;
     const std::vector<ModelStepResult> prefilled = executor.prefill(prefill, std::span(&item, 1));
     require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].firstToken,
@@ -329,7 +336,7 @@ public:
     for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
       if (redrawn == cycle) model::RuntimeInstrumentation::redrawTree(executor, request.id, temperature, noise);
       BatchPlan decode{.kind = WorkKind::Decode, .items = {{request.id, 0}}, .decodeStage = DecodeStage::Regular};
-      ModelBatchItem step{request.id, position, 0, pageTable_, 1};
+      ModelBatchItem step = windowed(ModelBatchItem{request.id, position, 0, pageTable_, 1});
       const std::vector<ModelStepResult> decoded = executor.decode(decode, std::span(&step, 1));
       require(decoded.size() == 1 && decoded[0].failure.empty() && !decoded[0].finished,
               "a decode cycle failed or ended its request");
@@ -391,7 +398,7 @@ public:
       tables[lane].resize(lanePages_);
       std::iota(tables[lane].begin(), tables[lane].end(), lane * lanePages_);
       BatchPlan prefill{.kind = WorkKind::Prefill, .items = {{request.id, rows, 0}}, .decodeStage = DecodeStage::Regular};
-      ModelBatchItem item{request.id, 0, rows, tables[lane], 1};
+      ModelBatchItem item = windowed(ModelBatchItem{request.id, 0, rows, tables[lane], 1});
       item.inputTokens = prompt;
       const std::vector<ModelStepResult> prefilled = executor.prefill(prefill, std::span(&item, 1));
       require(prefilled.size() == 1 && prefilled[0].failure.empty() &&
@@ -402,7 +409,7 @@ public:
       const std::optional<std::string> rejected = executor.provideMask(request.id, singletons(run.first(1)), forced);
       require(!rejected, "the runtime rejected a forced run: " + rejected.value_or(""));
       BatchPlan first{.kind = WorkKind::Decode, .items = {{request.id, 0}}, .decodeStage = DecodeStage::ApplyInitialMask};
-      ModelBatchItem step{request.id, rows, 0, tables[lane], 1};
+      ModelBatchItem step = windowed(ModelBatchItem{request.id, rows, 0, tables[lane], 1});
       const std::vector<ModelStepResult> selected = executor.decode(first, std::span(&step, 1));
       require(selected.size() == 1 && selected[0].failure.empty(), "a constrained lane's first selection failed");
     }
@@ -416,7 +423,7 @@ public:
       std::vector<ModelBatchItem> items;
       for (uint32_t lane = 0; lane < 2; ++lane) {
         plan.items.push_back({ids[lane], 0});
-        ModelBatchItem &item = items.emplace_back(ModelBatchItem{ids[lane], rows, 0, tables[lane], 1});
+        ModelBatchItem &item = items.emplace_back(windowed(ModelBatchItem{ids[lane], rows, 0, tables[lane], 1}));
         metal::AllocationFailure refusal;
         item.stateCaptures.push_back({boundary, executor.reserveState(ids[lane], boundary, refusal)});
         require(item.stateCaptures.back().reservation != nullptr, "the buffers of a decode capture were refused");
@@ -495,7 +502,7 @@ public:
     for (const uint32_t count : commands) {
       BatchPlan plan{.kind = WorkKind::Prefill, .items = {{request.id, count, offset}},
                             .decodeStage = DecodeStage::Regular, .passes = passes};
-      ModelBatchItem item{request.id, offset, count, pageTable_, 1};
+      ModelBatchItem item = windowed(ModelBatchItem{request.id, offset, count, pageTable_, 1});
       item.inputTokens = ids.subspan(offset, count);
       for (uint32_t pass = 0; pass < passes; ++pass) {
         const std::vector<ModelStepResult> results = executor.prefill(plan, std::span(&item, 1));
@@ -523,6 +530,23 @@ private:
   MemoryGovernor governor_;
   MemoryGovernor::Scope claim_;
   std::unique_ptr<kv::PageStorage> pages_;
+  // The distance from a block's base page to each page of its window unit.
+  std::vector<uint32_t> windowOffsets_;
+  // The window tables of the items windowed() gave them, kept while the
+  // items name them.
+  std::deque<std::vector<std::vector<uint32_t>>> windowTables_;
+
+  // The item with the window tables of its base pages (windowOffsets_).
+  ModelBatchItem windowed(ModelBatchItem item) {
+    std::vector<std::vector<uint32_t>> &tables = windowTables_.emplace_back();
+    for (const uint32_t offset : windowOffsets_) {
+      std::vector<uint32_t> &table = tables.emplace_back();
+      for (const uint32_t page : item.pageTable)
+        table.push_back(page + offset);
+    }
+    item.windowTables = tables;
+    return item;
+  }
   std::unique_ptr<model::QwenStateStorage> states_;
   std::vector<uint32_t> pageTable_;
   uint32_t vocabulary_ = 0;
@@ -582,17 +606,35 @@ constexpr double kFinalNormBound = 0.4324;
 // more; a second command that read nothing of the first by 0.19, and one
 // after other tokens in the three rows before the split by 0.06.
 constexpr double kLogitsBound = 0.02;
-// A lane of a several-lane command against its prompt alone, uninstrumented:
-// its prefill row measured at most 0.00049 and its decode row 0.109 (a
-// one-token lane's), on an M5 Pro and an M6 alike; twice those. The lanes'
-// joint prefill takes other tiles than a prompt's own command, and its 1,000
-// rows run the message gates' tiled kernel where a prompt of at most
+// A lane of a several-lane command against its prompt alone, uninstrumented.
+// The lanes' joint prefill takes other tiles than a prompt's own command, and
+// its 1,000 rows run the message gates' tiled kernel where a prompt of at most
 // MessageGate::kFusedRows rows alone, and every decode step, runs the decode
 // step's fused gates (ops/MessageGate.hpp): other summation orders of the
-// same roundings,
-// which this fixture carries through its 24 applications into the lane's KV
-// and states, which its decode step reads.
-constexpr double kLanePrefillBound = 0.001, kLaneDecodeBound = 0.22;
+// same roundings, which this fixture carries through its 24 applications into
+// the lane's KV and states, which its decode step reads, and through its
+// near-tied routes into other experts. So a lane's KL measures how far an
+// order's rounding carries, not an op's accuracy, which the kernel tests hold
+// against fp64 (convolution_mix_kernels_test.mm's op precision test). The
+// bounds are twice the most that 1.7.4 (61806e7b) and its benign
+// perturbations, each one op's sums in another order, measured on a 10-core
+// M4 (Apple9), a 20-core M5 Pro (Apple10) and a 12-core M6 (Apple11), the
+// most of the four lanes' prefill / decode KL (2026-11-27):
+//
+//                                               M4                 M5 Pro, M6
+//   1.7.4                                       0.00015 / 0.0435   0.00064 / 0.034
+//   the convolution's taps summed in order,
+//   forward or reversed                         0.00337 / 0.274    0.00162 / 0.011
+//   a mix's simdgroup partials reversed         0.00454 / 0.0296   0.00418 / 0.028-0.030
+//   a gate's simdgroup partials reversed        0.00015 / 0.0432
+//   the MoE combine's routes reversed           0.00015 / 0.0435
+//   the mixes of 512 threads                    1.7.4's bits
+//
+// The M5 Pro and the M6 measured the same prefill KLs, and decode KLs within
+// 10%, wherever both ran. The most is the M4's: 0.00454, and 0.274, the
+// one-token lane 1's decode row, whose near-tied route every fixed order of
+// the convolution's taps flips there.
+constexpr double kLanePrefillBound = 0.0091, kLaneDecodeBound = 0.55;
 
 // A captured slot's rows against the reference's (`want`, the sampled
 // rows'): the mean absolute difference over the mean absolute value.
@@ -628,7 +670,8 @@ double klDivergence(std::span<const float> reference, std::span<const float> eng
 // (`streamed`). A run that captures other ids loads its own (capturing).
 struct Loaded final {
   Loaded(const char *metallib, const std::filesystem::path &fixtureDirectory)
-      : root(std::filesystem::temp_directory_path() / "inkling2-target-test"), fixture(written(root)),
+      : root(std::filesystem::temp_directory_path() / ("inkling2-target-test-" + std::to_string(getpid()))),
+        fixture(written(root)),
         expected(readExpected(fixtureDirectory, fixture.layout)), ids(prompt(fixture.layout.tokens())),
         backend(metallib), model(capturing(1)),
         streamed(model::loadModel(

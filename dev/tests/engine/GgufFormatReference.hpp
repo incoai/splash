@@ -33,7 +33,7 @@ enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q
            IQ1M = GGUF_FMT_IQ1M, Q40 = GGUF_FMT_Q40, Q41 = GGUF_FMT_Q41, MXFP4 = GGUF_FMT_MXFP4,
            PQ20 = GGUF_FMT_PQ20, NVFP4 = GGUF_FMT_NVFP4, FP8 = GGUF_FMT_FP8, Q50 = GGUF_FMT_Q50, Q51 = GGUF_FMT_Q51,
            BF16 = GGUF_FMT_BF16, F16 = GGUF_FMT_F16, Q20 = GGUF_FMT_Q20, NVFP464 = GGUF_FMT_NVFP464,
-           MXFP8 = GGUF_FMT_MXFP8, FMT_COUNT = GGUF_FMT_COUNT };
+           MXFP8 = GGUF_FMT_MXFP8, BF1664 = GGUF_FMT_BF1664, F1664 = GGUF_FMT_F1664, FMT_COUNT = GGUF_FMT_COUNT };
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
 // The format of kQuantFormats name `name`, FMT_COUNT for none.
 inline Fmt fmtNamed(const std::string &name) {
@@ -46,7 +46,7 @@ inline float h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
 // A row of K values as a GGUF stores it: BF16's and F16's two bytes a value,
 // at any K; any other format's native blocks.
 inline uint32_t rowBytes(Fmt f, uint32_t K) {
-  if (f == BF16 || f == F16) return K * 2;
+  if (f == BF16 || f == F16 || f == BF1664 || f == F1664) return K * 2;
   const QuantFormat &i = kQuantFormats[f];
   return K / i.block_elements * i.block_bytes;
 }
@@ -178,8 +178,9 @@ inline std::vector<uint8_t> quantizeQ8_0(const std::vector<float> &x) {
   return blocks;
 }
 
-// Whether a format holds 16-bit float values, BF16 or F16.
-inline bool float16(Fmt f) { return f == BF16 || f == F16; }
+// Whether a format holds 16-bit float values, BF16 or F16 (either form), and whether they are bf16's.
+inline bool float16(Fmt f) { return f == BF16 || f == F16 || f == BF1664 || f == F1664; }
+inline bool bfloat16(Fmt f) { return f == BF16 || f == BF1664; }
 // N native rows of BF16 or F16 values: per 256 a normal draw of deviation 8 h2f(scale()), the magnitudes of a
 // quantized format of that scale, every 61st value of BF16 a ten-thousandth of that, below half's normal range,
 // so the staged tile's half rounds it.
@@ -191,8 +192,8 @@ std::vector<uint8_t> makeFloat16Native(Fmt f, uint32_t N, uint32_t K, std::mt199
   for (size_t i = 0; i < v.size() / 2; ++i) {
     if (i % 256 == 0) deviation = 8 * h2f(scale());
     float x = unit(rng) * deviation;
-    if (f == BF16 && i % 61 == 0) x *= 1e-4f;
-    const uint16_t bits = f == BF16 ? splash::test::floatToBf16(x) : f2h(x);
+    if (bfloat16(f) && i % 61 == 0) x *= 1e-4f;
+    const uint16_t bits = bfloat16(f) ? splash::test::floatToBf16(x) : f2h(x);
     memcpy(v.data() + 2 * i, &bits, 2);
   }
   return v;
@@ -322,7 +323,7 @@ inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
     case NVFP4: case NVFP464: return std::uniform_real_distribution<float>(0.000008f, 0.00006f);
     case FP8: case MXFP8: return std::uniform_real_distribution<float>(0.00002f, 0.00012f);
     // The scale whose quantized values a 16-bit tensor's take (makeFloat16Native).
-    case BF16: case F16: return std::uniform_real_distribution<float>(0.001f, 0.004f);
+    case BF16: case F16: case BF1664: case F1664: return std::uniform_real_distribution<float>(0.001f, 0.004f);
     case FMT_COUNT: break;
   }
   unknownFormat(f);
@@ -530,10 +531,10 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
       }
       packBits(lo, 8, p0); return;
     }
-    case BF16: case F16: {   // value 32 j + k of the block, times g = 1
+    case BF16: case F16: case BF1664: case F1664: {   // value 32 j + k of the block, times g = 1
       for (int k = 0; k < 32; ++k) {
         uint16_t x; memcpy(&x, blk + 2 * (32 * j + k), 2);
-        vals[k] = f == BF16 ? splash::test::bf16ToFloat(x) : h2f(x);
+        vals[k] = bfloat16(f) ? splash::test::bf16ToFloat(x) : h2f(x);
         memcpy(p0 + 2 * quant_slot(k), &x, 2);
       }
       return;
@@ -646,7 +647,9 @@ inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
     case Q3K: memcpy(dst, blk + kQ3KD, 2); dst[2] = dst[3] = 0; memcpy(dst + 4, blk + kQ3KScales, 12); return;
     case Q2K: memcpy(dst, blk + kQ2KD, 4); memcpy(dst + 4, blk, 16); return;
     case IQ1M: memcpy(dst, blk + kIQ1MScales, 8); return;
-    case BF16: case F16: { const float g = 1.0f; memcpy(dst, &g, 4); return; }   // the repack's g
+    case BF16: case F16: case BF1664: case F1664: {   // the repack's g
+      const float g = 1.0f; memcpy(dst, &g, 4); return;
+    }
     case FMT_COUNT: break;
   }
   unknownFormat(f);

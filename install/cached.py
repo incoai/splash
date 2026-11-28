@@ -1,9 +1,12 @@
 """Install, without the Hub, the models the Hugging Face cache holds whole
 that Splash serves: what other tools, or another Splash such as a source
-checkout, downloaded there. The desktop app runs it so that it offers those
-models beside the ones it downloaded:
+checkout, downloaded there. First it gives the installations an earlier
+release made the record the app offers their options by
+(upstream.bring_records_current). The desktop app runs it as it launches, so
+that it offers those models beside the ones it downloaded, each with the
+options it has:
 
-    python install/cached.py [--models DIR]
+    python install/cached.py [--models DIR] [--records [--first MODEL]]
 
 A repository it cannot serve installs nothing: a model of no family Splash
 serves, one missing files, or no model at all, such as a draft.
@@ -113,10 +116,24 @@ def install_cached(models_root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--models", type=Path, default=paths.MODELS)
+    parser.add_argument(
+        "--records",
+        action="store_true",
+        help="only bring the installations' records up to date, which takes "
+        "a second, and install nothing",
+    )
+    parser.add_argument(
+        "--first", metavar="MODEL", help="the model whose record comes first"
+    )
     args = parser.parse_args(argv)
     # Only what the cache holds: the Hub is never asked.
     os.environ["HF_HUB_OFFLINE"] = "1"
-    install_cached(args.models)
+    from . import upstream
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        upstream.bring_records_current(args.models, args.first)
+    if not args.records:
+        install_cached(args.models)
     return 0
 
 

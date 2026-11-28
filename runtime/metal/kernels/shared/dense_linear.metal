@@ -11,20 +11,14 @@
 // tile}.
 
 #include "metal/abi/DenseLinear.h"
-#include "metal/kernels/common/activation.h"
+#include "metal/kernels/common/dense_epilogue.h"
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-// What a tile does with a sum plus its bias: stores it (bf16), stores its
-// GELU (bf16), or adds it to the fp32 rows it stores into, as it is or times
-// its output's scale (a LayerScale's).
-enum DenseEpilogue {
-    DenseNone, DenseGeluTanh, DenseGeluErf, DenseResidual, DenseScaledResidual
-};
-
+// A tile stores each sum through its epilogue (dense_epilogue_store).
 template <ushort TileM, ushort TileN, ushort Simdgroups,
           DenseEpilogue Epilogue, typename Output>
 inline void dense_linear_tile(
@@ -74,19 +68,8 @@ inline void dense_linear_tile(
         const uint row = row_origin + index[1];
         if (row >= params.rows) continue;
         const uint column = output_origin + index[0];
-        float value = accumulated[i] + float(bias[column]);
-        if constexpr (Epilogue == DenseGeluTanh) {
-            value = splash_gelu_tanh(value);
-        } else if constexpr (Epilogue == DenseGeluErf) {
-            value = splash_gelu_erf(value);
-        }
-        device Output *out = output + ulong(row) * params.output_size + column;
-        if constexpr (Epilogue == DenseScaledResidual) {
-            value = value * float(scale[column]) + float(*out);
-        } else if constexpr (Epilogue == DenseResidual) {
-            value += float(*out);
-        }
-        *out = Output(value);
+        dense_epilogue_store<Epilogue>(accumulated[i], bias, scale,
+                                       output + ulong(row) * params.output_size + column, column);
     }
 }
 

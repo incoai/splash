@@ -137,6 +137,15 @@ def engine_factory(first, order=None):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_the_engine_is_told_to_stop_on_the_servers_signal_alone(self):
+        # A stop sent to the process group reaches the engine too: told so,
+        # it waits for the server's own SIGTERM, which follows the drain.
+        with mock.patch.object(engine_runtime.subprocess, "Popen") as popen:
+            engine_runtime.MultiplexedRuntime._spawn(["splash", "serve-native"])
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(environment["SPLASH_ENGINE_STOPPED_BY_PARENT"], "1")
+        self.assertEqual(environment.get("PATH"), os.environ.get("PATH"))
+
     def test_start_spawns_the_engine_and_returns_before_its_ready(self):
         """The server starts the engine and loads its tokenizer meanwhile:
         start() spawns it without waiting for Ready, and wait_ready() then
@@ -2374,6 +2383,28 @@ class RuntimeTests(unittest.TestCase):
             second.remaining_deadline_micros, engine_runtime._MAX_U64 - wall
         )
         self.assertEqual(second.absolute_deadline_unix_micros, engine_runtime._MAX_U64)
+
+    def test_wire_deadline_is_never_later_than_the_servers(self):
+        # Every clock read takes 5 ms of one true time. The engine reads its
+        # clocks the other way round, so a cancel at the server's deadline
+        # finds the engine's passed and counts a timeout.
+        now = [0.0]
+
+        def read(offset):
+            now[0] += 0.005
+            return offset + now[0]
+
+        deadline = 1.0
+        with (
+            mock.patch.object(
+                engine_runtime.time, "time_ns", lambda: int(read(1_700_000_000.0) * 1e9)
+            ),
+            mock.patch.object(engine_runtime.time, "monotonic", lambda: read(0.0)),
+        ):
+            absolute, remaining = engine_runtime._wire_deadline(deadline)
+        # The server's deadline on the wall clock, in µs.
+        self.assertLessEqual(absolute, (1_700_000_000.0 + deadline) * 1e6)
+        self.assertLessEqual(remaining, 1_000_000)
 
     def test_short_wait_leaves_shared_startup_running(self):
         factory = FakeFactory(initial_output=b"")

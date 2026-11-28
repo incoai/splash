@@ -41,11 +41,14 @@ static_assert([] {
 // NVFP4's for llama.cpp's NVFP4, whose block_nvfp4 rows the writer builds
 // NVFP4's native rows from (TensorRows::ggufNvfp4RowBytes).
 uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVFP4 : gguf_format_of(type); }
-// The format whose native rows hold `tensor`: its type's (imageFormat), but
-// NVFP4's form of 64-element blocks for an NVFP4 tensor whose rows are not
-// whole 256-element ones (llama.cpp's NVFP4 blocks are 64 elements).
+// The format whose native rows hold `tensor` as stored: its type's
+// (imageFormat), but the form of 64-element blocks for an NVFP4, BF16 or F16
+// tensor whose rows are not whole 256-element ones (llama.cpp's NVFP4 blocks
+// are 64 elements). A projection's 16-bit planes take theirs by the planes'
+// width (float16Planes).
 uint32_t imageFormat(const GgufTensor &tensor) {
   const uint32_t format = imageFormat(tensor.type);
+  if (format == GGUF_FMT_BF16 || format == GGUF_FMT_F16) return quant_float16_form(format, tensor.columns());
   return format == GGUF_FMT_NVFP4 && tensor.columns() % kQuantFormats[format].block_elements ? GGUF_FMT_NVFP464
                                                                                              : format;
 }
@@ -55,9 +58,8 @@ uint32_t imageFormat(const GgufTensor &tensor) {
 // embedding kernels gather.
 bool quantizedType(uint32_t type) { return imageFormat(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
-// The 16-bit float types: a norm of one widens to F32 (floatNorm), a
-// hyper-connection projection of one is prepared as Q8_0 (quantizedOrQ8_0),
-// and an alpha/beta pair of them is a float tensor (alphaBeta).
+// The 16-bit float types: a norm of one widens to F32 (floatNorm), and an
+// alpha/beta pair of them is a float tensor (alphaBeta).
 bool float16Type(uint32_t type) { return type == ggml::kBF16 || type == ggml::kF16; }
 // alpha/beta run as one segment: of their format when both are of one
 // quantized type but BF16 and F16 (one repacked tensor), else one float
@@ -74,8 +76,9 @@ bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml
 // its format's rows as stored (quant_stored_row_bytes), NVFP4's native rows
 // for llama.cpp's NVFP4 (Builder::tensorRows); 0 for a width that holds none.
 uint64_t storedRowBytes(const GgufTensor &tensor) {
-  return floatType(tensor.type) ? tensor.columns() * sizeof(float)
-                                : quant_stored_row_bytes(imageFormat(tensor), tensor.columns());
+  return floatType(tensor.type)    ? tensor.columns() * sizeof(float)
+         : float16Type(tensor.type) ? tensor.columns() * 2
+                                    : quant_stored_row_bytes(imageFormat(tensor), tensor.columns());
 }
 
 // A MoE router, which the float projection runs in fp32 as stored (router):
@@ -92,11 +95,19 @@ bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == g
 // type, or any of a format, which decodes to F32.
 bool floatTensorType(uint32_t type) { return floatProjectionType(type) || quantizedType(type); }
 
-// A repack of a [rows, columns] tensor in format, of no image section yet;
-// throws unless the shape is whole plane tiles.
-Repack tiledRepack(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
+// Throws unless a [rows, columns] tensor in format is whole plane tiles,
+// naming it, its shape and the unit its format's rows take.
+void requireTiles(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
   if (rows % QUANT_TILE_ROWS || columns % ggufColumnUnit(kQuantFormats[format]))
-    throw GgufError("tensor is not tile aligned: " + name);
+    throw GgufError("tensor is not tile aligned: " + name + " (" + std::to_string(rows) + " rows of " +
+                    std::to_string(columns) + " inputs in " + kQuantFormats[format].name + ", whose rows take whole " +
+                    std::to_string(ggufColumnUnit(kQuantFormats[format])) + "-input units)");
+}
+
+// A repack of a [rows, columns] tensor in format, of no image section yet;
+// throws unless the shape is whole plane tiles (requireTiles).
+Repack tiledRepack(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
+  requireTiles(format, rows, columns, name);
   Repack result;
   result.format = format;
   result.rows = rows;
@@ -167,8 +178,8 @@ class Builder {
 public:
   Builder(const GgufFile &file, const QwenTargetDimensions &geometry, Problems &problems, std::string name,
           uint32_t layer, uint32_t type, PlanOptions options = {})
-      : file_(file), geometry_(geometry), problems_(problems), exactlyMxfp8_(std::move(options.exactlyMxfp8)),
-        image_(std::move(name), layer, type, options.streamExperts) {}
+      : file_(file), geometry_(geometry), problems_(problems), options_(std::move(options)),
+        image_(std::move(name), layer, type, options_.streamExperts) {}
 
   // A vector the kernels read as F32 unrounded, as the reference GGUF
   // implementation does: a norm (ops::NormWeights) or Qwen3.8-Flash-Next's PLE
@@ -182,57 +193,35 @@ public:
                 floatType(tensor->type) ? Conversion::None : Conversion::WidenToFloat32);
   }
 
-  // Quantized rows [N, windows * K] repacked into planes, rows in `order`, as
-  // `windows` column windows of K inputs, window w's N rows after window
-  // w - 1's (TensorRows::windows).
+  // Quantized rows [N, windows * K] repacked into planes (planeRows), rows in
+  // `order`, as `windows` column windows of K inputs, window w's N rows after
+  // window w - 1's (TensorRows::windows).
   void quantized(const std::string &name, uint64_t rows, uint64_t columns, RowOrder order = {},
                  uint32_t windows = 1) {
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != windows * columns)
       throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(*tensor);
-    Repack repack = image_.planes(format, windows * rows, columns, name);
+    const TensorRows source = planeRows(*tensor, rows, columns, order);
+    Repack repack = image_.planes(gguf_format_of(source.type), windows * rows, columns, name);
     for (uint32_t window = 0; window < windows; ++window) {
-      TensorRows source = tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], windows * columns), order);
-      source.windows = windows;
-      source.window = window;
-      repack.sources.push_back(std::move(source));
+      TensorRows part = source;
+      part.windows = windows;
+      part.window = window;
+      repack.sources.push_back(std::move(part));
     }
     image_.repack(std::move(repack));
   }
 
-  // Rows [N, K] as quantized() repacks them, but of a BF16 or F16 tensor
-  // as the Q8_0 rows the reference quantize_row_q8_0_ref writes from its
-  // values, which the writer quantizes (builtRows).
-  void quantizedOrQ8_0(const std::string &name, uint64_t rows, uint64_t columns) {
-    const GgufTensor *tensor = file_.find(name);
-    if (!tensor || !float16Type(tensor->type)) return quantized(name, rows, columns);
-    problems_.read(*tensor);
-    if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    Repack repack = image_.planes(GGUF_FMT_Q80, rows, columns, name);
-    repack.sources.push_back(builtRows(*tensor, rows, GGUF_FMT_Q80));
-    image_.repack(std::move(repack));
-  }
-
-  // The format of a routed experts' tensor [N, K] and its rows: of a format,
-  // as stored (llama.cpp's NVFP4 as NVFP4's native rows); of BF16 or F16
-  // values (a release's MXFP8 experts that Unsloth's UD-Q8_K_XL widens to
-  // BF16), MXFP8 where they are exactly its values (exactlyMxfp8: lossless,
-  // half the bytes), else as stored where their rows are whole native blocks
-  // of their type, else as the Q8_0 the reference quantization makes of
-  // them, as quantizedOrQ8_0 does.
+  // The format of a routed experts' tensor [N, K] and its rows (planeRows),
+  // throwing unless they are whole plane tiles: of BF16 or F16 values that are
+  // exactly MXFP8's (a release's MXFP8 experts that Unsloth's UD-Q8_K_XL widens
+  // to BF16), MXFP8.
   std::pair<uint32_t, TensorRows> expertRows(const GgufTensor &tensor, uint64_t rows, uint64_t columns) {
-    uint32_t format = imageFormat(tensor);
-    if (float16Type(tensor.type)) {
-      const bool mxfp8 = !(columns % ggufColumnUnit(kQuantFormats[GGUF_FMT_MXFP8])) && exactlyMxfp8_ &&
-                         exactlyMxfp8_(file_.source(tensor.file), tensor.offset, tensor.elements(), tensor.type);
-      if (mxfp8 || columns % ggufColumnUnit(kQuantFormats[format])) {
-        format = mxfp8 ? GGUF_FMT_MXFP8 : GGUF_FMT_Q80;
-        return {format, builtRows(tensor, rows, format)};
-      }
-    }
-    return {format, tensorRows(tensor, rows, ggufRowBytes(kQuantFormats[format], columns))};
+    TensorRows source = planeRows(tensor, rows, columns, {}, true);
+    const uint32_t format = gguf_format_of(source.type);
+    requireTiles(format, rows, columns, tensor.name);
+    return {format, std::move(source)};
   }
 
   // One routed experts' tensor [experts * N, K] (routedExperts).
@@ -307,9 +296,10 @@ public:
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
   // order: one tensor of their format padded with zero rows to whole plane
   // tiles when both are of one quantized type, else one float tensor of the
-  // values each holds, all exactly: a BF16 pair as stored (the float
-  // projection reads BF16 weights as it reads their F32 values), any other
-  // pair as F32, F32 as stored and any other type decoded. A pair of BF16 or
+  // values each holds, all exactly: a pair of BF16 or of F32 holding BF16's
+  // values (floatKernelType) as BF16 (the float projection reads BF16 weights
+  // as it reads their F32 values), any other pair as F32, F32 as stored and
+  // any other type decoded. A pair of BF16 or
   // F16 is a float tensor too: a float segment reads the input unrotated
   // (requireRotation), as Prism's BF16 alpha/beta need, and leaves the GDN
   // input projection on Apple9's register tile, which takes no F16.
@@ -321,7 +311,7 @@ public:
       if (t->rows() != heads || t->columns() != hidden)
         throw GgufError("alpha/beta must be [" + std::to_string(heads) + ", hidden]: " + t->name);
     if (beta->type != alpha->type || !quantizedType(beta->type) || float16Type(beta->type)) {
-      const bool bfloat16 = beta->type == ggml::kBF16 && alpha->type == ggml::kBF16;
+      const bool bfloat16 = floatRowsType(*beta) == ggml::kBF16 && floatRowsType(*alpha) == ggml::kBF16;
       const uint64_t rowBytes = uint64_t{hidden} * (bfloat16 ? sizeof(uint16_t) : sizeof(float));
       image_.descriptor(bfloat16 ? ggml::kBF16 : ggml::kF32, 2ull * heads, hidden, {}, {2 * heads * rowBytes, 0, 0},
                         betaName);
@@ -331,7 +321,8 @@ public:
           image_.copyAt(destination, tensorRows(*t, heads, storedRowBytes(*t), grouped(0, 1)),
                         Conversion::DequantizeToFloat32);
         } else {
-          image_.copyAt(destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)), Conversion::None);
+          image_.copyAt(destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)),
+                        bfloat16 && floatType(t->type) ? Conversion::NarrowToBfloat16 : Conversion::None);
         }
         destination += heads * rowBytes;
       }
@@ -398,46 +389,49 @@ public:
 
   // A tensor [rows, columns] the float projection runs in fp32 (the QSA
   // indexer's projections, Inkling 2's message gates and sink projections):
-  // F32 or BF16 rows as stored, or another type's (a GGUF that quantizes
-  // them, as AtomicChat's Q8_0 gates) as the F32 values the GPU decodes them
-  // to, as the format's gather does.
-  // widened, a BF16 one's widen to F32 exactly.
+  // F32 or BF16 rows as a float kernel runs them (floatKernelRows), or
+  // another type's (a GGUF that quantizes them, as AtomicChat's Q8_0 gates) as
+  // the F32 values the GPU decodes them to, as the format's gather does.
+  // widened, a BF16 one's widen to F32 exactly, and an F32 one stays F32.
   void floatTensor(const std::string &name, uint64_t rows, uint64_t columns, bool widened = false) {
     const GgufTensor *tensor = find(name, floatTensorType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
       throw GgufError("expected a [" + std::to_string(rows) + ", " + std::to_string(columns) + "] tensor: " + name);
     const bool widen = widened && tensor->type == ggml::kBF16;
-    if (floatProjectionType(tensor->type) && !widen) return copiedRows(*tensor, storedRowBytes(*tensor));
+    if (floatProjectionType(tensor->type) && !widen) return floatKernelRows(*tensor, !widened);
     image_.descriptor(ggml::kF32, rows, columns, {}, {rows * columns * sizeof(float), 0, 0}, name);
     image_.copy(tensorRows(*tensor, rows, storedRowBytes(*tensor)),
                 widen ? Conversion::WidenToFloat32 : Conversion::DequantizeToFloat32);
   }
 
   // A projection [rows, columns] of fewer rows than a plane tile holds: F32
-  // or BF16 rows as stored, which the float projection runs in fp32 at any
-  // rows that are whole 8-column tiles of its kernels, or a quantized tensor
-  // repacked into whole plane tiles, its rows past `rows` zero.
+  // or BF16 rows as a float kernel runs them (floatKernelRows), which the
+  // float projection runs in fp32 at any rows that are whole 8-column tiles
+  // of its kernels, or a quantized tensor repacked into whole plane tiles,
+  // its rows past `rows` zero.
   void smallProjection(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = find(name, smallProjectionType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    if (floatProjectionType(tensor->type)) return copiedRows(*tensor, storedRowBytes(*tensor));
+    if (floatProjectionType(tensor->type)) return floatKernelRows(*tensor);
     const uint32_t format = imageFormat(*tensor);
     Repack repack = image_.planes(format, tiledRows(rows), columns, name);
     repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns)));
     image_.repack(std::move(repack));
   }
 
-  // The MoE router [rows, columns] as stored, which the float projection runs
-  // in fp32 (ops::QuantizedSegment::rows): F32 or BF16, as quantized GGUFs
-  // keep it, or a quantized type's native rows, as an MLX checkpoint's
-  // quantized router loads (model/SafetensorsImage.hpp).
+  // The MoE router [rows, columns], which the float projection runs in fp32
+  // (ops::QuantizedSegment::rows): F32 or BF16, as quantized GGUFs keep it, as
+  // a float kernel runs them (floatKernelRows), or a quantized type's native
+  // rows as stored, as an MLX checkpoint's quantized router loads
+  // (model/SafetensorsImage.hpp).
   void router(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = find(name, routerType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
       throw GgufError("expected a [" + std::to_string(rows) + ", " + std::to_string(columns) + "] router: " + name);
+    if (floatProjectionType(tensor->type)) return floatKernelRows(*tensor);
     copiedRows(*tensor, storedRowBytes(*tensor));
   }
 
@@ -545,16 +539,15 @@ private:
     return rows;
   }
 
-  // Rows [0, count) of a BF16 or F16 tensor as the native rows of `format`
-  // the writer builds from its values (TensorRows::float16RowBytes): Q8_0
-  // as the reference quantization rounds them, or MXFP8 exactly (mxfp8Block).
-  TensorRows builtRows(const GgufTensor &tensor, uint64_t count, uint32_t format) const {
-    TensorRows rows = tensorRows(tensor, count, tensor.bytes / count);
-    rows.float16Type = rows.type;
-    rows.float16RowBytes = rows.rowBytes;
-    rows.type = kQuantFormats[format].ggml_type;
-    rows.rowBytes = ggufRowBytes(kQuantFormats[format], tensor.columns());
-    return rows;
+  // The rows [0, count) of `tensor` the planes of a projection take, planes
+  // of `columns` inputs (a column window's), rows in `order`: a format's
+  // native rows as stored (tensorRows), or those float16Planes takes of BF16
+  // or F16 values, of routed experts with `experts`.
+  TensorRows planeRows(const GgufTensor &tensor, uint64_t count, uint64_t columns, RowOrder order = {},
+                       bool experts = false) const {
+    if (!float16Type(tensor.type))
+      return tensorRows(tensor, count, ggufRowBytes(kQuantFormats[imageFormat(tensor)], tensor.columns()), order);
+    return float16Planes(tensorRows(tensor, count, tensor.bytes / count, order), columns, experts, options_);
   }
 
   // A tensor's rows as the image holds them (tensorRows), rowBytes each,
@@ -565,10 +558,31 @@ private:
     image_.copy(rows);
   }
 
+  // The type a float kernel reads `tensor`'s rows in (floatKernelType): BF16
+  // for an F32 tensor of BF16's values alone, else its own.
+  uint32_t floatRowsType(const GgufTensor &tensor) const {
+    return floatKernelType(tensor.type, options_, file_.source(tensor.file), tensor.offset, tensor.elements());
+  }
+
+  // The rows of an F32 or BF16 tensor a float kernel runs (a float projection
+  // or a message gate, which widen BF16 rows to the fp32 values F32 rows
+  // hold), in the type it reads them in (floatRowsType): BF16 as stored, and
+  // F32 as BF16 rows where every value is a BF16 value (lossless, half the
+  // bytes, the same outputs where the tile is unchanged: selectFloatTile takes
+  // the accelerator's tile from fewer half tiles a core for BF16 rows, so some
+  // prefill chunks change tile), else as stored. `narrows` false keeps F32 as
+  // stored (a call of message gates that mixes formats).
+  void floatKernelRows(const GgufTensor &tensor, bool narrows = true) {
+    if (!narrows || floatRowsType(tensor) == tensor.type) return copiedRows(tensor, storedRowBytes(tensor));
+    image_.descriptor(ggml::kBF16, tensor.rows(), tensor.columns(), {},
+                      {tensor.rows() * tensor.columns() * sizeof(uint16_t), 0, 0}, tensor.name);
+    image_.copy(tensorRows(tensor, tensor.rows(), storedRowBytes(tensor)), Conversion::NarrowToBfloat16);
+  }
+
   const GgufFile &file_;
   const QwenTargetDimensions &geometry_;
   Problems &problems_;
-  std::function<bool(const WeightSource &, uint64_t, uint64_t, uint32_t)> exactlyMxfp8_;
+  PlanOptions options_;
   ImageBuilder image_;
 };
 
@@ -619,17 +633,14 @@ void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p, u
 }
 
 // One hyper-connection mix (model/Qwen4Exp.hpp Qwen4HyperWeights): its norm,
-// down and up projections and, when it injects, its injection weights. The
-// projections of BF16 or F16 (some GGUFs keep them BF16) are prepared as Q8_0,
-// the type other GGUFs store them in, in the rows the reference GGUF
-// quantization of Q8_0 makes from their values (Builder::quantizedOrQ8_0):
-// every decode cycle reads all of them, bandwidth-bound, and Q8_0 holds a value
-// in little more than half the bytes of a 16-bit float.
+// down and up projections, of any format (some GGUFs keep them BF16, which
+// load as every 16-bit projection does, float16Planes), and, when it injects,
+// its injection weights.
 void hyperImage(Builder &b, const QwenTargetDimensions &g, const std::string &stem, bool inject) {
   const uint64_t streams = g.streamWidth();
   b.floatNorm(stem + "_norm.weight", streams);
-  b.quantizedOrQ8_0(stem + "_down.weight", g.hyperRank, streams);
-  b.quantizedOrQ8_0(stem + "_up.weight", streams, g.hyperRank);
+  b.quantized(stem + "_down.weight", g.hyperRank, streams);
+  b.quantized(stem + "_up.weight", streams, g.hyperRank);
   if (inject) b.floatRows(stem + "_inject.weight", g.hyperConnections, streams, false);
 }
 
@@ -718,7 +729,7 @@ struct Qwen4ExpGguf final {
   static void tables(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options, Problems &problems,
                      std::vector<Image> &images) {
     const std::string table = "per_layer_token_embd.weight";
-    Builder b(file, g, problems, "ple.bin", g.pleLayer, kTableImageType);
+    Builder b(file, g, problems, "ple.bin", g.pleLayer, kTableImageType, options);
     b.storedTable(table, g.pleHeadDimension);
     Image image = b.finish();
     if (options.streamTable && problems.empty()) image.streamedRows = tableRows(file, table, g.pleHeadDimension);
@@ -806,11 +817,11 @@ std::vector<Image> targetImages(const GgufFile &file, const QwenTargetDimensions
     layer(image, index);
     images.push_back(image.finish());
   }
-  Builder headImage(file, g, problems, "head.bin", layerImages, 2);
+  Builder headImage(file, g, problems, "head.bin", layerImages, 2, options);
   head(headImage);
   headImage.quantized("output.weight", g.vocabularySize, g.hiddenSize);
   images.push_back(headImage.finish());
-  Builder embedding(file, g, problems, "embedding.bin", g.vocabularySize, g.hiddenSize);
+  Builder embedding(file, g, problems, "embedding.bin", g.vocabularySize, g.hiddenSize, options);
   embedding.embeddingRows("token_embd.weight");
   images.push_back(embedding.finish());
   tables(problems, images);
@@ -879,6 +890,70 @@ std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
 }
 
 uint64_t loadedBytes(const Image &image) { return image.streamedRows ? 0 : image.bytes; }
+
+WeightForm weightForm(uint32_t type, WeightReader reader, Float16Weights weights, bool exactMxfp8,
+                      bool exactBfloat16) noexcept {
+  if (reader == WeightReader::Planes && float16Type(type))
+    return exactMxfp8 ? WeightForm::Mxfp8 : weights == Float16Weights::Q8_0 ? WeightForm::Q8_0 : WeightForm::Stored;
+  if (reader == WeightReader::FloatKernel && floatType(type) && exactBfloat16) return WeightForm::Bfloat16;
+  return WeightForm::Stored;
+}
+
+TensorRows float16Planes(TensorRows stored, uint64_t columns, bool experts, const PlanOptions &options) {
+  const uint32_t type = gguf_format_of(stored.type);
+  if (type != GGUF_FMT_BF16 && type != GGUF_FMT_F16) throw GgufError("not a tensor of 16-bit floats: " + stored.name);
+  const bool mxfp8 = experts && !(columns % ggufColumnUnit(kQuantFormats[GGUF_FMT_MXFP8])) && options.exactlyMxfp8 &&
+                     options.exactlyMxfp8(*stored.file, stored.offset, stored.rows * stored.rowBytes / 2, stored.type);
+  const uint32_t form = quant_float16_form(type, columns);
+  const WeightForm loaded = weightForm(stored.type, WeightReader::Planes, options.weights, mxfp8, false);
+  const uint32_t format = loaded == WeightForm::Mxfp8  ? GGUF_FMT_MXFP8
+                          : loaded == WeightForm::Q8_0 ? GGUF_FMT_Q80
+                                                       : form;
+  if (format != form) {
+    stored.float16Type = stored.type;
+    stored.float16RowBytes = stored.rowBytes;
+    stored.rowBytes = ggufRowBytes(kQuantFormats[format], stored.rowBytes / 2);
+  }
+  stored.type = kQuantFormats[format].ggml_type;
+  return stored;
+}
+
+uint32_t floatKernelType(uint32_t type, const PlanOptions &options, const WeightSource &file, uint64_t offset,
+                         uint64_t values) {
+  const bool exact = floatType(type) && options.exactlyBfloat16 && options.exactlyBfloat16(file, offset, values);
+  return weightForm(type, WeightReader::FloatKernel, options.weights, false, exact) == WeightForm::Bfloat16
+             ? ggml::kBF16
+             : type;
+}
+
+std::string imageFormats(const Image &image) {
+  const auto typeName = [](uint32_t type) -> std::string {
+    if (type == ggml::kF32) return "f32";
+    const uint32_t format = gguf_format_of(type);
+    return format == GGUF_FMT_COUNT ? "ggml" + std::to_string(type) : kQuantFormats[format].name;
+  };
+  std::vector<std::string> lines;
+  const auto repack = [&](const Repack &r) {
+    std::string names;
+    for (const TensorRows &source : r.sources) names += (names.empty() ? "" : "+") + source.name;
+    lines.push_back(names + " " + kQuantFormats[r.format].name + " " + std::to_string(r.rows) + "x" +
+                    std::to_string(r.columns));
+  };
+  for (const Repack &r : image.repacks) repack(r);
+  if (image.experts)
+    for (const Repack &r : image.experts->projections) repack(r);
+  for (const Copy &copy : image.copies) {
+    const std::string written = copy.conversion == Conversion::None              ? typeName(copy.source.type)
+                                : copy.conversion == Conversion::NarrowToBfloat16 ? std::string("bf16")
+                                                                                 : std::string("f32");
+    lines.push_back(copy.source.name + " " + std::to_string(copy.source.first) + "+" +
+                    std::to_string(copy.source.rows) + " " + written);
+  }
+  std::sort(lines.begin(), lines.end());
+  std::string result;
+  for (const std::string &line : lines) result += line + "\n";
+  return result;
+}
 
 bool mxfp8Block(std::span<const float, 32> values, std::span<uint8_t, 33> block) noexcept {
   // A finite float's magnitude bits as significand * 2^exponent, the significand 24 bits wide (float subnormals

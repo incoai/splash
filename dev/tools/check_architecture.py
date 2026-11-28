@@ -168,7 +168,6 @@ LAYER_EXCEPTIONS: frozenset[tuple[str, str]] = frozenset(
         # Types the model interface exposes from below it: model/Model.hpp
         # includes ops/PagedKv.hpp and ops/Vision.hpp, ElasticPool.hpp and
         # WeightMemory.hpp include metal/Allocation.hpp.
-        ("runtime/engine/DiskLabels.hpp", "ops/PagedKv.hpp"),
         ("runtime/engine/Engine.hpp", "ops/Vision.hpp"),
         ("runtime/engine/KvCache.hpp", "ops/PagedKv.hpp"),
         ("runtime/engine/KvPool.hpp", "ops/PagedKv.hpp"),
@@ -262,8 +261,137 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 99 for the tails behind a lane, which a windowed cache gives up where the
 # budget refuses: the states that pin them leave, oldest first, and a Full
 # extent their trims empty beyond the lanes' floors pays for the Slim ones
-# (Cache::releaseTails).
-ENGINE_LINE_BUDGET = 31_209
+# (Cache::releaseTails). 31,388 adds 179 for a windowed copy's two parts
+# (254 lines over the 31,134 its uniform pages left), each a slot of its own
+# file with its own quota, write budget and presence: a tier interface that
+# names the parts of each call, writes and restores that end once their
+# parts have, the pairing of parts at a restart, and the files per component.
+# 31,920 adds 532 for a window unit with a lifetime of its own: a block holds
+# it while a state's tail does, a lane while its window reaches the block
+# (Cache::cutPageTable), a publication attaches the units of its tail
+# (Cache::tailUnits), and the walk releases states for their units in
+# c4630c80's order (Cache::tailReleases), its count and its take one
+# predicate (KvCache::freedBy). 32,010 adds 90 for a copy that holds what its
+# block holds: the parts a write gives it (Cache::copyParts), a part added
+# later under its copy's serial, a restore of the parts a tail reads, and a
+# start that takes back a base part alone. 32,069 adds 59 for the plan's
+# window floor: a lane's floor of blocks priced whole and base pages past it
+# (kvWindowFloorBlocks), in the capacity and in the streamed stores'
+# allowance, whose floor's command is a streamed group's where experts stream.
+# 32,070 adds 2 for the status fields a plan check reads: the lanes' page
+# tables of a page of a block, and each streamed expert size's slot bytes.
+# 32,067 takes 3 back: a publication carries its tail's units from its lane
+# down to the pins (Cache::tailUnits, KvCache::countState), no offers kept.
+# 32,068 adds 1: the plan reports what the window's lane tables add.
+# 32,072 adds 4: the plan reports the layout's smallest extent, which the
+# startup runway rounds up to, for a plan check that computes the minimum.
+# 32,163 adds 91 for the fixes this branch merges beside the storage stages:
+# 60 for the wait for memory (a lone request refused again waits and counts
+# afresh, and once one has waited requests are served in arrival order:
+# Engine::noteMemoryWait, queuedThrough_), 20 for the SSD cache's state
+# staging held only while its tier takes writes (MemoryLedger), and 11 for a
+# start that names a part of a model that is not installed (weightRefusal).
+# 32,088 adds 16: a write that does not start gives back the parts it acquired
+# into its block's copy (Cache::giveSlotBack). 32,108 adds 20: a take nets a
+# release only against the landing its claim was credited
+# (VictimQuery::landingCredited). 32,904 adds 796 for a point on the SSD that
+# holds its window K/V as window parts or as units until those are written:
+# the copy pins and the unit rule (KvCache::copyPins, needsUnit), the
+# unwritten units, their phase, write and count (Unit::Unwritten), the tails'
+# demotions counted a release at a time, the lane's reads of window parts
+# (Cache::startUnitRead), a point's parts and landing (Cache::pointParts,
+# pointLanded) and the window parts' replacement.
+# 1.7.4's other changes were made on branches of their own and joined here,
+# so each is given by what it adds, not by a running total.
+# Serving and the plan: 58 for an image start refused before it takes any
+# memory where its vision scratch and its prompt's KV cannot fit together
+# (Engine::imagesFit, EngineMemoryPlan::residentTokensBeside); 82 for the
+# requests the planned memory runs at once, what one more needs and the
+# start's line that says so (EngineMemoryPlan::noteConcurrentRequests,
+# reportConcurrentRequests); 26 for a persistent cache file found cut short,
+# said at the start, and the damage the files showed counted in /status
+# (disk.damage, StatusSample::cacheDamage); 6 for admission.stalled_wait_ms,
+# which the serving benchmark's G9 bounds; 93 for the token hit rate, why a
+# start's reuse stopped (ReuseEnd), the SSD restored tokens
+# (Cache::diskOnlyTokens) and what the quota gave up by kind; 50 for the room
+# a plan whose experts stream keeps for the cached states its K/V capacity
+# holds the tails of (kvCachedStates, cached_states_bytes) and 15 for a
+# streamed request's allowance priced as the plan prices it (kvPagesCost).
+# The SSD's orders: 17 for a full temporary quota that gives up copies no
+# state needs, then history and redundant copies together, the least
+# recently used first, and newest points' only copies last
+# (Cache::nextDiskReplacement, KvCache::orders); 7 for a full persistent
+# quota whose copy ahead takes only copies no state needs and history, and a
+# request's restore that refreshes its chain's copies (Cache::persist,
+# KvCache::refreshCopies), 5 for its give-up of a copy under a state counted
+# as one of a state, and 3 for the state copies refreshed with the K/V
+# copies (StateCache::refreshCopy); 21 for a write's room that passes over
+# the copy it adds parts to (KvCache::PassOver); 12 for a tier write that
+# allocates its ticket and spans before its first IO starts
+# (BasicKvPageTier::demote); 6 for a disk subtree that waits only for a
+# state's write within it (Cache::dropDiskSubtree).
+# The count and the take: 3 for a take whose unit waited for a transfer in
+# flight, which says Pending; 11 and 316 for the count of tail releases,
+# which judges history and the lanes' points against the states its own
+# releases evicted or left on the SSD alone and walks no chain per block
+# (Cache::SupersededMemo, followGone, chainLanded); 11 for the units a
+# release with no write frees after the quota gave up a state; 76 for a
+# count that stops once it covers its walk's need and one take's most
+# (Cache::reach, releasedUnits, nextTailRelease); 63 and 18 for a take that
+# goes on up to the claim's lack within its unit's count, in the later
+# phases while no step frees a state
+# (Cache::take, reclaimStep, stepMost); 7 for a need in place that keeps the
+# pages of its form it frees (Cache::releaseExtent, landingFill); 366 for
+# the answers of history, of a tail's unit and of a lane's deepest point the
+# cache keeps and drops by path (Cache::dropKept), the rule that a prompt's
+# replay point supersedes the states above it only once a request went on
+# from it (Cache::supersededNow); 87 for
+# a take's walk that resumes at the phase of the leaf the walk before it
+# took, its states where they were, while nothing made room on the SSD or
+# started a write (Cache::takeOldest, diskCalls_); 44 for a step past the
+# first that takes a unit only if what it frees at most fits what is left of
+# the count (Cache::unitMost, stepBudget_); 23 for a device need in place
+# whose steps past its first keep every page they free (Cache::keepsExtents_);
+# 20 for a take that reports the landing its release netted and the part of
+# it that stood for the claim's own credit (FreeResult::nettedBytes,
+# nettedCredited); 115 for a tail release's search that keeps the states
+# within a window below each block of a tail as it goes up (nextTailRelease's
+# tailFrees), the walk afresh kept as the test oracle checkTails; 31 for a
+# count that releases in the walk's order and takes what its phases take
+# (Cache::ordinaryTakes); 3 for landing pages that complete extents beside
+# the free pages past those a claim keeps (Cache::landingExtents); 42 for what leaves at no loss going before what is lost where the tier
+# takes no writes (WalkCursor::lost, Cache::lostOnLeaving); 14 for the
+# order written once, a table the walk's phaseAfter and the count both read;
+# 14 for a take's walk that resumes past a state it passes over for a write
+# it starts none of (Cache::takeOldest). Joined with them: the SSD's order of
+# giving up as one table, which the writer's worth reads too; 3 for the
+# states a lost leaf takes with it leaving as every released state does; 13
+# for a refused room request that searches the SSD's orders once and counts
+# as a refused demotion. Joined, with the lines the joins themselves took and
+# gave, they came to 34,761. The finish's branches add 96 for a capacity
+# failure's limit and what fits, which its error frame carries, and the
+# engine's stop signals, moved in from the command's main, less the admission
+# rule that gave a cached prefix up only where it could not fit alone; 19 for
+# the form a start loads 16-bit weights in; 233 for one order of giving up, a
+# table the walk and its count both read, what leaves at no loss first and
+# what running requests use last, every state given up leaving through one
+# exit, which marks each release no count foresees as it leaves rather than
+# every release after the quota gave a state up, one answer whether a point's
+# copy on the SSD stays as it leaves memory, one worth a write gives the
+# quota, and history written sparsely, a chain's first point and then one
+# point per spacing, a kept point's window parts written ahead; and none, net,
+# for one SSD quota order on both tiers, a waiting point's base found again
+# only where its chain lost a copy and a window part's read that keeps its
+# block's base page in place without holding it and finds its spans under the
+# lock its extents' allocations and releases take, less the quota's read-only
+# answer whether it takes a write, which nothing asked, and a copy's own reuse
+# test, which the reuse a queued request or the resume point is certain to
+# make answers. 35,122 adds 13, raised by the owner on 2026-11-27, for a start
+# that creates the decode pipelines of the lane counts memory kept from their
+# warmup, with no step run, so that such a count's first cycle compiles
+# nothing while its requests wait (Bootstrap.mm, RuntimeModel::
+# prepareDecodeBatch).
+ENGINE_LINE_BUDGET = 35_122
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

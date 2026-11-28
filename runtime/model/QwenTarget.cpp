@@ -183,7 +183,11 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     else if (geometry_.stateLayout.auxiliaryBytes && !sequence.auxiliaryIn)
       throw std::invalid_argument("Qwen decode lane without its auxiliary state");
     step.chunks[index] = sequence.chunk;
-    step.pageTables[index] = sequence.pageTable;
+    if (sequence.pageTables.size() != geometry_.kvLayout.blockPages())
+      throw std::invalid_argument("a Qwen prefill sequence's page tables do not match its blocks' pages");
+    step.pageTables.resize(sequence.pageTables.size());
+    for (size_t page = 0; page < sequence.pageTables.size(); ++page)
+      step.pageTables[page][index] = sequence.pageTables[page];
   }
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moe(geometry_.moeShape(), geometry_.moeRouterFormat, chunk.rows,
@@ -202,10 +206,10 @@ void QwenTarget::planAttention(PrefillStep &step) const {
                                                         geometry_.kvLayout, workspace, {.windowTokens = window}));
 }
 
-void QwenTarget::addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+void QwenTarget::addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t regions, uint32_t extentPages,
                                  std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
                                  uint32_t laneRows, const metal::MetalBuffer &paths) const {
-  ops::PagedAttention::addPathCommit(graph, layout, extentPages, pageTables, committed, laneRows, paths);
+  ops::PagedAttention::addPathCommit(graph, layout, regions, extentPages, pageTables, committed, laneRows, paths);
 }
 
 void QwenTarget::planOutputRows(PrefillStep &step, uint32_t index) const {
@@ -304,7 +308,8 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
     throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
   const ops::AttentionRows rows{b.laneRows, step.rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
-  const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
+  const std::span<const metal::MetalBuffer> pageTables =
+      std::span(step.pageTables[geometry_.kvLayout.blockPage(layer)]).first(sequences.size());
   linear.add(step.graph,
              {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
               .prepared = std::move(normalized)},
@@ -343,7 +348,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
       const PrefillKv history =
           step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
                                kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
-                               {sequence.pageTable, step.kvLayers[layer]});
+                               {pageTables[index], step.kvLayers[layer]});
       histories[index] = {history.kv, history.table, blocks.empty() ? ops::AttentionBlocks{} : blocks[index]};
     }
   }

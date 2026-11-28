@@ -192,7 +192,9 @@ def engine_events():
             b"a start command ran out of GPU memory",
         ),
         "warming": p.WarmingEvent(3, 9),
-        "start": p.StartEvent(91, 2, 4096, 4160, p.StateSource.DISK, True),
+        "start": p.StartEvent(
+            91, 2, 4096, 4160, p.StateSource.DISK, True, p.ReuseEnd.KV_WITHOUT_STATE, 64
+        ),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
         "mask_request_initial": p.MaskRequestEvent(91, 6, 4, (), ()),
@@ -223,6 +225,16 @@ def engine_events():
             b"kv_write_budget",
             b"the SSD cache's write budget is spent",
             21_600,
+        ),
+        "error_capacity": p.ErrorEvent(
+            p.FailureClass.REQUEST_ERROR,
+            91,
+            False,
+            b"kv_disk_quota",
+            b"this request's KV needs more of the SSD cache",
+            0,
+            p.CapacityLimit.DISK_QUOTA,
+            8191,
         ),
         "error_engine": p.ErrorEvent(
             p.FailureClass.ENGINE_UNHEALTHY,
@@ -1122,7 +1134,7 @@ class ProtocolPythonTests(unittest.TestCase):
         error = native_peer.serialize_event(
             p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"message")
         )
-        bad_error = mutate_u32(error, p.FRAME_HEADER_BYTES + 14, 0xFFFFFFFF)
+        bad_error = mutate_u32(error, p.FRAME_HEADER_BYTES + 19, 0xFFFFFFFF)
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
@@ -1136,6 +1148,28 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assert_fatal_event(
             p.IssueCode.INVALID_ERROR_CLASSIFICATION,
             p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"", 60),
+        )
+        # Only a request's capacity failure says what it lacked, and what fits
+        # only with what it lacked.
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ENUM_VALUE,
+            p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"", 0, 5),
+        )
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ERROR_CLASSIFICATION,
+            p.ErrorEvent(
+                p.FailureClass.ENGINE_UNHEALTHY,
+                0,
+                False,
+                b"bad",
+                b"",
+                0,
+                p.CapacityLimit.MEMORY,
+            ),
+        )
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ERROR_CLASSIFICATION,
+            p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"", 0, 0, 64),
         )
 
     def test_status_json_is_opaque_length_delimited_and_bounded(self):
@@ -1159,6 +1193,16 @@ class ProtocolPythonTests(unittest.TestCase):
                 True,
                 b"busy",
                 b"retry this request",
+            ),
+            p.ErrorEvent(
+                p.FailureClass.REQUEST_ERROR,
+                5,
+                False,
+                b"capacity_exhausted",
+                b"does not fit alone",
+                0,
+                p.CapacityLimit.MEMORY,
+                4080,
             ),
             p.ErrorEvent(
                 p.FailureClass.ENGINE_UNHEALTHY,

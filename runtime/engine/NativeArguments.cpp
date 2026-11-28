@@ -177,10 +177,6 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "always")
         throw UsageError("--kv-spill requires always");
       result.kvSpillAlways = true;
-    } else if (option == "--kv-window-trim") {
-      if (value != "on" && value != "off")
-        throw UsageError("--kv-window-trim requires on or off");
-      result.kvWindowTrim = value == "on";
     } else if (option == "--ane") {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
@@ -193,6 +189,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "bf16")
         throw UsageError("--activations requires auto or bf16");
       result.int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+    } else if (option == "--weights") {
+      if (value != "auto" && value != "original")
+        throw UsageError("--weights requires original or auto");
+      result.weights = value == "auto" ? model::gguf::Float16Weights::Q8_0 : model::gguf::Float16Weights::Published;
     } else if (option == "--verify-rows") {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");

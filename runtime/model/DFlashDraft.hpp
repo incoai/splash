@@ -264,12 +264,13 @@ struct DFlashDraftStep final {
 // finish, `finish` (QwenTargetDimensions::logitFinish): no candidate of the
 // rows past its tokens, which a head padded past them drafts over its whole
 // vocabulary to leave out, and its softcap on each candidate's score after
-// the selector's edge, as DFlash2 trains a draft of a softcapped head.
+// the selector's edge, as DFlash2 trains a draft of a softcapped head. Its
+// trees end at its target's stop tokens, `stopTokens` (ops::DraftSelector).
 class DFlashDraft final {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
                const ops::ExecutionPlans &operators, const ops::Projection &head,
-               ops::DraftVocabulary subset, ops::LogitFinishValues finish);
+               ops::DraftVocabulary subset, ops::LogitFinishValues finish, ops::StopTokens stopTokens);
 
   // A lane's tokens that choose the vocabulary of its steps: the last of the
   // tokens it read and its anchor (vocabulary).

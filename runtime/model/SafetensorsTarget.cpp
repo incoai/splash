@@ -36,19 +36,19 @@ private:
 SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                                  const std::filesystem::path &directory,
                                                  const SafetensorsTargetPlan &plan, SparseRowStoreOptions table,
-                                                 ExpertStoreOptions experts)
+                                                 ExpertStoreOptions experts, gguf::Float16Weights weights)
     : SafetensorsTargetLoader(backend, images, std::make_shared<Planned>(directory), plan, std::move(table),
-                              experts) {}
+                              experts, weights) {}
 
 SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                                  std::shared_ptr<Planned> planned, const SafetensorsTargetPlan &plan,
-                                                 SparseRowStoreOptions table, ExpertStoreOptions experts)
+                                                 SparseRowStoreOptions table, ExpertStoreOptions experts,
+                                                 gguf::Float16Weights weights)
     : TargetImages(backend, images, std::shared_ptr<std::vector<gguf::Image>>(planned, &planned->images),
                    [planned] { planned->checkpoint.checkUnchanged(); }, plan.layerImages, plan.firstMoeLayer,
-                   std::move(table), experts),
+                   std::move(table), experts, weights),
       planned_(std::move(planned)) {
-  gguf::PlanOptions options = planOptions();
-  options.exactlyMxfp8 = exactlyMxfp8;
+  const gguf::PlanOptions options = readingValues(planOptions());
   SafetensorsTargetPlan::Images plannedImages = plan.images(planned_->checkpoint, options);
   planned_->images = std::move(plannedImages.images);
   float32Norms_ = plannedImages.float32Norms;

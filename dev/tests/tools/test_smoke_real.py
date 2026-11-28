@@ -535,6 +535,7 @@ class SmokeRealTests(unittest.TestCase):
                 "submitted": 7,
                 "completed": 5,
                 "cancelled": 1,
+                "timed_out": 1,
                 "failed": 1,
             },
         }
@@ -545,38 +546,37 @@ class SmokeRealTests(unittest.TestCase):
                 status[key] = value
         return status
 
-    def test_scoring_timeout_accepts_either_terminal_path_after_cleanup(self):
-        for outcome in ("cancelled", "failed"):
-            with self.subTest(outcome=outcome):
-                before = self.timeout_status()
-                active = self.timeout_status(
-                    requests={"submitted": 8}, transport={"pending": 1}
-                )
-                finishing = self.timeout_status(
-                    requests={"submitted": 8, outcome: 2}, transport={"pending": 1}
-                )
-                idle = self.timeout_status(requests={"submitted": 8, outcome: 2})
-                with (
-                    mock.patch.object(
-                        smoke_real,
-                        "request",
-                        side_effect=[
-                            (200, status) for status in (active, finishing, idle)
-                        ],
-                    ) as request,
-                    mock.patch.object(smoke_real.time, "sleep") as sleep,
-                ):
-                    smoke_real.wait_for_timeout_cleanup(8000, before)
-                self.assertEqual(request.call_count, 3)
-                self.assertEqual(sleep.call_count, 2)
+    def test_scoring_timeout_ends_timed_out_after_cleanup(self):
+        # The engine counts a request its deadline ended, by its own deadline
+        # or the frontend's cancel at it, in timed_out alone.
+        before = self.timeout_status()
+        active = self.timeout_status(
+            requests={"submitted": 8}, transport={"pending": 1}
+        )
+        finishing = self.timeout_status(
+            requests={"submitted": 8, "timed_out": 2}, transport={"pending": 1}
+        )
+        idle = self.timeout_status(requests={"submitted": 8, "timed_out": 2})
+        with (
+            mock.patch.object(
+                smoke_real,
+                "request",
+                side_effect=[(200, status) for status in (active, finishing, idle)],
+            ) as request,
+            mock.patch.object(smoke_real.time, "sleep") as sleep,
+        ):
+            smoke_real.wait_for_timeout_cleanup(8000, before)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_scoring_timeout_rejects_invalid_outcomes_and_unhealthy_runtime(self):
         cases = {
             "not_admitted": {"requests": {"submitted": 7}},
             "extra_request": {"requests": {"submitted": 9}},
             "completed": {"requests": {"completed": 6}},
-            "double_terminal": {"requests": {"failed": 2}},
-            "double_cancel": {"requests": {"cancelled": 3}},
+            "failed": {"requests": {"failed": 2}},
+            "cancelled": {"requests": {"cancelled": 2}},
+            "double_timeout": {"requests": {"timed_out": 3}},
             "new_instance": {"instance": "replacement"},
             "native_restart": {"transport": {"restarts": 1}},
             "not_ready": {"ready": False},
@@ -584,7 +584,7 @@ class SmokeRealTests(unittest.TestCase):
         }
         for name, changes in cases.items():
             with self.subTest(name=name):
-                after = self.timeout_status(requests={"submitted": 8, "cancelled": 2})
+                after = self.timeout_status(requests={"submitted": 8, "timed_out": 2})
                 for key, value in changes.items():
                     if isinstance(value, dict):
                         after[key].update(value)
@@ -597,10 +597,10 @@ class SmokeRealTests(unittest.TestCase):
                     smoke_real.wait_for_timeout_cleanup(8000, self.timeout_status())
 
     def test_scoring_timeout_cleanup_has_a_deadline(self):
-        for cancelled, pending in ((1, 0), (1, 1), (2, 1)):
-            with self.subTest(terminal=cancelled == 2, pending=pending):
+        for timed_out, pending in ((1, 0), (1, 1), (2, 1)):
+            with self.subTest(terminal=timed_out == 2, pending=pending):
                 stuck = self.timeout_status(
-                    requests={"submitted": 8, "cancelled": cancelled},
+                    requests={"submitted": 8, "timed_out": timed_out},
                     transport={"pending": pending},
                 )
                 with (

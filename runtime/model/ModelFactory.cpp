@@ -104,12 +104,13 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
         table.readers = options.readers;
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, safetensorsTargetPlan(layout), table, experts);
+          SafetensorsTargetLoader loader(backend, images, directory, safetensorsTargetPlan(layout), table, experts,
+                                         options.weights);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), ggufTargetPlan(layout), table,
-                                  experts);
+                                  experts, options.weights);
           return readTarget(backend, layout, std::ref(loader));
         }
         }
@@ -122,13 +123,14 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
 
 QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend, const std::filesystem::path &root,
                                          const ModelDescriptor &descriptor, uint64_t streamedTableBytes,
-                                         std::shared_ptr<SsdReaders> readers) {
+                                         std::shared_ptr<SsdReaders> readers, gguf::Float16Weights weights) {
   if (!descriptor.valid()) throw std::invalid_argument("model descriptor is invalid");
   // Released before the first image, the images load reserved.
   WeightImages images(backend, descriptor.sourceIdentity);
   images.release();
-  const TargetWeights target = loadTarget(backend, images, root, descriptor,
-                                          {.streamedTableBytes = streamedTableBytes, .readers = std::move(readers)});
+  const TargetWeights target =
+      loadTarget(backend, images, root, descriptor,
+                 {.streamedTableBytes = streamedTableBytes, .readers = std::move(readers), .weights = weights});
   return std::visit(
       [&](const auto &weights) { return qwenTargetGeometry(weights, descriptor.draft.targetLayerIds()); }, target);
 }

@@ -337,7 +337,8 @@ struct MoeScratch final {
   // rows' inputs, intermediates and outputs, whatever the tile; the inputs
   // and intermediates hold tileRows - 1 rows more, which a last tile's matmul
   // may read past its live rows (moe_expert_slab.h). The router parks its
-  // fp32 scores in groupedInput until the gather claims it.
+  // fp32 scores in groupedInput until the gather claims it; a narrow step's
+  // holds the scores alone, its gate/up pass reading its rows in place.
   metal::MetalBuffer tileDescriptors;
   metal::MetalBuffer tileCount;
   metal::MetalBuffer groupedRoutes;
@@ -398,7 +399,7 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 // average at most 48 routes an expert) on M64 tiles throws. A row's bits are
 // the same on every tile: the tiles' 8-, 16-, 32- and 64-row matmuls sum its
 // products in one order (moe_live_rows).
-enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32, M64 = 64 };
+enum class MoeExpertTile : uint8_t { M8 = 8, M16 = 16, M32 = 32, M64 = 64 };
 
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
@@ -410,6 +411,11 @@ struct MoeConfig final {
   // A resident block's prefill passes on int8 activations where its expert
   // projections are af4g64 or af5g64 (MoE::addRouted, moe_int8.metal).
   bool int8Passes = false;
+  // The K partitions of the 8-row gate/up and down passes
+  // (moe_gguf_expert_tile): 1, or 2, a threadgroup of twice the simdgroups,
+  // each summing half of K (selectMoe).
+  uint8_t gateUpPartitions = 1;
+  uint8_t downPartitions = 1;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -423,6 +429,20 @@ public:
     return static_cast<uint32_t>(config_.expertTile);
   }
   [[nodiscard]] uint32_t maximumTiles() const noexcept { return maximumTiles_; }
+  // Whether the step is narrow, of at most MOE_NARROW_ROWS rows (a verify
+  // block): its gate/up pass reads its input rows in place, a column tile
+  // each route's row through the grouped routes, a staged tile all of the
+  // step's rows in one 8- or 16-row matmul (inputRows) whose routes' rows it
+  // stores, the bits of the gathered rows' (a row's sums are the same bits on
+  // every tile's matmul), so the step runs no gather: one dependent dispatch
+  // and the copy of its routed rows fewer (MoE::addRouted).
+  [[nodiscard]] bool narrow() const noexcept { return rows_ <= MOE_NARROW_ROWS; }
+  // The rows of the input the plan reads: its rows, or the rows of a narrow
+  // step's in-place matmul (moe_matmul_rows), past its rows those of no
+  // route, whose sums it discards.
+  [[nodiscard]] uint32_t inputRows() const noexcept {
+    return narrow() ? moe_matmul_rows(rows_, MOE_NARROW_ROWS) : rows_;
+  }
   [[nodiscard]] const MoeWorkspace &workspace() const noexcept {
     return workspace_;
   }
@@ -488,16 +508,17 @@ struct MoE final {
   [[nodiscard]] static MoePlan plan(MoeShape shape, uint32_t rows, MoeConfig config);
   // A step's routing (addRouting: the router, the selection and the
   // grouping into tiles), the load of its streamed experts, and its routed
-  // work (the gather, the expert passes and the combine). A streamed block's
-  // runs the gather and the passes over the tiles of experts resident before
-  // the load beside it (addResident, as MoeExpertStream::addLoad's `beside`),
-  // the rest after it (addRouted); a resident block's runs all of it after
-  // the routing (addRouted). Steps that share a load (a prefill group's
-  // chunks, QwenTarget::addPrefillLayers) run their routings, one load of
-  // the union beside the first step's resident work, then each step's work
-  // through its combine before the next step's: they share the scratch their
-  // gathers and passes write, all but their routing. With `convolution` (a
-  // verify step's) the combine runs it on its rows (MoeCombineConvolution).
+  // work (the gather but a narrow step's, MoePlan::narrow, the expert passes
+  // and the combine). A streamed block's runs the gather and the passes over
+  // the tiles of experts resident before the load beside it (addResident, as
+  // MoeExpertStream::addLoad's `beside`), the rest after it (addRouted); a
+  // resident block's runs all of it after the routing (addRouted). Steps
+  // that share a load (a prefill group's chunks,
+  // QwenTarget::addPrefillLayers) run their routings, one load of the union
+  // beside the first step's resident work, then each step's work through its
+  // combine before the next step's: they share the scratch their gathers and
+  // passes write, all but their routing. With `convolution` (a verify step's)
+  // the combine runs it on its rows (MoeCombineConvolution).
   static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const BlockMoeWeights &weights, const MoePlan &plan);
   static void addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,

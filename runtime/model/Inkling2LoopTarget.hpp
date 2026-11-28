@@ -63,7 +63,7 @@ public:
   void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows,
                     const ops::StepRows &step) const override;
   // The relative attention's commit of the K/V it stores.
-  void addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+  void addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t regions, uint32_t extentPages,
                        std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
                        uint32_t laneRows, const metal::MetalBuffer &paths) const override;
 
@@ -127,7 +127,8 @@ private:
     metal::MetalBuffer output;
   };
   // The application's gates `gates` of its mix rows of `queries` queries, one
-  // call (ops::MessageGate::add).
+  // call (ops::MessageGate::add), which reads the mixes' rows normalized
+  // where the mixes wrote them (ops::MessageGate::readsNormalized).
   void addGates(const PrefillStep &step, uint32_t application, uint32_t queries, std::span<const Gate> gates) const;
   // One of the application's convolutions over the step's rows: its state
   // columns in each lane's matrix, the sequences' states in and out, the

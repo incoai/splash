@@ -102,6 +102,19 @@ GgufDecodeFusedParams decodeFusedSegments(const LinearPlan &plan, std::span<cons
                        plan, order, bindings);
 }
 
+// Specializes the last dispatch's pipeline to the formats of `segments` (its
+// function constants 0-2, kernels/common/gguf_segments.h fused_formats): each
+// once, ascending, the last repeated to three, so the dispatches of one format
+// set share a pipeline, which builds and holds registers for those alone.
+void specializeFormats(metal::CommandGraph &graph, std::span<const QuantizedSegment *const> segments) {
+  std::array<uint32_t, kFusedSegments> formats{};
+  for (size_t i = 0; i < segments.size(); ++i) formats[i] = segments[i]->formatId;
+  std::sort(formats.begin(), formats.begin() + segments.size());
+  const auto distinct = std::unique(formats.begin(), formats.begin() + segments.size());
+  std::fill(distinct, formats.end(), distinct[-1]);
+  graph.specialize(formats);
+}
+
 // A fused projection's segments in tile order: those with the most bytes per
 // tile first, so their threadgroups do not form the tail.
 std::vector<const QuantizedSegment *> heaviestFirst(const std::vector<QuantizedSegment> &segments) {
@@ -163,10 +176,24 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only a staged block plan of whole PQ2_0 blocks per split runs int8 activations");
   if (c.tile == LinearTile::GgufColumn) {
     // The column tile reads its rows alone, a gate/up pair's both tensors in
-    // one pass, and splits K inside its threadgroup alone.
-    if (workload_.rows > GGUF_COLUMN_ROWS || c.splits != 1 || workload_.epilogue == LinearEpilogue::UpWithGate ||
+    // one pass, and splits K among its simdgroups and, split, its partitions,
+    // each simdgroup of a partition at least one group.
+    if (workload_.rows > GGUF_COLUMN_ROWS || !c.validSplits() ||
+        (c.splits > 1 && k / 32 < c.splits * GGUF_COLUMN_SPLITS) ||
+        workload_.epilogue == LinearEpilogue::UpWithGate ||
         c.oneGateUpPass != (workload_.epilogue == LinearEpilogue::GateUp))
-      throw std::invalid_argument("the column block tile takes up to GGUF_COLUMN_ROWS rows, unsplit, no up-with-gate");
+      throw std::invalid_argument(
+          "the column block tile takes up to GGUF_COLUMN_ROWS rows, a group per simdgroup, no up-with-gate");
+    return;
+  }
+  if (c.tile == LinearTile::GgufMatrix) {
+    // The matrix tile splits K among its simdgroups and, split, its
+    // partitions, each simdgroup of a partition at least one group; a gate/up
+    // runs as a gate pass and an up pass.
+    if (workload_.rows > kMaximumStagedRows || !c.validSplits() || k / 32 < c.splits * GGUF_COLUMN_SPLITS ||
+        c.oneGateUpPass)
+      throw std::invalid_argument(
+          "the matrix block tile takes up to two row groups' rows, a group per simdgroup, a gate/up in two passes");
     return;
   }
   if (c.tile == LinearTile::GgufRegister) {
@@ -187,6 +214,7 @@ void LinearPlan::requireConfiguration() const {
 
 uint32_t LinearPlan::storageRows() const noexcept {
   if (config_.tile == LinearTile::GgufColumn) return workload_.rows;
+  if (config_.tile == LinearTile::GgufMatrix) return matrixStorageRows(workload_.rows);
   if (config_.tile == LinearTile::GgufRegister) return tableTiles(workload_.rows) * GGUF_TABLE16_ROWS;
   if (config_.tile == LinearTile::GgufPrefill || config_.tile == LinearTile::GgufPrefillInt8)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
@@ -195,8 +223,22 @@ uint32_t LinearPlan::storageRows() const noexcept {
 
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
   const auto [n, k] = workload_.matrix;
-  // The column tile sums K's parts in its threadgroup alone.
-  if (config_.tile == LinearTile::GgufColumn) return {};
+  // Column tile: split, [split][row][column] fp32 partials of its rows, a
+  // one-pass gate/up's of both tensors, and one counter per column tile.
+  // Matrix tile: split, [split][row][column] fp32 partials of its rows and
+  // one counter per 32 columns of each row group.
+  if (config_.tile == LinearTile::GgufMatrix)
+    return config_.splits > 1
+               ? LinearScratchSize{0, 0, uint64_t{config_.splits} * workload_.rows * n * sizeof(float),
+                                   uint64_t{matrixRowGroups(workload_.rows).groups} * (n / GGUF_COLUMN_COLUMNS) *
+                                       sizeof(uint32_t)}
+               : LinearScratchSize{};
+  if (config_.tile == LinearTile::GgufColumn) {
+    const uint64_t columns = config_.oneGateUpPass ? 2 * uint64_t{n} : n;
+    return config_.splits > 1 ? LinearScratchSize{0, 0, uint64_t{config_.splits} * workload_.rows * columns * sizeof(float),
+                                                  uint64_t{n / GGUF_COLUMN_COLUMNS} * sizeof(uint32_t)}
+                              : LinearScratchSize{};
+  }
   // Register tile: the Table16 table and sums, and split, [lane][split][row]
   // [column] partials and one counter per 64-column tile, which covers every
   // lane.
@@ -301,6 +343,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   case LinearTile::GgufPrefill: addGgufPrefill(graph, b, p, plan); break;
   case LinearTile::GgufPrefillInt8: addGgufPrefillInt8(graph, b, p, plan); break;
   case LinearTile::GgufColumn: addGgufColumn(graph, b, p, plan, gate); break;
+  case LinearTile::GgufMatrix: addGgufMatrix(graph, b, p, plan, gate); break;
   }
 }
 
@@ -362,15 +405,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     }
     graph.add("gguf_decode_fused_m" + std::to_string(height), std::move(bindings), params, tileGrid(segmentColumns(p)),
               {GGUF_STAGED_THREADS, 1, 1});
-    // The pipeline decodes the segments' formats alone, each once in
-    // ascending order and the last repeated to three, so projections of one
-    // format set share it (gguf_linear.metal, fused_formats).
-    std::array<uint32_t, kFusedSegments> formats{};
-    for (size_t i = 0; i < order.size(); ++i) formats[i] = order[i]->formatId;
-    std::sort(formats.begin(), formats.begin() + order.size());
-    const auto distinct = std::unique(formats.begin(), formats.begin() + order.size());
-    std::fill(distinct, formats.end(), distinct[-1]);
-    graph.specialize(formats);
+    specializeFormats(graph, order);
   };
   if (config.oneGateUpPass) {
     const auto [g, u] = onePassTensors(p, *gate);
@@ -550,11 +585,15 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
 void Linear::addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
                            const LinearPlan &plan, const Projection *gate) const {
   const LinearWorkload w = plan.workload();
+  const uint32_t splits = plan.configuration().splits;
+  const auto [partials, counters] = splitScratch(b, splits);
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   const auto add = [&](std::string name, std::vector<metal::MetalBuffer> bindings, const QuantizedSegment &s) {
+    bindings.insert(bindings.end(), {partials, counters});
     graph.add(std::move(name), std::move(bindings),
-              GgufColumnParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, s.columnOffset, s.formatId},
-              {s.outputSize / GGUF_COLUMN_COLUMNS, 1, 1}, {GGUF_COLUMN_THREADS, 1, 1});
+              GgufColumnParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, s.columnOffset, s.formatId, splits},
+              {s.outputSize / GGUF_COLUMN_COLUMNS, splits, 1}, {GGUF_COLUMN_THREADS, 1, 1});
+    specializeFormats(graph, std::array{&s});
   };
   if (gate) {
     const auto [g, u] = onePassTensors(p, *gate);
@@ -565,11 +604,12 @@ void Linear::addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &b, c
   if (segments.size() > 1 && w.epilogue == LinearEpilogue::None && plan.destination() == FloatOutput::BFloat16) {
     std::vector<metal::MetalBuffer> bindings{b.input};
     const GgufColumnFusedParams params = fusedSegments(
-        GgufColumnFusedParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, plan,
-        heaviestFirst(segments), bindings);
-    bindings.push_back(b.output);
-    graph.add("gguf_column_fused", std::move(bindings), params, {segmentColumns(p) / GGUF_COLUMN_COLUMNS, 1, 1},
+        GgufColumnFusedParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, splits},
+        plan, heaviestFirst(segments), bindings);
+    bindings.insert(bindings.end(), {b.output, partials, counters});
+    graph.add("gguf_column_fused", std::move(bindings), params, {segmentColumns(p) / GGUF_COLUMN_COLUMNS, splits, 1},
               {GGUF_COLUMN_THREADS, 1, 1});
+    specializeFormats(graph, heaviestFirst(segments));
     return;
   }
   for (const QuantizedSegment &s : segments) {
@@ -579,6 +619,56 @@ void Linear::addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &b, c
     }
     add(kernelInstance("gguf_column_a", plan.destination()), {b.input, s.plane0, s.plane1Slot(), s.meta, b.output}, s);
   }
+}
+
+// One dispatch per tensor, each threadgroup GGUF_COLUMN_COLUMNS of the
+// tensor's columns over the plan's fragments, a gate/up as a gate pass and an
+// up pass (addDecodeTensor); a fused projection's segments in one dispatch
+// (gguf_matrix_fused_m<rows>), in tile order (heaviestFirst), as the column
+// tile runs them.
+void Linear::addGgufMatrix(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
+                           const LinearPlan &plan, const Projection *gate) const {
+  // The matrix tile is a family's whose calibration gives it splits (ProjectionCalibration::matrixSplits). Its
+  // kernels write values outside their bounds on Apple9 (gguf-projection on a 10-core M4), so a family without the
+  // law runs no plan of it, whether its selection made the plan (it never does) or a caller handed it one.
+  if (!calibration_.projection.matrixSplits)
+    throw std::invalid_argument("the matrix block tile is not this GPU family's: its calibration plans none");
+  const LinearWorkload w = plan.workload();
+  const uint32_t splits = plan.configuration().splits;
+  const auto [partials, counters] = splitScratch(b, splits);
+  const MatrixRowGroups groups = matrixRowGroups(w.rows);
+  const std::string rows = "_m" + std::to_string(groups.rows);
+  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
+                          const metal::MetalBuffer &aux) {
+    std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, output};
+    if (epilogue != 'a') bindings.push_back(aux);
+    bindings.insert(bindings.end(), {partials, counters});
+    graph.add((epilogue == 'a' ? kernelInstance("gguf_matrix_a", plan.destination())
+                               : std::string("gguf_matrix_") + epilogue) +
+                  rows,
+              std::move(bindings),
+              GgufColumnParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, s.columnOffset, s.formatId, splits},
+              {s.outputSize / GGUF_COLUMN_COLUMNS, splits, groups.groups}, {GGUF_COLUMN_THREADS, 1, 1});
+    specializeFormats(graph, std::array{&s});
+  };
+  if (segments.size() == 1) {
+    addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
+    return;
+  }
+  if (w.epilogue == LinearEpilogue::None && plan.destination() == FloatOutput::BFloat16) {
+    std::vector<metal::MetalBuffer> bindings{b.input};
+    const GgufColumnFusedParams params = fusedSegments(
+        GgufColumnFusedParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, splits},
+        plan, heaviestFirst(segments), bindings);
+    bindings.insert(bindings.end(), {b.output, partials, counters});
+    graph.add("gguf_matrix_fused" + rows, std::move(bindings), params,
+              {segmentColumns(p) / GGUF_COLUMN_COLUMNS, splits, groups.groups}, {GGUF_COLUMN_THREADS, 1, 1});
+    specializeFormats(graph, heaviestFirst(segments));
+    return;
+  }
+  for (const QuantizedSegment &s : segments)
+    tensor(s, epilogueSuffix(w.epilogue), b.output, epilogueInput(b, w.epilogue));
 }
 
 // Float segments of a projection (QuantizedSegment::isFloat): a float projection

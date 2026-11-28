@@ -327,19 +327,22 @@ class GlmArgumentReadingTests(unittest.TestCase):
         _, calls = self.assert_reads_alike(("weather", {"city": value}))
         self.assertEqual(json.loads(calls[0]["function"]["arguments"])["city"], value)
 
-    def test_a_cut_call_keeps_the_arguments_it_has(self):
+    def test_a_cut_call_is_not_a_call(self):
         text = flint_call("weather", {"city": "Paris", "days": 3})
-        # From the end of the function's name on.
-        for cut in range(len("<tool_call>weather<"), len(text)):
+        # From the end of the function's name on: nothing of it is returned
+        # or streamed, and the whole call is one.
+        for cut in range(len("<tool_call>weather<"), len(text) + 1):
             with self.subTest(cut=cut):
-                _, calls, _ = project(
+                _, calls, events = project(
                     text[:cut],
                     tool_policy(SCHEMAS),
-                    incomplete=True,
+                    incomplete=cut < len(text),
                     syntax=GLM_ARGS,
                 )
+                names = [call["function"]["name"] for call in calls]
+                self.assertEqual(names, [] if cut < len(text) else ["weather"])
                 self.assertEqual(
-                    [call["function"]["name"] for call in calls], ["weather"]
+                    "tool" in [kind for kind, _ in events], cut == len(text)
                 )
 
     def test_names_lose_their_space_and_a_repeated_parameter_keeps_its_first(self):
@@ -1192,17 +1195,51 @@ class InklingCallReadingTests(unittest.TestCase):
                     '{"city":"Paris","days":3}{}',
                 )
 
-    def test_a_cut_call_keeps_the_arguments_it_has(self):
+    def test_a_cut_call_is_not_a_call(self):
+        # Its arguments do not read as the object a call carries, and it
+        # streamed nothing.
         text = inkling2_call("weather", {"city": "Paris", "days": 3})
         cut = text[: text.index("days")]
-        _, _, calls, _ = self.read(cut, 4, incomplete=True)
-        self.assertEqual(
-            [
-                (call["function"]["name"], call["function"]["arguments"])
-                for call in calls
-            ],
-            [("weather", '{"city":"Paris","')],
-        )
+        _, content, calls, events = self.read(cut, 4, incomplete=True)
+        self.assertEqual((content, calls), ("", []))
+        self.assertNotIn("tool", [kind for kind, _ in events])
+
+    def test_a_call_whose_header_names_no_function_takes_its_object_s_name(self):
+        # Inkling at temperature 1 may leave the name out of a call's header:
+        # its object names the tool, whatever the case, and the call is read
+        # as one; an object that names no declared tool, and an opening whose
+        # header does not close, stay the text the model wrote.
+        nameless = MODEL + "<|content_invoke_tool_json|>"
+        called = nameless + '{"name":"weather","args":{"city":"Austin"}}' + END
+        for text, call in (
+            (called, ("weather", '{"city":"Austin"}')),
+            (
+                called.replace('"weather"', '"Weather"'),
+                ("weather", '{"city":"Austin"}'),
+            ),
+            (nameless + '{"args":{},"name":"time"}' + END, ("time", "{}")),
+        ):
+            for size in (1, 5, len(text)):
+                with self.subTest(text=text, size=size):
+                    _, content, calls, _ = self.read(text, size)
+                    self.assertEqual(content, "")
+                    self.assertEqual(
+                        [
+                            (c["function"]["name"], c["function"]["arguments"])
+                            for c in calls
+                        ],
+                        [call],
+                    )
+        for text in (
+            nameless + '{"name":"search","args":{"q":"x"}}' + END,
+            nameless + '{"args":{"city":"Austin"}}' + END,
+            MODEL + END + "after",
+        ):
+            for size in (1, 5, len(text)):
+                with self.subTest(text=text, size=size):
+                    _, content, calls, _ = self.read(text, size)
+                    self.assertEqual(calls, [])
+                    self.assertNotEqual(content, "")
 
     def test_an_object_laid_out_otherwise_is_read_whole(self):
         text = (

@@ -596,15 +596,32 @@ void beginCold(model::Runtime &runtime, const EngineRequest &request,
   runtime.beginColdRequest(request.modelView(), lane);
 }
 
+// The oracle's blocks: base page p's window unit, of a windowed target, is
+// the pages p + (j + 1) x stride for j below blockPages - 1, past every base
+// page the checks address.
+struct OracleBlocks final {
+  uint32_t blockPages = 1;
+  uint32_t stride = 0;
+};
+OracleBlocks oracleBlocks;
+
+// The page that holds a layer of the block on base page `page`.
+uint32_t pageOfLayer(const kv::Layout &layout, uint32_t page, uint32_t layer) {
+  const uint32_t at = layout.blockPage(layer);
+  return at ? page + at * oracleBlocks.stride : page;
+}
+
 // Gives an item the revision of its page list the way the engine's cache
 // does: a request's revision moves whenever its list differs from the last
 // one it named, which it keeps below the first page that differs. Growing
-// tables then take the runtime's incremental page-table writes.
+// tables then take the runtime's incremental page-table writes. Its window
+// tables follow its base pages (OracleBlocks).
 ModelBatchItem withRevision(ModelBatchItem item) {
   struct Named final {
     uint64_t revision = 0;
     uint32_t firstChanged = 0;
     std::vector<uint32_t> pages;
+    std::vector<std::vector<uint32_t>> windows;
   };
   static std::unordered_map<uint64_t, Named> named;
   Named &last = named[item.requestId];
@@ -613,7 +630,12 @@ ModelBatchItem withRevision(ModelBatchItem item) {
         std::ranges::mismatch(last.pages, item.pageTable).in1 - last.pages.begin());
     ++last.revision;
     last.pages.assign(item.pageTable.begin(), item.pageTable.end());
+    last.windows.assign(oracleBlocks.blockPages - 1, {});
+    for (uint32_t table = 0; table < last.windows.size(); ++table)
+      for (const uint32_t page : last.pages)
+        last.windows[table].push_back(page + (table + 1) * oracleBlocks.stride);
   }
+  item.windowTables = last.windows;
   item.pageTableRevision = last.revision;
   item.pageTableFirstChanged = last.firstChanged;
   return item;
@@ -4547,7 +4569,7 @@ std::vector<uint8_t> slotBytes(const kv::PageStorage &pages, std::span<const uin
   std::vector<uint8_t> bytes;
   for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
     const std::array<std::span<std::byte>, 4> spans =
-        pages.layerSpans(pageTable[position / kv::kPageTokens], layer);
+        pages.layerSpans(pageOfLayer(layout, pageTable[position / kv::kPageTokens], layer), layer);
     const auto append = [&](uint32_t tensor, uint64_t at, uint64_t count) {
       const auto *data = reinterpret_cast<const uint8_t *>(spans[tensor].data()) + at;
       bytes.insert(bytes.end(), data, data + count);
@@ -6460,7 +6482,8 @@ public:
     for (uint32_t place = first; place < last; ++place) {
       if (request.sources[place].indexed()) continue;
       std::vector<std::byte> bytes;
-      for (const auto &span : format_.transferSpans(kv_, request.pages[place]))
+      // A spilling layout has no window: the block is its one page.
+      for (const auto &span : format_.transferSpans(kv_, std::array<uint32_t, 1>{request.pages[place]}))
         bytes.insert(bytes.end(), span.begin(), span.end());
       places.push_back(place);
       moving.push_back(request.pages[place]);
@@ -6504,7 +6527,7 @@ public:
       const std::optional<std::span<const std::byte>> bytes =
           model::readKvCopy(*request.copies[places[index]], {0, format_.payloadBytes()}, buffer);
       require(bytes.has_value(), "a spilled page's copy could not be read whole");
-      format_.scatterPage(*bytes, kv_, page);
+      format_.scatterPage(*bytes, kv_, std::array<uint32_t, 1>{page});
       request.pages[places[index]] = page;
       request.sources[places[index]] = {};
       request.copies[places[index]].reset();
@@ -7094,7 +7117,7 @@ int main(int argc, char **argv) {
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
            "[--cached-states int8|exact] "
-           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--weights original|auto] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--lanes N] [--spill-tokens N] [--spill-window PAGES] "
            "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only | "
            "--siblings-only]");
@@ -7264,8 +7287,11 @@ int main(int argc, char **argv) {
     const uint32_t budgetPages = std::max({64 + 16 * lanes, kvLayout.minimumExtentPages(),
                                            model.expertStore() ? kGroupFixtureRows / kv::kPageTokens : 0U,
                                            kvLayout.indexDimension ? kDecodedIndexPages : 0U});
-    const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
-    const uint32_t pageCount = (budgetPages + extentPages - 1) / extentPages * extentPages;
+    // A windowed target's blocks take their window units' pages past those.
+    oracleBlocks = {kvLayout.blockPages(), budgetPages};
+    const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages * kvLayout.blockPages());
+    const uint32_t pageCount =
+        (budgetPages * kvLayout.blockPages() + extentPages - 1) / extentPages * extentPages;
     // What the checks on this pool hold at once beside the plan's fixed
     // memory: its pages, every lane's state and six cached states, as the
     // captured-state check holds four lanes beside its five states and the

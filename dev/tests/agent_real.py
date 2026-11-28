@@ -894,8 +894,12 @@ class ClientRun:
             )
         if not self.session:
             raise AgentFailure("client did not expose a real session id")
-        if after["requests"]["failed"] != before["requests"]["failed"]:
-            raise AgentFailure("native request failed")
+        # A request its deadline ended counts timed out, not failed.
+        if any(
+            after["requests"].get(key, 0) != before["requests"].get(key, 0)
+            for key in ("failed", "timed_out")
+        ):
+            raise AgentFailure("native request failed or timed out")
         reuse = row["reuse"]
         # Running work takes the replay points unfinished requests hold after
         # everything else; at a tight --max-memory that is legitimate, so it
@@ -1229,6 +1233,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--draft-model", type=launcher.model_artifacts.parse_draft_model
     )
+    parser.add_argument("--draft-revision")
     parser.add_argument("--language-only", action="store_true")
     parser.add_argument("--model-root", type=Path)
     parser.add_argument("--max-context", default="100K")
@@ -1248,8 +1253,29 @@ def parse_args(argv=None):
             revision=args.revision,
             language_only=args.language_only,
             draft_model=args.draft_model,
+            draft_revision=args.draft_revision,
         ).link
     return args
+
+
+# How many times a client's --version is run before its failure stands, a
+# second apart: in the seconds after a large server exits, macOS killed one
+# (codex, rc 137) that answered at once when run again (2 of 4 starts).
+VERSION_PROBES = 3
+
+
+def client_version(path):
+    """The client at path's answer to --version, run again after a failure
+    up to VERSION_PROBES times."""
+    for probe in range(VERSION_PROBES):
+        if probe:
+            time.sleep(1)
+        result = subprocess.run(
+            [path, "--version"], text=True, capture_output=True, timeout=20
+        )
+        if result.returncode == 0:
+            break
+    return result
 
 
 def main(argv=None):
@@ -1264,9 +1290,7 @@ def main(argv=None):
     versions = {}
     for name in selected:
         path = clients.find_executable(name)
-        result = subprocess.run(
-            [path, "--version"], text=True, capture_output=True, timeout=20
-        )
+        result = client_version(path)
         if result.returncode:
             raise AgentFailure(f"cannot determine {name} version")
         versions[name] = {
@@ -1313,6 +1337,11 @@ def main(argv=None):
                 args.model,
                 *(("--revision", args.revision) if args.revision else ()),
                 *(("--draft-model", args.draft_model) if args.draft_model else ()),
+                *(
+                    ("--draft-revision", args.draft_revision)
+                    if args.draft_revision
+                    else ()
+                ),
                 *(("--language-only",) if args.language_only else ()),
             ]
             with (directory / "server.log").open("x") as log:

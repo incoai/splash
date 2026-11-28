@@ -14,7 +14,7 @@ struct PoolState final {
                                   // entries in use
   uint64_t currentBytes = 0;      // allocated now
   uint64_t capBytes = 0;          // the bound grow() approaches; == currentBytes for a pool that grows only as it
-                                  // is used
+                                  // is used; what it holds above it the engine releases at its next pass
   uint64_t releaseUnitBytes = 0;  // what release(1) frees now; 0 at the floor
   std::vector<uint64_t> releaseUnits;  // what each release(1) frees from now to the floor, in turn, where the
                                        // units differ (the store's chunks); empty: each releaseUnitBytes

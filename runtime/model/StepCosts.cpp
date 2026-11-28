@@ -57,10 +57,33 @@ Pool poolOf(std::span<const std::span<const float>> chances, uint32_t cap, std::
 
 } // namespace
 
-StepCosts::StepCosts(std::span<const uint32_t> classes, uint32_t mostRows, bool rising) {
-  if (classes.empty() || classes.front() != 1 || !std::ranges::is_sorted(classes) || !mostRows)
+namespace {
+
+// The same classes for every lane count.
+std::array<std::vector<uint32_t>, SPLASH_MAXIMUM_BATCH_WIDTH> everyLane(std::span<const uint32_t> classes) {
+  std::array<std::vector<uint32_t>, SPLASH_MAXIMUM_BATCH_WIDTH> each;
+  each.fill({classes.begin(), classes.end()});
+  return each;
+}
+
+// Throws unless each lane count's classes start a step of one row and rise.
+void requireClasses(std::span<const std::vector<uint32_t>, SPLASH_MAXIMUM_BATCH_WIDTH> classes) {
+  for (const std::vector<uint32_t> &each : classes)
+    if (each.empty() || each.front() != 1 || !std::ranges::is_sorted(each))
+      throw std::invalid_argument("invalid step classes");
+}
+
+} // namespace
+
+StepCosts::StepCosts(std::span<const uint32_t> classes, uint32_t mostRows, bool rising)
+    : StepCosts(everyLane(classes), mostRows, rising) {}
+
+StepCosts::StepCosts(std::span<const std::vector<uint32_t>, kLanes> classesOf, uint32_t mostRows, bool rising) {
+  requireClasses(classesOf);
+  if (!mostRows)
     throw std::invalid_argument("invalid step classes");
   for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+    const std::vector<uint32_t> &classes = classesOf[lanes - 1];
     std::vector<Point> &points = tables_[lanes - 1];
     // The narrow cap's last step: a draft's block a lane, or the most rows
     // where they hold less (the tables of more lanes than a runtime of few
@@ -321,9 +344,11 @@ constexpr std::array<std::array<double, 4>, CostLine::kLanes> kSeed{{
 
 } // namespace
 
-CostLine::CostLine(std::span<const uint32_t> classes) : classes_(classes.begin(), classes.end()) {
-  if (classes_.empty() || classes_.front() != 1 || !std::ranges::is_sorted(classes_))
-    throw std::invalid_argument("invalid step classes");
+CostLine::CostLine(std::span<const uint32_t> classes) : CostLine(everyLane(classes)) {}
+
+CostLine::CostLine(std::span<const std::vector<uint32_t>, kLanes> classes) {
+  requireClasses(classes);
+  std::ranges::copy(classes, classes_.begin());
 }
 
 double CostLine::seed(uint32_t lanes, uint32_t rows) {
@@ -406,7 +431,7 @@ StepCosts::Choice CostLine::choose(std::span<const std::span<const float>> chanc
     passed += std::min({1 + static_cast<uint32_t>(above), holds[lane], kBlockRows});
   }
   passed = std::max(passed, kBlockRows);
-  if (const auto next = std::ranges::upper_bound(classes_, passed); next != classes_.end())
+  if (const auto next = std::ranges::upper_bound(classes_[lanes - 1], passed); next != classes_[lanes - 1].end())
     choice.step.rows = std::min(choice.step.rows, *next - 1);
   return choice;
 }

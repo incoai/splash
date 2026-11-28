@@ -51,21 +51,27 @@ struct DraftConvBatchParams {
 static_assert(sizeof(DraftConvBatchParams) == 8,
               "Draft convolution parameters are 8 bytes on both sides");
 
-// The attention core's split count (SPLASH_DRAFT_ATTENTION_SPLITS) and its
-// rings' slots per KV head (SPLASH_DRAFT_SLIDING_WINDOW) are compiled in.
-// value_stride, the values ring's stride between head dimensions, is the
-// window too (the op passes nothing else) but stays a run-time value: with it
-// compiled into the value tiles, the split kernel returns wrong rows at
-// random, and reports no error, on an M5 Max under full
-// MTL_SHADER_VALIDATION; without validation its output is bitwise that of
-// the run-time stride.
+// The attention core deals the live ring tiles of one (lane, KV head)
+// round-robin to `splits` groups, the last of which also attends the eight
+// current rows; a group's partial waits behind the grouped queries for the
+// reduce, which combines the splits in order. The split count is the plan's
+// (ops::DraftAttentionPlan), at most one a ring tile. The rings' slots
+// per KV head (SPLASH_DRAFT_SLIDING_WINDOW) are compiled in. value_stride,
+// the values ring's stride between head dimensions, is the window too (the
+// op passes nothing else) but stays a run-time value: with it compiled into
+// the value tiles, the split kernel returns wrong rows at random, and reports
+// no error, on an M5 Max under full MTL_SHADER_VALIDATION; without validation
+// its output is bitwise that of the run-time stride.
+#define SPLASH_DRAFT_ATTENTION_TILE 128u
+#define SPLASH_DRAFT_ATTENTION_MOST_SPLITS (SPLASH_DRAFT_SLIDING_WINDOW / SPLASH_DRAFT_ATTENTION_TILE)
 struct DraftAttentionBatchParams {
   uint32_t value_stride;
   uint32_t lanes;
+  uint32_t splits;
   uint32_t cache_length[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 8 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(DraftAttentionBatchParams) == 12 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Draft attention parameters are the same size on both sides");
 
 struct DraftContextParams {

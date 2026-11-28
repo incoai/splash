@@ -225,14 +225,25 @@ def json_bytes(value) -> bytes:
 
 
 def selection_link(
-    models: Path, model_id: str, *, revision=None, language_only=False, draft_model=None
+    models: Path,
+    model_id: str,
+    *,
+    revision=None,
+    language_only=False,
+    draft_model=None,
+    draft_revision=None,
 ) -> Path:
     """The selection link of model_id with these source options:
     OWNER/REPO[:VARIANT] under models for the model alone, else
-    .selections/<hash of the selection>."""
+    .selections/<hash of the selection>. A draft revision joins the hash only
+    where one is given, so that every selection made before the option keeps
+    its link."""
     repo_id, variant = split_model_id(model_id)
-    if revision or language_only or draft_model:
-        return _hashed_link(models, [model_id, revision, language_only, draft_model])
+    if revision or language_only or draft_model or draft_revision:
+        options = [model_id, revision, language_only, draft_model]
+        return _hashed_link(
+            models, options + ([draft_revision] if draft_revision else [])
+        )
     if variant is None:
         return models / repo_id
     return models / f"{repo_id}{serve_options.VARIANT_SEPARATOR}{variant}"
@@ -274,12 +285,22 @@ class Selection:
     revision: str | None
     language_only: bool
     draft_model: str | None
+    # The draft repository's branch, tag or commit, as revision is the
+    # target's; None follows its default branch.
+    draft_revision: str | None
     models_root: Path
     link: Path
 
     @classmethod
     def of(
-        cls, models_root, model, *, revision=None, language_only=False, draft_model=None
+        cls,
+        models_root,
+        model,
+        *,
+        revision=None,
+        language_only=False,
+        draft_model=None,
+        draft_revision=None,
     ):
         repo_id, variant = split_model_id(model)
         models_root = Path(models_root).resolve()
@@ -289,6 +310,7 @@ class Selection:
             revision=revision,
             language_only=language_only,
             draft_model=draft_model,
+            draft_revision=draft_revision,
         )
         return cls(
             model,
@@ -297,6 +319,7 @@ class Selection:
             revision,
             language_only,
             draft_model,
+            draft_revision,
             models_root,
             link,
         )
@@ -372,6 +395,34 @@ def link_selection(link: Path, target: Path):
         stage.rmdir()
 
 
+class Stopped(KeyboardInterrupt):
+    """A stop signal, raised where it arrives, as Ctrl+C is, so that the
+    folders an installer holds in `with` blocks are removed as it unwinds:
+    an install SIGTERM ended left 11 MB in $TMPDIR."""
+
+    def __init__(self, number):
+        super().__init__(number)
+        self.number = number
+
+
+def raise_stopped(number, _frame):
+    """The stop signals' handler (take_stop_signals). One stop ends the
+    program; another, as one after a Ctrl+C the terminal sent to the launcher
+    and its installer alike, must not cut short the unwinding it began."""
+    for each in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(each, signal.SIG_IGN)
+    raise Stopped(number)
+
+
+def take_stop_signals():
+    """Raise Stopped for SIGINT and SIGTERM from here on, both unblocked: the
+    launcher starts an installer with them blocked, so that one sent while
+    it starts is not lost; it arrives here. The launcher takes them so too."""
+    for number in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(number, raise_stopped)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Install Splash runtime weights")
     parser.add_argument("--models", type=Path, default=MODELS)
@@ -387,6 +438,9 @@ def parse_args(argv=None):
         type=parse_draft_model,
         help="the DFlash2 draft's repository or local directory, in place of the "
         "family's released one",
+    )
+    parser.add_argument(
+        "--draft-revision", help="optional draft repository branch, tag or commit"
     )
     parser.add_argument(
         "--language-only",
@@ -405,7 +459,22 @@ def parse_args(argv=None):
         "remove",
         help="remove the model's installations and the Hub cache files no other uses",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.draft_revision is not None and local_draft(args.draft_model):
+        parser.error(DRAFT_REVISION_OF_A_DIRECTORY)
+    return args
+
+
+# A local draft directory is files, not a repository with revisions.
+DRAFT_REVISION_OF_A_DIRECTORY = (
+    "--draft-revision cannot be used with a local --draft-model directory"
+)
+
+
+def local_draft(draft_model) -> bool:
+    """Whether --draft-model names a local directory (parse_draft_model makes
+    one absolute), not a Hub repository."""
+    return draft_model is not None and Path(draft_model).is_absolute()
 
 
 def main(argv=None):
@@ -416,6 +485,7 @@ def main(argv=None):
         revision=args.revision,
         language_only=args.language_only,
         draft_model=args.draft_model,
+        draft_revision=args.draft_revision,
     )
     if args.command == "link":
         print(selection.link)
@@ -424,9 +494,7 @@ def main(argv=None):
     from . import assembly, hub, upstream
 
     try:
-        # The launcher starts this with the stop signals blocked, so that one
-        # sent while it starts is not lost; it arrives here.
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+        take_stop_signals()
         if args.command == "prepare":
             if args.json_progress:
                 hub.report_json_progress()
@@ -471,8 +539,10 @@ def main(argv=None):
             )
         print(f"error: {error}", file=sys.stderr)
         return 1
-    except KeyboardInterrupt:
-        return 130
+    except Stopped as stop:
+        # The status a shell gives a program the signal ends: 130 for
+        # SIGINT, 143 for SIGTERM.
+        return 128 + stop.number
     return 0
 
 
@@ -484,7 +554,7 @@ if __name__ == "__main__":
 
     installer = importlib.import_module("install.models")
     status = installer.main()
-    if status == 130:
+    if status in (128 + signal.SIGINT, 128 + signal.SIGTERM):
         # Interrupted, a download goes on in huggingface_hub's threads, which
         # the interpreter would wait for at exit (hub._interruptible): end
         # the process at once, its output written.

@@ -2,9 +2,11 @@
 // normalization and concatenation before its down projection and the gated
 // row's norm after its forget and gain projections, a threadgroup a row,
 // built with the production flags, as the engine built them while it ran
-// them.
+// them; and the fused gates' normalized rows, by the production
+// normalization the mixes run.
 #pragma clang fp reassociate(off)
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/message_gate_normalize.h"
 #include "metal/kernels/common/rms_inverse.h"
 #include "message_gate_reference.h"
 
@@ -92,4 +94,22 @@ kernel void message_gate_test_norm(device const float *x [[buffer(0)]], device c
   const float inverse = rsqrt(squares[0] / p.hidden + kRmsEpsilon);
   for (uint d = tid; d < p.hidden; d += kThreads)
     output[ulong(row) * p.hidden + d] = bfloat((message_gate_test_gated(xr, mr, f, g, d) * inverse) * norm[d]);
+}
+
+// The fused gates' inputs normalized (ops::MessageGateBuffers::normalizedX,
+// normalizedMessage) of fp32 rows of p.x_stride values, whole slots of
+// p.hidden values a row (a mix's queries, or the messages), a threadgroup a
+// row's slot (grid: rows, slots), by the normalization the mixes writing
+// them run (kernels/common/message_gate_normalize.h), into bf16 rows of the
+// same layout.
+kernel void message_gate_test_normalize(device const float *rows [[buffer(0)]], device bfloat *normalized [[buffer(1)]],
+                                        constant MessageGateReferenceParams &p [[buffer(2)]],
+                                        uint2 group [[threadgroup_position_in_grid]],
+                                        uint tid [[thread_index_in_threadgroup]],
+                                        uint lane [[thread_index_in_simdgroup]],
+                                        uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partials[kMessageGateNormalizeSlots];
+  if (group.x >= p.rows || (group.y + 1) * p.hidden > p.x_stride) return;
+  const ulong at = ulong(group.x) * p.x_stride + ulong(group.y) * p.hidden;
+  message_gate_normalize<kThreads>(rows + at, normalized + at, p.hidden, tid, lane, sg, partials);
 }

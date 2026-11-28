@@ -56,8 +56,9 @@ struct GgufColumnParams {
   uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of the tensor
   uint32_t format;      // the tensor's GGUF_FMT_*, a one-pass gate/up's both tensors'
+  uint32_t splits;      // K partitions (grid.y); 1 = no cross-threadgroup reduction
 };
-static_assert(sizeof(GgufColumnParams) == 20, "GGUF column parameters are 20 bytes on both sides");
+static_assert(sizeof(GgufColumnParams) == 24, "GGUF column parameters are 24 bytes on both sides");
 // A fused projection's segments on the column tile (gguf_column_fused), as
 // GgufDecodeFusedParams's on the staged tile.
 struct GgufColumnFusedParams {
@@ -67,8 +68,9 @@ struct GgufColumnFusedParams {
   uint32_t cols[3];     // columns per segment; 0 past the last
   uint32_t fmt[3];      // GGUF_FMT_* per segment
   uint32_t offset[3];   // first destination column per segment
+  uint32_t splits;      // K partitions of every segment
 };
-static_assert(sizeof(GgufColumnFusedParams) == 48, "GGUF column fused parameters are 48 bytes on both sides");
+static_assert(sizeof(GgufColumnFusedParams) == 52, "GGUF column fused parameters are 52 bytes on both sides");
 
 // The register tile's activations, Table16 (kernels/common/gguf_sgmatrix.h):
 // per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,

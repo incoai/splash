@@ -207,6 +207,7 @@ void writeStreamedExperts(json::Writer &w, const std::optional<model::ExpertStor
         .field("slots", experts->slots)
         .field("experts", experts->experts)
         .field("resident", experts->resident);
+    w.array("slot_bytes", [&] { for (const uint64_t bytes : experts->slotBytes) w.value(bytes); });
     for (size_t use = 0; use < std::size(kStreamedUses); ++use) {
       const model::ExpertStoreStats::Use &counters = experts->uses[use];
       w.object(kStreamedUses[use], [&] {
@@ -226,23 +227,14 @@ void writeStreamedExperts(json::Writer &w, const std::optional<model::ExpertStor
   });
 }
 
-// A windowed layout's KV (kv.window): the pages a window and a state's tail
-// keep Full, whether pages past every window give up their windowed layers'
-// K/V, the pool's pages of each form in use, the blocks states' tails pin,
-// and the pages trimmed, the blocks that took the page of a writer that
-// computed them again and the states refused a tail that was not Full
-// (Cache::snapshot).
-void writeKvWindow(json::Writer &w, const KvWindowSnapshot &window, const KvPoolSnapshot &pool) {
-  const uint32_t slim = pool.slim.pagesAllocated - pool.slim.pagesFree;
-  const uint32_t used = pool.pagesAllocated - pool.pagesFree;
+// A windowed layout's KV (kv.window): the pages a row's window and a
+// state's tail read, the blocks states' tails hold, and the blocks that took
+// the page of a writer that computed them again (Cache::snapshot).
+void writeKvWindow(json::Writer &w, const KvWindowSnapshot &window) {
   w.object([&] {
     w.field("window_pages", window.windowPages)
-        .field("trim", window.trim)
-        .field("full_pages", used - slim)
-        .field("slim_pages", slim)
-        .field("slim_bytes", pool.slim.allocatedBytes)
         .field("pinned_blocks", window.pinnedBlocks)
-        .field("trimmed_pages", window.trimmedPages)
+        .field("window_units", window.windowUnits)
         .field("upgrades", window.upgrades)
         .field("refused_states", window.refusedStates);
   });
@@ -431,6 +423,8 @@ void writeIdentity(json::Writer &w, const engine::RuntimeCacheIdentity &cacheIde
           .field("build_id", cacheIdentity.buildId)
           .field("dtype", kv::storageFormatName(kvFormat, cacheIdentity.kvLayout.valuesTokenMajor))
           .field("block_tokens", kv::kPageTokens)
+          .field("cached_states", cacheIdentity.cachedStates)
+          .field("activations", cacheIdentity.activations == ops::Int8Activations::On ? "auto" : "bf16")
           .key("rope_scaling");
       writeRopeScaling(w, cacheIdentity.ropeScaling);
     });
@@ -466,7 +460,7 @@ void writeKv(json::Writer &w, const CacheSnapshot &resources) {
         .field("extent_compact_max_ms", resources.extentCompactMaxMilliseconds);
     if (resources.window) {
       w.key("window");
-      writeKvWindow(w, *resources.window, pool);
+      writeKvWindow(w, *resources.window);
     }
   });
 }
@@ -538,10 +532,34 @@ void writeDisk(json::Writer &w, const engine::EngineSnapshot &core, const Status
         .field("kv_pending_pages", tier.pendingPages)
         .field("persistent", resources.persistent)
         .field("kv_copies", tier.copies)
-        .field("kv_copy_failures", tier.copyFailures);
+        .field("kv_copy_failures", tier.copyFailures)
+        .field("kv_rewrites", tier.rewrites)
+        .field("kv_rewritten_bytes", tier.rewrittenBytes);
+    // What each class of the cache's writes stored (kv_spill has its own).
+    w.object("written_by", [&] {
+      w.field("states", resources.stateCache.offloadBytes)
+          .field("kv_demotions", tier.demotedBytes)
+          .field("kv_copies", tier.copiedBytes)
+          .field("kv_window_parts", tier.windowPartBytes);
+    });
     // Why the SSD cache the start asked for is off; absent while it is on, or set Off.
     if (!tier.offReason.empty())
       w.field("off_reason", tier.offReason);
+    // Damage the persistent cache's files showed: copies whose reads failed
+    // their checksums, and records past the end of a file cut short.
+    const model::SlotFileDamage &damage = sample.cacheDamage;
+    w.object("damage", [&] {
+      w.field("checksum_failures", damage.checksumFailures).field("cut_copies", damage.cutCopies);
+    });
+    // What the quota gave up for room, by kind (Cache::freeDiskSpace).
+    w.object("quota_given_up", [&] {
+      const auto &given = tier.quotaGivenUp;
+      w.field("window_parts", given[0])
+          .field("kv_copies", given[1])
+          .field("state_copies", given[2])
+          .field("states", given[3])
+          .field("states_in_use", given[4]);
+    });
     w.object("taken_back", [&] {
       w.field("states", resources.adoption.states)
           .field("kv_blocks", resources.adoption.blocks)
@@ -571,6 +589,9 @@ void writeCache(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("kv_disk_hit_tokens", core.resources.kvTier.restores * kv::kPageTokens)
         .field("lost_state_misses", lookup.lostStateMisses)
         .field("reused_tokens", core.reusedTokens)
+        .field("prompt_tokens", core.promptTokens)
+        .field("reused_disk_tokens", core.reusedDiskTokens)
+        .field("token_hit_rate", core.promptTokens ? double(core.reusedTokens) / double(core.promptTokens) : 0.0)
         .field("deduplicated_kv_tokens", core.deduplicatedKvTokens)
         .field("replay_state_publications", core.replayStatePublications)
         .field("deduplicated_state_publications", core.deduplicatedStatePublications)
@@ -588,6 +609,13 @@ void writeCache(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("priority_suspensions", core.prioritySuspensions)
         .field("resource_resumptions", core.resourceResumptions)
         .field("resource_replay_tokens", core.resourceReplayTokens);
+    // Starts by why their reuse stopped (ReuseEnd).
+    w.object("reuse_ends", [&] {
+      w.field("nothing_matched", core.reuseEnds[size_t(ReuseEnd::NothingMatched)])
+          .field("prefix_end", core.reuseEnds[size_t(ReuseEnd::PrefixEnd)])
+          .field("kv_without_state", core.reuseEnds[size_t(ReuseEnd::KvWithoutState)])
+          .field("disk_read_failed", core.reuseEnds[size_t(ReuseEnd::DiskReadFailed)]);
+    });
   });
 }
 
@@ -762,7 +790,8 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
           .field("restoring", resourceWait.restoring)
           .field("suspended", resourceWait.suspended)
           .field("draining", resourceWait.draining)
-          .field("oldest_wait_ms", resourceWait.oldestWaitMilliseconds);
+          .field("oldest_wait_ms", resourceWait.oldestWaitMilliseconds)
+          .field("stalled_wait_ms", resourceWait.stalledWaitMilliseconds);
     });
     w.object("loop", [&] {
       w.field("max_tick_ms", sample.loopMaxTickMilliseconds)
@@ -842,6 +871,7 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
       w.field("submitted", core.submitted)
           .field("completed", core.completed)
           .field("cancelled", core.cancelled)
+          .field("timed_out", core.timedOut)
           .field("failed", core.failed);
     });
     w.key("metrics");

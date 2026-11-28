@@ -44,7 +44,7 @@ inline std::optional<engine::HostMemory> hostMemory(std::optional<uint64_t> byte
 // Every submitted request has ended and no command is in flight.
 inline bool idle(const engine::NativeRuntime &loop) {
   const engine::EngineSnapshot counts = loop.statusSnapshot();
-  return counts.submitted == counts.completed + counts.cancelled + counts.failed &&
+  return counts.submitted == counts.completed + counts.cancelled + counts.timedOut + counts.failed &&
          !loop.commandInFlight();
 }
 
@@ -119,7 +119,7 @@ struct LoopFixture {
         pool(memory ? storage.through(*memory, governor->allocationAdmission()) : storage, shape.runwayPages),
         tier(kvTier(options)),
         budget(tier ? std::make_shared<model::DiskBudget>(
-                          uint64_t{options->tier->capacity} * tier->slotBytes(kv::PageForm::Full),
+                          uint64_t{options->tier->capacity} * tier->slotBytes(),
                           [this] { return monotonic; })
                     : nullptr),
         cache(pool, tier ? &*tier : nullptr, budget, options ? options->cacheSpill : std::nullopt),
@@ -174,11 +174,11 @@ struct LoopFixture {
     if (!residency.admit)
       residency.admit = governor ? governor->allocationAdmission() : test::admitAll;
     residency.idleReleaseMilliseconds = 1000.0 * idleReleaseSeconds;
-    config.unixMicros = [] { return uint64_t{1'000'000}; };
+    config.unixMicros = [this] { return clocks ? clocks->first() : uint64_t{1'000'000}; };
     if (options && options->timing)
       config.monotonicMilliseconds = [this] { return monotonic; };
     else
-      config.monotonicMilliseconds = [this] { return monotonic += clockStep; };
+      config.monotonicMilliseconds = [this] { return clocks ? clocks->second() : monotonic += clockStep; };
     return config;
   }
 
@@ -246,6 +246,8 @@ public:
   std::function<std::string()> status = test::readyStatusJson;
   double monotonic = 100.0;
   double clockStep = 0.0;
+  // A test's own unix and awake clocks, in place of the two above.
+  std::optional<std::pair<std::function<uint64_t()>, std::function<double()>>> clocks;
   Weights weights;
   engine::NativeRuntime loop;
   std::optional<engine::MemoryControl> control;

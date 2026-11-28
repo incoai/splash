@@ -72,9 +72,16 @@ public:
               std::shared_ptr<const CompositeState> state,
               std::shared_ptr<StateStaging> staging)
       : operation_(std::move(operation)), state_(std::move(state)),
-        staging_(std::move(staging)) {}
+        staging_(std::move(staging)) {
+    if (staging_)
+      ++staging_->writes;
+  }
   // The staging copy is the write's source until the worker has stopped.
-  ~FileOffload() override { operation_->drain(); }
+  ~FileOffload() override {
+    operation_->drain();
+    if (staging_)
+      --staging_->writes;
+  }
   bool ready() const noexcept override { return operation_->ready(); }
   bool finish() override { return operation_->wait(); }
   const std::shared_ptr<const CompositeState> &state() const noexcept override {
@@ -232,9 +239,8 @@ QwenCompositeState::QwenCompositeState(CompositeStateLayout layout,
 
 std::unique_ptr<StateOffload>
 QwenCompositeState::offload(std::function<void()> completion) const {
-  // The caller asked the write budget; the write needs what a copy in use
-  // does.
-  if (!canOffload(true)) return {};
+  // The caller asked; nothing has changed since on the engine thread.
+  if (!canOffload()) return {};
   const auto spans = stateSpans(buffers_.gdn->buffers().stateBase, layout_.target.cachedCellBytes(),
                                 buffers_.window->buffer());
   return write(
@@ -251,6 +257,8 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
     const std::shared_ptr<SlotFile> &file, const std::shared_ptr<StateStaging> &staging,
     const std::function<void(std::span<std::byte>)> &stage, CompositeStateLayout layout,
     QwenLogicalLengths lengths, std::function<void()> completion) {
+  if (!staging->held())
+    throw std::logic_error("a staged state write without the staging buffer");
   auto disk = file->acquire(layout.cachedBytes());
   if (!disk) return {};
   auto result = std::shared_ptr<const QwenCompositeState>(
@@ -276,8 +284,8 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
 
 std::unique_ptr<StateOffload>
 QwenCompositeState::persist(std::function<void()> completion) const {
-  // As for offload().
-  if (!canOffload(true))
+  // As for offload(); it stages nothing.
+  if (!canPersist())
     return {};
   auto disk = file_->acquire(layout_.cachedBytes());
   if (!disk)
@@ -333,6 +341,37 @@ QwenStateStorage::~QwenStateStorage() {
   pool_->cachedCells.clear();
   pool_->rings.clear();
   pool_->windows.clear();
+}
+
+PoolState QwenStateStorage::stagingState() const noexcept {
+  if (!staging_)
+    return {.name = "state_staging", .rebuildOnly = true};
+  const uint64_t bytes = layout_.cachedBytes();
+  const bool held = staging_->held(), takes = file_->takesWrite();
+  const bool kept = held && (takes || staging_->writes);
+  return {.name = "state_staging",
+          .floorBytes = kept ? bytes : 0,
+          .currentBytes = held ? bytes : 0,
+          .capBytes = takes ? bytes : 0,
+          .releaseUnitBytes = held && !kept ? bytes : 0,
+          .growUnitBytes = takes && !held ? bytes : 0,
+          .rebuildOnly = true};
+}
+
+uint64_t QwenStateStorage::releaseStaging() noexcept {
+  if (!stagingState().releaseUnitBytes)
+    return 0;
+  const uint64_t bytes = staging_->buffer.sizeBytes();
+  staging_->buffer = {};
+  return bytes;
+}
+
+metal::AllocationResult QwenStateStorage::growStaging(const metal::AllocationAdmission &admit) {
+  if (!stagingState().growUnitBytes)
+    return {};
+  return admit(layout_.cachedBytes(), [&] {
+    staging_->buffer = backend_.allocateBuffer(layout_.cachedBytes(), metal::BufferStorage::Shared, "qwen-state-staging");
+  });
 }
 
 const QwenLaneMetadata &QwenStateStorage::metadata(uint32_t index) const {
@@ -615,9 +654,8 @@ QwenStateStorage::snapshotToDisk(uint32_t index, std::function<void()> completio
   const Lane &source = lane(index);
   requireCommitted(source);
   validateLengths(source.metadata.lengths, true);
-  // The caller asked the write budget; the write needs what a copy in use
-  // does.
-  if (!canSnapshotToDisk(true))
+  // The caller asked; nothing has changed since on the engine thread.
+  if (!canSnapshotToDisk())
     return {};
   // The staging holds a slot's bytes: a cached cell, then the window.
   return QwenCompositeState::write(

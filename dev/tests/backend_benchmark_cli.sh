@@ -25,4 +25,21 @@ if [ "$status" -ne 1 ] ||
     exit 1
 fi
 test ! -s "$work/out"
+
+# --prompts gives the chat requests in the model's own tokens: seven lines, every
+# token inside the model's vocabulary (Qwen3.8-27B's 248320), else refused
+# before a device or metallib is opened.
+refuses_prompts() {
+    status=0
+    "$binary" "$work/missing.metallib" "$model" --prompts "$work/prompts" >"$work/out" 2>"$work/err" || status=$?
+    if [ "$status" -ne 1 ] || ! grep -Fqx "backend-benchmark: $1" "$work/err" || [ -s "$work/out" ]; then
+        echo "backend-benchmark did not refuse these --prompts: $1" >&2
+        cat "$work/err" >&2
+        exit 1
+    fi
+}
+printf '1 2 3\n4\n5\n6\n7\n8\n' >"$work/prompts"
+refuses_prompts '--prompts takes 7 lines of tokens: the decode prompt and the 6 transcript requests'
+printf '1 2 3\n4\n5\n6\n7\n8\n248320 9\n' >"$work/prompts"
+refuses_prompts "--prompts token 248320 lies outside the model's vocabulary of 248320 tokens"
 echo 'backend-benchmark CLI validation: PASS'

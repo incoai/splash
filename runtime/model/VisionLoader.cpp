@@ -210,12 +210,15 @@ VisionLoader::~VisionLoader() = default;
 
 const ops::VisionLayout &VisionLoader::layout() const noexcept { return planned_->layout; }
 
+const vision::Plan &VisionLoader::imagePlan() const noexcept { return planned_->plan; }
+
 ImagePlan VisionLoader::image() const {
   return {"vision/model.bin", std::string(kVisionMagic), planned_->layout.depth, 0, planned_->plan.bytes,
           [planned = planned_](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
             vision::writeVision(bytes, planned->plan);
             planned->checkUnchanged();
-          }};
+          },
+          0, {}, vision::imageFormats(planned_->plan)};
 }
 
 void VisionLoader::check() const {
@@ -227,7 +230,6 @@ void VisionLoader::check() const {
   plan.write(std::span<uint8_t>(static_cast<uint8_t *>(memory), bytes), {});
 }
 
-uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
 
 VisionTowerWeights loadVisionTowerWeights(metal::MetalBackend &backend, WeightImages &images,
                                           const VisionLoader &source) {
@@ -235,7 +237,7 @@ VisionTowerWeights loadVisionTowerWeights(metal::MetalBackend &backend, WeightIm
   const ops::VisionLayout &layout = source.layout();
   VisionTowerWeights result;
   WeightFile file = images.load(source.image());
-  result.tensors = layout.tower == ops::VisionTower::Inkling ? readInklingVision(file, layout)
+  result.tensors = layout.tower == ops::VisionTower::Inkling ? readInklingVision(file, layout, source.imagePlan())
                                                              : readQwenVision(file, layout);
   file.finish();
   result.files.push_back(file.record());

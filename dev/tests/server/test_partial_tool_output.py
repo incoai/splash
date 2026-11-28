@@ -609,7 +609,10 @@ class PartialToolOutputTests(unittest.TestCase):
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)
 
-    def test_chat_preserves_same_partial_arguments_in_both_modes(self):
+    def test_chat_cut_call_ends_as_each_mode_ends_one(self):
+        # A call the token limit cuts is no call in a complete response; a
+        # stream, which sent the call as the model wrote it, ends it with
+        # the arguments it sent. The finish reason is the limit in both.
         harness = self.harness(
             Plan([[13]], reason="length"), Plan([[13]], reason="length")
         )
@@ -624,10 +627,7 @@ class PartialToolOutputTests(unittest.TestCase):
         self.assertEqual(status, 200, raw)
         choice = json.loads(raw)["choices"][0]
         self.assertEqual(choice["finish_reason"], "length")
-        arguments = choice["message"]["tool_calls"][0]["function"]["arguments"]
-        self.assertEqual(arguments, '{"city":"Par')
-        with self.assertRaises(ValueError):
-            json.loads(arguments)
+        self.assertNotIn("tool_calls", choice["message"])
         status, _, raw = harness.request(
             "POST", "/v1/chat/completions", {**body, "stream": True}
         )
@@ -637,11 +637,12 @@ class PartialToolOutputTests(unittest.TestCase):
         streamed = "".join(
             call.get("function", {}).get("arguments", "")
             for item in chunks
+            if item["choices"]
             for call in item["choices"][0]["delta"].get("tool_calls", [])
         )
-        self.assertEqual(streamed, arguments)
+        self.assertEqual(streamed, '{"city":"Par')
 
-    def test_responses_partial_history_is_retained_and_continues(self):
+    def test_responses_drop_a_cut_call_and_continue(self):
         for stream in (False, True):
             with self.subTest(stream=stream):
                 harness = self.harness(Plan([[13]], reason="length"), Plan([[4]]))
@@ -657,17 +658,23 @@ class PartialToolOutputTests(unittest.TestCase):
                 self.assertEqual(status, 200, raw)
                 response = events(raw)[-1]["response"] if stream else json.loads(raw)
                 self.assertEqual(response["status"], "incomplete")
-                call = response["output"][0]
-                self.assertEqual(call["type"], "function_call")
-                self.assertEqual(call["status"], "incomplete")
-                self.assertEqual(call["arguments"], '{"city":"Par')
+                calls = [
+                    (item["status"], item["arguments"])
+                    for item in response["output"]
+                    if item["type"] == "function_call"
+                ]
+                # A stream ends the call it started incomplete; a complete
+                # response leaves it out.
+                self.assertEqual(
+                    calls, [("incomplete", '{"city":"Par')] if stream else []
+                )
                 status, _, raw = harness.request(
                     "POST",
                     "/v1/responses",
                     {
                         "model": "test-model",
                         "previous_response_id": response["id"],
-                        "input": "Continue without that unfinished tool call.",
+                        "input": "Continue.",
                         "reasoning": {"effort": "none"},
                         "max_output_tokens": 16,
                     },
@@ -679,15 +686,6 @@ class PartialToolOutputTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 200, stored)
                 self.assertEqual(json.loads(stored)["output"], response["output"])
-                history = harness.tokenizer.templates[-1][0]
-                unfinished = [
-                    json.loads(item["content"].split("\n", 1)[1])
-                    for item in history
-                    if str(item.get("content")).startswith("Incomplete tool call:\n")
-                ]
-                self.assertEqual(
-                    unfinished, [{"name": "weather", "arguments": '{"city":"Par'}]
-                )
 
     def test_anthropic_preserves_closed_calls_without_fabricating_partial_input(self):
         for tokens, expected in (([[13]], []), ([[5], [13]], [{"city": "Paris"}])):
@@ -729,7 +727,7 @@ class PartialToolOutputTests(unittest.TestCase):
             self.assertEqual(result, expected)
         self.assertEqual(
             [call["function"]["arguments"] for call in expected[1]],
-            ['{"city":"Paris"}', '{"city":"Par'],
+            ['{"city":"Paris"}'],
         )
 
     def test_typed_parameter_value_keeps_pending_bounded(self):
@@ -1039,18 +1037,14 @@ class PartialToolOutputTests(unittest.TestCase):
             if chunk["choices"]
         )
         self.assertEqual(chat_message["content"], expected)
-        self.assertEqual(
-            chat_message["tool_calls"][0]["function"]["arguments"], '{"city":"Par'
-        )
+        # The call the limit cut is no call.
+        self.assertNotIn("tool_calls", chat_message)
         self.assertEqual(chat_streamed, expected)
         self.assertEqual(chat_chunks[-1]["choices"][0]["finish_reason"], "length")
 
         response = json.loads(responses_payload)
         self.assertEqual(response["status"], "incomplete")
-        self.assertEqual(
-            [item["type"] for item in response["output"]],
-            ["message", "function_call"],
-        )
+        self.assertEqual([item["type"] for item in response["output"]], ["message"])
         nonstream_text = response["output"][0]["content"][0]["text"]
         events = response_events(responses_stream_payload)
         streamed_text = "".join(
@@ -1060,11 +1054,11 @@ class PartialToolOutputTests(unittest.TestCase):
         )
         completed = events[-1]["response"]
         self.assertEqual(completed["status"], "incomplete")
+        # The stream sent the call's start, and ends it incomplete.
         self.assertEqual(
-            [item["type"] for item in completed["output"]],
-            ["message", "function_call"],
+            [(item["type"], item["status"]) for item in completed["output"]],
+            [("message", "completed"), ("function_call", "incomplete")],
         )
-        self.assertEqual(completed["output"][1]["status"], "incomplete")
         completed_text = completed["output"][0]["content"][0]["text"]
         self.assertEqual(nonstream_text, expected)
         self.assertEqual(streamed_text, expected)
@@ -1230,9 +1224,9 @@ class TextAfterToolCallTests(unittest.TestCase):
         call = "<tool_call>\n<function=read>\n</function>\n</tool_call>"
         first = projector.put("First message. " + call)
         second = projector.put("POST-CALL TEXT THAT SHOULD BE VISIBLE")
-        self.assertEqual(
-            [kind for kind, _ in first], ["content", "tool", "tool", "tool"]
-        )
+        # The call streams whole once it closes: its header, then its
+        # arguments.
+        self.assertEqual([kind for kind, _ in first], ["content", "tool", "tool"])
         self.assertEqual(second, [("content", "POST-CALL TEXT THAT SHOULD BE VISIBLE")])
         content, calls, owed = projector.finish(True)
         self.assertEqual(
@@ -1351,7 +1345,8 @@ class TextAfterToolCallTests(unittest.TestCase):
 
     def check_cut_after_text_following_a_call(self, path, output, complete, finish):
         # The model writes text, a call and more text, and the token limit
-        # cuts a second call inside its argument.
+        # cuts a second call inside its argument: a stream ends it with the
+        # arguments it sent, a complete response leaves it out.
         text = (
             "First message. "
             + weather_call("Paris")
@@ -1384,7 +1379,6 @@ class TextAfterToolCallTests(unittest.TestCase):
             [
                 ("text", "First message. \nPost-call text.\n"),
                 ("call", '{"city":"Paris"}'),
-                ("call", '{"city":"Ro'),
             ],
             "length",
         )
@@ -1397,13 +1391,11 @@ class TextAfterToolCallTests(unittest.TestCase):
                 ("text", "First message. "),
                 ("call", '{"city":"Paris"}'),
                 ("text", "\nPost-call text.\n"),
-                ("call", '{"city":"Ro'),
             ],
             "incomplete",
         )
 
     def test_messages_keep_text_after_a_call_at_max_tokens(self):
-        # A complete message leaves out the unfinished call's partial input.
         self.check_cut_after_text_following_a_call(
             "/v1/messages",
             messages_output,
@@ -1415,9 +1407,10 @@ class TextAfterToolCallTests(unittest.TestCase):
             "max_tokens",
         )
 
-    def test_responses_stored_object_is_the_same_streamed_or_not(self):
-        # Items closed before the cut are complete in both modes; only the
-        # call the token limit cut is incomplete.
+    def test_responses_stored_object_matches_what_each_mode_sent(self):
+        # Items closed before the cut are complete in both modes. The call
+        # the token limit cut is none in a complete response; a stream, which
+        # sent its start, stores it incomplete.
         text = (
             "First message. "
             + PARIS
@@ -1447,9 +1440,9 @@ class TextAfterToolCallTests(unittest.TestCase):
             stored.append(
                 json.loads(payload.decode().replace(public_id, "id"))["output"]
             )
-        self.assertEqual(stored[0], stored[1])
+        self.assertEqual(stored[1][:3], stored[0])
         self.assertEqual(
-            [(item["type"], item["status"]) for item in stored[0]],
+            [(item["type"], item["status"]) for item in stored[1]],
             [
                 ("message", "completed"),
                 ("function_call", "completed"),

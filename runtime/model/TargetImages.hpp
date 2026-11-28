@@ -67,19 +67,21 @@ protected:
   // unwritten since they were planned. With a table store
   // (table.cacheBytes), the rows of a table the family adds stream instead
   // of loading; with expert memory (experts.memoryBytes), a MoE target's
-  // routed experts. The images begin with `layerImages` layer images, the
-  // first MoE layer's `firstMoeLayer`.
+  // routed experts. 16-bit projections load as `weights` says. The images
+  // begin with `layerImages` layer images, the first MoE layer's
+  // `firstMoeLayer`.
   TargetImages(metal::MetalBackend &backend, WeightImages &images, std::shared_ptr<std::vector<gguf::Image>> planned,
                std::function<void()> checkUnchanged, uint32_t layerImages, uint32_t firstMoeLayer,
-               SparseRowStoreOptions table, ExpertStoreOptions experts)
+               SparseRowStoreOptions table, ExpertStoreOptions experts, gguf::Float16Weights weights)
       : backend_(backend), weightImages_(images), images_(std::move(planned)),
         checkUnchanged_(std::move(checkUnchanged)), layers_(layerImages), firstMoeLayer_(firstMoeLayer),
-        table_(std::move(table)), experts_(experts) {}
+        table_(std::move(table)), experts_(experts), weights_(weights) {}
   ~TargetImages() = default;
 
-  // What the planner takes: whether experts and a table stream.
+  // What the planner takes: whether experts and a table stream, and how
+  // 16-bit projections load.
   [[nodiscard]] gguf::PlanOptions planOptions() const noexcept {
-    return {.streamExperts = experts_.memoryBytes != 0, .streamTable = table_.cacheBytes != 0};
+    return {.streamExperts = experts_.memoryBytes != 0, .streamTable = table_.cacheBytes != 0, .weights = weights_};
   }
   // The plan of the table's image, or null for a family without one.
   [[nodiscard]] const gguf::Image *tablePlan() const noexcept {
@@ -104,6 +106,7 @@ private:
   uint32_t layers_ = 0, firstMoeLayer_ = 0;
   SparseRowStoreOptions table_;
   ExpertStoreOptions experts_;
+  gguf::Float16Weights weights_;
 };
 
 } // namespace splash::model

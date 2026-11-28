@@ -3,6 +3,7 @@
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
 #include "ExpertChunkLayout.hpp"
+#include "GgufImage.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -45,13 +46,15 @@ using TargetWeights =
 // slots, the share the model's plan sets (model/ExpertStore.hpp,
 // ExpertStoreOptions, --expert-memory). Other models load as without them.
 // Streamed weights read on `readers`, the engine's one pool of SSD readers,
-// which KV reads share.
+// which KV reads share. The target's 16-bit projections load as `weights`
+// says (gguf::float16Planes, --weights).
 struct ModelLoadOptions final {
   uint64_t streamedTableBytes = 0;
   uint64_t expertMemoryBytes = 0;
   uint64_t expertFloorBytes = 0;
   double expertFloorShare = kExpertFloorShare;
   std::shared_ptr<SsdReaders> readers;
+  gguf::Float16Weights weights = gguf::Float16Weights::Published;
 };
 
 struct LoadedModel final {
@@ -191,12 +194,13 @@ loadModel(metal::MetalBackend &backend,
 // to too (Flash-Next Q2_0's largest, 743 MiB, of an M5 Max's 21 GiB); with
 // `streamedTableBytes`, its table streams through a row cache of that many
 // bytes on `readers`, as its whole image may exceed that buffer (Flash-Next's
-// 27,466 MiB).
+// 27,466 MiB). Its 16-bit projections plan as `weights` says.
 [[nodiscard]] QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend,
                                                        const std::filesystem::path &root,
                                                        const ModelDescriptor &descriptor,
                                                        uint64_t streamedTableBytes,
-                                                       std::shared_ptr<SsdReaders> readers);
+                                                       std::shared_ptr<SsdReaders> readers,
+                                                       gguf::Float16Weights weights);
 
 // The FFN layers of a target whose every layer's FFN is dense (denseFfn),
 // which the prefill FFN's Neural Engine split (ops::AneFfn) may take; none

@@ -360,7 +360,10 @@ class AnthropicAdapterTest(unittest.TestCase):
                 self.assertEqual(body, original)
                 self.assertEqual(
                     translated["response_format"],
-                    {"type": "json_schema", "json_schema": {"schema": SCHEMA}},
+                    {
+                        "type": "json_schema",
+                        "json_schema": {"schema": SCHEMA, "strict": True},
+                    },
                 )
                 self.assertEqual(translated["reasoning_effort"], "none")
 
@@ -432,7 +435,7 @@ class AnthropicAdapterTest(unittest.TestCase):
                     if "output_format" not in fields
                     else {
                         "type": "json_schema",
-                        "json_schema": {"schema": FORMAT["schema"]},
+                        "json_schema": {"schema": FORMAT["schema"], "strict": True},
                     },
                 )
 
@@ -1485,6 +1488,8 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                 "prefix_tokens": 1,
                 "state_source": "memory",
                 "lost_state": False,
+                "reuse_end": "prefix_end",
+                "reuse_end_tokens": 1,
                 "output_tokens": 1,
                 "output_tokens_details": {"thinking_tokens": 0},
             },
@@ -1846,6 +1851,10 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                             "prefix_tokens": matched_tokens,
                             "state_source": "memory" if matched_tokens else None,
                             "lost_state": False,
+                            "reuse_end": (
+                                "prefix_end" if matched_tokens else "nothing_matched"
+                            ),
+                            "reuse_end_tokens": matched_tokens,
                             "output_tokens": 2,
                             "output_tokens_details": {"thinking_tokens": 0},
                         },

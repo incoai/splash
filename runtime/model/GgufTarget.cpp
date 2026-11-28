@@ -48,18 +48,19 @@ std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                    const std::vector<std::filesystem::path> &paths, const GgufTargetPlan &plan,
-                                   SparseRowStoreOptions table, ExpertStoreOptions experts)
-    : GgufTargetLoader(backend, images, std::make_shared<Planned>(paths), plan, std::move(table), experts) {}
+                                   SparseRowStoreOptions table, ExpertStoreOptions experts,
+                                   gguf::Float16Weights weights)
+    : GgufTargetLoader(backend, images, std::make_shared<Planned>(paths), plan, std::move(table), experts, weights) {}
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                    std::shared_ptr<Planned> planned, const GgufTargetPlan &plan,
-                                   SparseRowStoreOptions table, ExpertStoreOptions experts)
+                                   SparseRowStoreOptions table, ExpertStoreOptions experts,
+                                   gguf::Float16Weights weights)
     : TargetImages(backend, images, std::shared_ptr<std::vector<gguf::Image>>(planned, &planned->images),
                    [planned] { planned->source.checkUnchanged(); }, plan.layerImages, plan.firstMoeLayer,
-                   std::move(table), experts),
+                   std::move(table), experts, weights),
       planned_(std::move(planned)) {
-  gguf::PlanOptions options = planOptions();
-  options.exactlyMxfp8 = exactlyMxfp8;
+  const gguf::PlanOptions options = readingValues(planOptions());
   planned_->images = plan.images(planned_->source.file(), options);
 }
 

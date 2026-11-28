@@ -171,6 +171,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
   // target layers it reads.
   constexpr std::array<uint32_t, 6> ownLayers{5, 19, 33, 47, 61, 63};
   require(inspect(dense.with(&SourceModel::draft, R"("num_hidden_layers": 5)", R"("num_hidden_layers": 3)")
+                      .with(&SourceModel::draft, "\"sliding_attention\",\n    \"sliding_attention\",\n", "")
                       .with(&SourceModel::draft, R"("intermediate_size": 17408)", R"("intermediate_size": 8192)")
                       .with(&SourceModel::draft, R"("rope_theta": 10000000)", R"("rope_theta": 1000000)")
                       .with(&SourceModel::draft, "61\n", "61,\n      63\n"))
@@ -180,7 +181,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
   // tell its target from other models of the architecture, which Splash does
   // not serve, such as Qwen3.5-4B.
   constexpr std::string_view supported =
-      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next";
+      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next";
   struct Refused final {
     std::string_view from, to, difference;
   };
@@ -297,6 +298,12 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
             "draft config dflash_config output_multiplier mismatch: checkpoint 2, runtime 1"},
            {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 16, "input_embedding_scale": 0.5)",
             "draft config dflash_config input_embedding_scale mismatch: checkpoint 0.5, runtime 1"},
+           // A draft layer of full attention, which the kernels would slide.
+           {&SourceModel::draft, "\"sliding_attention\"\n  ]", "\"full_attention\"\n  ]",
+            "draft config layer_types 4 must be sliding_attention"},
+           {&SourceModel::draft, "\"sliding_attention\",\n    \"sliding_attention\"\n  ]", "\"sliding_attention\"\n  ]",
+            "draft config layer_types count mismatch: checkpoint 4, runtime 5"},
+           {&SourceModel::draft, R"("layer_types")", R"("layer_kinds")", "draft config layer_types must be an array"},
        })
     refuses(source.with(refused.file, refused.from, refused.to), refused.error,
             "an upstream config was accepted with " + std::string(refused.to));
@@ -331,7 +338,7 @@ SourceModel withQuantizationConfig(const SourceModel &model, std::string_view qu
 // 32, mxfp8 8 and 32, nvfp4 4 and 16) when it omits them, as MLX loads it. The
 // entry false, which MLX writes for a module it leaves unquantized, is
 // accepted for every module: the images load a projection or the head left so
-// as Q8_0 (model/SafetensorsImage.hpp). A Model Optimizer target's is its
+// as its 16-bit values (model/SafetensorsImage.hpp). A Model Optimizer target's is its
 // quantization_config: NVFP4 in groups of 16 or per-tensor FP8 for each layer
 // it quantizes. So is a compressed-tensors target's: each config group NVFP4
 // or FP8 per channel or tensor. A GGUF target has none (above).
@@ -418,7 +425,7 @@ void testQuantization(const std::filesystem::path &fixtures) {
     refuses(refused.model.with(&SourceModel::config, refused.from, refused.to), refused.error,
             "an MLX quantization was accepted with " + std::string(refused.to));
   // A projection of each kind and the head left unquantized, which the images
-  // load as Q8_0.
+  // load as their 16-bit values.
   struct Unquantized final {
     const SourceModel &model;
     std::string module;
@@ -675,7 +682,7 @@ struct GgufHeaders final {
 // The headers of a GGUF of the target `layout` describes: its metadata
 // (gguf_fixtures::metadata) and its tensors, Q8_0 where the planner reads a
 // format and F32 elsewhere.
-GgufHeaders ggufHeaders(const model::QwenTargetDimensions &layout) {
+GgufHeaders ggufHeaders(const model::QwenTargetDimensions &layout, uint32_t head = gguf_fixtures::kQ8_0) {
   gguf_fixtures::TensorTypes types;
   for (const char *name :
        {"token_embd.weight", "output.weight", "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",
@@ -685,6 +692,7 @@ GgufHeaders ggufHeaders(const model::QwenTargetDimensions &layout) {
         "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight", "output_hc_down.weight",
         "output_hc_up.weight", "ple_key.weight", "ple_value.weight", "per_layer_token_embd.weight"})
     types[name] = gguf_fixtures::kQ8_0;
+  types["output.weight"] = head;
   return {{gguf_fixtures::metadata(layout)}, {gguf_fixtures::tensorTable(layout, types)}};
 }
 
@@ -697,6 +705,8 @@ GgufHeaders ggufHeaders(const model::QwenTargetDimensions &layout) {
 void testConfigurationCheck(const std::filesystem::path &fixtures) {
   const test::TemporaryDirectory directory("splash-model-check");
   uint32_t checks = 0;
+  // Whether the last check found weights --weights auto loads otherwise.
+  std::optional<bool> quantizable;
   const auto check = [&](std::string_view targetFormat, std::string_view visionFormat, std::string_view config,
                          const std::optional<GgufHeaders> &headers, std::optional<std::string_view> draft) {
     // Each check's files in a directory of their own.
@@ -715,8 +725,9 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
       }
     }
     if (draft) test::writeFile(draftConfig.emplace(root / "draft.json"), *draft);
+    quantizable.reset();
     return std::string(model::inspectSourceConfiguration(targetFormat, visionFormat, root / "config.json",
-                                                         headerDirectory, draftConfig));
+                                                         headerDirectory, draftConfig, &quantizable));
   };
   const SourceModel dense = mlxModel(fixtures, "qwen3.8-27b");
   const SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b");
@@ -738,6 +749,16 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   require(check("gguf", "none", kDenseGgufConfig, denseHeaders, dense.draft) == "Qwen3.8-27B" &&
               check("gguf", "none", kMoeGgufConfig, moeHeaders, std::nullopt) == "Qwen3.6-35B-A3B",
           "a GGUF's derived config and headers were not found to be its family");
+  // A GGUF none of whose tensors is 16-bit loads the same under either
+  // --weights; one with a BF16 head does not; a checkpoint's weights the
+  // check does not read.
+  require(quantizable == false, "a GGUF of quantized tensors was found to load otherwise under --weights auto");
+  require(check("gguf", "none", kDenseGgufConfig, ggufHeaders(model::Qwen3_8Layout{}, gguf_fixtures::ggmlType("BF16")),
+                std::nullopt) == "Qwen3.8-27B" &&
+              quantizable == true,
+          "a GGUF with a BF16 head was not found to load otherwise under --weights auto");
+  require(check("mlx-affine", "none", moe.config, std::nullopt, std::nullopt) == "Qwen3.6-35B-A3B" && !quantizable,
+          "a checkpoint's check named what --weights auto does to weights it did not read");
   // A split GGUF's headers, each part's under its name; a part alone is not
   // the target.
   require(check("gguf", "none", kMoeGgufConfig, moeHeaders.split(3), std::nullopt) == "Qwen3.6-35B-A3B",
@@ -1131,6 +1152,29 @@ void testInkling2(const std::filesystem::path &fixtures) {
   require(checkpoint.target == descriptor.target && checkpoint.targetSource == model::TargetSource::Safetensors &&
               checkpoint.valid(),
           "the release's Inkling-2-Mini config made another descriptor as a safetensors target");
+  // ddalcu/Inkling-2-Mini-MLX-8bit's config: MLX affine 8-bit in groups of
+  // 64, a text_config and a vision_config that name no model type, and no
+  // width the tower projects into. Each is its checkpoint's (inkling2_loop's
+  // text model and tower), so it serves the release's model with its tower;
+  // in a checkpoint of another model type the text_config is another model.
+  const SourceModel eightBit =
+      release.with(&SourceModel::record, R"("target_format":"gguf","vision_format":"none")",
+                   R"("target_format":"mlx-affine","vision_format":"safetensors")")
+          .with(&SourceModel::config,
+                "\"quantization_config\": {\n    \"quant_method\": \"modelopt\",\n    \"quant_algo\": \"NVFP4\"",
+                R"("quantization": {"group_size": 64, "bits": 8, "mode": "affine")")
+          .with(&SourceModel::config, R"("model_type": "inkling2_loop_text",)", "")
+          .with(&SourceModel::config, R"("model_type": "inkling2_vision",)", "")
+          .with(&SourceModel::config, R"("text_hidden_size": 2304,)", "");
+  const model::ModelDescriptor eightBitDescriptor = inspect(eightBit);
+  require(eightBitDescriptor.target == descriptor.target && eightBitDescriptor.hasVision() &&
+              eightBitDescriptor.valid(),
+          "an Inkling-2-Mini checkpoint whose sub-configs name no model type made another descriptor");
+  refuses(eightBit.with(&SourceModel::config, R"("model_type": "inkling2_loop",)", R"("model_type": "gemma3",)"),
+          "text model type gemma3_text", "a text_config of no model type in another checkpoint was accepted");
+  refuses(eightBit.with(&SourceModel::config, R"("posemb_grid_size": 32,)",
+                        R"("posemb_grid_size": 32, "text_hidden_size": 2048,)"),
+          "vision config text_hidden_size mismatch", "a tower projecting into another width was accepted");
 }
 
 int main(int argc, char **argv) {

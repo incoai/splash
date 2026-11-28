@@ -17,6 +17,31 @@ struct DispatchTiming {
   double gpuSeconds = 0.0;
 };
 
+// A copy taken after a dispatch while snapshotting every dispatch of a
+// pipeline family (BackendInstrumentation::snapshotEvery): its pipeline, its
+// first parameter bytes and the view it binds at the chosen binding.
+struct DispatchSnapshot {
+  std::string pipelineName;
+  std::vector<uint8_t> parameters;
+  std::vector<uint8_t> buffer;
+};
+
+// A command's dispatches as it was submitted while capturing, its event steps
+// dropped and each dispatch's parameter bytes copied into `payloads`, which
+// its bytes bindings point into: any of its dispatches can be submitted again,
+// alone or with others, while the buffers they bind live. Move-only, so the
+// bindings keep pointing into its own payloads.
+struct CapturedCommand {
+  std::vector<ComputeDispatch> dispatches;
+  std::vector<std::vector<uint8_t>> payloads;
+
+  CapturedCommand() = default;
+  CapturedCommand(CapturedCommand &&) noexcept = default;
+  CapturedCommand &operator=(CapturedCommand &&) noexcept = default;
+  CapturedCommand(const CapturedCommand &) = delete;
+  CapturedCommand &operator=(const CapturedCommand &) = delete;
+};
+
 // What tests and benchmarks observe of a MetalBackend beyond its serving
 // API. Only the instrumented build of MetalBackend.mm
 // (SPLASH_BACKEND_INSTRUMENTATION) defines these; production binaries never
@@ -48,6 +73,12 @@ public:
   // dispatches in the same order, and the host does the same work for both.
   // Profiling runs the first part's dispatches and then the second's.
   static void submitPartsWhole(MetalBackend &backend, bool enabled);
+  // While capturing, every command submitted (a command in two parts as one,
+  // its first part's dispatches and then its second's) runs as usual and is
+  // also kept as a CapturedCommand; takeCapturedCommands() reads and clears
+  // them. decode-profile's census times parts of a captured cycle with them.
+  static void captureCommands(MetalBackend &backend, bool enabled);
+  [[nodiscard]] static std::vector<CapturedCommand> takeCapturedCommands(MetalBackend &backend);
   // Whether awake host steps spin (HostStepGpu::Awake): the backend's check
   // that a GPU spin sees the CPU end it, run now unless one decided; nothing
   // while no check decided (every spin started after its release, the GPU
@@ -73,6 +104,15 @@ public:
   // until such a command ran), and disarms the step.
   static void snapshotAfter(MetalBackend &backend, std::string pipeline, std::vector<uint32_t> bindings);
   [[nodiscard]] static std::vector<std::vector<uint8_t>> takeSnapshot(MetalBackend &backend);
+  // While `prefix` is not empty, every command submitted (a command in two
+  // parts as one) runs a host step after each of its dispatches whose
+  // pipeline name starts with `prefix`, which copies that dispatch's first
+  // parameter bytes and the view of its buffer binding `fromLast` bindings
+  // before its last (a host-visible view); takeSnapshots() reads and clears
+  // the copies, in order. decode-profile --experts counts a cycle's routed
+  // experts with it.
+  static void snapshotEvery(MetalBackend &backend, std::string prefix, uint32_t fromLast);
+  [[nodiscard]] static std::vector<DispatchSnapshot> takeSnapshots(MetalBackend &backend);
 };
 
 } // namespace splash::metal

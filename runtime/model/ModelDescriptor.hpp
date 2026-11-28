@@ -76,6 +76,11 @@ struct ModelDescriptor final {
   [[nodiscard]] std::string_view family() const noexcept {
     return std::visit([](const auto &layout) { return layout.family; }, target);
   }
+  // The activations its plans take where a start gives no --activations: its family's default
+  // (QwenTargetDimensions::activations).
+  [[nodiscard]] ops::Int8Activations activations() const noexcept {
+    return std::visit([](const auto &layout) { return layout.activations; }, target);
+  }
   [[nodiscard]] bool valid() const noexcept;
 };
 
@@ -114,6 +119,8 @@ struct FamilyFacts final {
   bool denseFfn = false;
   uint32_t contextTokens = 0;
   uint32_t maximumContextTokens = 0;
+  // Its default --activations (QwenTargetDimensions::activations), as the option spells it.
+  std::string_view activations = "auto";
 };
 
 // Each family's facts, in kFamilies' order.
@@ -128,12 +135,19 @@ struct FamilyFacts final {
 // under the part's name), from which it plans the target as every start
 // plans the GGUF (gguf::planImages); and draft, once chosen, the DFlash2
 // draft's config.json. The installer runs it before any weight download
-// (the engine's model-check command).
+// (the engine's model-check command). targetHeaders is the directory of the
+// target's files or their headers: a GGUF's, which it needs, or a
+// checkpoint's shards, which the installer gives it once it has them. With them it sets
+// *quantizableWeights to whether --weights auto loads any of the target's
+// tensors in another format than --weights original does (gguf::imageFormats
+// of its two plans), which the app offers the option by; it leaves it unset
+// for a checkpoint without them, or one whose headers do not plan.
 [[nodiscard]] std::string_view
 inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                            const std::filesystem::path &config,
-                           const std::optional<std::filesystem::path> &ggufHeaders,
-                           const std::optional<std::filesystem::path> &draft);
+                           const std::optional<std::filesystem::path> &targetHeaders,
+                           const std::optional<std::filesystem::path> &draft,
+                           std::optional<bool> *quantizableWeights = nullptr);
 
 // Prepares once the image of the vision tower that an upstream model's
 // configuration describes (inspectSourceConfiguration's arguments but the

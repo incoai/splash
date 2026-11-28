@@ -196,12 +196,13 @@ class ConstraintCacheTests(unittest.TestCase):
         _, guidance = grammar_tokenizers()
         factory = constraints.ConstraintFactory(guidance, ready_for(guidance))
         unsatisfiable = {"type": "array", "minItems": 5, "maxItems": 2}
-        # More grammar symbols than the compiler can index make it panic.
+        # More grammar symbols than the compiler can index make it panic, or
+        # refuse the grammar's size.
         array = {"type": "array", "maxItems": tool_schema.MAX_GRAMMAR_BOUND}
         oversized = {"properties": {f"p{i}": array for i in range(1000)}}
         for schema, reason in (
             (unsatisfiable, "minItems (5) is greater than maxItems (2)"),
-            (oversized, "tool or output schema is too large to compile"),
+            (oversized, "too large to compile|too big"),
         ):
             with (
                 self.subTest(reason=reason),
@@ -211,7 +212,9 @@ class ConstraintCacheTests(unittest.TestCase):
                     tool_schema.json_grammar(schema, False, chat_format=QWEN)
                 )
             self.assertEqual(caught.exception.status, 400)
-            self.assertIn(reason, caught.exception.message)
+            self.assertRegex(
+                caught.exception.message, reason.replace("(", r"\(").replace(")", r"\)")
+            )
             self.assertNotIn("\n", caught.exception.message)
             self.assertNotIn("%llguidance", caught.exception.message)
 

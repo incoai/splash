@@ -139,9 +139,11 @@ a public one.
 
 huggingface_hub downloads on threads it joins, which finish their files
 before an interrupt reaches the program, so the download runs on a thread of
-its own (`hub._interruptible`) and Ctrl+C stops the installer within a
-fraction of a second: it unwinds its temporary files and ends without waiting
-for those threads, and the repository's next download removes the partial
+its own (`hub._interruptible`) and Ctrl+C or SIGTERM stops the installer
+within a fraction of a second: it unwinds its temporary files, its
+`splash-target-*` folder in `$TMPDIR` among them, and ends without waiting
+for those threads (a launcher that takes the stop passes it on as SIGTERM and
+kills an installer still running 2 s later), and the repository's next download removes the partial
 files they leave. A launcher run without writing bytecode (`-B` or
 `PYTHONDONTWRITEBYTECODE`) sets `PYTHONDONTWRITEBYTECODE=1` in its environment
 before `serve` starts anything, so the installer and the server write none
@@ -153,7 +155,9 @@ beside what it ships.
 ([Revisions](server.md#revisions)), each request within `hub.HUB_TIMEOUT`:
 
 - The installed commits: the assembly's links, sizes and times are checked and
-  it starts. It is re-assembled first when the draft's repository moved or
+  it starts. It is re-assembled first when the draft's repository moved (its
+  default branch, or the branch `--draft-revision` names; a commit never
+  moves) or
   this release changed the GGUF metadata adapter, from the snapshots it links
   (`assembly.source`), wherever `HF_HUB_CACHE` points now; if the new draft
   cannot be fetched or is not the family's ([Drafts](models.md#drafts)), the
@@ -174,13 +178,18 @@ beside what it ships.
 A missing assembly, or one that no longer verifies, is built again. Without the
 Hub it is built from a cached snapshot, of the commit the `--revision` names,
 or else the one the installation recorded or pinned, or one the Hub cache
-records for the branch, never of another revision. Splash downloads by
+records for the branch. Where that record's snapshot lacks a GGUF the
+selection's `:VARIANT` names, or its projector, as an interrupted download of
+the branch's next commit leaves it, the newest cached snapshot that holds them
+all stands in, named in the log (`upstream._cached_holding`); a selection that
+names no variant, or another revision, never takes another snapshot. Splash downloads by
 commit, which records no branch, so when the Hub names the commit of a
 default branch, Splash records it as `refs/main`, as a download of the branch
 does, once the cache holds that commit, when the Hub names it or a download of
 it ends: a model another Splash, such as a source checkout, installed from the
-default branch installs here too. Another installation's pins never stand
-in, as a pin does not say which revision it was installed for. Only files
+default branch installs here too. Another installation's pins stand in
+only so, for a variant the recorded snapshot lacks, as a pin does not say
+which revision it was installed for. Only files
 downloaded before are available, which is enough to rebuild a damaged or
 deleted assembly. `install/cached.py` installs this way every model the Hub
 cache holds whole that Splash serves, leaving out what the installer refuses,
@@ -193,7 +202,8 @@ the Hub's listing too. The installer never rewrites upstream files.
 
 Every start writes a model's target, draft and vision tensors into weight
 images in memory, in the layouts the kernels read: any vision tower in the
-BF16 layout of its tower's encoder, and the target, safetensors or GGUF, and
+BF16 layout of its tower's encoder, an Inkling projector's Q8_0 projections
+as `MDGG0001` Q8_0 planes in it, and the target, safetensors or GGUF, and
 the DFlash2 draft in the `MDGG0001` layout of the GGUF kernels ([MLX
 targets](models.md#mlx-targets)). Each source adapter is a loader, which validates the
 source's metadata and plans its images, and a writer:
@@ -204,11 +214,18 @@ for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by
 `GgufImage.cpp`) and `GgufPreparation` for a GGUF target, `VisionLoader` and
 `VisionPreparation` for a safetensors or GGUF vision tower. `GgufPreparation`
 repacks GGUF blocks ([GGUF targets](models.md#gguf-targets)) and safetensors tensors
-without requantization, but for the Q8_0 of Flash-Next's BF16 or F16
-hyper-connection projections, of 16-bit float routed experts that neither
-MXFP8 holds exactly nor BF16's blocks tile (16-bit experts MXFP8 holds load as
-it, exactly) and of a safetensors target's BF16 or F16 projections ([MLX
-targets](models.md#mlx-targets)), quantizes the draft's BF16 projections
+without requantization, but for the matrices of BF16 or F16 values the
+projection kernels read, a GGUF's or a safetensors target's, and the F32
+tensors a float kernel reads, which one rule plans (`gguf::weightForm`): 16-bit
+routed experts MXFP8 holds exactly load as it, losslessly, and every other
+16-bit projection, routed expert and head as the Q8_0 the reference GGUF
+quantization (`quantize_row_q8_0_ref`) makes of its values under `--weights
+auto`, or as stored under `--weights original`, the default ([MLX
+targets](models.md#mlx-targets), [16-bit weights](models.md#16-bit-weights),
+which names what loads otherwise than in 1.7.3); an F32 tensor of a float
+kernel BF16 holds exactly loads as BF16 under either, losslessly ([GGUF
+targets](models.md#gguf-targets)); it quantizes the
+draft's BF16 projections
 ([Drafts](models.md#drafts)), and computes a safetensors target's GDN decay as
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
 exponential. llama.cpp's NVFP4 rows are rebuilt as NVFP4's native blocks of
@@ -217,7 +234,11 @@ exponential. llama.cpp's NVFP4 rows are rebuilt as NVFP4's native blocks of
 which differs from the 256 form only in its meta unit (four scales and `g`,
 two groups wide): every tile reads both through the format list, as it reads
 every format, and the planner chooses the form by a tensor's width
-(`GgufImage.cpp` `imageFormat`). Every MoE layer's image holds its routed
+(`GgufImage.cpp` `imageFormat`). BF16 and F16 have such a form too (`bf1664`,
+`f1664`: `g` per 64 values), which rows of 16-bit values kept as stored that
+are not whole 256-value blocks take (`quant_float16_form`), as
+Qwen3.8-Flash-Next's hyper-connection up projections of 320 inputs do under
+`--weights original`. Every MoE layer's image holds its routed
 experts' scales after them, F32 [3][experts] (`ImageBuilder::expertScales`):
 a GGUF experts tensor's `.scale` as stored, whatever its type, and 1 for
 experts without one, which the expert passes multiply their sums by
@@ -232,12 +253,11 @@ packed message gates) is written as its transpose's F32 values
 keeps them last first (`RowOrder::reversed`).
 
 Loading never rounds a target or vision weight but in the F32 values of
-quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
-BF16 or F16 hyper-connection projections and of such 16-bit routed experts
-([GGUF targets](models.md#gguf-targets)) and of a safetensors target's BF16 or
-F16 projections, in the F32 quotient of an expert's global scale a checkpoint
+quantized tensors the kernels read unquantized, in the Q8_0 of 16-bit
+projections, routed experts and heads under `--weights auto`, in the F32 quotient of an expert's global scale a checkpoint
 holds as one (as llama.cpp's converter computes Inkling 2's `.scale`),
-in the BF16 values of an Inkling projector's Q8_0 matrices ([Vision](models.md#vision)), and
+in the BF16 values of an Inkling projector's Q8_0 tensors that are not a projection's matrix
+([Vision](models.md#vision)), and
 in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
 target's quantized shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
@@ -451,7 +471,45 @@ decode step's MoE combine also runs the FFN's convolution along the lanes'
 trees, in the combine's dispatch, a lane's rows a threadgroup's, which pass
 their combined values through threadgroup memory
 (`ops::MoeCombineConvolution`): the bits the combine and the convolution
-write apart. A decode step projects the keys and values of one row (a
+write apart. Its FFN mix likewise runs the mixer's output convolution, each
+row's threadgroup its row's before it mixes it, a thread the columns it then
+mixes (`ops::BlockResidualStates::convolution`, the `_convolved` kernels):
+the bits of that convolution's dispatch, which a prompt chunk still runs, and
+48 dispatches fewer a cycle. A step of more than 64 rows, whose mix is a
+threadgroup a row, runs the convolution's dispatch as a prompt chunk does
+(`ops::BlockResidualMix::convolves`): the many-row mix that convolved its rows
+wrote its gate's rows a last bit off the two dispatches' on Apple11, whose
+compiler contracted its sums otherwise than the mix's own, so a row's bits
+depended on how many rows shared its step. A later pass's application mixes the pass before's messages and
+its mixer's inputs in one dispatch, whose threadgroups run side by side
+(`ops::BlockResidualMix::addMix`), and a decode step's mixes also write the
+rows their message gates read normalized, which the gates' own dispatch
+normalized: 72 dispatches and a read and write of those rows fewer a cycle.
+The mix normalizes from its own fp32 sums, so a normalized value may round to
+the other bf16 neighbour (3 of 147,456 at 16 rows). A row and query's mix
+takes a barrier a reduction, where totals parked by single threads took two
+more: every simdgroup's partials by simd_sum into a slot, then simdgroup 0
+adds the norms' and scores' slots and takes the softmax in its lanes,
+parked past one more barrier, and every simdgroup adds an output's squares
+itself; a convolved mix's threads mix the columns they convolved, with no
+barrier between (barriers a mix: plain 3 to 2, through its norms 5 to 3,
+its gates' normalized rows 6 to 3, and a convolved mix the same, where it
+took one more). Every simdgroup taking the softmax itself, with no barrier
+after it, took longer. A decode step's message
+gates take a call's rows in one group, of the least power of two that holds
+them, up to 4, and more in groups of 4 (`ops::MessageGate::groupRows`):
+each group reads each gate's weights once and computes no row past its own
+power of two (one group of 8 rows, or of 16 as two halves of 8 in one
+threadgroup, took a decode step of 5 to 16 rows 0.1 to 2.4% longer on an M5
+Max, an M5 Pro and an M6; groups of 2 rows gained nothing more on two of the
+three). The decode step
+classes split where a step's group changes, where
+its mixes change launch past 64 rows (`ops::BlockResidualMix::rowKernels`)
+and, each width's, where relative attention's decode tile changes
+(`ops::RelativeAttention::decodeTileRows`), as its layout states them
+(`ops::DecodeRowKernels`, `ops::ExecutionPlans::decodeRowClasses`): the
+start creates each class's kernels from its last rows alone, so no class may
+hold a kernel change. A decode step projects the keys and values of one row (a
 sliding layer's, but where messages gate its inputs apart) as one projection
 of the two tensors side by side (`keyValueProjection`,
 `ops::Projection::sideBySide`), on one tensor's own plan, so each tensor's
@@ -642,7 +700,9 @@ engine or the models branches on the GPU:
   through them.
 
 One setting sits beside the measured row: `Int8Activations`
-(`runtime/ops/Linear.hpp`; `splash serve --activations`, on at `auto`, the default, off at `bf16`),
+(`runtime/ops/Linear.hpp`; `splash serve --activations`, on at `auto`, off at `bf16`; where a start gives neither,
+its model's family's default, `QwenTargetDimensions::activations`: `auto` for every family but Inkling-2, whose
+prefill gains little from it and whose default is `bf16`),
 whether a plan may round activations to int8 where an int8-activation path of
 rules 1, 2 and 5 takes them. The engine decides it once for `ExecutionPlans`,
 whose `Linear` holds it beside the calibration for `selectProjection` and
@@ -703,7 +763,14 @@ The rules:
    pair of one format in one pass, a fused projection's segments in one
    dispatch, each column as its own tensor's; on the M5 Max a [2048 x 6144] af4g64
    projection at one row takes 18.4 us on the column tile and 28 us on the
-   staged tile. Otherwise the register tile runs where it takes every
+   staged tile. It also splits K across threadgroups (`columnSplits`, the last
+   partition to arrive adding the partials) only where its grid leaves cores
+   short: while its threadgroups times their bits per weight hold fewer than 4.5
+   a core, into partitions of at least 512 inputs, so no projection of
+   Inkling-2-Mini splits on 10 to 32 cores, and Qwen3.8-Flash-Next's 320-column
+   hyper-connection projections in 4-bit formats do. At one threadgroup a core
+   the 16-core M5 Pro gains from a split and the 32-core M5 Max does not (a Pro
+   core streams 17.6 GB/s, a Max core 13.3), so the bound stays below both. Otherwise the register tile runs where it takes every
    quantized segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the
    IQ2 formats and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`)
    is below its `RegisterBoundary`: 4 x column tiles x table tiles <
@@ -734,9 +801,13 @@ The rules:
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
-4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
-   while a step's routes average at most one row per expert (a decode step's
-   of up to 32 rows of every family) and 32-row tiles beyond. On the M5 Pro
+4. *MoE.* Every GPU runs the experts on the staged tile: a decode step of
+   9 to 16 rows (a verify block) on 16-row tiles, where an expert takes at
+   most one route a row, so its routes are one tile and its weights are read
+   once (8-row tiles read them again past each 8 routes, and a block's rows
+   route alike); otherwise on 8-row tiles while a step's routes average at
+   most one row per expert (a decode step's of up to 32 rows of every family)
+   and 32-row tiles beyond. On the M5 Pro
    (Apple10, 16 to 31 cores) a prefill chunk on the staged passes whose
    routes average `ops::MoeCalibration::wideTileRoutes` or more an expert
    runs 64-row tiles, which dequantize an expert's weights once for up to 64
@@ -833,8 +904,9 @@ every projection
   tile, the staged norm, the hyper-connection norm's quarters, the block
   residual mix's kernel of a threadgroup a row from 65 rows, Inkling-2-Mini's
   message gates' `message_gate_rows` from 129 rows, where 128 and fewer run a
-  decode step's three fused kernels, and the Neural Engine split, which takes
-  no class's first chunk), so the chunks of one row and of the most take both
+  decode step's two fused kernels on the rows their mixes normalized, and the
+  Neural Engine split, which takes no class's first chunk), so the chunks of
+  one row and of the most take both
   sides. `kernel-selection` checks that
   every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
   its fifteen devices, and the kernels its prefill attention runs after each
@@ -1062,7 +1134,10 @@ moving both ways, so that step follows the text rather than the kernel. The
 register tile and Apple9's staged tile, whose matrix operations share the FP32 pipe or run exact in
 registers without a residency step in their time, split by tiers (`TierLaw`: threadgroups per
 core, inputs per partition and partitions, measured on a 40-core M3 Max, Apple9's staged tile taking
-the register tile's of eight partitions) that do not depend on the batch width.
+the register tile's of eight partitions) that do not depend on the batch width; Apple10 and Apple11
+split the register tile below one wave only to two threadgroups per core, not four (Inkling-2-Mini's
+k took 15-27% less time on four partitions than on eight on a 32-core M5 Max, 10-11% less on a
+20-core M5 Pro).
 Partitions stop at eight, but the register tile splits a grid that eight leave below three
 threadgroups per core into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's
 hyper-connection down projection, 320 columns over 10240 inputs; measured on Apple10, and on Apple9
@@ -1082,7 +1157,16 @@ slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select
 unsuffixed instances. The grouping packs the tiles' rows, a grouped row per route, each tile's after
 the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16-, 32- or 64-row matmul reads past
 its live rows into the next tile's, or past the last tile into the `tileRows - 1` rows the scratch
-holds past the routes', and stores its live rows alone.
+holds past the routes', and stores its live rows alone. The gather copies each grouped row's input
+there for the gate/up pass, but a narrow step's, of at most `MOE_NARROW_ROWS` (16) rows, a verify
+block (`ops::MoePlan::narrow`): its gate/up pass reads the step's rows in place, a column tile each
+route's row through the grouped routes, a staged tile all of the step's rows in one 8- or 16-row
+matmul (`MoePlan::inputRows`), whose routes' rows it stores; a row's sums are the same bits on every
+tile's matmul, so a narrow step runs no gather: one dependent dispatch and the copy of its routed
+rows fewer an application (on the 32-core M5 Max, Inkling-2-Mini's one-lane cycle of 16 rows takes
+1.2% less GPU time, 0.3% at one row). Merging the selection into the grouping's dispatch instead did
+not pay there: a dependent dispatch costs about 1.4 µs in a command, less than the merged kernel's
+added work.
 The expert passes launch the live tiles alone: the grouping kernel writes each
 pass's grid with the tile count, and the pass reads it as an indirect dispatch
 (`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot table
@@ -1095,7 +1179,22 @@ experts are one chunk of its routed planes, floor_slots = chunk_slots = its slot
 block's the expert store's floor and elastic chunks of its size (`model/ExpertChunkLayout.hpp`,
 [Streamed experts](server.md#streamed-experts)). The staged tile runs gate and up in one pass, a
 gate and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
-share one pair table where gate and up share their routed and their shared formats.
+share one pair table where gate and up share their routed and their shared formats. A decode
+step's pass on 8-row tiles may split K in two partitions (`MoeConfig::gateUpPartitions`,
+`downPartitions`; `moe_expert_gguf_m8k2_*`): threadgroups of twice the simdgroups, each summing
+half of K, the partitions' fp32 sums added in order before the epilogue. `selectMoe` splits a pass
+by its grid's threadgroups a core, its column tiles times the step's expected tiles (of rows routed
+independently) over the cores, on the staged tile's wave law (`MoeCalibration`): below its
+saturating count (6), where twice the simdgroups stream more, and from past one resident wave (10;
+two, 20, on the M5 Pros) to twelve waves (120), where the shorter walks shorten the last wave's tail; not between, nor past
+twelve waves, where the tail is too small a share to pay the partitions' sums, nor on Apple9 and
+Apple11 (a 10-core M4 and a 12-core M6 measured two partitions at 0.95-1.06 of one's time). On the 32-core
+M5 Max that took Inkling-2-Mini's one-lane cycle 0.4%, 1.9%, 0.6% and 3.1% less GPU time at 1, 4, 8
+and 16 rows and Qwen3.6-35B-A3B's 1.4-2.3% less, in place rows included; the sums' order changes, so
+outputs are not bitwise those of one partition (teacher-forced logits within the noise floor of a
+step-shape change). Four partitions do not fit a threadgroup's 32 KB, and expert passes with no
+stage, eight simdgroups along K, took 1-3% more than the staged passes' partitions: the stage does
+not bound them.
 An expert's only tile of at most `GGUF_COLUMN_ROWS` live rows runs on the column tile
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
@@ -1256,7 +1355,8 @@ time the float projection (`ops::addGgufFloat`, widths of any multiple of 8) on 
 instead, marking `selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B
 shape, or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), or at
 any other (`'HxIxExK'`), on the device's plans, each decode step also as the GB/s its layer and its
-expert passes alone stream its distinct experts at; `GGUF_MOE_ARGS='repack'` times the repack of
+expert passes alone stream its distinct experts at (`'partitions …'`: each decode pass in one and
+two K partitions by rows and threadgroups a core, the numbers behind `MoeCalibration`'s law); `GGUF_MOE_ARGS='repack'` times the repack of
 streamed experts into their slots (`moe_expert_load`, 1 to 32 jobs) and of tensors into an image
 (`gguf_repack`) in the streamed formats, each plane checked bytewise against the reference repack.
 
@@ -1303,16 +1403,20 @@ runs `attention-variants`, every
 variant through the production encoders against fp64, and
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
 Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole
-history without.
+history without; `--shapes inkling-window,inkling-full` times Inkling-2-Mini's relative attention
+(`ops::RelativeAttention`) as the model plans and encodes it: a prompt chunk's prepare and direct
+kernel (or split and reduce), a decode step's single pass of 8 or 16 rows a lane.
 
 ### Int8-activation prefill
 
 On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill chunk past one
-staged tile (more than 64 rows) of a projection whose quantized segments are all MLX affine 4- or
-5-bit in groups of 64 (`af4g64`, `af5g64`) or Q8_0 runs `LinearTile::GgufPrefillInt8`
-(`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
-(`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never),
-with int8 activations on. With them off (`--activations bf16`) every chunk runs the bf16 tiles,
+staged tile (more than 64 rows) of a projection whose quantized segments are all in formats the
+int8 tile decodes runs `LinearTile::GgufPrefillInt8` (`kernels/prefill/gguf_prefill_int8.metal`)
+instead of the bf16 tile (`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at
+0.9x its bf16 rate, never), with int8 activations on. Those formats are one list,
+`QUANT_PREFILL_INT8_FORMATS`, which compiles the tile's kernels and is the planner's rule
+(`quant_prefill_int8_format`): MLX affine 4-, 5- and 8-bit in groups of 64 (`af4g64`, `af5g64`,
+`af8g64`) and Q8_0. With int8 activations off (`--activations bf16`) every chunk runs the bf16 tiles,
 bit for bit, and the prefill arena holds no codes. `gguf_prefill_int8_quantize` writes each 64-input
 group of each row as int8 codes with its own scale, by the int8-activation rule
 (`kernels/common/int8_activations.h`), which a SwiGLU's up takes from its gate's plan
@@ -1321,10 +1425,13 @@ group of each row as int8 codes with its own scale, by the int8-activation rule
 straight from the planes into int8 `matmul2d` fragments and folds each
 group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. Q8_0's codes are int8
 already: its tile runs a 64-input group as two pairs of fragment steps, each pair one 32-input group
-of the weights, and folds `(sa d) sum(qa q)` per 32-group with that group's `d`. It reads the codes
+of the weights, and folds `(sa d) sum(qa q)` per 32-group with that group's `d`. `af8g64` keeps its
+codes in Q8_0's planes and runs Q8_0's steps, its unsigned codes entering the matmul as `q - 128`
+(the top bit flipped) and the group's four steps summed before one affine fold with `z + 128 s` in
+`z`'s place. It reads the codes
 the affine tiles read, in another schedule (a lane's two steps of a 32-group take one uint2 of each
 weight column's plane record), so a fused projection of affine and Q8_0 segments (a checkpoint's
-BF16 projections, loaded as Q8_0, beside its MLX ones) and a SwiGLU of the two still quantize their
+BF16 projections, loaded as Q8_0 under `--weights auto`, beside its MLX ones) and a SwiGLU of the two still quantize their
 rows once. The weights stay
 exact; only the activations round, per row and group, so an outlier channel costs only its own 64
 inputs. A group holding an infinity or a NaN, which its codes alone would round to finite values,
@@ -1344,6 +1451,9 @@ column tiles were a multiple of 16 (M6, 2048 rows: 260 column tiles took 29% lon
 a 16-core M5 Pro and a 12-core M6. With its Q8_0 projections on the tile, Inkling-2-Mini
 UD-Q4_K_M prefills 1.3% faster at 512 tokens, 0.4% at 4K and 1.5% at 32K, and Qwen3.6-35B-A3B
 UD-Q4_K_M 3.8% at 512 and 4.1% at 4K (fused GPU time, 20-core M5 Pro, three alternating pairs).
+With its `af8g64` projections on the tile, Inkling-2-Mini's 8-bit MLX pack prefills 4.4% faster at 8K
+tokens and 5-8% at 2K: its projections take 25% less time, the quantization included, and the tile
+alone 1.42x less than the bf16 tile at 2,048 rows (16-core M5 Pro, ABBA rounds).
 The quantizer stores each 32-input group's codes in the GEMM's
 fragment order (`prefill_int8_position`): the four inputs a lane takes in a fragment step, in the
 planes' slot order, are one word. The codes and scales are the prefill arena's
@@ -2045,24 +2155,23 @@ kernel may follow an address to the entries of the table it names.
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
 each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
-budget's pages unused (`Layout::extentPagesFor`). The regions follow the
-layers, except that a layout with a sliding window (`Layout::windowTokens`,
-over the layers `windowedLayers` names) places the regions of the layers no
-window bounds first and then the windowed layers', each in layer order
-(`Layout::region`): what a row reads of a page every window has passed lies in
-its first regions, and a page's SSD slot holds them first too. Each extent has
+budget's pages unused (`Layout::extentPagesFor`). A page has a region for
+each of its slots (`Layout::pageSlots`): every layer's without a window. A
+layout with a sliding window (`Layout::windowTokens`, over the layers
+`windowedLayers` names) gives a page a slot for each layer no window bounds,
+and a block its base unit, one such page, and its window unit, the
+windowed layers on `Layout::windowUnitPages` more pages of the same size
+(see [sliding windows](#sliding-windows)); a block's SSD slot holds the layers'
+regions in their order (`Layout::region`), the layers no window bounds first.
+Each extent has
 a form (`kv::PageForm`), which holds the first of a Full extent's regions
 (`Layout::regions`) and then, for a layout with a block index, their index
 plane: a Full extent every layer's; an Index extent none, only the plane, for
-pages whose K/V is on the SSD, and only a pool that spills allocates one; and a
-Slim extent, only of a layout with a sliding window whose slots hold a page's
-spans in order (`Layout::slimmable`), those of the layers no window bounds, for
-a page every row's window has passed. A layer's region sits at one offset in
-every extent that holds it, so the kernels reach a Slim page as they reach a
-Full one, through a real page table entry; only an Index page's is absent. A
-page moves to another form, its references with it, when its K/V leaves memory
-or comes back, or when it gives up its windowed layers' K/V
-(`KvPool::movePages`), and the copy takes what both forms hold. The pool
+pages whose K/V is on the SSD, and only a pool that spills allocates one. The
+kernels reach a Full page through a real page table entry; an Index page's is
+absent. A page moves to another form, its references with it, when its K/V
+leaves memory or comes back (`KvPool::movePages`), and the copy takes what
+both forms hold. The pool
 allocates an extent when it needs one of its pages. When it is built it
 allocates the runway, the extents of the first 64 pages, which startup warmup
 holds and runs on; nothing but the pool allocates or releases an extent. An
@@ -2076,11 +2185,12 @@ that bind it make resident (`PageStorage::writeEntries`). The host reaches the s
 returns free pages before it evicts anything: an empty extent as it is, and the
 free pages scattered over the others of its form as soon as they cover the
 extent of that form that holds the fewest pages, whose pages the pool copies to
-them (`KvPool::compactExtent`): a Full extent before a Slim one and a Slim one
-before an Index one, unless the reclaim needs the memory of one form, as a
+them (`KvPool::compactExtent`): a Full extent before an Index one, unless the reclaim needs the memory of one form, as a
 shortfall of Index pages needs Full memory. The blocks and requests on those
-pages follow them, a page a disk transfer reads or writes stays where it is, and
-a pass that evicts everything copies only what is left afterwards. Every extent
+pages follow them, a page a disk transfer reads or writes stays where it is (a
+window part's read into a lane's unit keeps its block's base page in place too,
+whose extent the read reaches), and a pass that evicts everything copies only
+what is left afterwards. Every extent
 a pass empties is released, except that the host's pass short of critical
 pressure, a pool's growth, optional work and startup cleanup keep one empty
 extent as the runway the next request starts from, and a pool that spills
@@ -2130,6 +2240,11 @@ behind one refused memory or the SSD cache's room for its KV
 behind a refused resume or start) and those waiting for a disk restore
 (`restoring`), reports suspended requests, recovery draining and the oldest
 current wait age, which for a refused request runs from when its wait began.
+`stalled_wait_ms` is how far into the resource wait limit the request furthest
+into it is, a lane in service refused growth included: the time since its wait
+began or a lane ahead of it last worked, whichever is later. A wait behind
+work in progress keeps restarting it, so it stays short while
+`oldest_wait_ms` grows; at the limit the request fails.
 `held_behind_refusal` is usually 0: the scheduler leaves out the starts a
 refused prompt leads unless their command ends their prompts. Memory
 transitions also appear in the console.
@@ -2152,11 +2267,22 @@ what it may take:
 | `Host` | The control pass's claim for the rest of the Mac |
 
 A claim either can wait for memory a transfer returns (`CanWait`) or needs it
-now (`Immediate`): optional work, a lane's window trims, the collection of
+now (`Immediate`): optional work, the collection of
 landed copies, a pool's growth, the weights' restore and the host's claim
 under critical pressure are immediate. Claims are ranked, the higher first: priority,
-then a decoding lane before a prefill one, then more completed work, then the
-earlier arrival (`ClaimRank`, the order in which lanes yield, reversed). A
+then, once a request has waited for memory (its start or resume refused it, or
+its lane yielded it), that request and every one submitted before it in
+arrival order, ahead of every later one; then a decoding lane before a prefill
+one, then more completed work, then the earlier arrival (`ClaimRank`, the
+order in which lanes yield, reversed). So the first yield costs the least
+work, and a request that has waited yields only to work ahead of it, which
+ends: none waits behind requests sent after it, and two that each need most
+of the memory take each other's cache once a turn, not at every retry. Its
+wait for memory then lasts as long as that work, past the resource wait's
+limit, which the work's progress restarts ([resource waits](#resource-waits)):
+`/status` reports the whole wait (`memory_governor.claims.oldest_ms`) and
+the part with nothing ahead progressing (`admission.stalled_wait_ms`), which
+alone the serving benchmark's G9 bounds, at 30 s. A
 claim that waits holds what it lacks against every claim ranked below it:
 their admissions leave that room, and those free pages of its form, free, so
 memory that lands goes to the highest-ranked waiter first, and claims ranked
@@ -2214,7 +2340,8 @@ take is skipped, not a stop:
    reply's opportunistic state among them), in the cache's one order
    (`Cache::walkFor`).
 3. Caches the model rebuilds on use: the vision encoder's scratch, images'
-   encoded rows, idle history staging, and the hot block cache while no lane
+   encoded rows, idle history staging, the SSD cache's state staging while
+   its tier takes no cache write, and the hot block cache while no lane
    reads above its floor.
 4. Cached units that need a write: the state the idle staging buffer writes,
    whose RAM frees at once, for any claim; what frees only once its write
@@ -2237,10 +2364,13 @@ take is skipped, not a stop:
    no lane's growth fits, the lane that yields first is suspended; while other
    lanes fit, a refused lane waits for them, resident. A lane alone, or a
    start with no lane in service, waits while its claim takes something
-   ([below](#what-a-refused-claim-takes)) or any write is in flight, and fails
-   with `capacity_exhausted` only once nothing else holds memory it could get:
-   no other request's KV or state in memory, no cached unit it may take, no
-   write in flight, and the store at its floor (`Engine::judge`).
+   ([below](#what-a-refused-claim-takes)) or any write is in flight, or where
+   its attempt was refused after `free()` met its need, retrying at the
+   resource wait's pace with a count afresh, and fails with
+   `capacity_exhausted` only once nothing else holds memory it could get: no
+   other request's KV or state in memory, no cached unit it may take, no write
+   in flight, and the store at its floor (`Engine::judge`). The resource wait
+   bounds the retries (`resource_timeout`).
 
 Once a unit the claim reached waits for a transfer, it takes nothing past
 step 4.
@@ -2252,12 +2382,12 @@ every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `InService`, can wait | yes | yes | yes | yes | its own, and its priority's or lower | yes | yes | yes | where it reaches them | last, for KV |
 | `InService`, immediate | yes | no | yes | no | no | no | yes | yes | no | no |
-| `Start` | yes | yes | yes | no | its priority's or lower | no | yes | no | no | no |
+| `Start` | yes | yes | yes | no | its priority's or lower | no | yes | yes | no | no |
 | `Optional` of a request | yes | no | yes | no | no | no | yes | no | no | no |
 | `Optional` KV its lane takes anyway (`laneNeeds`) | yes | no | yes | no | its own | no | yes | no | no | no |
 | `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no | no | no |
 | `Growth` | yes | no | no | no | no | no | no | no | no | no |
-| `Host` with a deficit | yes | yes | yes | no | every lane's under warning pressure; none at normal | no | no | no | no | no |
+| `Host` with a deficit | yes | yes | yes | no | every lane's under warning pressure; none at normal | no | while a start it refused waits | while a start it refused waits | no | no |
 | `Host` under critical pressure | yes | no | yes | no | every lane's | yes | yes | yes | yes | first |
 | A need the host refused | in place | no | yes | no | its own, in place | no | as its class | as its class | no | no |
 
@@ -2281,10 +2411,7 @@ the one a conversation's next turn most likely resumes from; the chains queued
 requests will restore are of certain reuse too. Only the KV of the lanes in
 service is never taken: every other claim takes certain reuse in its recency
 order, starts and the host's pass among them, but a pool's growth, which takes
-none, and optional work, which takes the resume point alone. That is vLLM's
-rule, whose cached blocks no running request references stay in its free queue
-and go in LRU order as blocks are allocated, and SGLang's, whose radix cache
-locks only running requests' paths and evicts unlocked leaves; kept from starts
+none, and optional work, which takes the resume point alone. Kept from starts
 and the host's pass, queued chains made sessions arriving together take turns
 (#758). The host's own pass takes certain reuse only while a start it refused
 waits, or at critical pressure: a pass for its margin alone, which other
@@ -2294,10 +2421,10 @@ from RAM, but a reply's opportunistic state
 (below), is written to the SSD cache first while the tier takes the write, with
 the KV it restores through, so a resume point or a queued chain that goes keeps
 its SSD copy: its turn starts with a restore read rather than a prefill. With
-no SSD cache it is dropped and prefilled again, as in vLLM.
+no SSD cache it is dropped and prefilled again.
 
 The engine's own optional work (the Index runway's refill with no Spill lane in
-service, trims with no lane in service) takes no unit at all: its rights are the
+service) takes no unit at all: its rights are the
 narrowest, `TakeRights{}`, which take only the idle state buffers and what
 lands, and its count walks no source. The pass command goes only to work that
 supersedes it, a conversion only to its own lane's KV growth, and a claim never
@@ -2599,7 +2726,8 @@ tick for its copy to land, logged a pending and a granted a page.
 The grant that ends a logged wait logs `granted`, since a wait can end in an
 attempt that runs no `free()`, as the pages it waited for land; and a need
 `free()` met whose attempt is still refused logs `met, yet refused again`, the
-ledger having counted room the attempt did not find. `/status` shows the
+ledger having counted room the attempt did not find; the request then waits
+for its next try rather than fail. `/status` shows the
 cache's pages (`kv.pages_cache`), its evicted states (`state.evictions`) and
 the pools' shrinks (`memory_governor.accounts`).
 
@@ -2691,9 +2819,86 @@ token resumes instead.
 Until the request ends, suspended or not, that replay point is in use, and so is
 the KV it restores through. When the last request using it ends, the point
 becomes the newest ordinary state; the older points on its chain keep their age.
-Cache units come in three classes: checkpoints, then ordinary states and KV
-(first the KV no state restores through, which saves no prefill), then what is
-in use, which only the claims [above](#memory-rules) may take.
+The cache gives up in one order, written once (`Cache::phaseAfter`), which the
+walk and its count both read:
+
+1. the checkpoints no running lane recovers from, oldest first: they save
+   the least;
+2. the dead leaves, KV no state restores through, which saves no prefill;
+3. history whose leaving writes nothing (`Cache::freeHistory`), oldest
+   first: superseded states ([sliding windows](#sliding-windows) says what
+   supersedes) that leave keeping a copy on the SSD, or unwritten;
+4. on a windowed layout, the tails' window units: superseded states, then
+   the points behind the running lanes but each lane's newest, by recency,
+   each only where its release frees a unit no lane holds;
+5. the units of points on the SSD alone, which a reclaim writes;
+6. by use, ordinary states and KV leaves in one recency order, in three
+   passes: what leaves at no loss (an SSD copy stays, or a write makes one),
+   the running lanes' recovery points, then what is lost. With nothing
+   written a lane's rolling checkpoint, which its next one supersedes, goes
+   before an idle conversation's newest state; where the tier writes the
+   ordinary class, that leaves first, at no loss, and a decoding lane no
+   longer evicts each reply checkpoint it has just captured;
+7. what is in use, at no loss before lost, which only the claims
+   [above](#memory-rules) may take.
+
+Every release takes a state in one mode (`Cache::releaseMode`): demoted, its
+RAM copy leaving through its SSD copy or the staging buffer's write and its
+tail's units as their window parts are written, or evicted with its copy. One
+predicate says whether a point's SSD copy stays as it leaves memory
+(`Cache::copyStays`), and the release mode, the tails (4 above) and sparse
+history all read it; it answers alike before and after the point's own
+release, so a count and its take judge a point the same whichever releases it
+first. A copy stays unless keeping it would wait for a write that does not
+come: a copy whose parts landed stays in every mode, so a persistent tier's
+landed point is demoted, never lost; where the KV tier takes no writes (no SSD
+cache, a file that stopped taking writes, the write budget spent), a point
+whose window parts are unwritten is evicted.
+
+Sparse history decides which history is written (`Cache::historyWritten`): a
+superseded point no request uses, leaving memory without a complete copy, is
+written where no point of its chain within the spacing below it has a copy
+that stays. So a chain's first point is written and then one point per 8,192
+tokens (`Cache::kSparseHistoryTokens`, the default of `Cache::sparseHistory`),
+and a go-back recomputes at most about 8K tokens while the SSD cache takes
+writes (`Cache::takesCacheWrites`) and has room for history: a history write
+takes room only from what the quota holds at rank 0 and from rank-1 copies
+used before it, or is refused (below), so a full cache keeps what was used
+more recently and older history is recomputed in full. In one rare shape the
+bound does not hold: on a windowed layout under memory pressure, a state in
+RAM with no SSD copy of its own (a reply checkpoint, `markReply`) within the
+spacing above a point written by use whose window parts still wait to be
+written counts as the point the history above it spaces from, so that history
+leaves unwritten, and once the state leaves without a copy a go-back
+recomputes from the next copy below, which can lie more than 8K tokens back.
+It only costs recompute; 1.7.5's classification rule removes
+the case. The rest of history leaves unwritten, early (3 above). On a windowed
+layout a kept point's tail's window parts are written as transfers are polled
+(`Cache::writeWindowsAhead`), not left to a walk that writes (5 above): its
+release queues them, and on the SSD alone it holds its units only while they
+are queued or in flight. Where they cannot be written (the tier takes no
+writes, or refuses the write at history's worth) it is no copy that stays, and
+the tails take it for its units. Until its parts land, a claim that cannot
+write them, a page scan or one that cannot wait, may take an idle
+conversation's newest point before them: the window is the write's latency,
+and a claim that waits never does. A point's write has one worth
+(`Cache::writeWorth`): history no request uses ranks with history in the SSD
+quota, any other point as a point, each by its last use (below).
+
+Every state the cache gives up leaves through one exit
+(`Cache::releaseState`): the walk's releases, those a lost leaf, a poisoned
+block or an unwritable unit takes with it, and the quota's give-ups for a
+write's room; that each frees what its count named is a test assertion
+(`Cache::checkReleases`). What no count foresees counts as freed elsewhere
+(`Cache::unitsFreedElsewhere`): the quota's give-ups, the points a poisoned
+block or an unwritable unit takes, and in a take whose write made room by
+giving up a state, or a copy under one, the releases with no write after it,
+as the point that give-up left history may then go. A count judges how each
+state leaves against the states it evicted before, as its take meets them,
+and a take settles what lands once over all its steps (`Cache::take`): a
+release nets only the landing the take as a whole cancelled of what the claim
+was credited.
+
 A prefill command captures the state of each boundary it reaches, in buffers
 reserved before it runs. A junction or a checkpoint retires its lane's
 checkpoint once published, and a checkpoint the same command would capture before it is not captured at all; the prompt's
@@ -2756,8 +2961,10 @@ well: reclaim takes checkpoints first and writes the states it evicts to the
 SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
 when no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
-request's own too, and a full quota makes room for one by dropping the oldest
-copy, perhaps an older conversation's restore point.
+request's own too, and a full quota makes room for one as for any state's
+write ([disk tier](#disk-tier)): one a reclaim evicts takes only the points
+used before its own, one published straight to the SSD, the newest, any
+point.
 
 A prompt's head, its system prompt and tools up to where the template opens
 another message (`head_tokens` in the request frame), gets an ordinary state at
@@ -2787,8 +2994,11 @@ prompt's replay point lies within a prefill chunk past the multiple of 4096
 below the head, which then holds no checkpoint; a head whose state lies at 4096
 tokens or below keeps none, as a cold prefill plans its first checkpoint at
 4096. It costs one more cached state a head, 4.4 MiB for Inkling-2-Mini, 19.6
-MiB for Qwen3.6-35B-A3B and 46.9 MiB for Qwen3.8-27B, and no KV: its blocks are
-the head's. It stays a checkpoint, which reclaim takes first (and, with the SSD
+MiB for Qwen3.6-35B-A3B and 46.9 MiB for Qwen3.8-27B, and no base KV: its blocks are
+the head's. On a target with sliding-window layers it also holds its tail's
+window units that no other state holds ([sliding windows](#sliding-windows)):
+up to 82.5 MiB on Inkling-2-Mini (32 blocks of 2.58 MiB) and 21.7 MiB on Flint
+(16 of 1.35 MiB). It stays a checkpoint, which reclaim takes first (and, with the SSD
 cache, writes to the SSD), as the replay point's is: no lane uses it once the
 head's state is published, and it serves only a conversation whose head ends
 differently, where the ordinary states that reclaim takes after it, the head's
@@ -2838,9 +3048,14 @@ cell, which the lane's next transition writes before it reads it, and decodes
 it from there, its promoted RAM copy taking the codes as they came.
 
 Decode keeps each lane's window current with its rings too, and a cycle whose
-retained rows may reach the next whole page reserves that page's state, in one
-attempt that frees nothing for it (`Engine::reserveReplyCapture`); refused, the
-cycle captures none. A decode step leaves the rows it retains on the lane's tape
+retained rows may reach the next whole page reserves that page's state
+(`Engine::reserveReplyCapture`). Its claim takes what frees at once, as any
+optional claim, but no running lane's recovery point, which each lane's next
+capture replaces only once published: those are pinned while the claim runs.
+Refused, the cycle captures none, and the cycles after it at that page try the
+lane's pool and the room alone, so a reply walks the take order once a page.
+No claim of a Spill lane's request, its capture's included, takes the free
+Index pages its own next page moves into (`EngineVictims::movesInto`). A decode step leaves the rows it retains on the lane's tape
 for the lane's next step to fold into the GDN state, so the cycle folds the rows
 before the page alone and stores the result's codes in the state's cell
 (`ops::GDN::addFold`: the next step's arithmetic, then the codec's, so the
@@ -2887,20 +3102,26 @@ page that holds a checkpoint already, a peer's prefill checkpoint or the state
 an identical earlier turn kept, reuses it as it is. A chat client
 that sends no reasoning back never renders a reasoning reply back: kept as
 ordinary states, the replies of 11 such chats served in turn at a 22 GB limit
-left their follow-ups 1 cached prefix of 22, where 1.6.2 left 18. Each block
-such a state was captured at keeps a mark (`KvCache::noteReply`) while the KV
-cache holds it, the state gone or not, and a request whose start's match
-reaches a marked block renders an earlier reply back (`CacheLookup::rendersReply`),
-as agent clients that send their reasoning back do: its end keeps its own
-reply's last state (`StateCache::keepReply`), a checkpoint reclaim writes as
-any, so its next turn resumes there after a reclaim too, from the SSD; each
-later turn that renders the one before back keeps its own, and one that does
-not leaves its reply's opportunistic again. Only a reply that holds at least
-`WriteBehind::kMinimumTokens` past its prompt's replay point is kept, as a
-shorter one recomputes faster than its state writes: kept, the 384-token
-replies of 12 agent conversations at a 27 GB limit wrote 24% more to the SSD
-to save 2.4% of their prefill. A suspended lane whose reply holds as much
-keeps its reply's newest state the same way, whatever its client: the point it
+left their follow-ups 1 cached prefix of 22, where 1.6.2 left 18. Each block a
+reply's decode published wholly past its prompt keeps a mark
+(`Cache::noteReply`) while the KV cache holds it, whether a state was captured
+there or not (a block shared with the prompt shows nothing: a client that drops
+reasoning renders a think opener the same, so a reply under 32 to 63 tokens
+cannot show it), and a request whose
+start's match reaches a marked block renders an earlier reply back
+(`CacheLookup::rendersReply`), as agent clients that send their reasoning back
+do: when it ends, its own reply's last state becomes an ordinary state, stamped
+after its prompt's replay point, where it lies past the block the reply shares
+with its prompt (`Engine::finish`; one at that block's end, a short reply's,
+stays opportunistic and costs its follow-up under 32 tokens of prefill),
+which reclaim and the SSD cache take by the recency of every ordinary state and
+write-behind takes as it takes the replay point, so its next turn resumes there
+after a reclaim too, from the SSD; each later turn that renders the one before
+back keeps its own, and one that does not leaves its reply's opportunistic
+again. Each conversation is judged by its own chain, so clients of both kinds
+share a server. A suspended lane whose reply holds at least
+`WriteBehind::kMinimumTokens` past its prompt's replay point keeps its reply's
+newest state (`StateCache::keepReply`), whatever its client: the point it
 resumes from, which a reclaim meanwhile writes, once, and which its next capture
 after the resume retires. A shorter reply's checkpoints stay opportunistic: once
 they went, the lane replays its reply from its prompt's replay point, as one
@@ -3101,121 +3322,152 @@ The wait fails at its limit once a whole limit passes with no such lane in
 flight; the request's own deadline, its `timeout` or `--request-timeout`,
 applies throughout.
 Readiness does not guarantee that a request-sized allocation fits. A request
-that cannot fit even alone, after every cached prefix was evicted and the expert
-store shrank to its floor, fails with 400 `capacity_exhausted`
-(`Engine::capacityExhausted`), naming what it could not allocate, then, as
+that cannot fit even alone, after every cached prefix it may take was evicted
+and the expert store shrank to its floor, fails with `capacity_exhausted`
+(`Engine::capacityExhausted`), naming what it could not allocate and, where
+the cache still holds prefixes its claim did not take, how many pages, then, as
 every end for want of memory does (`Engine::memoryShortfall`), its lane's
 mode, phase and tokens and the Metal memory outside the backend's buffers
 (`MemoryGovernor::untrackedBytes`), only for a Spill lane why its KV gave no
 more memory back (the SSD cache took no more of it where it owes copies no
 write started, `Cache::owesCopies`; otherwise even a release down to its floor
-does not cover what it lacks), and a smaller `--max-context`, or a larger
-`--max-memory` where one lowered the budget; retrying it fails the same way.
+does not cover what it lacks). Beside its sentence the failure says what the
+request lacked and the prompt tokens that holds it now (`CapacityShortfall`
+on the Error frame: for a Resident lane its KV and the free blocks beside,
+less the rows its decode step verifies; for an image refused at its start
+the plan's KV beside its vision memory; for a start refused at the SSD cache
+what memory or the quota holds), by which the server answers 400
+`context_length_exceeded` with that limit's advice; retrying it fails the
+same way.
 
 ## Sliding windows
 
 A target whose layers include sliding-window ones (`kv::Layout::windowTokens`,
 over the layers `windowedLayers` names) pages every layer, and a row of a
-windowed layer reads only the `windowTokens` keys before its own. Once every
-row that will run has passed a page by a window, its windowed layers' K/V is
-read no more, and the page gives it up for the Slim form, which keeps the
-layers no window bounds (`kv::PageForm::Slim`): for Flint 14 of 49 layers, 462
-KiB of a page's 1.58 MiB in int8. A cached state needs its tail, the
-`windowPages` blocks that end at its block (`Layout::windowPages`, 16 for a
-512-token window), Full, since a request resuming there reads them whole: so a
-cached prefix restores at a state as ever (`Cache::restoreRequest`), and states
-closer than a window share the pages of their tails. The cache keeps it so
+windowed layer reads only the `windowTokens` keys before its own. The pool
+has one page size: a page holds a slot for each layer no window bounds
+(`Layout::pageSlots`: 8 on Inkling-2-Mini, 14 on Flint, 528 KiB and 462 KiB
+in int8). A block's base unit is one page of those layers; its window unit
+is `Layout::windowUnitPages` pages that hold the windowed layers in their
+regions' order, taken and given back together, the last padded where they
+do not fill it (Inkling-2-Mini 5 pages, exact; Flint 3, 7 of their 42 slots
+unused). A page a window unit frees serves a base unit and the other way:
+there is no exchange between forms or pools. Only the pool and the lanes'
+tables see pages; the block tree, its counts and the SSD see a block's two
+units (`KvCache::Block::page` and `window`). A lane has a page table per page
+of a block (`DecodeTensor::PageTable`, one after another): the base pages'
+and one per window unit page, which holds by logical page the j-th page of
+each block's window unit (`ModelBatchItem::windowTables`). Each layer's
+dispatch binds the table of the page that holds it (`Layout::blockPage`) and
+its slot's placement (`PageStorage::layers`), so no kernel changed, and the
+decode's path commit runs once a table, over the slots that page holds
+(`Layout::usedSlots`).
+
+A block's window unit has a lifetime of its own. A cached state needs its
+tail, the `windowPages` blocks that end at its block (`Layout::windowPages`,
+16 for a 512-token window, 32 on Inkling-2-Mini), since a request resuming
+there reads them whole. A point's window K/V is in memory as units or on the
+SSD as window parts. A block holds its unit exactly while it is resident and
+the tail of a state with a RAM copy holds it, or the tail of a state with a
+disk copy does while the block's copy has no window part (the window K/V not
+written yet), or a transfer moves the unit; a lane holds the units of the
+blocks its window reads, as it holds any page, and a unit nobody holds is free
+at once, its pages serving any other unit. So a cached block costs its base
+page (528 KiB on Inkling-2-Mini, 462 KiB on Flint) and its unit only within a
+point's tail in memory (3.09 and 1.80 MiB a block with it), a point in memory
+costs its state and the units only it holds, and a point on the SSD its state's
+copy, its tail's window parts and its chain's base parts, and no memory once
+those are written. The memory plan prices one
+request's KV as its lane holds it: its floor of blocks whole, its window's,
+those its command writes (a prefill chunk's 64, or a streamed group's where
+the routed experts stream) and one more (`kvWindowFloorBlocks`), and past them
+each block's base page, all in whole extents of the one page size;
+`memory_plan.budget.kv_window.floor_pages` reports the floor in window pages.
+The tails of the points the cache keeps are cache, not counted there. The cache
 (`CacheWindowPolicy`):
 
-- Between commands, before any lane grows, `Cache::trimWindows` moves to the
-  Slim form every Full page that every request holding it has published
-  `windowPages` blocks past (its next command's rows, at or past its published
-  blocks, read no key on it), that no state's tail holds and that no transfer
-  moves, the cached pages no request holds and the pages requests keep beside
-  their blocks among them. The Slim runway's free pages take them first,
-  then extents memory allows: while a request is in service, memory it
-  needs, as its KV is, so the host's pause does not hold them back and a long
-  prompt's passed pages trim as it prefills. A refusal leaves pages Full for
-  the next pass: memory, never correctness. A multi-pass prefill publishes
-  only once its last pass ends, so its rows' windows stay Full between
-  passes.
-- Every state, in RAM or on the SSD, pins its tail (`KvCache::countState`, a
-  bounded walk beside the counts of the states below); only its removal
-  unpins the tail, which the next pass trims: a state written to the SSD
-  keeps its entry and its tail Full (`StateCache::reclaim` discards its RAM
-  copy alone), on a request's own chain too, where the plan's floor
-  (`kvWindowFloorPages`) does not count it. A conversation of turns shorter
-  than a window thus keeps every page it appends Full behind its own lane,
-  which no reclaim reaches. While the budget has room nothing changes; once
-  it refuses, the states behind the lanes leave for those pages
-  (`Cache::releaseTails`), in RAM or on the SSD with their copies, oldest
-  first: each whose tail holds a page that a running request holds a window
-  behind it and that no state that stays holds too. The resume point, what a
-  waiting request restores, a state a request uses and, of each running
-  request's chain, the head-most state (a prompt's head, which the next
-  conversation resumes at) and the newest stay. A prompt that matched a state
-  gone resumes at a state before it, or runs from its start, and computes the
-  blocks past it again.
-- A writer that computes a block again keeps its own page, which the block
-  takes once no transfer moves the block's (`KvCache::insert`,
-  `kv.window.upgrades`), rather than moving onto the block's page as a
-  writer of another layout does: its window reads the page whole, which a
-  Slim page no longer is, and were it to move onto a Full one, what it reads
-  would depend on whether trimming had taken the block's windowed layers.
-  Requests that hold the old page keep it, as a page of their own the next
-  passes trim once their windows have passed it. A copy of a Slim page goes,
-  there and where a disk-only block takes a writer's page: a block's copy
-  holds at least what its page holds, should the page leave.
-- A state is published only on a Full tail (`Cache::stateTailFull`), which a
-  command leaves where it computed or held the tail in its window; the engine
-  counts one it refuses as a failed publication. A start takes back a
-  persistent restore point only with Full copies of its tail.
-- Each cut of a request's page table checks that every page from the window
-  before its published blocks on is Full, always (`Cache::cutPageTable`).
-- A KV slot holds what its page holds when it is written, takes that much
-  of the SSD cache's quota ([disk tier](#disk-tier)), and its record names
-  the form (`KvSlotLabel`); a restore allocates that form. A restore point
-  persists its tail Full, as RAM holds it.
-
-So no byte a kernel reads changes: a run with trimming off
-(`--kv-window-trim off`, the native argument validation passes) emits the
-same tokens and logits wherever memory lets it cache what a run with
-trimming on caches, only taking the memory of Full pages. The memory plan
-counts on trimming, with it off too, so a validation run keeps within what
-Full pages hold: one request's KV capacity is the Full pages its lane keeps,
-its window's, the pages a command writes (a chunk, or a group of four where
-the routed experts stream) and one more (`kvWindowFloorPages`), in whole Full
-extents, and the pages of as many whole Slim extents as the rest holds, since an
-extent holds pages of one form; the pool's page ids cover the Slim pages the
-hard budget could hold. The budget can outlast the page ids: with every
-extent allocated the pool refuses a page as the budget does
-(`KvPool::growExtent`), and the claim's need of pages in place takes cached
-pages, which hold ids. A Full shortfall takes trims first, then, while the Slim
-pool has room for their tails, states, a checkpoint first, each followed by a
-trim of the tail it unpinned, while those trims free pages, before any KV leaf
-goes (`Cache::peek`, `Cache::take`). At the memory wall, where the Slim runway
-cannot refill, no state goes for its tail, and the victims go as without a
-window, dead leaves before ordinary states. A state the SSD cache keeps unpins
-nothing. Empty Slim extents beyond the runway go for the retry to grow by.
-
-That walk is a page need's (`Cache::trims`). A KV target the budget refuses
-lacks an extent's bytes with its pages in place, a device walk, which trims
-nothing and takes a state only for its buffers; in either walk a state with a
-copy on the SSD keeps its entry, and so its tail. The cache therefore gives up
-the tails behind the lanes itself, where the budget refuses
-(`Cache::trimWindows`); a refusal of the host's, which a wait lifts, takes
-none. A lane's target refused Full pages (`Cache::ensureTokens`) first
-releases the tails that hold the pages it takes and an extent's more, before
-anything else cached goes, and trims them. A Slim runway that cannot refill
-releases those that leave an extent's Full pages free, while the runway still
-holds pages to trim them into. A Full extent the trims leave free then leaves
-(`Cache::compactExtent`) and pays for the Slim extents of the rest and the
-runway's, six for one on Inkling-2-Mini's layout, but only while the Full pool
-holds more than the lanes' floors (`CacheWindowPolicy::floorPages`): each
-refusal brings a pool that tails fattened an extent nearer the plan's shape,
-and a pool at that shape, a long prompt's between its commands, keeps its
-extents as before. The tails that stay, a head's, a lane's newest and those of
-states in use, are Full pages the plan's floor does not count.
+- Counts on each block the RAM copies whose tail holds it and, apart, the
+  disk copies (`KvCache::countRamState`, `countDiskState`, bounded walks;
+  `kv.window.pinned_blocks` reports the blocks a tail holds and
+  `window_units` those that hold a unit). A resident block that comes to
+  need its unit takes it, from the lane that publishes or promotes the
+  state; one that needs it no longer gives it up once no transfer moves it.
+- Publishes a state only where each block of its tail holds its unit or
+  takes, in the same step, the unit of the publishing lane, which holds the
+  block's base page with the unit's pages in its tables: a base page and
+  its unit are written and taken together. The units go with the
+  publication down to the pins (`Cache::stateTailPresent`, `tailUnits`,
+  `KvCache::countState`; `kv.window.refused_states` counts the states
+  refused). A unit whose last pin leaves inside a publication is given up
+  as it ends (`KvCache::DeferredReleases`): a publication to the SSD makes
+  room for its write before it pins its tail.
+- Lets a lane's command read its window: at each cut the lane lets go of
+  the units of the blocks its window has passed, `windowPages` blocks before
+  its published blocks end, one step a block, each table entry absent before
+  its pages go (`Cache::cutPageTable`, `kv::kAbsentPage`). A lane that resumes
+  at a state holds the units of that state's tail and none before it.
+- Gives a block the page of a writer that computes it again, once no
+  transfer moves the block's (`KvCache::insert`, `kv.window.upgrades`),
+  rather than moving the writer onto the block's page as a writer of another
+  layout does: K/V another command computed can differ in its last bits, and
+  the writer's later rows' windows read the page beside its own command's.
+  Requests that hold the old page keep it until they let it go, and the
+  block's copy stays as one of another command's K/V.
+- Releases states for their tails' units in the walk's Tails phase, after
+  the checkpoints, the dead leaves and the history that leaves with no write:
+  superseded history of any tier, then the points behind the running lanes
+  but each lane's newest, by recency (`Cache::nextTailRelease`), each only
+  where its release helps free a unit no lane holds. Every claim's walk
+  reaches them: a lane's plan prices no tails, so a lane at the wall reaches
+  its plan's length only by the tails behind it (1.7.3's #824/#842 rule).
+  Each release takes its state in the one release mode
+  ([above](#replay-points-and-checkpoints)), which only a walk that writes
+  and waits takes where it writes. A point on the SSD alone whose tail holds
+  a unit leaves for it, with its copy, where its copy does not stay
+  (`Cache::copyStays`): history, and every point where the tier takes no
+  writes; else its units go as a reclaim writes their window parts
+  (`Unit::Unwritten`, `KvCache::unwrittenUnit`), or with those points where
+  the tier cannot take the write. What a release frees is what its count
+  counts (`KvCache::freedBy`).
+- Keeps states as it does for every layout (`Cache::superseded`): a state is
+  history once, down each path below it, the nearest ordinary state a later
+  request went on from is the only one, past which a later turn resumes. Such
+  a state counts only if a request went on from it: an ordinary state lies
+  below it, a running request's chain reaches it, or it is a head; a
+  finished request's last point alone supersedes nothing, as that request
+  may be a side question, a retry or an edit. Two such states are
+  conversations that part below it, and a running request that has reached
+  none still resumes from it: either keeps it. A reply's end no prompt has
+  rendered through supersedes nothing and keeps its prompt's replay point,
+  where a repeated turn resumes; it is history itself once a prompt left its
+  reply another way, by a block a prefill published beside one of the
+  reply's (in the block the reply shares with its prompt,
+  `Cache::noteReplyStart`, one that holds the prompt's tokens too). A
+  prompt's head (`Cache::noteHead`) is history only behind a deeper head
+  alone, a system message that grew, and on a persistent tier a point a
+  restart takes back only behind a point whose copies landed whole.
+- Writes a block's copy from its pages in parts, each in a file of its own:
+  its base part, the layers no window bounds from its base page, and its
+  window part, the windowed layers from its window unit's pages without the
+  slots that pad it (`kv::SlotFormat`, `kv::Component`). A copy holds what
+  its block holds: a block without its unit is written its base part alone,
+  one with it both, and a copy whose block gains a unit gains its window
+  part (`Cache::copyParts`); a window part outlives its unit, and one no
+  state's disk copy needs is the first copy a full quota gives up. A copy
+  ahead writes a point's state and its chain's base parts, and on a
+  persistent tier, whose restart needs them, its tail's window parts: a
+  durable point has landed once all three have (`Cache::pointLanded`), and
+  the one before it stays a point until then. A restore reads each
+  disk-only block's base part, and the window parts of the resumed state's
+  tail, a resident block's into the lane's own unit pages
+  (`Cache::startUnitRead`), which the block takes if a RAM copy's tail comes
+  to hold it. Each part has its own slot, bytes of
+  the quota and of the write budget, and presence. Both parts' labels carry
+  the block and a serial no other copy has, a part added later its copy's
+  (`KvSlotLabel`), by which a start pairs them; a window part alone, which a
+  crash before its base part landed leaves, stays behind, and so does a
+  state whose tail holds a block without its window part; a window part no
+  state taken back needs is given up.
 
 ## Disk tier
 
@@ -3225,7 +3477,22 @@ RAM and disk copies share the same block tree and recency order. Restoring a
 prefix keeps its disk copy, so its next eviction needs no write while that copy
 remains cached. The KV tier takes no Metal memory. The state staging buffer,
 one state, is a buffer of the backend's like every other: resident, and set
-aside by the memory plan within `--max-memory` when the tier starts. A quota too
+aside by the memory plan within `--max-memory` when the tier starts. It is
+held only while the tier takes cache writes (`QwenStateStorage::stagingState`,
+the model pool `state_staging`): once a spent write budget, a file that stopped
+taking writes or a limit below a state's slot closes the tier, its cap falls to
+zero and the ledger's next control pass gives it back (a pool holds nothing
+above its cap), once no write reads it, so states and KV take its memory as
+with no tier and a spent budget costs state memory nothing. Staged writes (an
+evicted state's offload, a state written from its lane) need it, and none
+starts without it, so an evicted state then leaves as with no tier; a write in
+place (`CompositeState::persist`) needs none. When the tier
+takes writes again the ledger's growth takes it back as it regrows any pool,
+from free room or from cached units that free now with no write, a quiet period
+after the last request went short of memory; refused, it stays out and the
+tier stages nothing until a later pass. On the 35B at a 36 GB studio the
+staging is 19.6 MiB, the third state buffer two conversations taking turns
+need. A quota too
 small for one state leaves the tier disabled and sets nothing aside, and so
 does the automatic quota where the plan has no room for the staging beside the
 model and the requested context, so a start the staging would fail goes on
@@ -3298,37 +3565,54 @@ The write budget, set only by `--max-cache-disk-writes`
 disk budget, counted at submission in the host pages each write of either
 file stores. Without it the bucket has no rate and admits every write, so nothing
 below is ever held back. It is the process's: each start begins with a
-quarter of a day's. It decides which states are written, and nothing else: one gate on the engine thread, the state file writable, its
-limit holding a slot and the budget admitting the state's class (a state in
-use passes), is read only by the state's admission probes
-(`CompositeState::canOffload`, `Model::canSnapshotToDisk`), never by a
-reservation, an acquire or a write, so a write the engine admitted is never
-refused for it. KV is demoted only for a chain a state on the SSD needs, and
-copied ahead only for a restore point whose state was written, so those writes
-pass the budget: a state the budget let through keeps its chain, and what a
-chain costs comes out of later states' share. The budget therefore paces the
-writes rather than bounding them: writes of states in use and of KV pass it,
-and every start begins with a quarter of a day's.
-While the budget is spent an evicted state is dropped, and `Cache::persist`
-reports the tier busy before it writes anything of a point; once the budget
-admits the point's state, the state is written first and the pages of its
-chain after it. It refuses a point for a file that stopped taking writes, or
-one larger than the room it may take (below). The budget refills on the awake
-clock the native loop schedules its wake-ups on, and write-behind wakes when
-the budget has room again.
+quarter of a day's. It is a cap on the cache's writes: one gate on the
+engine thread (`DiskBudget::admits`), open until a write overdraws the
+balance and then closed until the balance is back at an eighth of the burst
+(`kReopenShare`, 45 minutes of refill at any budget), so that a spent budget
+is a read-only spell that reopens with writes worth making rather than one
+write each time the refill brings the balance back to zero. It is read by
+`Cache::takesCacheWrites` before every KV write the cache starts, a demotion,
+a window part's write or a restore point's copy, and by the state's admission
+probes (`CompositeState::canOffload` and
+`canPersist`, `Model::canSnapshotToDisk`), never by a reservation, an acquire or a write, so
+a write the engine admitted is never refused for it, and the cache overdraws
+the budget by one write at most. While it is spent the tier takes no cache
+write, whatever the state's class or use: the cache keeps to memory as it
+does with a file that stopped taking writes, so an evicted state is dropped, a
+leaf a state on the SSD needs is not demoted and goes with the disk subtree
+that needs it, a unit kept for the window part of a point on the SSD goes
+with that point, and `Cache::persist` reports the tier busy, before it writes
+anything of a point and before each page of its chain; it refuses a point for
+a file that stopped taking writes, or one larger than the room it may take
+(below). Copies on the SSD stay readable. Only a Spill request's writes pass, which its admission paid for
+(`admitsSpill`). The budget refills on the awake clock the native loop
+schedules its wake-ups on, and write-behind wakes when the budget has room
+again; a clean stop refuses the points left while it is spent.
 
 Restore points get their copies ahead of need (`WriteBehind`,
 `Cache::persist`), so that a reclaim later frees a cached conversation at once
 rather than waiting for its writes: an ordinary state published or reused at
-least 2048 tokens deep, 10 s after its publication, unless an ordinary state on
-its only branch below supersedes it by then, its conversation having gone on;
-a persistent tier copies a head's state while it stays ordinary, as new
-conversations start from it whether or not its own went on.
-Its state is written from its own buffers, which stay in RAM, out of every
-eviction order until the write lands, and then the pages of its chain that have
-no copy, root first, at most a quarter of the KV writes in flight
-(`WriteClass::Persist`). Points are copied one at a time, in publication order,
-those that wait passed over.
+least 2048 tokens deep. A temporary tier copies one 10 s after its
+publication, unless an ordinary state on its only branch below supersedes it by
+then, its conversation having gone on. A persistent tier copies by progress: a
+point falls due at once when it is 2048 tokens deeper than the deepest point of
+its chain a restart would take back or being copied (`Cache::deepestTakenBack`,
+found again when that one is gone, a point lands or a copy its chain holds is
+given up or lost, `Cache::takeBrokenCopies`), and its copy goes on
+though its conversation does, its chain being a prefix of the next point's.
+A crash then loses what lies past the last point whose copy landed: at most
+2048 tokens and a turn while nothing waits, up to twice that during a copy (the
+point being copied is a base before it lands), and more while copies wait for
+the write budget or the tier. A point short of a stride waits for a clean stop,
+the queue keeping only those still newest; 1.7.3 copied an idle conversation's
+newest point after 10 s, so a crash after a pause now loses up to 2048 tokens. It copies a head's state at once while
+it stays ordinary, as new conversations start from it whether or not its own
+went on.
+The pages of its chain that have no copy are written first, root first, at
+most a quarter of the KV writes in flight (`WriteClass::Persist`), and its
+state last, once every page's copy is under way, from its own buffers, which
+stay in RAM, out of every eviction order until the write lands. Points are
+copied one at a time, in publication order, those that wait passed over.
 Nothing else is copied ahead, as each costs more to write than to lose: the KV
 past a point, which no state restores through and a reclaim drops first, a
 shorter point, which recomputes in less time than its state takes to write, and
@@ -3366,24 +3650,40 @@ queued points their conversations went on from or that are gone
 superseded points. There a point also waits while it is in use, as its request
 holds its chain and may go on from it, and its copies take only the room the
 quota has free beside the other copies and the commitments of Spill requests,
-giving up no copy: the redundant copies a full quota gives up first hold what
+giving up no copy: the redundant copies a full quota gives up hold what
 reclaims take before such a point, and the only copies what RAM no longer
 holds, while the point may never leave RAM. A point that room cannot hold is
 refused, and once the quota is full a reclaim writes what it takes, as for any
-victim without a copy, giving up redundant copies, those made ahead among them,
-first. A persistent tier copies every point, whether memory has run short or
-not and in use too, so that a start after a crash takes it back, gives up the
-oldest point for it (below), and refuses one larger than its limit, counting
+victim without a copy, in the one replacement order below. A persistent tier copies its points, whether memory has run short or
+not and in use too, so that a start after a crash takes them back, makes room
+for it only from what is worth less than a copy of what memory holds: window
+parts no point needs, copies no state needs and history, never another
+resident conversation's point nor an only copy (`nextDiskReplacement`'s
+`ahead`). A point that finds no such room is refused and asks again at its
+next stride; had it taken a resident conversation's point, that
+conversation's next stride would have copied its chain again whole and taken
+another's, so that conversations taking turns at a full quota rewrote each
+other's chains without end (on Inkling-2-Mini at a 7G quota 96 % of the pages
+copied ahead had been copied before). `Cache::persist` copies the chain first
+and the state last, so a refused point leaves no state copy, only copies of
+resident K/V that its next attempt goes on from, and an attempt that finds no
+room writes nothing. A conversation whose point is refused keeps its older
+point, or none, until there is room, which the console says once
+(`quotaFullAhead_`). It
+refuses one larger than its limit, counting
 each of its copies at what its slot takes, those still to write by what their
 pages hold (`Cache::pointFits`). A clean stop writes a persistent tier's
-waiting points, the newest first, then gives up the KV copies no state needs
-(`Cache::closePersistentTier`), which the next start would leave behind, for
+waiting points, the newest first, for up to 6 s (`supervision::kFlush`), then
+gives up the KV copies no state needs and the window parts no point's tail
+holds (`Cache::closePersistentTier`), which the next start would leave behind, for
 up to 2 s (`supervision::kDrain`: none goes and no punch starts past it, which
 `SlotFile::seal` holds the file's worker to; the next start frees those
-left): the blocks a Spill request wrote through past its
-point, and what is left of the chain of a point the full quota gave up, whose
-copies go only as later writes need room. A temporary tier's copies go with
-the process.
+left): the blocks a Spill request wrote through past its point, and what is
+left of the chain of a point the full quota gave up. The copies under a state
+only memory held, a refused point's chain among them and the chain of a point
+whose state the 6 s did not reach, go only as later writes need room, and
+after a stop the next start leaves them behind. A temporary tier's copies go
+with the process.
 
 Otherwise writes happen when RAM reclamation selects a victim without a copy.
 States copy through one staging buffer, freeing their RAM immediately. KV
@@ -3394,12 +3694,9 @@ request's prompt past the chain it restored, so leaves RAM one write at a time,
 and an allocation refused meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
 copies below them. Writes run on their file's IO worker. A KV page's slot
-holds what the page holds as it is written: a Slim page's is the first part of a
-Full page's payload, its regions in their order, and the block keeps the form of
-its copy (`KvCache::copyForm`), which a restore of the block allocates its page
-in. A KV page is restored by the engine's SSD readers (`SsdReaders`), which read
-what the page's form holds, its index alone, a Slim page's payload or the whole
-page, with one aligned read into memory of their own, and scatter it into the
+holds the page's K/V and index as it is written, its regions in their order. A
+KV page is restored by the engine's SSD readers (`SsdReaders`), which read what
+the page's form holds, its index alone or the whole page, with one aligned read into memory of their own, and scatter it into the
 page; the restores asked for between two submissions (`KvTier::submitRestores`)
 go out together, index restores on every reader and whole ones on at most
 `KvPageTier::kWholeRestoreReaders`. A state is restored on its file's worker.
@@ -3421,30 +3718,37 @@ point takes the slot of the oldest by writing that one out, and goes
 unpublished while the staging buffer is busy.
 Rolling checkpoints replace the least recently used copies like any state, so
 a suspended request keeps its progress when the quota is full; they retire when
-replaced; a prompt's last stays. Matched KV restores start from the root toward
+replaced; a prompt's last stays. A refused restore waits and retries as any
+queued start does, its prefix kept, and can end at the resource wait's limit
+rather than start cold; a lone start gives its state's lease up only when
+nothing else can free memory (`Engine::judge` fails), and its start then
+restores what the cache still holds and reports a state its claim took as
+lost. Matched KV restores start from the root toward
 the selected state, in that order as the tier takes them, with the state read
 alongside. Cancellation drops unsubmitted, unshared reads; submitted transfers
 drain before their buffers can be reused. Restored states remain usable even
 when there is no room to promote them into RAM cache. Promotion takes only the
 RAM of a state that keeps a disk copy.
 
-Two files share one quota for live slots, one of KV pages and one of states.
-With `--persistent-cache` they are `kv.slots` and `state.slots` in the cache's
-directory, each beside a file of its slots' records, and stay for the next
-start. Otherwise, or when another process holds that directory or it cannot be
+Two files share one quota for live slots, one of KV copies' base parts and
+one of states, and a layout with a sliding window has a third, of its copies'
+window parts.
+With `--persistent-cache` they are `kv.slots`, `kv-window.slots` and
+`state.slots` in the cache's directory, each beside a file of its slots'
+records, and stay for the next start. Otherwise, or when another process holds that directory or it cannot be
 used, they are temporary (`$TMPDIR/splash-cache-*`), unlinked as they are
 created and gone when the engine exits. A file's slots are all the size of its
-largest payload, a state or a Full page, each at its index times that size, and
-a slot is acquired for the payload it will hold and counts what it keeps on the
-volume (`SlotFile::quotaBytesFor`): the payload's host pages, which are what
-its write stores and what the write budget charges, so a Slim page's slot
-counts 464 KiB of Flint's 1.59 MiB and the quota holds 3.5 times the Slim
-pages it holds Full ones. The rest of the slot stays a hole, so a file's
-length can pass the quota while its blocks stay within it. The volume does
-not leave it one by itself: APFS allocates the gap before a write that lands
-past what the file held (gaps of 1 to 16 MiB were filled, one of 32 MiB was
-not: 256 payloads of 462 KiB in such slots took 407 MiB, and 116 MiB only once
-each slot had been freed and written again), so a write past the end of what
+payload in host pages, a state, a block's base part or its window part, each at
+its index times that size, and a slot is acquired for the payload it will hold
+and counts what it keeps on the volume (`SlotFile::quotaBytesFor`): the
+payload's host pages, which are what its write stores and what the write budget
+charges. A freed slot stays a hole (below), so a file's length can pass the
+quota while its blocks stay within it. The volume does not leave a hole by
+itself: APFS allocates the gap before a write that lands past what the file
+held (gaps of 1 to 16 MiB were filled, one of 32 MiB was not: on 1.7.3, whose
+KV slots each held a whole page's room, 256 payloads of 462 KiB, pages past
+every window, took 407 MiB, and 116 MiB only once each slot had been freed and
+written again), so a write past the end of what
 the file's slots hold returns the hole before it
 (`SlotFile::Backing::stored`, one `F_PUNCHHOLE`, 14 to 43 us). Nor does it
 keep a hole at the file's end: a write into one has all of it allocated up to
@@ -3455,8 +3759,9 @@ slot's extents on the volume are its payload's host pages, slot by slot: in a
 3,202,039,808 bytes of the KV file in 8,175 extents, as many as its slots
 count. The file's `st_blocks` ran 0.5% above that, and all of the difference
 lay past the file's end, where the cache writes nothing. APFS allocates ahead
-of a file that grows by writes spread over time: Slim pages written into new
-slots 60 ms apart, each past the end, kept up to 11.3 MiB beyond it, and
+of a file that grows by writes spread over time: on 1.7.3, payloads of 462 KiB
+written into new slots 60 ms apart, each past the end, kept up to 11.3 MiB
+beyond it, and
 appends of 1 MiB 100 ms apart 768 KiB. It keeps those blocks after the file
 closes until it drops them on its own; a truncation to the file's own length
 or an `fsync` leaves them, cloning the file drops them. In that cache they
@@ -3474,22 +3779,48 @@ follows how the file grew. No slot holds them, so the quota does not count them
 and the cache cannot give them back; the limit's rule, which reads the files'
 blocks (`DiskSpace::measure`), counts them as the tier's, as it counts the
 records files (1.2 MiB beside the Flint cache's 3 GiB), which hold no slot
-either. A full
-quota of temporary files replaces the oldest
-redundant copy first, then the oldest sole copy, across both
-KV and states; sole copies of states in use, and the KV they restore through,
-make room only for a copy that is itself in use, and last. A persistent tier
-keeps restore points whole instead, since its redundant copies are what the next
-start takes back: a full quota drops a KV copy that no state needs first, then
-the oldest state copy, redundant or not, after which the copies of its chain
-that no other state needs go first in turn. A state in RAM restores through the
-K/V RAM holds, not its copies: a copy of K/V that RAM holds too goes once no
-state on disk restores through it. The only copy of a state in use makes room
-only for a copy in use, and last. Either way the only copy of a unit of
-certain reuse, the newest resume point's state or a state or KV block on a
-chain a queued request will restore, makes room only for a Spill lane's
-active KV, since a running lane goes before a queued one; and an ordinary
-state that finds no other room is dropped. A claim's take finds a write's slot
+either.
+
+A full quota ranks each copy by what giving it up loses, alike on either
+tier, the oldest first within a rank by its conversation's last use
+(`Cache::freeDiskSpace`): 0, nothing: a window part no point needs, a KV copy
+no state in memory or on disk restores through; 1, a rewrite or a far go-back:
+history and the copies of what memory holds, state or KV, in one order; 2, a
+hit: a point's only copy, its state's, after which the KV on the SSD only that
+point restored through needs nothing (rank 0); 3, a request: the only copy of
+a state in use. A state on the SSD is history only where a deeper state of its
+chain supersedes it and holds an SSD copy itself. A write takes room only from
+what is worth less than what it writes, its worth the rank of what it writes
+and its last use (`Cache::writeWorth`): a persistent copy ahead from rank 0 and
+history; a demotion or a state's write of a point from ranks 0 and 1 and the
+points used before its own; a write sparse history makes of history, the
+state's and its window parts', from rank 0 and the rank-1 copies used before
+its own, never a point's only copy; a Spill lane's active KV, and the limit as
+it shrinks, from every point; a copy in use from rank 3 too. With nothing worth
+less left the write is refused and its item leaves without a copy. What a queued or running
+request restores from, the resume point and every block of a wanted chain are
+never given up for a copy; only a running lane's active KV takes them. A copy
+that holds the only window K/V of a point on the SSD is not redundant: it goes
+with its point. While redundant copies went before all history, their pages'
+rewrites were 51 to 68 % of a full temporary quota's writes on the dense
+models. A
+request's restore refreshes, root first and on either tier, each block of its
+chain that holds a copy and each state copy on it (`KvCache::refreshCopies`,
+`StateCache::refreshCopy`; a use otherwise touches only the tip, and an
+interior block kept the recency of its publication, so this order gave up
+every conversation's oldest-published root first and a demotion broke one
+point after another): the order then consumes the chain of the conversation
+used longest ago before it touches another's, and a head conversations share
+stays newest. It costs 0.17 ms for a chain of 3,100 blocks with copies and
+0.49 ms for 8,100 (M6), once per request; the leaf orders, which read the
+tip, and memory's orders of states are unchanged. Without the state copies'
+refresh a state copy kept its publication's recency while its chain's KV
+copies took each use's, so the state copies of every point were the oldest
+and one demotion gave them all up (on the release candidate, where a take
+reaches pages while states still have memory copies). A copy
+under a state in memory is never one no state needs, whether or not that state
+has a copy: it is the write memory saves when it lets the page go, and what
+the conversation's next point would otherwise write again. A claim's take finds a write's slot
 the same way, through the one replacement order (`Cache::nextDiskReplacement`):
 a full quota gives up the copies it may for the write, and the claim waits for
 the write. With no slot that way and no transfer in flight, the KV goes as with
@@ -3519,8 +3850,7 @@ runtime reports it once. The slot whose punch failed keeps its blocks, which
 them, the larger of the two, until a punch returns the range
 (`SlotFile::Backing::back`). A hole before a write past the file's end whose
 punch failed counts so too, each slot's range it lies in whole
-(`SlotFile::Backing::stored`). A quota of 16 Full slots then holds 16 Slim pages
-on 24.4 MiB of blocks, where on APFS it holds 56 on 25.4 MiB. The files keep
+(`SlotFile::Backing::stored`). The files keep
 the blocks of freed slots there, each up to its high-water mark, and the
 limit's rule counts them as the tier's.
 
@@ -3542,16 +3872,19 @@ one of each segment: the page's index, then each block's record. A state that
 fails it on its first read is a miss. Every read of a KV copy a restart took
 back checks the segments it covers: a whole or index restore that fails is a
 miss, and a block or history read that fails is `kv_unreadable` for the
-requests that read it. A KV record of a layout with a sliding window also names
-the form of the page its slot holds (`KvSlotLabel`), and a start takes back
-only the forms it restores. A slot it takes back counts what one acquired for
+requests that read it. A KV record of a layout with a sliding window also
+carries its copy's serial (`KvSlotLabel`), and a start takes a block back with
+its base part, and with a window part of the same copy, paired by the block's
+id and identity and that serial, where one landed; a state only where every
+block of its tail has one. A slot it takes back counts what one acquired for
 the record's payload does, and as adoption ends every block between one adopted
 payload's host pages and the next one's slot goes back to the volume
 (`SlotFile::finishAdoption`): the slots it leaves behind, and what a file
-whose writer returned no holes holds around its shorter payloads, so such a
-cache, each slot whole on the volume, is taken back as it is and shrinks to its
-payloads' pages at that start (96 slots, two in three Slim: 153 MiB before,
-80 MiB after, every payload matching its record).
+whose writer returned no holes holds around payloads shorter than its slots, so
+such a cache, each slot whole on the volume, is taken back as it is and shrinks
+to its payloads' pages at that start (a 1.7.3 cache of 96 slots, two in three
+of 462 KiB payloads in a whole page's room: 153 MiB before, 80 MiB after, every
+payload matching its record).
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
@@ -3564,10 +3897,22 @@ budget counts, the host pages of each write submitted, in the last 60 and
 under `state` (`disk_bytes`, `offloads`, `disk_hits`, `disk_promotions`). Cache
 counters include:
 
-- `kv_disk_hit_tokens`: tokens restored by completed KV transfers. Shared
+- `kv_disk_hit_tokens`: the pages completed KV transfers restored, 32 tokens
+  each, whether or not a request reused every token of a page. Shared
   transfers count once, including those completed before cancellation or a
   resource retry.
-- `lost_state_misses`: lookups that matched KV where a reusable state used to be.
+- `lost_state_misses`: lookups that matched KV where a reusable state used to be,
+  and starts that gave up a state whose prefix memory could not hold.
+- `prompt_tokens`, `reused_tokens` and `reused_disk_tokens`: the started
+  requests' prompt tokens, the tokens they resumed from, and of those the KV
+  only the SSD held when the lookup chose its chain (`Cache::diskOnlyTokens`);
+  `token_hit_rate` is the second over the first.
+- `reuse_ends`: starts by why their reuse stopped (`ReuseEnd`), decided from the
+  final lookup: no matched KV; matched KV past the state resumed from; a restore
+  that failed on an earlier attempt past where the start resumed; else the
+  prompt's end of the shared prefix. Whether the next block was one the quota
+  gave up is not known: a block whose only copy went is erased with no trace,
+  and `copiesGivenUp_` holds only blocks whose page stayed, which still match.
 - `probe_hashed_blocks`: KV pages hashed to rank waiting requests between
   commands. A waiting request's match is kept across passes and extended only
   past what the cache changed.

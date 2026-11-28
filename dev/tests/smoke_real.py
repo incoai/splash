@@ -1437,19 +1437,17 @@ def wait_for_timeout_cleanup(port: int, before: dict) -> None:
         )
         delta = {
             key: after["requests"][key] - before["requests"][key]
-            for key in ("submitted", "completed", "cancelled", "failed")
+            for key in ("submitted", "completed", "cancelled", "timed_out", "failed")
         }
+        # Whether the frontend's cancel or the native deadline finishes it, the
+        # engine counts a request its deadline ended timed out, and only so.
         require(
-            delta["submitted"] == 1 and delta["completed"] == 0,
-            f"unexpected scoring timeout outcome: {delta!r}",
+            delta["submitted"] == 1
+            and delta["completed"] == delta["cancelled"] == delta["failed"] == 0
+            and delta["timed_out"] in (0, 1),
+            f"score did not end timed out exactly once: {delta!r}",
         )
-        terminal = (delta["cancelled"], delta["failed"])
-        require(
-            terminal in ((0, 0), (1, 0), (0, 1)),
-            f"score did not terminate exactly once: {delta!r}",
-        )
-        # Frontend cancellation or the native deadline can finish first.
-        if terminal != (0, 0) and after["transport"]["pending"] == 0:
+        if delta["timed_out"] and after["transport"]["pending"] == 0:
             return
         require(time.monotonic() < limit, "scoring timeout cleanup did not finish")
         time.sleep(0.5)

@@ -2,6 +2,7 @@
 
 #include "metal/abi/Sampling.h"
 #include "ops/BufferExtent.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,7 +11,7 @@
 namespace splash::ops {
 namespace {
 
-constexpr uint32_t kShards = SPLASH_DRAFT_SAMPLING_SHARDS;
+constexpr uint32_t kMostShards = SPLASH_DRAFT_SAMPLING_MOST_SHARDS;
 constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
 // Each position's group scores its 16 x 16 edge table eight edges per
 // simdgroup task; eight simdgroups balance the seven-group B1 dispatch
@@ -19,7 +20,8 @@ constexpr uint32_t kEdgeThreads = 256;
 
 } // namespace
 
-DraftSelector::DraftSelector(uint32_t vocabulary) : vocabulary_(vocabulary) {
+DraftSelector::DraftSelector(uint32_t vocabulary, StopTokens stopTokens)
+    : vocabulary_(vocabulary), stopTokens_(stopTokens) {
   if (!vocabulary)
     throw std::invalid_argument("invalid draft selector vocabulary");
 }
@@ -28,32 +30,57 @@ DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
   if (!positions)
     throw std::invalid_argument("invalid draft selector workspace position count");
   const uint64_t candidates = uint64_t{positions} * SPLASH_DRAFT_CANDIDATES;
-  // The partial values are followed by each position's 16 x 16 edge table.
-  return {candidates * kShards * sizeof(uint32_t),
-          candidates * (kShards + SPLASH_DRAFT_CANDIDATES) * sizeof(float),
+  // Room for the most shards' partial values, then each position's 16 x 16
+  // edge table.
+  return {candidates * kMostShards * sizeof(uint32_t),
+          candidates * (kMostShards + SPLASH_DRAFT_CANDIDATES) * sizeof(float),
           candidates * sizeof(uint32_t), candidates * sizeof(float)};
 }
 
+uint32_t DraftSelector::shards(uint32_t lanes, uint32_t cores, uint32_t threadgroupsPerFourCores) {
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid draft selector batch");
+  if (!cores)
+    throw std::invalid_argument("a draft selector's shards are of a GPU's cores");
+  if (threadgroupsPerFourCores == kNever)
+    return kMostShards;
+  // The rows' share x = resident / rows; the power of two p nearest it in
+  // ratio, p / sqrt(2) <= x < p sqrt(2), doubles while x^2 >= 2 p^2.
+  const uint64_t resident = uint64_t{threadgroupsPerFourCores} * cores;
+  const uint64_t rows = uint64_t{4} * kPositions * lanes;
+  uint32_t shards = 2;
+  while (shards < kMostShards && resident * resident >= 2 * uint64_t{shards} * shards * rows * rows)
+    shards *= 2;
+  return shards;
+}
+
 void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-                        const DraftCodebooks &codebooks, DraftVocabulary vocabulary,
-                        std::span<const DraftTreeLane> lanes, float softcap) const {
+                        const DraftCodebooks &codebooks, DraftVocabulary vocabulary, uint32_t stride,
+                        std::span<const DraftTreeLane> lanes, uint32_t shards, float softcap) const {
   if (lanes.empty() || lanes.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
+  if (shards < 2 || shards > kMostShards || (shards & (shards - 1)))
+    throw std::invalid_argument("a draft selector's rows take a power of two of shards, 2 to its most");
   if (!(softcap >= 0.0F && std::isfinite(softcap)))
     throw std::invalid_argument("invalid draft selector softcap");
   if (vocabulary.leading > vocabulary.trailing || vocabulary.trailing > vocabulary_ || !vocabulary.columns(vocabulary_))
     throw std::invalid_argument("a draft's tokens lie in its vocabulary");
   const uint32_t count = static_cast<uint32_t>(lanes.size());
   const uint32_t columns = vocabulary.columns(vocabulary_);
+  if (stride < columns)
+    throw std::invalid_argument("a draft's logits rows hold its tokens' columns");
   SelectorBatchParams params{};
   params.lanes = count;
   params.vocabulary = vocabulary_;
   params.columns = columns;
+  params.stride = stride;
   params.leading = vocabulary.leading;
   params.trailing = vocabulary.trailing;
+  params.shards = shards;
   DraftTreeParams tree{};
   tree.lanes = count;
   tree.softcap = softcap;
+  std::ranges::copy(stopTokens_.ids, tree.stop_tokens);
   for (uint32_t lane = 0; lane < count; ++lane) {
     const DraftTreeLane &l = lanes[lane];
     // A tree's rows hold its anchor and every row's path below it, a verify
@@ -82,7 +109,7 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   const uint64_t queryRows = uint64_t{count} * SPLASH_DRAFT_QUERY_ROWS;
   const uint64_t codebook = uint64_t{vocabulary_} * SPLASH_DRAFT_SELECTOR_RANK * 2;
   const uint64_t treeRows = uint64_t{count} * SPLASH_TARGET_VERIFY_ROWS;
-  requireBytes(buffers.logits, queryRows * columns * sizeof(float), "draft logits");
+  requireBytes(buffers.logits, queryRows * stride * sizeof(float), "draft logits");
   requireBytes(buffers.partialIds, workspace.partialIdsBytes, "draft selector partial id");
   requireBytes(buffers.partialValues, workspace.partialValuesBytes, "draft selector partial value");
   requireBytes(buffers.candidates, workspace.candidatesBytes, "draft candidate");
@@ -104,7 +131,7 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   requireBytes(buffers.treeCaps, treeRows * sizeof(float), "draft tree cap");
   graph.add("draft_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            params, {uint64_t{count} * kPositions * kShards, 1, 1});
+            params, {uint64_t{count} * kPositions * shards, 1, 1});
   graph.add("draft_select_edges",
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,
@@ -139,7 +166,7 @@ void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const DraftSelecto
   graph.add("draft_verify_rows",
             {buffers.treeTokens, buffers.trees, buffers.treeScores, buffers.treeSizes, buffers.inputTokens,
              buffers.treeRows, buffers.laneRows, buffers.verifySources},
-            params, {1, 1, 1}, {1, 1, 1});
+            params, {1, 1, 1}, {SPLASH_VERIFY_ROWS_THREADS, 1, 1});
 }
 
 } // namespace splash::ops

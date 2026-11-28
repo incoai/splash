@@ -342,9 +342,8 @@ def read_projector(repo, name):
     float weight: it converts F32 and F16 only where every value is exact,
     as in an F16 projector made from a BF16 tower, where F16 rounds the
     smallest BF16 weights onto its subnormal grid and what that keeps is
-    still a BF16. A Q8_0 value, which few BF16s hold, is the one it rounds,
-    for the towers whose family takes Q8_0 projectors
-    (ModelFamily.projectors)."""
+    still a BF16. Q8_0 projections it keeps in Q8_0, for the towers whose
+    family takes Q8_0 projectors (ModelFamily.projectors)."""
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
     architecture = header.values.get("general.architecture")
@@ -717,6 +716,8 @@ def prepare(selection):
         installation=selection.link,
         installed=installed_commit,
     )
+    if installed_commit is None:
+        target = _cached_holding(selection, target)
     if installed is None and "manifest.json" in target.files:
         with hub.as_model_errors(f"cannot install {selection.model}"):
             manifest = models.read_json(target.file("manifest.json"))
@@ -724,6 +725,78 @@ def prepare(selection):
     if installed is not None and target.revision == installed_commit:
         return _start_installed(selection, target, installed)
     return _install_commit(selection, target, installed)
+
+
+def _cached_holding(selection, target):
+    """target, or, where it stands in from the Hub cache for the default
+    branch and lacks the GGUF selection's :VARIANT names, the newest cached
+    snapshot that holds that model whole, named in the log. The cache's
+    record of the branch can name a snapshot that holds only what an
+    interrupted download of the branch's new commit fetched (a projector of
+    1 GB of 17), while an older snapshot holds every file; offline, that one
+    installs. A snapshot holds the model when the target inspects from it,
+    its tower too unless the selection is text only, and it has each of the
+    target's files. A selection that names no variant never stands in on
+    another snapshot: whatever single GGUF that one holds is not what the
+    Hub would select. None holding the model: target stands where a
+    snapshot held its text, for the install to word what it lacks, and
+    otherwise the selection is refused, naming the commits looked at."""
+    if (
+        not target.unreachable_reason
+        or target.paths is None
+        or selection.revision is not None
+        or selection.variant is None
+    ):
+        return target
+    commits = list(dict.fromkeys([target.revision, *hub.cached_snapshots(target.name)]))
+    text_held = False
+    for commit in commits:
+        cached = (
+            target
+            if commit == target.revision
+            else hub.Repository.cached(
+                target.name,
+                commit,
+                unreachable_reason=target.unreachable_reason,
+                unreachable_kind=target.unreachable_kind,
+            )
+        )
+        with (
+            tempfile.TemporaryDirectory(prefix="splash-target-") as scratch,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            try:
+                inspected = inspect_target(
+                    cached, selection.variant, selection.language_only, Path(scratch)
+                )
+            except models.VisionError:
+                text_held = True
+                continue
+            except models.ModelError:
+                continue
+        if not set(inspected.files.values()) <= cached.files:
+            continue
+        if inspected.vision_note is not None and not selection.language_only:
+            # Its text, without the tower another snapshot may hold.
+            text_held = True
+            continue
+        if cached is not target:
+            print(
+                f"The Hub cache's {target.name}@{target.revision[:12]}, its "
+                f"record of the default branch, lacks {selection.model}; "
+                f"taking {commit}, the newest cached snapshot that holds it.",
+                flush=True,
+            )
+        return cached
+    if text_held:
+        return target
+    raise models.ModelError(
+        f"cannot install {selection.model}: could not reach the Hub "
+        f"({target.unreachable_reason}), and no cached commit of {target.name} "
+        f"holds :{selection.variant} whole (looked at "
+        f"{', '.join(commit[:12] for commit in commits)})",
+        kind=target.unreachable_kind,
+    )
 
 
 def remove(selection):
@@ -765,7 +838,12 @@ def _selections_of(selection):
     whose files nothing could delete once the model's row is gone. Its own
     comes last, so that a removal cut short can be asked for again."""
     links = []
-    if not (selection.revision or selection.language_only or selection.draft_model):
+    if not (
+        selection.revision
+        or selection.language_only
+        or selection.draft_model
+        or selection.draft_revision
+    ):
         links = [
             link
             for link in models.selection_links(selection.models_root)
@@ -1041,6 +1119,103 @@ def assembly_record(model, target, repo, draft, installed=None):
     return record
 
 
+def _weights_auto_changes(target_format, files):
+    """Whether --weights auto loads any weight of an assembly's target in
+    another format than the default does, as the engine plans the target's
+    files under each (its model check, given them): what the app offers the
+    option by. files maps each assembly path to its file. None where the
+    engine does not say, of a target it refuses when it loads it."""
+    with tempfile.TemporaryDirectory(prefix="splash-weights-") as scratch:
+        try:
+            for name, path in files.items():
+                if name.startswith("target/"):
+                    link = Path(scratch) / name
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(Path(path).absolute())
+            arguments = ["model-check", target_format, "none"]
+            arguments += [str(Path(files["config.json"]).absolute())]
+            arguments += [str(Path(scratch) / "target")]
+            checked = json.loads(models.run_engine(arguments, "model check"))
+        except (models.ModelError, OSError, KeyError):
+            return None
+    return checked.get("quantizable_weights")
+
+
+def _reasoning(family, files):
+    """What the model's own chat template makes of the reasoning efforts, as
+    its server reports it at /v1/models before any option changes it
+    (chat_templates.tokenizer_reasoning): whether it thinks unasked, the
+    efforts it renders differently, and the one it renders unasked. The app
+    offers Thinking's choices by it. files maps each assembly path to its
+    file; family names the model's. None where its tokenizer does not load
+    or its template does not render, which a start refuses."""
+    # Imported here: it takes Jinja, and transformers once it is asked, whose
+    # warnings a start silences too (launcher.py).
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    from server import chat_templates
+
+    with tempfile.TemporaryDirectory(prefix="splash-tokenizer-") as scratch:
+        try:
+            for name, path in files.items():
+                if name.startswith("tokenizer/"):
+                    link = Path(scratch) / name
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(Path(path).absolute())
+            return chat_templates.tokenizer_reasoning(
+                Path(scratch) / "tokenizer", families.named(family).chat_format
+            )
+        except Exception:  # a tokenizer's parsers raise what they like
+            return None
+
+
+# What the app offers a model's options by, which publish records.
+OPTION_KEYS = {"quantizable_weights", "reasoning"}
+
+
+def bring_records_current(models_root, first=None):
+    """Give each installation under models_root whose record lacks what the
+    app offers its options by (OPTION_KEYS: one made before 1.7.4) that
+    record, without the Hub or a start: its assembly published again as it
+    is, its record saying besides what the engine and the tokenizer say
+    (_weights_auto_changes, _reasoning). The installations of the model
+    first, if any, come first; each answer is asked for outside the
+    installation lock, and its record is written under it. One whose
+    record has them, or whose files are gone or changed, is left as it is,
+    and so is one another installation replaced meanwhile. The desktop app
+    runs it as it launches (cached.py); a start does as much for the model
+    it starts (_changes)."""
+    models_root = Path(models_root).resolve()
+    stale = []
+    for link in models.selection_links(models_root):
+        with suppress(models.ModelError, OSError):
+            installed = assembly.verify(link)
+            if not OPTION_KEYS <= installed.keys():
+                stale.append((link, installed))
+    stale.sort(key=lambda found: found[1]["model"] != first)
+
+    def options(installed):
+        files = {name: Path(e["path"]) for name, e in installed["files"].items()}
+        return {
+            "quantizable_weights": _weights_auto_changes(
+                installed["target_format"], files
+            ),
+            "reasoning": _reasoning(installed["family"], files),
+        }
+
+    for link, installed in stale:
+        with suppress(models.ModelError, OSError):
+            said = options(installed)
+            with models.installation_lock(models_root):
+                # Read again under the lock: another installation may have
+                # replaced it, and its files are checked as it is built.
+                if assembly.verify(link) != installed:
+                    continue
+                files = {n: Path(e["path"]) for n, e in installed["files"].items()}
+                published = assembly.build(models_root, installed | said, files)
+                models.link_selection(link, published)
+                assembly.collect_garbage(models_root, updating=True)
+
+
 def publish(models_root, link, record, files, *, keep_tower=False):
     """Publish the assembly of record and files (assembly path -> source
     file) at link, a selection link under models_root, and return it, or
@@ -1075,6 +1250,10 @@ def publish(models_root, link, record, files, *, keep_tower=False):
             )
             files = files | derived
             records |= _file_records(previous, derived.values())
+        record["quantizable_weights"] = _weights_auto_changes(
+            record["target_format"], files
+        )
+        record["reasoning"] = _reasoning(record["family"], files)
         record["files"] = {name: records[path] for name, path in sorted(files.items())}
         # A new installation requires its pins before it is published; its
         # older pins are retired once it is, in the repositories the
@@ -1115,7 +1294,8 @@ def _changes(installed, family, draft):
     """What a start changes in a verified assembly of the target's installed
     commit: the draft, when draft, as this start resolved it, is another
     repository or commit, or the GGUF metadata, when this release derives it
-    otherwise."""
+    otherwise, or what the app offers its options by (quantizable_weights,
+    reasoning), when its record lacks either."""
     if family is None:
         return [f"no supported family is named {installed['family']}"]
     changes = []
@@ -1130,15 +1310,21 @@ def _changes(installed, family, draft):
         "metadata"
     ] != assembly.metadata_key(installed["files"]):
         changes.append("the GGUF metadata adapter changed")
+    if not OPTION_KEYS <= installed.keys():
+        # An assembly made before 1.7.4: assembled again from its snapshots,
+        # its record says what the app offers of --weights and of Thinking.
+        changes.append("its record gains what the app offers its options by")
     return changes
 
 
 def _resolve_draft(family, selection, installed, target):
     """The draft's repository, --draft-model or else the family's DFlash2
-    release, at its default branch's commit: one Hub request, made only when
-    the Hub answered for the target. Otherwise, or when it cannot be
-    resolved, the installed draft stands in; without one, a commit the Hub
-    cache holds, else it fails with the target's reason and class."""
+    release, at the commit of --draft-revision or else of its default
+    branch: one Hub request, made only when the Hub answered for the target,
+    and none for a commit an installation of it records (Repository.resolve).
+    Otherwise, or when it cannot be resolved, the installed draft stands in;
+    without one, a commit the Hub cache holds, else it fails with the
+    target's reason and class."""
     name = selection.draft_model or family.draft_repo
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
@@ -1148,6 +1334,7 @@ def _resolve_draft(family, selection, installed, target):
     try:
         return hub.Repository.resolve(
             name,
+            selection.draft_revision,
             installation=selection.link,
             installed=commit,
             unreachable=None

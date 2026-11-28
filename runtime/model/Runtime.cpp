@@ -503,11 +503,14 @@ struct Runtime::Impl {
     uint64_t revision = 0;
   };
 
-  // A lane's GPU tables: its page table and, for a layout with a block
-  // index, its index table (ops::BlockIndex::tables), whose entries reach
-  // every page's index whatever its form.
+  // A lane's GPU tables: its page tables, one per page of a block
+  // (kv::Layout::blockPages), the base pages' first and then each window
+  // unit page's, of which a layer's dispatch binds the one of the page that
+  // holds it (kv::Layout::blockPage); and, for a layout with a block index,
+  // its index table (ops::BlockIndex::tables), whose entries reach every
+  // page's index whatever its form.
   struct LaneTables final {
-    MetalBuffer pages;
+    std::span<const MetalBuffer> pages;
     MetalBuffer index;
   };
 
@@ -515,10 +518,14 @@ struct Runtime::Impl {
   const LoadedModel &model;
   const RuntimeGeometry geometry;
   const ops::ExecutionPlans &operators;
+  // The target layout's relative attention variants (none: paged attention).
+  std::vector<ops::RelativeAttentionVariant> relativeAttention;
   kv::PageStorage &kvPages;
   QwenStateStorage &states;
   std::unique_ptr<PrefillArena> prefillArena;
   std::unique_ptr<DecodeArena> decodeArena;
+  // Each lane's page tables (LaneTables::pages), views of its PageTable.
+  std::vector<std::vector<MetalBuffer>> laneTableViews;
   // Every state lane's penalty words, bound whole: a batch lane reads the row
   // of its request's state lane, which need not be its own.
   MetalBuffer penaltyTable;
@@ -588,8 +595,9 @@ struct Runtime::Impl {
   // start measured a table, whose set replaces the kept one.
   bool warmedUp = false, measuredSteps = false;
   // The fewest rows of each class of a decode step's kernels, up to the most
-  // rows a step runs in one pass (ops::ExecutionPlans::decodeRowClasses).
-  std::vector<uint32_t> stepClasses;
+  // rows a step runs in one pass (ops::ExecutionPlans::decodeRowClasses),
+  // each lane count's, stepClasses[lanes - 1].
+  std::array<std::vector<uint32_t>, kLaneCount> stepClasses;
   // The fewest rows of each class of a prefill chunk's kernels
   // (ops::ExecutionPlans::prefillRowClasses).
   std::vector<uint32_t> prefillClasses;
@@ -707,9 +715,11 @@ struct Runtime::Impl {
     Impl &runtime_;
   };
 
-  // The model's elastic memories (Runtime::pools): the store's when its
-  // experts stream, the readers' hot blocks and staging when K/V spills, and
-  // the vision arena and embeddings when the model serves vision.
+  // The model's elastic memories (Runtime::pools): the SSD cache's state
+  // staging with a tier, the store's when its experts stream, the readers'
+  // hot blocks and staging when K/V spills, and the vision arena and
+  // embeddings when the model serves vision.
+  StateStagingPool stateStagingPool{states};
   std::optional<ExpertStorePool> expertPool;
   std::optional<HotBlocksPool> hotBlocksPool;
   StagingPool stagingPool{*this};
@@ -732,6 +742,9 @@ struct Runtime::Impl {
   // Whether a streamed-expert target's cycles plan a draft's block a lane
   // (RuntimeInstrumentation::planBlocks).
   bool blockPlans = false;
+  // A plain step's rows a lane, while decode cycles are plain steps
+  // (RuntimeInstrumentation::skipDraft).
+  std::optional<uint32_t> plainRows;
   // The captured rows of positions 0 .. replacedCaptureRows - 1 that every
   // prefill command's draft reads in place of those its target captured
   // (RuntimeInstrumentation::replaceCapturedRows).
@@ -771,7 +784,7 @@ struct Runtime::Impl {
                         },
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
-                   geometry.target.draftVocabulary, geometry.target.logitFinish()),
+                   geometry.target.draftVocabulary, geometry.target.logitFinish(), geometry.target.stopTokens),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
     if (states.layout() != model.stateLayout(states.layout().target.format, states.layout().target.cachedCodes) ||
@@ -781,6 +794,13 @@ struct Runtime::Impl {
     }
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
+    constexpr uint64_t tableBytes = uint64_t{kMaximumPageTableEntries} * sizeof(SplashKvPage);
+    for (uint32_t lane = 0; lane < geometry.target.lanes; ++lane) {
+      const MetalBuffer tables = decodeArena->get(lane, DecodeTensor::PageTable);
+      std::vector<MetalBuffer> &views = laneTableViews.emplace_back();
+      for (uint32_t page = 0; page < kvPages.layout().blockPages(); ++page)
+        views.push_back(backend.view(tables, page * tableBytes, tableBytes));
+    }
     penaltyTable =
         decodeArena->all(DecodeTensor::PenaltyState);
     // A decode step's classes, up to the rows a step runs in one pass: a
@@ -796,11 +816,17 @@ struct Runtime::Impl {
     mostStepRows = geometry.target.stepRows();
     if (model.expertStore())
       mostStepRows = std::min(mostStepRows, ExpertStore::cycleRows());
-    stepClasses = operators.decodeRowClasses(mostStepRows, moe);
+    const ops::DecodeRowKernels rowKernels = std::visit([](const auto &layout) {
+      return ops::DecodeRowKernels{.messageGates = layout.messageGates(),
+                                   .blockResidualMixes = layout.blockResidualMixes(),
+                                   .relativeAttention = !layout.relativeAttention().empty()};
+    }, geometry.layout);
+    for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes)
+      stepClasses[lanes - 1] = operators.decodeRowClasses(mostStepRows, moe, rowKernels, lanes);
     // A target whose layers attend through relative attention picks those
     // kernels by a chunk's rows too, in each variant its layout states
     // (QwenHybridLayout::relativeAttention), over its KV pages.
-    const std::vector<ops::RelativeAttentionVariant> relativeAttention = std::visit(
+    relativeAttention = std::visit(
         [](const auto &layout) {
           const auto variants = layout.relativeAttention();
           return std::vector<ops::RelativeAttentionVariant>(variants.begin(), variants.end());
@@ -817,7 +843,10 @@ struct Runtime::Impl {
         // page 5 (Runtime::measureDecodeSteps): the most points today, a MoE
         // target's 14, take 37 of four lanes' 64 pages and 69 of eight
         // lanes' 128 (ExecutionLimits::runwayPages).
-        stepCosts->requireRunway(5, ExecutionLimits::runwayPages(value.kvPages.extentPages(), geometry.target.lanes),
+        stepCosts->requireRunway(5,
+                                 ExecutionLimits::runwayPages(value.kvPages.extentPages(), geometry.target.lanes,
+                                                              value.kvPages.layout().blockPages()) /
+                                     value.kvPages.layout().blockPages(),
                                  geometry.target.lanes);
         for (uint32_t lanes = 1; lanes <= geometry.target.lanes; ++lanes) {
           const std::optional<std::string> line = value.recallStepCosts ? value.recallStepCosts(lanes) : std::nullopt;
@@ -832,6 +861,8 @@ struct Runtime::Impl {
     }
     rememberStepCosts = std::move(value.rememberStepCosts);
     forgetStepCosts = std::move(value.forgetStepCosts);
+    if (states.stagingState().currentBytes)
+      pools.push_back(&stateStagingPool);
     if (ExpertStore *store = model.expertStore())
       pools.push_back(&expertPool.emplace(*store));
     if (blockCache) {
@@ -1200,6 +1231,23 @@ struct Runtime::Impl {
     return admission;
   }
 
+  // Model::imageStartBytes: as activate() prices a start's images, with
+  // none held or encoded, an image that repeats counted once.
+  uint64_t imageStartBytes(const ModelRequest &request) const {
+    std::vector<ImageKey> seen;
+    uint64_t bytes = 0;
+    uint32_t encodePatches = 0;
+    for (const ImageSpan &span : request.images) {
+      if (span.end() <= request.restoredTokens || std::ranges::find(seen, imageKey(span)) != seen.end())
+        continue;
+      seen.push_back(imageKey(span));
+      bytes += alignUp(pixelBytes(span)) + alignUp(embeddingBytes(span));
+      encodePatches = std::max(encodePatches, span.gridHeight * span.gridWidth);
+    }
+    return encodePatches ? bytes + ops::ImageEncoder::scratchBytes(model.vision.tensors.layout, encodePatches)
+                         : bytes;
+  }
+
   // No image waits for its encode, so the vision arena can go.
   [[nodiscard]] bool visionIdle() const noexcept {
     return std::ranges::none_of(imageRows, [](const auto &entry) {
@@ -1265,8 +1313,7 @@ struct Runtime::Impl {
   }
 
   [[nodiscard]] LaneTables laneTables(uint32_t stateLane) const {
-    return {decodeArena->get(stateLane, DecodeTensor::PageTable),
-            decodeArena->get(stateLane, DecodeTensor::IndexTable)};
+    return {laneTableViews.at(stateLane), decodeArena->get(stateLane, DecodeTensor::IndexTable)};
   }
 
   [[nodiscard]] LaneTables synchronizedTables(Request &entry,
@@ -1279,6 +1326,10 @@ struct Runtime::Impl {
     }
     if (!item.pageTableRevision)
       throw std::invalid_argument("request page table has no revision");
+    if (item.windowTables.size() + 1 != kvPages.layout().blockPages() ||
+        std::ranges::any_of(item.windowTables,
+                            [&](const std::vector<uint32_t> &table) { return table.size() != item.pageTable.size(); }))
+      throw std::invalid_argument("request window tables do not match its blocks' window units");
     PageTableBinding &binding = pageTableBindings[entry.stateLane];
     const LaneTables tables = laneTables(entry.stateLane);
     // Rewrite only what changed since the tables were written: nothing at
@@ -1293,7 +1344,9 @@ struct Runtime::Impl {
         first = std::min(item.pageTableFirstChanged, size);
     }
     if (first < size) {
-      kvPages.writeEntries(item.pageTable, first, tables.pages);
+      kvPages.writeEntries(item.pageTable, first, tables.pages.front());
+      for (uint32_t table = 0; table < item.windowTables.size(); ++table)
+        kvPages.writeEntries(item.windowTables[table], first, tables.pages[1 + table]);
       if (tables.index)
         kvPages.writeIndexEntries(item.pageTable, first, tables.index);
     }
@@ -1339,7 +1392,7 @@ struct Runtime::Impl {
     return std::make_shared<SpilledKvReads>(
         spilledReader(historyStream), static_cast<uint32_t>(streamed - items.begin()), streamed->pageSources,
         static_cast<uint32_t>((end + kv::kPageTokens - 1) / kv::kPageTokens),
-        laneTables(request(streamed->requestId).stateLane).pages, kvPages.layers(),
+        laneTables(request(streamed->requestId).stateLane).pages.front(), kvPages.layers(),
         AttentionLayers{attentionLayersBefore(geometry.target, layers.first),
                         attentionLayersBefore(geometry.target, layers.end)});
   }
@@ -2088,7 +2141,7 @@ struct Runtime::Impl {
                                              .tokens = std::span(tokens).subspan(history),
                                              .request = std::move(request),
                                              .chunk = chunkParams(history, rows, pages),
-                                             .pageTable = tables.pages,
+                                             .pageTables = tables.pages,
                                              .indexTable = tables.index,
                                              .convolutionIn = in.convolutionLayers,
                                              .convolutionOut = out.convolutionLayers,
@@ -2108,8 +2161,9 @@ struct Runtime::Impl {
   // and lane cap, each lane after the longest history the target serves
   // before a lane's most rows, without running them
   // (Runtime::warmupDecodeBatch). The lanes' inputs are prepared for that
-  // history; the next decode prepares its own.
-  void prepareLongestVerify(std::span<Request *const> entries) {
+  // history; the next decode prepares its own. With `ownTapes`, each lane
+  // its own GDN tape slots (encodeTargetDecodeForward): lanes of one request.
+  void prepareLongestVerify(std::span<Request *const> entries, bool ownTapes = false) {
     const uint32_t history = geometry.target.contextTokens() - kDecodeRows;
     const std::vector<uint32_t> tokens(history);
     const std::vector<uint32_t> pages((history + kDecodeRows + kv::kPageTokens - 1) / kv::kPageTokens);
@@ -2120,25 +2174,92 @@ struct Runtime::Impl {
       targetModel->prepareVerifyLane(lane, history, request);
       items[lane] = {.requestId = entries[lane]->id, .logicalPosition = history, .pageTable = pages};
     }
-    // A step of each class's last rows (ops::ExecutionPlans::
-    // decodeRowClasses, and a draft's block a lane) up to mostStepRows at
-    // each lane cap that holds them: every kernel a step of any rows and cap
-    // within mostStepRows runs, so that no cycle --verify-rows auto chooses
-    // creates one while serving.
-    const auto lanes = static_cast<uint32_t>(entries.size());
+    for (const ops::StepRows &step : preparedSteps(static_cast<uint32_t>(entries.size()))) {
+      SpilledKvReads reads;
+      // Never run: its ops add their plans' alternates too.
+      CommandGraph graph;
+      graph.prepareAlternates();
+      encodeTargetDecodeForward(graph, entries, items, step, reads, ownTapes);
+      backend.preparePipelines(graph.dispatches());
+    }
+  }
+
+  // The steps of `lanes` lanes whose kernels the start creates: a step of
+  // each class's last rows (ops::ExecutionPlans::decodeRowClasses, and a
+  // draft's block a lane) up to mostStepRows at each lane cap that holds
+  // them, every kernel a step of any rows and cap within mostStepRows runs,
+  // so that no cycle --verify-rows auto chooses creates one while serving.
+  [[nodiscard]] std::vector<ops::StepRows> preparedSteps(uint32_t lanes) const {
     const uint32_t most = std::min(mostStepRows, lanes * kDecodeRows);
     std::vector<ops::StepRows> steps;
     for (uint32_t rows = lanes; rows <= most; ++rows)
-      if (rows == most || rows == lanes * kDraftRows || std::ranges::binary_search(stepClasses, rows + 1))
+      if (rows == most || rows == lanes * kDraftRows || std::ranges::binary_search(stepClasses[lanes - 1], rows + 1))
         for (const uint32_t cap : {kDraftRows, kDecodeRows})
           if (rows <= lanes * cap)
             steps.push_back({lanes, rows, cap});
-    for (const ops::StepRows &step : steps) {
-      SpilledKvReads reads;
-      CommandGraph graph;
-      encodeTargetDecodeForward(graph, entries, items, step, reads);
-      backend.preparePipelines(graph.dispatches());
+    return steps;
+  }
+
+  // Creates the pipelines of every decode cycle of `entries`' lanes, the
+  // draft's part and the target's, at each of preparedSteps(lanes) after
+  // `items`' history, ready to decode, without running one: the steps a
+  // warmup's one cycle does not run, whose kernels a step's rows and lane cap
+  // pick (a 16-row cap's relative attention after a short history was created
+  // while serving after a start of --verify-rows all, 189 ms on a 24 GB M6).
+  // With `ownTapes` the lanes are one request's (Runtime::prepareDecodeBatch),
+  // whose buffers each binds, each with its own GDN tape slots
+  // (encodeTargetDecodeForward). The lanes' inputs are written for them; the
+  // next decode writes its own.
+  void prepareDecodeSteps(std::span<Request *const> entries, std::span<const ModelBatchItem> items, bool ownTapes) {
+    const auto width = static_cast<uint32_t>(entries.size());
+    std::array<uint64_t, kLaneCount> positions{};
+    std::array<uint32_t, kLaneCount> depths{}, retained{};
+    std::array<LaneProposals, kLaneCount> proposals{};
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      Request &entry = *entries[lane];
+      prepareDecodeLane(entry, items[lane], lane);
+      depths[lane] = kDecodeRows - 1;
+      proposals[lane] = proposeChain(entry, lane, samplingPolicy(entry), depths[lane]);
+      positions[lane] = items[lane].logicalPosition;
     }
+    for (const ops::StepRows &step : preparedSteps(width)) {
+      // Never run: their ops add their plans' alternates too.
+      CommandGraph draft, target;
+      draft.prepareAlternates();
+      target.prepareAlternates();
+      addRopeTables(draft, {}, 0, decodeArena->batchSlice(DecodeTensor::DraftPositions, width), width * kDecodeRows,
+                    {}, {}, decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
+                    decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
+      targetModel->addDraftEmbedding(draft, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, width),
+                                     decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width * kDraftRows);
+      draftModel.addMaskRows(draft, decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
+      encodeDraftBatchGraph(draft, entries, std::span(positions).first(width), std::span(depths).first(width),
+                            std::span(proposals).first(width), step, 0.0F);
+      backend.preparePipelines(draft.dispatches());
+      for (uint32_t lane = 0; lane < width; ++lane)
+        retained[lane] = std::min({entries[lane]->maxNewTokens - entries[lane]->generatedTokens, step.laneCap,
+                                   step.rows - (width - 1)});
+      SpilledKvReads reads;
+      encodeBatchVerifyInput(target, step, anchorPositions(entries, items));
+      encodeBatchEmbedding(target, DecodeTensor::InputTokens, decodeArena->lanesRows(TargetTensor::Hidden0, width),
+                           width, step.rows);
+      encodeTargetDecodeForward(target, entries, items, step, reads, ownTapes);
+      encodeVerifyCommit(target, entries, items, std::span(retained).first(width), step);
+      backend.preparePipelines(target.dispatches());
+    }
+  }
+
+  // Creates the pipelines of every decode cycle of `width` lanes after
+  // `item`'s history and after the longest (prepareLongestVerify) without
+  // running one and without the lanes' own state: every lane is `entry`
+  // (Runtime::prepareDecodeBatch).
+  void prepareDecodeWidth(Request &entry, const ModelBatchItem &item, uint32_t width) {
+    std::array<Request *, kLaneCount> requests{};
+    requests.fill(&entry);
+    const std::span<Request *const> entries(requests.data(), width);
+    const std::vector<ModelBatchItem> items(width, item);
+    prepareDecodeSteps(entries, items, true);
+    prepareLongestVerify(entries, true);
   }
 
   // Creates the pipelines of a decode cycle's state capture
@@ -2355,7 +2476,7 @@ struct Runtime::Impl {
         destination.tokens = part.inputTokens;
         destination.request = targetRequest(*sequence.entry);
         destination.chunk = sequence.chunk;
-        destination.pageTable = sequence.tables.pages;
+        destination.pageTables = sequence.tables.pages;
         destination.indexTable = sequence.tables.index;
         destination.convolutionIn = in.convolutionLayers;
         destination.convolutionOut = out.convolutionLayers;
@@ -2531,6 +2652,35 @@ struct Runtime::Impl {
   // its host chain (`proposals`), no deeper than depths[lane], and the rows
   // of the trees it verifies, the best by the acceptance model's estimates
   // that the step holds, none past an anchor estimated below `floor`.
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  // A plain step's rows (RuntimeInstrumentation::skipDraft): each lane's
+  // `rows` rows from row lane x rows, a chain that all hold its anchor, laid
+  // out as draft_verify_rows lays out a chain of the lane's tree (row d at
+  // depth d, its parent row d - 1, the rows before it its path); and the
+  // lane's tree of as many rows with no draw, which the verify's sampling and
+  // keepChances read.
+  void layOutAnchors(std::span<Request *const> entries, uint32_t rows) {
+    const auto width = static_cast<uint32_t>(entries.size());
+    auto *tokens = contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::InputTokens, width), "verify input tokens");
+    auto *tree = contents<SplashTreeRow>(decodeArena->batchSlice(DecodeTensor::TreeRows, width), "verify tree rows");
+    auto *sources = contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::VerifySources, width), "verify sources");
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      const uint32_t first = lane * rows;
+      for (uint32_t depth = 0; depth < rows; ++depth) {
+        tokens[first + depth] = *laneEntry(entries, lane).pendingToken;
+        tree[first + depth] = {(2u << depth) - 1u,
+                               static_cast<uint16_t>(depth ? depth - 1 : SPLASH_TREE_ROOT),
+                               static_cast<uint16_t>(depth)};
+        sources[first + depth] = depth;
+      }
+      *contents<ops::LaneRows>(decodeArena->get(lane, DecodeTensor::LaneLayout), "lane rows") = {first, rows};
+      *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeSizes), "draft tree size") = rows;
+      std::fill_n(contents<uint8_t>(decodeArena->get(lane, DecodeTensor::DraftTreeDraws), "draft tree draws"),
+                  rows * SPLASH_TREE_CHILDREN, uint8_t{0xff});
+    }
+  }
+#endif
+
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
@@ -2797,9 +2947,12 @@ struct Runtime::Impl {
   // (QwenTarget::addPrefill with a decode chunk), each lane a sequence of the
   // step's lane cap of rows at most, which the selector's layout places, its
   // head over every row.
+  // With `ownTapes` (prepareDecodeWidth's lanes, one request's) lane i
+  // takes the GDN tape slots of state lane i, which hold nothing while no
+  // step runs, so that no lane's tape overlaps another's.
   void encodeTargetDecodeForward(CommandGraph &graph, std::span<Request *const> entries,
                                  std::span<const ModelBatchItem> items, const ops::StepRows &step,
-                                 SpilledKvReads &reads) {
+                                 SpilledKvReads &reads, bool ownTapes = false) {
     if (entries.empty() || entries.size() > kLaneCount || entries.size() != items.size() ||
         step.lanes != entries.size())
       throw std::invalid_argument("invalid target decode step");
@@ -2825,12 +2978,13 @@ struct Runtime::Impl {
       decode.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
       if (lane >= lanes) continue;
       const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
-      decode.gdnTapeLanes[lane] = {decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity),
-                                   decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity ^ 1),
+      const uint32_t tapeLane = ownTapes ? lane : entry.stateLane;
+      decode.gdnTapeLanes[lane] = {decodeArena->gdnTapeSlot(tapeLane, metadata.activeParity),
+                                   decodeArena->gdnTapeSlot(tapeLane, metadata.activeParity ^ 1),
                                    metadata.pendingPath};
       sequences[lane] = {.lane = lane,
                          .chunk = chunkParams(items[lane].logicalPosition, step.laneCap, items[lane].pageTable),
-                         .pageTable = tables.pages,
+                         .pageTables = tables.pages,
                          .indexTable = tables.index,
                          .auxiliaryIn = states.current(entry.stateLane).auxiliary};
     }
@@ -2920,16 +3074,20 @@ struct Runtime::Impl {
   // at the slots of their rows, from the lane's position.
   void encodeKvPathCommit(CommandGraph &graph, std::span<Request *const> entries,
                           std::span<const ModelBatchItem> items, const ops::StepRows &step) {
-    std::array<MetalBuffer, kLaneCount> tables;
     std::array<uint32_t, kLaneCount> committed{};
-    for (uint32_t lane = 0; lane < entries.size(); ++lane) {
-      tables[lane] = laneTables(entries[lane]->stateLane).pages;
+    for (uint32_t lane = 0; lane < entries.size(); ++lane)
       committed[lane] = static_cast<uint32_t>(items[lane].logicalPosition);
-    }
     const auto lanes = static_cast<uint32_t>(entries.size());
-    targetModel->addKvPathCommit(graph, kvPages.layout(), kvPages.extentPages(), std::span(tables).first(lanes),
-                                 std::span(committed).first(lanes), step.laneCap,
-                                 decodeArena->batchSlice(DecodeTensor::RetainedRows, lanes));
+    // One commit a page of a block, each moving the rows of the slots it
+    // holds through that page's tables.
+    for (uint32_t page = 0; page < kvPages.layout().blockPages(); ++page) {
+      std::array<MetalBuffer, kLaneCount> tables;
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        tables[lane] = laneTables(entries[lane]->stateLane).pages[page];
+      targetModel->addKvPathCommit(graph, kvPages.layout(), kvPages.layout().usedSlots(page), kvPages.extentPages(),
+                                   std::span(tables).first(lanes), std::span(committed).first(lanes), step.laneCap,
+                                   decodeArena->batchSlice(DecodeTensor::RetainedRows, lanes));
+    }
   }
 
   // The target's commit after acceptance (QwenTarget::addStateCommit): each
@@ -3019,6 +3177,11 @@ struct Runtime::Impl {
     encodeBatchAcceptance(graph, entries, maximumRetained, step);
     encodeKvPathCommit(graph, entries, items, step);
     encodeTargetStateCommit(graph, entries, step);
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    // A plain step leaves the draft's context and the captures alone.
+    if (plainRows)
+      return;
+#endif
     encodeDraftStateCommitBatch(graph, entries, items, step);
     encodeDecodeCaptures(graph, entries, items, maximumRetained, step);
   }
@@ -4091,24 +4254,37 @@ Runtime::decodeAsync(const BatchPlan &plan,
     }
 
     impl_->prepareDecodeLane(entry, item, lane);
-    impl_->prepareDecodeCapture(entry, item, laneResult);
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    if (!impl_->plainRows)
+#endif
+      impl_->prepareDecodeCapture(entry, item, laneResult);
     maximumRetained[lane] = laneResult.maximumRetained;
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
   CommandGraph draft = impl_->newGraph(Impl::GraphSite::DecodeDraft);
-  // The draft's RoPE rows alone: the target's follow the layout the cycle's
-  // selector writes (encodeBatchVerifyInput).
-  impl_->addRopeTables(draft, {}, 0, impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
-                       width * kDecodeRows, {}, {}, impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
-                       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->targetModel->addDraftEmbedding(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftInputTokens, width),
-                                       impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
-                                       width * kDraftRows);
-  impl_->draftModel.addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
-  impl_->encodeDraftBatchGraph(draft, entries, {logicalPositions.data(), width}, {depths.data(), width},
-                               std::span(proposals).first(width), step, choice.floor);
-  impl_->recordGraph(Impl::GraphSite::DecodeDraft, draft);
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  // A plain step runs no draft: the host lays its rows out.
+  if (impl_->plainRows) {
+    if (constrained)
+      throw std::logic_error("a plain decode step takes no constrained lane");
+    impl_->layOutAnchors(entries, step.laneCap);
+  } else
+#endif
+  {
+    // The draft's RoPE rows alone: the target's follow the layout the cycle's
+    // selector writes (encodeBatchVerifyInput).
+    impl_->addRopeTables(draft, {}, 0, impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
+                         width * kDecodeRows, {}, {}, impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
+                         impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
+    impl_->targetModel->addDraftEmbedding(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftInputTokens, width),
+                                         impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
+                                         width * kDraftRows);
+    impl_->draftModel.addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
+    impl_->encodeDraftBatchGraph(draft, entries, {logicalPositions.data(), width}, {depths.data(), width},
+                                 std::span(proposals).first(width), step, choice.floor);
+    impl_->recordGraph(Impl::GraphSite::DecodeDraft, draft);
+  }
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
   // The weights it reads on demand and the spilled K/V its reads bring.
   WorkCount count({}, impl_->model.expertStore(), reads);
@@ -4153,6 +4329,13 @@ Runtime::decodeAsync(const BatchPlan &plan,
                  constrained](CommandTiming timing) mutable {
     return impl->finalizeDecode(lanes, items, timing, *reads, step, planned, constrained);
   };
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  // A plain step has no draft part: its command is the target's alone.
+  if (impl_->plainRows) {
+    CommandTicket command = impl_->backend.submitCommandAsync(targetPart(), std::move(completion));
+    return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), std::move(count));
+  }
+#endif
   CommandTicket command = impl_->backend.submitCommandPartsAsync(draft.command(), targetPart, std::move(completion));
   return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), std::move(count));
 }
@@ -4184,8 +4367,8 @@ std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
                                   std::move(state));
 }
 
-bool Runtime::canSnapshotToDisk(bool inUse) const noexcept {
-  return impl_->states.canSnapshotToDisk(inUse);
+bool Runtime::canSnapshotToDisk() const noexcept {
+  return impl_->states.canSnapshotToDisk();
 }
 
 std::unique_ptr<StateOffload>
@@ -4210,6 +4393,10 @@ uint64_t Runtime::idleBufferBytes(uint32_t evictedStates, bool afterStart, bool 
 }
 
 uint64_t Runtime::startStateBytes() const noexcept { return impl_->states.startBytes(); }
+
+uint64_t Runtime::imageStartBytes(const ModelRequest &request) const {
+  return impl_->imageStartBytes(request);
+}
 
 // The staging is the prompts', whichever request holds it, so also for a
 // request the runtime has not begun, as the engine places a fresh start
@@ -4322,28 +4509,46 @@ void requireLanesSucceeded(std::span<const ModelStepResult> results) {
       throw std::runtime_error(result.failure);
 }
 
+// A warmup request's pages, block by block: block b takes the runway's pages
+// from b x blockPages (ExecutionLimits::runwayPages), its base page and then
+// its window unit's.
+struct WarmupPages final {
+  std::vector<uint32_t> pages;
+  std::vector<std::vector<uint32_t>> windows;
+  void add(uint32_t block, uint32_t blockPages) {
+    windows.resize(blockPages - 1);
+    pages.push_back(block * blockPages);
+    for (uint32_t table = 0; table < windows.size(); ++table)
+      windows[table].push_back(block * blockPages + 1 + table);
+  }
+};
+
 // Warmup runs on the startup runway the engine's KV pool allocated for a
 // runtime of `lanes` lanes (ExecutionLimits::runwayPages), whose pages its
 // caller holds while it runs (engine::KvPool::RunwayHold); it never
 // allocates KV.
-void requireRunwayPages(const kv::PageStorage &storage, std::span<const uint32_t> pages, uint32_t lanes) {
-  for (uint32_t page : pages) {
-    if (page >= ExecutionLimits::runwayPages(storage.extentPages(), lanes) || !storage.isAllocated(page)) {
-      throw std::logic_error("warmup KV page " + std::to_string(page) +
-                             " is outside the startup runway");
-    }
-  }
+void requireRunwayPages(const kv::PageStorage &storage, const WarmupPages &pages, uint32_t lanes) {
+  const uint32_t runway = ExecutionLimits::runwayPages(storage.extentPages(), lanes, storage.layout().blockPages());
+  const auto require = [&](uint32_t page) {
+    if (page >= runway || !storage.isAllocated(page))
+      throw std::logic_error("warmup KV page " + std::to_string(page) + " is outside the startup runway");
+  };
+  for (uint32_t page : pages.pages)
+    require(page);
+  for (const std::vector<uint32_t> &table : pages.windows)
+    for (uint32_t page : table)
+      require(page);
 }
 
 // A warmup request's batch item. Each warmup residency keeps one page list,
 // so its revision stays 1.
-ModelBatchItem warmupItem(uint64_t id, uint64_t position, uint32_t tokens,
-                          std::span<const uint32_t> pages) {
+ModelBatchItem warmupItem(uint64_t id, uint64_t position, uint32_t tokens, const WarmupPages &pages) {
   return {.requestId = id,
           .logicalPosition = position,
           .tokenCount = tokens,
-          .pageTable = pages,
-          .pageTableRevision = 1};
+          .pageTable = pages.pages,
+          .pageTableRevision = 1,
+          .windowTables = pages.windows};
 }
 
 } // namespace
@@ -4367,6 +4572,15 @@ void Runtime::prepareWarmupDecode(uint64_t requestId, uint32_t anchor) {
 }
 
 std::vector<uint32_t> Runtime::prefillRowClasses() const { return impl_->prefillClasses; }
+std::string Runtime::activationsDescription(uint32_t contextTokens) const {
+  // Each attention layer's variant, where they attend through paged attention.
+  std::vector<ops::AttentionVariant> paged;
+  const QwenTargetGeometry &target = impl_->geometry.target;
+  for (uint32_t layer = 0; impl_->relativeAttention.empty() && layer < target.kvLayout.attentionLayers; ++layer)
+    if (std::find(paged.begin(), paged.end(), target.attentionVariant(layer)) == paged.end())
+      paged.push_back(target.attentionVariant(layer));
+  return impl_->operators.activationsDescription(target.kvLayout, target.attentionQueryHeads, contextTokens, paged, impl_->relativeAttention);
+}
 
 WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   if (!rows || rows > kPrefillRows)
@@ -4381,8 +4595,9 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   request.maxNewTokens = 16;
   beginColdRequest(request, 0);
   try {
-    std::vector<uint32_t> pages((rows + kv::kPageTokens - 1) / kv::kPageTokens);
-    std::iota(pages.begin(), pages.end(), 0u);
+    WarmupPages pages;
+    for (uint32_t block = 0; block < (rows + kv::kPageTokens - 1) / kv::kPageTokens; ++block)
+      pages.add(block, impl_->kvPages.layout().blockPages());
     requireRunwayPages(impl_->kvPages, pages, impl_->geometry.target.lanes);
     BatchPlan plan{.kind = WorkKind::Prefill,
                    .items = {{id, rows}},
@@ -4449,9 +4664,9 @@ void Runtime::measureDecodeSteps(uint32_t width) {
   const uint32_t lanePages = StepCosts::lanePages(steps.size());
   const auto stateLane = [&](uint32_t lane) { return impl_->geometry.target.lanes - 1 - lane; };
   const std::optional<Impl::ForcedStep> forced = impl_->forcedStep;
-  std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
+  std::array<WarmupPages, ExecutionLimits::maximumBatchWidth> pages;
   for (uint32_t lane = 0; lane < width; ++lane) {
-    for (uint32_t page = 0; page < lanePages; ++page) pages[lane].push_back(5 + lane * lanePages + page);
+    for (uint32_t page = 0; page < lanePages; ++page) pages[lane].add(5 + lane * lanePages + page, impl_->kvPages.layout().blockPages());
     requireRunwayPages(impl_->kvPages, pages[lane], impl_->geometry.target.lanes);
   }
   std::vector<std::vector<double>> replays(StepCosts::kReplays, std::vector<double>(steps.size()));
@@ -4528,7 +4743,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
   const uint32_t lanePages = checking ? StepCosts::lanePages(StepCosts::kReplays) : 1;
   double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
-  std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
+  std::array<WarmupPages, ExecutionLimits::maximumBatchWidth> pages;
   bool stale = false;
   try {
     for (uint32_t lane = 0; lane < width; ++lane) {
@@ -4541,7 +4756,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       request.maxNewTokens = checking ? (2 + StepCosts::kReplays) * ExecutionLimits::targetVerifyRows : 16;
       if (checking) request.flags = RequestIgnoreEndOfSequence;
       beginColdRequest(request, stateLane(lane));
-      for (uint32_t page = 0; page < lanePages; ++page) pages[lane].push_back(5 + lane * lanePages + page);
+      for (uint32_t page = 0; page < lanePages; ++page) pages[lane].add(5 + lane * lanePages + page, impl_->kvPages.layout().blockPages());
       requireRunwayPages(impl_->kvPages, pages[lane], impl_->geometry.target.lanes);
       BatchPlan prefillPlan{.kind = WorkKind::Prefill,
                             .items = {{request.id, 1}},
@@ -4610,6 +4825,14 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                        impl_->request(firstId + lane).pendingToken,
                        impl_->states.metadata(stateLane(lane)).lengths.targetTokens});
     }
+    // Every other step of the width after the lanes' short history, which
+    // the cycle above and the longest verify's do not create (a start that
+    // measures no step, under --verify-rows all, or recalls its costs).
+    {
+      std::vector<ModelBatchItem> after;
+      for (uint32_t lane = 0; lane < width; ++lane) after.push_back(warmupItem(firstId + lane, positions[lane], 0, pages[lane]));
+      impl_->prepareDecodeSteps(std::span(entries).first(width), after, false);
+    }
     if (checking) {
       const ops::StepRows step = impl_->stepCosts->steps(width).back();
       impl_->forcedStep = Impl::ForcedStep{step.rows, step.laneCap};
@@ -4669,6 +4892,43 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
           wallSeconds, std::move(lanes)};
 }
 
+// One cold request of a token on the last state lane, at the runway's page 5
+// as a decode warmup's first lane, whose buffers every lane of `width` binds
+// (Impl::prepareDecodeWidth): a lane's memory, whatever the width, and no
+// step run.
+WarmupStepResult Runtime::prepareDecodeBatch(uint32_t width) {
+  if (!width || width > impl_->geometry.target.lanes)
+    throw std::invalid_argument("invalid decode preparation width");
+  constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 131;
+  const auto started = AwakeClock::now();
+  const std::vector<uint32_t> prompt{0};
+  ModelRequest request;
+  request.id = id;
+  request.prompt = prompt;
+  request.maxNewTokens = 16;
+  beginColdRequest(request, impl_->geometry.target.lanes - 1);
+  try {
+    WarmupPages pages;
+    pages.add(5, impl_->kvPages.layout().blockPages());
+    requireRunwayPages(impl_->kvPages, pages, impl_->geometry.target.lanes);
+    BatchPlan prefillPlan{.kind = WorkKind::Prefill, .items = {{id, 1}}, .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item = warmupItem(id, 0, 1, pages);
+    item.inputTokens = request.prompt;
+    requireLanesSucceeded(prefill(prefillPlan, std::span<const ModelBatchItem>(&item, 1)));
+    prepareWarmupDecode(id, prompt.back());
+    impl_->prepareDecodeWidth(impl_->request(id), warmupItem(id, 1, 0, pages), width);
+    impl_->prepareCapturePipelines(0, impl_->geometry.target.lanes - 1);
+    const double seconds = std::chrono::duration<double>(AwakeClock::now() - started).count();
+    logLine("Decode pipelines of ", width, width == 1 ? " lane" : " lanes", " created without a warmup step, in ",
+            seconds, " s");
+    end(id);
+    return {"B" + std::to_string(width) + " decode pipelines, no step run", seconds, {}};
+  } catch (...) {
+    end(id);
+    throw;
+  }
+}
+
 WarmupStepResult Runtime::warmupCompositeStateRestore() {
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 121;
   constexpr uint32_t prefixTokens = 2 * kv::kPageTokens;
@@ -4687,7 +4947,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   beginColdRequest(request, 0);
   try {
     // Deliberately non-contiguous physical ids exercise page-table lookup.
-    const std::vector<uint32_t> pages{12, 10, 11};
+    WarmupPages pages;
+    for (const uint32_t block : {12u, 10u, 11u})
+      pages.add(block, impl_->kvPages.layout().blockPages());
     requireRunwayPages(impl_->kvPages, pages, impl_->geometry.target.lanes);
     BatchPlan plan{.kind = WorkKind::Prefill,
                    .items = {{id, prefixTokens}},
@@ -4822,8 +5084,13 @@ ModelMemoryPlan memoryPlanOf(const ModelDescriptor &descriptor, ops::GdnStateFor
                              const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
   CompositeStateLayout states = descriptor.stateLayout;
   states.target.format = stateFormat;
-  return {states.laneBytes(), plannedPrefillBytes(geometry, operators), plannedDecodeBytes(geometry, operators),
-          geometry.target.lanes};
+  const uint64_t tables = decodePageTableBytes(geometry, operators, 1);
+  return {states.laneBytes(),
+          plannedPrefillBytes(geometry, operators),
+          plannedDecodeBytes(geometry, operators),
+          geometry.target.lanes,
+          tables,
+          decodePageTableBytes(geometry, operators, geometry.target.kvLayout.blockPages()) - tables};
 }
 
 } // namespace
@@ -4869,8 +5136,9 @@ std::span<const uint16_t> RuntimeInstrumentation::lastCapturedRows(const Runtime
 }
 
 // The selector's buffers (Impl::encodeDraftBatchGraph): its candidates and
-// unary scores a lane's positions after another's, its edge tables after the
-// step's shard partials (draft_select_edges), its trees a verify block a lane.
+// unary scores a lane's positions after another's, its edge tables after room
+// for the most shard partials (draft_select_edges), its trees a verify block a
+// lane.
 RuntimeInstrumentation::DraftLattice RuntimeInstrumentation::lastDraftLattice(const Runtime &runtime, uint32_t lane,
                                                                               uint32_t lanes) {
   constexpr uint64_t positions = SPLASH_DRAFT_PROPOSAL_TOKENS, candidates = SPLASH_DRAFT_CANDIDATES;
@@ -4880,7 +5148,7 @@ RuntimeInstrumentation::DraftLattice RuntimeInstrumentation::lastDraftLattice(co
   const auto *ids = contents<uint32_t>(arena.all(DecodeTensor::Candidates), "draft candidates") + lane * cells;
   const auto *unary = contents<float>(arena.all(DecodeTensor::Unary), "draft unary scores") + lane * cells;
   const auto *edges = contents<float>(arena.all(DecodeTensor::TopPartialValues), "draft edges") +
-                      lanes * positions * SPLASH_DRAFT_SAMPLING_SHARDS * candidates + lane * table;
+                      lanes * positions * SPLASH_DRAFT_SAMPLING_MOST_SHARDS * candidates + lane * table;
   const auto *next = contents<float>(arena.all(DecodeTensor::DraftTreeNext), "draft tree next") +
                      uint64_t{lane} * SPLASH_TARGET_VERIFY_ROWS * candidates;
   return {{ids, ids + cells}, {unary, unary + cells}, {edges, edges + table}, {next, next + candidates}};
@@ -4898,6 +5166,15 @@ void RuntimeInstrumentation::forceStepRows(Runtime &runtime, std::optional<uint3
   runtime.impl_->forcedStep.reset();
   if (rows)
     runtime.impl_->forcedStep = Runtime::Impl::ForcedStep{.rows = *rows, .laneCap = std::nullopt, .floor = floor};
+}
+
+void RuntimeInstrumentation::skipDraft(Runtime &runtime, std::optional<uint32_t> laneRows) {
+  if (laneRows && (!*laneRows || *laneRows > ExecutionLimits::targetVerifyRows))
+    throw std::invalid_argument("a plain step takes 1 to a verify block's rows a lane");
+  Runtime::Impl &impl = *runtime.impl_;
+  impl.plainRows = laneRows;
+  impl.forcedStep.reset();
+  if (laneRows) impl.forcedStep = Runtime::Impl::ForcedStep{.rows = *laneRows * kLaneCount, .laneCap = *laneRows};
 }
 
 void RuntimeInstrumentation::replaceTreeTokens(Runtime &runtime, uint64_t requestId,
@@ -4967,7 +5244,7 @@ RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runt
     return table ? std::span<const SplashKvPage>(contents<SplashKvPage>(table, "lane table"), kMaximumPageTableEntries)
                  : std::span<const SplashKvPage>();
   };
-  return {entries(tables.pages), entries(tables.index)};
+  return {entries(tables.pages.front()), entries(tables.index)};
 }
 
 std::vector<uint8_t> RuntimeInstrumentation::pendingGdnRows(const Runtime &runtime, uint64_t requestId) {

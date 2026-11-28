@@ -7,7 +7,13 @@
 // image's pixels and embedding rows. The shared dense operators its encoder
 // runs, the scaled residual, the LayerNorm into fp32 rows in place and the
 // attention of heads of 64 among them, are dense_linear_metal_test's and
-// dense_attention_metal_test's.
+// dense_attention_metal_test's. Last the whole tower of Q8_0 projections
+// (an mmproj's, DenseWeights::quantized) against the tower of the same
+// values in bf16, which every Q8_0 value of a power-of-two scale is, within
+// the bf16 rounding of a sum in another order (relative RMS 1e-2), at 17 and
+// 101 tokens; and so the towers of the production image's writer and reader
+// (vision::writeVision, readInklingVision) of a Q8_0 mmproj, its q, k and v
+// stacked into one projection's planes, and of the same values in BF16.
 //
 //   inkling-vision-metal METALLIB
 #include "LinearNumerics.hpp"
@@ -16,6 +22,13 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Vision.h"
+#include "TestFiles.hpp"
+#include "metal/abi/QuantFormat.h"
+#include "model/InklingVision.hpp"
+#include "model/VisionPreparation.hpp"
+#include "model/WeightLayout.hpp"
+#include "model/WeightSource.hpp"
+#include "model/WeightStore.hpp"
 #include "ops/InklingVision.hpp"
 
 #import <Foundation/Foundation.h>
@@ -351,6 +364,184 @@ void checkEncoderExtents(MetalBackend &backend) {
   std::printf("InklingVision extents: passed\n");
 }
 
+// A tower of random weights whose projections are Q8_0 (codes in
+// [-127, 127], a scale of 2^-11 or 2^-12 a block, whose products are exact
+// in bf16 and fp16) or, `q8` false, the same values in bf16; LayerNorms of
+// weight 1 and bias 0, LayerScales of 0.1 to 0.3.
+ops::VisionWeights randomTower(MetalBackend &backend, bool q8, uint32_t seed) {
+  std::mt19937 random(seed);
+  const auto bf16Values = [&](uint64_t count, float scale) {
+    MetalBuffer buffer = test::sharedBuffer(backend, count * 2);
+    randomize(buffer, count, random, scale);
+    return buffer;
+  };
+  const auto constant = [&](uint64_t count, float value) { return bf16Buffer(backend, count, floatToBf16(value)); };
+  const auto projection = [&](uint32_t outputs, uint32_t inputs) {
+    const float d = inputs > 1024 ? 0x1p-12F : 0x1p-11F;
+    const uint32_t groups = inputs / 32;
+    std::uniform_int_distribution<int> code(-127, 127);
+    ops::DenseWeights weights{{}, bf16Values(outputs, 0.05F), {}};
+    if (q8) {
+      MetalBuffer plane0 = test::sharedBuffer(backend, uint64_t{outputs} * inputs);
+      MetalBuffer meta = test::sharedBuffer(backend, uint64_t{outputs} * groups * 2);
+      const _Float16 scale = static_cast<_Float16>(d);
+      for (uint32_t n = 0; n < outputs; ++n)
+        for (uint32_t g = 0; g < groups; ++g) {
+          const uint64_t record = quant_tile_index(n, g, groups);
+          std::memcpy(static_cast<uint8_t *>(meta.contents()) + record * 2, &scale, 2);
+          for (uint32_t e = 0; e < 32; ++e)
+            static_cast<int8_t *>(plane0.contents())[record * 32 + quant_slot(e)] = static_cast<int8_t>(code(random));
+        }
+      weights.quantized = ops::QuantizedSegment::planes(GGUF_FMT_Q80, outputs, inputs, plane0, {}, meta);
+    } else {
+      weights.weight = test::sharedBuffer(backend, uint64_t{outputs} * inputs * 2);
+      for (uint64_t i = 0; i < uint64_t{outputs} * inputs; ++i)
+        words(weights.weight)[i] = floatToBf16(d * static_cast<float>(code(random)));
+    }
+    return weights;
+  };
+  const uint32_t hidden = kHidden, merged = kLayout.mergedHiddenSize;
+  const auto norm = [&] { return ops::LayerNormWeights{constant(hidden, 1.0F), constant(hidden, 0.0F)}; };
+  const auto layerScale = [&] {
+    std::uniform_real_distribution<float> uniform(0.1F, 0.3F);
+    MetalBuffer buffer = test::sharedBuffer(backend, uint64_t{hidden} * 2);
+    for (uint32_t i = 0; i < hidden; ++i) words(buffer)[i] = floatToBf16(uniform(random));
+    return buffer;
+  };
+  ops::VisionWeights model;
+  model.layout = kLayout;
+  model.patchEmbedding = {bf16Values(uint64_t{hidden} * kPatchDim, 0.03F), constant(hidden, 0.0F)};
+  model.positionTable = bf16Values(uint64_t{kSide} * kSide * hidden, 0.5F);
+  model.classToken = bf16Values(2 * hidden, 0.5F);
+  model.inputNorm = norm();
+  for (uint32_t i = 0; i < kLayout.depth; ++i) {
+    ops::VisionBlock block{norm(), projection(3 * hidden, hidden), projection(hidden, hidden), norm(),
+                           projection(kLayout.intermediateSize, hidden), projection(hidden, kLayout.intermediateSize)};
+    block.projection.scale = layerScale();
+    block.downProjection.scale = layerScale();
+    model.blocks.push_back(std::move(block));
+  }
+  model.mergerUpProjection = projection(merged, merged);
+  model.mergerDownProjection = projection(kLayout.outputHiddenSize, merged);
+  return model;
+}
+
+// The Q8_0 tower's embeddings of an image against the bf16 tower's: their
+// RMS difference within `bound` of the bf16 tower's RMS.
+void checkQ8Tower(MetalBackend &backend, const ops::VisionWeights &q8, const ops::VisionWeights &bf16,
+                  ops::ImageGrid grid, double bound) {
+  const MetalBuffer pixels = test::sharedBuffer(backend, grid.pixelBytes(kPatch));
+  std::mt19937 random(5);
+  for (uint64_t i = 0; i < grid.pixelBytes(kPatch); ++i)
+    static_cast<uint8_t *>(pixels.contents())[i] = static_cast<uint8_t>(random());
+  const uint64_t count = uint64_t{grid.mergedTokens()} * kLayout.outputHiddenSize;
+  const auto encode = [&](const ops::VisionWeights &weights) {
+    const ops::InklingVision vision(backend, weights, grid.patches());
+    const MetalBuffer embeddings = bf16Buffer(backend, count);
+    CommandGraph graph;
+    vision.encode(graph, grid, pixels, embeddings);
+    run(backend, graph);
+    std::vector<double> values(count);
+    for (uint64_t i = 0; i < count; ++i) values[i] = bf16ToFloat(words(embeddings)[i]);
+    return values;
+  };
+  const std::vector<double> got = encode(q8), expected = encode(bf16);
+  double difference = 0.0, magnitude = 0.0;
+  for (uint64_t i = 0; i < count; ++i) {
+    require(std::isfinite(got[i]), "the Q8_0 tower's embedding is not finite");
+    difference += (got[i] - expected[i]) * (got[i] - expected[i]);
+    magnitude += expected[i] * expected[i];
+  }
+  const double relative = std::sqrt(difference / magnitude);
+  const std::string label = "Q8_0 tower " + std::to_string(grid.height) + "x" + std::to_string(grid.width);
+  std::printf("%s: relative RMS difference %.2e (bound %.0e)\n", label.c_str(), relative, bound);
+  require(relative <= bound, label + ": the embeddings differ from the bf16 tower's");
+}
+
+// The production image's tower (vision::writeVision, readInklingVision) of a
+// Q8_0 mmproj, its q, k and v three tensors stacked into one projection's
+// planes, against the image of the same values, every one BF16 (power-of-two
+// scales), from the same writer and reader.
+void checkPreparedQ8Tower(MetalBackend &backend) {
+  const test::TemporaryDirectory directory("inkling-q8-image");
+  const model::vision::Plan base = model::inklingVisionPlan(kLayout);
+  std::mt19937 random(9);
+  std::normal_distribution<float> normal(0.0F, 1.0F);
+  std::uniform_int_distribution<int> code(-127, 127);
+  std::vector<uint8_t> file;
+  const auto append = [&](const void *data, uint64_t bytes) {
+    const uint64_t at = file.size();
+    file.insert(file.end(), static_cast<const uint8_t *>(data), static_cast<const uint8_t *>(data) + bytes);
+    return at;
+  };
+  // Each section's tensors: a projection's as Q8_0 blocks and as the same
+  // values in BF16, the others in BF16 for both; the zero biases none.
+  struct Tensor {
+    size_t section;
+    uint32_t rows, columns;
+    uint64_t q8 = 0, bf16 = 0;
+  };
+  std::vector<Tensor> tensors;
+  for (size_t index = 0; index < base.sections.size(); ++index) {
+    const model::vision::Section &s = base.sections[index];
+    if (s.gguf == "patch embedding bias" || s.gguf == "mm.1.bias" || s.gguf == "mm.2.bias") continue;
+    const uint32_t parts = s.stacked ? (s.projection ? 3 : 2) : 1;
+    const bool norm = s.gguf.find("ln") != std::string::npos && s.gguf.ends_with(".weight") && s.columns == 1;
+    const bool layerScale = s.gguf.find(".ls") != std::string::npos;
+    for (uint32_t part = 0; part < parts; ++part) {
+      Tensor t{index, s.rows / parts, s.columns};
+      std::vector<uint16_t> values(uint64_t{t.rows} * t.columns);
+      if (s.projection) {
+        const float d = t.columns > 1024 ? 0x1p-12F : 0x1p-11F;
+        const _Float16 scale = static_cast<_Float16>(d);
+        std::vector<uint8_t> blocks;
+        for (uint64_t i = 0; i < values.size(); i += 32) {
+          blocks.insert(blocks.end(), reinterpret_cast<const uint8_t *>(&scale), reinterpret_cast<const uint8_t *>(&scale) + 2);
+          for (uint32_t e = 0; e < 32; ++e) {
+            const int q = code(random);
+            blocks.push_back(static_cast<uint8_t>(static_cast<int8_t>(q)));
+            values[i + e] = floatToBf16(d * static_cast<float>(q));
+          }
+        }
+        t.q8 = append(blocks.data(), blocks.size());
+      } else {
+        for (uint16_t &v : values)
+          v = floatToBf16(norm ? 1.0F + 0.05F * normal(random) : layerScale ? 0.2F : 0.05F * normal(random));
+      }
+      t.bf16 = append(values.data(), values.size() * 2);
+      tensors.push_back(t);
+    }
+  }
+  const std::filesystem::path path = directory.path() / "mmproj.bin";
+  test::writeFile(path, file);
+  const model::WeightSource source(path);
+  const auto tower = [&](bool q8) {
+    model::vision::Plan plan = base;
+    for (const Tensor &t : tensors) {
+      const bool quantized = q8 && base.sections[t.section].projection;
+      const uint64_t bytes = quantized ? uint64_t{t.rows} * t.columns / 32 * 34 : uint64_t{t.rows} * t.columns * 2;
+      plan.sections[t.section].inputs.push_back(
+          {"tensor", {&source, quantized ? "Q8_0" : "BF16", {t.columns, t.rows}, quantized ? t.q8 : t.bf16, bytes}});
+    }
+    model::vision::placeQ8Matrices(plan);
+    MetalBuffer image = backend.allocateBuffer(plan.bytes, metal::BufferStorage::Shared, "vision image");
+    model::vision::writeVision({static_cast<uint8_t *>(image.contents()), plan.bytes}, plan);
+    model::WeightFile weights(backend, image, "vision/model.bin", model::kVisionMagic, kLayout.depth, 0, plan.bytes,
+                              "test");
+    ops::VisionWeights result = model::readInklingVision(weights, kLayout, plan);
+    weights.finish();
+    return std::pair{plan, std::move(result)};
+  };
+  const auto [q8Plan, q8] = tower(true);
+  const auto [bf16Plan, bf16] = tower(false);
+  uint32_t planes = 0;
+  for (const model::vision::Section &s : q8Plan.sections) planes += s.q8Planes;
+  require(planes == 4 * kLayout.depth + 2 && q8.blocks.front().qkv.isQuantized() && !bf16.blocks.front().qkv.isQuantized(),
+          "the prepared Q8_0 tower does not hold its projections as planes");
+  for (const ops::ImageGrid grid : {ops::ImageGrid{4, 4}, ops::ImageGrid{10, 10}})
+    checkQ8Tower(backend, q8, bf16, grid, 1e-2);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -371,6 +562,12 @@ int main(int argc, char **argv) {
       for (const uint32_t tokens : {5U, 127U, 129U, 261U}) checkQkvPrepare(backend, tokens);
       for (const uint32_t rows : {4U, 36U}) checkPatchRows(backend, rows);
       checkEncoderExtents(backend);
+      {
+        const ops::VisionWeights q8 = randomTower(backend, true, 3), bf16 = randomTower(backend, false, 3);
+        for (const ops::ImageGrid grid : {ops::ImageGrid{4, 4}, ops::ImageGrid{10, 10}})
+          checkQ8Tower(backend, q8, bf16, grid, 1e-2);
+      }
+      checkPreparedQ8Tower(backend);
       std::cout << "inkling_vision_metal_test: PASS\n";
       return 0;
     } catch (const std::exception &error) {

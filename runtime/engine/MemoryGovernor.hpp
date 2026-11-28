@@ -254,7 +254,7 @@ public:
   // work now: under the engine's limit, and of the host's headroom what lies
   // beyond its margin at normal pressure, read now, since pages are handed
   // out between the host rule's samples.
-  [[nodiscard]] std::array<uint32_t, 3> heldPages(ClaimId claim) const;
+  [[nodiscard]] std::array<uint32_t, kv::kPageForms> heldPages(ClaimId claim) const;
   // Frees what the claim lacks (MemoryLedger::free), in its scope: a lane's
   // release allocates the Index extents its pages move into. A need the host
   // refused is met in place first, from the pages and state buffers already

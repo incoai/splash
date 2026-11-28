@@ -96,6 +96,8 @@ struct StateCacheSnapshot {
   uint64_t checkpointRetirements = 0;
   // Evictions by a reclaim; rolling retirements are counted separately.
   uint64_t checkpointEvictions = 0;
+  // What the offloads stored, as their states count it.
+  uint64_t offloadBytes = 0;
 };
 
 struct StateEviction final {
@@ -127,9 +129,10 @@ enum class PersistStatus : uint8_t {
 // argument is the write's completion hook.
 using StateWriter =
     std::function<std::unique_ptr<StateOffload>(std::function<void()>)>;
-// Gives up one disk copy for a new copy of a state in use or not; false once
+// Gives up one disk copy for a new copy of the state at `kvBlock`, in use or
+// not, worth a point used at pointsBefore (Cache::freeDiskSpace); false once
 // nothing that copy may displace is left.
-using DiskRoom = std::function<bool(bool inUse)>;
+using DiskRoom = std::function<bool(uint64_t kvBlock, bool inUse, bool ahead, uint64_t pointsBefore)>;
 
 // Attaches one immutable target-recurrent + draft-context state to a complete
 // target-KV block, in RAM, on disk, or in both. The pair is restored
@@ -161,8 +164,9 @@ public:
   [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint);
 
   // Publishes a RAM copy; a disk copy of the block stays beside it.
+  // A windowed state's tail takes `units`, its lane's (KvCache::countState).
   void publishCompositeState(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,
-                             bool checkpoint);
+                             bool checkpoint, const KvCache::TailUnits &units = {});
   // Publishes a state that has no RAM copy by writing it from its lane: the
   // entry is the disk copy the ticket carries, with the write in flight.
   // False when the one write in flight holds the staging buffer, or when the
@@ -170,7 +174,7 @@ public:
   // nothing is published then. The caller reuses a stored state first
   // (reuseStoredState); publishing over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
-                                        bool checkpoint);
+                                        bool checkpoint, const KvCache::TailUnits &units = {});
   // Publication identity protects replacement states from stale handles.
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // Ensures this publication is no longer a disposable checkpoint. Returns
@@ -181,8 +185,9 @@ public:
   // opportunistic, a reclaim frees its RAM copy with no write and never
   // writes it, as a next prompt resumes there only if it renders the reply
   // back token for token. keepReply makes it a checkpoint a reclaim writes
-  // as any, once its request has shown its conversation does render replies
-  // back. A reuse by another publication, or a use, ends either.
+  // as any: a suspended lane's newest, which it resumes from
+  // (Engine::vacateLane). A reuse by another publication, or a use, ends
+  // either.
   void markReply(StateCheckpoint checkpoint) noexcept;
   void keepReply(StateCheckpoint checkpoint) noexcept;
   // The matching checkpoint is pinned: retireCheckpointState refuses it.
@@ -203,6 +208,7 @@ public:
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // An ordinary state, in either tier.
   [[nodiscard]] bool ordinary(uint64_t kvBlock) const noexcept;
+  [[nodiscard]] size_t entryCount() const noexcept { return entries_.size(); }
   // The size of the state at this block; zero without one.
   [[nodiscard]] uint64_t bytes(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
@@ -237,6 +243,14 @@ public:
   // use.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   inUseCandidate(const std::optional<CacheEvictionCandidate> &after = {}) const noexcept;
+  // Newest unpinned ordinary state in RAM, or checkpoint, or the next older
+  // than `before`.
+  [[nodiscard]] std::optional<CacheEvictionCandidate>
+  newestCandidate(bool checkpoint, const std::optional<CacheEvictionCandidate> &before = {}) const noexcept;
+  // The order of the three above, or of the only copies on the SSD, that
+  // holds the state, as a release of tails finds it there (reindex).
+  enum class Order : uint8_t { None, Ram, DiskOnly };
+  [[nodiscard]] Order orderOf(uint64_t kvBlock) const noexcept;
   // Frees the RAM copy of a candidate above (an unpinned RAM copy; anything
   // else throws std::logic_error): for nothing when a disk copy exists, by
   // writing one when the tier takes it (makeRoom frees quota on its behalf),
@@ -260,7 +274,7 @@ public:
   [[nodiscard]] bool reclaimWrites(uint64_t kvBlock) const noexcept;
   // Whether the tier takes the write of a writable RAM copy not in use, or
   // in use, now: CompositeState::canOffload, which answers alike for every
-  // writable copy of the class, asked of the oldest a reclaim may take;
+  // writable copy, asked of the oldest of the class a reclaim may take;
   // false without one.
   [[nodiscard]] bool takesWrite(bool inUse) const noexcept;
   // What a reclaim's walk over the RAM copies takes (Cache::reach): of the
@@ -301,6 +315,11 @@ public:
   diskCandidate(bool duplicate, const std::optional<CacheEvictionCandidate> &after = {}) const noexcept;
   // The oldest only copy of a state in use.
   [[nodiscard]] std::optional<CacheEvictionCandidate> inUseDiskCandidate() const noexcept;
+  // A request's restore through the block (Cache::restoreRequest): its disk
+  // copy takes the newest recency in the orders of disk copies, as the K/V
+  // copies of its chain do (KvCache::refreshCopies), so that a state copy is
+  // as old as its conversation's last use. Memory's orders keep lastUsed.
+  void refreshCopy(uint64_t kvBlock) noexcept;
   // Drops a redundant disk copy.
   void dropDisk(uint64_t kvBlock);
   // A read of this copy failed: it leaves once unpinned, a RAM copy stays.
@@ -313,11 +332,14 @@ public:
                  bool checkpoint);
   // A restored disk copy without a RAM copy takes one.
   [[nodiscard]] bool promotable(uint64_t kvBlock, const CompositeState *source) const noexcept;
+  // Its tail takes the units it lacks from `units` (KvCache::countRamState).
   void promote(uint64_t kvBlock, const CompositeState *source,
-               std::shared_ptr<const CompositeState> state);
+               std::shared_ptr<const CompositeState> state, const KvCache::TailUnits &units = {});
   void promotionSkipped() noexcept { ++promotionsSkipped_; }
   // The one state write is in flight; its RAM or quota returns when it lands.
   [[nodiscard]] bool writing() const noexcept { return pending_.has_value(); }
+  // It writes this block's state: its disk copy has not landed.
+  [[nodiscard]] bool writing(uint64_t kvBlock) const noexcept { return pending_ && pending_->kvBlock == kvBlock; }
   // The bytes of the RAM copy a write ahead of need reads (persist), which a
   // reclaim frees at once after it lands.
   [[nodiscard]] uint64_t persistingBytes() const noexcept {
@@ -337,6 +359,9 @@ private:
     std::shared_ptr<const CompositeState> disk;
     uint32_t pins = 0;
     uint64_t lastUsed = 0;
+    // When a request last restored through the state (refreshCopy): the
+    // orders of disk copies read the later of the two.
+    uint64_t copyUsed = 0;
     bool checkpoint = false;
     Reply reply = Reply::None;
     bool invalid = false;
@@ -382,7 +407,8 @@ private:
   // counts for the KV from the first attempt (KvCache::countDiskState), and
   // no longer once none starts.
   [[nodiscard]] std::unique_ptr<StateOffload> startWrite(uint64_t kvBlock, const StateWriter &write,
-                                                         bool makeRoom = true);
+                                                         bool makeRoom = true, bool ahead = false,
+                                                         const KvCache::TailUnits &units = {});
   // The disk copy this write carries, counted since startWrite, becomes the
   // entry's; the write is the one in flight, reading `source` in place when
   // given.
@@ -405,15 +431,12 @@ private:
   [[nodiscard]] KvCache::StateMarks marks(uint64_t kvBlock, const Entry &entry) const noexcept;
   // Names the resume point to the KV cache once it moved.
   void markResumePoint() noexcept;
-  void discardRam(Entry &entry) noexcept;
+  void discardRam(uint64_t kvBlock, Entry &entry) noexcept;
   void discardDisk(uint64_t kvBlock, Entry &entry) noexcept;
   // An ordinary publication or reuse: the block has held a reusable state,
   // and a checkpoint is upgraded, its disk copy labelled with its new class
   // at once.
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
-  [[nodiscard]] bool writing(uint64_t kvBlock) const noexcept {
-    return pending_ && pending_->kvBlock == kvBlock;
-  }
   // The write in flight reads this block's RAM copy (persist).
   [[nodiscard]] bool persisting(uint64_t kvBlock) const noexcept {
     return writing(kvBlock) && pending_->source;
@@ -456,6 +479,7 @@ private:
   uint64_t checkpointRetirements_ = 0;
   uint64_t checkpointEvictions_ = 0;
   uint64_t offloads_ = 0;
+  uint64_t offloadBytes_ = 0;
   uint64_t offloadFailures_ = 0;
   uint64_t invalidations_ = 0;
   // Destroyed before entries_: the ticket's disk copy may still be an entry.

@@ -43,6 +43,20 @@ template <class Layout> [[nodiscard]] SafetensorsTargetPlan safetensorsTargetPla
           }};
 }
 
+// Whether --weights auto plans any image of `checkpoint` in another format
+// than --weights original does (gguf::imageFormats of the two plans), from
+// its headers alone: what the app offers the option by (model-check).
+[[nodiscard]] inline bool weightsAutoChanges(const SafetensorsTargetPlan &plan,
+                                             const SafetensorsCheckpoint &checkpoint) {
+  const auto formats = [&](gguf::Float16Weights weights) {
+    std::vector<std::string> result;
+    for (const gguf::Image &image : plan.images(checkpoint, {.weights = weights}).images)
+      result.push_back(gguf::imageFormats(image));
+    return result;
+  };
+  return formats(gguf::Float16Weights::Q8_0) != formats(gguf::Float16Weights::Published);
+}
+
 class SafetensorsTargetLoader final : public TargetImages {
 public:
   // Plans every image of the checkpoint in directory once, as its family's
@@ -50,10 +64,10 @@ public:
   // the family adds stream through it (streamTable()) instead of loading
   // (table()). With expert memory (experts.memoryBytes), a MoE target's
   // routed experts stream (streamedExperts()) instead of loading with their
-  // layers.
+  // layers. 16-bit projections load as `weights` says (gguf::float16Planes).
   SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &directory,
                           const SafetensorsTargetPlan &plan, SparseRowStoreOptions table = {},
-                          ExpertStoreOptions experts = {});
+                          ExpertStoreOptions experts = {}, gguf::Float16Weights weights = gguf::Float16Weights::Published);
 
   // The streamed table, its store reading the table's native rows from the
   // checkpoint's open files (readRepackRows over its shards); none when the
@@ -73,7 +87,8 @@ private:
     std::vector<gguf::Image> images;
   };
   SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images, std::shared_ptr<Planned> planned,
-                          const SafetensorsTargetPlan &plan, SparseRowStoreOptions table, ExpertStoreOptions experts);
+                          const SafetensorsTargetPlan &plan, SparseRowStoreOptions table, ExpertStoreOptions experts,
+                          gguf::Float16Weights weights);
 
   std::shared_ptr<Planned> planned_;
   bool float32Norms_ = false;

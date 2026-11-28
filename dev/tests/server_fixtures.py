@@ -339,12 +339,21 @@ class Plan:
         self.matched_tokens = matched_tokens
         self.logits = logits
         # What the start found beside matched_tokens: prefix tokens, state
-        # source and lost state; by default the matched prefix, in RAM.
-        self.start = start or (
+        # source and lost state; by default the matched prefix, in RAM. Its
+        # reuse end follows from them, as the engine's does without a failed
+        # read: nothing matched, KV past the state, or the prefix's end.
+        prefix, source, lost = start or (
             matched_tokens,
             wire.StateSource.MEMORY if matched_tokens else wire.StateSource.NONE,
             False,
         )
+        if not prefix:
+            end = (wire.ReuseEnd.NOTHING_MATCHED, 0)
+        elif prefix > matched_tokens:
+            end = (wire.ReuseEnd.KV_WITHOUT_STATE, prefix - matched_tokens)
+        else:
+            end = (wire.ReuseEnd.PREFIX_END, prefix)
+        self.start = (prefix, source, lost, *end)
         self.started = threading.Event()
         self.release = threading.Event()
         if not block:
@@ -924,10 +933,11 @@ def main_args(**overrides):
             "max_concurrent_requests": serve_options.DEFAULT_CONCURRENT_REQUESTS,
             "disable_ane": False,
             "recalibrate_ane": False,
-            "activations": "auto",
+            "activations": None,
             "verify_rows": "auto",
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
+            "shutdown_timeout": serve_options.DEFAULT_SHUTDOWN_TIMEOUT,
             "queue_size": 1,
             "host": "127.0.0.1",
             "allowed_host": [],
@@ -941,6 +951,7 @@ def main_args(**overrides):
             "ple_memory": None,
             "expert_memory": None,
             "sparse_kv_memory": None,
+            "weights": "original",
             "kv_format": "int8",
             "state_format": "fp32",
             "cached_states": "int8",

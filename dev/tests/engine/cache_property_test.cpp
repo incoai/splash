@@ -19,7 +19,9 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -47,7 +49,7 @@ public:
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
   bool writable() const noexcept override { return !disk_; }
-  bool canOffload(bool) const noexcept override { return !disk_ && shelf_->takesWrites; }
+  bool canOffload() const noexcept override { return !disk_ && shelf_->takesWrites; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override { return shelve(); }
   std::unique_ptr<StateOffload> persist(std::function<void()>) const override { return shelve(); }
 
@@ -78,26 +80,59 @@ public:
   // (checkTake).
   // With usedStates, a request uses the state it resumes from, as the
   // engine's requests do (Cache::useState).
-  Run(uint32_t seed, bool windowed, bool peeks = false, bool usedStates = false)
-      : random_(seed), windowed_(windowed), peeks_(peeks), usedStates_(usedStates),
-        tier_(chance(50)),
-        budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
+  // Tight, a windowed run's conversations outgrow its budget, as long ones
+  // do at the memory wall: up to 36 blocks on 16 to 48 blocks' pages, and a
+  // state on 60% of growths, so that the budget refuses Cache::ensureTokens.
+  // A windowed run's blocks hold window units of 0 to 3 pages, and copies of
+  // them a window part of 100 bytes a page beside their base part's 100.
+  // Loose, 3 conversations of 12 pages never reach the 96 of the budget.
+  // Forked, a tight windowed run's conversations part from one another: the
+  // second base prompt shares the first's three pages, the third its first
+  // two, so that the states of conversations on one head pin its blocks
+  // together, as a regenerated reply's or a second conversation's do.
+  // Promoting, a start that read its state back from the SSD promotes it to
+  // RAM half the time, its copy a claim that reclaims (start).
+  // Sparse, sparse history spaces its writes every 4 to 8 pages by the seed
+  // (Cache::sparseHistory), so that its chains of 12 or 36 pages reach the
+  // spacing; else at the cache's default, past every chain.
+  Run(uint32_t seed, bool windowed, bool peeks = false, bool usedStates = false, bool tight = false,
+      bool forked = false, bool promotes = false, bool sparse = true)
+      : random_(seed), windowed_(windowed), peeks_(peeks), usedStates_(usedStates), promotes_(promotes),
+        tight_(windowed && tight),
+        unitPages_(windowed ? pick(0, 3) : 0), tier_(chance(50), 100 * unitPages_),
+        budget_(std::make_shared<model::DiskBudget>(kSlots * tier_.slotBytes())),
         spill_(windowed ? std::nullopt : std::optional(CacheSpillPolicy{pick(0, 2), pick(1, 2), chance(50)})),
         cache_(pool_, &tier_, budget_, spill_,
-               windowed ? std::optional(CacheWindowPolicy{pick(1, 3)}) : std::nullopt) {
+               windowed ? std::optional(CacheWindowPolicy{pick(1, 3), unitPages_}) : std::nullopt),
+        maximumPages_(tight_ ? 36 : 12) {
     tier_.budget = budget_;
     tier_.transferLimit = 64;
     tier_.writeLimits = {8, 4, 8};
-    storage_.budgetPages = 96;
+    // Each block takes its base page and its window unit.
+    storage_.budgetPages = (tight_ ? pick(16, 48) : 96) * (1 + unitPages_);
     // Every count a peek or a take makes of what a reclaim reaches follows
     // its rule over the whole cache, as kv-page-cache's
     // testPageReachFollowsItsRule states it.
     cache_.checkReaches(true);
+    // Every release of a state frees exactly the window units its count
+    // names (Cache::releaseState).
+    cache_.checkReleases(true);
+    // And each step of a take's walk checks the answers the cache keeps
+    // before it reads one: a take of many releases reads them between its
+    // own changes.
+    cache_.checkKeptAnswers(true);
+    cache_.checkResumes(true);
+    cache_.checkTails(true);
+    if (sparse)
+      cache_.sparseHistory((4 + seed % 5) * KvCache::pageTokens);
     for (uint32_t base = 0; base < bases_.size(); ++base) {
-      bases_[base].resize(kMaximumPages * KvCache::pageTokens + 1);
+      bases_[base].resize(maximumPages_ * KvCache::pageTokens + 1);
       for (uint32_t row = 0; row < bases_[base].size(); ++row)
         bases_[base][row] = 1000 * (base + 1) + row;
     }
+    if (forked)
+      for (uint32_t base = 1; base < bases_.size(); ++base)
+        std::copy_n(bases_[0].begin(), (4 - base) * KvCache::pageTokens, bases_[base].begin());
   }
 
   void step() {
@@ -107,10 +142,9 @@ public:
     case 3: static_cast<void>(cache_.writeThrough()); break;
     case 4: land(); break;
     case 5:
-      static_cast<void>(windowed_ ? cache_.trimWindows(chance(80))
-                                  : cache_.spillWritten(chance(50) ? SpilledExtents::KeepRunway
-                                                                   : SpilledExtents::Released)
-                                        .additionalPages);
+      if (!windowed_)
+        static_cast<void>(
+            cache_.spillWritten(chance(50) ? SpilledExtents::KeepRunway : SpilledExtents::Released).additionalPages);
       break;
     case 6: reclaim(); break;
     case 7: keepQuota(); break;
@@ -129,17 +163,31 @@ public:
   }
 
   uint64_t steps = 0;
+  // Growths the budget refused in the end, and admissions refused again for a
+  // need the ledger had met.
+  uint64_t refusedGrowths = 0, refusedAfterMet = 0;
   // Units taken, by whether their takes freed, in the need's measure, all
   // peek counted when it first offered them (exact) or less (short), and of
   // those offered as needing no write the same: a short one of those is one
   // of the classes checkTake names.
   uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0;
+  // Takes that wrote and whose room on the SSD gave up a state holding
+  // window units (Quota, checkTake).
+  uint64_t quotaTakes = 0;
+  // States read back from the SSD and promoted, their copies' claims reclaiming.
+  uint64_t promotions = 0;
+  // Claims whose count stopped short of the full count once it covered
+  // their need (checkTake).
+  uint64_t boundedCounts = 0;
+  // Device needs in place among the claims (checkTake), drawn only where
+  // inPlaceNeeds_ is set: the pinned seeds keep the claims they were found
+  // with.
+  bool inPlaceNeeds_ = false;
+  uint64_t inPlaceClaims = 0;
   // Releases of whole extents for bytes (releaseExtents): those taken, those whose last extent the free Full pages
   // beside completed, those beside transfers in flight, and those that freed less than their count where the runway
   // held less than an extent before, or where the runway's refill was refused and moved fewer pages.
   uint64_t extentReleases = 0, besideReleases = 0, inFlightReleases = 0, shortRunwayReleases = 0, refusedReleases = 0;
-  // Drains that found the tier holding copies of Slim pages.
-  uint64_t slimCopies = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -152,12 +200,10 @@ public:
     require(pool.pagesActive == 0 && budget_->committedBytes() == 0 && cache_.spillSnapshot().heldBytes == 0,
             "a finished run left pages held, quota committed or copies held");
     // The quota counts what the cache's copies hold and no more: each KV
-    // copy what a slot of the page it was written from takes, a Slim page's
-    // less than a Full one's, and each state.
+    // copy's slot and each state.
     const CacheSnapshot held = cache_.snapshot();
     require(budget_->usedBytes() == held.kvTier.diskBytes + held.stateCache.diskBytes,
             "the quota counts other than what the cache's copies hold");
-    slimCopies += held.kvTier.diskBytes < uint64_t{held.kvTier.diskBlocks} * tier_.slotBytes(kv::PageForm::Full);
   }
 
   // Every request ends; the transfers in flight stay so.
@@ -197,15 +243,23 @@ public:
                           .requestId = cls == ClaimClass::Host ? 0u : 1u,
                           .reach = chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary,
                           .timing = chance(50) ? NeedTiming::Immediate : NeedTiming::CanWait};
-    const kv::PageForm form = !chance(50) ? kv::PageForm::Full : windowed_ ? kv::PageForm::Slim : kv::PageForm::Index;
+    const kv::PageForm form = !chance(50) || windowed_ ? kv::PageForm::Full : kv::PageForm::Index;
     const uint32_t stateBuffers = chance(30) ? 1u : 0u;
     // A device need, a page need, or a need of state buffers alone.
     const uint32_t kind = pick(0, 2);
     const bool device = kind == 0;
     const bool states = kind == 2;
+    // A device need in place, as the engine makes it when refused memory
+    // for a lane's pages: bytes and pages of its form, met by either
+    // (MemoryLedger's covered), its units counted by those pages (reach).
+    const bool inPlace = device && inPlaceNeeds_ && chance(50);
+    const uint32_t placePages = inPlace ? pick(1, 8) : 0;
+    inPlaceClaims += inPlace ? 1 : 0;
     const VictimQuery query =
         test::query(claim,
-                    device   ? Need{.bytes = pick(1, 8) * 400ull, .stateBuffers = stateBuffers}
+                    inPlace  ? Need{.bytes = pick(1, 8) * 400ull, .pages = placePages, .form = form,
+                                    .stateBuffers = stateBuffers}
+                    : device ? Need{.bytes = pick(1, 8) * 400ull, .stateBuffers = stateBuffers}
                     : states ? Need{.hostRefused = chance(50), .stateBuffers = pick(1, 2)}
                              : Need{.hostRefused = chance(50), .pages = pick(1, 8), .form = form,
                                     .stateBuffers = stateBuffers},
@@ -222,18 +276,30 @@ public:
     std::vector<uint64_t> wanted;
     if (usedStates_) {
       const std::span<const uint32_t> base = bases_[pick(0, static_cast<uint32_t>(bases_.size()) - 1)];
-      const CacheProbe probe = cache_.probe(base.first(pick(1, kMaximumPages - 2) * KvCache::pageTokens + 1), {});
+      const CacheProbe probe = cache_.probe(base.first(pick(1, maximumPages_ - 2) * KvCache::pageTokens + 1), {});
       wanted.assign(probe.restoredChain().begin(), probe.restoredChain().end());
       cache_.setWantedChains({wanted});
     }
     const bool wantedResident = !wanted.empty() && cache_.stateResident(wanted.back());
     // A unit's measure: bytes for a device need, pages of its form for a
     // page need, buffers for a state need.
+    // In place, the pages of its form it keeps free, and beside them the
+    // bytes of the other forms' extents (bytesThrough), either of which the
+    // ledger's covered() takes.
     const auto measure = [&](const engine::Victim &unit) -> uint64_t {
-      return device ? unit.bytes : states ? unit.stateBuffers : unit.form == form ? unit.pages : 0;
+      return device && !inPlace ? unit.bytes : states ? unit.stateBuffers : unit.form == form ? unit.pages : 0;
     };
     const auto gaveOf = [&](const FreeResult &taken) -> uint64_t {
-      return device ? taken.nowBytes + taken.laterBytes : states ? taken.stateBuffers : taken.pages;
+      return device && !inPlace ? taken.nowBytes + taken.laterBytes : states ? taken.stateBuffers : taken.pages;
+    };
+    const auto bytesThrough = [&](const engine::Victim &unit) {
+      uint64_t sum = 0;
+      for (std::optional<engine::Victim> each = cache_.peek(query, nullptr); each; each = cache_.peek(query, &*each)) {
+        sum += each->later && immediate ? 0 : each->bytes;
+        if (each->key == unit.key)
+          break;
+      }
+      return sum;
     };
     // What the units from the head of the cache's order through `unit`
     // count, as the ledger counts them (MemoryLedger::bound): a claim that
@@ -251,14 +317,43 @@ public:
       }
       return sum;
     };
+    // A count stops once it covers the need and the most one take frees
+    // past it (Cache::reach): the units it offers count no more, through
+    // each, than the count of all the walk reaches, and cover the need
+    // exactly when that count does; the takes below check that each frees
+    // no more than the bounded count offered through its unit.
+    if (!states) {
+      const auto counts = [&](bool bounded) {
+        cache_.boundCounts(bounded);
+        std::map<uint64_t, uint64_t> through;
+        uint64_t sum = 0;
+        for (std::optional<engine::Victim> each = cache_.peek(query, nullptr); each; each = cache_.peek(query, &*each)) {
+          sum += each->later && immediate ? 0 : measure(*each);
+          through[each->key] = sum;
+        }
+        cache_.boundCounts(true);
+        return std::pair{through, sum};
+      };
+      const auto [bounded, boundedSum] = counts(true);
+      const auto [full, fullSum] = counts(false);
+      const uint64_t need = device && !inPlace ? query.need.bytes : query.need.pages;
+      require((boundedSum >= need) == (fullSum >= need) && boundedSum <= fullSum,
+              "the bounded count gave " + std::to_string(boundedSum) + " where the full count gave " +
+                  std::to_string(fullSum) + " of a need of " + std::to_string(need));
+      for (const auto &[key, sum] : bounded)
+        if (const auto other = full.find(key); other != full.end())
+          require(sum <= other->second, "the bounded count through a unit gave " + std::to_string(sum) +
+                                            ", the full count " + std::to_string(other->second));
+      boundedCounts += boundedSum < fullSum ? 1 : 0;
+    }
     // What a take that gives something changes: the memory the pool holds,
     // its free, landing and cached pages, the states in RAM, the writes
     // started.
     const auto fingerprint = [&] {
       const CacheSnapshot snapshot = cache_.snapshot();
       return std::tuple{pool_.allocatedBytes(),          pool_.freePageCount(kv::PageForm::Full),
-                        pool_.freePageCount(kv::PageForm::Slim), pool_.freePageCount(kv::PageForm::Index),
-                        cache_.demotedPages(),           snapshot.pool.pagesPrefix,
+                        pool_.freePageCount(kv::PageForm::Index), cache_.demotedPages(),
+                        snapshot.pool.pagesPrefix,
                         snapshot.stateCache.entries,     snapshot.stateCache.bytes,
                         snapshot.stateCache.offloads,    tier_.demotions};
     };
@@ -270,8 +365,8 @@ public:
       uint64_t freed = 0;
       bool write = false;
       bool pending = false;
-      uint64_t slimRoom = 0;
-      bool netted = false;
+      // The landing its takes netted (FreeResult::nettedBytes).
+      uint64_t netted = 0;
       std::string takes;
     };
     std::map<uint64_t, Taken> taken;
@@ -279,6 +374,13 @@ public:
     // the head of the order, again from the head after a take that gave
     // something, the next one after a take that gave nothing; a claim that
     // does not wait for writes passes over what lands later.
+    // The landing the takes credited (laterBytes) and no release netted
+    // since: what the next take may net (VictimQuery::landingCredited).
+    uint64_t credited = 0, gaveAll = 0, gaveBytes = 0;
+    // The claim as a whole, against what the pool really released (below):
+    // what its takes reported now and later, and netted.
+    uint64_t claimReported = 0, claimNetted = 0, claimQuota = 0;
+    const uint64_t claimAllocated = pool_.allocatedBytes(), claimLanding = cache_.returning().landingBytes;
     for (std::optional<engine::Victim> unit = cache_.peek(query, nullptr); unit;) {
       if (unit->later && immediate) {
         unit = cache_.peek(query, &*unit);
@@ -288,17 +390,51 @@ public:
       const bool firstTake = !taken.contains(unit->key);
       Taken &record = taken[unit->key];
       if (firstTake)
-        record = {.counted = measure(*unit),
-                  .write = unit->write,
-                  .slimRoom = uint64_t{pool_.allocatedExtents(kv::PageForm::Slim)} * pool_.extentPages()};
+        record = {.counted = measure(*unit), .write = unit->write};
       const auto unchanged = fingerprint();
       const uint64_t before = pool_.allocatedBytes();
       const uint64_t offloads = cache_.snapshot().stateCache.offloads;
       const uint32_t demotions = tier_.demotions;
       const uint64_t landingBefore = cache_.returning().landingBytes;
-      const uint32_t slimBefore = pool_.freePageCount(kv::PageForm::Slim);
-      const FreeResult result = cache_.take(query, *unit);
+      const uint64_t elsewhere = cache_.unitsFreedElsewhere();
+      // The landing the takes before it credited, and what the claim lacks
+      // past what they freed, as the ledger passes them: a take of the
+      // cache's reclaims takes steps up to that lack.
+      VictimQuery taking = query;
+      taking.landingCredited = credited;
+      taking.lackingBytes = device ? query.need.bytes - std::min<uint64_t>(query.need.bytes, gaveBytes) : 0;
+      taking.lackingPages = (device && !inPlace) || states ? 0 : query.need.pages - std::min<uint64_t>(query.need.pages, gaveAll);
+      const uint64_t throughBytes = inPlace ? bytesThrough(*unit) : 0;
+      const FreeResult result = cache_.take(taking, *unit);
+      // A take nets no more of the landing than the claim was credited and
+      // still holds: by the takes before it and its own steps, and, waiting
+      // for landings, the drop of the ledger's count of what lands
+      // (reclaimStep).
+      const uint64_t landingDrop = landingBefore - std::min(landingBefore, cache_.returning().landingBytes);
+      require(result.nettedCredited <= result.nettedBytes && result.nettedCredited <= credited + result.laterBytes &&
+                  result.nettedBytes - result.nettedCredited <= (query.rights.waitsForLandings ? landingDrop : 0),
+              "a take netted " + std::to_string(result.nettedBytes) + " (" + std::to_string(result.nettedCredited) +
+                  " of the claim's own credit of " + std::to_string(credited) + ")");
+      credited = credited - std::min(credited, result.nettedCredited) + result.laterBytes;
+      claimReported += result.nowBytes + result.laterBytes;
+      claimNetted += result.nettedBytes;
       const uint64_t released = before - std::min(before, pool_.allocatedBytes());
+      // Quota: a take that writes makes room on the SSD as the quota gives
+      // copies up, and a state given up there frees the window units its
+      // tail held, which no count can know (Cache::unitsFreedElsewhere), as
+      // are those of a point the give-up left history that the same take
+      // releases with no write (take-used forked seed 21777). Its
+      // pages are subtracted from what the take freed, in the need's
+      // measure: for bytes, the whole extents they fill at most.
+      const uint64_t quotaPages = (cache_.unitsFreedElsewhere() - elsewhere) * unitPages_;
+      require(unit->write || !quotaPages, "a take of a unit offered as needing no write gave copies up for the quota");
+      const uint64_t extentBytes = uint64_t{pool_.extentPages()} * storage_.bytesPerPage(kv::PageForm::Full);
+      const uint64_t quotaBytes = (quotaPages + pool_.extentPages() - 1) / pool_.extentPages() * extentBytes;
+      const uint64_t quota = device && !inPlace ? quotaBytes
+                             : states           ? 0
+                                                : quotaPages;
+      quotaTakes += quotaPages ? 1 : 0;
+      claimQuota += quotaBytes;
       require(result.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
                                                std::to_string(result.nowBytes));
       const uint64_t written = cache_.snapshot().stateCache.offloads - offloads;
@@ -312,17 +448,24 @@ public:
       // Peek never counts less than its take frees: a take frees no more
       // than the units from the head through it count, the units before it
       // being what the take may free first (free pages, the extents they
-      // fill).
-      require(gaveOf(result) <= through, "a take freed " + std::to_string(gaveOf(result)) +
-                                             " where the units through it counted " + std::to_string(through));
+      // fill). Judged at each take against the units as then offered, a unit
+      // offered again counting afresh: for a device need by bytes its bytes
+      // now and later, in place its pages and, below, its bytes.
+      require(gaveOf(result) - std::min(gaveOf(result), quota) <= through,
+              "a take freed " + std::to_string(gaveOf(result)) + " (" + std::to_string(quota) +
+                  " of it through the quota) where the units through it counted " + std::to_string(through));
+      const uint64_t resultBytes = result.nowBytes + result.laterBytes;
+      require(!inPlace || resultBytes - std::min(resultBytes, quotaBytes) <= throughBytes,
+              "in place, a take freed " + std::to_string(resultBytes) + " bytes where the units through it counted " +
+                  std::to_string(throughBytes));
       record.freed += gaveOf(result);
+      gaveAll += gaveOf(result);
+      gaveBytes += resultBytes;
       record.pending = record.pending || result.outcome == FreeOutcome::Pending;
-      const uint32_t slimAfter = pool_.freePageCount(kv::PageForm::Slim);
-      record.slimRoom += slimAfter - std::min(slimAfter, slimBefore);
-      record.netted = record.netted || (device && released > gaveOf(result) &&
-                                        cache_.returning().landingBytes < landingBefore);
+      record.netted += result.nettedBytes;
       record.takes += " [" + std::to_string(measure(*unit)) + " counted, " + std::to_string(gaveOf(result)) +
-                      " freed, " + std::to_string(released) + " released, " + std::to_string(result.stateBuffers) +
+                      " freed, " + std::to_string(released) + " released, " + std::to_string(result.nettedBytes) +
+                      " netted, " + std::to_string(result.stateBuffers) +
                       " states, outcome " + std::to_string(static_cast<int>(result.outcome)) + "]";
       // Progress: a take that says it gave something changed the cache, so
       // the ledger's peek again from the head never finds the same unit for
@@ -339,34 +482,51 @@ public:
         unit = cache_.peek(query, &*unit);
       }
     }
+    // What the claim's takes reported and netted covers what the pool
+    // released, read from the pool rather than from the takes' own account.
+    // Not yet held (kLandingTold, the oracle of its own task): that a claim
+    // is told no more, now and later, than the pool released and what lands
+    // at its end, past the landing it was credited at its start when it
+    // waits for landings (MemoryLedger::free). It fails from take plain seed
+    // 10 on: a waiting claim credited 400 of landing by the ledger's count
+    // (returning, no runway, spills beside) whose release took the free pages
+    // that landing needed, which the take's count (landingFill, the runway
+    // kept, demotions alone) never saw, and so reported as now.
+    constexpr bool kLandingTold = false;
+    if (device && !inPlace) {
+      const uint64_t released = claimAllocated - std::min(claimAllocated, pool_.allocatedBytes());
+      const uint64_t told = claimReported + (query.rights.waitsForLandings ? claimLanding : 0);
+      require(!kLandingTold || told <= released + cache_.returning().landingBytes + claimQuota,
+              "a claim's takes reported " + std::to_string(claimReported) + " where the pool released " +
+                  std::to_string(released) + " and " + std::to_string(cache_.returning().landingBytes) + " lands");
+      require(claimReported + claimNetted >= released,
+              "a claim's takes reported " + std::to_string(claimReported) + " and netted " +
+                  std::to_string(claimNetted) + " where the pool released " + std::to_string(released));
+    }
     // Tightness: a unit offered as needing no write frees all it counted
-    // when first offered, but for three classes, each named by what its
-    // takes report:
+    // when first offered, but for two classes, each named by what its takes
+    // report:
     // - Pending: a take of it ended Pending, a transfer in flight holding
     //   the rest, which comes back as it lands.
-    // - Trims: a page need of Full pages in a windowed cache, short by at
-    //   most the Slim pages its trims could go into (those allocated when it
-    //   was first offered, and each its takes freed). Its count trims the
-    //   pages the windows passed and the tails of the states the phase lets
-    //   go into the Slim pages free or freed in the phase; its takes trim
-    //   only once a state goes, into the Slim pages free then, and only what
-    //   no other tail or window still holds, and the Trim unit before it
-    //   trims into the Slim pages its takes free: what it trims itself
-    //   depends on the order of the phase's takes.
-    // - Netted: a device need whose take released an extent the landing
-    //   pages would have completed, as the landing count dropped. The take
-    //   credits the release less the landing extent it cancels (net
-    //   nothing), while the count keeps the release as its least (Cache::
-    //   reach), so that a claim takes that memory now rather than waiting for
-    //   the landing (testAReleaseOfWhatALandingCompletesCountsOnce).
+    // - Netted: a device need by bytes whose take released an extent the
+    //   landing pages would have completed, a landing the claim was credited
+    //   and still held (checked at each take): by the ledger's count of what
+    //   lands, or by its own takes before (take plain seed 1226654: a Later
+    //   unit's evictions let a demotion complete an extent, credited later;
+    //   the Now unit's release then took the free pages it needed). The take
+    //   credits the release less the landing it cancels and reports that
+    //   (FreeResult::nettedBytes), while the count keeps the release as its
+    //   least (Cache::reach), so that a claim takes that memory now rather
+    //   than waiting for the landing: what it freed and netted is exactly
+    //   what it counted (testAReleaseOfWhatALandingCompletesCountsOnce,
+    //   testAReleaseNetsTheLandingAnEarlierTakeCredited).
     for (const auto &[key, record] : taken) {
       const bool exact = record.freed >= record.counted;
       ++(exact ? exactUnits : shortUnits);
       if (!record.write)
         ++(exact ? exactNoWrite : shortNoWrite);
-      const bool trims = windowed_ && !device && !states && form == kv::PageForm::Full &&
-                         record.counted - std::min(record.counted, record.freed) <= record.slimRoom;
-      require(exact || record.write || record.pending || trims || record.netted,
+      require(exact || record.write || record.pending ||
+                  (device && !inPlace && record.netted && record.freed + record.netted >= record.counted),
               "a unit offered as needing no write freed " + std::to_string(record.freed) + " of the " +
                   std::to_string(record.counted) + " it counted (unit " + std::to_string(key >> 56) + ":" +
                   std::to_string(key & 0xff) + (device ? ", device" : states ? ", states" : ", pages") +
@@ -384,7 +544,6 @@ public:
 
 private:
   static constexpr uint64_t kSlots = 160;
-  static constexpr uint32_t kMaximumPages = 12;
 
   struct Request final {
     uint32_t base = 0;
@@ -414,15 +573,25 @@ private:
   }
   bool waiting(uint64_t id) const { return cache_.kvRestoreStatus(id) == KvRestoreStatus::Pending; }
 
-  // Admits as the engine does: a denial makes room in reclaim steps, of
-  // the form denied, until the pages fit or nothing more goes.
+  // Admits as the engine does (Engine::allocate): a denial makes room in
+  // reclaim steps, of the form denied, until the pages fit, nothing more
+  // goes, or the need is one already freed for once: at the wall a need met
+  // for Index pages can free a Full extent the retry refills first, and is
+  // refused again for ever.
   template <class Attempt> TokenAdmission admit(Attempt attempt) {
     TokenAdmission admission = attempt();
-    while (admission.failure == TokenAdmissionFailure::Denied &&
-           test::takeFirst(cache_, test::kInServiceGrowth,
-                           {.pages = admission.additionalPages, .form = admission.form})
-                   .outcome == FreeOutcome::Met)
+    std::vector<Need> freedFor;
+    while (admission.failure == TokenAdmissionFailure::Denied) {
+      const Need need{.pages = admission.additionalPages, .form = admission.form};
+      if (std::ranges::find(freedFor, need) != freedFor.end()) {
+        ++refusedAfterMet;
+        break;
+      }
+      freedFor.push_back(need);
+      if (test::takeFirst(cache_, test::kInServiceGrowth, need).outcome != FreeOutcome::Met)
+        break;
       admission = attempt();
+    }
     return admission;
   }
 
@@ -433,12 +602,12 @@ private:
     if (requests_.size() >= 6) return;
     const uint64_t id = ++nextId_;
     Request request{.base = pick(0, static_cast<uint32_t>(bases_.size()) - 1),
-                    .pages = pick(1, kMaximumPages - 2),
+                    .pages = pick(1, maximumPages_ - 2),
                     .mode = !windowed_ && chance(60) ? KvMode::Spill : KvMode::Resident};
     CacheLookup lookup = cache_.lookup(prompt(request), {});
     cache_.beginRequest(id, request.mode);
     const Cache::ChainCopies copies = lookup.state ? cache_.chainCopies(lookup.state->kvBlock()) : Cache::ChainCopies{};
-    if (request.mode == KvMode::Spill && !cache_.commitSpill(id, kMaximumPages - copies.copied, copies)) {
+    if (request.mode == KvMode::Spill && !cache_.commitSpill(id, maximumPages_ - copies.copied, copies)) {
       cache_.endRequest(id);
       return;
     }
@@ -447,6 +616,21 @@ private:
       return;
     }
     request.pages = lookup.resumeBoundary() / KvCache::pageTokens;
+    // As the engine does once a state's read lands (Engine::pollRestores), the
+    // state is promoted to RAM, its copy a claim that may reclaim
+    // (Engine::promotedCopy), before the lane goes on.
+    if (promotes_ && lookup.state && !lookup.state->state()->residentBytes() && chance(50)) {
+      tier_.complete();
+      static_cast<void>(cache_.pollTransfers());
+      if (cache_.kvRestoreStatus(id) == KvRestoreStatus::None) {
+        const uint64_t before = cache_.snapshot().stateCache.promotions;
+        cache_.promoteState(lookup, [&] {
+          reclaim();
+          return std::make_shared<ShelvedState>(shelf_, false);
+        }, id);
+        promotions += cache_.snapshot().stateCache.promotions - before;
+      }
+    }
     if (usedStates_ && lookup.state) {
       request.state = lookup.state->kvBlock();
       request.use = cache_.useState(request.state);
@@ -458,19 +642,21 @@ private:
   // a state lands at its newest block.
   void grow() {
     Request *request = anyRequest();
-    if (!request || request->pages >= kMaximumPages) return;
+    if (!request || request->pages >= maximumPages_) return;
     const uint64_t id = idOf(*request);
     if (waiting(id)) return;
-    const uint32_t pages = std::min(kMaximumPages, request->pages + pick(1, 3));
-    if (!admit([&] { return cache_.ensureTokens(id, pages * KvCache::pageTokens + 1); }).granted()) return;
+    const uint32_t pages = std::min(maximumPages_, request->pages + pick(1, 3));
+    const TokenAdmission grown = admit([&] { return cache_.ensureTokens(id, pages * KvCache::pageTokens + 1); });
+    refusedGrowths += !grown.granted();
+    if (!grown.granted()) return;
     request->pages = pages;
     cache_.publishCommittedBlocks(id, prompt(*request), pages * KvCache::pageTokens, {});
-    // As the engine does, a state at a block another request published one
-    // at is reused, and one is published only with a tail it restores from.
+    // As the engine does, a state goes only where its tail holds its window
+    // units, and one at a block another request published one at is reused.
     if (const uint64_t block = cache_.blockAt(id, pages * KvCache::pageTokens);
-        chance(30) && !cache_.reuseStoredState(block) && cache_.stateTailFull(block)) {
+        chance(tight_ ? 60 : 30) && cache_.stateTailPresent(block, id) && !cache_.reuseStoredState(block)) {
       const bool checkpoint = peeks_ && chance(30);
-      cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), checkpoint);
+      cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), checkpoint, id);
       // Half the checkpoints are replies' states, which a reply's decode
       // captures, half of those kept, as its request's end keeps one.
       if (checkpoint && chance(50)) {
@@ -533,7 +719,7 @@ private:
   void convert() {
     Request *request = anyRequest();
     if (windowed_ || !request || request->mode == KvMode::Spill) return;
-    if (cache_.convertToSpill(idOf(*request), kMaximumPages)) request->mode = KvMode::Spill;
+    if (cache_.convertToSpill(idOf(*request), maximumPages_)) request->mode = KvMode::Spill;
   }
 
   // Guard: a claim releases a Spill request's oldest pages whose copies
@@ -558,7 +744,7 @@ private:
     std::optional<CacheProbe> start;
     if (chance(50)) {
       const std::span<const uint32_t> base = bases_[pick(0, static_cast<uint32_t>(bases_.size()) - 1)];
-      start = cache_.probe(base.first(pick(1, kMaximumPages - 2) * KvCache::pageTokens + 1), {});
+      start = cache_.probe(base.first(pick(1, maximumPages_ - 2) * KvCache::pageTokens + 1), {});
     }
     const std::span<const uint64_t> kept = start ? start->restoredChain() : std::span<const uint64_t>{};
     const ReleaseRule rule{.takesFrom = [&](uint64_t holder) { return released.contains(holder); }, .kept = kept};
@@ -726,15 +912,19 @@ private:
   bool windowed_;
   bool peeks_;
   bool usedStates_;
-  // Index pages of 10 bytes for a run that spills, Slim ones of 30 for a
-  // windowed one.
-  test::TestKvStorage storage_{1024, 100, 4, 10, 30};
+  bool promotes_;
+  bool tight_;
+  // A windowed run's window unit, beside each block's base page.
+  uint32_t unitPages_;
+  // Index pages of 10 bytes for a run that spills.
+  test::TestKvStorage storage_{1024, 100, 4, 10};
   KvPool pool_{storage_, 4};
   test::TestKvTier tier_;
   std::shared_ptr<model::DiskBudget> budget_;
   std::optional<CacheSpillPolicy> spill_;
   engine::Cache cache_;
   std::shared_ptr<Shelf> shelf_ = std::make_shared<Shelf>(Shelf{.budget = budget_});
+  uint32_t maximumPages_;
   std::array<std::vector<uint32_t>, 3> bases_;
   std::map<uint64_t, Request> requests_;
   // What the commands in flight read.
@@ -742,12 +932,41 @@ private:
   uint64_t nextId_ = 0;
 };
 
-// Seeds 1..plainSeeds plain and 1..windowedSeeds windowed, plus windowed seed 9454 (a poisoned
-// block's write lands after its subtree left).
-void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t releases = 0, beside = 0, inFlight = 0, shortRunway = 0, refused = 0, slimCopies = 0;
-  const auto check = [&](uint32_t seed, bool windowed) {
-    Run run(seed, windowed);
+// The runs' kinds: plain, windowed, windowed on a tight budget, and the same
+// with conversations that part from one another.
+struct Kind final {
+  bool windowed = false, tight = false, forked = false;
+  [[nodiscard]] std::string name() const {
+    return forked ? "forked tight windowed " : tight ? "tight windowed " : windowed ? "windowed " : "";
+  }
+};
+constexpr std::array kKinds{Kind{}, Kind{.windowed = true}, Kind{.windowed = true, .tight = true},
+                            Kind{.windowed = true, .tight = true, .forked = true}};
+
+// The seeds a test runs: of every kind 1..plain or 1..windowed and its pinned seeds, or of one kind (`only`)
+// first..last alone, with requests using their states or not (`usedStates`, the take test's).
+struct Seeds final {
+  uint32_t plain = 8000, windowed = 400;
+  std::optional<Kind> only;
+  uint32_t first = 1, last = 0;
+  std::optional<bool> usedStates;
+  [[nodiscard]] bool runs(Kind kind) const {
+    return !only || (only->windowed == kind.windowed && only->tight == kind.tight && only->forked == kind.forked);
+  }
+  [[nodiscard]] uint32_t from() const { return only ? first : 1; }
+  [[nodiscard]] uint32_t to(Kind kind) const { return only ? last : kind.windowed ? windowed : plain; }
+};
+
+// Seeds 1..plainSeeds plain and 1..windowedSeeds windowed, tight and forked, plus windowed seed 9454 (a
+// poisoned block's write lands after its subtree left) and tight windowed seed 173965 (a part acquired into a
+// block's copy for a write that does not start goes back).
+void testRandomRuns(const Seeds &seeds) {
+  uint64_t releases = 0, beside = 0, inFlight = 0, shortRunway = 0, refused = 0;
+  uint64_t refusedGrowths = 0, refusedAfterMet = 0, promotions = 0;
+  // The pinned seeds run as they were found, without promotions, sparse
+  // history at the cache's spacing.
+  const auto check = [&](uint32_t seed, Kind kind, bool promotes = true) {
+    Run run(seed, kind.windowed, false, false, kind.tight, kind.forked, promotes, promotes);
     try {
       for (int step = 0; step < 600; ++step)
         run.step();
@@ -755,74 +974,198 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
       run.drain();
       run.settle();
     } catch (const std::exception &error) {
-      throw std::runtime_error(std::string(windowed ? "windowed " : "") + "seed " + std::to_string(seed) + ": " +
-                               error.what());
+      throw std::runtime_error(kind.name() + "seed " + std::to_string(seed) + ": " + error.what());
     }
+    refusedGrowths += kind.tight ? run.refusedGrowths : 0;
+    refusedAfterMet += kind.tight ? run.refusedAfterMet : 0;
+    promotions += run.promotions;
     releases += run.extentReleases;
     beside += run.besideReleases;
     inFlight += run.inFlightReleases;
     shortRunway += run.shortRunwayReleases;
     refused += run.refusedReleases;
-    slimCopies += run.slimCopies;
   };
-  for (const bool windowed : {false, true})
-    for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
-      check(seed, windowed);
-  check(9454, true);
-  std::cout << "cache property runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
-            << " windowed and windowed seed 9454; " << releases << " releases of whole extents, " << beside
+  for (const Kind kind : kKinds)
+    for (uint32_t seed = seeds.from(); seeds.runs(kind) && seed <= seeds.to(kind); ++seed)
+      check(seed, kind);
+  if (seeds.only) {
+    std::cout << "cache property runs ok: " << seeds.only->name() << "seeds " << seeds.first << " to " << seeds.last
+              << ", " << promotions << " promotions whose copies reclaimed\n";
+    return;
+  }
+  check(9454, {.windowed = true}, false);
+  check(173965, {.windowed = true, .tight = true}, false);
+  require(refusedGrowths > 0, "no tight run's budget refused a growth");
+  std::cout << "cache property runs ok: " << seeds.plain << " plain seeds, " << seeds.windowed
+            << " windowed, as many tight and forked, sparse history every 4 to 8 pages, windowed seed 9454 and tight "
+               "seed 173965; the tight ones' budgets "
+               "refused " << refusedGrowths
+            << " growths in the end, " << refusedAfterMet << " admissions refused again for a need met; "
+            << releases << " releases of whole extents, " << beside
             << " of them completed by free pages beside, " << inFlight << " beside transfers in flight; of all, "
             << shortRunway << " freed less than counted with the runway short of an extent and " << refused
-            << " with its refill refused; the quota counted what the copies held at every run's end, " << slimCopies
-            << " of them with copies of Slim pages\n";
+            << " with its refill refused; " << promotions
+            << " promotions whose copies reclaimed; the quota counted what the copies held at every run's end\n";
 }
 
 // The same runs with random claims counted and taken (checkTake), again with requests using the states they resume
-// from.
-void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t steps = 0, exact = 0, shortOf = 0, exactNoWrite = 0, shortNoWrite = 0;
-  const auto check = [&](uint32_t seed, bool windowed, bool usedStates) {
-    Run run(seed, windowed, true, usedStates);
+// from, plus windowed seed 3965 (a page need counts the leaf under a superseded state in RAM, which only the state's
+// going lets the walk take: it goes because its tail holds the leaf), plain seed 380 with used states (a page need
+// counts the leaf under a history state that holds no page) and plain seed 16561 (a leaf's state leaves as room is
+// made for its copy, which finds no slot) and plain seed 11843 with used states (a release beside a landing the claim
+// was never credited gives its bytes now).
+void testTakeNeverExceedsPeek(const Seeds &seeds) {
+  uint64_t steps = 0, exact = 0, shortOf = 0, exactNoWrite = 0, shortNoWrite = 0, quotaTakes = 0, bounded = 0,
+           inPlace = 0;
+  bool inPlaceNeeds = true;
+  // The pinned seeds run as they were found, sparse history at the cache's
+  // spacing.
+  bool sparse = true;
+  const auto check = [&](uint32_t seed, Kind kind, bool usedStates) {
+    Run run(seed, kind.windowed, true, usedStates, kind.tight, kind.forked, false, sparse);
+    run.inPlaceNeeds_ = inPlaceNeeds;
     try {
       for (int step = 0; step < 600; ++step)
         run.step();
       run.endRequests();
       run.drain();
     } catch (const std::exception &error) {
-      throw std::runtime_error(std::string(usedStates ? "used states " : "") +
-                               (windowed ? "take windowed " : "take ") + "seed " + std::to_string(seed) + ": " +
-                               error.what());
+      throw std::runtime_error(std::string(usedStates ? "used states " : "") + "take " + kind.name() + "seed " +
+                               std::to_string(seed) + ": " + error.what());
     }
     steps += run.steps;
     exact += run.exactUnits;
     shortOf += run.shortUnits;
     exactNoWrite += run.exactNoWrite;
     shortNoWrite += run.shortNoWrite;
+    quotaTakes += run.quotaTakes;
+    bounded += run.boundedCounts;
+    inPlace += run.inPlaceClaims;
   };
   for (const bool usedStates : {false, true})
-    for (const bool windowed : {false, true})
-      for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
-        check(seed, windowed, usedStates);
-  std::cout << "cache take runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed; " << steps
+    for (const Kind kind : kKinds)
+      for (uint32_t seed = seeds.from(); seeds.usedStates.value_or(usedStates) == usedStates && seeds.runs(kind) &&
+                                         seed <= seeds.to(kind);
+           ++seed)
+        check(seed, kind, usedStates);
+  if (seeds.only) {
+    std::cout << "cache take runs ok: " << (*seeds.usedStates ? "used states " : "") << seeds.only->name()
+              << "seeds " << seeds.first << " to " << seeds.last << ", " << bounded
+              << " counts bounded short of the full count, " << inPlace << " device claims in place\n";
+    return;
+  }
+  inPlaceNeeds = false;
+  sparse = false;
+  check(3965, {.windowed = true}, false);
+  check(380, {}, true);
+  check(16561, {}, false);
+  check(11843, {}, true);
+  // Plain seed 138904 with used states: a take whose leaf waited for a transfer in flight says Pending.
+  check(138904, {}, true);
+  // Windowed layouts, each a rule of the count of points on the SSD: forked seed 32532 (stage 3's tail releases,
+  // count and take apart), windowed seed 5171 with used states (a unit a write in flight frees as a state's release
+  // lands), 21947 with used states (a unit's write into its block's copy, which then shows the window part), forked
+  // 35860 with used states (tail releases counted one at a time, history and modes judged on those before).
+  check(32532, {.windowed = true, .tight = true, .forked = true}, false);
+  check(5171, {.windowed = true}, true);
+  check(21947, {.windowed = true}, true);
+  check(35860, {.windowed = true, .tight = true, .forked = true}, true);
+  // Forked seeds: 301249, a state a count released earlier supersedes nothing, nor holds a state below a block;
+  // 39667 with used states, a point whose RAM copy a count released is from then on a point only on the SSD;
+  // 412049, a release with no write leaves its units to the writes of their window parts.
+  check(301249, {.windowed = true, .tight = true, .forked = true}, false);
+  check(39667, {.windowed = true, .tight = true, .forked = true}, true);
+  check(412049, {.windowed = true, .tight = true, .forked = true}, false);
+  // The take scan of e34562a0: tight 60576 with used states (a disk subtree kept for a state write elsewhere),
+  // forked 66773 with used states (a demotion's landing counted before its child's), forked 143938 and forked 21777
+  // with used states (a point the quota's give-up left history, released in the same take).
+  check(60576, {.windowed = true, .tight = true}, true);
+  check(66773, {.windowed = true, .tight = true, .forked = true}, true);
+  check(143938, {.windowed = true, .tight = true, .forked = true}, false);
+  check(21777, {.windowed = true, .tight = true, .forked = true}, true);
+  // A persistent quota's demotion gives up a copy under a landed point's state in a take, and the point above it,
+  // superseded only while that chain had landed, is history and released in the same take (tight 6613, used states).
+  check(6613, {.windowed = true, .tight = true}, true);
+  // With device needs in place drawn (the scan's stream): forked 12632 and 22423, a take's step took pins off a
+  // tail whose release its next step freed, past what a count that ran to its end had counted.
+  inPlaceNeeds = true;
+  check(12632, {.windowed = true, .tight = true, .forked = true}, false);
+  check(22423, {.windowed = true, .tight = true, .forked = true}, false);
+  // Plain 644947: a device need in place whose second step's landing completed an extent of another form, bytes no
+  // count bounded past the first step.
+  check(644947, {}, false);
+  // Plain 1226654: a release that cancelled the landing an earlier take of the claim credited, which the take nets
+  // (Netted) though the landing count stayed.
+  check(1226654, {}, false);
+  // Plain 101189: a take's first step released the extent free pages it had just freed completed alone, the
+  // ledger's count of what lands dropping, and its second freed a page that let the landing complete it again: the
+  // take nets only what it cancelled over all its steps (Cache::take).
+  check(101189, {}, false);
+  // The release mode's scan seeds, run as the scan ran them, sparse history every 4 + seed % 5 pages: forked 24004
+  // (8 pages), a point sparse history kept and queued stopped being kept as a write the take's walk started on its
+  // chain made the point below it no history (f2250deb); windowed 144893 (7 pages), a release with no write after
+  // the quota gave up a copy under a state in the same take (quotaGaveUpState_); tight 105583 (7 pages), and with
+  // used states, a point the count demoted judged as on the SSD alone (copyStays). Tight 15667 at the cache's
+  // spacing, where the scan found it: a point whose release wrote its copy counted as one to space from, and once
+  // on the SSD alone one the tails let go (copyStays).
+  sparse = true;
+  check(24004, {.windowed = true, .tight = true, .forked = true}, false);
+  check(144893, {.windowed = true}, false);
+  check(105583, {.windowed = true, .tight = true}, false);
+  check(105583, {.windowed = true, .tight = true}, true);
+  sparse = false;
+  check(15667, {.windowed = true, .tight = true}, false);
+  inPlaceNeeds = false;
+  std::cout << "cache take runs ok: " << seeds.plain << " plain seeds, " << seeds.windowed
+            << " windowed, tight and forked, sparse history every 4 to 8 pages, the pinned seeds; "
+            << steps
             << " reclaim steps taken as the ledger takes, each that gave something changing the cache and freeing no "
             << "more than the units through its own counted, every offered unit's first take giving something or "
             << "waiting; " << exact << " units freed all peek counted, " << shortOf << " less (" << exactNoWrite
-            << " and " << shortNoWrite << " of those needing no write, each Pending, Trims or Netted)\n";
+            << " and " << shortNoWrite << " of those needing no write, each Pending or Netted); " << quotaTakes
+            << " takes that wrote freed window units through the quota's copies given up (Quota); " << bounded
+            << " counts stopped short of the full count once they covered the need; " << inPlace
+            << " device claims in place\n";
 }
 
 } // namespace
 
-// cache-property [plainSeeds windowedSeeds]: 40 and 400 by default.
+// cache-property [plainSeeds windowedSeeds]: 8000 and 400 by default (a plain run costs a fifth of a windowed one), every
+// kind and test with the pinned seeds.
+// cache-property TEST KIND FIRST [LAST]: one test (runs, take, or take-used: the take test with requests using
+// their states) of one kind (plain, windowed, tight, forked), seeds FIRST to LAST (FIRST alone by default), so that
+// a scan splits across cores and a failing seed runs again alone.
 int main(int argc, char **argv) {
-  if (argc != 1 && argc != 3) {
-    std::cerr << "usage: cache-property [plainSeeds windowedSeeds]\n";
+  const std::array<std::pair<std::string_view, Kind>, 4> kinds{
+      std::pair{std::string_view{"plain"}, kKinds[0]}, std::pair{std::string_view{"windowed"}, kKinds[1]},
+      std::pair{std::string_view{"tight"}, kKinds[2]}, std::pair{std::string_view{"forked"}, kKinds[3]}};
+  const std::array<std::string_view, 3> tests{"runs", "take", "take-used"};
+  const auto kind = argc >= 4 ? std::ranges::find(kinds, std::string_view{argv[2]}, &decltype(kinds)::value_type::first)
+                              : kinds.end();
+  const auto test = argc >= 4 ? std::ranges::find(tests, std::string_view{argv[1]}) : tests.end();
+  if ((argc != 1 && argc != 3 && argc != 4 && argc != 5) || (argc >= 4 && (kind == kinds.end() || test == tests.end()))) {
+    std::cerr << "usage: cache-property [plainSeeds windowedSeeds] | cache-property runs|take|take-used "
+                 "plain|windowed|tight|forked FIRST [LAST]\n";
     return 2;
   }
   try {
-    const uint32_t plainSeeds = argc == 3 ? static_cast<uint32_t>(std::stoul(argv[1])) : 40u;
-    const uint32_t windowedSeeds = argc == 3 ? static_cast<uint32_t>(std::stoul(argv[2])) : 400u;
-    testRandomRuns(plainSeeds, windowedSeeds);
-    testTakeNeverExceedsPeek(plainSeeds, windowedSeeds);
+    Seeds seeds;
+    if (argc == 3) {
+      seeds.plain = static_cast<uint32_t>(std::stoul(argv[1]));
+      seeds.windowed = static_cast<uint32_t>(std::stoul(argv[2]));
+    } else if (argc >= 4) {
+      seeds.only = kind->second;
+      seeds.first = static_cast<uint32_t>(std::stoul(argv[3]));
+      seeds.last = argc == 5 ? static_cast<uint32_t>(std::stoul(argv[4])) : seeds.first;
+      seeds.usedStates = *test == "take-used";
+      if (*test == "runs")
+        testRandomRuns(seeds);
+      else
+        testTakeNeverExceedsPeek(seeds);
+      return 0;
+    }
+    testRandomRuns(seeds);
+    testTakeNeverExceedsPeek(seeds);
     std::cout << "cache property tests passed\n";
     return 0;
   } catch (const std::exception &error) {

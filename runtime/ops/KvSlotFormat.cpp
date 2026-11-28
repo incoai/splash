@@ -63,14 +63,15 @@ SlotFormat::SlotFormat(const Layout &layout) : layout_(layout) {
   recordPitch_ = pitchFor(recordsOffset_, recordBytes_, layout_.attentionLayers * kBlocksPerPage);
 }
 
-uint64_t SlotFormat::payloadBytes(PageForm form) const {
-  if (!version()) return layout_.bytesPerModelPage(form);
-  if (form != PageForm::Full) throw std::logic_error("a KV slot of block records holds a Full page");
+uint64_t SlotFormat::payloadBytes(Component component) const {
+  if (component == Component::Window)
+    return uint64_t{layout_.attentionLayers - layout_.pageSlots()} * layout_.bytesPerLayerPage();
+  if (!version()) return layout_.bytesPerModelPage();
   return recordsOffset_ + (uint64_t{layout_.attentionLayers} * kBlocksPerPage - 1) * recordPitch_ + recordBytes_;
 }
 
-std::vector<uint64_t> SlotFormat::segments() const {
-  if (!version()) return {payloadBytes()};
+std::vector<uint64_t> SlotFormat::segments(Component component) const {
+  if (!version() || component == Component::Window) return {payloadBytes(component)};
   std::vector<uint64_t> result(uint64_t{layout_.attentionLayers} * kBlocksPerPage + 1, recordPitch_);
   result.front() = recordsOffset_;
   result.back() = recordBytes_;

@@ -1115,15 +1115,15 @@ void invalidSteps() {
   // lanes' 128 eight lanes of 14 at 128 rows a step; a table of a class every
   // row makes runs past eight lanes' and is refused.
   using splash::model::ExecutionLimits;
-  static_assert(ExecutionLimits::runwayPages(32, 1) == 64 && ExecutionLimits::runwayPages(32, 4) == 64 &&
-                ExecutionLimits::runwayPages(32, 8) == 128 && ExecutionLimits::runwayPages(128, 5) == 128);
+  static_assert(ExecutionLimits::runwayPages(32, 1, 1) == 64 && ExecutionLimits::runwayPages(32, 4, 1) == 64 &&
+                ExecutionLimits::runwayPages(32, 8, 1) == 128 && ExecutionLimits::runwayPages(128, 5, 1) == 128);
   std::vector<uint32_t> everyRow;
   for (uint32_t row = 1; row <= 128; ++row) everyRow.push_back(row);
   const StepCosts every(everyRow, 128, false), moe(kClasses, 128, true), four(kClasses, 64, true);
-  rejects([&] { every.requireRunway(5, ExecutionLimits::runwayPages(128, 8), 8); }, "startup runway",
+  rejects([&] { every.requireRunway(5, ExecutionLimits::runwayPages(128, 8, 1), 8); }, "startup runway",
           "a table whose measurement runs past the startup runway was taken");
-  moe.requireRunway(5, ExecutionLimits::runwayPages(32, 8), 8);
-  four.requireRunway(5, ExecutionLimits::runwayPages(32, 4), 4);
+  moe.requireRunway(5, ExecutionLimits::runwayPages(32, 8, 1), 8);
+  four.requireRunway(5, ExecutionLimits::runwayPages(32, 4, 1), 4);
   StepCosts costs(kClasses, 64, false);
   const size_t points = costs.points(2).size();
   for (const std::vector<std::vector<double>> &replays :

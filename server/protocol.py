@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 16
+PROTOCOL_VERSION = 17
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -62,13 +62,16 @@ _STATUS_REQUEST = struct.Struct("<Q")
 _RELEASE_REQUEST = struct.Struct("<Q")
 # Concurrent requests, context, vision, vocabulary, mask rows, stop count.
 _READY = struct.Struct("<IIBIII")
-# Request, lane, matched prompt tokens, prefix tokens, state source, lost state.
-_START = struct.Struct("<QIIIBB")
+# Request, lane, matched prompt tokens, prefix tokens, state source, lost
+# state, reuse end, reuse end tokens.
+_START = struct.Struct("<QIIIBBBI")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
 _DONE = struct.Struct("<QBBIIQQQIIIII")
-_ERROR = struct.Struct("<BBIQII")
+# Failure class, retryable, retry after, request, capacity limit, fits tokens,
+# code bytes, message bytes.
+_ERROR = struct.Struct("<BBIQBIII")
 _STATUS_JSON = struct.Struct("<Q")
 # Kind, bound, required bytes, budget bytes, plan context, message bytes.
 _START_FAILED = struct.Struct("<BBQQII")
@@ -84,9 +87,9 @@ assert _HEADER.size == FRAME_HEADER_BYTES
 assert _REQUEST.size == 118
 assert _IMAGE_SPAN.size == 40
 assert _READY.size == 21
-assert _START.size == 22
+assert _START.size == 27
 assert _DONE.size == 62
-assert _ERROR.size == 22
+assert _ERROR.size == 27
 assert _STATUS_JSON.size == 8
 assert _START_FAILED.size == 26
 assert _WARMING.size == 8
@@ -396,6 +399,17 @@ class StateSource(IntEnum):
     DISK = 2
 
 
+class ReuseEnd(IntEnum):
+    """Why a start's reuse stopped (engine::ReuseEnd): nothing matched; the
+    prompt parts from the cache where the matched KV ends; KV matched past the
+    state it resumed from; or a read from the SSD cache failed."""
+
+    NOTHING_MATCHED = 0
+    PREFIX_END = 1
+    KV_WITHOUT_STATE = 2
+    DISK_READ_FAILED = 3
+
+
 @dataclass(slots=True, frozen=True)
 class StartEvent:
     request_id: int
@@ -404,11 +418,13 @@ class StartEvent:
     # from, zero for a cold start; the prompt's tokens whose KV the cache
     # matched, the state's included; where that state was; and whether a
     # matched block past the state once held a state that is gone from both
-    # tiers.
+    # tiers; why its reuse stopped, and that end's tokens (engine::StartFound).
     matched_prompt_tokens: int
     prefix_tokens: int = 0
     state_source: StateSource = StateSource.NONE
     lost_state: bool = False
+    reuse_end: ReuseEnd = ReuseEnd.NOTHING_MATCHED
+    reuse_end_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -478,6 +494,19 @@ class DoneEvent:
     bounded: bool = False
 
 
+class CapacityLimit(IntEnum):
+    """What a request that cannot fit even alone lacked (engine::
+    CapacityLimit): memory, memory beside its images, an SSD cache that takes
+    no writes, or the SSD cache's quota of active KV; none for any other
+    failure."""
+
+    NONE = 0
+    MEMORY = 1
+    IMAGE_MEMORY = 2
+    CLOSED_DISK = 3
+    DISK_QUOTA = 4
+
+
 @dataclass(slots=True, frozen=True)
 class ErrorEvent:
     failure_class: FailureClass
@@ -488,6 +517,10 @@ class ErrorEvent:
     # For a retryable request error, the seconds after which a retry may
     # succeed, as when the SSD cache's write budget refills; 0 for at once.
     retry_after_seconds: int = 0
+    # For a request that cannot fit even alone, what it lacked and the most
+    # prompt tokens that holds it now, 0 where the engine cannot say.
+    capacity_limit: CapacityLimit = CapacityLimit.NONE
+    fits_tokens: int = 0
 
 
 # The JSON is opaque to the transport: the document carries its own
@@ -1277,19 +1310,28 @@ def _decode_event(frame: Frame) -> EngineEvent:
             kind, bound, required, budget, plan_context, payload[_START_FAILED.size :]
         )
     if frame_type is FrameType.START:
-        request_id, lane, matched, prefix, source, lost = _START.unpack(payload)
+        request_id, lane, matched, prefix, source, lost, end, end_tokens = (
+            _START.unpack(payload)
+        )
         if not request_id:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "start event request id must be non-zero"
             )
-        if source > max(StateSource) or lost > 1:
+        if source > max(StateSource) or lost > 1 or end > max(ReuseEnd):
             _fatal(
                 IssueCode.INVALID_ENUM_VALUE,
-                "start state source or lost state is invalid",
+                "start state source, lost state or reuse end is invalid",
                 request_id,
             )
         return StartEvent(
-            request_id, lane, matched, prefix, StateSource(source), bool(lost)
+            request_id,
+            lane,
+            matched,
+            prefix,
+            StateSource(source),
+            bool(lost),
+            ReuseEnd(end),
+            end_tokens,
         )
     if frame_type is FrameType.PROMPT_PROGRESS:
         request_id, processed, elapsed = _PROMPT_PROGRESS.unpack(payload)
@@ -1425,9 +1467,16 @@ def _decode_event(frame: Frame) -> EngineEvent:
             )
         return event
     if frame_type is FrameType.ERROR:
-        failure, retryable, retry_after, request_id, code_bytes, message_bytes = (
-            _ERROR.unpack_from(payload)
-        )
+        (
+            failure,
+            retryable,
+            retry_after,
+            request_id,
+            limit,
+            fits_tokens,
+            code_bytes,
+            message_bytes,
+        ) = _ERROR.unpack_from(payload)
         if retryable > 1 or code_bytes + message_bytes != len(payload) - _ERROR.size:
             _fatal(
                 IssueCode.INVALID_PAYLOAD_LENGTH,
@@ -1463,6 +1512,20 @@ def _decode_event(frame: Frame) -> EngineEvent:
                 "only a retryable error says when to retry",
                 request_id,
             )
+        if limit > max(CapacityLimit):
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "error event capacity limit is invalid",
+                request_id,
+            )
+        if (limit and classification is not FailureClass.REQUEST_ERROR) or (
+            fits_tokens and not limit
+        ):
+            _fatal(
+                IssueCode.INVALID_ERROR_CLASSIFICATION,
+                "only a request's capacity failure says what fits",
+                request_id,
+            )
         message_start = _ERROR.size + code_bytes
         return ErrorEvent(
             classification,
@@ -1471,6 +1534,8 @@ def _decode_event(frame: Frame) -> EngineEvent:
             payload[_ERROR.size : message_start],
             payload[message_start:],
             retry_after,
+            CapacityLimit(limit),
+            fits_tokens,
         )
     if frame_type is FrameType.STATUS_JSON:
         (correlation_id,) = _STATUS_JSON.unpack_from(payload)

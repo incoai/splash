@@ -18,7 +18,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <csignal>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -152,11 +151,12 @@ void printUsage(std::string_view executable) {
       " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
       " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
-      " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
+      " [--activations auto|bf16] [--weights original|auto] [--relaunch-context TOKENS]"
+      " [--ple-memory BYTES|auto|off]"
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
-      " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]"
+      " [--kv-spill always] [--verify-rows auto|all]"
       " [--max-concurrent-requests REQUESTS]");
-  writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
+  writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [SHARDS] [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " vision-check mlx-affine|gguf safetensors|gguf CONFIG ROOT");
   writeStderrLine("       " + command + " device-check");
@@ -239,55 +239,14 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.expertMemory = arguments.expertMemory;
   config.resources.sparseKvMemory = arguments.sparseKvMemory;
   config.resources.kvSpillAlways = arguments.kvSpillAlways;
-  config.resources.kvWindowTrim = arguments.kvWindowTrim;
   config.resources.verifyRows = arguments.verifyRows;
   config.resources.lanes = arguments.lanes;
   config.resources.int8Activations = arguments.int8Activations;
+  config.resources.weights = arguments.weights;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;
 }
-
-// SIGTERM, SIGINT and SIGHUP end the transport loop instead of killing the
-// process, so the normal destructors run. An inherited ignored SIGHUP (nohup)
-// stays ignored, as it does for the server. SIGPIPE is ignored: a closed
-// parent pipe surfaces as EPIPE, which ends the transport as a shutdown.
-std::atomic<engine::FdTransport *> gShutdownTransport{nullptr};
-
-void requestShutdownFromSignal(int) {
-  const int savedErrno = errno;
-  if (engine::FdTransport *transport =
-          gShutdownTransport.load(std::memory_order_acquire)) {
-    transport->requestShutdown();
-  }
-  errno = savedErrno;
-}
-
-// Keep shutdown idempotent through process teardown. Detach the transport before
-// it is destroyed; later stop signals remain harmless until process exit.
-class ShutdownSignals final {
-public:
-  explicit ShutdownSignals(engine::FdTransport &transport) {
-    gShutdownTransport.store(&transport, std::memory_order_release);
-    struct sigaction action {};
-    action.sa_handler = requestShutdownFromSignal;
-    sigemptyset(&action.sa_mask);
-    action.sa_flags = 0;
-    for (const int number : {SIGTERM, SIGINT, SIGHUP}) {
-      struct sigaction inherited {};
-      if (number == SIGHUP && sigaction(number, nullptr, &inherited) == 0 &&
-          inherited.sa_handler == SIG_IGN)
-        continue;
-      sigaction(number, &action, nullptr);
-    }
-    std::signal(SIGPIPE, SIG_IGN);
-  }
-  ShutdownSignals(const ShutdownSignals &) = delete;
-  ShutdownSignals &operator=(const ShutdownSignals &) = delete;
-  ~ShutdownSignals() {
-    gShutdownTransport.store(nullptr, std::memory_order_release);
-  }
-};
 
 // The time the newest restore points of a persistent cache get to reach the
 // disk once the transport has ended, before the cache closes; the server
@@ -353,7 +312,7 @@ int serveNative(int argc, char **argv) {
   if (const std::filesystem::path caches = splashCaches(); !caches.empty())
     reportLegacyWeightCache(caches / "weights");
   engine::FdTransport transport(STDIN_FILENO, STDOUT_FILENO);
-  ShutdownSignals signals(transport);
+  engine::StopSignals signals(transport);
   std::optional<MemoryPressureMonitor> pressureMonitor;
   IdleSleepAssertion idleSleep;
 
@@ -465,18 +424,29 @@ int checkDevice(int argc) {
 // installer applies before any weight download: the family it describes, as
 // JSON, or the refusal (model::inspectSourceConfiguration).
 int checkModel(int argc, char **argv) {
-  // The draft's config, when given, follows the target's: its config, and a
-  // GGUF's directory of headers after it.
-  const int draftIndex = argc > 2 && std::string_view(argv[2]) == "gguf" ? 6 : 5;
+  // The draft's config, when given, follows the target's: its config, and
+  // the directory of its headers after it, which a GGUF always has.
+  const bool headers = argc > 2 && (std::string_view(argv[2]) == "gguf" ||
+                                    (argc > 5 && std::filesystem::is_directory(argv[5])));
+  const int draftIndex = headers ? 6 : 5;
   if (argc != draftIndex && argc != draftIndex + 1)
     throw engine::UsageError(
-        "model-check takes the source formats, the target's config, a GGUF target's headers and the draft's config");
+        "model-check takes the source formats, the target's config, the target's headers and the draft's config");
   const auto path = [&](int index) {
     return index < argc ? std::optional<std::filesystem::path>(argv[index]) : std::nullopt;
   };
+  std::optional<bool> quantizable;
   const std::string_view family = model::inspectSourceConfiguration(
-      argv[2], argv[3], argv[4], draftIndex == 6 ? path(5) : std::nullopt, path(draftIndex));
-  std::printf("{\"family\":\"%.*s\"}\n", static_cast<int>(family.size()), family.data());
+      argv[2], argv[3], argv[4], draftIndex == 6 ? path(5) : std::nullopt, path(draftIndex), &quantizable);
+  // quantizable_weights: whether --weights auto loads any weight of the
+  // target in another format; absent where its headers were not given or do
+  // not plan.
+  json::Writer w;
+  w.object([&] {
+    w.field("family", family);
+    if (quantizable) w.field("quantizable_weights", *quantizable);
+  });
+  std::printf("%s\n", w.str().c_str());
   return 0;
 }
 
@@ -506,7 +476,8 @@ int printFamilies(int argc) {
             .field("sparse_kv", facts.sparseKv)
             .field("dense_ffn", facts.denseFfn)
             .field("context_tokens", facts.contextTokens)
-            .field("max_context_tokens", facts.maximumContextTokens);
+            .field("max_context_tokens", facts.maximumContextTokens)
+            .field("activations", facts.activations);
       });
   });
   std::printf("%s\n", w.str().c_str());

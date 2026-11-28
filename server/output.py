@@ -2,6 +2,7 @@
 validation."""
 
 import re
+import threading
 from dataclasses import dataclass
 
 from jsonschema.exceptions import ValidationError
@@ -260,17 +261,17 @@ _NOT_JSON = object()
 _PYTHON_LITERALS = {"True": True, "False": False, "None": None}
 
 
-def _json_value(text):
+def _json_value(text, depth=2):
     """The JSON value `text` spells, if it can be written back as JSON in its
     call's arguments: its numbers finite, its strings Unicode and its
     containers, in the arguments object, nested at most MAX_ARGUMENTS_DEPTH
-    deep. Otherwise _NOT_JSON."""
+    deep. Otherwise _NOT_JSON. `depth` is the value's level: 2 for a value
+    in the arguments object, 1 for the object."""
     try:
         value = json_codec.loads(text)
     except ValueError:
         return _NOT_JSON
-    # The value's level in the arguments object.
-    pending = [(value, 2)]
+    pending = [(value, depth)]
     while pending:
         item, depth = pending.pop()
         if isinstance(item, str):
@@ -282,6 +283,13 @@ def _json_value(text):
             children = [*item, *item.values()] if isinstance(item, dict) else item
             pending.extend((child, depth + 1) for child in children)
     return value
+
+
+def _arguments_object(text):
+    """Whether `text`, a closed call's arguments, is the JSON object every
+    dialect returns a call's arguments as, within the bounds _json_value
+    reads a value in it by."""
+    return isinstance(_json_value(text, depth=1), dict)
 
 
 def convert_value(text, types):
@@ -321,9 +329,12 @@ class StreamingToolCallProjector:
     The arguments' close or the call's close ends the call; the call's close
     after an arguments' close (Qwen's </function>) may be left out. A call
     whose arguments are one JSON object (the "json" kind) streams them as
-    written after the object's name and ends at the call's close. Names
-    lose the space around them; an opening that names no function, or a name
-    too long to be one, reads as text; other text inside a call is dropped,
+    written after the object's name and ends at the call's close; one whose
+    header names no function, its name's close straight after the call's
+    opening, is held until it closes and named by its object, as a header
+    names one. Names lose the space around them; any other opening that
+    names no function, or a name too long to be one, reads as text; other
+    text inside a call is dropped,
     and a repeated parameter keeps its first value. A value typed as string
     alone, or untyped, streams as written; any other converts at its end
     (convert_value). Text outside calls streams as it arrives, and the
@@ -337,10 +348,40 @@ class StreamingToolCallProjector:
     """
 
     def __init__(
-        self, policy, request_id, structured=False, syntax=None, think_close=THINK_END
+        self,
+        policy,
+        request_id,
+        structured=False,
+        syntax=None,
+        think_close=THINK_END,
+        streaming=False,
     ):
         # The types of the tools its calls name, read as they name them.
         self.tool_types = ParameterTypes(policy) if policy is not None else None
+        # The tools a call may name: those the request declares, whose names
+        # its calls are returned under (ToolPolicy.declared_name).
+        self.policy = policy
+        self.declared = policy.names if policy is not None else frozenset()
+        # The output from the open call on (put), and where in it the call's
+        # opening begins: a call that is not returned is the text the model
+        # wrote.
+        self.text = ""
+        self.call_start = None
+        # A closed call returned as text, until the text after its close
+        # shows where the call ends; and why each call that was not returned
+        # was not (REJECTED_CALL_REASONS).
+        self.rejected_call = None
+        self.rejections = []
+        # Whether the output streams: a call of a declared tool then streams
+        # once its arguments begin as an object (_start_call), as OpenAI
+        # and Anthropic stream them; otherwise a call is held
+        # until it closes. The open call streams (call_streams), whether its
+        # JSON arguments' start has been read (arguments_read), and the id of
+        # a streamed call the output cut, which ends incomplete.
+        self.streaming = streaming
+        self.call_streams = False
+        self.arguments_read = False
+        self.cut_call = None
         self.request_id = request_id
         # The layout its calls are read in, which a tool policy needs.
         self.syntax = syntax
@@ -352,9 +393,11 @@ class StreamingToolCallProjector:
         self.pending = ""
         self.state = "output" if structured else "content"
         self.call_index = 0
-        # The open call, None while the text names none.
+        # The open call, None while the text names none: the declared tool it
+        # names, else its name as written, and its name as written.
         self.call_id = None
         self.function_name = None
+        self.written_name = None
         # The types by which its declared parameters and any others convert.
         self.parameter_types = {}
         self.other_types = None
@@ -397,47 +440,72 @@ class StreamingToolCallProjector:
         return "".join(self.content_fragments[: self.streamed_count])
 
     def _emit_argument(self, fragment, events):
+        # A held call streams once it has closed and been read as one
+        # (_finish_call): one the output cuts, or that is not returned, has
+        # sent nothing. A started one streams each fragment.
         self.argument_fragments.append(fragment)
-        for chunk in argument_deltas(fragment):
-            events.append(
-                (
-                    "tool",
-                    {
-                        "index": self.call_index,
-                        "function": {"arguments": chunk},
-                    },
-                )
+        if self.call_streams:
+            events.extend(
+                ("tool", {"index": self.call_index, "function": {"arguments": chunk}})
+                for chunk in argument_deltas(fragment)
             )
 
+    def _start_call(self, events):
+        """Stream the open call from here on: its header, then the arguments
+        read so far and each fragment after them."""
+        if not self.streamed_count:
+            # Whitespace before the first text only framed the calls.
+            self.content_fragments.clear()
+        events.append(self._header())
+        events.extend(
+            ("tool", {"index": self.call_index, "function": {"arguments": chunk}})
+            for chunk in argument_deltas("".join(self.argument_fragments))
+            if chunk
+        )
+        self.call_streams = True
+
+    def _header(self):
+        return (
+            "tool",
+            {
+                "index": self.call_index,
+                "id": self.call_id,
+                "type": "function",
+                "function": {"name": self.function_name},
+            },
+        )
+
+    def _consumed(self):
+        """Where in the output the text put() has read ends."""
+        return len(self.text) - len(self.pending)
+
+    def _not_a_call(self, name, events):
+        """An opening that names no function, and the text after it, as
+        content: nothing of a call has streamed yet."""
+        self.state = "content"
+        self.call_start = None
+        self.call_id = self.function_name = self.written_name = None
+        self._emit_content(self.syntax.call_open + name, events)
+
     def _begin_call(self, name, events):
-        if not name.strip(NAME_SPACE):
-            # Nothing of a call has streamed yet: the opening, and the text
-            # after it, are content.
-            self.state = "content"
-            self._emit_content(self.syntax.call_open + name, events)
+        # A call of the "json" kind whose header names no function may name
+        # it in its object, once the header closes (body_open, _end_body).
+        if not name.strip(NAME_SPACE) and self.syntax.arguments != "json":
+            self._not_a_call(name, events)
             return
         self.state = "arguments"
         self.argument_fragments = []
         self.parameter_count = 0
         self.parameter_names = set()
-        name = name.strip(NAME_SPACE)
-        if not self.streamed_count:
-            # Whitespace before the first text only framed the calls.
-            self.content_fragments.clear()
+        self.written_name = name.strip(NAME_SPACE)
+        name = self.policy.declared_name(self.written_name) or self.written_name
         self.function_name = name
         self.call_id = f"call_{self.request_id}_{self.call_index}"
         self.parameter_types, self.other_types = self.tool_types.of(name)
-        events.append(
-            (
-                "tool",
-                {
-                    "index": self.call_index,
-                    "id": self.call_id,
-                    "type": "function",
-                    "function": {"name": name},
-                },
-            )
-        )
+        self.arguments_read = False
+        if self.streaming and name in self.declared and self.syntax.arguments != "json":
+            # Arguments the projector writes are an object from their start.
+            self._start_call(events)
         if self.syntax.arguments == "json":
             # The name's close, then the call's JSON object.
             self.state = "body_open"
@@ -518,29 +586,74 @@ class StreamingToolCallProjector:
             arguments = value.get(key) if isinstance(value, dict) else None
             if isinstance(arguments, dict):
                 text = json_codec.dumps(arguments)
+            # A call whose header names no function is the call of the
+            # declared tool its object names, as a header's name would be
+            # (ToolPolicy.declared_name); one that names none is its text.
+            named = (
+                value.get(self.syntax.json_name_key)
+                if isinstance(value, dict)
+                else None
+            )
+            if not self.written_name and isinstance(named, str):
+                self.function_name = self.policy.declared_name(named) or ""
             self._emit_argument(text.strip() or "{}", events)
         self._finish_call(events)
 
     def _finish_call(self, events):
+        """Close the open call. One that has streamed (_start_call) ends as
+        sent; arguments that turned out not to be JSON are counted. A held
+        one is returned, and streamed whole, where it names a declared tool
+        (ToolPolicy.declared_name) and its arguments read as a JSON object;
+        otherwise it is the text the model wrote, once the text after it
+        shows where the call ends (_settle_rejected)."""
         if self.syntax.arguments != "json":
             self._emit_argument("}", events)
-        self.closed_calls.append(
-            {
-                "id": self.call_id,
-                "type": "function",
-                "function": {
-                    "name": self.function_name,
-                    "arguments": "".join(self.argument_fragments),
-                },
-            }
-        )
-        self.call_index += 1
+        arguments = "".join(self.argument_fragments)
+        if self.function_name not in self.declared:
+            reason = "undeclared"
+        elif not _arguments_object(arguments):
+            reason = "invalid_arguments"
+        else:
+            reason = None
+        if self.call_streams and reason is not None:
+            self.rejections.append(reason)
+            reason = None
+        elif reason is None and not self.call_streams:
+            if not self.streamed_count:
+                # Whitespace before the first text only framed the calls.
+                self.content_fragments.clear()
+            events.append(self._header())
+            events.extend(
+                ("tool", {"index": self.call_index, "function": {"arguments": chunk}})
+                for chunk in argument_deltas(arguments)
+            )
+        if reason is None:
+            self.closed_calls.append(
+                {
+                    "id": self.call_id,
+                    "type": "function",
+                    "function": {"name": self.function_name, "arguments": arguments},
+                }
+            )
+            self.call_index += 1
+            self.text_visible = False
+            self.call_start = None
+        else:
+            self.rejections.append(reason)
+            self.rejected_call = self.call_start
         self.call_id = None
         self.function_name = None
+        self.written_name = None
+        self.call_streams = False
         self.argument_fragments = []
-        self.text_visible = False
         # A call of the "json" kind ended at its call_close.
         self.state = "content" if self.syntax.arguments == "json" else "closing"
+
+    def _settle_rejected(self, events):
+        """The text of the call _finish_call did not return, as content, once
+        put() has read past the call's close."""
+        start, self.rejected_call, self.call_start = self.rejected_call, None, None
+        self._emit_content(self.text[start : self._consumed()], events)
 
     def _next_tag(self, *tags):
         """The tag of `tags` that the pending text spells first, and where."""
@@ -559,10 +672,16 @@ class StreamingToolCallProjector:
         return name
 
     def put(self, text):
+        if self.call_start is None and self.rejected_call is None:
+            # Outside a call only the text not yet read is kept.
+            self.text = self.pending
         self.pending += text
+        self.text += text
         events = []
         syntax = self.syntax
         while self.pending:
+            if self.rejected_call is not None and self.state == "content":
+                self._settle_rejected(events)
             if self.state == "output":
                 first = self.pending.lstrip()
                 if not first:
@@ -581,10 +700,11 @@ class StreamingToolCallProjector:
                     self._emit_content(ready, events)
                     break
                 self._emit_content(self.pending[:start], events)
-                self.pending = self.pending[start + len(tag) :]
                 if tag != self.think_close:
                     # A call's opening, the other tag.
+                    self.call_start = self._consumed() + start
                     self.state = "name"
+                self.pending = self.pending[start + len(tag) :]
                 continue
             if self.state == "name":
                 # The character that ends the name stays: the arguments drop
@@ -594,10 +714,15 @@ class StreamingToolCallProjector:
                 self._begin_call(name, events)
                 continue
             if self.state == "body_open":
-                # The name's close, which the name left in the text.
+                # The name's close, which the name left in the text. A header
+                # that names no function is a call's only where it closes:
+                # the call is then held until its object names it.
                 close = syntax.name_close
                 if len(self.pending) < len(close) and close.startswith(self.pending):
                     break
+                if not self.written_name and not self.pending.startswith(close):
+                    self._not_a_call("", events)
+                    continue
                 self.pending = self.pending.removeprefix(close)
                 self.state = "body_prefix"
                 continue
@@ -605,7 +730,7 @@ class StreamingToolCallProjector:
                 # The object's name, as the template writes it, before the
                 # arguments, which then stream as written; an object laid out
                 # otherwise is read whole at the call's close.
-                prefix = syntax.json_prefix(self.function_name)
+                prefix = syntax.json_prefix(self.written_name)
                 if self.pending.startswith(prefix):
                     self.pending = self.pending[len(prefix) :]
                     self.state = "body_arguments"
@@ -614,6 +739,20 @@ class StreamingToolCallProjector:
                 else:
                     self.state = "body"
                 continue
+            if (
+                self.state == "body_arguments"
+                and self.streaming
+                and not self.arguments_read
+                and self.function_name in self.declared
+            ):
+                # A streaming call starts once its arguments begin as an
+                # object; any other is held, and is text once it closes.
+                first = self.pending.lstrip()
+                if not first:
+                    break
+                self.arguments_read = True
+                if first.startswith("{"):
+                    self._start_call(events)
             if self.state in ("body_arguments", "body"):
                 end = self.pending.find(syntax.call_close)
                 if end >= 0:
@@ -680,6 +819,8 @@ class StreamingToolCallProjector:
                 elif syntax.call_close.startswith(rest):
                     break
                 self.state = "content"
+        if self.rejected_call is not None and self.state == "content":
+            self._settle_rejected(events)
         return events
 
     @property
@@ -701,15 +842,39 @@ class StreamingToolCallProjector:
         still owes for what put() held back.
 
         Output cut short, by the token limit or a stop sequence inside a
-        call, keeps an open call with the arguments it has, and no call
-        whose name it cut; other output that ends inside a call closes the
-        call, what it held back after a value being the start of the value's
-        close. Cut output with a call has the content the stream published,
-        which leaves out whitespace that no visible text has followed since
-        the start or the last call. Otherwise the content is the text
-        outside calls without whitespace that only frames them and, when
-        cut, a trailing partial tag."""
+        call, drops the call it cut where it was held, having streamed
+        nothing: a call that did not close is not a call. A call that had
+        started streaming ends with the arguments it streamed (cut_call). Other output that ends inside a call
+        closes the call, what it held back after a value being the start of
+        the value's close. Cut output with a call, made or cut, has the
+        content the stream published, which leaves out whitespace that no
+        visible text has followed since the start or the last call.
+        Otherwise the content is the text outside calls without whitespace
+        that only frames them and, when cut, a trailing partial tag."""
         events = []
+        cut_call = incomplete and self.in_call
+        streamed_cut = None
+        if cut_call:
+            self.rejections.append("cut")
+            if self.call_streams:
+                # Nothing is retracted: the call ends incomplete, with the
+                # arguments it streamed.
+                streamed_cut = {
+                    "id": self.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": self.function_name,
+                        "arguments": "".join(self.argument_fragments),
+                    },
+                }
+                self.cut_call = self.call_id
+            self.pending = ""
+            self.state = "content"
+            self.call_id = self.function_name = self.written_name = self.call_start = (
+                None
+            )
+            self.call_streams = False
+            self.argument_fragments = []
         if not incomplete:
             if self.state == "name":
                 # A name too long to be one stays text, as the content reads it.
@@ -723,6 +888,8 @@ class StreamingToolCallProjector:
             if self.state in ("arguments", "parameter"):
                 self.pending = ""
                 self._finish_call(events)
+            if self.state == "body_open" and not self.written_name:
+                self._not_a_call("", events)
             if self.state in ("body_open", "body_prefix", "body_arguments", "body"):
                 text, self.pending = self.pending, ""
                 if self.state in ("body_open", "body_prefix"):
@@ -731,6 +898,8 @@ class StreamingToolCallProjector:
         if self.state == "closing":
             self.pending = ""
             self.state = "content"
+        if self.rejected_call is not None:
+            self._settle_rejected(events)
         if (
             self.state in ("content", "output", "json")
             and self.pending
@@ -740,27 +909,82 @@ class StreamingToolCallProjector:
             )
         ):
             self.content_fragments.append(self.pending)
-        elif self.closed_calls:
+        elif self.closed_calls or cut_call:
             # Whitespace held after the last text only framed the calls.
             del self.content_fragments[self.streamed_count :]
         self.pending = ""
         calls = list(self.closed_calls)
-        if self.call_id is not None:
-            calls.append(
-                {
-                    "id": self.call_id,
-                    "type": "function",
-                    "function": {
-                        "name": self.function_name,
-                        "arguments": "".join(self.argument_fragments),
-                    },
-                }
-            )
+        if streamed_cut is not None:
+            calls.append(streamed_cut)
         streamed = self._streamed_content()
-        content = streamed if calls and incomplete else "".join(self.content_fragments)
+        content = (
+            streamed
+            if (calls or cut_call) and incomplete
+            else "".join(self.content_fragments)
+        )
         if unsent := content[len(streamed) :]:
             events.append(("content", unsent))
         return content, calls, events
+
+
+# Why a call the model wrote was not returned whole: it named a tool the
+# request does not declare (returned as text), its arguments are not a JSON
+# object (as text where it was held, as sent where it had streamed), or the
+# output ended before it closed (dropped where it was held, ended incomplete
+# where it had streamed).
+REJECTED_CALL_REASONS = ("undeclared", "invalid_arguments", "cut")
+_REJECTED_CALL_WORDS = {
+    "undeclared": "undeclared tool",
+    "invalid_arguments": "arguments not a JSON object",
+    "cut": "cut before its close",
+}
+
+
+class RejectedCalls:
+    """How many calls the server has not returned, by reason, for /status
+    and Prometheus."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counts = dict.fromkeys(REJECTED_CALL_REASONS, 0)
+
+    def add(self, reasons):
+        with self._lock:
+            for reason in reasons:
+                self._counts[reason] += 1
+
+    def stats(self):
+        with self._lock:
+            return dict(self._counts)
+
+
+class KeywordCounts:
+    """How many times the server has generated a best-effort answer without
+    each schema keyword its grammar does not enforce, for /status and
+    Prometheus."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counts = {}
+
+    def add(self, keywords):
+        with self._lock:
+            for keyword in keywords:
+                self._counts[keyword] = self._counts.get(keyword, 0) + 1
+
+    def stats(self):
+        with self._lock:
+            return dict(self._counts)
+
+
+def rejected_calls_line(reasons):
+    """The part of a log line that says which calls were not returned."""
+    counts = {reason: reasons.count(reason) for reason in REJECTED_CALL_REASONS}
+    return " · ".join(
+        f"{count} {_REJECTED_CALL_WORDS[reason]}"
+        for reason, count in counts.items()
+        if count
+    )
 
 
 def argument_deltas(arguments):

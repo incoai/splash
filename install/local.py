@@ -32,7 +32,6 @@ from __future__ import annotations
 import functools
 import json
 import os
-import signal
 import sys
 import tempfile
 from contextlib import redirect_stdout
@@ -323,7 +322,7 @@ def _main(argv=None):
     parser.add_argument("--language-only", action="store_true")
     args = parser.parse_args(argv)
     try:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+        models.take_stop_signals()
         with redirect_stdout(sys.stderr):
             prepared = _prepare_paths(
                 _path(args.target),
@@ -339,8 +338,8 @@ def _main(argv=None):
     except OSError as error:
         print(json.dumps(serve_record.failure(serve_record.INTERNAL, str(error))))
         return 1
-    except KeyboardInterrupt:
-        return 130
+    except models.Stopped as stop:
+        return 128 + stop.number
     return 0
 
 

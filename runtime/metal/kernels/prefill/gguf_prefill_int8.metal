@@ -1,9 +1,11 @@
-// Int8-activation prefill GEMMs for MLX affine 4- and 5-bit weights in groups of 64 (af4g64, af5g64) and for Q8_0
-// (ops::LinearTile::GgufPrefillInt8). Each 64-input group g of a chunk row is quantized to int8 codes qa with its own
-// scale sa_g, and with w = s * q + z per affine weight group:
+// Int8-activation prefill GEMMs for the formats the tile decodes (QUANT_PREFILL_INT8_FORMATS): MLX affine 4-, 5- and
+// 8-bit weights in groups of 64 (af4g64, af5g64, af8g64) and Q8_0 (ops::LinearTile::GgufPrefillInt8). Each 64-input
+// group g of a chunk row is quantized to int8 codes qa with its own scale sa_g, and with w = s * q + z per affine
+// weight group:
 //
 //   y[m][n] = sum_g ( (sa_g[m] s_g[n]) sum_{k in g} qa[m][k] q[n][k]  +  z_g[n] (sa_g[m] sum_{k in g} qa[m][k]) )
 //
+// where 8-bit codes q, unsigned, enter the int8 matmul as q - 128 with z + 128 s in z's place;
 // and with w = d * q per Q8_0 32-group h of g (its codes int8 already):
 //
 //   y[m][n] = sum_g sa_g[m] sum_{h < 2} d_{g,h}[n] sum_{k in h} qa[m][k] q[n][k]
@@ -19,6 +21,7 @@
 // same codes in another schedule, so that a fused projection of both quantizes its rows once: steps 2h and 2h + 1
 // take 32-group h alone, lane column x the inputs at 32h + 8x + 4 (t & 1) .. +3, chunk x of the 32-group's plane
 // record (one uint2 of its bytes, chunk slots {0, 4, 1, 5} from it in the even step, {2, 6, 3, 7} in the odd one).
+// af8g64 keeps its codes in Q8_0's planes and takes Q8_0's schedule, its group's four steps summed before its fold.
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/gguf_prefill_int8_tile.h"
 #include "metal/kernels/common/gguf_tile.h"
@@ -77,7 +80,7 @@ inline uint2 prefill_int8_walk(uint at, uint2 grid) {
 // x is so one column tile's row tiles of a block, whatever the column count; a grid of (column tiles, row tiles)
 // kept them together only where the column tiles were a multiple of 16 (M6: 260 column tiles took 29% longer than
 // 256 at 2048 rows). aux (buffer 6) is the residual or the gate, the output for the plain epilogue, which reads none.
-#define GGUF_PREFILL_INT8_KERNEL(B, f, ep, Ep)                                                                         \
+#define GGUF_PREFILL_INT8_KERNEL(F, f, ep, Ep)                                                                         \
   kernel void gguf_prefill_int8_##f##_##ep(                                                                            \
       device const char *codes [[buffer(0)]], device const float2 *scales [[buffer(1)]],                               \
       device const uchar *w0 [[buffer(2)]], device const uchar *w1 [[buffer(3)]],                                      \
@@ -88,15 +91,13 @@ inline uint2 prefill_int8_walk(uint at, uint2 grid) {
     const uint rows = (p.rows + GGUF_PREFILL_INT8_ROWS - 1) / GGUF_PREFILL_INT8_ROWS,                                  \
                at = tid.y * GGUF_PREFILL_INT8_WALK + tid.x;                                                            \
     if (at >= p.column_tiles * rows) return;                                                                           \
-    prefill_int8_tile<B, Ep>(codes, scales, w0, w1, meta, output, aux,                                                 \
+    prefill_int8_tile<F, Ep>(codes, scales, w0, w1, meta, output, aux,                                                 \
                              {p.input_size, p.rows, p.storage_rows, p.out_stride, p.out_offset, p.plane_input_size},    \
                              prefill_int8_walk(at, uint2(p.column_tiles, rows)), lane, simd_group);                    \
   }
-#define GGUF_PREFILL_INT8_FORMAT(B, f)                                                                                 \
-  GGUF_PREFILL_INT8_KERNEL(B, f, a, EpNone) GGUF_PREFILL_INT8_KERNEL(B, f, r, EpResidual)                              \
-  GGUF_PREFILL_INT8_KERNEL(B, f, g, EpUpWithGate)
-GGUF_PREFILL_INT8_FORMAT(4, af4g64)
-GGUF_PREFILL_INT8_FORMAT(5, af5g64)
-GGUF_PREFILL_INT8_FORMAT(8, q80)
+#define GGUF_PREFILL_INT8_FORMAT(F, f)                                                                                 \
+  GGUF_PREFILL_INT8_KERNEL(F, f, a, EpNone) GGUF_PREFILL_INT8_KERNEL(F, f, r, EpResidual)                              \
+  GGUF_PREFILL_INT8_KERNEL(F, f, g, EpUpWithGate)
+QUANT_PREFILL_INT8_FORMATS(GGUF_PREFILL_INT8_FORMAT)
 #undef GGUF_PREFILL_INT8_FORMAT
 #undef GGUF_PREFILL_INT8_KERNEL

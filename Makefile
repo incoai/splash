@@ -25,9 +25,11 @@ MODEL ?=
 # with vision.
 REVISION ?=
 DRAFT_MODEL ?=
+DRAFT_REVISION ?=
 LANGUAGE_ONLY ?=
 MODEL_ARGS = --model "$(MODEL)" $(if $(REVISION),--revision "$(REVISION)") \
 	$(if $(DRAFT_MODEL),--draft-model "$(DRAFT_MODEL)") \
+	$(if $(DRAFT_REVISION),--draft-revision "$(DRAFT_REVISION)") \
 	$(if $(filter 1,$(LANGUAGE_ONLY)),--language-only)
 MODEL_INSTALL = $(PYTHON) install/models.py $(MODEL_ARGS)
 # The installation's selection link, as the installer names it.
