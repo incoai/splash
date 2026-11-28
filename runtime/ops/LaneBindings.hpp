@@ -1,18 +1,17 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
-#include "metal/MetalBackend.hpp"
+#include "metal/CommandGraph.hpp"
 
 #include <array>
 #include <span>
 #include <stdexcept>
-#include <vector>
 
 namespace splash::ops {
 
 // Batched kernels bind one buffer per lane for each per-lane state tensor and
 // index them by lane, so every slot must be bound even when fewer lanes run.
-inline void appendLaneBindings(std::vector<metal::MetalBuffer> &bindings,
+inline void appendLaneBindings(metal::BufferList &bindings,
                                std::span<const metal::MetalBuffer> first,
                                std::span<const metal::MetalBuffer> second) {
   constexpr size_t lanes = SPLASH_MAXIMUM_BATCH_WIDTH;

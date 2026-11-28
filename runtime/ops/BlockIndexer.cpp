@@ -223,6 +223,8 @@ void BlockIndexer::addCommit(metal::CommandGraph &graph, const IndexerCommit &co
   std::ranges::copy(commit.anchors, std::begin(params.first_position));
   const auto in = laneBindings(commit.pendingIn), out = laneBindings(commit.pendingOut);
   const auto tables = laneBindings(commit.indexTables);
+  static_assert(4 + 3 * SPLASH_MAXIMUM_BATCH_WIDTH <= metal::kInlineBufferBindings,
+                "block indexer commit bindings outgrow the inline binding capacity");
   graph.add("block_indexer_commit",
             {commit.keys, commit.blockKeys, commit.paths, commit.laneRows,
              in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7],

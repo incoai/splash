@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -551,6 +552,20 @@ struct Runtime::Impl {
   std::vector<std::weak_ptr<const HeldState>> stateHolds;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
+  // Each place that builds a step's command graph; graphs from one site
+  // share a shape.
+  enum class GraphSite : uint8_t { Prefill, DecodeDraft, DecodeTarget, VerifyForward, VerifyCommit, Count };
+  // The dispatch count of the last graph each site built. The next graph at
+  // a site reserves that many, so a steady shape never regrows its dispatch
+  // list, which would move every dispatch's inline bindings.
+  std::array<std::atomic<uint32_t>, static_cast<size_t>(GraphSite::Count)> graphSizes{};
+  [[nodiscard]] CommandGraph newGraph(GraphSite site) const {
+    return CommandGraph{graphSizes[static_cast<size_t>(site)].load(std::memory_order_relaxed)};
+  }
+  void recordGraph(GraphSite site, const CommandGraph &graph) {
+    graphSizes[static_cast<size_t>(site)].store(static_cast<uint32_t>(graph.dispatches().size()),
+                                                std::memory_order_relaxed);
+  }
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
@@ -3329,13 +3344,14 @@ struct Runtime::Impl {
           }
         }
 
-        CommandGraph target;
+        CommandGraph target = impl_.newGraph(GraphSite::VerifyForward);
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
         impl_.encodeBatchVerifyInput(target, step_,
                                      anchorPositions(std::span(entries).first(lanes_.size()), items_));
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
                                    impl_.decodeArena->lanesRows(TargetTensor::Hidden0, width), width, step_.rows);
         impl_.encodeTargetDecodeForward(target, {entries.data(), lanes_.size()}, items_, step_, *reads_);
+        impl_.recordGraph(GraphSite::VerifyForward, target);
         submit(target);
         stage_ = Stage::TargetForward;
       }
@@ -3374,9 +3390,10 @@ struct Runtime::Impl {
               impl_.uploadConstraintMasks(lane, entry.maskWords);
           }
 
-          CommandGraph commit;
+          CommandGraph commit = impl_.newGraph(GraphSite::VerifyCommit);
           impl_.encodeVerifyCommit(commit, {entries.data(), lanes_.size()}, items_,
                                    {maximumRetained.data(), lanes_.size()}, step_);
+          impl_.recordGraph(GraphSite::VerifyCommit, commit);
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -3703,7 +3720,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
   // could not read.
   for (uint32_t lane = 0; begins && lane < items.size(); ++lane)
     impl_->request(items[lane].requestId).unreadableBlocks.clear();
-  CommandGraph graph;
+  CommandGraph graph = impl_->newGraph(Impl::GraphSite::Prefill);
   if (impl_->aneFfn) {
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       draws[lane] = impl_->request(items[lane].requestId).rngCounter;
@@ -3714,6 +3731,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
   const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items, layers);
   CommandGraph encodes;
   const auto outputs = impl_->encodePrefillGraph(graph, encodes, items, entries, *reads, layers);
+  impl_->recordGraph(Impl::GraphSite::Prefill, graph);
   // A state captured inside the command starts from the lane's context
   // window as the command finds it, whose older rows the command's own rows
   // overwrite. It is copied once, before the command's first pass runs: a
@@ -4078,7 +4096,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
-  CommandGraph draft;
+  CommandGraph draft = impl_->newGraph(Impl::GraphSite::DecodeDraft);
   // The draft's RoPE rows alone: the target's follow the layout the cycle's
   // selector writes (encodeBatchVerifyInput).
   impl_->addRopeTables(draft, {}, 0, impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
@@ -4090,6 +4108,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->draftModel.addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
   impl_->encodeDraftBatchGraph(draft, entries, {logicalPositions.data(), width}, {depths.data(), width},
                                std::span(proposals).first(width), step, choice.floor);
+  impl_->recordGraph(Impl::GraphSite::DecodeDraft, draft);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
   // The weights it reads on demand and the spilled K/V its reads bring.
   WorkCount count({}, impl_->model.expertStore(), reads);
@@ -4112,13 +4131,14 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // above (prepareDecodeLane), before the draft's part goes. Where it cannot
   // be built the draft's part has run alone, which wrote the cycle's own
   // rows of the decode arena and nothing a lane keeps.
-  CommandGraph target;
+  CommandGraph target = impl_->newGraph(Impl::GraphSite::DecodeTarget);
   const auto targetPart = [&] {
     impl_->encodeBatchVerifyInput(target, step, Impl::anchorPositions(entries, items));
     impl_->encodeBatchEmbedding(target, DecodeTensor::InputTokens,
                                 impl_->decodeArena->lanesRows(TargetTensor::Hidden0, width), width, step.rows);
     impl_->encodeTargetDecodeForward(target, entries, items, step, *reads);
     impl_->encodeVerifyCommit(target, entries, items, {maximumRetained.data(), width}, step);
+    impl_->recordGraph(Impl::GraphSite::DecodeTarget, target);
     return target.command();
   };
 
