@@ -73,7 +73,13 @@
 // no scale, so its g is 1, which the repack writes; a native block is 256 of
 // its values, a whole number of the type's one-element blocks. That block is
 // the repack's alone: rows kept as stored (quant_stored_row_bytes) hold each
-// value as its own block, at any width.
+// value as its own block, at any width. A tensor whose rows are not whole
+// 256-value blocks takes its type's form of 64-element blocks, BF16_64 or
+// F16_64, whose meta unit spans two groups (as NVFP4_64's does). The Apple9
+// register tile does not take those rows: it builds a format's coefficients of
+// several groups per meta unit over 256-input units (quant_register_tensor),
+// as it does for Q2_0's 64-element blocks, so on Apple9 they run the staged
+// tile.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #define QUANT_CONSTANT constant constexpr
@@ -132,7 +138,9 @@
 #define GGUF_FMT_Q20 43u
 #define GGUF_FMT_NVFP464 44u
 #define GGUF_FMT_MXFP8 45u
-#define GGUF_FMT_COUNT 46u
+#define GGUF_FMT_BF1664 46u
+#define GGUF_FMT_F1664 47u
+#define GGUF_FMT_COUNT 48u
 
 // The tensor type an image descriptor names for an MLX affine format: no GGUF
 // type is of this form.
@@ -143,6 +151,10 @@
 #define QUANT_FP8_TYPE 0x46503845u
 #define QUANT_NVFP464_TYPE 0x4E563634u
 #define QUANT_MXFP8_TYPE 0x4D584638u
+// The tensor types of BF16's and F16's forms of 64-element blocks ("BF64",
+// "F164"), whose native blocks are 64 of a GGUF tensor's 16-bit values.
+#define QUANT_BF1664_TYPE 0x42463634u
+#define QUANT_F1664_TYPE 0x46313634u
 // Byte offsets in NVFP4's native block (its scales at 0) and FP8's (its g at 0).
 #define QUANT_NVFP4_G 16u
 #define QUANT_NVFP4_CODES 20u
@@ -212,6 +224,9 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {42, 64, 18, 8, 0, 2, 2, "q20"},      // GGUF's block_q2_0, one d per 64 elements; meta: d
     {QUANT_NVFP464_TYPE, 64, 40, 16, 0, 8, 2, "nvfp464"},   // meta: the 4 E4M3 scales, g
     {QUANT_MXFP8_TYPE, 32, 33, 32, 0, 1, 1, "mxfp8"},       // FP8's planes; meta: e, as MXFP4's
+    // BF16's and F16's forms of 64-element blocks; meta: g, which the repack writes.
+    {QUANT_BF1664_TYPE, 64, 128, 64, 0, 4, 2, "bf1664"},
+    {QUANT_F1664_TYPE, 64, 128, 64, 0, 4, 2, "f1664"},
 };
 
 // The format that stores a GGUF tensor type (or a loader's);
@@ -238,30 +253,51 @@ inline constexpr bool quant_affine_format(uint32_t format) {
 }
 inline constexpr uint32_t quant_affine_bits(uint32_t format) { return (kQuantFormats[format].ggml_type >> 8) & 0xFF; }
 // Whether a format's native block is the loader's rather than a GGUF type's:
-// the MLX affine formats, NVFP4 (of both block sizes), FP8 and MXFP8.
+// the MLX affine formats, NVFP4 (of both block sizes), FP8, MXFP8 and the
+// 16-bit floats' forms of 64-element blocks.
 inline constexpr bool quant_loader_format(uint32_t format) {
   return quant_affine_format(format) || format == GGUF_FMT_NVFP4 || format == GGUF_FMT_NVFP464 ||
-         format == GGUF_FMT_FP8 || format == GGUF_FMT_MXFP8;
+         format == GGUF_FMT_FP8 || format == GGUF_FMT_MXFP8 || format == GGUF_FMT_BF1664 ||
+         format == GGUF_FMT_F1664;
+}
+// The format of a 16-bit float tensor's planes (GGUF_FMT_BF16 or
+// GGUF_FMT_F16) of `columns` inputs: its own, or its form of 64-element
+// blocks for rows that are not whole 256-value blocks.
+inline constexpr uint32_t quant_float16_form(uint32_t format, uint64_t columns) {
+  if (columns % kQuantFormats[format].block_elements == 0) return format;
+  return format == GGUF_FMT_BF16 ? GGUF_FMT_BF1664 : GGUF_FMT_F1664;
 }
 // Whether a format's values enter a bf16 matrix multiply exactly, as the
 // Apple9 register tile takes them (kernels/decode/linear_gguf_sgmatrix.metal):
-// every format's but F16's, whose 11-bit significands bf16 does not hold.
-inline constexpr bool quant_register_format(uint32_t format) { return format != GGUF_FMT_F16; }
+// every format's but F16's (either form), whose 11-bit significands bf16 does
+// not hold.
+inline constexpr bool quant_register_format(uint32_t format) {
+  return format != GGUF_FMT_F16 && format != GGUF_FMT_F1664;
+}
 // Whether the int8 decode tiles (kernels/shared/gguf_linear.metal
 // gguf_decode_int8_*) take a format: PQ2_0, whose two-bit codes q stand for
 // q - 1, exact in int8, with one d per 128-input block.
 inline constexpr bool quant_decode_int8_format(uint32_t format) { return format == GGUF_FMT_PQ20; }
-// Whether the int8 prefill tile (kernels/prefill/gguf_prefill_int8.metal
-// gguf_prefill_int8_*) takes a format: MLX affine 4 and 5 bits in groups of
-// 64 and Q8_0, whose codes are int8 exactly, each Q8_0 32-group with its d.
+// The formats the int8 prefill tile decodes, as X(format id, kernel name
+// token): codes of 4, 5 or 8 bits in Q4_K's, Q5_K's or Q8_0's planes, int8
+// exactly (8-bit affine codes less 128), under an affine s and z per 64
+// inputs (MLX in groups of 64) or a d per 32 (Q8_0). The tile's kernels
+// (kernels/prefill/gguf_prefill_int8.metal gguf_prefill_int8_<token>_*) are
+// this list's, and so is quant_prefill_int8_format: a format the tile
+// decodes is one every unit of it takes the tile for.
+#define QUANT_PREFILL_INT8_FORMATS(X)                                                                               \
+  X(GGUF_FMT_AF4G64, af4g64) X(GGUF_FMT_AF5G64, af5g64) X(GGUF_FMT_AF8G64, af8g64) X(GGUF_FMT_Q80, q80)
+// Whether the int8 prefill tile takes a format (QUANT_PREFILL_INT8_FORMATS).
 inline constexpr bool quant_prefill_int8_format(uint32_t format) {
-  return format == GGUF_FMT_AF4G64 || format == GGUF_FMT_AF5G64 || format == GGUF_FMT_Q80;
+#define QUANT_PREFILL_INT8_IS(F, f) || format == (F)
+  return false QUANT_PREFILL_INT8_FORMATS(QUANT_PREFILL_INT8_IS);
+#undef QUANT_PREFILL_INT8_IS
 }
 // Whether the MoE experts' int8 prefill passes (kernels/shared/moe_int8.metal
 // moe_expert_int8_*) take a format: MLX affine 4 and 5 bits in groups of 64.
-// Not Q8_0, which the dense tile takes: no real model has run Q8_0 experts on
-// these passes, and their six routes an expert (ops::selectMoe) were measured
-// on af4g64.
+// Not Q8_0 or af8g64, which the dense tile takes: no real model has run 8-bit
+// experts on these passes, and their six routes an expert (ops::selectMoe)
+// were measured on af4g64.
 inline constexpr bool quant_moe_int8_format(uint32_t format) {
   return format == GGUF_FMT_AF4G64 || format == GGUF_FMT_AF5G64;
 }
@@ -281,10 +317,16 @@ inline constexpr uint32_t quant_slot(uint32_t e) { return 8 * ((e >> 2) & 3) + 4
 // The columns a [N, K] tensor is a multiple of, from its format's native
 // block of `block_elements` elements: one 64-input span of the activation
 // tables for a block that fits in one (32 or 64 elements: Q2_0's 64 and the
-// MLX affine formats' groups of 64 too), else a whole 256-input superblock
-// (PQ2_0's 128-input blocks and the groups of 128 too).
+// MLX affine formats' groups of 64 too), else whole native blocks (PQ2_0's
+// 128-input blocks and the MLX groups of 128, a K-quant's 256-input
+// superblock), each two or four whole spans. Every tile reads a group's meta
+// unit at group / meta_groups and steps whole groups or spans, and decode K
+// partitions take whole meta units, so a row of whole blocks is all a tile
+// needs; the Apple9 register tile alone takes whole 256-input units of a
+// format of several groups per meta unit (quant_register_tensor), and a
+// tensor of other widths runs the staged tile there.
 inline constexpr uint32_t quant_column_unit(uint32_t block_elements) {
-  return block_elements > 64 ? 256 : 64;
+  return block_elements > 64 ? block_elements : 64;
 }
 
 // Whether the Apple9 register tile (kernels/decode/linear_gguf_sgmatrix.metal)

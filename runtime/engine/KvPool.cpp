@@ -13,7 +13,7 @@ namespace splash::engine {
 namespace {
 
 // The order extents of each form are compacted and released in.
-constexpr std::array kForms{kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index};
+constexpr std::array kForms = kv::kAllPageForms;
 
 } // namespace
 
@@ -355,7 +355,6 @@ uint32_t KvPool::unfixedExtents(std::span<const uint32_t> fixed, kv::PageForm fo
 KvPoolSnapshot KvPool::snapshot() const {
   KvPoolSnapshot result;
   result.index = formSnapshot(kv::PageForm::Index);
-  result.slim = formSnapshot(kv::PageForm::Slim);
   for (const kv::PageForm form : kForms) {
     const KvPoolFormSnapshot each = formSnapshot(form);
     result.pagesAllocated += each.pagesAllocated;

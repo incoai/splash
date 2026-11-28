@@ -69,7 +69,7 @@ void validate(const BlockMoeWeights &weights, MoeShape shape) {
     throw std::invalid_argument("MoE expert chunks were checked for another block");
 }
 
-MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, bool int8Passes) {
+MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, bool int8Passes, bool narrow) {
   if (!shape.valid())
     throw std::invalid_argument("invalid MoE workspace shape");
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
@@ -79,8 +79,10 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, bool
   // tile's matmul may read past its live rows (moe_matmul_rows).
   const uint64_t matmulRows = routes + tileRows - 1;
   // The router's fp32 scores, a row of routerWidth() expert slots per row,
-  // live in the grouped input until the gather overwrites them.
+  // live in the grouped input until the gather overwrites them; a narrow
+  // step's passes read its rows in place, its grouped input the scores alone.
   const uint64_t scoreBytes = uint64_t{rows} * shape.routerWidth() * sizeof(float);
+  const uint64_t groupedBytes = narrow ? 0 : tableBytes(shape.hiddenSize, matmulRows);
   // The int8 passes' codes and scales (addGgufPrefillInt8Quantize): the
   // chunk's rows of the hidden size, and a grouped row per route of the
   // larger of it and the intermediate size, the gate/up input's then down's.
@@ -89,7 +91,7 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, bool
   return {routes * sizeof(uint32_t), routes * sizeof(float),
           uint64_t{tiles} * sizeof(MoeTileDescriptor), sizeof(MoeTileCount),
           routes * sizeof(uint32_t), routes * sizeof(uint32_t), uint64_t{shape.experts} * sizeof(uint32_t),
-          std::max(tableBytes(shape.hiddenSize, matmulRows), scoreBytes),
+          std::max(groupedBytes, scoreBytes),
           matmulRows * shape.expertIntermediateSize * sizeof(uint16_t),
           routes * shape.hiddenSize * sizeof(uint16_t),
           int8Passes ? gguf_prefill_int8_table_bytes(shape.hiddenSize, rows) : 0,
@@ -130,15 +132,23 @@ std::array<uint32_t, Count> passFormats(std::array<uint32_t, Count> formats) {
 // within the column tiles of `group` and maximumTiles(), the routed experts in
 // the slots `slots` names: gate and up in one pass
 // (moe_expert_gguf_m<rows>_gate_up[_mixed], whose simdgroups each decode
-// their own pass's formats) from the grouped rows the gather writes into
-// groupedInput to expertIntermediate, then down to expertOutput
-// (moe_expert_gguf_m<rows>_down), each times its experts' scales
-// (BlockMoeWeights::expertScales).
-void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
+// their own pass's formats) to expertIntermediate, from the grouped rows the
+// gather writes into groupedInput or, a narrow step's (MoePlan::narrow), from
+// its input rows in place through the grouped routes (MoeGgufGateUpParams),
+// then down to expertOutput (moe_expert_gguf_m<rows>_down), each times its
+// experts' scales (BlockMoeWeights::expertScales).
+void addExperts(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
                 const metal::MetalBuffer &slots, const MoePlan &plan, const MoeGroupParams &group, uint32_t range) {
+  const MoeScratch &scratch = buffers.scratch;
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
-  const std::string kernel = "moe_expert_gguf_m" + std::to_string(plan.tileRows());
+  // A pass's kernel, of its tile rows and K partitions.
+  const auto kernel = [&](uint32_t partitions) {
+    return "moe_expert_gguf_m" + std::to_string(plan.tileRows()) +
+           (partitions > 1 ? "k" + std::to_string(partitions) : "");
+  };
+  const uint32_t gateUpPartitions = plan.configuration().gateUpPartitions,
+                 downPartitions = plan.configuration().downPartitions;
   // The passes' instances for the shape's shared slices.
   const std::string slices(compiledRouting(shape).slicesSuffix);
   const size_t gateUpOffset = range == MOE_TILES_LOADED     ? offsetof(MoeTileCount, loaded_gate_up_grid)
@@ -163,23 +173,24 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   // One pair table where gate and up share their formats, one each otherwise.
   const bool mixed = gate.routed.formatId != up.routed.formatId || gate.shared.formatId != up.shared.formatId;
   const std::string activation(compiledRouting(shape).activationSuffix);
-  graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up") + slices + activation,
-            {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
+  graph.add(kernel(gateUpPartitions) + (mixed ? "_gate_up_mixed" : "_gate_up") + slices + activation,
+            {plan.narrow() ? buffers.input : scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
              gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
              up.shared.plane0, up.shared.plane1Slot(), up.shared.meta,
-             scratch.expertIntermediate, slots, weights.expertScales},
+             scratch.expertIntermediate, slots, weights.expertScales, scratch.groupedRoutes},
             MoeGgufGateUpParams{hidden, intermediate, shape.experts, gate.routed.formatId, gate.shared.formatId,
-                                up.routed.formatId, up.shared.formatId, floorSlots, chunkSlots, range},
-            {group.gate_up_columns, tiles, 1}, gateUpGrid, {GGUF_STAGED_THREADS, 1, 1});
+                                up.routed.formatId, up.shared.formatId, floorSlots, chunkSlots, range,
+                                plan.narrow() ? plan.rows() : 0, shape.routesPerToken()},
+            {group.gate_up_columns, tiles, 1}, gateUpGrid, {GGUF_STAGED_THREADS * gateUpPartitions, 1, 1});
   graph.specialize(passFormats<4>({gate.routed.formatId, gate.shared.formatId, up.routed.formatId, up.shared.formatId}));
   graph.addresses(weights.chunks.planes());
   // Down, projection 2 of the routed experts, which it reaches in the chunks.
-  graph.add(kernel + "_down" + slices,
+  graph.add(kernel(downPartitions) + "_down" + slices,
             {scratch.expertIntermediate, scratch.tileDescriptors, scratch.tileCount, down.shared.plane0,
              down.shared.plane1Slot(), down.shared.meta, scratch.expertOutput, slots, weights.expertScales},
             MoeGgufExpertParams{intermediate, hidden, shape.experts, down.routed.formatId, down.shared.formatId,
                                 floorSlots, chunkSlots, range},
-            {group.down_columns, tiles, 1}, downGrid, {GGUF_STAGED_THREADS, 1, 1});
+            {group.down_columns, tiles, 1}, downGrid, {GGUF_STAGED_THREADS * downPartitions, 1, 1});
   graph.specialize(passFormats<2>({down.routed.formatId, down.shared.formatId}));
   graph.addresses(weights.chunks.planes());
 }
@@ -196,7 +207,11 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config)
   // an expert that select them (selectMoe).
   if (config.expertTile == MoeExpertTile::M64 && shape.sharedSlices == 2)
     throw std::invalid_argument("invalid MoE expert tiles: no 64-row passes for two shared slices");
-  workspace_ = workspaceFor(shape, rows, tileRows(), config.int8Passes);
+  // The 8-row passes alone are compiled for two K partitions (moe_gguf.metal).
+  for (const uint8_t partitions : {config.gateUpPartitions, config.downPartitions})
+    if (partitions != 1 && (partitions != 2 || config.expertTile != MoeExpertTile::M8))
+      throw std::invalid_argument("invalid MoE K partitions: 1, or 2 on 8-row expert tiles");
+  workspace_ = workspaceFor(shape, rows, tileRows(), config.int8Passes, narrow());
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
 
@@ -217,7 +232,10 @@ MoeGroupParams groupParams(const MoePlan &plan, const BlockMoeWeights &weights) 
           0};
 }
 
+// The grouped rows' inputs, which the gate/up pass reads but a narrow step's,
+// which reads its rows in place.
 void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan) {
+  if (plan.narrow()) return;
   const MoeShape shape = plan.shape();
   const MoeScratch &scratch = buffers.scratch;
   graph.add("moe_gather_rows",
@@ -298,7 +316,7 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, cons
   validate(weights, shape);
   const MoeWorkspace &required = plan.workspace();
   const uint64_t hiddenRows = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
-  requireBytes(buffers.input, hiddenRows, "MoE input");
+  requireBytes(buffers.input, uint64_t{plan.inputRows()} * shape.hiddenSize * sizeof(uint16_t), "MoE input");
   requireBytes(buffers.residual, hiddenRows, "MoE residual");
   requireBytes(buffers.output, hiddenRows, "MoE output");
   const MoeScratch &scratch = buffers.scratch;
@@ -334,7 +352,7 @@ void MoE::addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
                       const BlockMoeWeights &weights, const MoePlan &plan) {
   if (!weights.stream) throw std::invalid_argument("a resident MoE block's experts run after its routing alone");
   addGather(graph, buffers, plan);
-  addExperts(graph, buffers.scratch, weights, buffers.scratch.expertSlots, plan, groupParams(plan, weights),
+  addExperts(graph, buffers, weights, buffers.scratch.expertSlots, plan, groupParams(plan, weights),
              MOE_TILES_RESIDENT);
 }
 
@@ -346,12 +364,12 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                     const MoeCombineConvolution *convolution) {
   const MoeGroupParams group = groupParams(plan, weights);
   if (weights.stream) {
-    addExperts(graph, buffers.scratch, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED);
+    addExperts(graph, buffers, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED);
   } else if (plan.configuration().int8Passes) {
     addInt8Experts(graph, buffers, weights, plan);
   } else {
     addGather(graph, buffers, plan);
-    addExperts(graph, buffers.scratch, weights, weights.slotTable, plan, group, MOE_TILES_ALL);
+    addExperts(graph, buffers, weights, weights.slotTable, plan, group, MOE_TILES_ALL);
   }
   addCombine(graph, buffers, plan, convolution);
 }

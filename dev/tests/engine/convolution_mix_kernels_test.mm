@@ -24,9 +24,12 @@
 // - the mix of 1, 3 and 4 queries over 1 to 5 states (bf16 stack planes, bf16
 //   or fp32 current rows), plain and through its norms, of 5 rows (a
 //   threadgroup a row and query) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a
-//   threadgroup a row);
-// - the message gate through its norm, its fused kernels' and its reference
-//   path's, and the paths against each other;
+//   threadgroup a row); two mixes in one call, bit for bit each one's own;
+// - the mix's outputs normalized for the message gates (BlockResidualMixInput::
+//   normalized), against fp64;
+// - the message gate through its norm, its fused kernels' (from its inputs
+//   normalized as the mixes normalize them) and its reference path's, and the
+//   paths against each other;
 // - the logit finish's softcap and padding rows.
 #include "ChainRows.hpp"
 #include "message_gate_reference.h"
@@ -36,6 +39,7 @@
 #include "../../../runtime/ops/LogitFinish.hpp"
 #include "../../../runtime/ops/MessageGate.hpp"
 #include "../../../runtime/ops/MoE.hpp"
+#include "../../../runtime/ops/Normalization.hpp"
 #include "../../../runtime/ops/ShortConvolution.hpp"
 #include "ops/LaneRows.hpp"
 
@@ -822,16 +826,36 @@ void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool curre
   const ops::BlockResidualShape shape{m.hidden, stack, queries};
   const MetalBuffer queryBuffer = upload(backend, m.queryValues),
                     output = scratch(backend, size_t{m.rows} * queries * m.hidden * 4);
+  // Plain, and with each query's output normalized for the message gates
+  // too, which leaves the outputs as they are.
+  const MetalBuffer normalizedRows = scratch(backend, size_t{m.rows} * queries * m.hidden * 2),
+                    outputBeside = scratch(backend, size_t{m.rows} * queries * m.hidden * 4);
   CommandGraph graph;
-  ops::BlockResidualMix::addMix(graph, states, queryBuffer, output, shape, m.rows);
+  const std::array<ops::BlockResidualMixInput, 2> calls{
+      ops::BlockResidualMixInput{states, queryBuffer, shape, output, {}},
+      ops::BlockResidualMixInput{states, queryBuffer, shape, outputBeside, normalizedRows}};
+  ops::BlockResidualMix::addMix(graph, std::span(&calls[0], 1), m.rows);
+  ops::BlockResidualMix::addMix(graph, std::span(&calls[1], 1), m.rows);
   run(backend, graph);
   const auto got = download<float>(output, size_t{m.rows} * queries * m.hidden);
-  bool ok = true;
+  const auto gotNormalized = download<uint16_t>(normalizedRows, size_t{m.rows} * queries * m.hidden);
+  bool ok = true, okNormalized = true;
   for (uint32_t r = 0; r < m.rows; ++r) {
     const auto want = mixReference(m, r);
     for (size_t i = 0; i < want.size(); ++i) ok &= closeF32(got[size_t{r} * queries * m.hidden + i], want[i]);
+    // Each query's output RMS-normalized without weights, rounded to bf16.
+    for (uint32_t q = 0; q < queries; ++q) {
+      double squares = 0;
+      for (uint32_t d = 0; d < m.hidden; ++d) squares += want[size_t{q} * m.hidden + d] * want[size_t{q} * m.hidden + d];
+      const double inverse = 1 / std::sqrt(squares / m.hidden + 1e-6);
+      for (uint32_t d = 0; d < m.hidden; ++d)
+        okNormalized &= closeBf16(f32(gotNormalized[(size_t{r} * queries + q) * m.hidden + d]),
+                                  want[size_t{q} * m.hidden + d] * inverse);
+    }
   }
   check(ok, scope);
+  check(okNormalized && download<float>(outputBeside, size_t{m.rows} * queries * m.hidden) == got,
+        scope + ", each query's output normalized for the message gates beside it");
   if (queries > BLOCK_RESIDUAL_MIX_MAXIMUM_NORMS) return;
   std::vector<ops::NormWeights> norms;
   std::vector<MetalBuffer> outputs;
@@ -858,6 +882,380 @@ void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool curre
     }
   }
   check(okNorm, scope + ", each query through its own norm");
+}
+
+// The test producer's parameters (rms_norm_epilogue_test.metal).
+struct RmsNormEpilogueTestParams {
+  RmsNormEpilogueParams norm;
+  uint32_t simdgroup;
+};
+static_assert(sizeof(RmsNormEpilogueTestParams) == 20, "the test's parameters are 20 bytes on both sides");
+
+// A producer's RMS norm epilogue (kernels/common/rms_norm_epilogue.h) in its
+// test producer (rms_norm_epilogue_test): tiles of 32 columns, each storing
+// bf16(a + b) of every row and its sums of squares, the last writing the
+// rows' weighted RMS norm, against the fp64 norm of the stored rows and
+// against norm_rms's of them (Normalization::addRms), each within a bf16
+// step; the counter back at zero, so a second dispatch on the same scratch
+// writes the same bits. A decode step's rows (1, 2, 3, 16, 128), the 35B's,
+// Inkling's and the 27B's widths (2048, 2304, 5120), F32 and bf16 weights,
+// and a threadgroup's tiles or a simdgroup's (to 16 rows).
+void normEpilogueTest(MetalBackend &backend) {
+  for (const uint32_t width : {2048u, 2304u, 5120u})
+    for (const uint32_t rows : {1u, 2u, 3u, 16u, 128u})
+      for (const bool floatWeights : {true, false})
+        for (const bool simdgroup : {false, true}) {
+          if (simdgroup && rows > 16) continue;
+          std::mt19937 rng(width + rows * 7 + (floatWeights ? 1 : 0) + (simdgroup ? 2 : 0));
+          const uint32_t tiles = width / 32;
+          const size_t values = size_t{rows} * width;
+          const std::vector<float> a = bf16Values(randoms(rng, values, 1.0f)), b = bf16Values(randoms(rng, values, 0.5f));
+          std::vector<float> weights = randoms(rng, width, 0.5f);
+          for (float &w : weights) w += 1.0f;
+          if (!floatWeights) weights = bf16Values(weights);
+          const MetalBuffer weightBuffer = floatWeights ? upload(backend, weights) : upload(backend, bf16s(weights));
+          const ops::RmsNormEpilogue epilogue{{weightBuffer, floatWeights},
+                                              scratch(backend, values * 2),
+                                              scratch(backend, ops::RmsNormEpilogue::partialsBytes(tiles, rows)),
+                                              upload(backend, std::vector<uint32_t>{0})};
+          const RmsNormEpilogueTestParams params{epilogue.params(rows, width, tiles), simdgroup ? 1u : 0u};
+          const MetalBuffer aBuffer = upload(backend, bf16s(a)), bBuffer = upload(backend, bf16s(b)),
+                            stored = scratch(backend, values * 2), reference = scratch(backend, values * 2);
+          const auto bound = epilogue.bindings();
+          const auto produce = [&](CommandGraph &graph) {
+            graph.add("rms_norm_epilogue_test", {aBuffer, bBuffer, stored, bound[0], bound[1], bound[2], bound[3]},
+                      params, {tiles, 1, 1}, {256, 1, 1});
+          };
+          CommandGraph first;
+          produce(first);
+          ops::Normalization::addRms(first, stored, epilogue.weights, reference, width, rows);
+          run(backend, first);
+          const auto got = download<uint16_t>(epilogue.output, values), kernel = download<uint16_t>(reference, values),
+                     rowValues = download<uint16_t>(stored, values);
+          const bool zero = download<uint32_t>(epilogue.counter, 1)[0] == 0;
+          CommandGraph second;
+          produce(second);
+          run(backend, second);
+          const bool again = download<uint16_t>(epilogue.output, values) == got &&
+                             download<uint32_t>(epilogue.counter, 1)[0] == 0;
+          bool ok = true, okKernel = true;
+          for (uint32_t r = 0; r < rows; ++r) {
+            double squares = 0;
+            for (uint32_t c = 0; c < width; ++c) {
+              const double x = f32(rowValues[size_t{r} * width + c]);
+              squares += x * x;
+            }
+            const double inverse = 1 / std::sqrt(squares / width + 1e-6);
+            for (uint32_t c = 0; c < width; ++c) {
+              const size_t i = size_t{r} * width + c;
+              ok &= closeBf16(f32(got[i]), f32(rowValues[i]) * inverse * weights[c]);
+              okKernel &= closeBf16(f32(got[i]), f32(kernel[i]));
+            }
+          }
+          const std::string scope = "RMS norm epilogue of " + std::to_string(rows) + " rows of " +
+                                    std::to_string(width) + ", " + (floatWeights ? "F32" : "bf16") + " weights, " +
+                                    (simdgroup ? "a simdgroup's tiles" : "a threadgroup's tiles");
+          check(ok && okKernel, scope + ": the stored rows' norm within a bf16 step of fp64's and of norm_rms's");
+          check(zero && again, scope + ": the counter back at zero, and a second dispatch the same bits");
+        }
+}
+
+// The mix's scores and the convolution's sums against fp64, as 1.7.4 took
+// them and as this tree does (mix_conv_precision_test.metal): a mix of one
+// query over five states, random and at magnitudes 1e-3 to 1e3, its states
+// of scales 1 to 30 as a stack's blocks are, its query of sd 0.2, each
+// output value's error in its row's root mean square (a value near zero
+// counts by its row's size), max and mean, and its weights' relative error;
+// and a static convolution of 4 taps at the same magnitudes, Sum onto a bf16
+// residual, its outputs' error in units of their bf16 step. Printed, the
+// tree's against 1.7.4's; it fails where the tree's error passes 1.7.4's by
+// more than a tenth.
+// The precision kernels' parameters (mix_conv_precision_test.metal).
+struct MixPrecisionParams {
+  BlockResidualMixParams mix;
+  uint32_t onePass;
+};
+struct ConvPrecisionParams {
+  uint32_t channels, ordered;
+};
+void mixConvPrecisionTest(MetalBackend &backend) {
+  constexpr uint32_t hidden = 2304, rows = 32, stack = 4, channels = 2304;
+  std::printf("op precision against fp64: magnitude, 1.7.4's and this tree's max / mean error\n");
+  bool noWorse = true;
+  for (const double magnitude : {1e-3, 1e-1, 1.0, 1e1, 1e3}) {
+    std::mt19937 rng(static_cast<uint32_t>(1000 + std::log10(magnitude) * 10));
+    MixCase m;
+    m.hidden = hidden;
+    m.stack = stack;
+    m.queries = 1;
+    m.rows = rows;
+    m.planeRows = rows;
+    m.stackRows = randoms(rng, size_t{rows} * stack * hidden, 1.0f);
+    for (size_t i = 0; i < m.stackRows.size(); ++i)
+      m.stackRows[i] *= float(magnitude * std::pow(3.0, double(i / (size_t{rows} * hidden))));
+    m.stackRows = bf16Values(m.stackRows);
+    m.current = randoms(rng, size_t{rows} * hidden, float(30 * magnitude));
+    m.queryValues = randoms(rng, hidden, 0.2f);
+    const MetalBuffer stackBuffer = upload(backend, bf16s(m.stackRows)), current = upload(backend, m.current),
+                      query = upload(backend, m.queryValues);
+    const BlockResidualMixParams p{rows, hidden, stack, 1, rows * hidden,
+                                   static_cast<float>(1.0 / std::sqrt(double(hidden)))};
+    double maxError[2]{}, meanError[2]{}, maxWeight[2]{};
+    for (const uint32_t onePass : {0u, 1u}) {
+      const MetalBuffer weights = scratch(backend, size_t{rows} * BLOCK_RESIDUAL_MIX_MAXIMUM_STATES * 4),
+                        output = scratch(backend, size_t{rows} * hidden * 4);
+      CommandGraph graph;
+      graph.add("mix_precision_test", {stackBuffer, current, query, weights, output},
+                MixPrecisionParams{p, onePass}, {rows, 1, 1}, {BLOCK_RESIDUAL_MIX_THREADS, 1, 1});
+      run(backend, graph);
+      const auto got = download<float>(output, size_t{rows} * hidden);
+      const auto gotWeights = download<float>(weights, size_t{rows} * BLOCK_RESIDUAL_MIX_MAXIMUM_STATES);
+      for (uint32_t r = 0; r < rows; ++r) {
+        const auto want = mixReference(m, r);
+        double squares = 0;
+        for (const double v : want) squares += v * v;
+        const double rms = std::sqrt(squares / hidden);
+        for (uint32_t d = 0; d < hidden; ++d) {
+          const double error = std::fabs(got[size_t{r} * hidden + d] - want[d]) / std::max(std::fabs(want[d]), rms);
+          maxError[onePass] = std::max(maxError[onePass], error);
+          meanError[onePass] += error / (double(rows) * hidden);
+        }
+        // The fp64 weights of the row's states.
+        const uint32_t states = stack + 1;
+        std::vector<double> scores(states);
+        for (uint32_t s = 0; s < states; ++s) {
+          const float *x = s < stack ? &m.stackRows[(size_t{s} * rows + r) * hidden] : &m.current[size_t{r} * hidden];
+          double xx = 0, qx = 0;
+          for (uint32_t d = 0; d < hidden; ++d) {
+            xx += double(x[d]) * x[d];
+            qx += double(m.queryValues[d]) * x[d];
+          }
+          scores[s] = qx / std::sqrt(xx / hidden + 1e-6) / std::sqrt(double(hidden));
+        }
+        const double top = *std::max_element(scores.begin(), scores.end());
+        double total = 0;
+        for (double &v : scores) total += (v = std::exp(v - top));
+        for (uint32_t s = 0; s < states; ++s)
+          maxWeight[onePass] = std::max(maxWeight[onePass],
+                                        std::fabs(gotWeights[size_t{r} * BLOCK_RESIDUAL_MIX_MAXIMUM_STATES + s] -
+                                                  scores[s] / total) / (scores[s] / total));
+      }
+    }
+    std::printf("  mix scores, magnitude %g: outputs %.3g / %.3g against %.3g / %.3g, weights %.3g against %.3g\n",
+                magnitude, maxError[0], meanError[0], maxError[1], meanError[1], maxWeight[0], maxWeight[1]);
+    noWorse &= maxError[1] <= 1.1 * maxError[0] + 1e-9 && meanError[1] <= 1.1 * meanError[0] + 1e-12;
+    // The convolution of a chain of rows at the magnitude.
+    const std::vector<float> input = bf16Values(randoms(rng, size_t{rows} * channels, float(magnitude)));
+    const std::vector<float> taps = randoms(rng, size_t{channels} * kTaps, 0.4f);
+    const std::vector<float> residual = bf16Values(randoms(rng, size_t{rows} * channels, float(magnitude)));
+    const MetalBuffer inputBuffer = upload(backend, bf16s(input)), tapsBuffer = upload(backend, taps),
+                      residualBuffer = upload(backend, bf16s(residual));
+    double convMax[2]{}, convMean[2]{};
+    for (const uint32_t ordered : {0u, 1u}) {
+      const MetalBuffer output = scratch(backend, size_t{rows} * channels * 4);
+      CommandGraph graph;
+      graph.add("conv_precision_test", {inputBuffer, tapsBuffer, residualBuffer, output}, ConvPrecisionParams{channels, ordered},
+                {rows, (channels + 255) / 256, 1}, {256, 1, 1});
+      run(backend, graph);
+      const auto got = download<float>(output, size_t{rows} * channels);
+      for (uint32_t r = 0; r < rows; ++r)
+        for (uint32_t ch = 0; ch < channels; ++ch) {
+          double sum = 0;
+          for (uint32_t k = 0; k < kTaps; ++k)
+            sum += double(taps[size_t{ch} * kTaps + (kTaps - 1 - k)]) *
+                   (r >= k ? double(input[size_t{r - k} * channels + ch]) : 0.0);
+          const double y = (sum + input[size_t{r} * channels + ch]) / std::sqrt(double(kTaps + 1));
+          // In bf16 steps of y, the rounding the kernel takes.
+          const double step = std::max(std::fabs(y), 1e-30) / 128;
+          const double error = std::fabs((got[size_t{r} * channels + ch] - residual[size_t{r} * channels + ch]) - y) / step;
+          convMax[ordered] = std::max(convMax[ordered], error);
+          convMean[ordered] += error / (double(rows) * channels);
+        }
+    }
+    std::printf("  convolution, magnitude %g: %.3g / %.3g bf16 steps against %.3g / %.3g\n", magnitude, convMax[0],
+                convMean[0], convMax[1], convMean[1]);
+    noWorse &= convMax[1] <= 1.1 * convMax[0] + 1e-9 && convMean[1] <= 1.1 * convMean[0] + 1e-12;
+  }
+  check(noWorse, "the mix's one-pass scores and the convolution's ordered sums no less accurate against fp64 than "
+                 "1.7.4's, at magnitudes 1e-3 to 1e3");
+}
+
+// A decode step's FFN mix running its mixer's output convolution
+// (BlockResidualStates::convolution, the _convolved kernels) against that
+// convolution's own dispatch (Sum along the lanes' trees) and then the mix of
+// its rows: Inkling-2-Mini's FFN mix (one query over three states) with the
+// rows its gate reads normalized, or through its norm. Two lanes and a row of
+// no lane (a tree of 8 rows, as convTreeTest's, and a chain of 3) on a
+// residual; a lane of 16 rows at a block boundary (no residual); a lane of
+// one row. Uninstrumented (`exact`) the current rows and every output
+// bit for bit, under shader validation, which compiles the kernels apart,
+// within a bf16 step; the tape, copies, bit for bit either way; in one
+// dispatch; a row of no lane's current row and tape not written. And eight
+// lanes of 9 rows, past BLOCK_RESIDUAL_MIX_QUERY_ROWS (the _rows kernels),
+// which do not convolve: the two dispatches, and the mix asked to convolve
+// them refused (ops::BlockResidualMix::convolves).
+void convolvedMixTest(MetalBackend &backend, bool exact) {
+  struct Case {
+    std::string name;
+    std::vector<ops::LaneRows> lanes;
+    uint32_t rows;
+    bool residual;
+  };
+  std::vector<Case> cases{{"two lanes and a row of no lane", {{0, 8}, {8, 3}}, 12, true},
+                          {"a lane of 16 rows at a block boundary", {{0, 16}}, 16, false},
+                          {"a lane of one row", {{0, 1}}, 1, true}};
+  Case wide{"eight lanes of 9 rows", {}, 72, true};
+  for (uint32_t l = 0; l < 8; ++l) wide.lanes.push_back({l * 9, 9});
+  cases.push_back(wide);
+  constexpr uint32_t hidden = 2304, stack = 2;
+  constexpr uint16_t kSentinel = 0x7FC1;
+  for (const Case &k : cases) {
+    std::mt19937 rng(97 + k.rows);
+    const uint32_t rows = k.rows, lanes = static_cast<uint32_t>(k.lanes.size());
+    const ops::ShortConvShape shape{hidden, 0};
+    const ops::ShortConvState state{128, hidden + 384};
+    const ConvCase c = convCase(rng, shape, state, rows, lanes);
+    std::vector<ops::TreeRow> tree(rows, splash::test::chainRow(0));
+    std::vector<bool> inLane(rows, false);
+    for (uint32_t l = 0; l < lanes; ++l)
+      for (uint32_t r = 0; r < k.lanes[l].rows; ++r) {
+        const uint32_t first = k.lanes[l].first;
+        const uint32_t parent =
+            l == 0 && k.lanes[l].rows == 8 ? std::array<uint32_t, 8>{0, 0, 1, 2, 3, 1, 5, 0}[r] : r - 1;
+        tree[first + r] = r ? ops::TreeRow{tree[first + parent].ancestors | 1u << r, static_cast<uint16_t>(parent),
+                                           static_cast<uint16_t>(tree[first + parent].depth + 1)}
+                            : splash::test::chainRow(0);
+        inLane[first + r] = true;
+      }
+    std::vector<MetalBuffer> in;
+    for (uint32_t l = 0; l < lanes; ++l) in.push_back(upload(backend, bf16s(c.states[l])));
+    const MetalBuffer input = upload(backend, bf16s(c.input)), taps = upload(backend, c.taps),
+                      residual = k.residual ? upload(backend, bf16s(c.residual)) : MetalBuffer{},
+                      treeBuffer = upload(backend, tree), layout = laneRowsOf(backend, k.lanes);
+    const ops::LayoutRows layoutRows{lanes, rows, splash::test::mostRows(k.lanes)};
+    const uint32_t planeRows = rows + 3;
+    const MetalBuffer stackRows = upload(backend, bf16s(randoms(rng, size_t{planeRows} * stack * hidden, 1.0f))),
+                      queries = upload(backend, randoms(rng, hidden, 0.2f));
+    const ops::NormWeights norm{upload(backend, randoms(rng, hidden, 0.5f)), true};
+    // The current rows before: what a row of no lane mixes.
+    const std::vector<float> current = randoms(rng, size_t{rows} * hidden, 3.0f);
+    const ops::BlockResidualShape mixShape{hidden, stack, 1};
+    for (const bool normed : {false, true}) {
+      struct Run {
+        MetalBuffer current, tape, output, normalized;
+        size_t dispatches = 0;
+      };
+      const auto runMix = [&](bool fused) {
+        Run r{upload(backend, current), upload(backend, std::vector<uint16_t>(size_t{rows} * state.stride, kSentinel)),
+              scratch(backend, size_t{rows} * hidden * 4),
+              upload(backend, std::vector<uint16_t>(size_t{rows} * hidden, kSentinel))};
+        const ops::ShortConvBuffers buffers{input, taps, {}, 0, residual, r.current};
+        const ops::ShortConvVerify convolution{buffers, shape, in, state, layout, layoutRows, treeBuffer, r.tape};
+        CommandGraph graph;
+        if (!fused)
+          ops::ShortConvolution::addConvolution(graph, buffers, shape, ops::ShortConvOutput::Sum, in, {}, state,
+                                                layout, layoutRows, {}, treeBuffer, r.tape);
+        const ops::BlockResidualStates states{stackRows, planeRows, r.current, true, fused ? &convolution : nullptr};
+        if (normed) {
+          ops::BlockResidualMix::addMixNorm(graph, states, queries, std::span(&norm, 1), std::span(&r.normalized, 1),
+                                            mixShape, rows);
+        } else {
+          const ops::BlockResidualMixInput mix{states, queries, mixShape, r.output, r.normalized};
+          ops::BlockResidualMix::addMix(graph, std::span(&mix, 1), rows);
+        }
+        r.dispatches = graph.dispatches().size();
+        run(backend, graph);
+        return r;
+      };
+      const std::string scope = std::string("block residual mix running its convolution (") + k.name +
+                                (normed ? ", through its norm)" : ", its gate's rows normalized)");
+      const Run before = runMix(false);
+      if (!ops::BlockResidualMix::convolves(rows)) {
+        // More rows than a threadgroup mixes a row and query: the convolution's dispatch, then the _rows mix, as a
+        // prompt chunk runs them; a mix asked to convolve them is refused.
+        bool refused = false;
+        try {
+          static_cast<void>(runMix(true));
+        } catch (const std::invalid_argument &) {
+          refused = true;
+        }
+        check(refused && before.dispatches == 2,
+              scope + ": a call of more rows than a row and query's mix takes runs the convolution's dispatch and "
+                      "the mix's, and a mix asked to convolve them is refused");
+        continue;
+      }
+      const Run fused = runMix(true);
+      const auto values = size_t{rows} * hidden, tapeValues = size_t{rows} * state.stride;
+      const auto gotCurrent = download<float>(fused.current, values),
+                 wantCurrent = download<float>(before.current, values);
+      const auto gotTape = download<uint16_t>(fused.tape, tapeValues),
+                 wantTape = download<uint16_t>(before.tape, tapeValues);
+      const auto gotOutput = download<float>(fused.output, values), wantOutput = download<float>(before.output, values);
+      const auto gotNormalized = download<uint16_t>(fused.normalized, values),
+                 wantNormalized = download<uint16_t>(before.normalized, values);
+      // The tape holds copies of the inputs, and its columns past the
+      // convolution's their sentinels: bit for bit either way.
+      bool same = gotTape == wantTape, untouched = true;
+      for (size_t i = 0; i < values; ++i) {
+        same &= gotCurrent[i] == wantCurrent[i] ||
+                (!exact && (closeF32(gotCurrent[i], wantCurrent[i]) || closeBf16(gotCurrent[i], wantCurrent[i])));
+        same &= gotNormalized[i] == wantNormalized[i] ||
+                (!exact && closeBf16(f32(gotNormalized[i]), f32(wantNormalized[i])));
+        if (!normed) same &= gotOutput[i] == wantOutput[i] || (!exact && closeBf16(gotOutput[i], wantOutput[i]));
+      }
+      for (uint32_t r = 0; r < rows; ++r) {
+        if (inLane[r]) continue;
+        for (uint32_t col = 0; col < state.stride; ++col) untouched &= gotTape[size_t{r} * state.stride + col] == kSentinel;
+        for (uint32_t d = 0; d < hidden; ++d)
+          untouched &= gotCurrent[size_t{r} * hidden + d] == current[size_t{r} * hidden + d];
+      }
+      check(same && fused.dispatches == 1 && before.dispatches == 2,
+            scope + (exact ? ": the current rows, the tape and the outputs bit for bit as the convolution's and "
+                             "the mix's dispatches', in one"
+                           : ": the current rows, the tape and the outputs within a bf16 step of the convolution's "
+                             "and the mix's dispatches', in one"));
+      check(untouched, scope + ": no row of no lane convolved");
+    }
+  }
+}
+
+// Two mixes in one call (a gated application's messages, four queries over
+// two states, and its mixer's inputs, one or three queries over three)
+// against each one's own call, of 5 rows (a threadgroup a row and query) and
+// of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a threadgroup a row and mix): each
+// output bit for bit, the one kernel's either way.
+void mixPairTest(MetalBackend &backend) {
+  for (const uint32_t queries : {1u, 3u})
+    for (const uint32_t rows : {5u, BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3}) {
+      std::mt19937 rng(71 + queries + rows);
+      constexpr uint32_t hidden = 2304;
+      const std::array<ops::BlockResidualShape, 2> shapes{ops::BlockResidualShape{hidden, 1, 4},
+                                                          ops::BlockResidualShape{hidden, 2, queries}};
+      std::vector<ops::BlockResidualMixInput> mixes;
+      for (const ops::BlockResidualShape &shape : shapes) {
+        const uint32_t planeRows = rows + 3;
+        mixes.push_back({{upload(backend, bf16s(bf16Values(randoms(rng, size_t{planeRows} * shape.stack * hidden, 1.0f)))),
+                          planeRows, upload(backend, bf16s(bf16Values(randoms(rng, size_t{rows} * hidden, 3.0f))))},
+                         upload(backend, randoms(rng, size_t{shape.queries} * hidden, 0.2f)), shape,
+                         scratch(backend, size_t{rows} * shape.queries * hidden * 4), {}});
+      }
+      CommandGraph pair;
+      ops::BlockResidualMix::addMix(pair, mixes, rows);
+      check(pair.dispatches().size() == 1, "two block residual mixes in one call: one dispatch");
+      run(backend, pair);
+      std::vector<std::vector<float>> together;
+      for (const ops::BlockResidualMixInput &mix : mixes)
+        together.push_back(download<float>(mix.output, size_t{rows} * mix.shape.queries * hidden));
+      bool same = true;
+      for (size_t m = 0; m < mixes.size(); ++m) {
+        CommandGraph alone;
+        ops::BlockResidualMix::addMix(alone, std::span(&mixes[m], 1), rows);
+        run(backend, alone);
+        same &= download<float>(mixes[m].output, size_t{rows} * mixes[m].shape.queries * hidden) == together[m];
+      }
+      check(same, "two block residual mixes in one call, 4 and " + std::to_string(queries) + " queries of " +
+                      std::to_string(rows) + " rows: each output bit for bit as its own call's");
+    }
 }
 
 // A call's gates on the same rows (MessageGateInput): x rows of a mix of
@@ -965,9 +1363,22 @@ void addReferenceGates(CommandGraph &graph, const ops::MessageGateBuffers &buffe
   }
 }
 
+// The fused gates' inputs normalized (MessageGateBuffers::normalizedX,
+// normalizedMessage): `count` fp32 rows of `slots` slots of `hidden` values
+// into bf16 rows of their layout, as the mixes writing them normalize them
+// (message_gate_test_normalize).
+void addNormalized(CommandGraph &graph, const MetalBuffer &rows, const MetalBuffer &normalized, uint32_t slots,
+                   uint32_t hidden, uint32_t count) {
+  const MessageGateReferenceParams p{count, hidden, slots * hidden, 0, 0, 0, 0};
+  graph.add("message_gate_test_normalize", {rows, normalized}, p, {count, slots, 1},
+            {MESSAGE_GATE_REFERENCE_THREADS, 1, 1});
+}
+
 // Runs rows [first, first + count) of the case's gates as one call on
 // `path`, into `outputs` (a buffer a gate, [rows][hidden] bf16), over views
-// of the shared rows; the counters stay zero.
+// of the shared rows, a call of the fused gates (MessageGate::readsNormalized)
+// first normalizing them as the mixes writing them do; the counters stay
+// zero.
 void runGates(MetalBackend &backend, const GateCase &c, const MetalBuffer &x, const MetalBuffer &message,
               std::span<const ops::MessageGateWeights> weights, std::span<const MetalBuffer> norms,
               std::span<const MetalBuffer> outputs, const MetalBuffer &counters, uint32_t first, uint32_t count,
@@ -977,17 +1388,24 @@ void runGates(MetalBackend &backend, const GateCase &c, const MetalBuffer &x, co
   for (uint32_t g = 0; g < c.gates; ++g)
     gates.push_back({weights[g], {norms[g], true}, c.column(g) * hidden, g * hidden,
                      backend.view(outputs[g], uint64_t{first} * hidden * 2, uint64_t{count} * hidden * 2)});
+  const bool normalized = path == GatePath::Fused && ops::MessageGate::readsNormalized(count);
   const ops::MessageGateBuffers buffers{
       backend.view(x, uint64_t{first} * 3 * hidden * 4, uint64_t{count} * 3 * hidden * 4),
       3 * hidden,
       backend.view(message, uint64_t{first} * 4 * hidden * 4, uint64_t{count} * 4 * hidden * 4),
       4 * hidden,
+      normalized ? scratch(backend, size_t{count} * 3 * hidden * 2) : MetalBuffer{},
+      normalized ? scratch(backend, size_t{count} * 4 * hidden * 2) : MetalBuffer{},
       scratch(backend, size_t{count} * 2 * hidden * 2),
       scratch(backend, size_t{c.gates} * count * rank * 2),
       scratch(backend, size_t{c.gates} * count * hidden * 4),
       scratch(backend, size_t{count} * hidden * 4),
       counters};
   CommandGraph graph;
+  if (normalized) {
+    addNormalized(graph, buffers.x, buffers.normalizedX, 3, hidden, count);
+    addNormalized(graph, buffers.message, buffers.normalizedMessage, 4, hidden, count);
+  }
   if (path == GatePath::Reference) addReferenceGates(graph, buffers, gates, hidden, count);
   else ops::MessageGate::add(graph, buffers, gates, hidden, count);
   run(backend, graph);
@@ -1003,7 +1421,8 @@ std::string gateKernels(uint32_t rows, GatePath path) {
 // Each gate of a call of one or three gates (a layer's FFN gate; its q, k and
 // v gates of x queries of their own or of one) against fp64 with the
 // source's bf16 roundings of the down projection's input and output: fused
-// (a decode step's rows: one group and a group and a part), tiled (more rows,
+// (a decode step's rows: one group of a power of two, or groups of 4 rows
+// and a part of one), tiled (more rows,
 // a prompt chunk's: whole tiles and a part of one) and through the reference
 // path's float projections, of F32 weights and of BF16, the counters back at
 // zero. The weights' values are the same in either format, and so is every
@@ -1050,6 +1469,41 @@ void gateTest(MetalBackend &backend, uint32_t rows, uint32_t gates, bool sharedX
         "message gates, " + std::to_string(gates) + " a call" + kind + ", of " + std::to_string(rows) + " rows (" +
             gateKernels(rows, path) + shape +
             ") through their norms, x and the messages at columns of wider rows, F32 and BF16 weights alike");
+}
+
+// A decode step's gates in groups of each power of two (MessageGate::groupRows):
+// a row's outputs are the same bits whatever its call's rows (1, 2, 3, 6, 13,
+// 16 and 17, a group and a part), as a lane's rows are whatever lanes run
+// beside it. Uninstrumented alone (`exact`): shader validation compiles the
+// kernels apart.
+void gateGroupBitsTest(MetalBackend &backend, bool exact) {
+  if (!exact) return;
+  std::mt19937 rng(43);
+  constexpr uint32_t most = 17, gates = 3;
+  const GateCase c(rng, most, gates, false);
+  const MetalBuffer x = upload(backend, c.x), message = upload(backend, c.message);
+  std::vector<MetalBuffer> norms;
+  for (uint32_t g = 0; g < gates; ++g) norms.push_back(upload(backend, c.norm[g]));
+  const MetalBuffer counters = scratch(backend, ops::MessageGate::kCountersBytes);
+  std::memset(counters.contents(), 0, counters.sizeBytes());
+  std::vector<ops::MessageGateWeights> weights;
+  for (uint32_t g = 0; g < gates; ++g) weights.push_back(c.weights(backend, g, true));
+  // Each call's first row of each gate.
+  std::vector<std::vector<uint16_t>> first;
+  for (const uint32_t rows : {1u, 2u, 3u, 6u, 13u, 16u, 17u}) {
+    std::vector<MetalBuffer> outputs;
+    for (uint32_t g = 0; g < gates; ++g) outputs.push_back(scratch(backend, size_t{rows} * c.hidden * 2));
+    runGates(backend, c, x, message, weights, norms, outputs, counters, 0, rows);
+    std::vector<uint16_t> row;
+    for (uint32_t g = 0; g < gates; ++g) {
+      const auto values = download<uint16_t>(outputs[g], c.hidden);
+      row.insert(row.end(), values.begin(), values.end());
+    }
+    first.push_back(std::move(row));
+  }
+  bool same = true;
+  for (const auto &row : first) same &= row == first.front();
+  check(same, "message gates of a decode step: a row's bits the same in a call of 1, 2, 3, 6, 13, 16 and 17 rows");
 }
 
 // The gates' three paths on the same rows: a call of three gates of more rows
@@ -1225,7 +1679,14 @@ int main(int argc, const char *argv[]) {
               mixTest(backend, stack, queries, currentFloat, rows);
         for (const uint32_t rows : {5u, BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3}) mixTest(backend, 0, 1, currentFloat, rows);
       }
-      for (const uint32_t rows : {6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1}) {
+      mixPairTest(backend);
+      convolvedMixTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
+      mixConvPrecisionTest(backend);
+      normEpilogueTest(backend);
+      // A decode step's groups of each power of two (1 and 2 rows, 3 in 4) and of 4 rows with a part of one
+      // (6, 13, 16 and the most rows), and a prompt chunk's tiles.
+      for (const uint32_t rows : {1u, 2u, 3u, 6u, 13u, 16u, ops::MessageGate::kFusedRows,
+                                  ops::MessageGate::kFusedRows + 1}) {
         gateTest(backend, rows, 1, true);
         gateTest(backend, rows, 3, false);
       }
@@ -1249,6 +1710,7 @@ int main(int argc, const char *argv[]) {
       gateTest(backend, ops::MessageGate::kFusedRows + 1, 3, false, GatePath::Fused,
                GateCase::kHidden, 24);
       gatePathsTest(backend);
+      gateGroupBitsTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
       gateRefusalTest(backend);
       logitFinishTest(backend);
     } catch (const std::exception &error) {

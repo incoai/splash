@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -182,6 +183,10 @@ class LocalServeTests(unittest.TestCase):
                 "--revision cannot be used with --model-dir",
             ),
             (
+                ["--model-dir", "model", "--draft-revision", "main"],
+                "--draft-revision cannot be used with --model-dir",
+            ),
+            (
                 ["--model-dir", "model", "--draft-model", "owner/draft"],
                 "--draft-model must be a local DFlash2 draft directory",
             ),
@@ -264,7 +269,8 @@ class LocalPreparationCommandTests(unittest.TestCase):
                 {"kind": "model", "message": "bad model"},
             ),
             (OSError("unreadable"), 1, {"kind": "internal", "message": "unreadable"}),
-            (KeyboardInterrupt(), 130, None),
+            (local.models.Stopped(signal.SIGINT), 130, None),
+            (local.models.Stopped(signal.SIGTERM), 143, None),
         ):
             with (
                 self.subTest(failure=type(failure).__name__),

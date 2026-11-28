@@ -455,6 +455,26 @@ class ChatTemplateProbeTests(unittest.TestCase):
                     (chosen.later_system, chosen.source), (UNSUPPORTED, text)
                 )
 
+    def test_a_tokenizer_on_disk_reports_its_templates_reasoning(self):
+        """What the installer records for the app before any server starts:
+        the report of the default template of the tokenizer in a directory,
+        and none of a family whose requests' effort reaches no model, whose
+        tokenizer is not read."""
+        with tempfile.TemporaryDirectory() as directory:
+            tokenizer(source("qwen38")).save_pretrained(directory)
+            self.assertEqual(
+                chat_templates.tokenizer_reasoning(directory, QWEN),
+                {
+                    "thinks": True,
+                    "efforts": ["low", "medium", "xhigh"],
+                    "default": "xhigh",
+                },
+            )
+        self.assertEqual(
+            chat_templates.tokenizer_reasoning("/nowhere", FLINT),
+            {"thinks": None, "efforts": [], "default": None},
+        )
+
     def test_reasoning_names_the_efforts_a_template_tells_apart(self):
         """Qwen3.8's templates tell three efforts apart, the others rendering
         as their aliases, and reason at xhigh by default; Qwen3.6's reason or
@@ -1112,6 +1132,33 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 )
                 self.assertEqual(job.thinking, expected)
         self.assertEqual(probe.call_count, 1)
+        # A top-level enable_thinking is the same switch, sent either way.
+        for top, kwargs, extra, thinking in (
+            (False, None, {"reasoning_effort": "high"}, False),
+            (True, None, {"reasoning_effort": "none"}, True),
+            (False, off, {}, False),
+        ):
+            with self.subTest(top=top, kwargs=kwargs, extra=extra):
+                job = chat_frontend(qwen).prepare(
+                    {
+                        "model": "test-model",
+                        "messages": messages,
+                        "enable_thinking": top,
+                        "chat_template_kwargs": kwargs,
+                        **extra,
+                    },
+                    deadline=fixtures.FOREVER,
+                )
+                self.assertEqual(job.thinking, thinking)
+        for fields, error in (
+            ({"enable_thinking": "false"}, "enable_thinking must be a boolean"),
+            (
+                {"enable_thinking": True, "chat_template_kwargs": off},
+                "enable_thinking and chat_template_kwargs enable_thinking differ",
+            ),
+        ):
+            with self.subTest(fields=fields), self.assertRaisesRegex(APIError, error):
+                app.prepare({**body, **fields}, deadline=fixtures.FOREVER)
         for kwargs, error in (
             ("on", "must be an object"),
             ({"tools": []}, "cannot set tools"),

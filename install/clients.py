@@ -229,6 +229,12 @@ def _claude(path, server, environment, arguments):
         CLAUDE_CODE_USE_VERTEX="0",
         CLAUDE_CODE_USE_FOUNDRY="0",
     )
+    # Splash gives no verdict on a tool call, so auto mode's review stays with
+    # the client: its own classifier requests, which the served model answers
+    # (a prompt of about 30K tokens, prefilled once). Asked, a server that
+    # returns none costs the first request; Claude Code 2.1.269 and 2.1.277,
+    # which read no such variable, ask on every request and deny the calls.
+    environment["CLAUDE_CODE_AUTO_MODE_SERVER"] = "0"
     # Auto mode adds classifier inference to tool approval. Start in the
     # normal approval mode, even if the user's global default is auto.
     return [

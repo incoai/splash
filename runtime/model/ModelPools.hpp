@@ -1,8 +1,9 @@
 #pragma once
 
 // The model's memories that follow the engine's (model::ElasticPool), over
-// the mechanisms that hold them: the store of streamed experts (ExpertStore)
-// and the hot block cache of spilled K/V (KvBlockCache). The runtime's own,
+// the mechanisms that hold them: the store of streamed experts (ExpertStore),
+// the hot block cache of spilled K/V (KvBlockCache) and the SSD cache's state
+// staging (QwenStateStorage). The runtime's own,
 // the history's staging, the vision arena and the image embeddings, are
 // Runtime::Impl's (Runtime::pools). An adapter only calls its mechanism's
 // functions: none changes how the mechanism holds or gives back its memory.
@@ -10,6 +11,7 @@
 #include "model/ElasticPool.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
+#include "model/QwenState.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -92,6 +94,23 @@ public:
 
 private:
   KvBlockCache &cache_;
+};
+
+// The SSD cache's state staging (QwenStateStorage::stagingState): one unit,
+// held while the tier takes cache writes, which the engine gives back once
+// it takes none (its cap) and takes back once it takes them again.
+class StateStagingPool final : public ElasticPool {
+public:
+  explicit StateStagingPool(QwenStateStorage &states) noexcept : states_(states) {}
+
+  [[nodiscard]] PoolState state() const override { return states_.stagingState(); }
+  uint64_t release(uint64_t bytes) override { return bytes ? states_.releaseStaging() : 0; }
+  metal::AllocationResult grow(const metal::AllocationAdmission &admit) override {
+    return states_.growStaging(admit);
+  }
+
+private:
+  QwenStateStorage &states_;
 };
 
 } // namespace splash::model

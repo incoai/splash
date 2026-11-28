@@ -11,7 +11,7 @@
 // tiles each read their history in one split, the direct kernels, which
 // write their tiles' rows themselves (Direct below); each tile
 // SPLASH_ATTENTION_TILE_ROWS query rows of one KV head (a direct kernel's
-// SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS), every sequence of a command in one
+// its GPU family's rows), every sequence of a command in one
 // dispatch, its rows its entry of the command's layout. The geometry is
 // Inkling-2-Mini's: 24 query heads over 8 KV heads of 128 dimensions, three a
 // group, a tile one part of 24 fused rows. Every kernel here computes in its
@@ -100,7 +100,7 @@ inline void relative_attention_split_phase(
   const ulong slot = tile.first_slot + split;
   device float *own = partials + slot * M * HeadDim;
   relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, SPLASH_ATTENTION_TILE_ROWS, HeadDim, Window,
-                               CacheElement, Int8Queries>(
+                               CacheElement, Int8Queries, true>(
       queries + tile.offset, reinterpret_cast<device int8_t *>(own),
       relative_states + tile.offset / HeadDim * SPLASH_RELATIVE_ATTENTION_STATES, relative_bias, page_table,
       params.kv, kv_head, tile.first_position, tile.active_rows, run, scores, probabilities, row_max, row_sum,
@@ -239,9 +239,9 @@ RELATIVE_ATTENTION_REDUCE(relative_attention_reduce_w1023, 1023)
 
 // Direct (ops::RelativeAttention::addAttention, a dispatch whose sequences
 // each read their history in one split): a threadgroup of 256 threads per (KV
-// head, tile), each tile SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS rows of one KV
-// head, a sequence's tiles the dispatch's from its first_tile on in tiles of
-// that many rows. A tile runs the split's page loop over its one run of pages,
+// head, tile), each tile Rows rows of one KV head (its GPU family's), a
+// sequence's tiles the dispatch's from its first_tile on in tiles of that
+// many rows. A tile runs the split's page loop over its one run of pages,
 // those of its first row's window to its last row's: the union of the runs of
 // its two paged-attention tiles of the same rows, whose other pages none of a
 // row's keys sit on, so that their probabilities are zero and leave the row's
@@ -257,8 +257,12 @@ RELATIVE_ATTENTION_REDUCE(relative_attention_reduce_w1023, 1023)
 // layer's attention 10% of its time after 2,048 tokens (4.55 ms against 4.10
 // without) and a full layer's 1.7% after 8,192; a tile of twice the rows,
 // which reads each page once for both, ran 5-11% faster than two tiles at
-// short histories (0 to 2,048 tokens) and 0.6-4% at 8,192 and 30,720.
-template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement, bool Int8Queries>
+// short histories (0 to 2,048 tokens) and 0.6-4% at 8,192 and 30,720. Its
+// tiles take the family's rows (ops::AttentionCalibration::directRows: 21,
+// whose 63 fused rows it multiplies as 64, or 16) and rescale every row: each
+// family's direct tiles are taller than the tiles it bounds.
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint Rows, uint HeadDim, uint Window, typename CacheElement,
+          bool Int8Queries>
 inline void relative_attention_direct_phase(
     device bfloat *queries, device float *partials, device const SplashKvPage *page_table,
     device const SplashTreeRow *tree, device const SplashLaneRows *layout, device const float *relative_states,
@@ -267,7 +271,6 @@ inline void relative_attention_direct_phase(
     threadgroup bfloat *probabilities, threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale, uint3 group, uint thread_index, uint, uint,
     uint s) {
-  constexpr uint Rows = SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS;
   constexpr uint M = QueryHeadsPerKVHead * Rows, QHeads = KVHeads * QueryHeadsPerKVHead;
   constexpr uint Width = QHeads * HeadDim;
   using Row = RelativeAttentionRow<QHeads, HeadDim>;
@@ -287,7 +290,8 @@ inline void relative_attention_direct_phase(
                                        (SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead) * HeadDim;
   static_assert(M * HeadDim <= SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead * HeadDim * sizeof(float),
                 "a tile's query codes fit a slot of the paged attention's partials");
-  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement, Int8Queries>(
+  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement, Int8Queries,
+                               false>(
       queries + offset, reinterpret_cast<device int8_t *>(codes),
       relative_states + offset / HeadDim * SPLASH_RELATIVE_ATTENTION_STATES, relative_bias, page_table, params.kv,
       kv_head, first_position, active_rows, run, scores, probabilities, row_max, row_sum, previous_scale, rescale,
@@ -342,8 +346,9 @@ inline void relative_attention_direct_phase(
 // and its sums, which it does not write (other buffers of the dispatch), and
 // the rows' sinks' staging, before the parameters. Over the whole history and
 // a sliding layer's window, for INT8 pages with bf16 or INT8 queries and BF16
-// pages.
-#define RELATIVE_ATTENTION_DIRECT_KERNEL(Name, Window, CacheElement, Int8Queries)                                \
+// pages; for tiles of SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS rows and, _r16,
+// of SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS_R16.
+#define RELATIVE_ATTENTION_DIRECT_KERNEL(Name, Rows, Window, CacheElement, Int8Queries)                          \
   kernel void Name(                                                                                           \
       device bfloat *queries [[buffer(0)]],                                                                   \
       device float *partials [[buffer(1)]],                                                                   \
@@ -369,7 +374,7 @@ inline void relative_attention_direct_phase(
       uint thread_index [[thread_index_in_threadgroup]],                                                      \
       uint lane [[thread_index_in_simdgroup]],                                                                \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                                                   \
-    constexpr uint M = 3 * SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS;                                             \
+    constexpr uint M = relative_attention_matmul_rows(3 * Rows);                                              \
     constexpr uint N = SplashKvPageTokens;                                                                    \
     alignas(16) threadgroup float scores[M * N];                                                              \
     alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
@@ -378,19 +383,21 @@ inline void relative_attention_direct_phase(
     threadgroup float previous_scale[M];                                                                      \
     threadgroup atomic_uint rescale;                                                                          \
     const uint s = splash_attention_sequence_of_tile(params, group.y);                                        \
-    relative_attention_direct_phase<8, 3, 128, Window, CacheElement, Int8Queries>(                            \
+    relative_attention_direct_phase<8, 3, Rows, 128, Window, CacheElement, Int8Queries>(                      \
         queries, partials,                                                                                    \
         SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5,  \
                             page_table6, page_table7),                                                        \
         tree, layout, relative_states, relative_bias, projection, hidden, table, sums, sinks, params, scores,  \
         probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index, lane, simd_group, s);   \
   }
-#define RELATIVE_ATTENTION_DIRECTS(Suffix, Window)                                                            \
-  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8_direct##Suffix, Window, int8_t, false)               \
-  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8q_direct##Suffix, Window, int8_t, true)               \
-  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_bf16_direct##Suffix, Window, bfloat, false)
-RELATIVE_ATTENTION_DIRECTS(, 0)
-RELATIVE_ATTENTION_DIRECTS(_w1023, 1023)
+#define RELATIVE_ATTENTION_DIRECTS(Suffix, Rows, Window)                                                      \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8_direct##Suffix, Rows, Window, int8_t, false)         \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8q_direct##Suffix, Rows, Window, int8_t, true)         \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_bf16_direct##Suffix, Rows, Window, bfloat, false)
+RELATIVE_ATTENTION_DIRECTS(, SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS, 0)
+RELATIVE_ATTENTION_DIRECTS(_w1023, SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS, 1023)
+RELATIVE_ATTENTION_DIRECTS(_r16, SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS_R16, 0)
+RELATIVE_ATTENTION_DIRECTS(_r16_w1023, SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS_R16, 1023)
 #undef RELATIVE_ATTENTION_DIRECTS
 #undef RELATIVE_ATTENTION_DIRECT_KERNEL
 
@@ -413,7 +420,7 @@ RELATIVE_ATTENTION_DIRECTS(_w1023, 1023)
 // head's splits' staging: the INT8 query codes, the relative states and the
 // bf16 queries, in that order.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, uint Window, bool PositionScaled,
-          typename CacheElement, bool Int8Queries, bool Table>
+          typename CacheElement, bool Int8Queries, bool Table, bool BoundedRescale>
 inline void relative_attention_decode_phase(
     device const bfloat *projection, device const bfloat *keys, device const bfloat *values,
     device const float *query_scale, device const float *relative_scale, device const float *relative_bias,
@@ -426,8 +433,12 @@ inline void relative_attention_decode_phase(
   using Row = RelativeAttentionRow<KVHeads * QueryHeadsPerKVHead, HeadDim>;
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead, D = HeadDim, States = Row::States;
   constexpr uint Simdgroups = 8;
-  constexpr uint Tiles = RowsPerTile / SPLASH_ATTENTION_TILE_ROWS;
-  static_assert(Tiles * SPLASH_ATTENTION_TILE_ROWS == RowsPerTile && M <= 64, "whole tiles of a 256-thread loop");
+  // A lane of up to a paged tile's rows takes one of its slots, a verify
+  // block's two.
+  constexpr uint Tiles = (RowsPerTile + SPLASH_ATTENTION_TILE_ROWS - 1) / SPLASH_ATTENTION_TILE_ROWS;
+  static_assert((RowsPerTile <= SPLASH_ATTENTION_TILE_ROWS || Tiles * SPLASH_ATTENTION_TILE_ROWS == RowsPerTile) &&
+                    M <= 64,
+                "a slot's rows or whole slots, of a 256-thread loop");
   const uint kv_head = group.x, s = group.y, split = group.z;
   constant SplashAttentionSequence &sequence = params.sequence[s];
   const SplashAttentionRows rows = splash_attention_rows(layout, params, s);
@@ -464,7 +475,8 @@ inline void relative_attention_decode_phase(
   threadgroup_barrier(mem_flags::mem_device);
   // Publish the tile's rows' partials and statistics, then arrive.
   const ulong slot = head_slot + split;
-  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, RowsPerTile, D, Window, CacheElement, Int8Queries>(
+  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, RowsPerTile, D, Window, CacheElement, Int8Queries,
+                               BoundedRescale>(
       queries, reinterpret_cast<device int8_t *>(staging), states, relative_bias, page_table, params.kv, kv_head,
       first, rows.rows, run, scores, probabilities, row_max, row_sum, previous_scale, rescale,
       splash_attention_tree(params, sequence, rows, tree, first), thread_index,
@@ -516,12 +528,17 @@ inline void relative_attention_decode_phase(
 // and the table's sums (other buffers of the dispatch without a table), the
 // page tables, the command's tree rows (another buffer of the dispatch
 // without), its layout and the parameters. Each is compiled for blocks of up
-// to 8 rows and, _r16, a verify block's 16; for the layers' two variants
+// to 2 rows (_r2, 6 fused rows multiplied as 8), 5 (_r5, 15 as 16), 8 and,
+// _r16, a verify block's 16, a narrow cap's lanes the smallest that holds
+// their rows (RelativeAttention::plan), whose tiles bound their rescale
+// or, _r16_unbounded, rescale every row (the family's choice for the shape,
+// ops::AttentionCalibration::boundedRescaleRows); for the layers' two variants
 // alone, a full layer's (the whole history, position-scaled: _scaled) and a
 // sliding one's (windowed, unscaled: _w1023); plain and writing the
 // out-projection's Table16 input too (_table16); for INT8 pages with bf16 or
 // INT8 queries, and BF16 pages.
-#define RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, Table) \
+#define RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, Table, \
+                                         BoundedRescale)                                                      \
   kernel void Name(                                                                                           \
       device const bfloat *projection [[buffer(0)]],                                                          \
       device const bfloat *keys [[buffer(1)]],                                                                \
@@ -550,7 +567,7 @@ inline void relative_attention_decode_phase(
       uint thread_index [[thread_index_in_threadgroup]],                                                      \
       uint lane [[thread_index_in_simdgroup]],                                                                \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                                                   \
-    constexpr uint M = 3 * RowsPerTile;                                                                       \
+    constexpr uint M = relative_attention_matmul_rows(3 * RowsPerTile);                                       \
     constexpr uint N = SplashKvPageTokens;                                                                    \
     alignas(16) threadgroup float scores[M * N];                                                              \
     alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
@@ -560,7 +577,7 @@ inline void relative_attention_decode_phase(
     threadgroup atomic_uint rescale;                                                                          \
     threadgroup uint arrival;                                                                                 \
     relative_attention_decode_phase<8, 3, RowsPerTile, 128, Window, PositionScaled, CacheElement, Int8Queries,  \
-                                    Table>(                                                                   \
+                                    Table, BoundedRescale>(                                                   \
         projection, keys, values, query_scale, relative_scale, relative_bias, partials, statistics, counters,  \
         hidden, table, sums,                                                                                  \
         SPLASH_LANE_BINDING(group.y, page_table0, page_table1, page_table2, page_table3, page_table4,          \
@@ -568,22 +585,27 @@ inline void relative_attention_decode_phase(
         tree, layout, params, scores, probabilities, row_max, row_sum, previous_scale, &rescale, &arrival,     \
         group, thread_index, lane, simd_group);                                                               \
   }
-#define RELATIVE_ATTENTION_DECODE_OUTPUTS(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries)  \
-  RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, false) \
+#define RELATIVE_ATTENTION_DECODE_OUTPUTS(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries,   \
+                                          BoundedRescale)                                                     \
+  RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, false, \
+                                   BoundedRescale)                                                            \
   RELATIVE_ATTENTION_DECODE_KERNEL(Name##_table16, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, \
-                                   true)
-#define RELATIVE_ATTENTION_DECODE_FORMATS(Suffix, RowsPerTile, Window, PositionScaled)                         \
+                                   true, BoundedRescale)
+#define RELATIVE_ATTENTION_DECODE_FORMATS(Suffix, RowsPerTile, Window, PositionScaled, BoundedRescale)         \
   RELATIVE_ATTENTION_DECODE_OUTPUTS(relative_attention_q8_decode##Suffix, RowsPerTile, Window, PositionScaled,  \
-                                    int8_t, false)                                                            \
+                                    int8_t, false, BoundedRescale)                                            \
   RELATIVE_ATTENTION_DECODE_OUTPUTS(relative_attention_q8q_decode##Suffix, RowsPerTile, Window, PositionScaled, \
-                                    int8_t, true)                                                             \
+                                    int8_t, true, BoundedRescale)                                             \
   RELATIVE_ATTENTION_DECODE_OUTPUTS(relative_attention_bf16_decode##Suffix, RowsPerTile, Window, PositionScaled, \
-                                    bfloat, false)
-#define RELATIVE_ATTENTION_DECODE_VARIANTS(Suffix, RowsPerTile)                                                \
-  RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_scaled, RowsPerTile, 0, true)                                     \
-  RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_w1023, RowsPerTile, 1023, false)
-RELATIVE_ATTENTION_DECODE_VARIANTS(, 8)
-RELATIVE_ATTENTION_DECODE_VARIANTS(_r16, 16)
+                                    bfloat, false, BoundedRescale)
+#define RELATIVE_ATTENTION_DECODE_VARIANTS(Suffix, RowsPerTile, BoundedRescale)                                \
+  RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_scaled, RowsPerTile, 0, true, BoundedRescale)                     \
+  RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_w1023, RowsPerTile, 1023, false, BoundedRescale)
+RELATIVE_ATTENTION_DECODE_VARIANTS(_r2, 2, true)
+RELATIVE_ATTENTION_DECODE_VARIANTS(_r5, 5, true)
+RELATIVE_ATTENTION_DECODE_VARIANTS(, 8, true)
+RELATIVE_ATTENTION_DECODE_VARIANTS(_r16, 16, true)
+RELATIVE_ATTENTION_DECODE_VARIANTS(_r16_unbounded, 16, false)
 #undef RELATIVE_ATTENTION_DECODE_VARIANTS
 #undef RELATIVE_ATTENTION_DECODE_FORMATS
 #undef RELATIVE_ATTENTION_DECODE_OUTPUTS

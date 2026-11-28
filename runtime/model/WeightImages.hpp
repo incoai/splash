@@ -39,7 +39,8 @@ using ImageWriter = std::function<void(std::span<uint8_t> bytes, const metal::Me
 // (gguf::Image::residentBytes: a layer whose routed experts stream), and the
 // bytes its writer writes that its readers parse, where the plan has them
 // (gguf::Image::fills: its header and descriptors), which its file reads
-// while the image holds no memory (WeightFile).
+// while the image holds no memory (WeightFile), and the formats its tensors
+// load in, which its record names (WeightFileRecord::formats).
 struct ImagePlan final {
   std::string component;
   std::string magic;
@@ -49,6 +50,7 @@ struct ImagePlan final {
   ImageWriter write;
   uint64_t declaredBytes = 0;
   std::shared_ptr<const std::vector<gguf::Fill>> planned = {};
+  std::string formats = {};
 };
 
 // A model's weights in memory: each image in a buffer of its own, written

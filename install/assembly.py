@@ -57,8 +57,13 @@ RECORD_KEYS = {
 # A text-only assembly of a family that serves images may record why the
 # Hub's listing of its commit gave no tower Splash serves (vision_unavailable),
 # so that later starts do not ask again until the commit moves
-# (upstream._lacks_tower).
-OPTIONAL_RECORD_KEYS = {"vision_unavailable"}
+# (upstream._lacks_tower). One also records whether --weights auto loads any
+# of its weights in another format than the default (quantizable_weights; null
+# where the engine could not say), by which the app offers that option, and
+# what its chat template makes of the reasoning efforts (reasoning, as
+# /v1/models reports it; null where its tokenizer does not load), by which
+# the app offers Thinking's choices; an assembly made before 1.7.4 does not.
+OPTIONAL_RECORD_KEYS = {"vision_unavailable", "quantizable_weights", "reasoning"}
 FILE_RECORD_KEYS = {"path", "bytes", "mtime_ns", "ctime_ns", "digest"}
 
 
@@ -183,6 +188,8 @@ def _well_formed(record):
         set(record) - OPTIONAL_RECORD_KEYS
         == RECORD_KEYS | ({"metadata"} if gguf_target else set())
         and isinstance(record.get("vision_unavailable", ""), str)
+        and isinstance(record.get("quantizable_weights"), bool | None)
+        and isinstance(record.get("reasoning"), dict | None)
         and (
             "vision_unavailable" not in record or record.get("vision_format") == "none"
         )

@@ -50,7 +50,7 @@ inline bool memoryDenied(const StateBuffers &buffers) noexcept { return !buffers
 // claims ranked above it hold (`held`) left free, as a page is handed out
 // only beyond them (KvPool::acquirePages), of a KV need; the pooled state
 // buffers a lane's activation lacks, one state's buffers.
-inline std::optional<Need> inPlace(const TokenAdmission &admission, const std::array<uint32_t, 3> &held) {
+inline std::optional<Need> inPlace(const TokenAdmission &admission, const std::array<uint32_t, kv::kPageForms> &held) {
   const uint64_t wanted = uint64_t{admission.additionalPages} + held[static_cast<size_t>(admission.form)];
   return Need{.pages = static_cast<uint32_t>(
                   std::min<uint64_t>(wanted > admission.availablePages ? wanted - admission.availablePages : 0,
@@ -60,11 +60,11 @@ inline std::optional<Need> inPlace(const TokenAdmission &admission, const std::a
               .kv = true};
 }
 
-inline std::optional<Need> inPlace(const model::ModelMemoryAdmission &, const std::array<uint32_t, 3> &) {
+inline std::optional<Need> inPlace(const model::ModelMemoryAdmission &, const std::array<uint32_t, kv::kPageForms> &) {
   return Need{};
 }
 
-inline std::optional<Need> inPlace(const StateBuffers &, const std::array<uint32_t, 3> &) {
+inline std::optional<Need> inPlace(const StateBuffers &, const std::array<uint32_t, kv::kPageForms> &) {
   return Need{.stateBuffers = 1};
 }
 
@@ -130,12 +130,14 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
       break;
     // Freed for once in this allocation and refused again. Where free() met
     // the need, the ledger counted room the attempt did not find, which the
-    // log says, a met at no cost logging nothing; a need free() found pending
-    // or short, as it took what it could, logged that.
+    // log says, a met at no cost logging nothing, and the denial carries
+    // (judge); a need free() found pending or short, as it took what it
+    // could, logged that.
     if (const auto before = std::ranges::find(freedFor, need, &std::pair<Need, bool>::first);
         before != freedFor.end()) {
       if (before->second)
         ledger.refusedAfterMet(claim.id, need);
+      denial.metRefused = before->second;
       break;
     }
     const bool exempt = ledger.claim(claim.id).hostExempt;
@@ -159,7 +161,7 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
   if (ledger.claim(claim.id).hostExempt)
     ledger.setHostExempt(claim.id, false);
   if (admission.granted()) {
-    ledger.granted(claim.id);
+    ledger.granted(claim.id, std::is_same_v<Admission, TokenAdmission>);
   } else {
     denial.allocationFailure = admission.allocationFailure;
     if constexpr (std::is_same_v<Admission, TokenAdmission>) {

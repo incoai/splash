@@ -21,10 +21,12 @@ using namespace metal;
 // step rounds once (and as fast as the fma() chain). Each thread loads the next group's payload while the group's FMAs
 // run, and its meta unit when the next group enters a new one, and reads the activations 16 bytes at a time (their
 // rows of K, a multiple of 64, start 16-byte aligned in page-aligned buffers).
-template <class F, ushort Rows>
-inline void column_dot(device const bfloat *x, uint rows, uint input_size, device uchar *w0, device uchar *w1,
-                       device uchar *meta, uint column, uint g_begin, uint g_end, threadgroup half2 *tl,
-                       thread float (&sums)[Rows]) {
+// Row r of the rows lies at row_at(r), each row's K inputs in order: a matrix's rows (column_dot), or rows a
+// table names (the MoE gate/up pass's rows read in place, kernels/shared/moe_gguf.metal).
+template <class F, ushort Rows, class RowAt>
+inline void column_dot_rows(RowAt row_at, uint rows, uint input_size, device uchar *w0, device uchar *w1,
+                            device uchar *meta, uint column, uint g_begin, uint g_end, threadgroup half2 *tl,
+                            thread float (&sums)[Rows]) {
   const uint groups = input_size / 32, units = groups / F::MetaGroups;
   const uint plane_tile = column / QUANT_TILE_ROWS, plane_row = column % QUANT_TILE_ROWS;
   device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
@@ -50,7 +52,7 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
 #pragma unroll
     for (ushort r = 0; r < Rows; ++r) {
       if (r >= rows) break;
-      device const uint4 *xr = reinterpret_cast<device const uint4 *>(x + ulong(r) * input_size + g * 32);
+      device const uint4 *xr = reinterpret_cast<device const uint4 *>(row_at(r) + g * 32);
       float sum = 0.0f;
 #pragma unroll
       for (ushort i = 0; i < 8; ++i) {
@@ -64,6 +66,14 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
       sums[r] += sum;
     }
   }
+}
+// The rows of the matrix x of rows of K inputs.
+template <class F, ushort Rows>
+inline void column_dot(device const bfloat *x, uint rows, uint input_size, device uchar *w0, device uchar *w1,
+                       device uchar *meta, uint column, uint g_begin, uint g_end, threadgroup half2 *tl,
+                       thread float (&sums)[Rows]) {
+  column_dot_rows<F, Rows>([&](uint r) { return x + ulong(r) * input_size; }, rows, input_size, w0, w1, meta, column,
+                           g_begin, g_end, tl, sums);
 }
 
 // column_dot in the run-time format `format` (uniform per threadgroup), for each format `formats` switches to, after

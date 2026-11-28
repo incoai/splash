@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <compare>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -90,16 +92,22 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // GgufRegister: the exact register tile on bf16 8x8 matrix operations
 // (Apple9), over an activation table, all the plan's rows in one threadgroup,
 // up to kMaximumRegisterRows, optional K splits.
-// GgufPrefillInt8: a prefill chunk's plans past one row group of MLX affine
-// 4- and 5-bit g64 and Q8_0 weights (quant_prefill_int8_format) in int8 activations, quantized per row
+// GgufPrefillInt8: a prefill chunk's plans past one row group of weights in
+// the formats it decodes (quant_prefill_int8_format: MLX affine 4-, 5- and
+// 8-bit g64 and Q8_0) in int8 activations, quantized per row
 // and 64-input group into the scratch table, against the weights' exact codes
 // (kernels/prefill/gguf_prefill_int8.metal); not exact, unsplit, the prefill
 // tile's storage rows.
 // GgufColumn: a plan of at most GGUF_COLUMN_ROWS rows as a GEMV in registers,
 // each lane one column, reading those rows alone
-// (kernels/decode/linear_gguf_column.metal); unsplit across threadgroups, a
-// gate/up pair of one format in one pass.
-enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8, GgufColumn };
+// (kernels/decode/linear_gguf_column.metal), split across threadgroups where
+// its grid leaves cores short (ColumnLaw), a gate/up pair of one format in one
+// pass.
+// GgufMatrix: a decode plan of up to kMaximumStagedRows rows on the column
+// tile's grid whose simdgroups run matmul2d on 16-row fragments from registers
+// (kernels/decode/linear_gguf_matrix.metal), in one or two row groups
+// (matrixRowGroups), split across threadgroups as the column tile is.
+enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8, GgufColumn, GgufMatrix };
 // One staged tile's most rows, and the register and column tiles' (the
 // decode tiles): a prefill chunk's plan of more runs the prefill tiles, the int8
 // one where its paths take it, and a decode step's two row groups of the
@@ -116,6 +124,24 @@ inline constexpr uint32_t kMaximumStagedRows = GGUF_STAGED_ROWS;
   return (rows + GGUF_TABLE16_ROWS - 1) / GGUF_TABLE16_ROWS;
 }
 inline constexpr uint32_t kMaximumRegisterRows = kRegisterTableTiles * GGUF_TABLE16_ROWS;
+// The matrix tile's row groups of 16-row fragments, as the staged tile's
+// (stagedRowGroups): a plan of up to 64 rows is one group of ⌈r / 16⌉
+// fragments (its pipelines _m16 to _m64), a decode step of 65 to 128 rows two
+// groups of the fragments of half its rows, which read the weights once each.
+inline constexpr uint32_t kMatrixFragmentRows = 16;
+struct MatrixRowGroups final {
+  uint32_t groups;
+  uint32_t rows;   // a group's: its fragments' rows
+};
+[[nodiscard]] constexpr MatrixRowGroups matrixRowGroups(uint32_t rows) noexcept {
+  const uint32_t groups = rows > GGUF_ROW_GROUP_ROWS ? 2 : 1, each = (rows + groups - 1) / groups;
+  return {groups, (each + kMatrixFragmentRows - 1) / kMatrixFragmentRows * kMatrixFragmentRows};
+}
+// The rows a matrix plan of `rows` rows stores: its row groups' fragments.
+[[nodiscard]] constexpr uint32_t matrixStorageRows(uint32_t rows) noexcept {
+  const MatrixRowGroups groups = matrixRowGroups(rows);
+  return groups.groups * groups.rows;
+}
 // A one-pass gate/up pair's simdgroup holds both tensors' sums of every row:
 // up to 32 rows (kernels/shared/gguf_linear.metal); a plan of more runs the
 // pair in two passes.
@@ -189,8 +215,8 @@ struct LinearWorkload final {
 
 struct LinearConfig final {
   LinearTile tile = LinearTile::GgufStaged;
-  // Cross-threadgroup K partitions for GgufStaged and GgufRegister, a power
-  // of two up to kMaximumSplits; GgufPrefill uses one.
+  // Cross-threadgroup K partitions for GgufStaged, GgufRegister and
+  // GgufColumn, a power of two up to kMaximumSplits; GgufPrefill uses one.
   uint32_t splits = 1;
   static constexpr uint32_t kMaximumSplits = 16;
   // GgufStaged: each column tile starts its walk over its K partition at its
@@ -340,13 +366,27 @@ enum class StepKind : uint8_t { Prefill, Decode };
 // What selection reads of a unit's formats (KernelSelection.hpp).
 struct UnitFormats;
 
+// The int8-activation paths a runtime's plans have selected so far, which each
+// plan that selects one marks (ExecutionPlans::activationsDescription): the
+// int8 prefill tile or expert passes, and the int8 decode tiles in a prefill
+// chunk's plans and in a decode step's.
+struct Int8PathsTaken final {
+  std::atomic<bool> prefillTile{false}, prefillDecodeTiles{false}, decodeTiles{false};
+  // Marks `path`, a load where it is marked already.
+  static void mark(std::atomic<bool> &path) noexcept {
+    if (!path.load(std::memory_order_relaxed)) path.store(true, std::memory_order_relaxed);
+  }
+};
+
 // Owns projection pipeline selection and dispatch. Plans follow the device's
 // KernelCalibration, the runtime's Int8Activations (KernelSelection.cpp),
 // which ExecutionPlans also gives its attention plans, and the work they
 // compute.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device, Int8Activations int8Activations, StepKind step) noexcept;
+  // `taken`, where given, records the int8 paths its plans select.
+  explicit Linear(const DeviceCapabilities &device, Int8Activations int8Activations, StepKind step,
+                  std::shared_ptr<Int8PathsTaken> taken = {}) noexcept;
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
   [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
@@ -435,11 +475,14 @@ private:
                        const Projection *gate) const;
   void addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
                      const LinearPlan &plan, const Projection *gate) const;
+  void addGgufMatrix(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
+                     const LinearPlan &plan, const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   KernelCalibration calibration_;
   Int8Activations int8Activations_;
   StepKind step_;
+  std::shared_ptr<Int8PathsTaken> taken_;
 };
 
 } // namespace splash::ops

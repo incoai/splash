@@ -39,9 +39,24 @@ constexpr std::string_view kDiskQuotaTimeoutMessage =
 // `item` reads the page table its lane's cut gave it (Cache::cutPageTable).
 void setPageTable(ModelBatchItem &item, PageTableView pageTable) {
   item.pageTable = pageTable.pages;
+  item.windowTables = pageTable.windows;
   item.pageTableRevision = pageTable.revision;
   item.pageTableFirstChanged = pageTable.firstChanged;
   item.pageSources = std::move(pageTable.sources);
+}
+
+// Why a start's reuse stopped (ReuseEnd), and that end's tokens: a read that
+// failed past where the start resumes outranks what its lookup shows, which
+// the cache's loss of the unread prefix made shorter.
+std::pair<ReuseEnd, uint32_t> endOfReuse(const CacheLookup &lookup, uint32_t failedRestoreTokens) {
+  const uint32_t resumed = lookup.resumeBoundary();
+  if (failedRestoreTokens > resumed)
+    return {ReuseEnd::DiskReadFailed, failedRestoreTokens};
+  if (!lookup.kvBoundary)
+    return {ReuseEnd::NothingMatched, 0};
+  if (lookup.kvBoundary > resumed)
+    return {ReuseEnd::KvWithoutState, lookup.kvBoundary - resumed};
+  return {ReuseEnd::PrefixEnd, lookup.kvBoundary};
 }
 
 } // namespace
@@ -86,8 +101,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   ledger.setBufferBytes([&model = model_](uint32_t states, bool afterStart, bool keepLane) {
     return model.idleBufferBytes(states, afterStart, keepLane);
   });
-  ledger.setPageBytes({cache_.bytesPerPage(kv::PageForm::Full), cache_.bytesPerPage(kv::PageForm::Index),
-                       cache_.bytesPerPage(kv::PageForm::Slim)});
+  ledger.setPageBytes({cache_.bytesPerPage(kv::PageForm::Full), cache_.bytesPerPage(kv::PageForm::Index)});
 }
 
 Engine::~Engine() { config_.governor->ledger().removeSource(victims_); }
@@ -147,9 +161,9 @@ void Engine::submit(EngineRequest value) {
   ++counters_.submitted;
 }
 
-void Engine::cancel(uint64_t id) {
+void Engine::cancel(uint64_t id, double now) {
   if (const auto found = requests_.find(id); found != requests_.end())
-    settle(found->second, {LaneOutcome::Cancelled, {}});
+    settle(found->second, {LaneOutcome::Cancelled, {}, 0, now >= found->second.request.deadlineMilliseconds});
 }
 
 void Engine::stop(uint64_t id) {
@@ -187,6 +201,11 @@ void Engine::setCompletionNotifier(std::function<void()> notifier) {
   cache_.setCompletionNotifier(completionNotifier_);
   if (weights_)
     weights_->setCompletionNotifier(completionNotifier_);
+}
+
+uint32_t Engine::restorePointsHeldByBudget() const noexcept {
+  const bool held = cache_.persistent() && cache_.kvTierWritable() && !cache_.takesCacheWrites();
+  return held ? writeBehind_.snapshot().waiting : 0;
 }
 
 bool Engine::flushRestorePoints() {
@@ -694,12 +713,8 @@ bool Engine::admitQueued(double now) {
     scheduler_.deferAdmission(id);
   };
   // The tokens a request's start would reuse, from its probe brought up to
-  // date, or as its last probe found for a start this pass does not try:
-  // none for a request that ignores the cache, which is ranked by its whole
-  // prompt.
+  // date, or as its last probe found for a start this pass does not try.
   const auto cachedTokens = [&](Request &active, bool refresh) -> uint32_t {
-    if (active.skipCache)
-      return 0;
     if (!active.admissionProbe)
       active.admissionProbe = cache_.probe(active.exactTokens, promptIdentity(active.request));
     else if (refresh)
@@ -924,9 +939,6 @@ uint32_t Engine::sharedPrefillBoundary(const Request &left,
 
 bool Engine::pendingSharedPrefill(const Request &active,
                                   uint32_t resumeBoundary) const {
-  // A request that ignores the cache uses no producer's state.
-  if (active.skipCache)
-    return false;
   for (const auto &[id, peer] : requests_) {
     if (!peer.lane || peer.request.priority > active.request.priority)
       continue;
@@ -965,7 +977,7 @@ uint32_t Engine::awaitedBoundary(const Request &producer, uint32_t end) const {
     // An unstarted request of the producer's priority starts once the states
     // it waits for are published, resuming where its probe last found; one
     // of a lower priority waits for the producer's priority to be done.
-    if (waiter.lane || waiter.finalized || waiter.skipCache || scheduler_.suspended(id) ||
+    if (waiter.lane || waiter.finalized || scheduler_.suspended(id) ||
         waiter.request.priority != producer.request.priority)
       continue;
     const uint32_t resumeBoundary =
@@ -984,12 +996,8 @@ bool Engine::admit(Request &active, double now) {
   const bool supersedes = scheduler_.yieldsTo(active.request.priority, {.passes = passCommand_.progress()});
   ModelRequest modelRequest = active.request.modelView();
   modelRequest.prompt = active.exactTokens;
-  CacheLookup lookup =
-      active.skipCache
-          ? CacheLookup{}
-          : cache_.lookup(modelRequest.prompt, promptIdentity(active.request),
-                          active.admissionProbe ? &*active.admissionProbe
-                                                : nullptr);
+  CacheLookup lookup = cache_.lookup(modelRequest.prompt, promptIdentity(active.request),
+                                     active.admissionProbe ? &*active.admissionProbe : nullptr);
   // Only unstarted requests wait for a resident producer. Recheck planned
   // boundaries each step so producer loss leaves no stale dependency or lease.
   if (!resuming && pendingSharedPrefill(active, lookup.resumeBoundary())) {
@@ -1009,6 +1017,11 @@ bool Engine::admit(Request &active, double now) {
     active.outputLimit = active.request.maxNewTokens;
   if (!resuming)
     active.kvMode = *active.placement;
+  if (!resuming && active.kvMode == KvMode::Resident)
+    if (std::optional<LaneEnd> refusal = imagesFit(active, lookup.resumeBoundary())) {
+      settle(active, std::move(*refusal));
+      return true;
+    }
   // A request is in service when no other lane is resident
   // (anotherResident): the host exempts it once nothing in place meets it,
   // and it takes up to what is in use. Beside a resident lane it is a start,
@@ -1040,7 +1053,8 @@ bool Engine::admit(Request &active, double now) {
   // (judge() says Fail: no other lane is resident, nothing is pending or in
   // flight, the host is not refusing). It then starts without the pin rather
   // than wait for ever, and looks up again once it holds its lane, so a state
-  // the ledger wrote to disk is restored, not recomputed.
+  // the ledger wrote to disk is restored, not recomputed, and one the claim
+  // took is reported lost where the KV it matched is left (Cache::lookup).
   bool droppedLease = false;
   if (!state.admission.granted() && lookup.state && memoryDenied(state.admission) &&
       judge(state.denial, active.request.id) == Verdict::Fail) {
@@ -1081,6 +1095,7 @@ bool Engine::admit(Request &active, double now) {
     return false;
   }
   const uint32_t resumeBoundary = lookup.resumeBoundary();
+  active.diskRestoredTokens = cache_.diskOnlyTokens(chainEnd(lookup));
   // The matched chain first, then the first work's pages for a lane that
   // will not go through ordinary prefill admission before it runs: one
   // that resumes, or one that waits for a restore. As for its lane, beside
@@ -1116,11 +1131,8 @@ bool Engine::admit(Request &active, double now) {
                                        pageShortfall(kv.admission)));
       return true;
     }
-    // Release the prefix pin before retrying without its memory footprint.
-    if (verdict == Verdict::Fail) {
-      active.skipCache = true;
-      active.admissionProbe.reset();
-    }
+    // A refused restore waits and retries, its prefix kept, as any queued
+    // start does.
     waitForResources(active, now, kv.denial);
     return false;
   }
@@ -1147,7 +1159,6 @@ bool Engine::admit(Request &active, double now) {
 void Engine::completeAdmission(Request &active, CacheLookup &lookup,
                                 DraftContextPlan draft) {
   const bool resuming = scheduler_.suspended(active.request.id);
-  active.skipCache = false;
   active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   // The blocks a resume restores past those the request published are blocks
@@ -1203,7 +1214,10 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   const StateSource source = !lookup.state ? StateSource::None
                              : lookup.state->state()->residentBytes() ? StateSource::Memory
                                                                        : StateSource::Disk;
-  events_.started(active.request.id, {resumeBoundary, lookup.kvBoundary, source, lookup.lostState}, *active.lane);
+  const auto [reuseEnd, reuseEndTokens] = endOfReuse(lookup, std::exchange(active.failedRestoreTokens, 0));
+  events_.started(active.request.id,
+                  {resumeBoundary, lookup.kvBoundary, source, lookup.lostState, reuseEnd, reuseEndTokens},
+                  *active.lane);
   if (active.request.returnProgress) {
     active.reportedPromptTokens = resumeBoundary;
     events_.promptProgress(active.request.id, resumeBoundary);
@@ -1211,9 +1225,12 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   if (resumeBoundary) {
     ++counters_.cacheHits;
     counters_.reusedTokens += resumeBoundary;
+    counters_.reusedDiskTokens += std::min(active.diskRestoredTokens, resumeBoundary);
   } else {
     ++counters_.coldMisses;
   }
+  counters_.promptTokens += active.exactTokens.size();
+  ++counters_.reuseEnds[static_cast<size_t>(reuseEnd)];
   if (config_.spill.capable)
     ++(active.kvMode == KvMode::Spill ? counters_.spill.spill : counters_.spill.resident);
 }
@@ -1244,7 +1261,7 @@ bool Engine::pollRestores() {
     const bool stateRestored = !restore.ticket || restore.ticket->finish();
     if (stateRestored && kv == KvRestoreStatus::None) {
       if (restore.ticket)
-        cache_.promoteState(restore.lookup, [&] { return promotedCopy(active, *restore.ticket); });
+        cache_.promoteState(restore.lookup, [&] { return promotedCopy(active, *restore.ticket); }, id);
       completeAdmission(active, restore.lookup, std::move(restore.draft));
       continue;
     }
@@ -1254,6 +1271,7 @@ bool Engine::pollRestores() {
       cache_.discardState(restore.lookup.state->kvBlock(),
                           restore.lookup.state->state().get());
     }
+    active.failedRestoreTokens = std::max(active.failedRestoreTokens, restore.lookup.resumeBoundary());
     restore.ticket.reset();
     restore.lookup = {};
     vacateLane(active, scheduler_.suspended(id));
@@ -1339,9 +1357,8 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after, bool co
   bool changed = false;
   for (const auto &[id, peer] : requests_) {
     // A request finalized earlier in this admission pass is still listed
-    // until the pass ends. A request that ignores the cache uses no junction.
-    if (id == active.request.id || peer.lane || scheduler_.suspended(id) ||
-        peer.finalized || peer.skipCache ||
+    // until the pass ends.
+    if (id == active.request.id || peer.lane || scheduler_.suspended(id) || peer.finalized ||
         peer.request.priority < active.request.priority)
       continue;
     changed = addStateBoundary(active, after, sharedPrefillBoundary(active, peer), false,
@@ -1403,6 +1420,15 @@ void Engine::publishCommittedBlocks(Request &active, uint32_t committedTokens) {
                                 promptIdentity(active.request));
   active.unreadDeduplicatedKvTokens += cache_.publishCommittedBlocks(
       active.request.id, active.exactTokens, committedTokens, promptIdentity(active.request));
+  // Each block its decode published wholly past the prompt is its reply's,
+  // captured at or not: a prompt that matches one renders 32 reply tokens
+  // back token for token. One shared with the prompt shows nothing, as a
+  // client that drops reasoning renders a think opener the same: a reply
+  // that fills no whole block (under 32 to 63 tokens) stays opportunistic,
+  // its follow-up prefilling at most that many tokens again.
+  const uint32_t replyBlock = (active.promptTokens + KvCache::pageTokens - 1) / KvCache::pageTokens;
+  cache_.noteReply(active.request.id, std::max(active.publishedTokens / KvCache::pageTokens, replyBlock));
+  cache_.noteReplyStart(active.request.id, active.promptTokens);
   active.publishedTokens = std::max(active.publishedTokens, committedTokens);
 }
 
@@ -1478,9 +1504,10 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
                            : replay   ? counters_.replayStatePublications
                                       : counters_.junctionMaterializations;
   const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
-  // A windowed layout's state restores only through a Full tail, which
-  // the command that computed it, or held it in its window, leaves so.
-  if (!cache_.stateTailFull(block)) {
+  // A windowed layout's state restores only through its tail's window
+  // units, which the lane that computed them, or holds them in its window,
+  // gives the blocks that hold none.
+  if (!cache_.stateTailPresent(block, active.request.id)) {
     ++failures;
     return false;
   }
@@ -1533,20 +1560,20 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
                  state;
     }
     if (state) {
-      cache_.publishCompositeState(block, std::move(state), checkpoint);
+      cache_.publishCompositeState(block, std::move(state), checkpoint, active.request.id);
       ++publications;
       if (recycled)
         ++counters_.recycledStatePublications;
     } else if (cache_.reuseStoredState(block, checkpoint)) {
       // No cache slot takes a RAM copy of a state already on disk.
       ++counters_.deduplicatedStatePublications;
-    } else if (model_.canSnapshotToDisk(cache_.stateInUse(block)) &&
+    } else if (model_.canSnapshotToDisk() &&
                cache_.publishStateToDisk(
                    block,
                    [&](std::function<void()> completion) {
                      return model_.snapshotToDisk(active.request.id, std::move(completion));
                    },
-                   checkpoint)) {
+                   checkpoint, active.request.id)) {
       // No cache slot holds the state; the tier takes it from the lane.
       ++counters_.diskStatePublications;
       ++publications;
@@ -1569,6 +1596,8 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
                                        : StateCheckpoint{};
   // The head's state goes to write-behind as a head, which new conversations
   // start from whether or not this one goes on from it.
+  if (objective.tokens == headBoundary(active))
+    cache_.noteHead(block);
   if (!checkpoint)
     writeBehind_.published(block, objective.tokens, now, objective.tokens == headBoundary(active));
   return true;
@@ -1597,34 +1626,6 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   };
   // The Index runway refills, as at the tick's start, before any lane grows.
   spillLanded(false);
-  // A windowed layout's windowed layers' K/V of the pages every window has
-  // passed, the processed rows' (Cache::trimWindows), leaves too: into the
-  // Slim runway and what memory allows, the rest Full for a later pass. A
-  // Slim page takes a fraction of the Full page it frees for the lanes to
-  // grow into, so the Slim extents are memory the lanes in service need: an
-  // InService claim of the engine's while one is, else an Optional one, and
-  // a long prompt's pages trim as it prefills rather than filling the
-  // budget Full. Refused, they ask the ledger as the lanes' pages do, and
-  // in service pass the host once nothing in place meets them; with no lane
-  // in service they take only what costs nothing. A
-  // refusal the ledger does not meet leaves pages Full for a later pass.
-  {
-    const bool inService = laneInService();
-    ClaimHandle claim;
-    claim.governor = &governor();
-    claim.id = governor().ledger().open(
-        {.cls = inService ? ClaimClass::InService : ClaimClass::Optional,
-         .timing = NeedTiming::Immediate});
-    const MemoryGovernor::Scope scope(governor(), claim.id);
-    static_cast<void>(cache_.trimWindows());
-    for (Need need = governor().need(claim.id); need.bytes; need = governor().need(claim.id)) {
-      if (governor().free(claim.id, need).outcome != FreeOutcome::Met)
-        break;
-      governor().ledger().refused(claim.id, {});
-      if (!cache_.trimWindows())
-        break;
-    }
-  }
   // A command's later passes run its items again: their lanes hold what
   // they need, and only their page tables may have changed, as moves
   // between commands rewrite them.
@@ -1773,7 +1774,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     return Prepared::Replan;
   }
   // A decoding lane reserves the state its cycle captures
-  // (reserveReplyCapture), which frees nothing for it.
+  // (reserveReplyCapture), which takes what frees at once once a page.
   for (size_t index = 0; !prefill && plan.decodeStage == DecodeStage::Regular && index < plan.items.size();
        ++index)
     reserveReplyCapture(request(plan.items[index].requestId), states[index], captures[index], supersedes);
@@ -1823,7 +1824,7 @@ std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> cand
   for (const PrefillAdmission &candidate : candidates) {
     const Request &active = requests_.at(candidate.requestId);
     const KvMode mode = placement(active);
-    const bool restored = mode == KvMode::Spill && active.admissionProbe && !active.skipCache &&
+    const bool restored = mode == KvMode::Spill && active.admissionProbe &&
                           cache_.restoresIndexPages(active.admissionProbe->restoredChain());
     shapes.push_back({.requestId = candidate.requestId,
                       .gainsIndexPages = gainsIndexPages(mode, candidate.cachedTokens),
@@ -2015,10 +2016,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       // one before it, and an opportunistic one (Cache::markReply), which
       // frees first and is never written. The lane's next one replaces it a
       // page on, and the last one serves only a next prompt that renders the
-      // reply back token for token, which a chat client that sends no
-      // reasoning back never does: kept as ordinary states, the replies of
-      // 11 such chats served in turn at a 22 GB limit left their follow-ups
-      // 1 cached prefix of 22, where 1.6.2, which kept none, left 18.
+      // reply back token for token (Engine::finish).
       const std::vector<LaneCapture> &reached = captures[index];
       if (result.capturedStates.size() > reached.size())
         throw std::logic_error("model returned mismatched captured states");
@@ -2157,6 +2155,11 @@ void Engine::settle(Request &active, LaneEnd end) {
     }
     return;
   }
+  // A request its deadline ended counts timed out, whatever end it reports.
+  if (end.outcome != LaneOutcome::Stopped)
+    ++(end.timedOut                                ? counters_.timedOut
+       : end.outcome == LaneOutcome::Cancelled ? counters_.cancelled
+                                               : counters_.failed);
   if (end.outcome == LaneOutcome::Cancelled)
     finish(active, EngineFinishReason::Cancelled, {});
   else if (end.outcome == LaneOutcome::Stopped)
@@ -2166,7 +2169,7 @@ void Engine::settle(Request &active, LaneEnd end) {
 }
 
 Engine::LaneEnd Engine::deadlineEnd() {
-  return {LaneOutcome::DeadlineExceeded, std::string(kDeadlineExceededMessage)};
+  return {LaneOutcome::DeadlineExceeded, std::string(kDeadlineExceededMessage), 0, true};
 }
 
 std::string Engine::memoryShortfall(const Request &active, const std::optional<ResidentRoom> &room) const {
@@ -2190,6 +2193,25 @@ std::string Engine::memoryShortfall(const Request &active, const std::optional<R
   return message;
 }
 
+std::optional<Engine::LaneEnd> Engine::imagesFit(const Request &active, uint32_t restoredTokens) const {
+  if (active.request.images.empty() || !config_.residentTokensBeside)
+    return std::nullopt;
+  ModelRequest images = active.request.modelView();
+  images.restoredTokens = restoredTokens;
+  const uint64_t vision = model_.imageStartBytes(images);
+  const uint64_t fits = config_.residentTokensBeside(vision);
+  if (active.exactTokens.size() < fits)
+    return std::nullopt;
+  // A prompt fits with its first output token: fewer tokens than this one's.
+  const auto prompt = static_cast<uint32_t>(fits ? fits - 1 : 0);
+  return LaneEnd{.outcome = LaneOutcome::CapacityExhausted,
+                 .message = "the request's images need " + std::to_string(vision / kMiB) +
+                            " MiB of vision scratch and image buffers, beside which the memory a lone request may "
+                            "take holds the KV of " + std::to_string(fits) + " tokens, fewer than its " +
+                            std::to_string(active.exactTokens.size()) + "; refused before it took any memory",
+                 .capacity = {CapacityLimit::ImageMemory, prompt}};
+}
+
 Engine::LaneEnd Engine::capacityExhausted(const Request &active,
                                           std::string_view what,
                                           metal::AllocationFailure failure,
@@ -2197,14 +2219,35 @@ Engine::LaneEnd Engine::capacityExhausted(const Request &active,
   std::string message = "could not allocate " + std::string(what) + ": " + metal::allocationFailureName(failure);
   if (!detail.empty())
     message += " (" + std::string(detail) + ")";
-  // A lone lane judge failed: only other limits fit it. --max-memory only
-  // lowers this Mac's budget (EngineMemoryPolicy::hardBudgetBytes), so a
-  // larger one helps only where one lowered it.
+  // A lone lane judge failed: only other limits fit it. Its claim took every
+  // cached unit it may take: the pages the cache holds still for no request
+  // it names, since then not every cached prefix went, and why the claim
+  // may not have them, as far as the engine knows it.
+  const KvPoolSnapshot pool = cache_.snapshot().pool;
+  const uint32_t cached = pool.pagesAllocated - pool.pagesFree - pool.pagesActive;
   message += "; " + memoryShortfall(active) +
-             ", even after every cached prefix was evicted and any store of streamed experts shrank to its "
-             "floor: restart the server with a smaller --max-context, or with a larger --max-memory where one "
-             "lowered it";
-  return {LaneOutcome::CapacityExhausted, std::move(message)};
+             (cached ? ", even after every cached prefix its claim may take was evicted and any store of streamed "
+                       "experts shrank to its floor (cached_prefix_pages=" +
+                           std::to_string(cached) +
+                           " stay in memory, which it could not take: its own restored prefix, or prefixes held for "
+                           "a lookup or not offered to it)"
+                     : std::string(", even after every cached prefix was evicted and any store of streamed experts "
+                                   "shrank to its floor"));
+  // What memory holds it is known for a Resident lane alone: its KV and the
+  // free blocks it could grow into, all its claim could take.
+  const uint32_t fits = active.lane && active.kvMode == KvMode::Resident
+                            ? promptTokensHeld(kvCapacity(active.request.id) +
+                                               cache_.growthPages(0) * KvCache::pageTokens)
+                            : 0;
+  return {.outcome = LaneOutcome::CapacityExhausted,
+          .message = std::move(message),
+          .capacity = {active.request.images.empty() ? CapacityLimit::Memory : CapacityLimit::ImageMemory, fits}};
+}
+
+uint32_t Engine::promptTokensHeld(uint64_t kvTokens) noexcept {
+  constexpr uint64_t rows = model::ExecutionLimits::targetVerifyRows;
+  return static_cast<uint32_t>(
+      std::min<uint64_t>(kvTokens > rows ? kvTokens - rows : 0, std::numeric_limits<uint32_t>::max()));
 }
 
 void Engine::finish(Request &active, EngineFinishReason reason,
@@ -2223,38 +2266,42 @@ void Engine::finish(Request &active, EngineFinishReason reason,
   events_.completed(active.request.id, reason, bounded, active.promptTokens,
                     completionTokens, active.deduplicatedKvTokens, optionLogits,
                     active.speculation);
-  if (reason == EngineFinishReason::Cancelled) {
-    ++counters_.cancelled;
-  } else {
+  if (reason != EngineFinishReason::Cancelled)
     ++counters_.completed;
-  }
+  const StateCheckpoint reply = active.rendersReplies ? active.latestCheckpoint : StateCheckpoint{};
   release(active);
+  // Where its prompt rendered a reply back, its reply's last state becomes
+  // ordinary, stamped after the replay point, and is written behind as it,
+  // where it lies past the block the reply shares with its prompt: on a
+  // block the reply filled whole, which a prompt renders back or leaves
+  // (Cache::superseded). One at that shared block's end, a short reply's or
+  // the last capture memory allowed, stays opportunistic: it saves its
+  // follow-up under 32 tokens of prefill and kept would cost a state's
+  // write every turn of a tool loop. Elsewhere it stays opportunistic too:
+  // kept ordinary, 11 chats' replies at a 22 GB limit left 1 cached prefix
+  // of 22, where keeping none left 18.
+  // reuseStoredState, which makes it ordinary, comes after every test: an
+  // ordinary reply state is one written behind.
+  if (reply && active.lastTokenMilliseconds &&
+      cache_.checkpointState(reply.kvBlock).publication == reply.publication &&
+      cache_.stateDepth(reply.kvBlock) >= active.promptTokens + KvCache::pageTokens &&
+      cache_.reuseStoredState(reply.kvBlock))
+    writeBehind_.published(reply.kvBlock, cache_.stateDepth(reply.kvBlock), *active.lastTokenMilliseconds);
 }
 
 void Engine::finishFailure(Request &active, LaneEnd end) {
   scheduler_.fail(active.request.id);
   active.finalized = true;
-  events_.failed(active.request.id, end.outcome, std::move(end.message), end.retryAfterSeconds);
-  ++counters_.failed;
+  events_.failed(active.request.id, end.outcome, std::move(end.message), end.retryAfterSeconds, end.capacity);
   release(active);
 }
 
 void Engine::vacateLane(Request &active, bool keepContinuation) {
   const uint64_t id = active.request.id;
-  // An ended request whose prompt rendered an earlier reply back keeps its
-  // own reply's last state (Cache::keepReply), which a reclaim then writes
-  // as any checkpoint: its conversation renders replies back, as agent
-  // clients that send reasoning back do (their follow-ups resumed after the
-  // reply 15 times of 15), so its next turn is likely to resume there too.
-  // Only a reply that saves its next turn the prefill of a point worth a
-  // write over its prompt's replay point (WriteBehind::kMinimumTokens) is
-  // kept: a shorter one recomputes faster than its state writes. Kept, the
-  // 384-token replies of 12 agent conversations at a 27 GB limit wrote 24%
-  // more to the SSD to save 2.4% of their prefill. A suspended lane keeps its
-  // reply's newest state by the same measure, whatever its client: the point
-  // it resumes from, which a reclaim meanwhile writes, once, rather than drop
-  // it and leave the resume to replay the whole reply.
-  if ((keepContinuation || active.rendersReplies) &&
+  // A suspended lane keeps its reply's newest state (Cache::keepReply), the
+  // point it resumes from, which a reclaim then writes once rather than
+  // drop, where it saves a point worth a write (WriteBehind::kMinimumTokens).
+  if (keepContinuation &&
       active.exactTokens.size() >= promptReplayBoundary(active) + WriteBehind::kMinimumTokens)
     cache_.keepReply(active.latestCheckpoint);
   if (passCommand_.holds(id))
@@ -2287,7 +2334,7 @@ void Engine::release(Request &active) {
 }
 
 void Engine::sweepTerminal(double now) {
-  bool swept = false;
+  bool swept = false, waited = false;
   for (auto iterator = requests_.begin(); iterator != requests_.end();) {
     const uint64_t id = iterator->first;
     Request &active = iterator->second;
@@ -2295,9 +2342,17 @@ void Engine::sweepTerminal(double now) {
       ++iterator;
       continue;
     }
+    waited = waited || active.waitedForMemory;
     scheduler_.remove(id);
     iterator = requests_.erase(iterator);
     swept = true;
+  }
+  // The queue for memory ends at the latest request left that waited.
+  if (waited) {
+    queuedThrough_.reset();
+    for (auto &[_, active] : requests_)
+      if (active.waitedForMemory)
+        noteMemoryWait(active);
   }
   if (weights_ && swept && requests_.empty())
     weights_->idleFrom(now);

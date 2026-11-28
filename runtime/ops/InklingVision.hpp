@@ -22,8 +22,8 @@ namespace splash::ops {
 //    residual add;
 //  - the patch rows without the class token's, four neighbours (2x2) to a
 //    row of 4096, into the projector: 4096 -> GELU -> the text width.
-// Every matrix is bf16 (a Q8_0 projector's, rounded to it when its image is
-// written), activations bf16 between fp32 epilogues, the residual fp32. Its
+// Every matrix is bf16, or Q8_0 as its mmproj gives it (DenseWeights::
+// quantized), activations bf16 between fp32 epilogues, the residual fp32. Its
 // own kernels are shared/inkling_vision.metal's; its projections, LayerNorms
 // and attention are the shared dense operators, as Qwen's tower's.
 class InklingVision final : public ImageEncoder {

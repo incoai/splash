@@ -71,6 +71,19 @@ public:
   // not teach; none gives the choice back. For measuring steps' costs by
   // their rows, and for steps whose lanes take fewer rows than they hold.
   static void forceStepRows(Runtime &runtime, std::optional<uint32_t> rows, float floor = 0.0F);
+  // With `laneRows` R, every later decode cycle is a plain step: no draft
+  // dispatch runs, and each lane verifies a chain of R rows that all hold its
+  // anchor (R = 1: the anchor alone; more: the copied rows of another
+  // engine's verify ladder), a forced step of a lane cap of R. The host lays
+  // the rows out as draft_verify_rows lays out a chain (with no draw, so that
+  // a sampled row samples the target alone), and the acceptance reads the
+  // copies; the target's part runs as in any cycle, but commits no draft
+  // context and writes no state capture, so the draft's context falls
+  // behind: a runtime that ran plain steps is not to draft again.
+  // Unconstrained lanes only. None gives the step back to the cycles' choice,
+  // as forceStepRows(none) does. For measuring the target's verify alone
+  // against another engine's (decode-profile --plain R).
+  static void skipDraft(Runtime &runtime, std::optional<uint32_t> laneRows);
   // The next decode cycle of constrained request `requestId` gives each row
   // `row` of its lane's tree past the anchor the token `token` of `tokens`
   // in place of its own: written into the cycle's verify input once its

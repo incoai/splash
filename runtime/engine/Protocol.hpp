@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 16;
+inline constexpr uint16_t kProtocolVersion = 17;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -208,7 +208,8 @@ struct RequestFrame {
 //                  u32 vocabularySize, u32 maskRows, u32 stop token count,
 //                  u32 stop tokens
 //   Start          u64 requestId, u32 lane, u32 matchedPromptTokens,
-//                  u32 prefixTokens, u8 stateSource, u8 lostState
+//                  u32 prefixTokens, u8 stateSource, u8 lostState, u8 reuseEnd,
+//                  u32 reuseEndTokens
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
 //   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
@@ -219,8 +220,8 @@ struct RequestFrame {
 //                  u32 acceptedDraftTokens, u32 speculative cycles, u32 count,
 //                  f32 option logits
 //   Error          u8 failureClass, u8 retryable, u32 retryAfterSeconds,
-//                  u64 requestId, u32 code bytes, u32 message bytes, the code,
-//                  the message
+//                  u64 requestId, u8 capacityLimit, u32 fitsTokens, u32 code
+//                  bytes, u32 message bytes, the code, the message
 //   StatusJson     u64 correlationId, the JSON
 //   StartFailed    u8 kind, u8 bound, u64 requiredBytes, u64 budgetBytes,
 //                  u32 planContextTokens, u32 message bytes, the message
@@ -306,6 +307,8 @@ struct StartEvent {
   uint32_t prefixTokens = 0;
   engine::StateSource stateSource = engine::StateSource::None;
   bool lostState = false;
+  engine::ReuseEnd reuseEnd = engine::ReuseEnd::NothingMatched;
+  uint32_t reuseEndTokens = 0;
 
   bool operator==(const StartEvent &) const = default;
 };
@@ -374,6 +377,9 @@ struct ErrorEvent {
   // For a retryable request error, the seconds after which a retry may
   // succeed, as when the SSD cache's write budget refills; 0 for at once.
   uint32_t retryAfterSeconds = 0;
+  // For a request that cannot fit even alone, what it lacked and the prompt
+  // tokens that fit (engine::CapacityShortfall); none otherwise.
+  engine::CapacityShortfall capacity{};
 
   bool operator==(const ErrorEvent &) const = default;
 };

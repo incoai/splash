@@ -523,11 +523,11 @@ void PagedAttention::addBlockLists(metal::CommandGraph &graph, const metal::Meta
             {tiles, sequences.size(), 1}, {SPLASH_ATTENTION_BLOCK_LIST_THREADS, 1, 1});
 }
 
-void PagedAttention::addPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+void PagedAttention::addPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t regions, uint32_t extentPages,
                                    std::span<const metal::MetalBuffer> pageTables,
                                    std::span<const uint32_t> committed, uint32_t laneRows,
                                    const metal::MetalBuffer &paths) {
-  addKvPathCommit(graph, commitKernel, layout, extentPages, pageTables, committed, laneRows, paths);
+  addKvPathCommit(graph, commitKernel, layout, regions, extentPages, pageTables, committed, laneRows, paths);
 }
 
 void PagedAttention::addStageLayer(metal::CommandGraph &graph, SplashKvLayer poolLayer, metal::MetalBuffer poolTable,

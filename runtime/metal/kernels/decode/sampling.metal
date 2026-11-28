@@ -1087,15 +1087,17 @@ inline void simd_best_head(float value, uint token, thread float &best,
   best_token = simd_min(value == best ? token : 0xffffffffu);
 }
 
-// One shard of one proposal row. Threads stream their share of the shard in
-// 16-byte vectors, keep the chunk in registers, and first find the 16th
-// largest of the per-thread maxima: at least sixteen tokens are that large,
-// so nothing below it can be in the row's top-16 and the exact sorted insert
-// only runs for the few survivors. The group then pops its best sixteen in
-// rank order. The (value desc, id asc) order is total, so the partial is the
-// same set in the same order whatever the thread partition; it ranks the
-// row's columns and writes their tokens (SelectorBatchParams), whose order
-// is theirs.
+// One of a proposal row's `shards` shards (SelectorBatchParams). Threads
+// stream their share of the shard in 16-byte vectors and keep the chunk in
+// registers. Each simdgroup then finds the 16th largest of its threads'
+// maxima by rank, 32 shuffles a thread and no barrier: at least sixteen of
+// the shard's tokens are that large, so nothing below it, nor below the
+// largest such bound of an earlier chunk, can be in the shard's top-16, and
+// the exact sorted insert only runs for the few survivors. The group then
+// pops its best sixteen in rank order. The (value desc, id asc) order is
+// total, so the partial is the same set in the same order whatever the
+// thread partition; it ranks the row's columns and writes their tokens
+// (SelectorBatchParams), whose order is theirs.
 kernel void draft_select_top16_sharded(
     device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
@@ -1107,16 +1109,18 @@ kernel void draft_select_top16_sharded(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr uint K = SPLASH_DRAFT_CANDIDATES;
   constexpr uint VectorTokens = 4, ChunkVectors = 16;
+  // The row's token columns, the first `columns` of its `stride`: a padded
+  // head's columns past them are never read.
   const uint vocabulary = params.columns;
-  uint batch = group / (Positions * Shards);
-  uint local = group % (Positions * Shards);
-  uint position = local / Shards;
-  uint shard = local % Shards;
-  ulong row_start = (ulong(batch) * Rows + position + 1) * vocabulary;
-  uint shard_tokens = (vocabulary + Shards - 1) / Shards;
+  const uint shards = params.shards;
+  uint batch = group / (Positions * shards);
+  uint local = group % (Positions * shards);
+  uint position = local / shards;
+  uint shard = local % shards;
+  ulong row_start = (ulong(batch) * Rows + position + 1) * params.stride;
+  uint shard_tokens = (vocabulary + shards - 1) / shards;
   uint begin = min(shard * shard_tokens, vocabulary);
   uint end = min(begin + shard_tokens, vocabulary);
   // Vector loads require 16-byte alignment. Handle the shard's unaligned head
@@ -1150,8 +1154,7 @@ kernel void draft_select_top16_sharded(
       top16_insert(values, ids, value, token);
   }
 
-  threadgroup float maxima[256];
-  threadgroup float thresholds[8];
+  float threshold = -INFINITY;
   for (uint chunk = 0; chunk < vectors; chunk += 256 * ChunkVectors) {
     float4 loaded[ChunkVectors];
     float best = -INFINITY;
@@ -1164,20 +1167,13 @@ kernel void draft_select_top16_sharded(
             best = loaded[i][j];
       }
     }
-    // The 16th largest thread maximum: the minimum over the maxima that
-    // fewer than sixteen others exceed.
-    maxima[thread_index] = best;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The simdgroup's 16th largest thread maximum: the least of the maxima
+    // that fewer than sixteen of its others exceed (-infinity, no bound,
+    // while fewer than sixteen of its threads hold a token).
     uint above = 0;
-    for (uint other = 0; other < 256; ++other)
-      above += maxima[other] > best ? 1u : 0u;
-    float candidate = simd_min(above < K ? best : INFINITY);
-    if (lane == 0)
-      thresholds[simd_group] = candidate;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float threshold = thresholds[0];
-    for (uint other = 1; other < 8; ++other)
-      threshold = min(threshold, thresholds[other]);
+    for (ushort other = 0; other < 32; ++other)
+      above += simd_shuffle(best, other) > best ? 1u : 0u;
+    threshold = max(threshold, simd_min(above < K ? best : INFINITY));
 
     for (uint i = 0; i < ChunkVectors; ++i) {
       uint index = chunk + thread_index + i * 256;
@@ -1231,22 +1227,25 @@ kernel void draft_select_top16_sharded(
   }
 }
 
-// Merges the eight shard partials of one row into the simdgroup's lanes: each
-// lane holds four consecutive entries of one shard's sorted list and sixteen
-// rounds pop the simdgroup-wide best into rank order, lane `rank` keeping it.
+// Merges the `shards` shard partials of one row (a power of two, 2 to
+// SPLASH_DRAFT_SAMPLING_MOST_SHARDS) into the simdgroup's lanes: each lane
+// holds shards / 2 consecutive entries of one shard's sorted list, the rest
+// of its registers the empty sentinel, and sixteen rounds pop the
+// simdgroup-wide best into rank order, lane `rank` keeping it.
 inline void top16_merge_shards(device const uint *partial_ids,
                                device const float *partial_values,
-                               uint row, uint lane, thread float &value,
-                               thread uint &token) {
+                               uint row, uint shards, uint lane,
+                               thread float &value, thread uint &token) {
   constexpr uint K = SPLASH_DRAFT_CANDIDATES;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr uint Entries = Shards * K / 32;
-  uint origin = row * Shards * K + lane * Entries;
-  float values[Entries];
-  uint ids[Entries];
-  for (uint i = 0; i < Entries; ++i) {
-    values[i] = partial_values[origin + i];
-    ids[i] = partial_ids[origin + i];
+  constexpr uint MostEntries = SPLASH_DRAFT_SAMPLING_MOST_SHARDS * K / 32;
+  static_assert(K % MostEntries == 0, "a lane's entries are of one shard");
+  const uint entries = shards * K / 32;
+  const uint origin = row * shards * K + lane * entries;
+  float values[MostEntries];
+  uint ids[MostEntries];
+  for (uint i = 0; i < MostEntries; ++i) {
+    values[i] = i < entries ? partial_values[origin + i] : -INFINITY;
+    ids[i] = i < entries ? partial_ids[origin + i] : 0xffffffffu;
   }
   value = -INFINITY;
   token = 0xffffffffu;
@@ -1259,15 +1258,15 @@ inline void top16_merge_shards(device const uint *partial_ids,
       token = best_id;
     }
     if (values[0] == best && ids[0] == best_id)
-      top_pop<Entries>(values, ids);
+      top_pop<MostEntries>(values, ids);
   }
 }
 
 // One group per proposal row. Simdgroup 0 merges its candidates and unary
 // scores; simdgroup 1 merges the preceding row (the anchor for row 0). The
 // remaining simdgroups score the 16 x 16 predecessor/candidate edge table in
-// fixed per-lane reduction order. The table follows the shard partials in
-// partial-values scratch.
+// fixed per-lane reduction order. The table follows room for the most shards'
+// partials in partial-values scratch (SelectorBatchParams).
 kernel void draft_select_edges(
     device const uint *partial_ids [[buffer(0)]],
     device float *partial_values [[buffer(1)]],
@@ -1283,7 +1282,7 @@ kernel void draft_select_edges(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  constexpr uint MostShards = SPLASH_DRAFT_SAMPLING_MOST_SHARDS;
   constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
   constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
   uint batch = row / Positions;
@@ -1293,7 +1292,7 @@ kernel void draft_select_edges(
   if (simd_group == 0) {
     float value;
     uint token;
-    top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
+    top16_merge_shards(partial_ids, partial_values, row, params.shards, lane, value, token);
     if (lane < Candidates) {
       candidates[row * Candidates + lane] = token;
       unary[row * Candidates + lane] = value;
@@ -1303,8 +1302,7 @@ kernel void draft_select_edges(
     uint token = params.anchor[batch];
     if (position > 0) {
       float value;
-      top16_merge_shards(partial_ids, partial_values, row - 1, lane, value,
-                         token);
+      top16_merge_shards(partial_ids, partial_values, row - 1, params.shards, lane, value, token);
     }
     if (lane < Candidates)
       predecessors[lane] = token;
@@ -1317,7 +1315,7 @@ kernel void draft_select_edges(
   constexpr uint TaskCandidates = 8, Dims = Rank / 32;
   uint tasks = (position > 0 ? Candidates : 1) * (Candidates / TaskCandidates);
   device float *table = partial_values +
-                        ulong(params.lanes) * Positions * Shards * Candidates +
+                        ulong(params.lanes) * Positions * MostShards * Candidates +
                         ulong(row) * Candidates * Candidates;
   device const bfloat *row_hidden =
       hidden + (ulong(batch) * Rows + position + 1) * Rank;
@@ -1385,12 +1383,13 @@ struct TreeLattice {
                  [kTreeChildren];
 };
 
-struct TreeHeap {
+// The tree's entries in the order pushed. A taken entry's score is
+// -infinity: every open one's, an estimate, is at least 0.
+struct TreeEntries {
   float score[kTreeEntries];
-  uint order[kTreeEntries];
   uint info[kTreeEntries];
   uint size;
-  uint pushed;
+  uint open;
 };
 
 // A lane's tree as it grows: its rows' tokens, ancestors' masks, parents,
@@ -1415,54 +1414,36 @@ struct TreeRows {
   uint made;
 };
 
-// A new row's record of its children: none yet.
-inline void tree_row_clear(threadgroup TreeRows &rows, uint row) {
-  for (uint child = 0; child < kTreeChildren; ++child)
-    rows.draw[row][child] = kNoCandidate;
-  for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
-    rows.next[row][i] = 0.0f;
+// A new row's record of its children: none yet. The growing simdgroup's lane
+// i clears its entries (draft_select_tree).
+inline void tree_row_clear(threadgroup TreeRows &rows, uint row, uint simd_lane) {
+  if (simd_lane < kTreeChildren)
+    rows.draw[row][simd_lane] = kNoCandidate;
+  if (simd_lane < SPLASH_DRAFT_CANDIDATES)
+    rows.next[row][simd_lane] = 0.0f;
 }
 
-inline bool tree_entry_before(threadgroup TreeHeap &heap, uint a, uint b) {
-  return heap.score[a] > heap.score[b] ||
-         (heap.score[a] == heap.score[b] && heap.order[a] < heap.order[b]);
+// Lane 0 of the growing simdgroup appends an entry.
+inline void tree_push(threadgroup TreeEntries &entries, float score, uint info) {
+  const uint at = entries.size++;
+  entries.score[at] = score;
+  entries.info[at] = info;
+  ++entries.open;
 }
 
-inline void tree_entry_swap(threadgroup TreeHeap &heap, uint a, uint b) {
-  const float score = heap.score[a];
-  const uint order = heap.order[a], info = heap.info[a];
-  heap.score[a] = heap.score[b];
-  heap.order[a] = heap.order[b];
-  heap.info[a] = heap.info[b];
-  heap.score[b] = score;
-  heap.order[b] = order;
-  heap.info[b] = info;
-}
-
-inline void tree_push(threadgroup TreeHeap &heap, float score, uint info) {
-  uint at = heap.size++;
-  heap.score[at] = score;
-  heap.order[at] = heap.pushed++;
-  heap.info[at] = info;
-  while (at > 0 && tree_entry_before(heap, at, (at - 1) / 2)) {
-    tree_entry_swap(heap, at, (at - 1) / 2);
-    at = (at - 1) / 2;
-  }
-}
-
-// Removes the first entry, which the caller has read.
-inline void tree_pop(threadgroup TreeHeap &heap) {
-  tree_entry_swap(heap, 0, --heap.size);
-  for (uint at = 0;;) {
-    uint first = at;
-    for (uint child = 2 * at + 1; child <= 2 * at + 2; ++child)
-      if (child < heap.size && tree_entry_before(heap, child, first))
-        first = child;
-    if (first == at)
-      break;
-    tree_entry_swap(heap, at, first);
-    at = first;
-  }
+// The open entry the tree takes next, every lane of the growing simdgroup
+// alike: the largest score, the earliest pushed among equal ones. Lane i
+// looks at entries i, i + 32 and i + 64.
+inline uint tree_next_entry(threadgroup TreeEntries &entries, uint simd_lane) {
+  float best = -INFINITY;
+  uint at = kTreeEntries;
+  for (uint entry = simd_lane; entry < entries.size; entry += 32)
+    if (entries.score[entry] > best) {
+      best = entries.score[entry];
+      at = entry;
+    }
+  const float top = simd_max(best);
+  return simd_min(best == top ? at : kTreeEntries);
 }
 
 inline uint tree_info(bool chain, uint parent, uint position, uint index) {
@@ -1547,57 +1528,59 @@ inline float tree_gumbel(ulong key, uint token) {
 // retained 0.954 and 0.985 of the time (108 and 328 rows), and the draft rows
 // beside them were estimated 0.202 and 0.193 and retained 0.088 and 0.018 (34
 // and 56 rows): the anchor's children summed to 1.14 to 1.16.
+// One simdgroup expands the row: lane i takes candidate i, the scalars stay
+// uniform across its lanes, and lane 0 alone writes the row's record and its
+// entries (draft_select_tree).
 inline void tree_expand(threadgroup TreeLattice &lattice,
-                        threadgroup TreeHeap &heap, threadgroup TreeRows &rows,
+                        threadgroup TreeEntries &entries, threadgroup TreeRows &rows,
                         constant DraftTreeParams &params, uint lane,
                         uint children, uint row, uint position,
                         uint predecessor, float score, uint chain_token,
-                        float chain_rate) {
+                        float chain_rate, uint simd_lane) {
+  constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
+  static_assert(Candidates <= 32, "a candidate a lane");
   threadgroup const float *q = lattice.probability[position][predecessor];
   const float temperature = params.temperature[lane];
-  float top = 0.0f;
-  for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
-    top = max(top, q[i]);
-  float mass = 0.0f;
-  for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i) {
-    const float weight = temperature == 0.0f || !(q[i] > 0.0f)
-                             ? q[i]
-                             : exp((log(q[i]) - log(top)) / temperature);
-    rows.next[row][i] = weight;
-    mass += weight;
-  }
-  for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
-    rows.next[row][i] /= mass;
-  float keys[SPLASH_DRAFT_CANDIDATES];
-  for (uint i = 0; temperature > 0.0f && i < SPLASH_DRAFT_CANDIDATES; ++i)
-    keys[i] = rows.next[row][i] > 0.0f
-                  ? log(rows.next[row][i]) + tree_gumbel(rows.key[row], lattice.ids[position][i])
-                  : -INFINITY;
+  const bool candidate = simd_lane < Candidates;
+  const float own_q = candidate ? q[simd_lane] : 0.0f;
+  const float top = simd_max(own_q);
+  const float weight = !candidate                                 ? 0.0f
+                       : temperature == 0.0f || !(own_q > 0.0f) ? own_q
+                                                                 : exp((log(own_q) - log(top)) / temperature);
+  const float probability = weight / simd_sum(weight);
+  if (candidate)
+    rows.next[row][simd_lane] = probability;
+  const float key = candidate && temperature > 0.0f && probability > 0.0f
+                        ? log(probability) + tree_gumbel(rows.key[row], lattice.ids[position][simd_lane])
+                        : -INFINITY;
   uint taken = 0;
   float bound = score, left = 1.0f - chain_rate, reserved = chain_rate;
   for (uint child = 0; child < children; ++child) {
-    uint drawn = SPLASH_DRAFT_CANDIDATES;
+    uint drawn = Candidates;
     if (temperature == 0.0f) {
       const uint likeliest = lattice.likeliest[position][predecessor][child];
       drawn = q[likeliest] > 0.0f ? likeliest : drawn;
     } else {
-      for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
-        if (!(taken & (1u << i)) && keys[i] > -INFINITY &&
-            (drawn == SPLASH_DRAFT_CANDIDATES || keys[i] > keys[drawn]))
-          drawn = i;
+      // The largest key of the candidates not drawn yet, the lowest index
+      // among equal ones.
+      const float open = taken & (1u << simd_lane) ? -INFINITY : key;
+      const float best = simd_max(open);
+      drawn = best > -INFINITY ? simd_min(open == best ? simd_lane : Candidates) : Candidates;
     }
-    if (drawn == SPLASH_DRAFT_CANDIDATES)
+    if (drawn == Candidates)
       return;
     taken |= 1u << drawn;
     const bool joins_chain = lattice.ids[position][drawn] == chain_token;
     const float cap = joins_chain ? left + reserved : left;
-    rows.draw[row][child] = uchar(drawn);
-    rows.left[row][child] = cap;
-    const float own = min(tree_draft_estimate(params, lane, rows.next[row][drawn], position), cap);
+    const float own = min(tree_draft_estimate(params, lane, simd_shuffle(probability, ushort(drawn)), position), cap);
     left = joins_chain ? cap - max(own, reserved) : left - own;
     reserved = joins_chain ? 0.0f : reserved;
     bound = min(bound, score * own);
-    tree_push(heap, bound, tree_info(false, row, position, drawn));
+    if (simd_lane == 0) {
+      rows.draw[row][child] = uchar(drawn);
+      rows.left[row][child] = cap;
+      tree_push(entries, bound, tree_info(false, row, position, drawn));
+    }
   }
 }
 
@@ -1644,12 +1627,14 @@ kernel void draft_select_tree(
     device float *caps [[buffer(11)]],
     constant DraftTreeParams &params [[buffer(12)]],
     uint lane [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  constexpr uint MostShards = SPLASH_DRAFT_SAMPLING_MOST_SHARDS;
   constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
   threadgroup TreeLattice lattice;
-  threadgroup TreeHeap heap;
+  threadgroup TreeEntries entries;
   threadgroup TreeRows rows;
 
   const ulong origin = ulong(lane) * Positions * Candidates;
@@ -1661,7 +1646,7 @@ kernel void draft_select_tree(
     if (position > 0 || predecessor == 0) {
       device const float *edges =
           partial_values +
-          ulong(params.lanes) * Positions * Shards * Candidates +
+          ulong(params.lanes) * Positions * MostShards * Candidates +
           ((ulong(lane) * Positions + position) * Candidates + predecessor) *
               Candidates;
       // A softcapped head's draft takes the softcap on each sum, its tanh the
@@ -1699,7 +1684,12 @@ kernel void draft_select_tree(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
-  if (thread_index == 0) {
+  static_assert(Rows <= 32, "a made row a lane");
+  // The first simdgroup grows the tree: its lanes find the next entry
+  // together (tree_next_entry) and take a candidate or a made row of each
+  // step's work, and lane 0 alone writes the entries and a row's scalars,
+  // each write seen by the others past the simdgroup barrier after it.
+  if (simd_group == 0) {
     device const uint *chain =
         chain_tokens + ulong(lane) * SPLASH_TREE_CHAIN_TOKENS;
     device const float *rates = chain_rates + ulong(lane) *
@@ -1707,60 +1697,79 @@ kernel void draft_select_tree(
                                                   SPLASH_TREE_AGREEMENTS;
     const uint children = params.children[lane];
     const uint deepest = params.depth[lane], chained = params.chain[lane];
-    heap.size = 0;
-    heap.pushed = 0;
-    rows.made = 1;
-    rows.token[0] = params.anchor[lane];
-    rows.ancestors[0] = 1;
-    rows.parent[0] = SPLASH_TREE_ROOT;
-    rows.depth[0] = 0;
-    rows.on_chain[0] = true;
-    rows.q[0] = 1.0f;
-    rows.estimate[0] = 1.0f;
-    rows.cap[0] = 1.0f;
-    rows.key[0] = ulong(params.noise[lane][1]) << 32 | params.noise[lane][0];
-    tree_row_clear(rows, 0);
+    if (simd_lane == 0) {
+      entries.size = 0;
+      entries.open = 0;
+      rows.made = 1;
+      rows.token[0] = params.anchor[lane];
+      rows.ancestors[0] = 1;
+      rows.parent[0] = SPLASH_TREE_ROOT;
+      rows.depth[0] = 0;
+      rows.on_chain[0] = true;
+      rows.q[0] = 1.0f;
+      rows.estimate[0] = 1.0f;
+      rows.cap[0] = 1.0f;
+      rows.key[0] = ulong(params.noise[lane][1]) << 32 | params.noise[lane][0];
+    }
+    tree_row_clear(rows, 0, simd_lane);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     if (deepest > 0) {
       const float rate =
           chained ? tree_chain_rate(lattice, chain, rates, 0) : 0.0f;
-      tree_expand(lattice, heap, rows, params, lane, children, 0, 0, 0, 1.0f,
-                  chained ? chain[0] : kNoChainToken, rate);
-      if (chained)
-        tree_push(heap, rate, tree_info(true, 0, 0, 0));
+      tree_expand(lattice, entries, rows, params, lane, children, 0, 0, 0, 1.0f,
+                  chained ? chain[0] : kNoChainToken, rate, simd_lane);
+      if (chained && simd_lane == 0)
+        tree_push(entries, rate, tree_info(true, 0, 0, 0));
+      simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     // No more rows than the tokens a walk of the tree may retain.
     const uint most = min(Rows, deepest + 1);
-    while (heap.size && rows.made < most) {
-      const float score = heap.score[0];
-      const uint info = heap.info[0];
-      tree_pop(heap);
+    while (entries.open && rows.made < most) {
+      const uint taken = tree_next_entry(entries, simd_lane);
+      const float score = entries.score[taken];
+      const uint info = entries.info[taken];
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_lane == 0) {
+        entries.score[taken] = -INFINITY;
+        --entries.open;
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
       const bool from_chain = (info & kTreeChain) != 0;
       const uint parent = (info >> 16) & 0x7fffu;
       const uint position = (info >> 8) & 0xffu, index = info & 0xffu;
       const uint token =
           from_chain ? chain[position] : lattice.ids[position][index];
-      // A token path the tree holds already gains no row.
-      uint row = 0;
-      for (uint other = 1; other < rows.made && !row; ++other)
-        row = rows.parent[other] == parent && rows.token[other] == token
-                  ? other
-                  : 0;
+      // A greedy lane takes no row of a stop token, which would add no token
+      // (DraftTreeParams).
+      const bool stop = stop_token(params.stop_tokens, token);
+      if (stop && params.temperature[lane] == 0.0f)
+        continue;
+      // A token path the tree holds already gains no row: lane i looks at
+      // made row i + 1.
+      const uint made = rows.made, other = simd_lane + 1;
+      const uint same = simd_min(other < made && rows.parent[other] == parent && rows.token[other] == token
+                                     ? other
+                                     : Rows);
+      uint row = same < Rows ? same : 0;
       if (!row) {
-        row = rows.made++;
-        rows.token[row] = token;
-        rows.ancestors[row] = rows.ancestors[parent] | (1u << row);
-        rows.parent[row] = ushort(parent);
-        rows.depth[row] = ushort(position + 1);
-        rows.on_chain[row] = rows.on_chain[parent] && position < chained &&
-                             token == chain[position];
-        // A row a host chain token made is no draft step: its estimate is
-        // the chain's, and it has no draft probability.
-        rows.q[row] = from_chain ? -1.0f : rows.next[parent][index];
-        rows.estimate[row] = score;
-        rows.cap[row] = from_chain ? 1.0f : tree_cap(rows, parent, index);
-        rows.key[row] = tree_key(rows.key[parent], token);
-        tree_row_clear(rows, row);
-      } else if (!from_chain && rows.q[row] < 0.0f) {
+        row = made;
+        if (simd_lane == 0) {
+          rows.made = made + 1;
+          rows.token[row] = token;
+          rows.ancestors[row] = rows.ancestors[parent] | (1u << row);
+          rows.parent[row] = ushort(parent);
+          rows.depth[row] = ushort(position + 1);
+          rows.on_chain[row] = rows.on_chain[parent] && position < chained &&
+                               token == chain[position];
+          // A row a host chain token made is no draft step: its estimate is
+          // the chain's, and it has no draft probability.
+          rows.q[row] = from_chain ? -1.0f : rows.next[parent][index];
+          rows.estimate[row] = score;
+          rows.cap[row] = from_chain ? 1.0f : tree_cap(rows, parent, index);
+          rows.key[row] = tree_key(rows.key[parent], token);
+        }
+        tree_row_clear(rows, row, simd_lane);
+      } else if (!from_chain && rows.q[row] < 0.0f && simd_lane == 0) {
         // A draft step that joins a lookup chain's row labels the draft's
         // calibration like any draft row: such rows, which the draft's top
         // candidate often is, the target accepted 97-100% of the time in
@@ -1769,24 +1778,28 @@ kernel void draft_select_tree(
         rows.q[row] = rows.next[parent][index];
         rows.cap[row] = tree_cap(rows, parent, index);
       }
-      // The row's children lie a step deeper.
-      if (position + 1 >= deepest)
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      // The row's children lie a step deeper, and none past a stop.
+      if (stop || position + 1 >= deepest)
         continue;
       // A row on the chain's path has the chain's next token for a child.
       const bool chain_child = rows.on_chain[row] && position + 1 < chained;
       if (!from_chain && position + 1 < Positions)
-        tree_expand(lattice, heap, rows, params, lane, children, row,
+        tree_expand(lattice, entries, rows, params, lane, children, row,
                     position + 1, index, score,
                     chain_child ? chain[position + 1] : kNoChainToken,
                     chain_child ? tree_chain_rate(lattice, chain, rates,
                                                   position + 1)
-                                : 0.0f);
-      else if (from_chain && position + 1 < chained)
-        tree_push(heap,
+                                : 0.0f,
+                    simd_lane);
+      else if (from_chain && position + 1 < chained && simd_lane == 0)
+        tree_push(entries,
                   score * tree_chain_rate(lattice, chain, rates, position + 1),
                   tree_info(true, row, position + 1, 0));
+      simdgroup_barrier(mem_flags::mem_threadgroup);
     }
-    sizes[lane] = rows.made;
+    if (simd_lane == 0)
+      sizes[lane] = rows.made;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index < rows.made) {
@@ -1803,14 +1816,17 @@ kernel void draft_select_tree(
   }
 }
 
-// One thread lays out a decode cycle's rows (VerifyRowsParams) from the
+// One threadgroup lays out a decode cycle's rows (VerifyRowsParams) from the
 // trees the selector grew, lane l's sizes[l] rows from row l *
 // SPLASH_TARGET_VERIFY_ROWS of tree_tokens, trees and scores: each lane's
 // rows, and its rows' tokens, tree rows and sources (the row of its lane's
 // tree each is), packed in lane order, and after them the rows of no lane,
 // each lane 0's anchor and no source (SPLASH_NO_TOKEN). A lane's rows are
 // numbered in preorder, the earlier-taken (likelier) child first, so that
-// the likeliest path of its tree lies on its first rows.
+// the likeliest path of its tree lies on its first rows. Every candidate row
+// ranks itself among the others in a thread of its own, the cap and floor
+// walk the ranks in one thread, and each lane lays out its rows in one; one
+// thread did all of it, 10 us at one lane and 60 at four on an M5 Pro.
 kernel void draft_verify_rows(device const uint *tree_tokens [[buffer(0)]],
                               device const SplashTreeRow *trees [[buffer(1)]],
                               device const float2 *scores [[buffer(2)]],
@@ -1820,80 +1836,109 @@ kernel void draft_verify_rows(device const uint *tree_tokens [[buffer(0)]],
                               device SplashLaneRows *lane_rows [[buffer(6)]],
                               device uint *sources [[buffer(7)]],
                               constant VerifyRowsParams &params [[buffer(8)]],
-                              uint index [[thread_position_in_grid]]) {
+                              uint index [[thread_position_in_threadgroup]]) {
   constexpr uint Lanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
-  if (index != 0)
-    return;
-  // Every lane's rows past its anchor by estimate, a lane's earlier row first
-  // among equal ones.
-  float estimates[Lanes * Rows];
-  uint owners[Lanes * Rows];
-  uint count = 0;
-  for (uint lane = 0; lane < params.lanes; ++lane) {
-    for (uint row = 1; row < sizes[lane]; ++row) {
-      const float estimate = scores[lane * Rows + row].y;
-      uint at = count++;
-      for (; at > 0 && estimates[at - 1] < estimate; --at) {
-        estimates[at] = estimates[at - 1];
-        owners[at] = owners[at - 1];
-      }
-      estimates[at] = estimate;
-      owners[at] = lane;
-    }
+  constexpr uint Candidates = Lanes * (Rows - 1);
+  static_assert(Candidates <= SPLASH_VERIFY_ROWS_THREADS && Lanes * Rows <= SPLASH_VERIFY_ROWS_THREADS,
+                "a thread a candidate row and a step row");
+  threadgroup uint first_candidate[Lanes + 1];
+  threadgroup float estimate_of[Candidates];
+  threadgroup float ranked[Candidates];
+  threadgroup uint owner_of[Candidates];
+  threadgroup uint rows[Lanes], first_row[Lanes + 1];
+  // Every lane's rows past its anchor, lane by lane in tree order.
+  if (index == 0) {
+    first_candidate[0] = 0;
+    for (uint lane = 0; lane < params.lanes; ++lane)
+      first_candidate[lane + 1] = first_candidate[lane] + sizes[lane] - 1;
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint count = first_candidate[params.lanes];
+  uint own_lane = 0;
+  if (index < count) {
+    while (index >= first_candidate[own_lane + 1])
+      ++own_lane;
+    estimate_of[index] = scores[own_lane * Rows + 1 + index - first_candidate[own_lane]].y;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Their order by estimate, an earlier one first among equal ones.
+  if (index < count) {
+    const float estimate = estimate_of[index];
+    uint rank = 0;
+    for (uint other = 0; other < count; ++other)
+      rank += estimate_of[other] > estimate || (estimate_of[other] == estimate && other < index);
+    ranked[rank] = estimate;
+    owner_of[rank] = own_lane;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   // The best of them that the cycle's rows and the lanes' cap hold, none
   // below the floor: they fall, so the first below it ends them.
-  uint rows[Lanes];
-  for (uint lane = 0; lane < params.lanes; ++lane)
-    rows[lane] = 1;
-  uint taken = params.lanes;
-  for (uint i = 0; i < count && taken < params.rows; ++i) {
-    if (estimates[i] < params.floor)
-      break;
-    if (rows[owners[i]] == params.lane_cap)
-      continue;
-    ++rows[owners[i]];
-    ++taken;
+  if (index == 0) {
+    for (uint lane = 0; lane < params.lanes; ++lane)
+      rows[lane] = 1;
+    uint taken = params.lanes;
+    for (uint i = 0; i < count && taken < params.rows; ++i) {
+      if (ranked[i] < params.floor)
+        break;
+      if (rows[owner_of[i]] == params.lane_cap)
+        continue;
+      ++rows[owner_of[i]];
+      ++taken;
+    }
+    first_row[0] = 0;
+    for (uint lane = 0; lane < params.lanes; ++lane)
+      first_row[lane + 1] = first_row[lane] + rows[lane];
   }
-  uint first = 0;
-  for (uint lane = 0; lane < params.lanes; ++lane) {
-    device const uint *token = tree_tokens + lane * Rows;
-    uint parent[Rows];
-    for (uint row = 0; row < rows[lane]; ++row)
-      parent[row] = trees[lane * Rows + row].parent;
-    // Preorder: a row's children follow it, each with its subtree, in the
-    // order the tree took them.
-    uint order[Rows], placed[Rows], stack[Rows];
-    uint size = 0, next = 0;
-    stack[size++] = 0;
-    while (size) {
-      const uint row = stack[--size];
-      placed[row] = next;
-      order[next++] = row;
-      for (uint child = rows[lane]; child-- > row + 1;)
-        if (parent[child] == row)
-          stack[size++] = child;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Preorder: a row's children follow it, each with its subtree, in the
+  // order the tree took them. A thread a lane's row finds its place: the rows
+  // before it are its ancestors and, below its deepest common ancestor with
+  // another, the other's branch where that one's child of the ancestor was
+  // taken first. A row's ancestors' mask holds it and every row on its path,
+  // each taken after its parent, so the deepest common ancestor is the masks'
+  // highest common row and a branch's child of it the branch's lowest row
+  // past it.
+  threadgroup uint placed[Lanes][Rows];
+  const uint lane = index / Rows, row = index % Rows;
+  const bool laid = lane < params.lanes && row < rows[lane];
+  device const SplashTreeRow *lane_tree = trees + lane * Rows;
+  const uint path = laid ? lane_tree[row].ancestors : 0u;
+  if (laid) {
+    uint place = 0;
+    for (uint other = 0; other < rows[lane]; ++other) {
+      const uint other_path = lane_tree[other].ancestors;
+      if (other == row || other_path & (1u << row))
+        continue;
+      if (path & (1u << other)) {
+        ++place;
+        continue;
+      }
+      const uint common = 31u - clz(path & other_path);
+      const uint below = ~((2u << common) - 1u);
+      place += ctz(other_path & below) < ctz(path & below);
     }
-    uint ancestors[Rows], depths[Rows];
-    for (uint at = 0; at < rows[lane]; ++at) {
-      const uint row = order[at];
-      const uint up = at ? placed[parent[row]] : uint(SPLASH_TREE_ROOT);
-      ancestors[at] = (at ? ancestors[up] : 0u) | (1u << at);
-      depths[at] = at ? depths[up] + 1 : 0u;
-      tokens[first + at] = token[row];
-      tree[first + at] = {ancestors[at], ushort(up), ushort(depths[at])};
-      sources[first + at] = row;
-    }
-    lane_rows[lane] = {first, rows[lane]};
-    first += rows[lane];
+    placed[lane][row] = place;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (laid) {
+    const uint first = first_row[lane], at = placed[lane][row];
+    uint ancestors = 0;
+    for (uint bits = path; bits; bits &= bits - 1)
+      ancestors |= 1u << placed[lane][ctz(bits)];
+    const uint up = row ? placed[lane][lane_tree[row].parent] : uint(SPLASH_TREE_ROOT);
+    tokens[first + at] = tree_tokens[lane * Rows + row];
+    tree[first + at] = {ancestors, ushort(up), ushort(popcount(path) - 1)};
+    sources[first + at] = row;
+    if (!row)
+      lane_rows[lane] = {first, rows[lane]};
   }
   // The rows of no lane (VerifyRowsParams), which the embedding gathers by
   // their token, on no path and of no parent: none of an earlier cycle's.
-  for (uint row = first; row < params.rows; ++row) {
-    tokens[row] = tree_tokens[0];
-    tree[row] = {0u, ushort(SPLASH_TREE_ROOT), ushort(0)};
-    sources[row] = SPLASH_NO_TOKEN;
+  if (index >= first_row[params.lanes] && index < params.rows) {
+    tokens[index] = tree_tokens[0];
+    tree[index] = {0u, ushort(SPLASH_TREE_ROOT), ushort(0)};
+    sources[index] = SPLASH_NO_TOKEN;
   }
 }
 

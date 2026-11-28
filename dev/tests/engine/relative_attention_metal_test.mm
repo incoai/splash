@@ -73,6 +73,17 @@ constexpr ops::RelativeAttentionVariant kFull{.windowTokens = 0, .positionScaled
 // head h takes kSinks[(h + row) % 4] and a quarter for each four heads before
 // it, so that each row's and head's sink is its own.
 constexpr std::array kSinks{-9.0f, 0.0f, 12.4f, 60.0f};
+// The tile shapes a case plans, its family's (ops::AttentionCalibration):
+// Apple10's, or Apple9's, whose direct tiles of 16 rows and verify blocks'
+// lanes that rescale every row run kernels of their own.
+enum class Tiles { Apple10, Apple9 };
+ops::AttentionCalibration withTiles(ops::AttentionCalibration row, Tiles tiles) {
+  if (tiles == Tiles::Apple9) {
+    row.directRows = ops::kApple9Attention.directRows;
+    row.boundedRescaleRows = ops::kApple9Attention.boundedRescaleRows;
+  }
+  return row;
+}
 
 kv::Layout layoutOf(kv::Format format, uint32_t layers = 1) {
   return {.attentionLayers = layers, .kvHeads = kKvHeads, .headDimension = kHeadDimension, .format = format};
@@ -161,10 +172,11 @@ struct Case final {
   std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> tables;
   uint32_t poisoned = 0;
   ops::RelativeAttentionWeights weights;
+  Tiles tiles = Tiles::Apple10;
 
   [[nodiscard]] uint32_t page(uint32_t lane, uint32_t token) const { return pages[lane][token / kPageTokens]; }
   [[nodiscard]] ops::AttentionCalibration attention() const {
-    ops::AttentionCalibration row = test::attentionRow(int8Queries ? 1U : ops::kNever);
+    ops::AttentionCalibration row = withTiles(test::attentionRow(int8Queries ? 1U : ops::kNever), tiles);
     row.cores = kCores;
     return row;
   }
@@ -191,7 +203,8 @@ uint32_t windowStart(ops::RelativeAttentionVariant variant, uint32_t position) {
 }
 
 Case makeCase(metal::MetalBackend &backend, kv::Format format, bool int8Queries, ops::RelativeAttentionVariant variant,
-              uint32_t lanes, uint32_t rows, std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories) {
+              uint32_t lanes, uint32_t rows, std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories,
+              Tiles tiles = Tiles::Apple10) {
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> pageCounts{};
   uint32_t allPages = 1;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -206,6 +219,7 @@ Case makeCase(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
             {zeroed(backend, kQueryHeads * kHeadDimension * sizeof(float)),
              zeroed(backend, kQueryHeads * kStates * sizeof(float)),
              zeroed(backend, kExtent * kStates * sizeof(float))}};
+  data.tiles = tiles;
   data.layer = data.pool.layer(kLayer);
   for (uint32_t head = 0; head < kQueryHeads; ++head) {
     for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension)
@@ -413,12 +427,13 @@ ops::RelativeAttentionPlan decodePlanOf(const Case &data, const Step &step) {
                                  ops::StepKind::Decode);
 }
 
-// A lane's single-pass splits: decodeSplits of the pages its tile reads.
+// A lane's single-pass splits: decodeSplits of the pages its tile reads, in
+// a step of the case's lanes.
 uint32_t decodeLaneSplits(const Case &data, const Step &step, uint32_t lane) {
   const uint32_t pages = (data.histories[lane] + step.first + step.rows + kPageTokens - 1) / kPageTokens;
   return RelativeAttention::decodeSplits(
       data.variant.windowTokens ? std::min(pages, kv::windowAttentionPages(data.variant.windowTokens)) : pages,
-      step.rows, data.attention().cores);
+      step.rows, data.lanes, data.attention());
 }
 
 // A decode step's single pass on a poisoned workspace and zero counters, as
@@ -683,7 +698,7 @@ std::string describe(const Case &data, std::string_view phase) {
                      (data.variant.windowTokens ? " window " + std::to_string(data.variant.windowTokens)
                                                 : " whole history, position-scaled");
   for (uint32_t lane = 0; lane < data.lanes; ++lane) text += " " + std::to_string(data.histories[lane]);
-  return text;
+  return text + (data.tiles == Tiles::Apple9 ? " (Apple9's tiles)" : "");
 }
 
 // The direct kernel writes the split and reduce's bits: a lane's prompt chunk
@@ -782,8 +797,8 @@ bool checkDirectBits(metal::MetalBackend &backend, const Case &data, const Step 
 // each chunk of one split (checkDirectBits).
 void checkPrefill(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
                   ops::RelativeAttentionVariant variant, uint32_t history, uint32_t rows,
-                  std::vector<uint32_t> split = {}) {
-  const Case data = makeCase(backend, format, int8Queries, variant, 1, rows, {history, 0, 0, 0});
+                  std::vector<uint32_t> split = {}, Tiles tiles = Tiles::Apple10) {
+  const Case data = makeCase(backend, format, int8Queries, variant, 1, rows, {history, 0, 0, 0}, tiles);
   const std::string what = describe(data, "prefill") + " rows " + std::to_string(rows);
   double largest = 0;
   uint32_t direct = 0, chunks = 0;
@@ -945,11 +960,11 @@ void runPrepare(metal::MetalBackend &backend, const Case &data, const Step &step
 // every checked row against fp64, and no row past a lane's rows written.
 void checkDecode(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
                  ops::RelativeAttentionVariant variant, std::span<const uint32_t> histories, uint32_t bound,
-                 std::span<const uint32_t> laneRows, bool trees) {
+                 std::span<const uint32_t> laneRows, bool trees, Tiles tiles = Tiles::Apple10) {
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> lanes{};
   std::copy(histories.begin(), histories.end(), lanes.begin());
   const auto count = uint32_t(histories.size());
-  const Case data = makeCase(backend, format, int8Queries, variant, count, bound, lanes);
+  const Case data = makeCase(backend, format, int8Queries, variant, count, bound, lanes, tiles);
   const Step step = makeStep(backend, data, 0, bound, kPageTokens, trees ? treesOf(count, bound) : std::vector<Tree>{},
                              std::vector<uint32_t>(laneRows.begin(), laneRows.end()));
   runPrepare(backend, data, step);
@@ -1032,9 +1047,10 @@ void checkDecodeBits(metal::MetalBackend &backend, kv::Format format, bool int8Q
 // lane of `bound` rows of each count, encoded as addDecode encodes it with
 // the count set, which leaves its counters zero.
 void checkDecodeSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
-                            ops::RelativeAttentionVariant variant, uint32_t history, uint32_t bound) {
+                            ops::RelativeAttentionVariant variant, uint32_t history, uint32_t bound,
+                            Tiles tiles = Tiles::Apple10) {
   constexpr uint32_t kSplits = SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS;
-  const Case data = makeCase(backend, format, int8Queries, variant, 1, bound, {history, 0, 0, 0});
+  const Case data = makeCase(backend, format, int8Queries, variant, 1, bound, {history, 0, 0, 0}, tiles);
   const Step step = makeStep(backend, data, 0, bound, kPageTokens, treesOf(1, bound));
   const ops::RelativeAttentionPlan plan = decodePlanOf(data, step);
   const ops::AttentionWorkspace workspace =
@@ -1129,13 +1145,21 @@ void checkPlans() {
                   plan.directPipeline() == "relative_attention_" + name + "_direct" + window,
               "a plan names another variant's kernels");
       // 300 rows after 5,000 tokens: a sliding layer's window in one split,
-      // whose dispatch runs the direct kernel over 19 tiles of 16 rows, a
-      // full layer's history in more.
+      // whose dispatch runs the direct kernel over 15 tiles of 21 rows (the
+      // last of 6), a full layer's history in more.
       require(plan.dispatches().size() == 1 &&
                   plan.direct(plan.dispatches()[0]) == (variant.windowTokens != 0) &&
                   plan.directGroups(plan.dispatches()[0]).x == kKvHeads &&
-                  plan.directGroups(plan.dispatches()[0]).y == 19,
+                  plan.directGroups(plan.dispatches()[0]).y == 15,
               "a plan runs the direct kernel other than for one split");
+      // Apple9's direct tiles of 16 rows: 19 of them (the last of 12), on
+      // their own kernel.
+      const ops::RelativeAttentionPlan narrow = RelativeAttention::plan(
+          sequence, layout, withTiles(test::attentionRow(ops::kNever), Tiles::Apple9), ops::Int8Activations::On,
+          chunk, variant);
+      require(narrow.directPipeline() == "relative_attention_" + name + "_direct_r16" + window &&
+                  narrow.directRows() == 16 && narrow.directGroups(narrow.dispatches()[0]).y == 19,
+              "Apple9's direct tiles are not its own");
       const ops::RelativeAttentionPlan codes = RelativeAttention::plan(
           lane, layout, test::attentionRow(1), ops::Int8Activations::On, chunk, variant);
       require(codes.splitPipeline() ==
@@ -1171,48 +1195,109 @@ void checkPlans() {
                       plan.directPipeline().empty() && plan.dispatches().size() == 1 &&
                       !plan.direct(plan.dispatches()[0]),
                   "a decode plan names another kernel");
+          ops::AttentionCalibration row = test::attentionRow(ops::kNever);
+          row.cores = cores;
+          // Under the narrow cap a step's lanes run the smallest tile that
+          // holds its most rows a lane, with the cap's own splits; a verify
+          // block's lanes run its tile whatever their rows.
+          for (const auto &[laneRows, tile] : {std::pair<uint32_t, const char *>{1, "_r2"}, {2, "_r2"}, {3, "_r5"},
+                                               {5, "_r5"}, {6, ""}, {8, ""}}) {
+            const ops::RelativeAttentionPlan fewer =
+                RelativeAttention::plan(steps, layout, row, ops::Int8Activations::On,
+                                        {2 * lanes.partialsBytes, 2 * lanes.statisticsBytes}, variant,
+                                        ops::StepKind::Decode, laneRows);
+            const bool wide = cap > kLaneRows;
+            require(fewer.decodePipeline() == "relative_attention_" + name + "_decode" +
+                                                  std::string(wide ? "_r16" : tile) +
+                                                  (variant.windowTokens ? "_w1023" : "") +
+                                                  (variant.positionScaled ? "_scaled" : "") &&
+                        fewer.decodeLaneRows() == (wide ? cap : laneRows) &&
+                        fewer.sequences()[0].splits == plan.sequences()[0].splits &&
+                        fewer.sequences()[1].splits == plan.sequences()[1].splits,
+                    "a decode step's lanes of fewer rows run another tile or other splits");
+          }
           for (size_t s = 0; s < steps.size(); ++s) {
             const uint32_t pages = (steps[s].committed_tokens + cap + kPageTokens - 1) / kPageTokens;
             require(plan.sequences()[s].splits ==
                         RelativeAttention::decodeSplits(
                             variant.windowTokens ? std::min(pages, kv::windowAttentionPages(kWindow)) : pages, cap,
-                            cores),
-                    "a decode lane's splits are not its own pages'");
+                            static_cast<uint32_t>(steps.size()), row),
+                    "a decode lane's splits are not its own pages' in its step's lanes");
           }
           require(decode(1).decodePipeline() ==
                       "relative_attention_" + std::string(format == kv::Format::Int8 ? "q8q" : "bf16") + "_decode" +
                           suffix,
                   "a decode plan's INT8 queries score INT8 pages alone");
+          // Apple9 bounds the rescale of a narrow lane's 24 fused rows alone:
+          // a verify block's lanes rescale every row (_unbounded).
+          ops::AttentionCalibration apple9 = withTiles(test::attentionRow(ops::kNever), Tiles::Apple9);
+          apple9.cores = cores;
+          require(RelativeAttention::plan(steps, layout, apple9, ops::Int8Activations::On,
+                                          {2 * lanes.partialsBytes, 2 * lanes.statisticsBytes}, variant,
+                                          ops::StepKind::Decode)
+                          .decodePipeline() ==
+                      "relative_attention_" + name + "_decode" +
+                          std::string(cap > kLaneRows ? "_r16_unbounded" : "") + (variant.windowTokens ? "_w1023" : "") +
+                          (variant.positionScaled ? "_scaled" : ""),
+                  "Apple9's lanes name another kernel");
         }
   }
   // A lane's splits: one per kDecodeCorePages / cores pages, but one a page
-  // up to a verify block's most, at most decodeMostSplits, and as many as the
-  // runs of pages they make. On 20 cores (most 12 and 7) 9 pages' 7 splits of
-  // 2 pages make 5 runs, a window's 34 pages take 9 and a full layer's 65 11
-  // runs of 6; on 32 cores (16 and 10) the window 12 runs of 3 and 65 pages
-  // 13 of 5.
+  // up to (cores + 8) / 4, at most the step's lanes' share of the
+  // threadgroups the GPU keeps resident (Apple10: 19 every four cores of a
+  // narrow cap's tiles, 14 of a verify block's; Apple9 none) to the nearest
+  // whole split, within what one lane repays alone ((cores + 16) / 3 and
+  // (cores + 8) / 4), and as many as the runs of pages they make. One lane on
+  // 20 cores (most 12 and 7) runs 9 pages in 5 runs, a window's 34 pages in 9
+  // (7 for a verify block) and a full layer's 65 in 11 runs of 6; on 32 cores
+  // (16 and 10) the window in 12 runs of 3 (a verify block's in 9 of 4, 33
+  // pages too) and 65 pages in 13; four lanes on 32 cores (5 and 4) the window
+  // in 5 and 4 runs each, two lanes in 9; on a 10-core Apple9 GPU a long
+  // history in 8 (4 for a verify block) for one lane, four or eight, and four
+  // lanes' window in 5 runs each.
   constexpr uint32_t wide = SPLASH_TARGET_VERIFY_ROWS;
   const uint32_t window = kv::windowAttentionPages(kWindow);
-  require(RelativeAttention::decodeMostSplits(kLaneRows, 20) == 12 &&
-              RelativeAttention::decodeMostSplits(wide, 20) == 7 &&
-              RelativeAttention::decodeMostSplits(kLaneRows, 32) == 16 &&
-              RelativeAttention::decodeMostSplits(wide, 32) == 10 &&
-              RelativeAttention::decodeMostSplits(kLaneRows, 1000) == SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS,
-          "a decode lane's most splits follow another rule");
+  const auto on = [](uint32_t cores, Tiles tiles = Tiles::Apple10) {
+    ops::AttentionCalibration row = tiles == Tiles::Apple9 ? ops::kApple9Attention : test::attentionRow(ops::kNever);
+    row.cores = cores;
+    return row;
+  };
+  require(RelativeAttention::decodeMostSplits(kLaneRows, 1, on(20)) == 12 &&
+              RelativeAttention::decodeMostSplits(wide, 1, on(20)) == 7 &&
+              RelativeAttention::decodeMostSplits(kLaneRows, 1, on(32)) == 16 &&
+              RelativeAttention::decodeMostSplits(wide, 1, on(32)) == 10 &&
+              RelativeAttention::decodeMostSplits(kLaneRows, 4, on(32)) == 5 &&
+              RelativeAttention::decodeMostSplits(wide, 4, on(32)) == 4 &&
+              RelativeAttention::decodeMostSplits(kLaneRows, 8, on(20)) == 1 &&
+              RelativeAttention::decodeMostSplits(kLaneRows, 1, on(1000)) == SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS,
+          "a decode step's most splits follow another rule");
   bool pageEach = true;
   for (const uint32_t cores : {20U, 32U})
-    for (uint32_t pages = 1; pages <= RelativeAttention::decodeMostSplits(wide, cores); ++pages)
-      pageEach = pageEach && RelativeAttention::decodeSplits(pages, kLaneRows, cores) == pages &&
-                 RelativeAttention::decodeSplits(pages, wide, cores) == pages;
-  require(pageEach && window == 34 && RelativeAttention::decodeSplits(9, kLaneRows, 20) == 5 &&
-              RelativeAttention::decodeSplits(window, kLaneRows, 20) == 9 &&
-              RelativeAttention::decodeSplits(65, kLaneRows, 20) == 11 &&
-              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 20) == 12 &&
-              RelativeAttention::decodeSplits(1u << 20, wide, 20) == 7 &&
-              RelativeAttention::decodeSplits(window, kLaneRows, 32) == 12 &&
-              RelativeAttention::decodeSplits(65, kLaneRows, 32) == 13 &&
-              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 32) == 16 &&
-              RelativeAttention::decodeSplits(1u << 20, wide, 32) == 10,
+    for (const uint32_t cap : {kLaneRows, wide})
+      for (uint32_t pages = 1; pages <= (cores + 8) / 4; ++pages)
+        pageEach = pageEach && RelativeAttention::decodeSplits(pages, cap, 1, on(cores)) == pages;
+  require(pageEach && window == 34 && RelativeAttention::decodeSplits(9, kLaneRows, 1, on(20)) == 5 &&
+              RelativeAttention::decodeSplits(window, kLaneRows, 1, on(20)) == 9 &&
+              RelativeAttention::decodeSplits(window, wide, 1, on(20)) == 7 &&
+              RelativeAttention::decodeSplits(65, kLaneRows, 1, on(20)) == 11 &&
+              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 1, on(20)) == 12 &&
+              RelativeAttention::decodeSplits(1u << 20, wide, 1, on(20)) == 7 &&
+              RelativeAttention::decodeSplits(window, kLaneRows, 1, on(32)) == 12 &&
+              RelativeAttention::decodeSplits(window, wide, 1, on(32)) == 9 &&
+              RelativeAttention::decodeSplits(window - 1, wide, 1, on(32)) == 9 &&
+              RelativeAttention::decodeSplits(65, kLaneRows, 1, on(32)) == 13 &&
+              RelativeAttention::decodeSplits(65, wide, 1, on(32)) == 10 &&
+              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 1, on(32)) == 16 &&
+              RelativeAttention::decodeSplits(1u << 20, wide, 1, on(32)) == 10 &&
+              RelativeAttention::decodeSplits(window, kLaneRows, 4, on(32)) == 5 &&
+              RelativeAttention::decodeSplits(window, wide, 4, on(32)) == 4 &&
+              RelativeAttention::decodeSplits(window, kLaneRows, 2, on(32)) == 9 &&
+              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 4, on(32)) == 5 &&
+              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 1, on(10, Tiles::Apple9)) == 8 &&
+              RelativeAttention::decodeSplits(1u << 20, wide, 1, on(10, Tiles::Apple9)) == 4 &&
+              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 4, on(10, Tiles::Apple9)) == 8 &&
+              RelativeAttention::decodeSplits(1u << 20, kLaneRows, 8, on(10, Tiles::Apple9)) == 8 &&
+              RelativeAttention::decodeSplits(window, kLaneRows, 4, on(10, Tiles::Apple9)) == 5,
           "a decode lane's splits follow another rule");
   rejects(
       [&] {
@@ -1304,6 +1389,11 @@ int main(int argc, char **argv) {
       checkPrefill(backend, format, int8Queries, kFull, 1010, 40, {7});
       checkPrefill(backend, format, int8Queries, kFull, 8180, 100, {31});
       checkPrefill(backend, format, int8Queries, kFull, 20000, 17);
+      // Apple9's direct tiles of 16 rows: chunks of one split from position 0
+      // and after a prefix, alone and in chunks.
+      checkPrefill(backend, format, int8Queries, kSliding, 0, 2048, {}, Tiles::Apple9);
+      checkPrefill(backend, format, int8Queries, kSliding, 4103, 1100, {509}, Tiles::Apple9);
+      checkPrefill(backend, format, int8Queries, kFull, 0, 1300, {257}, Tiles::Apple9);
       // Verify chains of one to four lanes and trees of four, before, at and
       // past the window and the extent, and past 8192.
       for (const auto variant : {kSliding, kFull}) {
@@ -1337,6 +1427,11 @@ int main(int argc, char **argv) {
         checkDecode(backend, format, int8Queries, variant, kWide, kLaneRows, kEight, true);
         for (const uint32_t cap : {kLaneRows, uint32_t{SPLASH_TARGET_VERIFY_ROWS}})
           checkDecodeSplitCounts(backend, format, int8Queries, variant, 4103, cap);
+        // Apple9's verify blocks' lanes, which rescale every row.
+        checkDecode(backend, format, int8Queries, variant, kTrees, SPLASH_TARGET_VERIFY_ROWS,
+                    std::array<uint32_t, 4>{9, 1, 16, 12}, true, Tiles::Apple9);
+        checkDecodeSplitCounts(backend, format, int8Queries, variant, 4103, SPLASH_TARGET_VERIFY_ROWS,
+                               Tiles::Apple9);
         checkDecodeBits(backend, format, int8Queries, variant, 1031, kLaneRows, false);
         checkDecodeBits(backend, format, int8Queries, variant, 2000, 1, false);
         checkDecodeBits(backend, format, int8Queries, variant, 8190, 5, true);

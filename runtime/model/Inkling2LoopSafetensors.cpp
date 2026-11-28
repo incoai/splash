@@ -134,7 +134,8 @@ constexpr std::array<std::string_view, 3> kMessageGateProjections{"down_proj", "
 // The sources of section `rest` of weight layer `layer` (blk.<layer>.<rest>)
 // in `checkpoint`, of `names`.
 std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint, Names names,
-                                        const Inkling2LoopLayout &layout, uint32_t layer, std::string_view rest) {
+                                        const Inkling2LoopLayout &layout, uint32_t layer, std::string_view rest,
+                                        const gguf::PlanOptions &options) {
   const std::string model(kModels[names]), p = model + "layers." + std::to_string(layer) + ".";
   const bool sliding = layout.slides(layer);
   const uint64_t hidden = layout.hiddenSize;
@@ -199,10 +200,12 @@ std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint,
   // release's names (which mlx-lm's earlier conversions keep) or mlx-vlm's
   // and mlx-lm's. The fused kernels take a call's gates in one format
   // (ops::MessageGate): the mixer's q, k and v gates, or the FFN's
-  // (kInkling2LoopGateCalls). A call whose projections mix BF16 and F32
-  // (mlx-community's conversions keep a gate's forget and gain F32 and its
-  // down projection BF16) takes its BF16 rows widened to F32, exactly; one of
-  // a single format keeps it.
+  // (kInkling2LoopGateCalls). A call whose projections mix BF16 and F32, an
+  // F32 one holding BF16's values counting as BF16 (it loads as BF16 rows:
+  // gguf::floatKernelType, as mlx-community's conversions keep a
+  // gate's forget and gain F32 of the release's BF16 values beside its BF16
+  // down projection), takes its BF16 rows widened to F32, exactly; one of a
+  // single format keeps it.
   const auto controller = [&](size_t gate, size_t projection) {
     return p + "controllers." + std::string(kControllers[gate]) + "." + std::string(kGateProjections[projection]) +
            "_weight";
@@ -217,9 +220,12 @@ std::vector<SectionSource> layerSources(const SafetensorsCheckpoint &checkpoint,
     const Inkling2LoopGateCall call = inkling2LoopGateCall(gate);
     for (size_t other = call.first; other < call.end; ++other)
       for (size_t projection = 0; projection < kGateProjections.size(); ++projection)
-        if (const SourceTensor *tensor = checkpoint.find(gateTensor(other, projection))) {
-          bfloat16 = bfloat16 || tensor->dtype == "BF16";
-          float32 = float32 || tensor->dtype == "F32";
+        if (const SourceTensor *tensor = checkpoint.find(gateTensor(other, projection));
+            tensor && (tensor->dtype == "BF16" || tensor->dtype == "F32")) {
+          const uint32_t stored = tensor->dtype == "BF16" ? ggml::kBF16 : ggml::kF32;
+          (gguf::floatKernelType(stored, options, *tensor->file, tensor->offset, tensor->bytes / 4) == ggml::kBF16
+               ? bfloat16
+               : float32) = true;
         }
     return bfloat16 && float32;
   };
@@ -270,11 +276,12 @@ std::vector<SectionSource> headSources(Names names, std::string_view section) {
 
 // The sources of section `name` in `checkpoint`, of `names`.
 std::vector<SectionSource> sources(const SafetensorsCheckpoint &checkpoint, Names names,
-                                   const Inkling2LoopLayout &layout, std::string_view name) {
+                                   const Inkling2LoopLayout &layout, std::string_view name,
+                                   const gguf::PlanOptions &options) {
   if (!name.starts_with("blk.")) return headSources(names, name);
   const size_t dot = name.find('.', 4);
   return layerSources(checkpoint, names, layout, uint32_t(std::stoul(std::string(name.substr(4, dot - 4)))),
-                      name.substr(dot + 1));
+                      name.substr(dot + 1), options);
 }
 
 } // namespace
@@ -289,7 +296,9 @@ SafetensorsTargetPlan safetensorsTargetPlan(const Inkling2LoopLayout &layout) {
                     checkpoint, layout, layout.weightLayers, options,
                     [&](uint32_t index) { return inkling2::layerSections(layout, index); },
                     inkling2::headSections(layout),
-                    [&](const gguf::Section &section) { return sources(checkpoint, names, layout, section.name); }),
+                    [&](const gguf::Section &section) {
+                      return sources(checkpoint, names, layout, section.name, options);
+                    }),
                 true};
           }};
 }

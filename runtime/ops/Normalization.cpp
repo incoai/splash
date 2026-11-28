@@ -29,6 +29,16 @@ void Normalization::addLayer(metal::CommandGraph &graph, const metal::MetalBuffe
             {input, weights.weight, weights.bias, output}, LayerNormParams{width, epsilon}, {rows, 1, 1});
 }
 
+RmsNormEpilogueParams RmsNormEpilogue::params(uint32_t rows, uint32_t width, uint32_t tiles) const {
+  if (!rows || rows > RMS_NORM_EPILOGUE_MAXIMUM_ROWS || !width || width % 4 || !tiles)
+    throw std::invalid_argument("invalid RMS norm epilogue");
+  requireBytes(weights.buffer, weights.bytes(width), "RMS norm epilogue weights");
+  requireBytes(output, uint64_t{rows} * width * sizeof(uint16_t), "RMS norm epilogue output");
+  requireBytes(partials, partialsBytes(tiles, rows), "RMS norm epilogue partials");
+  requireBytes(counter, kCounterBytes, "RMS norm epilogue counter");
+  return {rows, width, tiles, weights.float32 ? 1u : 0u};
+}
+
 PreparedInput Normalization::addRms(metal::CommandGraph &graph,
                                     metal::MetalBuffer input,
                                     const NormWeights &weight,

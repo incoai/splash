@@ -121,6 +121,8 @@ void readDeviceCapabilities(id<MTLDevice> device,
          [device supportsFamily:static_cast<MTLGPUFamily>(1000 + next)]; ++next)
         family = next;
     capabilities.appleGpuFamily = family;
+    capabilities.memoryBytesPerSecond =
+        DeviceCapabilities::classMemoryBytesPerSecond(capabilities.gpuClass(), capabilities.gpuCoreCount);
     capabilities.physicalMemoryBytes = NSProcessInfo.processInfo.physicalMemory;
     capabilities.recommendedMaxWorkingSetBytes =
         device.recommendedMaxWorkingSetSize;
@@ -1268,6 +1270,58 @@ struct MetalBackend::Impl {
     uint64_t lastCommandBuffers = 0;
     // BackendInstrumentation::submitPartsWhole.
     bool wholeParts = false;
+    // BackendInstrumentation::snapshotEvery: the pipelines' name prefix, the
+    // binding counted from the last, and the copies.
+    std::string everyPrefix;
+    uint32_t everyFromLast = 0;
+    std::vector<DispatchSnapshot> everySnapshots;
+
+    // `command` with a host step after each of its dispatches of everyPrefix,
+    // its events in `events`; none if it holds none.
+    std::optional<Command> withEverySnapshot(const Command &command, std::vector<EventStep> &events) {
+        events.assign(command.events.begin(), command.events.end());
+        bool any = false;
+        for (size_t index = 0; index < command.dispatches.size(); ++index) {
+            const ComputeDispatch &dispatch = command.dispatches[index];
+            if (!dispatch.pipelineName.starts_with(everyPrefix)) continue;
+            if (dispatch.buffers.size() <= everyFromLast || dispatch.bytes.empty())
+                throw MetalBackendError("a snapshot's dispatch binds too few buffers or no parameters");
+            const MetalBuffer view = dispatch.buffers[dispatch.buffers.size() - 1 - everyFromLast].buffer;
+            const auto *bytes = static_cast<const uint8_t *>(dispatch.bytes[0].data);
+            DispatchSnapshot taken{dispatch.pipelineName, {bytes, bytes + dispatch.bytes[0].sizeBytes}, {}};
+            EventStep step;
+            step.before = index + 1;
+            step.kind = EventStep::Kind::Host;
+            step.work = [this, view, taken = std::move(taken)]() mutable {
+                const auto *contents = static_cast<const uint8_t *>(view.contents());
+                if (!contents) throw MetalBackendError("a snapshot's view is not host-visible");
+                taken.buffer.assign(contents, contents + view.sizeBytes());
+                everySnapshots.push_back(taken);
+            };
+            events.insert(std::ranges::upper_bound(events, step.before, {}, &EventStep::before), std::move(step));
+            any = true;
+        }
+        if (!any) return std::nullopt;
+        return Command{command.dispatches, events};
+    }
+
+    // BackendInstrumentation::captureCommands: whether submitted commands are
+    // kept, and those kept.
+    bool capturing = false;
+    std::vector<CapturedCommand> captured;
+
+    // Keeps `dispatches` as a CapturedCommand, each bytes binding pointing
+    // into its own copy of the bytes.
+    void capture(std::span<const ComputeDispatch> dispatches) {
+        CapturedCommand command;
+        command.dispatches.assign(dispatches.begin(), dispatches.end());
+        for (ComputeDispatch &dispatch : command.dispatches)
+            for (BytesBinding &binding : dispatch.bytes) {
+                const auto *bytes = static_cast<const uint8_t *>(binding.data);
+                binding.data = command.payloads.emplace_back(bytes, bytes + binding.sizeBytes).data();
+            }
+        captured.push_back(std::move(command));
+    }
     // BackendInstrumentation::stageExpertTiles.
     bool stagedExpertTiles = false;
     // BackendInstrumentation::snapshotAfter: the pipeline a host step follows
@@ -2631,10 +2685,22 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
         if (const std::optional<Command> snapshotted = impl_->withSnapshot(command, events))
             return submitCommandAsync(*snapshotted, std::move(completion));
     }
+    if (!impl_->everyPrefix.empty()) {
+        // The copies' host steps go in once: the command they are in is
+        // submitted with the prefix cleared for it.
+        std::vector<EventStep> events;
+        if (const std::optional<Command> snapshotted = impl_->withEverySnapshot(command, events)) {
+            const std::string prefix = std::exchange(impl_->everyPrefix, {});
+            CommandTicket ticket = submitCommandAsync(*snapshotted, std::move(completion));
+            impl_->everyPrefix = prefix;
+            return ticket;
+        }
+    }
 #endif
     [[maybe_unused]] const NSUInteger buffers = checkEvents(command.events, command.dispatches.size());
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
     impl_->lastCommandBuffers = buffers;
+    if (impl_->capturing) impl_->capture(command.dispatches);
     if (impl_->dispatchProfiling)
         return impl_->submitProfiled(command.dispatches, command.events, std::move(completion));
 #endif
@@ -2650,9 +2716,9 @@ CommandTicket MetalBackend::submitCommandPartsAsync(const Command &first, const 
     if (!rest) throw MetalBackendError("a command in two parts needs its second");
     if (!first.events.empty()) throw MetalBackendError("a command's first part has no event steps");
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
-    // Profiled, the parts are one command: the first part's dispatches, then
-    // the second's.
-    if (impl_->dispatchProfiling) {
+    // Profiled, captured or snapshotted, the parts are one command: the
+    // first part's dispatches, then the second's.
+    if (impl_->dispatchProfiling || impl_->capturing || !impl_->everyPrefix.empty()) {
         const Command second = rest();
         std::vector<ComputeDispatch> dispatches(first.dispatches.begin(), first.dispatches.end());
         dispatches.insert(dispatches.end(), second.dispatches.begin(), second.dispatches.end());
@@ -2774,6 +2840,23 @@ BackendInstrumentation::takeDispatchProfile(MetalBackend &backend) {
 
 void BackendInstrumentation::submitPartsWhole(MetalBackend &backend, bool enabled) {
     backend.impl_->wholeParts = enabled;
+}
+
+void BackendInstrumentation::snapshotEvery(MetalBackend &backend, std::string prefix, uint32_t fromLast) {
+    backend.impl_->everyPrefix = std::move(prefix);
+    backend.impl_->everyFromLast = fromLast;
+}
+
+std::vector<DispatchSnapshot> BackendInstrumentation::takeSnapshots(MetalBackend &backend) {
+    return std::exchange(backend.impl_->everySnapshots, {});
+}
+
+void BackendInstrumentation::captureCommands(MetalBackend &backend, bool enabled) {
+    backend.impl_->capturing = enabled;
+}
+
+std::vector<CapturedCommand> BackendInstrumentation::takeCapturedCommands(MetalBackend &backend) {
+    return std::exchange(backend.impl_->captured, {});
 }
 
 std::optional<bool> BackendInstrumentation::awakeHostStepsSpin(MetalBackend &backend) {

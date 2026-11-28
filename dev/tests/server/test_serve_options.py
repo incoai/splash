@@ -111,6 +111,11 @@ OPTIONS = {
         },
         ("", " "),
     ),
+    "--weights": values(
+        "--weights",
+        {"original": "original", "auto": "auto"},
+        ("", "q8", "published", "16bit", "bf16"),
+    ),
     "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
     "--state-format": values(
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
@@ -250,6 +255,11 @@ OPTIONS = {
         "--request-timeout",
         {"3600": 3600.0, "0.5": 0.5, "90s": 90.0, "30M": 1800.0, "1.5h": 5400.0},
         ("0", "-1", "-1m", "inf", "nan", "10x", "m", "off", "soon"),
+    ),
+    "--shutdown-timeout": values(
+        "--shutdown-timeout",
+        {"off": 0.0, "0": 0.0, "2.5": 2.5, "10s": 10.0, "15": 15.0},
+        ("-1", "16", "1m", "inf", "nan", "soon"),
     ),
     "--queue-size": values(
         "--queue-size", {"64": 64, "1": 1}, ("0", "-1", "1.5", "many")

@@ -5,8 +5,8 @@
 //   vision-preparation [inkling-]safetensors|[inkling-]gguf DIRECTORY EXPECTED
 //   vision-preparation padding DIRECTORY
 //
-// EXPECTED is an independently serialized file the image and the size
-// estimate must equal; the installer's check of the source
+// EXPECTED is an independently serialized file the image must equal; the
+// installer's check of the source
 // (VisionLoader::check) refuses what the image's writer refuses, and nothing
 // else. padding writes a padded section after an unpadded one and checks its
 // padding is zero.
@@ -131,8 +131,6 @@ int main(int argc, char **argv) {
           std::to_string(differs.first - bytes.begin()) + " (" +
           std::to_string(bytes.size()) + " written, " +
           std::to_string(expected.size()) + " expected)");
-    if (model::visionImageBytes(layout) != expected.size())
-      throw std::runtime_error("vision size estimate differs from the oracle");
     std::cout << model::weightDigest(bytes) << '\n';
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

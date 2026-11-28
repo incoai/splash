@@ -3,6 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/KernelCalibration.hpp"
+#include "ops/Weights.hpp"
 
 #include <cstdint>
 #include <string>
@@ -10,14 +11,18 @@
 namespace splash::ops {
 
 // A dense projection as its checkpoint stores it: bf16 weights
-// [outputs][inputs] and a bf16 bias of every output, zeros for a projection
-// stored without one; and, for one whose output a LayerScale multiplies
-// (Inkling 2's tower), that scale of every output, bf16, which the
-// ScaledResidual epilogue reads.
+// [outputs][inputs], or, for a matrix its source holds as Q8_0 (an Inkling 2
+// mmproj's), those codes and scales as the planes of a GGUF image's Q8_0
+// tensor (`quantized`, metal/abi/QuantFormat.h) in place of `weight`; a bf16
+// bias of every output, zeros for a projection stored without one; and, for
+// one whose output a LayerScale multiplies (Inkling 2's tower), that scale of
+// every output, bf16, which the ScaledResidual epilogue reads.
 struct DenseWeights final {
   metal::MetalBuffer weight;
   metal::MetalBuffer bias;
   metal::MetalBuffer scale{};
+  QuantizedSegment quantized{};
+  [[nodiscard]] bool isQuantized() const noexcept { return !quantized.isFloat(); }
 };
 
 // What a projection does with each sum plus its bias: stores it, or its
@@ -27,7 +32,9 @@ struct DenseWeights final {
 enum class DenseEpilogue : uint8_t { None, GeluTanh, GeluErf, Residual, ScaledResidual };
 
 // Dense projections on the tile the device's KernelCalibration picks for
-// each one's grid (DenseLinear.cpp).
+// each one's grid (DenseLinear.cpp); a quantized one on the GGUF bf16
+// prefill tile, its inputs bf16 whatever the runtime's Int8Activations
+// (DenseLinear.cpp gives the reason).
 class DenseLinear final {
 public:
   // Inputs are whole multiples of the kernels' 128-wide K chunks, outputs of
@@ -37,14 +44,20 @@ public:
 
   explicit DenseLinear(const DeviceCapabilities &device) noexcept;
 
+  // The kernel a projection of `rows` rows into outputSize columns of
+  // inputSize inputs runs, of bf16 weights or of quantized ones in `format`
+  // (GGUF_FMT_*; kFloat32 for bf16 weights).
+  [[nodiscard]] std::string kernel(uint32_t rows, uint32_t outputSize, uint32_t inputSize, DenseEpilogue epilogue,
+                                   uint32_t format = QuantizedSegment::kFloat32) const;
+
   // The rows of input a projection of `rows` rows reads: whole row tiles.
   [[nodiscard]] static uint32_t paddedRows(uint32_t rows) noexcept;
   // The projection's contract, which its owner checks once, where it takes
   // the weights: an output size of a whole kOutputMultiple and an input size
   // of a whole kInputMultiple (the kernels compute whole tiles and K chunks
-  // and would leave the rest out), outputSize x inputSize bf16 weights and
-  // outputSize bf16 biases, and scales if it has any. Throws, naming `name`,
-  // otherwise.
+  // and would leave the rest out), outputSize x inputSize bf16 weights, or
+  // Q8_0 planes of them, and outputSize bf16 biases, and scales if it has
+  // any. Throws, naming `name`, otherwise.
   static void requireWeights(const DenseWeights &weights, uint32_t outputSize, uint32_t inputSize,
                              const std::string &name);
   // output[r] = epilogue(input[r] weight^T + bias) for the rows r < rows of
@@ -53,7 +66,10 @@ public:
   // it or on the tile, so a row's bits are the same at any offset in its
   // buffer and in a projection of any rows. Throws unless each buffer holds
   // what the kernel reaches: paddedRows(rows) rows of input, `rows` of
-  // output.
+  // output. A quantized projection's tile stages each weight in fp16, which
+  // holds a Q8_0 block's scale times its code to 2^-11 of it, and it writes
+  // the rows up to the next whole 32 where the output holds them (padding
+  // that no reader reads), its own rows alone otherwise.
   void add(metal::CommandGraph &graph, const DenseWeights &weights, uint32_t outputSize, uint32_t inputSize,
            const metal::MetalBuffer &input, const metal::MetalBuffer &output, uint32_t rows,
            DenseEpilogue epilogue = DenseEpilogue::None) const;

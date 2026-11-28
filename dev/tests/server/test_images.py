@@ -300,6 +300,71 @@ def image_message(url=None):
 
 
 class ImageRequestTest(HarnessTestCase):
+    def test_an_image_that_cannot_fit_names_the_image_options(self):
+        # The vision scratch of a large image and its prompt's KV beside it
+        # do not fit what a lone request may take: the client is told to
+        # compact or send a smaller image, and of --max-memory and
+        # --max-image-pixels, never of --max-context, which changes neither.
+        native = (
+            "the request's images need 551 MiB of vision scratch and image "
+            "buffers, beside which the memory a lone request may take holds the "
+            "KV of 41 tokens, fewer than its 66; refused before it took any memory"
+        )
+        failure = api.engine_runtime.RequestFailed(
+            1,
+            b"capacity_exhausted",
+            native.encode(),
+            capacity_limit=native_wire.CapacityLimit.IMAGE_MEMORY,
+            fits_tokens=40,
+        )
+        runtime = FakeRuntime(Plan(exception=failure), Plan(exception=failure))
+        harness = self.harness(runtime, tokenizer=ImagePadTokenizer())
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", chat_body(messages=[image_message()])
+        )
+        self.assertEqual(status, 400)
+        error = json.loads(payload)["error"]
+        self.assertEqual(error["code"], "context_length_exceeded")
+        tokens = len(runtime.requests[0].frame.prompt_tokens)
+        self.assertEqual(
+            error["message"],
+            f"prompt does not fit in this server's memory: {tokens} tokens > 40 "
+            "tokens it holds for this request now; send a smaller image, or "
+            "restart the server with a larger --max-memory or a smaller "
+            "--max-image-pixels",
+        )
+        body = anthropic_body()
+        body["messages"] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": png_data_url().split(",", 1)[1],
+                        },
+                    },
+                ],
+            }
+        ]
+        status, _, payload = harness.request("POST", "/v1/messages", body)
+        self.assertEqual(status, 400)
+        message = json.loads(payload)["error"]["message"]
+        self.assertTrue(
+            message.startswith(
+                "prompt is too long: "
+                f"{len(runtime.requests[1].frame.prompt_tokens)} tokens > 40 "
+                "maximum input tokens"
+            ),
+            message,
+        )
+        for text in (error["message"], message):
+            self.assertIn("--max-image-pixels", text)
+            self.assertNotIn("--max-context", text)
+
     def test_image_parts_expand_placeholders_and_carry_spans_and_pixels(self):
         runtime = FakeRuntime(Plan([[4]]))
         harness = self.harness(runtime, tokenizer=ImagePadTokenizer())

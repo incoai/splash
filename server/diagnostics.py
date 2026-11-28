@@ -333,6 +333,18 @@ def _reasoning_parts(reasoning):
     return parts
 
 
+def _reuse_end(end, tokens):
+    """Where a start's reuse stopped (backend.REUSE_ENDS), with that end's
+    tokens."""
+    if end == "prefix_end":
+        return f"reuse ended: prompt parts from the cache at {tokens:,}"
+    if end == "kv_without_state":
+        return f"reuse ended: KV matched {tokens:,} tokens past the last state"
+    if end == "disk_read_failed":
+        return f"reuse ended: an SSD read to {tokens:,} failed"
+    return "reuse ended: nothing matched"
+
+
 def _request(record):
     """The request a line names, where the engine took it: its id, as the
     engine's own lines and `/status` give it, so that the lines that start
@@ -350,6 +362,10 @@ def print_request(record):
         # request's error message, which may quote it.
         if record.get("engine_reason"):
             parts.append(record["engine_reason"])
+        # What helps a request that cannot fit even alone, as its client is
+        # told (errors.CapacityError).
+        if record.get("remedy"):
+            parts.append(record["remedy"])
         print_status(" · ".join(parts), error=True)
         return
     if outcome == "started":
@@ -361,6 +377,8 @@ def print_request(record):
             f"input {record['prompt_tokens']:,}",
             f"cached {record['cached_tokens']:,}",
         ]
+        if record.get("reuse_end"):
+            parts.append(_reuse_end(record["reuse_end"], record["reuse_end_tokens"]))
         if "reasoning" in record:
             parts.extend(_reasoning_parts(record["reasoning"]))
         print_status(" · ".join(parts))

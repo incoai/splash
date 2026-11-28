@@ -18,6 +18,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -57,9 +58,9 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 
 // How readRows reads a tensor's rows: as stored, or as its format's native
 // rows, which it builds from a quantized safetensors tensor's tensors, from
-// a GGUF's NVFP4 rows, or by quantizing a BF16 weight (into af4g64) or a
-// tensor of BF16 or F16 values, a GGUF's or a checkpoint's (into Q8_0, or
-// exactly into MXFP8).
+// a GGUF's NVFP4 rows, by quantizing a draft's BF16 weight (into af4g64), or
+// from a tensor of BF16 or F16 values, a GGUF's or a checkpoint's (into
+// Q8_0, or exactly into MXFP8).
 enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16, QuantizedFloat16 };
 RowReader rowReader(const gguf::TensorRows &rows) {
   if (rows.safetensors.codes) return RowReader::Safetensors;
@@ -266,16 +267,19 @@ void quantizeMxfp8Block(const float *values, uint8_t *block, const std::string &
     throw GgufError(name + " holds a value MXFP8 does not hold exactly");
 }
 
-// Native Q8_0 or MXFP8 bytes (the format of rows.type) [column, column +
-// span) of `count` rows of a tensor of BF16 or F16 values, a GGUF's or a
-// checkpoint's, from source row `start` on, back to back, each 32 values
-// built as quantizeQ8_0Block rounds them or as quantizeMxfp8Block holds
-// them. One read per run of rows
-// when they are read whole, else per row.
+// Native Q8_0 or MXFP8 bytes (the format of rows.type)
+// [column, column + span) of `count` rows of a tensor of BF16 or F16 values,
+// a GGUF's or a checkpoint's, from source row `start` on, back to back, each
+// 32 values built as quantizeQ8_0Block rounds them or as quantizeMxfp8Block
+// holds them. One read per run of rows when they are read whole, else per
+// row.
 void quantizeFloat16Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column,
                          uint64_t span, uint8_t *to) {
-  const bool mxfp8 = gguf_format_of(rows.type) == GGUF_FMT_MXFP8;
-  const QuantFormat &format = kQuantFormats[mxfp8 ? GGUF_FMT_MXFP8 : GGUF_FMT_Q80];
+  const uint32_t id = gguf_format_of(rows.type);
+  if (id != GGUF_FMT_Q80 && id != GGUF_FMT_MXFP8)
+    throw GgufError("16-bit values are built into Q8_0 or MXFP8 rows alone: " + rows.name);
+  const bool mxfp8 = id == GGUF_FMT_MXFP8;
+  const QuantFormat &format = kQuantFormats[id];
   if (column % format.block_bytes || span % format.block_bytes)
     throw GgufError(std::string(format.name) + " rows are built by whole blocks: " + rows.name);
   const bool float16 = rows.float16Type == ggml::kF16;
@@ -698,41 +702,68 @@ void addDecodedChunks(metal::MetalBackend &backend, const metal::MetalBuffer &im
 
 } // namespace
 
-bool exactlyMxfp8(const WeightSource &file, uint64_t offset, uint64_t values, uint32_t type) {
-  if (type != ggml::kBF16 && type != ggml::kF16) throw GgufError("not a 16-bit float tensor in " + file.path().string());
-  // A start plans its target several times, its sizing's (model/ModelSizing.hpp) and its load's, each from a source
-  // of its own on the same unchanged file (WeightSource::checkUnchanged). So the cache is the process's, a file known
-  // by its identity whatever source holds it, and each tensor's values are read once, the first time a plan asks.
+namespace {
+
+// Which format a tensor's values are asked to be exactly (exactly).
+enum class Exactly : uint8_t { Mxfp8, Bfloat16 };
+
+// Whether every run of `run` of a tensor's `values` values of `valueBytes`
+// bytes at data offset `offset` of `file` holds `exact`'s question, read in
+// chunks on a thread per core. A start plans its target several times, its
+// sizing's (model/ModelSizing.hpp) and its load's, each from a source of its
+// own on the same unchanged file (WeightSource::checkUnchanged). So the cache
+// is the process's, a file known by its identity whatever source holds it,
+// and each tensor's values are read once for each question, the first time a
+// plan asks.
+bool exactly(const WeightSource &file, uint64_t offset, uint64_t values, uint64_t valueBytes, uint64_t run,
+             Exactly question, const std::function<bool(const uint8_t *)> &exact) {
   static std::mutex mutex;
-  static std::map<std::pair<std::array<int64_t, 5>, uint64_t>, bool> known;
-  const std::pair key{file.identity(), offset};
+  static std::map<std::tuple<std::array<int64_t, 5>, uint64_t, Exactly>, bool> known;
+  const std::tuple key{file.identity(), offset, question};
   {
     const std::lock_guard lock(mutex);
     if (const auto found = known.find(key); found != known.end()) return found->second;
   }
-  constexpr uint64_t kBlock = 32, kChunkValues = kChunkReadBytes / 2;
-  if (values % kBlock) return false;
-  const bool float16 = type == ggml::kF16;
-  std::atomic<bool> exact = true;
-  parallelFor((values + kChunkValues - 1) / kChunkValues, [&](size_t chunk, unsigned) {
-    if (!exact.load(std::memory_order_relaxed)) return;
-    const uint64_t first = chunk * kChunkValues, count = std::min(kChunkValues, values - first);
-    std::vector<uint8_t> bytes(count * 2);
-    file.readData(offset + first * 2, bytes);
-    std::array<float, kBlock> block;
-    std::array<uint8_t, kBlock + 1> encoded;
-    for (uint64_t at = 0; at < count && exact.load(std::memory_order_relaxed); at += kBlock) {
-      for (uint64_t i = 0; i < kBlock; ++i) {
-        uint16_t bits;
-        std::memcpy(&bits, bytes.data() + 2 * (at + i), 2);
-        block[i] = widenFloat16(bits, float16);
-      }
-      if (!gguf::mxfp8Block(block, encoded)) exact.store(false, std::memory_order_relaxed);
-    }
+  if (values % run) return false;
+  const uint64_t chunkValues = kChunkReadBytes / valueBytes / run * run;
+  std::atomic<bool> holds = true;
+  parallelFor((values + chunkValues - 1) / chunkValues, [&](size_t chunk, unsigned) {
+    if (!holds.load(std::memory_order_relaxed)) return;
+    const uint64_t first = chunk * chunkValues, count = std::min(chunkValues, values - first);
+    std::vector<uint8_t> bytes(count * valueBytes);
+    file.readData(offset + first * valueBytes, bytes);
+    for (uint64_t at = 0; at < count && holds.load(std::memory_order_relaxed); at += run)
+      if (!exact(bytes.data() + at * valueBytes)) holds.store(false, std::memory_order_relaxed);
   });
   const std::lock_guard lock(mutex);
-  known.emplace(key, exact.load());
-  return exact;
+  known.emplace(key, holds.load());
+  return holds;
+}
+
+} // namespace
+
+bool exactlyMxfp8(const WeightSource &file, uint64_t offset, uint64_t values, uint32_t type) {
+  if (type != ggml::kBF16 && type != ggml::kF16) throw GgufError("not a 16-bit float tensor in " + file.path().string());
+  constexpr uint64_t kBlock = 32;
+  const bool float16 = type == ggml::kF16;
+  return exactly(file, offset, values, 2, kBlock, Exactly::Mxfp8, [float16](const uint8_t *bytes) {
+    std::array<float, kBlock> block;
+    std::array<uint8_t, kBlock + 1> encoded;
+    for (uint64_t i = 0; i < kBlock; ++i) {
+      uint16_t bits;
+      std::memcpy(&bits, bytes + 2 * i, 2);
+      block[i] = widenFloat16(bits, float16);
+    }
+    return gguf::mxfp8Block(block, encoded);
+  });
+}
+
+bool exactlyBfloat16(const WeightSource &file, uint64_t offset, uint64_t values) {
+  return exactly(file, offset, values, 4, 1, Exactly::Bfloat16, [](const uint8_t *bytes) {
+    float value;
+    std::memcpy(&value, bytes, 4);
+    return exactBfloat16(value).has_value();
+  });
 }
 
 void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, uint8_t *to) {
@@ -873,13 +904,14 @@ WeightFile loadImage(metal::MetalBackend &backend, WeightImages &images, std::st
                     writeGgufImage(backend, buffer, *plan);
                     checkUnchanged();
                   },
-                  plan->residentBytes, std::shared_ptr<const std::vector<gguf::Fill>>(plan, &plan->fills)};
+                  plan->residentBytes, std::shared_ptr<const std::vector<gguf::Fill>>(plan, &plan->fills),
+                  gguf::imageFormats(*plan)};
   return images.load(std::move(image));
 }
 
 WeightFileRecord imageRecord(const WeightImages &images, std::string_view prefix, const gguf::Image &plan) {
   return {std::string(prefix) + plan.name, plan.magic, plan.layer, plan.type, plan.residentBytes,
-          images.contentIdentity()};
+          images.contentIdentity(), gguf::imageFormats(plan)};
 }
 
 } // namespace splash::model

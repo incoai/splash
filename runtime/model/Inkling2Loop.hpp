@@ -291,6 +291,11 @@ struct Inkling2LoopLayout final : QwenHybridLayout {
   [[nodiscard]] constexpr std::array<ops::RelativeAttentionVariant, 2> relativeAttention() const noexcept {
     return {fullAttention(), slidingAttention()};
   }
+  // A later pass's layers' inputs pass through message gates, and every
+  // layer's mix its block residual (below), whose decode kernels follow a
+  // step's rows (ops::ExecutionPlans::decodeRowClasses).
+  [[nodiscard]] constexpr bool messageGates() const noexcept { return loopPasses > 1; }
+  [[nodiscard]] constexpr bool blockResidualMixes() const noexcept { return true; }
 
   // Its weight layers, and the loop: weight layers loopFirstLayer to
   // loopEndLayer - 1 run loopPasses times a token, with their weights shared;
@@ -394,7 +399,11 @@ struct Inkling2LoopLayout final : QwenHybridLayout {
                           .expertSelectionBias = true,
                           .expertRoutedScale = 8.0F,
                           .expertGateSoftcap = 4,
-                          .expertUpSoftcap = 25},
+                          .expertUpSoftcap = 25,
+                          // Its activations are bf16 unless a start gives --activations auto: int8 ones took
+                          // about 3% off its GGUFs' prefill and 8% off its MLX 4-bit pack's, and nothing off a
+                          // decode step, for the rounding of every prefill row (measured 2026-11-27).
+                          .activations = ops::Int8Activations::Off},
                          "Inkling-2-Mini"} {
     // An application slides as its weight layer does; none rotates.
     slidingLayers = schedule().slidingApplications();

@@ -101,6 +101,7 @@ def stream(exchange, job, stream_options, *, chat):
         collected = exchange.collect(
             job,
             on_start=start,
+            streaming=True,
             on_text=lambda field, text: exchange.sse(chunk(payload(field, text))),
             on_tool_delta=lambda delta: exchange.sse(chunk({"tool_calls": [delta]})),
             on_idle=keepalive,

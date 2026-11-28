@@ -2272,6 +2272,21 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
 // reference does and take about as long as an ordinary row's search: even
 // key splits bound every search to a few passes, where pivots at distances
 // of the temperature alone once took thousands and stalled the batch.
+//
+// kExtremeSearchBound is how many ordinary searches an extreme one may take.
+// What it guards against is a search of hundreds or thousands of passes. The
+// extreme searches' time does not follow the ordinary one's: on a quiet
+// 12-core M6, 1.7.4's ordinary search took 0.48 to 1.32 ms and 1.7.5's takes
+// 0.41 to 0.45, while the saturated tail's kept its 3.6 to 4.8 ms on both, so
+// its ratio rose from 3 to 9 to 7.9 to 11.6; on a 16-core M5 Pro it read 8.2
+// and 9.6 beside another GPU job (ordinary 0.47 and 0.56 ms). A bound of 8
+// failed every quiet run of 1.7.5 on the M6, and one in three of 1.7.4's,
+// whenever its ordinary search ran fast. 24 is twice the largest ratio
+// measured, far under a search that does not converge: on a 32-core M5 Max,
+// whose saturated tail reads 3.1 ordinary searches, the same search run eight
+// times over in the timed command reads 28.8 and fails, and four times over
+// 8.3 and passes (a scratch build).
+constexpr double kExtremeSearchBound = 24.0;
 void extremeSearches(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 248320;
   Sampling sampling(vocabulary);
@@ -2338,7 +2353,7 @@ void extremeSearches(MetalBackend &backend) {
                         referenceDistribution(batch.row(row), vocabulary,
                                               c.policy),
                         std::string(c.name) + " row " + std::to_string(row));
-    require(seconds <= 8.0 * ordinary,
+    require(seconds <= kExtremeSearchBound * ordinary,
             std::string(c.name) + ": the search took " +
                 std::to_string(seconds / ordinary) + " times an ordinary one");
   }
@@ -3415,7 +3430,7 @@ void childTestsOfTheSelectorsDraws(MetalBackend &backend, const SamplingPolicy &
       lanes.push_back({7, 2, 0, 3, DraftCalibration{}, policy.temperature,
                        uint64_t{random.next()} << 32 | random.next()});
     CommandGraph layout;
-    selector.add(layout, trees, codebooks, DraftVocabulary{}, lanes);
+    selector.add(layout, trees, codebooks, DraftVocabulary{}, vocabulary, lanes, SPLASH_DRAFT_SAMPLING_MOST_SHARDS);
     DraftSelector::addVerifyRows(layout, trees, step);
     static_cast<void>(backend.submitCommandAsync(layout.dispatches()).wait());
     // Each row's logits: its tree row's, the anchor's, a child's or a

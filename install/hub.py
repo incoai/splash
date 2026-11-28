@@ -24,6 +24,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
@@ -34,6 +35,9 @@ from . import models
 HUB_TIMEOUT = 5
 # Seconds between two measurements of a download's progress.
 PROGRESS_INTERVAL = 0.25
+# Seconds after which a log gets a download's progress line even short of
+# its next tenth (_ConsoleProgress).
+LOG_PROGRESS_SECONDS = 30
 # Seconds a download's caller waits on it at a time, the longest Ctrl+C
 # takes to reach that caller (_interruptible).
 INTERRUPT_INTERVAL = 0.1
@@ -158,6 +162,18 @@ def cached_repositories() -> list[str]:
 
 def snapshot(repo_id: str, commit: str) -> Path:
     return folder(repo_id) / "snapshots" / commit
+
+
+def cached_snapshots(repo_id: str) -> list[str]:
+    """The commits of repo_id whose snapshots the Hub cache holds, the one
+    whose folder changed last first."""
+    snapshots = [
+        path
+        for path in (folder(repo_id) / "snapshots").glob("*")
+        if models.is_hex_digest(path.name, 40) and path.is_dir()
+    ]
+    snapshots.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    return [path.name for path in snapshots]
 
 
 def snapshot_commit(path: Path, repo_id: str) -> str:
@@ -499,7 +515,9 @@ class Repository:
         (_cached_commits); without either, the ModelError carries that class
         for the app. unreachable and unreachable_kind, from another repository
         this start, stand for the Hub's answer without a request. A different
-        revision is never substituted."""
+        revision is never substituted here; offline, a default branch's GGUF
+        variant the recorded snapshot lacks may be taken from another
+        (upstream._cached_holding)."""
         from huggingface_hub import constants
 
         if Path(name).is_absolute():
@@ -681,9 +699,11 @@ def _cached_commits(name, revision, installation):
     without the Hub, most specific first: revision itself when it is a
     commit; the commit installation recorded, then the ones it pinned
     (refs/splash); then the cache's record of the branch or tag (refs/main,
-    _record_default_branch). Other installations' pins never stand in: a pin
-    does not say which revision it was installed for. The record is read as
-    it is, so a damaged installation can be rebuilt."""
+    _record_default_branch). Other installations' pins are not among them: a
+    pin does not say which revision it was installed for (only a GGUF
+    variant the recorded snapshot lacks is looked for in every snapshot,
+    upstream._cached_holding). The record is read as it is, so a damaged
+    installation can be rebuilt."""
     if models.is_hex_digest(revision, 40):
         return [revision.lower()]
     commits = []
@@ -875,23 +895,25 @@ def _interruptible(call, *args, **kwargs):
 
 @contextmanager
 def _download_progress(repo_id, blobs, files, fetch):
-    """With json_progress, report the download in the block of files,
-    (bytes, blob ID) pairs in the blobs folder, of which it fetches those in
-    fetch, as JSON lines on stdout, and yield the tqdm class the block's
-    snapshot_download counts with (None without json_progress): done first
-    the bytes of the files the folder has whole, so that a download started
-    again goes on from what the one before finished, then, measured every
-    PROGRESS_INTERVAL, whenever it grew, those and the bytes received, and
-    done == total once the block succeeds. Received is what the network has
-    brought or what the folder holds of fetch, whichever is more, and at most
-    the total: under Xet a file is written in order from chunks that arrive
-    out of order and wait in memory, so the folder alone can stay at 0 for
-    minutes, then jump."""
-    if not (json_progress and fetch):
+    """Report the download in the block of files, (bytes, blob ID) pairs in
+    the blobs folder, of which it fetches those in fetch, in bytes: as JSON
+    lines on stdout with json_progress, else on the console
+    (_ConsoleProgress); and yield the tqdm class the block's
+    snapshot_download counts with, whose bars draw nothing: huggingface_hub's
+    own counts files, 0 of 2 for minutes. Done first the bytes of the files
+    the folder has whole, so that a download started again goes on from what
+    the one before finished, then, measured every PROGRESS_INTERVAL, whenever
+    it grew, those and the bytes received, and done == total once the block
+    succeeds. Received is what the network has brought or what the folder
+    holds of fetch, whichever is more, and at most the total: under Xet a
+    file is written in order from chunks that arrive out of order and wait in
+    memory, so the folder alone can stay at 0 for minutes, then jump."""
+    if not fetch:
         yield None
         return
     total = sum(size for size, _ in files)
     had = total - sum(size for size, _ in fetch)
+    report = _report_progress if json_progress else _ConsoleProgress()
     counted = _network_counter()
     stop = threading.Event()
 
@@ -905,17 +927,59 @@ def _download_progress(repo_id, blobs, files, fetch):
             # size goes uncounted once, so only growth is reported.
             if now > done:
                 done = now
-                _report_progress(repo_id, done, total)
+                report(repo_id, done, total)
 
-    _report_progress(repo_id, had, total)
+    report(repo_id, had, total)
     thread = threading.Thread(target=measure)
     thread.start()
+    succeeded = False
     try:
         yield counted
+        succeeded = True
     finally:
         stop.set()
         thread.join()
-    _report_progress(repo_id, total, total)
+        if not succeeded and isinstance(report, _ConsoleProgress):
+            report.close()
+    report(repo_id, total, total)
+
+
+class _ConsoleProgress:
+    """A download's bytes on stdout, beside its Fetching line: on a terminal
+    one line rewritten at each report, ended with the download, whether it
+    succeeds or not (close); in a log, as `splash serve` relays the
+    installer's output, a line at each tenth of the total and whenever
+    LOG_PROGRESS_SECONDS pass without one, so that a log of an 8 GB download
+    holds about a dozen lines, and one of 65 GB at 10 MB/s a line every 30 s
+    rather than every eleven minutes."""
+
+    def __init__(self):
+        self.terminal = sys.stdout.isatty()
+        self.tenths = -1
+        self.written = 0.0
+        self.open = False
+
+    def __call__(self, repo_id, done, total):
+        line = (
+            f"Downloading {repo_id}: {done / 1e9:.2f} of {total / 1e9:.2f} GB "
+            f"({100 * done // max(total, 1)}%)"
+        )
+        tenths = 10 * done // max(total, 1)
+        now = time.monotonic()
+        if self.terminal:
+            self.open = done != total
+            sys.stdout.write(f"\r{line}\033[K{'' if self.open else chr(10)}")
+        elif tenths > self.tenths or now - self.written >= LOG_PROGRESS_SECONDS:
+            self.tenths, self.written = tenths, now
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    def close(self):
+        """End the terminal's line a download that failed left open."""
+        if self.open:
+            self.open = False
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 
 # The progress bar snapshot_download counts the bytes from the network on, as
@@ -925,8 +989,7 @@ NETWORK_BAR = "huggingface_hub.snapshot_download.transfer"
 
 def _network_counter():
     """A tqdm class for snapshot_download that counts in `received` the bytes
-    its network bar is told have arrived; json_progress has its bars draw
-    nothing."""
+    its network bar is told have arrived, and draws none of its bars."""
     from huggingface_hub.utils import tqdm
 
     lock = threading.Lock()
@@ -936,6 +999,7 @@ def _network_counter():
 
         def __init__(self, *args, **kwargs):
             self.network = kwargs.get("name") == NETWORK_BAR
+            kwargs["disable"] = True
             super().__init__(*args, **kwargs)
 
         def update(self, n=1):

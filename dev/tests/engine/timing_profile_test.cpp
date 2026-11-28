@@ -321,9 +321,11 @@ void testTheHarnessClockRunsCommandsForTheirTime() {
 void testTheTierLandsTransfersAtItsRate() {
   test::EngineHarness harness({.tier = test::TierOptions{.bytesPerMillisecond = 0.5}});
   test::TestKvTier &tier = *harness.tier;
-  const auto slot = [&] { return tier.acquireSlot(kv::PageForm::Full, model::DiskBudget::Draw::Cache); };
-  const std::unique_ptr<engine::KvTransfer> write = tier.demote(3, slot(), engine::WriteClass::Reclaim, {});
-  const std::unique_ptr<engine::KvTransfer> read = tier.restore(slot(), 4, {});
+  const kv::Components base = tier.components();
+  const auto slot = [&] { return tier.acquireSlot(base, model::DiskBudget::Draw::Cache, nullptr); };
+  const std::unique_ptr<engine::KvTransfer> write =
+      tier.demote(std::array<uint32_t, 1>{3}, slot(), base, engine::WriteClass::Reclaim, {});
+  const std::unique_ptr<engine::KvTransfer> read = tier.restore(tier.adopt(), base, std::array<uint32_t, 1>{4}, {});
   require(tier.nextLanding() == 201.0, "the write is not due a slot's bytes at the rate after it started");
   harness.advanceTo(200.0);
   require(!write->ready(), "a write landed before it was due");
@@ -333,7 +335,8 @@ void testTheTierLandsTransfersAtItsRate() {
   harness.advanceTo(201.0);
   require(read->ready(), "a submitted restore that was due did not land");
   require(write->finish() && read->finish(), "a landed transfer failed");
-  const std::unique_ptr<engine::KvTransfer> next = tier.demote(5, slot(), engine::WriteClass::Reclaim, {});
+  const std::unique_ptr<engine::KvTransfer> next =
+      tier.demote(std::array<uint32_t, 1>{5}, slot(), base, engine::WriteClass::Reclaim, {});
   harness.runUntil([&] { return next->ready(); }, "the next write did not land");
   require(harness.now() == 401.0, "the clock moved to " + std::to_string(harness.now()) + ", not the landing");
 }

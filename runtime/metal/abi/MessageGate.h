@@ -16,16 +16,32 @@
 
 #define MESSAGE_GATE_THREADS 256u
 
-// The fused gates (ops::MessageGate, a decode step's rows): three kernels over
+// The fused gates (ops::MessageGate, a decode step's rows): two kernels over
 // up to MESSAGE_GATE_MAXIMUM_GATES gates of the same rows (a layer's q, k and
-// v inputs: grid z), the last two over groups of MESSAGE_GATE_GROUP_ROWS rows,
-// which read a gate's weights, F32 or BF16 rows as stored, once a group.
-// message_gate_normalize normalizes and concatenates each row of a gate once,
-// a threadgroup a row, into the bf16 rows that each of the down projection's
-// threadgroups of the row's group reads, where each had normalized its
-// group's rows itself: an eight-row decode step's gates took 2.13 ms where
-// they took 2.64 (Inkling-2-Mini on a 16-core M5 Pro, separate dispatches),
-// the step 0.47 ms less. message_gate_down writes MESSAGE_GATE_DOWN_OUTPUTS
+// v inputs: grid z), over groups of rows, which read a gate's weights, F32 or
+// BF16 rows as stored, once a group: a call's rows in one group, of the
+// least power of two that holds them, up to MESSAGE_GATE_GROUP_ROWS, more in
+// groups of that many (ops::MessageGate::groupRows). Each kernel computes
+// every row of its group, so a group past the call's rows computes rows it
+// stores nothing of (a step of 1 row took an 8-row group's time). A group
+// holds at most 4 rows: a call of 5 to 16 rows as groups of 4, two to four
+// times the threadgroups, each thread keeping half or a quarter of the sums,
+// took Inkling-2-Mini's whole decode step 1.3-2.4% less on a 32-core M5 Max,
+// 0.1-1.2% on a 12-core M6 and 0.4-1.8% on a 16-core M5 Pro than as one group
+// of 8 rows, or of 16 as two halves of 8 in one threadgroup, though it reads
+// each gate's weights once a group more (decode-profile A B B A at 5 to 8, 12
+// and 16 rows a lane, the same bits; the M5 Max's two to four lanes of 8 rows
+// 0.8-1.9% less). Groups of 2 rows took a step of 3 or 4 rows 1% less on the
+// M5 Max and no less on the others. Each row of x
+// and of the messages is normalized once, into the bf16 rows that each of the
+// down projection's threadgroups of the row's group reads, by the mix that
+// writes it, in the mix's dispatch (kernels/common/message_gate_normalize.h,
+// ops::BlockResidualMixInput::normalized), where each threadgroup had
+// normalized its group's rows itself: an eight-row decode step's gates took
+// 2.13 ms where they took 2.64 (Inkling-2-Mini on a 16-core M5 Pro, separate
+// dispatches, a kernel of a threadgroup a row normalizing them), the step
+// 0.47 ms less; in the mixes, 48 dispatches fewer a step. message_gate_down
+// writes MESSAGE_GATE_DOWN_OUTPUTS
 // of the group's rank values a threadgroup (32 threadgroups a gate for a rank
 // of 64; a simdgroup a value, 8 threadgroups, took 2.0 ms of a decode step's
 // 96 gates against 1.25 ms on an M5 Pro, F32 weights a gate a dispatch);
@@ -35,7 +51,7 @@
 // then writes the group's normalized rows (slices of 128 and 64 values, two
 // and four threads a value, ran no faster). A rank is at most
 // MESSAGE_GATE_MAXIMUM_RANK, a multiple of four.
-#define MESSAGE_GATE_GROUP_ROWS 8u
+#define MESSAGE_GATE_GROUP_ROWS 4u
 #define MESSAGE_GATE_DOWN_OUTPUTS 2u
 #define MESSAGE_GATE_MAXIMUM_RANK 64u
 #define MESSAGE_GATE_MAXIMUM_GATES 3u

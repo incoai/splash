@@ -44,7 +44,13 @@ tests take every family's shapes from that list
 (`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
 under `text_config`; Flint's is flat, its keys at the top level, which the check
 reads only for a model type whose configs are flat (a layout type's
-`flatConfig`). Flint loads from a GGUF or an MLX checkpoint, and its configuration is held to
+`flatConfig`). A `text_config` that names no model type is its checkpoint's
+text model, of the config's own model type with `_text` after it (as every
+family's checkpoints name theirs, `inkling2_loop_text` of `inkling2_loop`), and
+Inkling 2's `vision_config` without a model type or `text_hidden_size` its
+checkpoint's tower, projecting into its text model's width: so
+`ddalcu/Inkling-2-Mini-MLX-8bit`, whose sub-configs name neither, loads.
+Flint loads from a GGUF or an MLX checkpoint, and its configuration is held to
 Flint's values key by key (its widths, router, window, `layer_types`,
 `no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
 `rope_theta` and the rest where it states them).
@@ -78,8 +84,8 @@ splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
 splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
-A model ID with `--revision`, `--language-only` or `--draft-model` is a
-separate installation from the same ID without them. The app downloads and
+A model ID with `--revision`, `--language-only`, `--draft-model` or
+`--draft-revision` is a separate installation from the same ID without them. The app downloads and
 updates a model with Text only on as its `--language-only` installation, and
 lists the model installed so alone as it lists one installed without it;
 deleting it in the app removes every installation of the model.
@@ -93,13 +99,14 @@ of 32, 64 or 128, mxfp4 and mxfp8 (4 and 8 bits in groups of 32) and nvfp4 (4
 bits in groups of 16), mixed in any way across modules, and refuses any other
 format, naming the module. A projection, an expert or the head the checkpoint
 holds unquantized (an entry `false`, as mlx-lm writes for a module it leaves
-so), in BF16 or F16, loads as Q8_0, quantized from its values by the reference
-GGUF quantization of Q8_0 (`quantize_row_q8_0_ref`), as a GGUF's BF16
-hyper-connection projections do ([GGUF targets](#gguf-targets)): every decode
-cycle reads every projection, and Q8_0 holds a value in little more than half
-the bytes of a 16-bit float. Experts whose 16-bit values are exactly MXFP8's
-load as MXFP8 instead, as a GGUF's do. The router, the shared-expert gate, GDN alpha and
-beta and the token table load unquantized as stored. An affine weight is
+so), in BF16 or F16, loads as a GGUF's BF16 and F16 projections do ([16-bit
+weights](#16-bit-weights)): as stored by default, or with `--weights auto` as Q8_0; with `--weights original`
+as its 16-bit values as stored, in the 16-bit form of 64-element blocks where
+its rows are not whole 256-value blocks; rows that are not whole 64-value
+blocks are refused, naming the module and its width. Experts whose 16-bit
+values are exactly MXFP8's load as MXFP8 instead, losslessly, as a GGUF's do. The router, the shared-expert gate, GDN alpha and
+beta and the token table load unquantized as stored, an F32 router or message
+gate of BF16's values as BF16 ([GGUF targets](#gguf-targets)). An affine weight is
 `s * q + z` for its group's bf16 `.scales` and `.biases` and its code `q`,
 packed little-endian in `.weight`'s 32-bit words at every width; an mxfp4
 weight is an E2M1 code times
@@ -148,7 +155,8 @@ layer they quantize, by `quantized_layers` or else by `quant_algo` for every
 layer the `ignore` patterns leave, must hold NVFP4 in groups of 16 (`NVFP4`,
 `W4A16_NVFP4`) or FP8 with one scale per tensor (`FP8`); any other algorithm
 is refused before any weight download, naming the layer, and a projection or
-the head they leave unquantized loads as Q8_0, as an MLX target's does. An
+the head they leave unquantized loads as an MLX target's does ([16-bit
+weights](#16-bit-weights)). An
 NVFP4 weight is `g * e4m3 * e2m1`: its
 E2M1 code (two per byte of `.weight`, U8), its 16 elements' E4M3 scale
 (`.weight_scale`, F8_E4M3) and the tensor's FP32 `.weight_scale_2`; an FP8
@@ -176,7 +184,9 @@ group's weights must be NVFP4 (`nvfp4-pack-quantized`: float 4-bit by
 `channel` or `tensor`), symmetric and in their stored column order; anything
 else is refused before any weight download, naming the group. A projection no
 group quantizes, or one an `ignore` entry names, such as the BF16 head of
-RedHatAI's checkpoints, loads as Q8_0, as an MLX target's does. An NVFP4
+RedHatAI's checkpoints, loads as an MLX target's does ([16-bit
+weights](#16-bit-weights)). An
+NVFP4
 weight's codes are
 `.weight_packed`, its `g` the reciprocal of the F32 `.weight_global_scale`;
 an FP8 weight's F32 or BF16 `.weight_scale` is the tensor's `g` or, `[rows,
@@ -206,28 +216,22 @@ takes as two windows of each row pair (oMLX's `w13` and mlx-vlm's
 `gate_up_proj` keep them so). A conversion keeps those codes: nvfp4 experts with
 MLX's `global_scale` (the release's amax) or mlx-lm's `weight_scale_2` (its
 quotient), mxfp8 ones as they are ([MLX targets](#mlx-targets)). The release's
-attention projections and head are BF16 and load as Q8_0, as an MLX target's
-unquantized projections do, its token table as its bf16 rows, its routers as
-their BF16 rows. With those projections on bf16 activations, as
-`--activations bf16` runs them, its logits, teacher-forced over 1,933
-positions of five prompts, are within a mean KL of 0.0024 nats of those of its
-BF16 projections (UD-Q4_K_M's are as near), pick the same top-1 at 98.7% of
-positions, and keep each prompt's NLL of the greedy continuation within 0.004
-(0.1838 pooled, BF16's 0.1847). On M5 and later Macs, by default, a prefill
-chunk of more than 64 rows runs those Q8_0 projections on int8 activations,
-which adds its own error ([int8-activation
-prefill](internals.md#int8-activation-prefill)). A full layer's static
+attention projections and head are BF16 and load as an MLX target's
+unquantized projections do, as stored by default and as Q8_0 under `--weights auto` ([16-bit
+weights](#16-bit-weights)), its token table as its bf16 rows, its routers as
+their BF16 rows. A full layer's static
 convolution taps (`static_w`) and the relative bias
 (`rel_logits_proj.proj`) are stored transposed, the taps last first, and the
 release keeps its loop layers' message queries in two lists of every loop
 layer's (`middle_cycle_cross_pass_queries`, its q and FFN rows, and
 `_kv_queries`, its k and v rows), its block mix queries in lists of every
 layer's (`attn_res.attn_queries`, `mlp_queries`). A loop layer's message
-gates load as stored, F32 or BF16. The fused kernels take a call's gates (its
+gates load as stored, F32 or BF16, an F32 one of BF16's values as BF16
+([GGUF targets](#gguf-targets)). The fused kernels take a call's gates (its
 q, k and v gates, or its FFN gate) in one format, so a call that mixes the
 two has its BF16 rows widened to F32, exactly: mlx-vlm's conversions keep a
-gate's down projection BF16 and its forget and gain F32 (28 MB more for
-`mlx-community/Inkling-2-Mini-4bit`). A checkpoint's MTP head is not loaded;
+gate's down projection BF16 and its forget and gain F32, of the release's
+BF16 values, so all of them load as BF16. A checkpoint's MTP head is not loaded;
 its vision tower is ([Vision](#vision)). Where a checkpoint and a GGUF hold
 the same values, the images are the same bytes (`gguf-preparation`).
 
@@ -255,20 +259,24 @@ have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
-  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16; a tensor of a format of
-  256-value blocks (the K-quants, BF16, F16) whose rows are not whole blocks
-  of it is refused by name, but routed experts of BF16 or F16 values, which
-  load as MXFP8 or Q8_0 (below);
+  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16, which load as Q8_0 by
+  default ([16-bit weights](#16-bit-weights)); a tensor of a format of
+  256-value blocks (the K-quants) whose rows are not whole blocks of it is
+  refused by name; BF16 and F16 rows kept as stored that are not whole
+  256-value blocks load in the type's form of 64-element blocks (below), and
+  rows that are not whole 64-value blocks are refused by name and width;
 - token embeddings: any of the linears' formats;
 - norms: F32, BF16 or F16, loaded as the F32 values they hold;
 - the MoE router: F32, BF16 or any of the linears' quantized formats (not
-  F16), which the float projection runs as stored, a quantized one as its
-  native rows (as an MLX target's quantized router loads);
+  F16), which the float projection runs as stored (an F32 one of BF16's
+  values as BF16, below), a quantized one as its native rows (as an MLX
+  target's quantized router loads);
 - the shared-expert scalar gate: F32, BF16 or Q8_0, loaded as the F32 values
   it holds;
 - the projections a family runs in fp32 (Qwen3.8-Flash-Next's QSA indexer
   projections, Inkling 2's message gates and sink projections): F32 or BF16
-  as stored, or any of the linears' formats, loaded as the F32 values it
+  as stored (an F32 one of BF16's values as BF16, below), or any of the
+  linears' formats, loaded as the F32 values it
   holds (AtomicChat's Q8_0 and Q4_K/Q5_0 gates, the sink projections of
   lmstudio-community's and ggml-org's files in their queries' format); a
   call of Inkling 2's message gates that mixes BF16 with another format, as
@@ -278,7 +286,8 @@ have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
 - the GDN convolution, decay and time-step bias: F32;
 - GDN alpha and beta: each any of the linears' formats or F32. Two of one
   quantized type other than BF16 and F16 load as one segment of the GDN input
-  projection in that format; any other pair loads as one F32 tensor of the
+  projection in that format; a pair of BF16 or of F32 of BF16's values as one
+  BF16 tensor (below); any other pair as one F32 tensor of the
   values each holds, every type but F32 decoded on the GPU by its format's
   gather (`gguf_embed_f32_<format>`), GGML's own F32 values. A BF16 or F16
   pair stays such a float segment: it reads the input unrotated, as Prism's
@@ -363,8 +372,10 @@ BF16 and F16 are formats of the image like the quantized ones, for the tensors
 a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention
 projections and LM head and some of the 35B-A3B's projections and experts in
 BF16, and other publishers keep alpha and beta, GDN projections, experts or
-the token table in F16. Their planes hold the values as stored, with an FP32
-scale of 1 per 256 values; the staged tiles round each value once to half, the
+the token table in F16. A projection, routed expert or head of them loads as
+Q8_0 under `--weights auto`, and with `--weights original`, the default, its planes hold the values as
+stored, with an FP32 scale of 1 per 256 values ([16-bit
+weights](#16-bit-weights)); the staged tiles round each value once to half, the
 Apple9 register tile reads BF16 exactly and takes no F16, so a projection with
 an F16 weight stages there. Whole-BF16 and F16 models are not a target: before
 any weight download, and before the engine's model check, the installer
@@ -377,22 +388,51 @@ quantized. The native loader does not check this.
 Routed experts of BF16 or F16 values load as MXFP8 where every 32 of their
 values are exactly an MXFP8 block's (an E8M0 power of two times E4M3 values),
 as a release's MXFP8 experts widened hold them: Inkling 2's last four layers'
-experts in Unsloth's UD-Q8_K_XL, BF16 of the release's MXFP8, whose down
-projections of 1152 inputs BF16's blocks of 256 cannot hold. Lossless, at half
-the bytes; each block takes the smallest exponent that holds its largest
+experts in Unsloth's UD-Q8_K_XL, BF16 of the release's MXFP8. Lossless, at
+half the bytes; each block takes the smallest exponent that holds its largest
 magnitude, 2^-127 at least (`gguf::mxfp8Block`). Whether a tensor's values are
 MXFP8's needs them, which a start reads once before it sizes and plans the
 target (`exactlyMxfp8`, every value of each 16-bit expert tensor, on a thread
 per core). On an M5 Pro (48 GB), UD-Q8_K_XL's 8.15 GB of them took 1.05 s
 beside the weights' 3.88 s load from a fresh copy of the file, which no cache
 held, and 0.43 s beside 1.93 s from the page cache. Experts of other values
-load as stored where their rows are whole 256-value blocks, else as the Q8_0
-the reference quantization makes of them, as Flash-Next's hyper-connection
-projections do. The engine's model check, of headers alone, plans those
-fallbacks. A Mac that streams the routed experts ([Streamed
+load as every 16-bit projection does ([16-bit weights](#16-bit-weights)): as
+Q8_0, or with `--weights original` as stored, where rows that are not whole
+256-value blocks take BF16's or F16's form of 64-element blocks (`bf1664`,
+`f1664`, whose scale `g`, always 1, spans 64 values where it spans 256); rows
+that are not whole 64-value blocks are refused, naming the tensor and its
+width. The engine's model check, of headers alone, plans them so. A Mac that streams the routed experts ([Streamed
 experts](server.md#streamed-experts)) reads such an expert's 16-bit values at
 every load and builds its MXFP8 blocks again: twice the SSD bytes of the MXFP8
 it holds.
+
+An F32 tensor a float kernel reads (the MoE router, a float projection such as
+Inkling 2's message gates and sink projections, GDN alpha and beta) loads as
+BF16 rows where every value is a BF16 value (its low 16 bits zero), as a
+BF16 release's tensors that a conversion writes as F32 hold them: lossless, at
+half the bytes (`Conversion::NarrowToBfloat16`). Decode gives the same outputs
+bit for bit, as the float projection and the message gates widen BF16 rows to
+the fp32 values F32 rows hold. A prefill chunk's tile follows its rows'
+format (`selectFloatTile`: the accelerator tile from 3 half-tiles a core for
+BF16 rows, 4 for F32), so a chunk of a size between the two thresholds takes
+the faster tile, within the noise floor: Inkling-2-Mini's Unsloth GGUFs at
+449 to 576 rows on 20 cores, Qwen3.6-35B-A3B at 193 to 256. The rule that plans the projections' 16-bit
+planes plans it (`gguf::weightForm`), and as it loses nothing it holds under
+both `--weights auto` and `--weights original` ([16-bit
+weights](#16-bit-weights)), as MXFP8's does; a float kernel's BF16 tensor
+loads as stored under either. A start reads such a tensor's values once to
+tell, as it reads experts' for MXFP8 (`exactlyBfloat16`). Unsloth's
+Inkling-2-Mini GGUFs (UD-IQ3_XXS, UD-Q2_K_XL, UD-Q4_K_M) keep its message
+gates (113 MB) and routers (28 MB) F32 of the release's BF16 values, UD-Q8_K_XL
+its routers alone, and Qwen3.6-35B-A3B's UD-Q2_K_XL and UD-Q4_K_M its routers
+(84 MB) and GDN alpha and beta (16 MB); mlx-community's and ddalcu's MLX
+conversions of Inkling-2-Mini keep its routers and the gates' forget and gain
+so; the release keeps them BF16. On a 24 GB M6 (UD-IQ3_XXS) the gates and
+routers then took 1.66 ms of a one-row decode cycle where they took 2.45, and
+the cycle 29.28 ms where it took 30.13; on a 32-core M5 Max (UD-Q4_K_M) the
+cycle took 17.91 ms where it took 18.11; both with the same tokens
+(`decode-profile`). The engine's model check, of headers alone, plans them
+F32.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
 Qwen3.6-35B-A3B from UD-IQ1_S to UD-Q8_K_XL. llama-quantize's default type
@@ -400,12 +440,11 @@ selection stores alpha and beta in the file type's format (Q4_K in a Q4_K_M),
 as in lmstudio-community's files, so those load too. A format's image takes
 the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta
 units (1/16 bit more), IQ3_S's chunk words (4.06 bits for its 3.44) and BF16's
-and F16's scales (1/8 bit more). Qwen3.8-Flash-Next's hyper-connection
-projections are the exception to loading a GGUF's formats as stored: those of
-BF16 or F16 (as some GGUFs keep them) load as Q8_0, the type other GGUFs store
-them in, quantized from their values by the reference GGUF quantization of Q8_0:
-every decode cycle reads all of them, and Q8_0 holds a value in little more
-than half the bytes. The gates they make move by less than one bf16 step.
+and F16's scales (1/8 bit more, 1/2 in their 64-element form).
+Qwen3.8-Flash-Next's hyper-connection projections of BF16 or F16, as some
+GGUFs keep them (`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`'s), load as
+every 16-bit projection does, with `--weights original` the up projections'
+320 inputs in the 64-element form.
 
 A MoE layer may hold its routed experts' gate and up weights in llama.cpp's
 fused `ffn_gate_up_exps` (`create_tensor_gate_up_exps`, as byteshape's files
@@ -458,6 +497,88 @@ Q2_0 is GGUF tensor type 42, `block_q2_0`, as in the GSQ-RCO GGUFs:
 2-bit codes q worth d (q - 1) with one half d per 64 weights. Its planes are
 PQ2_0's ([PQ2_0](#pq2_0)), with a meta unit per 64 weights.
 
+## 16-bit weights
+
+Every matrix of BF16 or F16 values the projection kernels read, from a GGUF
+or a safetensors checkpoint alike, loads by one rule (`gguf::weightForm`):
+the attention, GDN, MLP and shared-expert projections, routed experts,
+Qwen3.8-Flash-Next's hyper-connection and PLE projections and the output
+head. Under `--weights original`, the default, each loads as its file stores it (below). Under `--weights auto` each loads as Q8_0, the block_q8_0
+rows the reference GGUF quantization (`quantize_row_q8_0_ref`) makes of its
+values: every decode cycle reads a projection whole, and Q8_0 holds a value in
+1.06 bytes where a 16-bit plane takes 2.02. A value or a block scale Q8_0
+cannot hold (an infinity, a NaN or past 65504 x 127) is refused by the
+tensor's name. 1.7.3 loaded a checkpoint's 16-bit projections, routed experts
+and head (MLX's, Model Optimizer's, compressed-tensors', Inkling 2's release's)
+and a GGUF's 16-bit hyper-connection projections, and routed experts whose rows
+are not whole 256-value blocks, as this Q8_0 too, but kept a GGUF's other 16-bit
+projections, routed experts and head as stored: under the default these load
+as Q8_0 now, as Unsloth's UD-Q8_K_XL attention projections and heads
+(Inkling-2-Mini's, Qwen3.8-27B's) and the BF16 PLE projections some
+Qwen3.8-Flash-Next GGUFs keep (ISTA's Q2_0 `ple_value`) do. The other quants
+cached here keep no 16-bit projection (Unsloth's UD-Q4_K_M, UD-Q2_K_XL and
+UD-IQ3_XXS of Inkling-2-Mini, Qwen3.6-35B-A3B and Qwen3.8-27B; the Inkling
+ones hold BF16 tap and sink projections only, which load as stored) and load
+the same under both modes. Under `--weights original` each loads as its
+file stores it, in BF16's or F16's planes, or, for rows that are not whole
+256-value blocks, in the type's form of 64-element blocks. Under either, routed
+experts whose values are exactly MXFP8's load as MXFP8, lossless at half the
+bytes ([GGUF targets](#gguf-targets)), a stack of them or each expert's
+module of its own alike, and every other tensor loads as it always does:
+norms, Flint's sinks, the token and PLE tables and GDN alpha and beta keep
+their stored values (widened to F32 where the kernels read F32). The tensors
+the float kernels read stay as stored under either mode too: routers, the
+shared-expert gate, Inkling 2's message gates and sink and tap projections,
+and Qwen3.8-Flash-Next's QSA indexer projections; under either, an F32
+router, message gate, sink, tap or indexer projection, or GDN alpha and beta,
+whose every value is a BF16 value loads as BF16, the same values in half the
+bytes ([GGUF targets](#gguf-targets)). Routers and the indexer
+pick experts or positions, where an error flips a choice rather than nudging
+a value, and the gates and small projections are a sliver of the bytes
+(Inkling-2-Mini's: 30 million values beside the 1.1 billion of its 16-bit
+projections and head). A
+quantized weight loads as its file stores it under either; a model without
+16-bit projections loads the same images under both,
+and the start's `Runtime precision` line names the mode
+([Server options](server.md#server-options)). The draft's BF16 projections load as
+MLX's 4-bit affine quantization makes them whatever the mode
+([Drafts](#drafts)). `--weights` covers the language model: the vision
+tower loads as its source stores it in both modes, a 16-bit or F32 tower as
+exact BF16 and a Q8_0 projector's projections as Q8_0
+([Vision](#vision)), where 1.7.3 rounded a Q8_0 projector to BF16. Each
+image's record names the format every tensor loads in, so the two modes of a
+model with 16-bit projections never share a
+[persistent cache](server.md#persistent-cache).
+
+What the mode costs, on Inkling-2-Mini's release
+(thinkingmachines/Inkling-2-Mini, BF16 attention projections and head) on a
+16-core M5 Pro, 48 GB: teacher-forced over 1,933 positions of five prompts on
+bf16 activations, `--weights auto`'s logits are a mean KL of 0.0025 nats from
+`--weights original`'s, the top-1 changes at 0.8% of positions, and the negative log
+likelihood of the true tokens is 0.1835 against 0.1851 (under `--activations
+auto`, its default until 1.7.4, which rounds Q8_0 projections' prefill rows to int8 on this Mac:
+KL 0.0025, top-1 changed at 1.2%, 0.1833 against 0.1852). Unsloth's
+UD-Q8_K_XL of it gives the release's figures in either mode, to the last digit
+printed: its BF16 attention projections and head, which 1.7.3 kept as stored,
+hold the release's values. Under `--weights auto` the release's 33 weight images are
+1.7.3's byte for byte, and the speed gate against 1.7.3 (`backend_regression`,
+three samples in ABBA order) finds the same outputs and decode within 0.3% at
+one to four lanes. As previously measured, the BF16 values take
+0.98 GiB more weights and the bytes of reading them: after a 2,583-token
+prompt a one-lane decode cycle took 52.6 ms where Q8_0's took 45.1, a
+four-lane one 97.2 against 90.7, the prompt's prefill 1.79 s against 1.73,
+and under `--max-memory 26G` the memory plan held a context of 306,193 tokens
+where Q8_0's held 367,633. On ISTA's Qwen3.8-Flash-Next Q2_0 (an M6, its
+experts and PLE table streamed), teacher-forced over 1,973 positions of the
+same five texts on bf16 activations, `--weights auto`'s logits are a mean KL of 0.0026
+nats from `--weights original`'s, the top-1 changes at 1.6% of positions, and the
+negative log likelihood of the true tokens is 0.5375 against 0.5378. The
+hyper-connection projections alone as Q8_0, 1.7.3's loading of this file,
+change the top-1 at 31 positions too, at a KL of 0.0026 (negative log likelihood 0.5369),
+and its `ple_value` alone at 31, at a KL of 0.0016 (0.5346): near-ties of a
+2-bit model, which any small change of its weights moves, while two runs of
+one mode give the same logits bit for bit.
+
 ## PQ2_0
 
 PQ2_0 is Prism ML's type 142, `block_pq2_0` of PrismML-Eng/llama.cpp, which
@@ -488,7 +609,8 @@ of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
 release ships its mask token's embedding. Installation downloads only those files and follows the repository's default
-branch as it follows the target's ([Revisions](server.md#revisions)); `--draft-model`
+branch as it follows the target's ([Revisions](server.md#revisions)), or the
+branch, tag or commit `--draft-revision` names, which a commit pins; `--draft-model`
 accepts another repository, followed the same way, or a local directory that
 holds them. A checkpoint is installed only when the engine accepts its
 configuration with the target's (its `model-check`), so a draft of another
@@ -501,7 +623,8 @@ target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
 its reserved special tokens, 150019 to 150143, as its
 `dflash_config.mask_token_id`, which the target's layout then holds,
 `QwenTargetDimensions::firstDraftMaskToken`), and its attention (32 query and
-8 KV heads of 128), selector (rank 256, 16 candidates) and 2048-token window are
+8 KV heads of 128), selector (rank 256, 16 candidates) and 2048-token window
+in every layer (its `layer_types` all `sliding_attention`) are
 those the kernels are built for, and its block at least their 8 rows, of which a
 cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
 `readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
@@ -622,7 +745,11 @@ verify and why, and `/status` reports it as `verify_rows`. The selector grows
 each lane's verify rows into a tree over its candidates (`draft_select_tree`):
 from the anchor, best first by the estimate that the target accepts a row's
 path, the product of its steps' estimates, each row taking its most likely
-candidates at the next position as children, and a lane whose thinking end starts at
+candidates at the next position as children, but none under a row of one of
+its target's stop tokens, after which acceptance retains nothing; a greedy
+lane takes no row of a stop token at all, since its parent's argmax selects
+the stop with or without the row, while a sampled lane keeps the stop rows its
+draft drew, which its parent's rejection sampling tests. A lane whose thinking end starts at
 its anchor takes the end as a chain of its own, whose rows the target selects
 whatever its logits. A lane not thinking under a budget also proposes a
 prompt-lookup chain beside them:
@@ -793,10 +920,17 @@ publishes as BF16, F16 and F32 and ggml-org as BF16 and Q8_0; the installer
 prefers BF16, then F32 and F16, and takes Q8_0 last. A checkpoint's patch
 embedding orders a patch's values by row, column and channel, which
 preparation reorders to the image's channels first, so each source writes the
-same image, byte for byte, from the same BF16 values. A Q8_0 matrix is the one
-tensor preparation rounds: each value, its block's F16 scale times its int8
-quant, becomes the nearest BF16, ties to even, the precision the tower's
-kernels read every weight in (`model/InklingVision.hpp` lays out its image).
+same image, byte for byte, from the same BF16 values. A Q8_0 projector keeps
+its projections in Q8_0: each block's int8 quants and F16 scale, byte for
+byte, as the planes a GGUF target's Q8_0 tensor has (329 MiB against the BF16
+image's 610), which the GGUF bf16 prefill tile multiplies on bf16 inputs
+whatever `--activations` says: rounded to int8 as a target's Q8_0 prefill
+rounds them, an image's embeddings moved 4-12% from the BF16 tower's, against
+1-2% for the Q8_0 values themselves. On a 16-core M5 Pro the tile encodes a
+Q8_0 tower as fast as the dense bf16 tile encodes a BF16 one (156 against
+160 ms at 3,072 patches). A Q8_0 tensor that is not a projection's matrix, or
+one of q, k and v beside another type, is refused, naming it
+(`model/InklingVision.hpp` lays out its image).
 Its processor is transformers' `Inkling2ImageProcessor`, whose one
 configuration is its class's defaults (a token of 40 x 40 pixels, mean and
 deviation 0.5): an MLX conversion, which saves none, is installed with them.
@@ -1123,8 +1257,8 @@ implicitly.
 `--mmproj` supplies a local BF16, F32 or F16 GGUF vision projector (or Q8_0,
 for Inkling 2). Without
 one, a GGUF serves text only. An MLX target uses its own vision tower unless
-`--language-only` is set. `--revision` cannot be combined with `--model-dir`,
-and `--mmproj` requires `--model-dir` and cannot be combined with
+`--language-only` is set. `--revision` and `--draft-revision` cannot be
+combined with `--model-dir`, and `--mmproj` requires `--model-dir` and cannot be combined with
 `--language-only`. Files are linked, and each start prepares them again under
 the same validation, publication and lifetime rules described below.
 
@@ -1153,8 +1287,9 @@ PYTHONPATH="$ROOT" "$ROOT/python/bin/python3" -P -m server.server "$MODEL" \
 `--model` is the ID the API reports, in `OWNER/REPO` form, and `--binary` the
 engine of the same checkout or release (`build/splash` in a checkout). The
 server takes the [server options](server.md#server-options) of `splash serve`; the
-model's source options (`--revision`, `--draft-model`, `--language-only`,
-`--offline`) are `prepare_local_model`'s arguments instead, or have no use.
+model's source options (`--revision`, `--draft-model`, `--draft-revision`,
+`--language-only`, `--offline`) are `prepare_local_model`'s arguments instead,
+or have no use.
 
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else

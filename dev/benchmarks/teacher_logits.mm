@@ -3,8 +3,8 @@
 //
 //   teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS [--window END:ROWS...]
 //                  [--kv-format int8|bf16] [--state-format fp32|bf16] [--activations auto|bf16]
-//                  [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes] [--draft yes]
-//                  [--captured-rows FILE]
+//                  [--weights original|auto] [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]
+//                  [--draft yes] [--captured-rows FILE]
 //
 // TOKENS holds little-endian uint32 token ids, read as they are: no BOS, no
 // chat template. For each window a cold request prefills ids [0, END - ROWS)
@@ -179,8 +179,8 @@ void writeDraftLattice(const model::Runtime &executor, const std::string &path, 
 
 // One window on state lane 0, which the request leaves free.
 void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Window window, uint64_t id,
-               std::span<const uint32_t> pages, uint32_t vocabulary, const std::string &output, uint32_t captureWidth,
-               bool draft) {
+               std::span<const uint32_t> pages, std::span<const std::vector<uint32_t>> windowTables,
+               uint32_t vocabulary, const std::string &output, uint32_t captureWidth, bool draft) {
   const uint32_t start = window.end - window.rows;
   const std::span<const uint32_t> prompt = tokens.first(start);
   const std::span<const uint32_t> forced = tokens.subspan(start, window.rows + 1);
@@ -204,6 +204,7 @@ void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Windo
     const uint32_t count = std::min(chunk, start - offset);
     BatchPlan plan{.kind = WorkKind::Prefill, .items = {{id, count, offset}}, .decodeStage = DecodeStage::Regular};
     ModelBatchItem item{id, offset, count, pages, 1};
+    item.windowTables = windowTables;
     item.inputTokens = prompt.subspan(offset, count);
     const std::vector<ModelStepResult> results = executor.prefill(plan, std::span(&item, 1));
     require(results.size() == 1 && results[0].failure.empty() && results[0].consumedPromptTokens == count,
@@ -229,7 +230,8 @@ void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Windo
   uint32_t position = start;
   for (uint32_t cycle = 0; cycle < window.rows / kRows; ++cycle) {
     BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}}, .decodeStage = DecodeStage::Regular};
-    const ModelBatchItem item{id, position, 0, pages, 1};
+    ModelBatchItem item{id, position, 0, pages, 1};
+    item.windowTables = windowTables;
     const std::vector<ModelStepResult> results = executor.decode(plan, std::span(&item, 1));
     require(results.size() == 1 && results[0].failure.empty(),
             "decode failed: " + (results.empty() ? std::string("no result") : results[0].failure));
@@ -267,14 +269,15 @@ int main(int argc, char **argv) {
       if (argc < 5) {
         std::cerr << "usage: teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS "
                      "[--window END:ROWS...] [--kv-format int8|bf16] [--state-format fp32|bf16] "
-                     "[--activations auto|bf16] [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes] "
+                     "[--activations auto|bf16] [--weights original|auto] [--expert-memory SIZE] [--ple-memory SIZE] "
+                     "[--captures yes] "
                      "[--draft yes] [--captured-rows FILE]\n";
         return 2;
       }
       std::vector<Window> windows;
       bool captures = false, draft = false;
       std::string capturedRows;
-      ops::Int8Activations int8Activations = ops::Int8Activations::On;
+      std::optional<ops::Int8Activations> int8Activations;
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       model::ModelLoadOptions loadOptions;
@@ -320,18 +323,20 @@ int main(int argc, char **argv) {
       const std::filesystem::path root(argv[2]);
       // Streamed weights read on a pool of SSD readers, as the engine's do.
       loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
-      model::LoadedModel model = model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
-      ops::ExecutionPlans operators(backend.capabilities(), int8Activations);
+      const model::ModelDescriptor descriptor = model::inspectModelRoot(root);
+      model::LoadedModel model = model::loadModel(backend, root, descriptor, loadOptions);
+      ops::ExecutionPlans operators(backend.capabilities(), int8Activations.value_or(descriptor.activations()));
       const uint32_t vocabulary =
           std::visit([](const auto &layout) { return layout.vocabularySize; }, model.descriptor.target);
       for (const uint32_t token : tokens)
         require(token < vocabulary, "TOKENS holds an id outside the vocabulary");
 
-      // The longest window's rows and its last cycle's, in whole extents.
+      // The longest window's rows and its last cycle's, every page of their
+      // blocks (kv::Layout::blockPages), in whole extents.
       const kv::Layout kvLayout = model.targetKvLayout(format);
       const uint32_t extentPages = kvLayout.maximumExtentPages();
       const uint32_t lanePages = (lastEnd + kRows + kv::kPageTokens - 1) / kv::kPageTokens;
-      const uint32_t pageCount = (lanePages + extentPages - 1) / extentPages * extentPages;
+      const uint32_t pageCount = (lanePages * kvLayout.blockPages() + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory,
                               0);
       // Every allocation through the governor is for a claim: the run's are
@@ -347,9 +352,15 @@ int main(int argc, char **argv) {
       context.verifyRows = model::VerifyRows::All;
       model::Runtime executor(context);
 
+      // Block b's base page is page b, and its window unit's j-th page
+      // b + (j + 1) x lanePages.
       std::vector<uint32_t> pageTable(lanePages);
       for (uint32_t page = 0; page < lanePages; ++page)
         pageTable[page] = page;
+      std::vector<std::vector<uint32_t>> windowTables(kvLayout.blockPages() - 1);
+      for (uint32_t table = 0; table < windowTables.size(); ++table)
+        for (uint32_t page = 0; page < lanePages; ++page)
+          windowTables[table].push_back(page + (table + 1) * lanePages);
       std::printf("device %s, %s KV, %s state, %zu ids\n", backend.capabilities().deviceName.c_str(),
                   format == kv::Format::Int8 ? "int8" : "bf16", std::string(ops::formatName(stateFormat)).c_str(),
                   tokens.size());
@@ -374,7 +385,7 @@ int main(int argc, char **argv) {
       }
       model::RuntimeInstrumentation::replaceCapturedRows(executor, replacedRows);
       for (size_t index = 0; index < windows.size(); ++index)
-        runWindow(executor, tokens, windows[index], index + 1, pageTable, vocabulary, argv[4],
+        runWindow(executor, tokens, windows[index], index + 1, pageTable, windowTables, vocabulary, argv[4],
                   captures ? rowWidth : 0, draft);
       return 0;
     } catch (const std::exception &error) {

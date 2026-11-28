@@ -31,7 +31,7 @@ struct Planned {
 std::vector<Planned> sections(const ops::VisionLayout &l) {
   std::vector<Planned> result;
   const auto add = [&](std::vector<std::string> tensors, std::string label, uint32_t rows, uint32_t columns = 1,
-                       uint32_t storedColumns = 0) {
+                       uint32_t storedColumns = 0, bool projection = false) {
     const bool stacked = tensors.size() > 1;
     result.push_back({{.mlx = {},
                        .gguf = std::move(label),
@@ -39,8 +39,14 @@ std::vector<Planned> sections(const ops::VisionLayout &l) {
                        .columns = columns,
                        .storedRows = rows,
                        .storedColumns = storedColumns ? storedColumns : columns,
-                       .stacked = stacked},
+                       .stacked = stacked,
+                       .projection = projection},
                       std::move(tensors)});
+  };
+  // A block's or the merger's projection, which may be stored as Q8_0
+  // planes (vision::placeQ8Matrices).
+  const auto projection = [&](std::vector<std::string> tensors, std::string label, uint32_t rows, uint32_t columns) {
+    add(std::move(tensors), std::move(label), rows, columns, 0, true);
   };
   const auto norm = [&](const std::string &name) {
     add({name + ".weight"}, name + ".weight", l.hiddenSize);
@@ -54,29 +60,24 @@ std::vector<Planned> sections(const ops::VisionLayout &l) {
   for (uint32_t i = 0; i < l.depth; ++i) {
     const std::string block = "v.blk." + std::to_string(i) + ".";
     norm(block + "ln1");
-    add({block + "attn_q.weight", block + "attn_k.weight", block + "attn_v.weight"}, block + "attn_qkv.weight",
-        3 * l.hiddenSize, l.hiddenSize);
+    projection({block + "attn_q.weight", block + "attn_k.weight", block + "attn_v.weight"},
+               block + "attn_qkv.weight", 3 * l.hiddenSize, l.hiddenSize);
     add({block + "attn_q.bias", block + "attn_k.bias", block + "attn_v.bias"}, block + "attn_qkv.bias",
         3 * l.hiddenSize);
-    add({block + "attn_out.weight"}, block + "attn_out.weight", l.hiddenSize, l.hiddenSize);
+    projection({block + "attn_out.weight"}, block + "attn_out.weight", l.hiddenSize, l.hiddenSize);
     add({block + "attn_out.bias"}, block + "attn_out.bias", l.hiddenSize);
     add({block + "ls1.weight"}, block + "ls1.weight", l.hiddenSize);
     norm(block + "ln2");
-    add({block + "ffn_up.weight"}, block + "ffn_up.weight", l.intermediateSize, l.hiddenSize);
+    projection({block + "ffn_up.weight"}, block + "ffn_up.weight", l.intermediateSize, l.hiddenSize);
     add({block + "ffn_up.bias"}, block + "ffn_up.bias", l.intermediateSize);
-    add({block + "ffn_down.weight"}, block + "ffn_down.weight", l.hiddenSize, l.intermediateSize);
+    projection({block + "ffn_down.weight"}, block + "ffn_down.weight", l.hiddenSize, l.intermediateSize);
     add({block + "ffn_down.bias"}, block + "ffn_down.bias", l.hiddenSize);
     add({block + "ls2.weight"}, block + "ls2.weight", l.hiddenSize);
   }
-  add({"mm.1.weight"}, "mm.1.weight", l.mergedHiddenSize, l.mergedHiddenSize);
+  projection({"mm.1.weight"}, "mm.1.weight", l.mergedHiddenSize, l.mergedHiddenSize);
   add({}, "mm.1.bias", l.mergedHiddenSize);
-  add({"mm.2.weight"}, "mm.2.weight", l.outputHiddenSize, l.mergedHiddenSize);
+  projection({"mm.2.weight"}, "mm.2.weight", l.outputHiddenSize, l.mergedHiddenSize);
   add({}, "mm.2.bias", l.outputHiddenSize);
-  uint64_t at = kWeightFileAlignment;
-  for (auto &[s, tensors] : result) {
-    s.offset = at;
-    at = alignWeightOffset(at + uint64_t(s.storedRows) * s.storedColumns * kBFloat16Bytes);
-  }
   return result;
 }
 
@@ -198,11 +199,8 @@ std::vector<uint64_t> checkpointShape(const Section &s, uint32_t parts) {
 
 Plan inklingVisionPlan(const ops::VisionLayout &layout) {
   Plan result{layout.depth, layout.patchSize, 0, {}};
-  for (auto &[section, tensors] : sections(layout)) {
-    result.bytes = alignWeightOffset(section.offset + uint64_t(section.storedRows) * section.storedColumns *
-                                                          kBFloat16Bytes);
-    result.sections.push_back(std::move(section));
-  }
+  for (auto &[section, tensors] : sections(layout)) result.sections.push_back(std::move(section));
+  vision::placeSections(result);
   return result;
 }
 
@@ -239,6 +237,7 @@ void bindInklingMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Pl
   if (!unused.empty())
     throw WeightStoreError("mmproj tensors the vision tower does not use: " + unused + " (" +
                            gguf.source().path().string() + ")");
+  vision::placeQ8Matrices(plan);
 }
 
 void bindInklingCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLayout &layout, Plan &plan) {
@@ -278,13 +277,28 @@ void bindInklingCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::V
   if (!unused.empty()) throw WeightStoreError("checkpoint tensors the vision tower does not use: " + unused);
 }
 
-ops::VisionWeights readInklingVision(WeightFile &file, const ops::VisionLayout &layout) {
+ops::VisionWeights readInklingVision(WeightFile &file, const ops::VisionLayout &layout, const Plan &plan) {
   const auto bytes = [](uint64_t rows, uint64_t columns) {
     return checkedMultiply<WeightStoreError>(checkedMultiply<WeightStoreError>(rows, columns, "vision weight elements"),
                                              kBFloat16Bytes, "vision weight bytes");
   };
-  const auto affine = [&](uint64_t output, uint64_t input, std::string_view label) -> ops::DenseWeights {
-    return {file.section(bytes(output, input), label), file.section(bytes(output, 1), label)};
+  // The plan's projections stored as Q8_0 planes, by their section's name.
+  std::set<std::string, std::less<>> q8;
+  for (const Section &s : plan.sections)
+    if (s.q8Planes) q8.insert(s.gguf);
+  const auto affine = [&](uint32_t output, uint32_t input, std::string_view label,
+                          std::string_view section = {}) -> ops::DenseWeights {
+    ops::DenseWeights weights;
+    if (q8.contains(section)) {
+      weights.quantized = readQuantizedSegment(file, label);
+      if (weights.quantized.formatId != GGUF_FMT_Q80 || weights.quantized.outputSize != output ||
+          weights.quantized.inputSize != input)
+        throw WeightStoreError("vision Q8_0 matrix does not match the layout: " + std::string(label));
+    } else {
+      weights.weight = file.section(bytes(output, input), label);
+    }
+    weights.bias = file.section(bytes(output, 1), label);
+    return weights;
   };
   const auto norm = [&](std::string_view label) -> ops::LayerNormWeights {
     return {file.section(bytes(layout.hiddenSize, 1), label), file.section(bytes(layout.hiddenSize, 1), label)};
@@ -299,20 +313,22 @@ ops::VisionWeights readInklingVision(WeightFile &file, const ops::VisionLayout &
   result.inputNorm = norm("input-norm");
   result.blocks.reserve(layout.depth);
   for (uint32_t index = 0; index < layout.depth; ++index) {
+    const std::string name = "v.blk." + std::to_string(index) + ".";
     ops::VisionBlock block;
     block.norm1 = norm("norm1");
-    block.qkv = affine(3 * layout.hiddenSize, layout.hiddenSize, "qkv");
+    block.qkv = affine(3 * layout.hiddenSize, layout.hiddenSize, "qkv", name + "attn_qkv.weight");
     // Each output projection's LayerScale follows its bias.
-    block.projection = affine(layout.hiddenSize, layout.hiddenSize, "proj");
+    block.projection = affine(layout.hiddenSize, layout.hiddenSize, "proj", name + "attn_out.weight");
     block.projection.scale = file.section(bytes(layout.hiddenSize, 1), "ls1");
     block.norm2 = norm("norm2");
-    block.upProjection = affine(layout.intermediateSize, layout.hiddenSize, "fc1");
-    block.downProjection = affine(layout.hiddenSize, layout.intermediateSize, "fc2");
+    block.upProjection = affine(layout.intermediateSize, layout.hiddenSize, "fc1", name + "ffn_up.weight");
+    block.downProjection = affine(layout.hiddenSize, layout.intermediateSize, "fc2", name + "ffn_down.weight");
     block.downProjection.scale = file.section(bytes(layout.hiddenSize, 1), "ls2");
     result.blocks.push_back(std::move(block));
   }
-  result.mergerUpProjection = affine(layout.mergedHiddenSize, layout.mergedHiddenSize, "merger-fc1");
-  result.mergerDownProjection = affine(layout.outputHiddenSize, layout.mergedHiddenSize, "merger-fc2");
+  result.mergerUpProjection = affine(layout.mergedHiddenSize, layout.mergedHiddenSize, "merger-fc1", "mm.1.weight");
+  result.mergerDownProjection =
+      affine(layout.outputHiddenSize, layout.mergedHiddenSize, "merger-fc2", "mm.2.weight");
   return result;
 }
 

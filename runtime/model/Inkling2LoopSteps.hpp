@@ -29,11 +29,14 @@ namespace splash::model {
 // keyValueProjection), and a full layer's dynamic taps of each (KV heads x
 // taps a row); a prompt chunk's relative states and row
 // sinks the attention's projection stages for its split (fp32, in the
-// queries' staged rows); a message gate's concatenated norms (2 hiddenSize),
-// low rank (loopGateRank, three gates' in a row) and forget and gain rows
-// (fp32; a decode step's forget rows three fused gates' gated rows; a longer
-// prompt chunk's forget, gain and concatenation rows its three tiled gates'
-// gated rows, fp32 of hiddenSize each), and the fused gates' counters
+// queries' staged rows); the mixes' and the messages' rows normalized for the
+// fused gates (bf16, of their layouts, for ops::MessageGate::kFusedRows rows
+// alone, the most a call of those gates takes), a message gate's low rank
+// (loopGateRank, three gates' in a row) and forget and gain rows (fp32; a
+// decode step's forget rows three fused gates' gated rows; a longer prompt
+// chunk's forget, gain and concatenation rows, the last a prompt chunk's
+// alone (2 hiddenSize bf16), its three tiled gates' gated rows, fp32 of
+// hiddenSize each), and the fused gates' counters
 // (ops::MessageGate::kCountersBytes, zero between calls); zero rows, which
 // the MoE adds its weighted sum to (ops::MoeBuffers::residual); and a decode
 // step's convolution inputs of every application, rows of stateColumns() values,
@@ -56,6 +59,8 @@ struct Inkling2LoopScratch final {
   metal::MetalBuffer convolvedValues;
   metal::MetalBuffer relativeStates;
   metal::MetalBuffer rowSinks;
+  metal::MetalBuffer normalizedMixed;
+  metal::MetalBuffer normalizedMessages;
   metal::MetalBuffer gateConcat;
   metal::MetalBuffer gateLow;
   metal::MetalBuffer gateForget;

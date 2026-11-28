@@ -109,11 +109,14 @@ public:
   // a stall away, and neither differs from the 64th by a millisecond a cycle.
   static constexpr double kContextDecay = 1.0 - 1.0 / 64.0;
 
-  // A lane count's steps over `classes`, the fewest rows of each class of a
-  // decode step's kernels (ops::ExecutionPlans::decodeRowClasses), of up to
-  // `mostRows` rows, the rows a step runs in one pass, a verify block a lane
-  // (a streamed-expert store's cycles take no table: CostLine); `rising`
-  // where a class's cost rises with its rows (a MoE target's).
+  // A lane count's steps over its classes, classes[lanes - 1], the fewest
+  // rows of each class of a decode step's kernels of that many lanes
+  // (ops::ExecutionPlans::decodeRowClasses), of up to `mostRows` rows, the
+  // rows a step runs in one pass, a verify block a lane (a streamed-expert
+  // store's cycles take no table: CostLine); `rising` where a class's cost
+  // rises with its rows (a MoE target's). The second form gives every lane
+  // count the same classes.
+  StepCosts(std::span<const std::vector<uint32_t>, kLanes> classes, uint32_t mostRows, bool rising);
   StepCosts(std::span<const uint32_t> classes, uint32_t mostRows, bool rising);
 
   // A class of a lane count's steps, or of a rising class the rows past its
@@ -312,6 +315,8 @@ public:
   // (Runtime::Impl::chooseStep): at eight lanes of Qwen3.6-35B-A3B on a
   // 10-core M4, a step past it, which loads its experts in two rounds, took
   // 11.05 ms a token where steps within it took 8.15.
+  explicit CostLine(std::span<const std::vector<uint32_t>, kLanes> classes);
+  // Every lane count over the same classes.
   explicit CostLine(std::span<const uint32_t> classes);
 
   // The shape of a cycle's cost by its rows (a cycle of every row costs 1),
@@ -360,7 +365,8 @@ private:
   [[nodiscard]] static double seedSlope(uint32_t lanes);
   [[nodiscard]] const Cost &table(uint32_t lanes, bool constrained) const;
 
-  std::vector<uint32_t> classes_;
+  // Each lane count's classes.
+  std::array<std::vector<uint32_t>, kLanes> classes_;
   std::array<std::array<Cost, kLanes>, 2> tables_{};
   std::array<std::array<uint64_t, kLanes>, 2> cycles_{};
 };

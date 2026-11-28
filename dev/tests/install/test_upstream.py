@@ -52,7 +52,7 @@ from install import assembly, families, hub, models, paths, upstream
 # tells it apart.
 UNSUPPORTED = (
     "no supported model has this architecture [(]{}[)]; "
-    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next"
+    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B [(]Ornith-1.5-122B[)], Qwen3.8-Flash-Next"
 )
 
 
@@ -80,6 +80,82 @@ class UpstreamTest(unittest.TestCase):
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
         self.assertEqual(len(set(repos)), len(repos))
+
+    def test_the_engine_says_what_weights_auto_changes_of_an_assemblys_target(self):
+        # What the app offers --weights by is the engine's answer, asked of
+        # the target's files linked as the assembly links them; where the
+        # engine does not say, nothing is said.
+        root = self.root / "files"
+        root.mkdir()
+        files = {}
+        for name in ("config.json", "target/model.safetensors", "tokenizer/t.json"):
+            files[name] = root / name.replace("/", "-")
+            files[name].write_bytes(name.encode())
+        seen = {}
+
+        def engine(arguments, purpose):
+            target = Path(arguments[-1])
+            seen.update(
+                arguments=arguments[:-1],
+                target={
+                    str(p.relative_to(target)): p.read_bytes() for p in target.iterdir()
+                },
+            )
+            return '{"family": "Qwen3.8-27B", "quantizable_weights": true}'
+
+        with mock.patch.object(models, "run_engine", engine):
+            self.assertIs(upstream._weights_auto_changes("mlx-affine", files), True)
+        self.assertEqual(
+            seen,
+            {
+                "arguments": [
+                    "model-check",
+                    "mlx-affine",
+                    "none",
+                    str(files["config.json"]),
+                ],
+                "target": {"model.safetensors": b"target/model.safetensors"},
+            },
+        )
+        for said in ('{"family": "Qwen3.8-27B"}', models.ModelError("refused")):
+            with mock.patch.object(models, "run_engine", side_effect=[said]):
+                self.assertIsNone(upstream._weights_auto_changes("mlx-affine", files))
+
+    def test_an_assembly_records_what_its_template_makes_of_reasoning(self):
+        # The server's own report (chat_templates.tokenizer_reasoning), asked
+        # of the assembly's tokenizer files linked as it links them; nothing
+        # where the tokenizer does not load.
+        from server import chat_templates
+
+        root = self.root / "files"
+        root.mkdir()
+        files = {}
+        for name in ("config.json", "tokenizer/tokenizer.json", "target/m.gguf"):
+            files[name] = root / name.replace("/", "-")
+            files[name].write_bytes(name.encode())
+        seen = {}
+
+        def reasoning(directory, chat_format):
+            seen.update(
+                files={p.name: p.read_bytes() for p in Path(directory).iterdir()},
+                chat_format=chat_format,
+            )
+            return {"thinks": True, "efforts": [], "default": None}
+
+        with mock.patch.object(chat_templates, "tokenizer_reasoning", reasoning):
+            self.assertEqual(
+                upstream._reasoning(MOE.name, files),
+                {"thinks": True, "efforts": [], "default": None},
+            )
+        self.assertEqual(
+            seen,
+            {
+                "files": {"tokenizer.json": b"tokenizer/tokenizer.json"},
+                "chat_format": MOE.chat_format,
+            },
+        )
+        # A tokenizer.json that is none.
+        self.assertIsNone(upstream._reasoning(MOE.name, files))
 
     def test_family_is_identified_by_architecture_not_name(self):
         # The engine's check (its model-check command), with and without the
@@ -892,6 +968,9 @@ class UpstreamTest(unittest.TestCase):
         )
         record = assembly.verify(chosen.link)
         self.assertEqual(record["family"], MOE.name)
+        # Its shard's header is not one: what --weights auto does to its
+        # weights is recorded as unsaid, and the app does not offer the option.
+        self.assertIsNone(record["quantizable_weights"])
         self.assertEqual(
             record["sources"],
             {
@@ -1424,7 +1503,7 @@ class UpstreamTest(unittest.TestCase):
             f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot install "
             f"{MODEL}@{'b' * 40}: no supported model has this architecture (text "
             "config head_dim: safetensors 128, Qwen3.8-27B 256); supported: Qwen3.8-27B, "
-            "Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next",
+            "Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next",
             warnings,
         )
         self.assertEqual(chosen.link.resolve(), installed)
@@ -1470,6 +1549,44 @@ class UpstreamTest(unittest.TestCase):
             all(name.startswith(DENSE.draft_repo + "/") for name in fake.downloads)
         )
         self.assertEqual(pins(self.cache), sorted(["a" * 40, "e" * 40]))
+
+    def test_a_draft_revision_pins_the_draft_as_a_revision_pins_the_target(self):
+        # A 40-hex --draft-revision installs that commit beside the draft's
+        # default branch, and holds it while the branch moves and the
+        # target's follows its own: the draft is asked for no more.
+        fake = fake_hub(self, self.cache)
+        fake.publish(
+            DENSE.draft_repo, "e" * 40, lambda p: draft_dir(p, DENSE), branch="preview"
+        )
+        chosen = selection(self.root, draft_revision="e" * 40)
+        self.prepare(chosen)
+        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft_repo, "e" * 40)])
+        fake.publish(DENSE.draft_repo, "f" * 40, lambda p: draft_dir(p, DENSE))
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        fake.requests.clear(), fake.downloads.clear()
+        self.prepare(chosen)
+        self.assertEqual(fake.requests, [(MODEL, None)])
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"],
+            {
+                "target": {"repo": MODEL, "revision": "b" * 40},
+                "draft": {"repo": DENSE.draft_repo, "revision": "e" * 40},
+            },
+        )
+
+    def test_a_draft_revision_names_a_branch_of_a_chosen_draft_repository(self):
+        # A branch is followed as the target's is, in --draft-model's
+        # repository as in the family's.
+        fake = fake_hub(self, self.cache)
+        repository = "someone/other-draft"
+        fake.publish(repository, "c" * 40, lambda p: draft_dir(p, DENSE), branch="v2")
+        chosen = selection(self.root, draft_model=repository, draft_revision="v2")
+        self.prepare(chosen)
+        self.assertEqual(fake.requests, [(MODEL, None), (repository, "v2")])
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["draft"],
+            {"repo": repository, "revision": "c" * 40},
+        )
 
     def test_an_installation_of_another_draft_repository_moves_to_the_familys(self):
         fake = fake_hub(self, self.cache)
@@ -2252,6 +2369,7 @@ class UpstreamTest(unittest.TestCase):
         record = json.loads((chosen.link / "model.json").read_text())
         for change in (
             lambda r: r.pop("family"),
+            lambda r: r.update(quantizable_weights="no"),
             lambda r: r.update(metadata="0" * 64),
             lambda r: r.update(target_format="safetensors"),
             lambda r: r.update(version=True),

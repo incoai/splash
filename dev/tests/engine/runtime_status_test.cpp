@@ -96,9 +96,13 @@ StatusInputs representativeStatus() {
           "context regression needs a model capacity larger than the limit");
   engine.submitted = 3;
   engine.completed = 2;
+  engine.timedOut = 1;
   engine.cacheHits = 1;
   engine.coldMisses = 2;
   engine.reusedTokens = 64;
+  engine.promptTokens = 256;
+  engine.reusedDiskTokens = 32;
+  engine.reuseEnds = {2, 1, 0, 0};
   engine.deduplicatedKvTokens = 96;
   engine.junctionMaterializations = 1;
   engine.checkpointPublications = 3;
@@ -147,6 +151,7 @@ StatusInputs representativeStatus() {
                              .lazyJunctions = 1};
   engine.resources.activeRequests = 1;
   engine.resources.kvTier.restores = 3;
+  engine.resources.kvTier.quotaGivenUp = {0, 4, 1, 3, 0};
   engine.resources.kvTier.readBytes = 12345;
   engine.resources.kvTier.writtenBytes = 67890;
   engine.resources.kvTier.writeRate = {.hourBytes = 16384, .dayBytes = 65536};
@@ -161,10 +166,10 @@ StatusInputs representativeStatus() {
   engine.resources.kvTier.copies = 64;
   engine.resources.adoption = {2, 96, 4096, 1};
   engine.writeBehind = {1, 5, 3, 0};
-  // Sliding windows that trim, and a target whose KV can spill: a request
-  // spilled, one converted and one's output was bounded.
-  engine.resources.window = engine::KvWindowSnapshot{
-      .windowPages = 16, .trim = true, .pinnedBlocks = 4, .trimmedPages = 12, .upgrades = 1, .refusedStates = 1};
+  // Sliding windows, and a target whose KV can spill: a request spilled,
+  // one converted and one's output was bounded.
+  engine.resources.window =
+      engine::KvWindowSnapshot{.windowPages = 16, .pinnedBlocks = 4, .windowUnits = 6, .upgrades = 1, .refusedStates = 2};
   engine.spill = {.spill = 1, .resident = 2, .converted = 1, .bounded = 1};
   // Prefill ran six units, three of them beside decoders; a command ran in
   // passes and a superseding plan abandoned it between them; one plan was
@@ -289,6 +294,7 @@ StatusInputs representativeStatus() {
                                   .slots = 3072,
                                   .experts = 10240,
                                   .resident = 3000,
+                                  .slotBytes = {262'144},
                                   .shrinks = 2,
                                   .regrows = 1};
   experts.uses[1] = {
@@ -411,6 +417,15 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                   std::string::npos &&
               tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
           "token-major values were reported dimension-major");
+  // The precision options a start ran at besides the KV format, which every
+  // cached page and state was computed at (--cached-states, --activations).
+  StatusInputs exact = status;
+  exact.identity.cachedStates = "exact";
+  exact.identity.activations = ops::Int8Activations::Off;
+  const std::string exactStatus = exact.json();
+  require(json.find("\"cached_states\":\"int8\",\"activations\":\"auto\"") != std::string::npos &&
+              exactStatus.find("\"cached_states\":\"exact\",\"activations\":\"bf16\"") != std::string::npos,
+          "the cache identity did not report the cached states' storage and the activations a start ran at");
 
   StatusInputs unmeasuredInputs = status;
   unmeasuredInputs.sample.telemetry = {};
@@ -429,8 +444,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
 // Whole documents for the branches the representative one leaves out. A
 // spilling target: the plan's kv_spill, readers not yet built, a Spill
 // request, the Neural Engine split serving, SSD writes closed and two warmup
-// steps memory-limited. A resident target with windows: the plan's kv_window,
-// no kv_spill or kv.window, no host telemetry, the idle release off, the
+// steps memory-limited. A resident target with windows: no kv_spill or
+// kv.window, no host telemetry, the idle release off, the
 // split off, the streamed stores absent, SSD writes open, Metal failed with a
 // reason that needs escaping after it created two pipelines while serving,
 // YaRN, BF16 token-major KV, no requests, no ledger accounts and one warmup
@@ -662,13 +677,14 @@ void testMemoryPressureTelemetry() {
 void testResourceWaitDiagnostics() {
   ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
                             .restoring = 1, .suspended = 1,
-                            .oldestWaitMilliseconds = 1250.0, .draining = true};
+                            .oldestWaitMilliseconds = 1250.0, .stalledWaitMilliseconds = 250.0,
+                            .draining = true};
   const auto memoryPlan = plan();
   const std::string json = statusOf(memoryPlan, {.resourceWait = wait});
   require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
                     "\"waiting_concurrency\":1,\"held_behind_refusal\":4,\"restoring\":1,"
                     "\"suspended\":1,\"draining\":true,"
-                    "\"oldest_wait_ms\":1250},\"loop\":{\"max_tick_ms\":0,\"stall_budget_ms\":30000,") !=
+                    "\"oldest_wait_ms\":1250,\"stalled_wait_ms\":250},\"loop\":{\"max_tick_ms\":0,\"stall_budget_ms\":30000,") !=
               std::string::npos,
           "resource wait summary is missing or inaccurate");
   const std::string ticked = statusOf(memoryPlan, {.resourceWait = wait, .loopMaxTickMilliseconds = 1843.25});
@@ -738,6 +754,7 @@ void testStreamedExpertsStatus() {
                                   .slots = 8192,
                                   .experts = 25088,
                                   .resident = 8000,
+                                  .slotBytes = {2'097'152, 1'048'576},
                                   .shrinks = 2,
                                   .regrows = 1};
   experts.uses[1] = {.loads = 480,
@@ -758,7 +775,7 @@ void testStreamedExpertsStatus() {
               "\"streamed_experts\":{\"cap_bytes\":18602770432,\"floor_bytes\":15837691904,\"chunks\":3,"
               "\"cap_chunks\":4,\"shrinks\":2,\"regrows\":1,\"arena_bytes\":17179869184,"
               "\"staging_bytes\":452984832,\"slots\":8192,"
-              "\"experts\":25088,\"resident\":8000,\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
+              "\"experts\":25088,\"resident\":8000,\"slot_bytes\":[2097152,1048576],\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
               "\"read_ahead\":0,\"hit_rate\":0,\"read_bytes\":0,\"host_steps\":{\"pickup_ms\":" +
               none + ",\"work_ms\":" + none + ",\"resume_ms\":" + none +
               "}},"
@@ -890,25 +907,21 @@ void testKvSpillStatus() {
 }
 
 // A windowed target's KV reports its window under kv.window: the pages a
-// window keeps Full, whether the pages past every window give up their
-// windowed layers' K/V, the pool's Full and Slim pages in use and the Slim
-// pages' bytes, the blocks states' tails pin, and the pages trimmed, the
-// blocks that took the page of a writer that computed them again and the
-// states refused a tail that was not Full. Another target reports none. An
-// added field: the schema version stays.
+// row's window and a state's tail read, the blocks states' tails hold, and
+// the blocks that took the page of a writer that computed them again.
+// Another target reports none.
 void testKvWindowStatus() {
   engine::EngineSnapshot engine;
   engine.resources.pool = {.pagesAllocated = 1024, .pagesFree = 124, .pagesActive = 300, .pagesPrefix = 700};
-  engine.resources.pool.slim = {.pagesAllocated = 768, .pagesFree = 68, .allocatedBytes = 768 * 473'088ULL};
   const auto status = [&] {
     return statusOf(plan(), {.engine = engine});
   };
   require(status().find("\"window_pages\"") == std::string::npos, "a target without a window reported one");
-  engine.resources.window = engine::KvWindowSnapshot{
-      .windowPages = 16, .trim = true, .pinnedBlocks = 48, .trimmedPages = 9000, .upgrades = 3, .refusedStates = 1};
-  require(status().find("\"window\":{\"window_pages\":16,\"trim\":true,\"full_pages\":200,\"slim_pages\":700,"
-                        "\"slim_bytes\":363331584,\"pinned_blocks\":48,\"trimmed_pages\":9000,\"upgrades\":3,"
-                        "\"refused_states\":1}") != std::string::npos,
+  engine.resources.window =
+      engine::KvWindowSnapshot{.windowPages = 16, .pinnedBlocks = 48, .windowUnits = 52, .upgrades = 3, .refusedStates = 1};
+  require(status().find("\"window\":{\"window_pages\":16,\"pinned_blocks\":48,\"window_units\":52,\"upgrades\":3,"
+                        "\"refused_states\":1}") !=
+              std::string::npos,
           "a windowed target's kv.window differs:\n" + status());
 }
 

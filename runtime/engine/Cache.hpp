@@ -47,8 +47,8 @@ struct CacheLookup final {
   // A matched block deeper than the state once held a reusable state that
   // is gone from both tiers.
   bool lostState = false;
-  // A matched block held a reply's state (KvCache::noteReply): the prompt
-  // renders an earlier reply back, as far as that block at least.
+  // A matched block is one a reply's decode published (KvCache::noteReply):
+  // the prompt renders an earlier reply back, as far as that block at least.
   bool rendersReply = false;
 
   [[nodiscard]] uint32_t resumeBoundary() const noexcept {
@@ -95,9 +95,9 @@ struct CacheLookupSnapshot final {
   uint64_t lostStateMisses = 0;
 };
 
-// What holds the disk tier's writes back: nothing, the write budget (states
-// not in use wait for it; only when one is set), or a file that stopped
-// taking writes.
+// What holds the disk tier's writes back: nothing, the write budget (while
+// it is spent the cache writes nothing; only when one is set), or a file
+// that stopped taking writes.
 enum class DiskWritesGate : uint8_t { No, Budget, Closed };
 
 struct KvTierSnapshot final {
@@ -110,7 +110,7 @@ struct KvTierSnapshot final {
   // What the volume had available when the limit was last set.
   uint64_t volumeAvailableBytes = 0;
   DiskWritesGate writesGated = DiskWritesGate::No;
-  // What writes not in use may take now; zero once overdrawn, and zero
+  // What the cache's writes may take now; zero once overdrawn, and zero
   // without a write budget, when nothing is held back.
   uint64_t writeBudgetBytes = 0;
   // How long the files' writes held back for reads a step waited for
@@ -137,6 +137,18 @@ struct KvTierSnapshot final {
   uint64_t diskBytes = 0;
   // Why a tier the start asked for is off (its "SSD cache off" line); empty otherwise.
   std::string offReason;
+  // What demotions and copies ahead wrote, the parts each wrote, of them the
+  // window parts, and the pages written again after their copy was given up
+  // while they stayed in RAM (copiesGivenUp_).
+  uint64_t demotedBytes = 0;
+  uint64_t copiedBytes = 0;
+  uint64_t windowPartBytes = 0;
+  uint64_t rewrites = 0;
+  uint64_t rewrittenBytes = 0;
+  // What the quota gave up for room, by the kind of copy (freeDiskSpace, in
+  // Cache::DiskVictim's order): window parts, KV copies, state copies, only
+  // copies of states, and of states in use.
+  std::array<uint64_t, 5> quotaGivenUp{};
 };
 
 // What a start took back from a persistent tier: the states and KV blocks
@@ -182,17 +194,14 @@ struct KvSpillSnapshot final {
 };
 
 // What a cache of a windowed layout holds and did (/status kv.window): the
-// pages each request's window and each state's tail keep Full, whether
-// pages below every window give up their windowed layers' K/V
-// (CacheWindowPolicy::trim), the blocks a state's tail pins, and the pages
-// trimmed, the blocks that took the page of a writer that computed them
-// again (KvCache::upgrades) and the states refused a tail that was not
-// Full.
+// pages a row's window and a state's tail read, the blocks a state's tail
+// holds and those that hold a window unit, the blocks that took the page of
+// a writer that computed them again (KvCache::upgrades), and the states
+// refused because a block of their tail held no unit (stateTailPresent).
 struct KvWindowSnapshot final {
   uint32_t windowPages = 0;
-  bool trim = false;
   uint32_t pinnedBlocks = 0;
-  uint64_t trimmedPages = 0;
+  uint32_t windowUnits = 0;
   uint64_t upgrades = 0;
   uint64_t refusedStates = 0;
 };
@@ -231,16 +240,20 @@ struct TokenAdmission final {
   kv::PageForm form = kv::PageForm::Full;
   // The free pages of each form the attempt takes, which the room made for
   // it keeps (Need::keptPages): a restore's (restoreRequest).
-  std::array<uint32_t, 3> keptPages{};
+  std::array<uint32_t, kv::kPageForms> keptPages{};
 
   [[nodiscard]] bool granted() const noexcept {
     return failure == TokenAdmissionFailure::None;
   }
 };
 
-// The page list a command of a request reads (Cache::cutPageTable).
+// The page list a command of a request reads (Cache::cutPageTable): its
+// blocks' base pages and, with a window, a table per page of their window
+// units, table j holding by logical page the j-th page of each block's, and
+// kv::kAbsentPage for a block its window no longer reaches.
 struct PageTableView final {
   std::span<const uint32_t> pages;
+  std::span<const std::vector<uint32_t>> windows;
   // Where each page reads its K/V (ModelBatchItem::pageSources); null while
   // none holds only its index.
   std::shared_ptr<const model::KvPageSources> sources;
@@ -253,6 +266,7 @@ struct PageTableView final {
 // never what a command reads.
 struct PageTableState final {
   std::span<const uint32_t> pages;
+  std::span<const std::vector<uint32_t>> windows;
   uint64_t revision = 0;
   uint32_t firstChanged = 0;
 };
@@ -273,20 +287,14 @@ struct CacheSpillPolicy final {
 };
 
 // What the cache of a layout with a sliding window (kv::Layout::windowTokens)
-// keeps Full: the windowPages pages (kv::Layout::windowPages) before each
-// request's next row, which its windowed layers read, and the tail of each
-// state, the windowPages blocks that end at its block, which a request that
-// resumes there reads. Every other page gives up its windowed layers' K/V
-// (Cache::trimWindows) unless trim is off, which changes no byte a kernel
-// reads and only takes more memory: a run with it off computes what one
-// with it on does, to the bit.
+// counts: the tail of each state, the windowPages blocks (kv::Layout::
+// windowPages) that end at its block, which a request that resumes there
+// reads (KvCache::countState); and what a block holds beside its base page,
+// its window unit of unitPages pages (kv::Layout::windowUnitPages), while a
+// state's tail holds it, and a lane while its window reaches the block.
 struct CacheWindowPolicy final {
   uint32_t windowPages = 0;
-  bool trim = true;
-  // The Full pages the plan counts for a lane (kvWindowFloorPages): at the
-  // memory wall only the Full extents beyond the lanes' leave for Slim ones
-  // (Cache::trimWindows). 0 counts none.
-  uint32_t floorPages = 0;
+  uint32_t unitPages = 0;
 };
 
 // Whether a request may start to spill now, or what holds it back: the KV
@@ -368,15 +376,25 @@ enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
 // A slot an earlier process left in a persistent tier's file: its label
 // (KvSlotLabel or StateLabel), and how to take it back, which only what
-// the cache keeps is.
+// the cache keeps is. A KV slot is a part of a block's copy (kv::Component),
+// taken back into the copy that holds the block's other parts, or a new one.
 struct PersistedKv final {
   std::vector<std::byte> label;
-  std::function<std::shared_ptr<KvDiskSlot>()> adopt;
+  std::function<std::shared_ptr<KvDiskSlot>(std::shared_ptr<KvDiskSlot> into)> adopt;
+  kv::Component part = kv::Component::Base;
 };
 struct PersistedState final {
   std::vector<std::byte> label;
   // The disk copy of a state at that many tokens.
   std::function<std::shared_ptr<const CompositeState>(uint32_t tokens)> adopt;
+};
+
+// What a write of a point's copy is worth in the SSD order
+// (Cache::freeDiskSpace's ranks): history no request uses rank 1, any other
+// point rank 2 (Cache::writeWorth); and its block's last use.
+struct DiskWorth final {
+  uint8_t rank = 2;
+  uint64_t lastUse = std::numeric_limits<uint64_t>::max();
 };
 
 // Owns active KV page leases, the content-addressed KV graph and cached
@@ -391,9 +409,10 @@ public:
   // the states' file can run on it without the tier. A persistent KV tier
   // makes the cache persistent: its copies are labelled for the next
   // process, and the quota keeps whole restore points by the recency of
-  // their states (freeDiskSpace). A windowed layout's cache keeps what its
-  // window policy says Full (CacheWindowPolicy), and the labels of its
-  // copies name their page's form too (KvSlotLabel).
+  // their states (freeDiskSpace). A windowed layout's cache counts its
+  // states' tails (CacheWindowPolicy). A copy has a part for each of the
+  // tier's components, and all of them are made, written, counted, given up,
+  // read and taken back together: a block's copy is whole or none.
   // With a spill policy, on a layout that can spill (kv::Layout::spillable)
   // and with a tier, requests may spill (KvMode::Spill), and the blocks
   // requests hold keep their copies (KvCache::holdPage).
@@ -405,37 +424,85 @@ public:
 
   [[nodiscard]] bool persistent() const noexcept { return persistent_; }
   // A file that stopped taking writes closes the KV tier; existing copies
-  // stay readable. KV writes pass the write budget (model::DiskBudget).
+  // stay readable.
   [[nodiscard]] bool kvTierWritable() const noexcept { return tier_ && tier_->writable(); }
+  // The tier takes any cache write now: writable, its write budget not spent
+  // (model::DiskBudget::admits). Else the cache keeps to memory as without a
+  // tier, reading its copies; only a Spill request's writes pass.
+  [[nodiscard]] bool takesCacheWrites() const noexcept {
+    return kvTierWritable() && (!diskBudget_ || diskBudget_->admits());
+  }
   // Before the first request, takes back the restore points an earlier
   // process left in a persistent tier: each state whose block's chain is
   // whole, and that chain. Everything else stays behind, and once the files
-  // finish adoption its slots are free. A windowed layout's copies come
-  // back as the form their labels name, a Full or a Slim page's, and a
-  // state only with a tail of Full copies (stateTailFull). Then copies go
-  // while the disk limit is exceeded, as keepDiskLimit() gives them up. Ids
+  // finish adoption its slots are free. A block comes back only with a
+  // part of each component, paired by its id, identity and copy serial
+  // (KvSlotLabel); a part alone stays behind with what lies below it.
+  // Then copies go while
+  // the disk limit is exceeded, as keepDiskLimit() gives them up. Ids
   // and recency continue after those taken back.
   [[nodiscard]] CacheAdoption adopt(std::vector<PersistedKv> blocks,
                                     std::vector<PersistedState> states);
   // One step of giving the restore point at this block its copies on the
   // disk tier while it stays in RAM, ahead of need: a reclaim then frees its
   // memory at once, and a persistent tier's next process takes it back. The
-  // state is written from its own buffers once the write budget admits it,
-  // the tier busy until then, and then the pages of its chain that have no
-  // disk copy, root first, beside the commands that may read them; they pass
-  // the budget, as every KV write does. Nothing starts while the tier serves
+  // tier is busy while it takes no cache writes (takesCacheWrites); then the
+  // pages of its chain that have no disk copy are written, root first,
+  // beside the commands that may read them, and the state last, from its own
+  // buffers, once every copy of the chain is under way: a point refused for
+  // room leaves no state copy. Nothing starts while the tier serves
   // what is needed now, a restore that waits, a reclaim's demotion or a
   // Spill request's write through, and the pages take a small share of the
-  // tier's writes. A point is unneeded unless it is still the newest of its
-  // conversation (newestPoint), or, a `head`, still an ordinary state, which
-  // new conversations start from whether or not one went on from it. Every
+  // tier's writes. A temporary tier's point is unneeded unless still the
+  // newest of its conversation (newestPoint), a persistent tier's once no
+  // ordinary state, its copies serving the points after it. Every
   // point is refused once a file stopped taking writes, and one larger than
   // the room it may take (pointFits) or given up to make room for itself.
-  [[nodiscard]] PersistStatus persist(uint64_t block, bool head = false);
+  [[nodiscard]] PersistStatus persist(uint64_t block);
+  // The deepest point above this block on its chain that a restart takes
+  // back (adopt) once the writes in flight land: a state on the SSD each
+  // block of whose chain has a copy, landed or in flight, or the point
+  // persist() copies; 0 for none. Walks the chain. It reads no window part:
+  // a copy whose window part failed keeps its base part, and a state a
+  // reclaim wrote may hold its tail's window K/V as units until they are
+  // written, and either counts. `landed` counts only points that have
+  // landed whole, window parts too (pointLanded): what a crash now would
+  // leave.
+  [[nodiscard]] uint64_t deepestTakenBack(uint64_t block, bool landed = false) const;
+  // The block's copy, or with `state` its state's, has landed: a copy of
+  // what its pages hold, or a disk-only block's of what a tail of it reads.
+  [[nodiscard]] bool copyLanded(uint64_t block, bool state) const;
+  // The point at the block has landed whole, its three parts: its state's
+  // copy, the base part of each block of its chain, the window part of each
+  // block of its tail. The one predicate of a persistent tier's durability.
+  [[nodiscard]] bool pointLanded(uint64_t block) const;
+  // The window part of each block of the state's tail has landed.
+  [[nodiscard]] bool tailLanded(uint64_t block) const;
+  // Whether a point deepestTakenBack() gave still is, as far as its own
+  // copies tell: the point persist() copies, or a block whose own copy and
+  // state's copy stand; its tail's window parts stay while its state's copy
+  // needs them (KvCache::copyPins). A copy above it may go while those stay,
+  // given up as a copy of what memory holds (freeDiskSpace) or lost with a
+  // write that failed: takeBrokenCopies() names those blocks, and a point
+  // whose chain holds one is found again by a walk.
+  [[nodiscard]] bool stillTakenBack(uint64_t block) const {
+    return block == persisting_.block || (kv_.contains(block) && kv_.ownCopy(block) && states_.onDisk(block));
+  }
+  // The blocks whose copy a persistent tier gave up or lost while a state
+  // lay at or below them, since the last call, oldest first
+  // (stillTakenBack).
+  [[nodiscard]] std::vector<uint64_t> takeBrokenCopies() noexcept { return std::exchange(brokenCopies_, {}); }
+  // The blocks of the chain ending at this block, root first; none once it
+  // is gone.
+  [[nodiscard]] std::vector<uint64_t> chainBlocks(uint64_t block) const {
+    return kv_.contains(block) ? kv_.chain(block).blocks : std::vector<uint64_t>{};
+  }
+  // Pages of the chain ending at this block; 0 once it is gone.
+  [[nodiscard]] uint32_t chainLength(uint64_t block) const {
+    return kv_.contains(block) ? kv_.chainLength(block) : 0;
+  }
   // The block holds a restore point a conversation still resumes from: an
-  // ordinary state with no ordinary state below it, or with ordinary states
-  // on more than one of its branches, which no single conversation went on
-  // from. persist() copies only such a point.
+  // ordinary state nothing superseded. persist() copies only such a point.
   [[nodiscard]] bool newestPoint(uint64_t block) const;
   // What the copies ahead of need in flight (persist) let a reclaim free at
   // once after they land: the bytes of the pages they copy and of the RAM
@@ -447,7 +514,7 @@ public:
   // `end`; each state copy's label takes its state's current recency, which
   // the next process orders them by.
   void closePersistentTier(AwakeClock::time_point end = AwakeClock::time_point::max()) {
-    while (AwakeClock::now() < end && kv_.unneededCopy())
+    while (AwakeClock::now() < end && (kv_.unneededCopy() || unneededWindow()))
       static_cast<void>(freeDiskSpace(false, false));
     states_.relabel();
   }
@@ -460,8 +527,8 @@ public:
   // in the order a full quota replaces them (freeDiskSpace), never a copy in
   // transfer or the only copy of a state in use.
   void keepDiskLimit();
-  // When the write budget admits a state's write not in use again, on its
-  // clock; empty while it does now or without a budget.
+  // When the write budget admits cache writes again, on its clock; empty
+  // while it does now or without a budget.
   [[nodiscard]] std::optional<double> diskWritesAdmittedAt() const noexcept {
     return diskBudget_ ? diskBudget_->admitsAgainAt() : std::nullopt;
   }
@@ -471,12 +538,6 @@ public:
   [[nodiscard]] std::optional<double> spillWritesAdmittedAt() const noexcept {
     return diskBudget_ ? diskBudget_->admitsSpillAt(diskBudget_->committedBytes()) : std::nullopt;
   }
-  // At a clean stop: the write budget holds nothing back any more.
-  void liftDiskWriteBudget() noexcept {
-    if (diskBudget_)
-      diskBudget_->lift();
-  }
-
   void setCompletionNotifier(std::function<void()> notifier) {
     states_.setCompletionNotifier(notifier);
     completionNotifier_ = std::move(notifier);
@@ -525,6 +586,9 @@ public:
     uint32_t unheld;
   };
   [[nodiscard]] ChainCopies chainCopies(uint64_t block) const;
+  // The tokens of the chain that ends at this block (none for 0) whose K/V
+  // no page in RAM holds: what a restore of it reads from the SSD cache.
+  [[nodiscard]] uint32_t diskOnlyTokens(uint64_t block) const;
   // Commits quota for `pages` pages of a Spill request, which each page it
   // publishes then draws or returns (DiskBudget::commit); false, committing
   // nothing, when spillRoom() cannot hold them beside the unheld copies of
@@ -660,6 +724,11 @@ public:
   // The bytes one page of the form takes, and the pages of an extent.
   [[nodiscard]] uint64_t bytesPerPage(kv::PageForm form) const noexcept { return pool_.bytesPerPage(form); }
   [[nodiscard]] uint32_t extentPages() const noexcept { return pool_.extentPages(); }
+  // The bytes a block holding its window unit takes in memory, its base page
+  // and its unit's (KvCache::blockPages); one without a unit takes a page's.
+  [[nodiscard]] uint64_t bytesPerBlock() const noexcept {
+    return pool_.bytesPerPage(kv::PageForm::Full) * kv_.blockPages();
+  }
   // The pages a Resident request's conversion to Spill would move to the
   // Index form: its Full pages that spillEligibility would find Eligible
   // were it Spill, past its dense history and short of its tail window, no
@@ -667,34 +736,17 @@ public:
   [[nodiscard]] uint32_t convertiblePages(uint64_t requestId) const;
   // The pool's free pages of `form`.
   [[nodiscard]] uint32_t freePages(kv::PageForm form) const noexcept { return pool_.freePageCount(form); }
-  // The pages of `chain`, a start's (CacheProbe::restoredChain), that are in
+  // The blocks of `chain`, a start's (CacheProbe::restoredChain), that are in
   // memory in a form its start takes in place (restoreRequest): any but the
   // Index form, which a Resident start moves to Full pages.
   [[nodiscard]] uint32_t residentChainPages(std::span<const uint64_t> chain) const;
-  // The need `pages` more Full pages of the lanes make, as ensureTokens
-  // takes them (KvPool::takeFreePages): the free pages first, which a walk
-  // for it keeps (Need::keptPages), then whole extents.
-  [[nodiscard]] Need growthNeed(uint32_t pages) const;
-  // The most Full pages whose growthNeed `bytes` meets: the free ones, then
+  // The need `blocks` more blocks of the lanes make, their pages as
+  // ensureTokens takes them (KvPool::takeFreePages): the free pages first,
+  // which a walk for it keeps (Need::keptPages), then whole extents.
+  [[nodiscard]] Need growthNeed(uint32_t blocks) const;
+  // The most blocks whose growthNeed `bytes` meets: of the free pages, then
   // those of the whole extents the bytes allocate.
   [[nodiscard]] uint64_t growthPages(uint64_t bytes) const;
-  // Between commands, with a window: moves to the Slim form every Full page
-  // no row will read whole again: every request that holds it has
-  // published windowPages blocks past it (its next command's rows, at or
-  // past its published blocks, reach no key on it), no state's tail holds
-  // it and no transfer moves it; cached pages no request holds go too, and
-  // the pages requests keep beside their blocks, a writer's own or one a
-  // block left for a writer's (KvCache::insert). Free Slim pages take them
-  // first, the runway's among them, then with `allocate` the extents of the
-  // form it allocates, and the runway refills; a refusal leaves the rest
-  // Full, which costs only memory, for the next pass. Where the budget
-  // refuses, the tails behind the lanes leave first (releaseTails), for an
-  // extent's Full pages beside the `taking` a refused Full target takes
-  // (ensureTokens): a refill refused, the wall, trims them into what the
-  // runway holds, and a Full extent left free beyond the lanes' floors
-  // (CacheWindowPolicy::floorPages) leaves for the Slim extents of the rest.
-  // Returns the pages moved; none with trim off.
-  uint32_t trimWindows(bool allocate = true, uint32_t taking = 0);
   // The request's pages of the index form, whose K/V only the SSD cache
   // holds.
   [[nodiscard]] uint32_t indexPages(uint64_t requestId) const;
@@ -727,9 +779,12 @@ public:
   void recordLookup(const CacheLookup &lookup);
   // Gives a state the lookup restored from disk the RAM copy `copy` takes
   // (StateRestore::snapshot, in a claim of the request), asked only while
-  // the state has none; a copy refused leaves it on disk alone.
+  // the state has none; a copy refused leaves it on disk alone. A windowed
+  // state's tail takes the units it lacks from `lane`, the request that
+  // restored it (stateTailPresent); without them it stays on disk alone.
   void promoteState(const CacheLookup &lookup,
-                    const std::function<std::shared_ptr<const CompositeState>()> &copy);
+                    const std::function<std::shared_ptr<const CompositeState>()> &copy,
+                    std::optional<uint64_t> lane = std::nullopt);
   // Gives the request the matched chain up to its state. Disk-only blocks
   // get fresh pages and start their restores; the request waits on
   // kvRestoreStatus() before it runs. Pages are admitted like ensureTokens(),
@@ -742,7 +797,7 @@ public:
   // holds it spilled too.
   [[nodiscard]] TokenAdmission restoreRequest(uint64_t requestId,
                                               const CacheLookup &lookup,
-                                              std::array<uint32_t, 3> held = {});
+                                              std::array<uint32_t, kv::kPageForms> held = {});
   [[nodiscard]] KvRestoreStatus kvRestoreStatus(uint64_t requestId) const;
 
   // Gives the request pages for its first tokenCount tokens, which the work
@@ -758,7 +813,7 @@ public:
   [[nodiscard]] TokenAdmission
   ensureTokens(uint64_t requestId, uint64_t tokenCount,
                uint64_t writtenTokens = std::numeric_limits<uint64_t>::max(),
-               std::array<uint32_t, 3> held = {});
+               std::array<uint32_t, kv::kPageForms> held = {});
   // The request's page list as it is now, at the revision and first change
   // its next cut gives it.
   [[nodiscard]] PageTableState pageTable(uint64_t requestId) const;
@@ -766,9 +821,10 @@ public:
   // command: every change since the last cut makes one new revision, which
   // differs from the last from the first page any of them changed, with its
   // sources cut from there. A command reads only a cut list: another change
-  // before the next cut stays in the same revision. With a window, every
-  // page from the window before the request's published blocks on is Full,
-  // or std::logic_error: what its rows' windows read holds every layer.
+  // before the next cut stays in the same revision. With a window, the
+  // lane first lets go of the units of the blocks its window has passed
+  // since the last cut, one step a block (windowStart), each table entry
+  // made absent before its pages go.
   [[nodiscard]] PageTableView cutPageTable(uint64_t requestId);
 
   // Canonicalizes every newly complete Page32 block. A block whose parent,
@@ -787,35 +843,52 @@ public:
   // Reuses the state at this block in either tier, as reuseCompositeState()
   // does a RAM copy.
   [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
-  // A windowed layout's state needs its tail Full (stateTailFull), or the
-  // publication is a std::logic_error.
+  // A windowed layout's state is published only where every block of its
+  // tail holds its window unit or takes one, in the same step, from `lane`,
+  // the publishing request, which holds the block's base page with the
+  // unit's pages in its tables; stateTailPresent says whether it is,
+  // counting each refusal, and a publication where it is not is a logic
+  // error. A layout without a window needs no lane.
+  [[nodiscard]] bool stateTailPresent(uint64_t kvBlock, std::optional<uint64_t> lane = std::nullopt);
   void publishCompositeState(uint64_t kvBlock,
                              std::shared_ptr<const CompositeState> state,
-                             bool checkpoint);
+                             bool checkpoint, std::optional<uint64_t> lane = std::nullopt);
   // Publishes the state of the lane at this block straight to disk, for a
   // state no cache slot can hold: `write` starts the write from the lane.
   // False when the tier cannot take the state now; nothing is published then.
   // The caller reuses a stored state first (reuseStoredState); publishing
   // over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
-                                        bool checkpoint);
-  // Whether a state may be published at this block: with a window, the
-  // windowPages blocks that end at it, which a request resuming there reads
-  // whole, are Full in RAM or in their copies (KvCache::tailFull), as a
-  // command that computed or held them in its window leaves them. A refused
-  // tail counts in the window snapshot.
-  [[nodiscard]] bool stateTailFull(uint64_t kvBlock);
+                                        bool checkpoint, std::optional<uint64_t> lane = std::nullopt);
   // The request holding the handle is unfinished and its conversation
   // resumes from the state at this block: see StateCache::useState.
   [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.useState(kvBlock); }
   // A state at this block is in use, published or yet to be: its writes
   // pass the disk tier's write budget.
   [[nodiscard]] bool stateInUse(uint64_t kvBlock) const noexcept { return states_.inUse(kvBlock); }
+  // The block is where a prompt's head ends (KvCache::noteHead).
+  void noteHead(uint64_t kvBlock) { kv_.noteHead(kvBlock); }
+  // The tokens of the state at this block: its chain's.
+  [[nodiscard]] uint32_t stateDepth(uint64_t kvBlock) const { return kv_.chainLength(kvBlock) * KvCache::pageTokens; }
+  // Pins the state at this block, out of every victim choice, while the lease lives.
+  [[nodiscard]] std::optional<CompositeStateLease> pinState(uint64_t block) { return states_.acquireDeepest({&block, 1}); }
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // The state at this block has a RAM copy.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // Notes the request's published blocks from its `first` on as its reply's (KvCache::noteReply).
+  void noteReply(uint64_t requestId, uint32_t first) {
+    for (const std::vector<uint64_t> &chain = request(requestId).cachedBlocks; first < chain.size(); ++first)
+      kv_.noteReply(chain[first]);
+  }
+  // Notes the block the request's reply shares with its prompt's last
+  // `promptTokens % pageTokens` tokens, once published (KvCache::noteReplyStart).
+  void noteReplyStart(uint64_t requestId, uint32_t promptTokens) {
+    const std::vector<uint64_t> &chain = request(requestId).cachedBlocks;
+    if (const uint32_t at = promptTokens / KvCache::pageTokens; promptTokens % KvCache::pageTokens && at < chain.size())
+      kv_.noteReplyStart(chain[at], promptTokens % KvCache::pageTokens);
+  }
   // A reply's state, opportunistic or kept (StateCache::markReply).
   void markReply(StateCheckpoint checkpoint) noexcept { states_.markReply(checkpoint); }
   void keepReply(StateCheckpoint checkpoint) noexcept { states_.keepReply(checkpoint); }
@@ -825,10 +898,19 @@ public:
     return states_.checkpointPinned(checkpoint);
   }
 
+  // Sparse history's spacing (historyWritten), by default: a go-back
+  // recomputes at most this many tokens; about one point in every 8 turns of
+  // a conversation is written.
+  static constexpr uint32_t kSparseHistoryTokens = 8192;
+  // Tests: sparse history's spacing in tokens, so that a test's chains of a
+  // few dozen pages reach it (cache-property runs it at 4 to 8 pages).
+  void sparseHistory(uint32_t tokens) noexcept { sparseHistoryTokens_ = tokens; }
+  [[nodiscard]] uint32_t sparseHistoryTokens() const noexcept { return sparseHistoryTokens_; }
+
   // The cache as a source of the units the memory ledger takes, in the order
   // of its walk: free pages first (an empty extent, then compaction toward
-  // one; for a page need other forms' empty extents, and a windowed cache's
-  // trims for Full pages), checkpoints, KV no state restores through,
+  // one; for a page need other forms' empty extents), checkpoints, KV no
+  // state restores through,
   // ordinary states and resident leaves by one recency order, then, for a
   // claim that reaches InUse, states in use and the KV they restore through.
   // The units of certain reuse, the resume point and the wanted chains, and
@@ -845,8 +927,8 @@ public:
   // use (ReclaimPhase). So every claim takes every unit that frees with no
   // write before one that needs a write, within the one recency order, and
   // an Immediate claim takes none whose write it would wait for. A page need
-  // takes the other forms' empty extents and a windowed cache's trims
-  // first. A state need's units are its states, one each.
+  // takes the other forms' empty extents first. A state need's units are
+  // its states, one each.
   //
   // peek() changes nothing and counts each unit as VictimSource's contract
   // asks, the units through it an upper bound of what its take frees (a
@@ -898,7 +980,7 @@ public:
   // The pages the demotions in flight free as they land, by form: returning()'s
   // landing pages less the Full pages that under --kv-spill always spill as
   // their copies land, which free only as spillWritten() moves them.
-  [[nodiscard]] std::array<uint32_t, 3> demotedPages() const;
+  [[nodiscard]] std::array<uint32_t, kv::kPageForms> demotedPages() const;
   // The chains the requests waiting to start restore (their admission
   // probes): the KV of every block of each, and the state at its last, which
   // the request resumes from (CacheProbe::restoredChain), are of certain
@@ -925,13 +1007,26 @@ public:
   [[nodiscard]] CacheSnapshot snapshot() const;
   // What the reclaim counts looked at beside the counts the caches keep:
   // the blocks of the chain a start reuses and the staged state's
-  // (KvCache::reachVisits), the states the walk keeps and those of its order
-  // up to the staged one (StateCache::reclaimVisits), and the pages of the
-  // running requests' windows (trimmableCount, passedKeptPages, which the
-  // trims read too); never the cache.
+  // (KvCache::reachVisits), and the states the walk keeps and those of its
+  // order up to the staged one (StateCache::reclaimVisits); never the cache.
+  // and the blocks and states the walk's searches visited: the states a
+  // release of tails considers, the history search below each
+  // (superseded), the points below an unwritten unit (unitPoints).
   [[nodiscard]] uint64_t reachVisits() const noexcept {
-    return kv_.reachVisits() + states_.reclaimVisits() + windowVisits_;
+    return kv_.reachVisits() + states_.reclaimVisits() + searchVisits_;
   }
+  // Whether a count stops once it covers its walk's need (reach) and a take
+  // of its first phase takes steps up to the claim's lack, as they do; off,
+  // a count counts all its walk reaches and a take takes one step (tests
+  // compare the two).
+  void boundCounts(bool bounded) noexcept { countsBounded_ = bounded; }
+  // Tests: a walk that resumes within a take (takeOldest) also walks from
+  // the head and throws std::logic_error where the two give different units.
+  void checkResumes(bool check) noexcept { checkResumes_ = check; }
+  // Tests: each block a tail release's search asks (nextTailRelease) is also
+  // judged by the states within a window below it walked afresh
+  // (unitPoints), std::logic_error where the two differ.
+  void checkTails(bool check) noexcept { checkTails_ = check; }
   // The resident leaves the takes' walks were given (KvCache::leafVisits):
   // the leaves they tried, never the cache.
   [[nodiscard]] uint64_t leafVisits() const noexcept { return kv_.leafVisits(); }
@@ -939,9 +1034,22 @@ public:
   // Tests, between commands: std::logic_error unless the blocks, pages,
   // references and quota keep every invariant spilling relies on.
   void checkInvariants() const;
+  // Window units that went free other than by the releases the walk's
+  // count foresees (releaseState with `counted`): those of a state the quota
+  // gave up for a write's room, of the points a poisoned block or an
+  // unwritable unit takes with it, of a leaf a lost copy takes, and of the
+  // releases with no write in a take after its quota gave up a state or a
+  // copy under one (quotaGaveUpState_).
+  [[nodiscard]] uint64_t unitsFreedElsewhere() const noexcept { return kv_.unitsFreed() - unitsReleased_; }
   // Tests: every reach the reclaim counts take also follows its rule over
   // the whole cache (KvCache::checkReaches).
   void checkReaches(bool check) noexcept { kv_.checkReaches(check); }
+  // Tests: every release of a state frees exactly the window units its
+  // count names (releaseState), std::logic_error otherwise.
+  void checkReleases(bool check) noexcept { checkReleases_ = check; }
+  // Tests: each step of a take's walk checks the answers the cache keeps
+  // (checkKept) before it reads one, as checkInvariants() does after it.
+  void checkKeptAnswers(bool check) noexcept { checkKept_ = check; }
 
 private:
   // A probe reads the KV graph to cut its chain (CacheProbe::matchableChain).
@@ -954,7 +1062,13 @@ private:
   [[nodiscard]] uint32_t stateTokens(std::span<const uint64_t> blocks) const;
 
   struct Request final {
+    // Its blocks' base pages by logical page, and its window tables
+    // (PageTableView::windows): every page of each block it holds.
     std::vector<uint32_t> pages;
+    std::vector<std::vector<uint32_t>> windows;
+    // The first logical page whose window entries it may hold: those before
+    // are absent (cutPageTable).
+    uint32_t windowFrom = 0;
     std::vector<uint64_t> cachedBlocks;
     KvMode mode = KvMode::Resident;
     // The last cut (cutPageTable) and the first page changed since, if any.
@@ -985,27 +1099,49 @@ private:
     uint32_t spillScan = 0;
     uint32_t pendingRestores = 0;
     bool restoreFailed = false;
-    // With a window, the indices of the pages it keeps beside the blocks
-    // there while they are Full: its own, which it wrote while a transfer
-    // moved the block's, and one the block left for the page of a writer
-    // that computed it again (publishCommittedBlocks).
-    std::vector<uint32_t> privatePages;
   };
   // Records a change of the request's page list from index first on.
   static void pagesChanged(Request &active, uint32_t first) noexcept;
-  // With a window, the first of the request's pages the rows of its next
-  // command read: windowPages pages before its published blocks.
+  // The window unit of the request's logical page `index`.
+  [[nodiscard]] static std::vector<uint32_t> windowAt(const Request &active, uint32_t index);
+  // The first logical page a command of the request reads its window from:
+  // windowPages pages before its published blocks end, as its rows lie at
+  // or past them.
   [[nodiscard]] uint32_t windowStart(const Request &active) const noexcept;
+  // The units the blocks of a state's tail that hold none take from the
+  // lane that publishes it (stateTailPresent); none when the lane does not
+  // hold one of them.
+  [[nodiscard]] std::optional<KvCache::TailUnits> tailUnits(uint64_t kvBlock, std::optional<uint64_t> lane) const;
+  // The request holds the block's pages at logical page `index` in place of
+  // its own, which it still holds.
+  void holdBlock(Request &active, uint32_t index, uint64_t block);
   // A page being written to the tier, and what for (WriteClass): a reclaim
   // demotion, whose page frees once the copy lands; a copy persist() writes
   // ahead of need of a page that stays; or a Spill request's page written
   // through, which stays Full until a claim releases it (releasePages), or
   // under --kv-spill always spillWritten moves it.
+  // The parts it writes. A reclaim's write of a unit held for points on the
+  // SSD alone (`unit`) frees that unit as it lands and leaves the block's
+  // base page.
   struct Write final {
     uint64_t block = 0;
     WriteClass write = WriteClass::Reclaim;
     std::unique_ptr<KvTransfer> transfer;
+    kv::Components parts = 0;
     AwakeClock::time_point started = AwakeClock::now();
+    bool unit = false;
+  };
+  // A read of a block's window part into a lane's own unit pages, for the
+  // tail of the point it resumes, apart from the block's transfer: the pages
+  // it keeps where they are until it lands (pagesInTransfer), base page
+  // first, whose extent the tier reads for the block's spans, and the
+  // requests waiting. It holds the unit pages; the base page is the
+  // block's.
+  struct UnitRead final {
+    uint64_t block = 0;
+    std::vector<uint32_t> pages;
+    std::unique_ptr<KvTransfer> transfer;
+    std::vector<uint64_t> waiters;
   };
   struct Restore final {
     // Null until the tier has room for it.
@@ -1057,25 +1193,24 @@ private:
     // extent it empties.
     bool evictedKv = false;
   };
-  // What one reclaim step gave up: a state, whose buffers return to the
-  // model's pool, or a KV leaf, whose memory returns with the extent it
-  // leaves empty.
+  // What one reclaim step gave up: a state's RAM copy, whose buffers return
+  // to the model's pool, or KV, a leaf's or a unit a point on the SSD alone
+  // held, whose memory returns with the extent it leaves empty.
   struct Victim final {
     bool kv = false;
   };
 
   // The units of the walk peek() and take() go over, and the reclaim steps with
   // them (Victim::key holds the unit above the block's id): the empty extents
-  // of the other forms released, for a page need; a windowed cache's trims; a
-  // phase of the reclaims for a device or a page need (takeReclaim, evictOne),
+  // of the other forms released, for a page need; a phase of the reclaims for a device or a page need (takeReclaim, evictOne),
   // whose id holds the phase; a checkpoint in RAM; a KV leaf no state restores
   // through; an ordinary state in RAM or a resident KV leaf, or in a page scan
   // the state in RAM on the leaf that goes next; and the same of what is in
-  // use. peek() gives a state need's states as units of their own, and the
-  // reclaim steps take the leaves.
+  // use; a state whose release frees the window units only it holds
+  // (tailRelease). peek() gives a state need's states as units of their
+  // own, and the reclaim steps take the leaves.
   enum class Unit : uint8_t {
     Extent = 1,
-    Trim,
     Reclaim,
     Checkpoint,
     DeadLeaf,
@@ -1085,7 +1220,15 @@ private:
     UsedState,
     UsedLeaf,
     UsedLeafState,
+    Tail,
+    Unwritten,
   };
+  // The releases of states for their tails' window units, in the order
+  // every claim's walk takes them (the Tails phase): superseded history,
+  // then the points behind the running lanes but each lane's newest, by
+  // recency. A lane's plan prices no tails, so a lane at the wall reaches
+  // its plan's length only by the tails behind it (1.7.3's #824/#842 rule).
+  enum class TailRelease : uint8_t { History, BehindLanes };
   // What a walk goes over: what is in use too with InUse, only the leaves
   // and the states in RAM on them in a page scan, and only states for a
   // state's buffers.
@@ -1103,11 +1246,22 @@ private:
   // waits for the tier the newer leaves of its phase that need one
   // (demotionsHeld).
   struct WalkCursor final {
-    enum class Phase : uint8_t { Checkpoints, DeadLeaves, Ordinary, InUse, Done };
+    enum class Phase : uint8_t { Checkpoints, DeadLeaves, History, Tails, Unwritten, ByUse, InUse, Done };
     Phase phase = Phase::Checkpoints;
+    // A phase by use goes over its items by what their leaving costs, each
+    // pass by recency: what leaves at no loss (lostOnLeaving: a state the SSD
+    // keeps a copy of or its release writes, a leaf with a copy or that a
+    // demotion writes); the running lanes' recovery points, rolling
+    // checkpoints each lane's next one supersedes (recoveryPoint); what is
+    // lost.
+    enum class Pass : uint8_t { NoLoss, Recovery, Lost };
+    Pass pass = Pass::NoLoss;
+    TailRelease tails = TailRelease::History;
     bool started = false;
     bool statesHeld = false;
     bool demotionsHeld = false;
+    // A resumed walk (takeOldest) starts its phase's leaves over.
+    bool restartLeaves = false;
     std::optional<CacheEvictionCandidate> state;
     std::optional<CacheEvictionCandidate> leaf;
     std::optional<Unit> last;
@@ -1163,8 +1317,12 @@ private:
     bool inPlace = false;
     bool statesAreUnits = false;
     uint32_t pages = 0;
+    // A device need's bytes, and its pages in place: what a count covers
+    // before it stops (Cache::reach).
+    uint64_t bytes = 0;
+    uint32_t inPlacePages = 0;
     kv::PageForm form = kv::PageForm::Full;
-    std::array<uint32_t, 3> keptPages{};
+    std::array<uint32_t, kv::kPageForms> keptPages{};
     bool hostRefused = false;
     friend bool operator==(const Walk &, const Walk &) = default;
     // Whether it keeps the state at `block`, or the KV block, of a chain.
@@ -1226,6 +1384,151 @@ private:
   // The state is of certain reuse beside what is in use: the resume point,
   // a wanted chain's state.
   [[nodiscard]] bool certainReuse(uint64_t block) const;
+  // The ordinary state in RAM is history whose leaving writes nothing
+  // (releaseMode): a deeper state superseded it, and it has a complete copy,
+  // the tier takes no writes, or sparse history leaves it unwritten. A walk
+  // reaches it before any state nothing superseded (the History phase);
+  // history that sparse history writes leaves by use, as a point does.
+  [[nodiscard]] bool freeHistory(uint64_t block, const std::unordered_set<uint64_t> &gone = {}) const;
+  // Sparse history: a superseded point no request uses, leaving memory
+  // without a complete SSD copy of its own (its state's and its tail's
+  // window parts landed), is written where no point of its chain below it
+  // within the spacing (sparseHistoryTokens) has a copy that stays
+  // (copiedBelow): a chain's first point, and then one point past the
+  // spacing from the last, so a go-back recomputes at most about the
+  // spacing. Its writes go at history's worth (writeWorth), its tail's
+  // window parts written as transfers are polled (writeWindowsAhead). Else it
+  // leaves unwritten, early, as its leaving frees memory now and writes
+  // nothing. A
+  // superseded point with a complete copy leaves memory with no write, its
+  // copy staying. `below`: the point copiedBelow gives, where the caller
+  // has it.
+  [[nodiscard]] bool historyWritten(uint64_t block, const std::unordered_set<uint64_t> &gone = {},
+                                    const uint64_t *below = nullptr) const;
+  // The one predicate on a point's SSD copy, which the release mode, the
+  // tails and sparse history read: whether its copy stays as it leaves
+  // memory. A state in RAM keeps or writes its copy where keptLeaving says;
+  // a point on the SSD alone whose window parts have not landed is kept on
+  // the same terms, else the tails give it up for its units with its copy.
+  // It answers alike before and after the point's own release.
+  [[nodiscard]] bool copyStays(uint64_t block, const std::unordered_set<uint64_t> &gone = {},
+                               const uint64_t *below = nullptr) const;
+  // Whether a point whose leaving writes (`writes`, its tail's window parts
+  // among them: `window`) keeps its copy: a copy whose parts landed stays in
+  // every mode (it writes nothing), so a persistent tier's landed point is
+  // never lost; where the KV tier takes no writes no window part is
+  // written; history no request uses is written only where sparse history
+  // writes it (historyWritten), and lacking window parts it is kept in RAM,
+  // whose release queues them, and on the SSD alone while they are queued
+  // (windowsAhead_), else the tails take it.
+  [[nodiscard]] bool keptLeaving(uint64_t block, const std::unordered_set<uint64_t> &gone, bool writes,
+                                 const uint64_t *below) const;
+
+  // The state's leaving loses it: the SSD holds no copy, and its release
+  // would not write one.
+  [[nodiscard]] bool lostOnLeaving(uint64_t block) const;
+  // The walk's History phase (`history`) or its Ordinary phase takes the
+  // ordinary state in RAM: lost history in the one, none in the other, and
+  // only where it serves the need or, ordinary, no state in RAM below it
+  // keeps its chain. Of a count, against the pins its releases took off
+  // (`gone`) and the RAM copies they took (`released`).
+  [[nodiscard]] bool ordinaryTakes(const Walk &walk, uint64_t block, bool history,
+                                   const std::unordered_set<uint64_t> &released = {},
+                                   const KvCache::Gone &gone = {},
+                                   const std::unordered_set<uint64_t> &evicted = {}) const;
+  // The checkpoint is a running lane's recovery point: on a page a request
+  // holds, no deeper state superseded it, and a reclaim would drop it, not
+  // write it. It is no disposable checkpoint (Checkpoints) but goes by use,
+  // after what leaves at no loss and before what else is lost
+  // (WalkCursor::Pass): where the tier writes the ordinary class, a lane at
+  // the wall no longer evicts each reply checkpoint it just captured (62
+  // published and 61 evicted over a 2,000-token reply, #818); where nothing
+  // is written, a lane's rolling checkpoint, which its next supersedes, goes
+  // before an idle conversation's newest state, as 1.7.3 took checkpoints.
+  [[nodiscard]] bool recoveryPoint(uint64_t block) const;
+  // The walk's phase after `phase`.
+  [[nodiscard]] WalkCursor::Phase phaseAfter(const Walk &walk, WalkCursor::Phase phase) const;
+  // The one worth of a point's write the release mode, a state's write and
+  // a unit's window parts' write read (DiskWorth).
+  using Worth = DiskWorth;
+  [[nodiscard]] Worth writeWorth(uint64_t block, const std::unordered_set<uint64_t> &gone = {}) const;
+  // How every release takes a state (reclaimState, the tails, the count):
+  // demoted, its RAM copy leaving through its SSD copy or the staging
+  // buffer's write and its tail's units as their window parts are written,
+  // where its copy stays (keptLeaving); or evicted with its copy. Whether
+  // it writes anything (then only a walk that writes and waits takes it),
+  // and at what worth. With the states a count of releases took before
+  // (`gone`).
+  struct ReleaseMode final {
+    bool evict = false;
+    bool writes = false;
+    Worth worth;
+  };
+  [[nodiscard]] ReleaseMode releaseMode(uint64_t block, const std::unordered_set<uint64_t> &gone = {},
+                                        const uint64_t *below = nullptr) const;
+  [[nodiscard]] KvCache::PinRelease pinRelease(uint64_t block, bool evict) const;
+  // The next state past `after`, oldest first, that a release of tails
+  // takes at the stage: of the states it may take (the checkpoints, the
+  // ordinary states and the only copies on the SSD, none in use, pinned,
+  // kept by the walk or `released` already; at History the superseded ones,
+  // behind the lanes all but each running lane's newest), one whose tail
+  // holds a block every pin in memory left on which,
+  // beside those `gone`, is such a state's, whose unit then frees or, for a
+  // walk that writes and waits, is left to the write of its window part,
+  // the block's unit idle and, behind the lanes, its base page a lane's.
+  // What the walk gives (nextUnit) and what its count releases
+  // (releasedUnits) alike; it judges the states it reaches and those whose
+  // tails share a block with theirs, not the whole cache.
+  [[nodiscard]] std::optional<CacheEvictionCandidate>
+  nextTailRelease(const Walk &walk, TailRelease stage, const std::optional<CacheEvictionCandidate> &after,
+                  const std::unordered_set<uint64_t> &released, const std::unordered_set<uint64_t> &evicted,
+                  const KvCache::Gone &gone) const;
+  // The blocks whose units the releases of states a walk of the class
+  // makes with no write free, each at the release that takes its last pin
+  // (KvCache::freedBy), in the walk's order (phaseAfter) and as its phases
+  // take them: checkpoints, history, tails, ordinary states and recovery
+  // points (these first where the tier takes no writes), and what is in use
+  // that leave with no copy (now), and the states those releases take; those the `staged`
+  // state's write frees as it starts (staged); and for a walk that writes and
+  // waits, those the tails' demotions and the states that wait for the
+  // staging buffer free as their writes start or land (written). None
+  // without a window unit, and so in no page scan (walkFor).
+  struct ReleasedUnits final {
+    std::vector<uint64_t> now;
+    std::unordered_set<uint64_t> states;
+    std::vector<uint64_t> staged;
+    std::vector<uint64_t> written;
+  };
+  // The releases a count simulates, in the walk's order, until `enough`
+  // says the units they free so far cover the walk's need (asked before the
+  // first and after the 1st, 4th, 16th ... release), or to the end.
+  [[nodiscard]] ReleasedUnits releasedUnits(const Walk &walk, ReclaimClass upTo, uint64_t staged,
+                                            const std::function<bool(const ReleasedUnits &)> &enough = {}) const;
+  // A release of the state at the block, by eviction or reclaim, which
+  // frees exactly the units KvCache::freedBy names now (checkReleases):
+  // every state the cache gives up leaves through it, the walk's, those a
+  // lost leaf takes with it (reclaimKvLeaf, dropDiskSubtree), and with
+  // `counted` false those no count foresees: the quota's give-ups for a
+  // write's room (freeDiskSpace), the points a poisoned block or an
+  // unwritable unit takes with it (dropPoisoned, dropUnitPoints) and a lost
+  // copy's leaf (evictStateOnDiskLeaf), whose units are freed elsewhere.
+  [[nodiscard]] StateEviction releaseState(uint64_t block, bool evict, bool counted = true);
+  // Starts the writes of the window parts of units held for points on the
+  // SSD alone, those a release left so or unwrittenUnit ones: Started, or
+  // as demoteKv says what holds it back.
+  [[nodiscard]] LeafReclaim writeUnit(const Walk &walk, uint64_t block);
+  // Gives up the points on the SSD whose tails hold an unwritten unit, and
+  // with them the unit, where the walk takes the unit (unitTakes); whether
+  // the unit went.
+  [[nodiscard]] bool dropUnitPoints(const Walk &walk, uint64_t block);
+  // The states at the block and below it within a window, whose tails hold
+  // it; whether the walk takes the block's unwritten unit, every one of them
+  // a point it may give up should the write find no room (none in use for a
+  // class short of InUse, pinned or kept); the unwritten units it does not
+  // take, which its reach leaves out.
+  [[nodiscard]] std::vector<uint64_t> unitPoints(uint64_t block) const;
+  [[nodiscard]] bool unitTakes(const Walk &walk, uint64_t block) const;
+  [[nodiscard]] std::vector<uint64_t> unitsKept(const Walk &walk) const;
   // What a walk does with the RAM copy of a state it reaches, the one rule
   // every step and count of the walk follows (holdAfter, reclaimState,
   // victimOf, reach through StateCache::reclaims, recycleState): passes it
@@ -1243,7 +1546,8 @@ private:
     When when = When::Now;
     bool write = false;
   };
-  [[nodiscard]] StateReclaim stateReclaim(const Walk &walk, uint64_t block, uint64_t staged = 0) const;
+  [[nodiscard]] StateReclaim stateReclaim(const Walk &walk, uint64_t block, uint64_t staged = 0,
+                                          const std::unordered_set<uint64_t> &gone = {}) const;
   // The states a walk keeps beside those in use, which it passes over: the
   // resume point while it keeps it and the states the chains it keeps
   // restore from.
@@ -1286,8 +1590,7 @@ private:
   // landing. For a walk that can wait, now and written count too the
   // extents landing pages complete beside the pages then free, with the
   // landings that taking a state in RAM lets free, as its takes credit them
-  // (Cache::take). A page walk that trims also frees the Full pages it
-  // moves into Slim ones. States: the RAM copies the walk takes, now those
+  // (Cache::take). States: the RAM copies the walk takes, now those
   // that need no write; written the first that needs one, while no write
   // holds the staging buffer, which frees at once; later the others, which
   // wait for that buffer (StateCache::reclaims). The counts cost the chains
@@ -1306,6 +1609,16 @@ private:
     [[nodiscard]] const Amount &of(ReclaimPhase phase) const noexcept;
   };
   [[nodiscard]] ReclaimReach reach(const Walk &walk, ReclaimClass upTo) const;
+  // One reclaim of the phase for a take of its unit (Cache::take), which
+  // settles what lands over all its steps.
+  [[nodiscard]] FreeResult reclaimStep(const Walk &walk, ReclaimPhase phase);
+  // The most one reclaim frees in the walk's measure: pages, or a device
+  // need's bytes.
+  [[nodiscard]] uint64_t stepMost(const Walk &walk) const;
+  // The most pages taking the unit frees now: a leaf's page and unit; a
+  // state's release the units it frees (KvCache::freedBy, released or
+  // demoted) and, on a resident leaf, the leaf's.
+  [[nodiscard]] uint64_t unitMost(const WalkUnit &unit) const;
   // The walk of a phase: of its class; Immediate but for what frees as
   // writes land; no write for what frees with none.
   [[nodiscard]] Walk phaseWalk(const Walk &walk, ReclaimPhase phase) const;
@@ -1355,6 +1668,9 @@ private:
   // transfersInFlight() as the walk's takes wait for it: of the copies
   // ahead, those that return to the walk.
   [[nodiscard]] bool transfersInFlight(const Walk &walk) const noexcept;
+  // A write in flight frees a unit as it lands, whatever its class
+  // (KvCache::unitLeaving).
+  [[nodiscard]] bool unitsLanding() const noexcept;
   // A copy persist() writes frees nothing as it lands: its page stays, as
   // does a Spill request's once no request holds its block. Until then it
   // holds its block out of every order, and every block above it.
@@ -1386,7 +1702,8 @@ private:
   // scan has no checkpoints. A step that finds nothing reports pending while
   // a transfer in flight can return what is needed (returns). With `reach`,
   // a leaf goes only where it leads to an extent in reach (takeOldest).
-  [[nodiscard]] ReclaimResult evictOne(const Walk &walk, std::optional<std::array<bool, 3>> reach = std::nullopt);
+  [[nodiscard]] ReclaimResult evictOne(const Walk &walk,
+                                       std::optional<std::array<bool, kv::kPageForms>> reach = std::nullopt);
   // The units of the walk, each taken in turn until one goes, which it returns.
   // One that waits for a transfer in flight leaves the others to go: a
   // checkpoint ends the checkpoints, a state holds back the newer states of its
@@ -1394,12 +1711,12 @@ private:
   // class that need one stay. Nothing once all stay. With `reach`, the forms
   // whose extents evicting KV may still empty (formsInReach), a leaf that leads
   // to none of them (leadsToReach) frees no memory, and the walk passes over
-  // it.
-  [[nodiscard]] std::optional<Victim> takeOldest(const Walk &walk, std::optional<std::array<bool, 3>> reach);
-  // The first state of the walk, of states alone, goes as the walk says: the
-  // oldest checkpoint, else the oldest ordinary state, then, up to InUse, a
-  // state in use. A state that needs a write the walk passes over leaves the
-  // next.
+  // it. `waited`: a unit waited for a transfer in flight.
+  [[nodiscard]] std::optional<Victim> takeOldest(const Walk &walk,
+                                                 std::optional<std::array<bool, kv::kPageForms>> reach, bool &waited);
+  // The state the walk's count staged (stagedState) goes through the idle
+  // staging buffer's write, as the walk says (reclaimState): the count and
+  // the take of the Written phase name one state.
   [[nodiscard]] ReclaimResult recycleState(const Walk &walk);
   // One memory reclaim of a unit of the walk, which began with `demotions`
   // pages held by the demotions in flight (demotionPages) and the landing
@@ -1408,8 +1725,8 @@ private:
   // (formsInReach), the walk's victims, its leaves that lead to such a form
   // alone (leadsToReach), until one is released, the landing pages fill one
   // more, a need of pages (Walk::inPlace) has one more page of its form, or
-  // a state goes; otherwise a state (recycleState).
-  [[nodiscard]] ReclaimResult takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
+  // a state goes; otherwise a state of the walk, its leaves passed over.
+  [[nodiscard]] ReclaimResult takeReclaim(const Walk &walk, const std::array<uint32_t, kv::kPageForms> &demotions,
                                           uint64_t fillBefore);
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
   // one, by demotion when a state on it or below it depends on it, by
@@ -1420,6 +1737,14 @@ private:
   // Immediate passes over a leaf that needs a demotion.
   [[nodiscard]] LeafReclaim reclaimKvLeaf(const Walk &walk, uint64_t block, ReclaimTiming timing);
   [[nodiscard]] LeafReclaim demoteKv(const Walk &walk, uint64_t block);
+  // Starts the write of the block's parts into `slot`, acquired for them,
+  // into the block's copy where `into`; false, the parts given back
+  // (giveSlotBack), when the tier refuses it.
+  [[nodiscard]] bool startKvWrite(uint64_t block, std::shared_ptr<KvDiskSlot> slot, kv::Components parts, bool into,
+                                  WriteClass write, bool unit = false);
+  // The parts a write acquired into the block's copy (`into`) and did not
+  // start go back, else the copy counts them taken and never written.
+  void giveSlotBack(const std::shared_ptr<KvDiskSlot> &slot, kv::Components parts, bool into);
   // Only a state restores a disk-only chain, through its own block and every
   // block above.
   [[nodiscard]] bool kvNeededByState(uint64_t block) const {
@@ -1431,49 +1756,90 @@ private:
   }
   // Erases the disk-only subtree below a resident leaf and the states on it,
   // in use or not; false, erasing nothing, while a block of it is in transfer
-  // or active (a lookup holding a state keeps its block active) or a state
-  // write is in flight.
+  // or active (a lookup holding a state keeps its block active) or the state
+  // write in flight is of a block in it.
   [[nodiscard]] bool dropDiskSubtree(uint64_t block);
   // Nothing below a block whose read failed matches any more. Once none of
   // it is in transfer or active, it is erased with the states on it, in use
   // or not, and the poisoned block leaves once nothing refers to it: with its
   // last user, or here once a transfer that held it has landed.
   void dropPoisoned();
+  // Starts the writes of the window parts of the points sparse history keeps
+  // (windowsAhead_), each unit of their tails not yet under way, and lets go
+  // of a point whose parts landed, that left, or one of whose units the tier
+  // cannot take: the tails then take it for its units.
+  void writeWindowsAhead();
   // The KV tier's part of pollTransfers().
   [[nodiscard]] bool pollTierTransfers();
-  // A slot for a new KV copy of a page of the form, replacing older copies
-  // while the tier's limit for the draw has no room for it, and none while
-  // that limit cannot hold it; inUse when a state in use needs the copy. A
-  // committed page's draw replaces the spilled chain of a state in RAM too,
-  // once nothing else is left.
-  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(kv::PageForm form, model::DiskBudget::Draw draw,
-                                                            bool inUse);
-  // Gives up one disk copy for a new copy, in use or not: the oldest
-  // redundant one, KV or state, else the oldest that is the only copy, never
-  // the KV of a state in RAM. The only copy of a state in use, and the KV
-  // it restores through, go only for a copy in use, and after every other.
-  // The only copy of what is of certain reuse (reusedCopy) goes only for a
-  // Spill lane's active KV (`active`). False when the disk holds nothing the
-  // new copy may displace.
-  // In a persistent tier a redundant copy is what the next process takes
-  // back, and the unit worth keeping is a restore point, a state on disk and
-  // its chain. A KV copy no state needs goes first, then the oldest state
-  // copy, redundant or not: the copies of its chain that no other state
-  // needs become unneeded and go on later calls, so a chain stays whole
-  // while a state on disk needs it. A state in RAM needs only the copies
-  // that hold the only K/V of its chain's blocks: a redundant copy goes
-  // once no state on disk restores through it.
-  [[nodiscard]] bool freeDiskSpace(bool inUse, bool active);
+  // A new KV copy of a block, a slot for each of its parts, replacing older
+  // copies while the tier's limit for the draw has no room for them (the SSD
+  // order, freeDiskSpace), and none while that limit cannot hold them;
+  // inUse when a state in use needs the copy. A committed page's draw
+  // replaces the spilled chain of a state in RAM too, once nothing else is
+  // left. worth: what the copy is worth (freeDiskSpace).
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(kv::Components parts, model::DiskBudget::Draw draw,
+                                                            bool inUse, bool ahead = false,
+                                                            const std::shared_ptr<KvDiskSlot> &into = {},
+                                                            Worth worth = {});
+  // The SSD order, one for both tiers. A give-up's rank is what it loses;
+  // within a rank the oldest goes first, a copy's age its conversation's
+  // last use: the later of its block's or state's use and the last restore
+  // through it (KvCache::refreshCopies, StateCache::refreshCopy).
+  //   0  nothing: a window part or a K/V copy no point on the SSD needs
+  //   1  a rewrite or a far go-back: history, and the copies of what memory
+  //      holds, state or K/V, in one order
+  //   2  a hit: a point's only copy, its state's (its chain's copies then
+  //      need nothing: rank 0)
+  //   3  a request: the only copy of a state in use
+  // A room request takes only what is worth less than what it writes (its
+  // Worth: the rank of what it writes and its last use, writeWorth):
+  //   a copy ahead (persistent), of what  rank 0 and history
+  //   memory holds
+  //   a point's only copy (a demotion, a   ranks 0-1, and the points used
+  //   state's write; rank 2)               before it (Worth::lastUse)
+  //   history's copy (rank 1: what sparse  rank 0, and the rank-1 copies
+  //   history writes)                      used before it
+  //   a Spill lane's active KV (`active`), every point
+  //   the limit as it shrinks (anyPoint)
+  //   a copy in use (`inUse`)              rank 3 too
+  // With nothing worth less left the write is refused, and its item leaves
+  // without a copy (quotaRefused_). Never given up for a copy: the state the
+  // resume point or a queued request restores (certainReuse), and so the K/V
+  // copies it restores through, nor what a running request uses; only a
+  // running lane's active KV takes them. A state on the SSD is history
+  // (diskHistory) when a deeper state of its chain supersedes it and holds an
+  // SSD copy itself. False when nothing the new copy may displace is left.
+  // No dry sum checks ahead that the victims below the bound cover a write:
+  // a conversation's chain on the SSD frees only after its tip has gone, so
+  // a sum over the orders would see one copy where giving way frees the
+  // chain.
+  static constexpr uint64_t anyPoint = std::numeric_limits<uint64_t>::max();
+  [[nodiscard]] bool freeDiskSpace(bool inUse, bool active, bool ahead = false, Worth worth = {});
   // freeDiskSpace's choice: the copy it gives up next.
-  enum class DiskVictim : uint8_t { KvCopy, StateCopy, KvLeaf, StateOnly, StateInUse };
+  enum class DiskVictim : uint8_t { WindowPart, KvCopy, StateCopy, StateOnly, StateInUse };
+  static_assert(static_cast<size_t>(DiskVictim::StateInUse) + 1 == std::tuple_size_v<decltype(KvTierSnapshot::quotaGivenUp)>);
   struct DiskReplacement final {
     DiskVictim kind;
     CacheEvictionCandidate at;
   };
-  [[nodiscard]] std::optional<DiskReplacement> nextDiskReplacement(bool inUse, bool active) const;
-  // A disk copy of certain reuse: the resume point's or a queued request's
-  // state, and a KV block on a queued request's chain.
-  [[nodiscard]] bool reusedCopy(uint64_t block, bool state) const;
+  // Its answer: the next victim, or refused when a point is left and none
+  // was used before what the write holds.
+  struct DiskChoice final {
+    std::optional<DiskReplacement> next;
+    bool refused = false;
+  };
+  [[nodiscard]] DiskChoice nextDiskReplacement(bool inUse, bool active, bool ahead = false, Worth worth = {}) const;
+  // History on the SSD: superseded, by a deeper state of its chain that
+  // holds an SSD copy (freeDiskSpace's table).
+  [[nodiscard]] bool diskHistory(uint64_t block) const;
+  // A persistent tier's copy of a block a state lies at or below: a point
+  // a restart takes back may restore through it.
+  [[nodiscard]] bool copyUnderState(uint64_t block) const {
+    return persistent_ && (states_.contains(block) || kv_.stateBelow(block));
+  }
+  // The oldest window part no state's disk copy needs (KvCache::
+  // unneededWindowCandidate) that no lane's read holds (unitReads_).
+  [[nodiscard]] std::optional<CacheEvictionCandidate> unneededWindow() const;
   // Evicts the state in RAM, not in use, of the oldest disk leaf holding
   // one, as a spilled leaf can: the leaf and the chain above it become
   // copies freeDiskSpace gives up. False when no disk leaf holds one.
@@ -1483,13 +1849,35 @@ private:
   // exceed what active KV leaves of the limit; returns how many copies went.
   uint32_t fitDiskLimit();
   // A persistent tier's label for the block's disk copy.
-  void labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot);
-  // Ordinary states below the block sit on exactly one of its branches.
-  [[nodiscard]] bool superseded(uint64_t block) const;
-  // What a copy of the block takes of the quota: its slot's bytes, or
-  // without a copy what a slot of its page's form takes; nothing for a block
-  // with neither, which holds nothing to write.
-  [[nodiscard]] uint64_t copyBytes(uint64_t block) const;
+  void labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot, kv::Components parts);
+  // The parts a write gives the block's copy, of those `want` names (all by
+  // default), a copy holding what its block holds: those its pages hold that
+  // its own copy lacks, into it (`into`); beside a copy of another command's
+  // K/V, all of them in a new copy.
+  static constexpr kv::Components kAnyParts = 0xff;
+  struct CopyParts final {
+    kv::Components parts = 0;
+    std::shared_ptr<KvDiskSlot> into;
+  };
+  [[nodiscard]] CopyParts copyParts(uint64_t block, kv::Components want = kAnyParts) const;
+  // A state at the block is history: of the states below it that supersede
+  // it, the nearest down each path, there is exactly one, and no running
+  // request still resumes from the block (its chain ends before that state,
+  // or its pages are on a path that holds none). With none below, it is a
+  // conversation's newest; with two, conversations parted below it, and it
+  // serves each of them. A prompt's head (noteHead) is history only behind
+  // a deeper head alone, and a reply's end no prompt rendered through once
+  // a prompt left its reply another way.
+  [[nodiscard]] bool superseded(uint64_t block, const std::unordered_set<uint64_t> &gone = {}) const;
+  // What a copy of the block takes of the quota once it has the parts of
+  // `want` its pages hold: its slot's bytes and those parts' it lacks;
+  // nothing for a disk-only block without a copy, which holds nothing to
+  // write.
+  [[nodiscard]] uint64_t copyBytes(uint64_t block, kv::Components want = kAnyParts) const;
+  // The parts a point's copy gives the block at `index` of its chain of
+  // `blocks`: the base part, and on a persistent tier, whose restart needs
+  // it, the window part of a block of its tail.
+  [[nodiscard]] kv::Components pointParts(size_t index, size_t blocks) const noexcept;
   // The point persist() copies: its chain, root first, how many of its
   // blocks from the root have a copy that landed, and what the chain's
   // copies take of the quota, those still to write by their pages' forms as
@@ -1513,9 +1901,10 @@ private:
   // full quota gives those up as well. Without a disk budget the tier's
   // slots bound it.
   [[nodiscard]] bool pointFits(const PersistCursor &point) const;
-  // An ordinary state at the block or anywhere below it.
-  [[nodiscard]] bool holdsOrdinaryState(uint64_t block) const;
   void startRestore(uint64_t block);
+  // Starts a read of the block's window part into `pages`, the unit of the
+  // request that waits for it (UnitRead).
+  void startUnitRead(uint64_t block, std::span<const uint32_t> pages, uint64_t requestId);
   // By form, whether evicting the walk's KV may empty an extent
   // (Walk::reaches): of the pages its class may reuse (reusablePages), the
   // `demoting` pages a unit found in flight and the runway the walk keeps
@@ -1527,21 +1916,22 @@ private:
   // can leave past its free pages and the pages all demotions in flight
   // bring, this take's included: each page that leaves meets the need in
   // place, as reach() counts it, with no extent emptied.
-  [[nodiscard]] std::array<bool, 3> formsInReach(const Walk &walk, const std::array<uint32_t, 3> &demoting) const;
+  [[nodiscard]] std::array<bool, kv::kPageForms> formsInReach(
+      const Walk &walk, const std::array<uint32_t, kv::kPageForms> &demoting) const;
   // Evicting the resident leaf may lead to an extent of a form in `reach`
   // emptying: its page is of such a form, or the page of a block above it,
   // which may become a leaf once the leaf has gone, as a spilled chain's
-  // Index pages above its Full tail and a windowed one's Slim pages above its
-  // window do.
-  [[nodiscard]] bool leadsToReach(uint64_t block, const std::array<bool, 3> &reach) const;
-  // The extents `landing` pages of the form complete beside its free pages,
-  // past the runway the walk keeps.
+  // Index pages above its Full tail do.
+  [[nodiscard]] bool leadsToReach(uint64_t block, const std::array<bool, kv::kPageForms> &reach) const;
+  // The extents `landing` pages of the form complete beside its free pages
+  // past those the walk keeps (Walk::keptPages, which its claim takes in
+  // place), past the runway it keeps.
   [[nodiscard]] uint32_t landingExtents(const Walk &walk, kv::PageForm form, uint32_t landing) const noexcept;
   // The bytes of the extents the pages of the demotions landing complete
   // (landingExtents); none for a walk that cannot wait. A reclaim gives
   // what it releases now and what it adds to this.
   [[nodiscard]] uint64_t landingFill(const Walk &walk) const noexcept;
-  // For a shortfall of pages of the form in a cache that spills or trims:
+  // For a shortfall of pages of the form in a cache that spills:
   // the empty extents of the other forms beyond the runway each keeps, and
   // for Index pages, when none is, a Full extent compaction empties (the Full
   // pages spills freed fund the next Index extent). Returns the bytes
@@ -1568,10 +1958,10 @@ private:
   [[nodiscard]] std::shared_ptr<const model::KvPageSources>
   cutSources(const Request &active) const;
 
-  // Spilling (a cache with a spill policy). Its pages keep every layer (the
-  // constructor), so a page a request commits quota for is written whole
-  // and takes a Full page's slot, as each copy its chain already has does.
-  [[nodiscard]] uint64_t spillSlotBytes() const { return tier_->slotBytes(kv::PageForm::Full); }
+  // Spilling (a cache with a spill policy). A page a request commits quota
+  // for is written whole and takes a slot, as each copy its chain already
+  // has does.
+  [[nodiscard]] uint64_t spillSlotBytes() const { return tier_->slotBytes(parts_); }
   [[nodiscard]] uint64_t heldSlotBytes() const noexcept { return kv_.heldCopyBytes(); }
   // A Spill request's commitment: locks quota for `pages` slots; false,
   // committing nothing, when active KV's limit cannot hold them beside
@@ -1605,6 +1995,9 @@ private:
   [[nodiscard]] Eligibility spillEligibility(uint64_t block, const ReleaseRule &rule = {}) const;
   // Writes of the class in flight.
   [[nodiscard]] uint32_t writes(WriteClass write) const noexcept;
+  // The pages a reclaim write frees as it lands, at most: a unit write's
+  // unit, another's block.
+  [[nodiscard]] uint32_t writePages(const Write &write) const;
   // Pages Spill requests hold, written through or copied ahead, whose Full
   // pages free as their copies land under --kv-spill always (spillsOnLanding).
   [[nodiscard]] uint32_t spillingWrites() const noexcept;
@@ -1623,7 +2016,7 @@ private:
   // copies land (freesOnLanding), each judged on those started before it.
   [[nodiscard]] std::unordered_set<uint64_t> freeingDemotions() const;
   // The pages the demotions in flight hold, by form.
-  [[nodiscard]] std::array<uint32_t, 3> demotionPages() const noexcept;
+  [[nodiscard]] std::array<uint32_t, kv::kPageForms> demotionPages() const noexcept;
   // The bytes of the whole extents `pages` pages add to the free pages of
   // their form and `beside` more pages that free before them (Returning),
   // past the empty one a runway keeps with keepRunway.
@@ -1661,47 +2054,165 @@ private:
                                                uint32_t claimed = 0);
   // The copy of the K/V on an Index page.
   [[nodiscard]] model::KvPageSource sourceOf(uint32_t page) const;
-  // Every request that holds the page, at chain index `index`, has
-  // published the window's pages past it.
-  [[nodiscard]] bool windowsPassed(uint32_t page, uint32_t index) const;
-  // The pages of the cached blocks every window has passed, whose windowed
-  // layers trimming takes, oldest first, the `most` oldest (trimWindows); and
-  // their count, the trim candidates but those a window reads: it scans each
-  // running request's pages from its window's start (windowStart) to its
-  // last, a cost the running requests bound, not the cache.
-  [[nodiscard]] std::vector<uint32_t> trimmablePages(size_t most) const;
-  [[nodiscard]] uint32_t trimmableCount() const;
-  // The states behind the lanes leave, in RAM or on the SSD with their
-  // copies, oldest first: each whose tail holds a page a running request
-  // holds a window behind it, which the plan counts Slim
-  // (kvWindowFloorPages), and no state that stays holds too, until `pages`
-  // such pages wait for a trim. The resume point, what a waiting request
-  // restores (certainReuse), a state a request uses and, of each running
-  // request's chain, the head-most state and the newest stay. A prompt that
-  // matched a state gone resumes at one before it (KvCache::insert).
-  void releaseTails(uint32_t pages);
-  // The pages requests keep beside their blocks that are Full and every
-  // window has passed, each once, sorted: those trimWindows moves of them.
-  [[nodiscard]] std::vector<uint32_t> passedKeptPages() const;
-  // The Full pages trimWindows(false) moves to the Slim form as many free
-  // Slim pages allow: those every window has passed (trimmableCount, which
-  // checkInvariants checks against trimmablePages) and the kept ones
-  // (passedKeptPages).
-  [[nodiscard]] uint32_t passedPages() const;
-  // A page need of Full pages in a windowed cache that trims: trims free
-  // pages in place for it, the passed pages first (its Trim unit, peek: as
-  // many as the free Slim pages take, since no take allocates, a ledger take
-  // running outside any allocation's scope), then, after a state that goes,
-  // the passed pages and the tail it unpins (reach).
-  [[nodiscard]] bool trims(const Walk &walk) const noexcept;
-
   KvPool &pool_;
   KvTier *tier_;
+  // The parts of every copy: each of the tier's components.
+  kv::Components parts_ = 0;
+  // The serial of the last copy labelled, which every later one exceeds,
+  // continued after those an earlier process recorded (KvSlotLabel).
+  uint64_t copySerial_ = 0;
   std::optional<CacheSpillPolicy> spill_;
   bool persistent_;
   std::optional<CacheWindowPolicy> window_;
+  uint64_t refusedStates_ = 0;
+  mutable uint64_t searchVisits_ = 0;
+  // The answers of superseded() within one count of releases
+  // (releasedUnits), against the set of states its releases evicted
+  // (`gone`): the count asks of each candidate at each of its steps, which
+  // asked afresh is quadratic in what the cache holds. A state the count
+  // evicts changes the answer of the states above it up to the nearest
+  // that ends their searches (stopsSearch); of each, where that walk ended
+  // and the states it passed, so that the next walk through it goes on from
+  // there.
+  struct SupersededMemo final {
+    struct Walked final {
+      uint64_t stop = 0;
+      std::vector<uint64_t> passed;
+    };
+    const std::unordered_set<uint64_t> *gone = nullptr;
+    std::unordered_set<uint64_t> seen;
+    std::unordered_map<uint64_t, bool> answers;
+    std::unordered_map<uint64_t, Walked> walked;
+    // The states gone and those their walks passed: any other's answer is
+    // the one the cache keeps against no state gone (history_).
+    std::unordered_set<uint64_t> passed;
+    // The states whose RAM copy a release of the count took while their disk
+    // copies stay: from then on points only on the SSD, as the walk sees
+    // them once that release is taken (tailCandidates offers them so).
+    std::unordered_set<uint64_t> demoted;
+    // Of each block asked, whether the base part of every block of its chain
+    // has landed (pointLanded), which does not change within a count.
+    std::unordered_map<uint64_t, bool> chainLanded;
+    // Of each point asked, whether its tail's window parts have landed
+    // (tailLanded), which does not change within a count either.
+    std::unordered_map<uint64_t, bool> tailLanded;
+    // Of each block asked, the point sparse history spaces its writes from
+    // (copiedBelow).
+    std::unordered_map<uint64_t, uint64_t> copied;
+  };
+  // A release of the count in hand took the state's RAM copy and kept its
+  // disk copy (SupersededMemo::demoted).
+  [[nodiscard]] bool countDemoted(uint64_t block) const {
+    return supersededMemo_ && supersededMemo_->demoted.contains(block);
+  }
+  // Takes the memo's answers back for the states `gone` gained since.
+  void followGone(SupersededMemo &memo, const std::unordered_set<uint64_t> &gone) const;
+  // The base part of every block of the chain ending at the block has
+  // landed.
+  [[nodiscard]] bool chainLanded(uint64_t block) const;
+  // A state below the block that is not of `gone`.
+  [[nodiscard]] bool stateBelow(uint64_t block, const std::unordered_set<uint64_t> &gone) const;
+  // An ordinary state that ends every search of superseded() that meets it,
+  // whatever it starts from.
+  [[nodiscard]] bool stopsSearch(uint64_t block, const std::unordered_set<uint64_t> &gone) const;
+  mutable SupersededMemo *supersededMemo_ = nullptr;
+  bool countsBounded_ = true;
+  bool checkKept_ = false;
+  // Each answer the cache keeps is the one asked afresh now
+  // (std::logic_error otherwise).
+  void checkKept() const;
+  bool checkResumes_ = false;
+  bool checkTails_ = false;
+  bool checkReleases_ = false;
+  // Where the next walk of the take in hand may start (takeOldest): the
+  // cursor of the leaf the last walk took, for the same walk and forms in
+  // reach, its parent and the states then held.
+  struct WalkResume final {
+    Walk walk;
+    std::optional<std::array<bool, kv::kPageForms>> reach;
+    WalkCursor cursor;
+    uint64_t parent = 0;
+    size_t states = 0;
+    uint64_t disk = 0;
+  };
+  std::optional<WalkResume> resume_;
+  // The pages a take's next step may still free within its unit's count:
+  // a walk takes no unit that could free more (takeOldest).
+  std::optional<uint64_t> stepBudget_;
+  // A device need in place's steps past its first keep every page they free
+  // (releaseExtent releases none, landingFill credits none): its budget is
+  // in pages, and bytes past its first step no count bounded.
+  bool keepsExtents_ = false;
+  // Calls that may change what the SSD holds or start a write: room made
+  // for a copy (freeDiskSpace), a write started (startKvWrite).
+  uint64_t diskCalls_ = 0;
+  // Holds a memo for what it spans, a peek or a count, where none is held:
+  // the cache does not change meanwhile.
+  struct MemoScope final {
+    const Cache &cache;
+    SupersededMemo memo;
+    bool owns;
+    explicit MemoScope(const Cache &owner) : cache(owner), owns(!owner.supersededMemo_) {
+      if (owns)
+        cache.supersededMemo_ = &memo;
+    }
+    ~MemoScope() {
+      if (owns)
+        cache.supersededMemo_ = nullptr;
+    }
+    MemoScope(const MemoScope &) = delete;
+    MemoScope &operator=(const MemoScope &) = delete;
+  };
+  [[nodiscard]] bool supersededNow(uint64_t block, const std::unordered_set<uint64_t> &gone) const;
+  // The answers of superseded() against no state gone, kept until a change
+  // the cache records at a block (KvCache::historyChanged) can make one
+  // differ: before an answer is read, dropKept() walks up from each block
+  // changed and drops those of the states whose searches reach it. A
+  // reply's end no prompt rendered through is not kept: its answer reads
+  // the blocks beside its own (leftBehind), not those below it.
+  mutable std::unordered_map<uint64_t, bool> history_;
+  // Kept the same way: whether a state's tail holds a unit (tailHoldsUnit).
+  mutable std::unordered_map<uint64_t, bool> tailUnits_;
+  // The nearest point of the block's chain below it, within sparse
+  // history's spacing of it, whose copy stays (copyStays), through those
+  // that leave without one (0 for none): what sparse history spaces its
+  // writes from.
+  [[nodiscard]] uint64_t copiedBelow(uint64_t block, const std::unordered_set<uint64_t> &gone = {}) const;
+  void dropKept() const;
+  [[nodiscard]] bool keptHistory(uint64_t block) const;
+  // A block of the state's tail holds a unit.
+  [[nodiscard]] bool tailHoldsUnit(uint64_t block) const;
+  // A reply's end no prompt has rendered through: a held reply, a leaf, no
+  // request's chain ends there.
+  [[nodiscard]] bool unrenderedReply(uint64_t block) const;
+  uint64_t unitsReleased_ = 0;
+  // In this take the quota gave up a state for a write's room, or in a
+  // persistent tier a copy under a state, which a landed point needs: a
+  // point the give-up leaves history may go next with no write, which no
+  // count foresees (what a full quota gives up is known only as the write
+  // makes room), and the releases with no write after it in the take count
+  // with the quota's (unitsFreedElsewhere; take windowed seed 144893).
+  // Nothing is lost: the point is history by the rules, and the next count
+  // offers it.
+  bool quotaGaveUpState_ = false;
+  // The points sparse history keeps whose tail's window parts their release
+  // left to be written (keptLeaving): written ahead of any walk as transfers
+  // are polled (writeWindowsAhead), each kept while they are queued or in
+  // flight, until they land or the tier cannot take one.
+  std::unordered_set<uint64_t> windowsAhead_;
+  uint32_t sparseHistoryTokens_ = kSparseHistoryTokens;
   CacheAdoption adoption_;
   std::shared_ptr<model::DiskBudget> diskBudget_;
+  // A copy ahead found the quota full of only copies, and none has found
+  // room since (freeDiskSpace's console line).
+  bool quotaFullAhead_ = false;
+  // The last room request was refused: what was left was worth no less than
+  // what it would write (freeDiskSpace). Its item leaves without a copy.
+  bool quotaRefused_ = false;
+  // Blocks whose copy went while their page stayed, until written again.
+  std::unordered_set<uint64_t> copiesGivenUp_;
+  // takeBrokenCopies().
+  std::vector<uint64_t> brokenCopies_;
   std::function<void()> diskMeasure_;
   CacheRecency recency_;
   KvCache kv_;
@@ -1709,6 +2220,8 @@ private:
   std::unordered_map<uint64_t, Request> requests_;
   // The chains requests waiting to start restore (setWantedChains).
   RestoredChains wanted_;
+  // Window parts being read into lanes' unit pages (UnitRead).
+  std::vector<UnitRead> unitReads_;
   // Writes in flight, in the order they started. Only reclaim demotions,
   // and under --kv-spill always writes of pages that spill once they land,
   // free memory a reclaim waits for (pendingPages); the other copies
@@ -1731,11 +2244,6 @@ private:
   KvSpillSnapshot spilled_;
   model::LatencyHistogram restoreLatency_;
   CacheLookupSnapshot lookup_;
-  // The window snapshot's counts.
-  uint64_t trimmedPages_ = 0;
-  uint64_t refusedStates_ = 0;
-  // The requests' pages trimmableCount and passedKeptPages looked at.
-  mutable uint64_t windowVisits_ = 0;
   double extentCompactMaxMilliseconds_ = 0.0;
   std::function<void()> completionNotifier_;
 };

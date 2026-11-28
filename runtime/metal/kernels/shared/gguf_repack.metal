@@ -196,7 +196,8 @@ static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, 
       if (j == 0) for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
       break;
     }
-    case GGUF_FMT_BF16: case GGUF_FMT_F16: {   // 256 values, element e of group j value 32 j + e; no scale: g = 1
+    case GGUF_FMT_BF16: case GGUF_FMT_F16: case GGUF_FMT_BF1664: case GGUF_FMT_F1664: {
+      // 256 values (64 in the 64-element forms), element e of group j value 32 j + e; no scale: g = 1
       device const ushort *values = (device const ushort *)blk + 32 * j;
       for (uint e = 0; e < 32; ++e) ((device ushort *)out0)[quant_slot(e)] = values[e];
       if (j == 0) *((device float *)meta) = 1.0f;

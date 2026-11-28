@@ -36,6 +36,23 @@ inline bool split_arrive_last(device atomic_uint *counter, uint splits,
   return true;
 }
 
+// split_arrive_last for a threadgroup of which one simdgroup alone stores the partials and arrives, the others having
+// returned (the column tile, kernels/decode/linear_gguf_column.metal): the same fences around the arrival, the
+// simdgroup's barrier for the threadgroup's, and lane 0's arrival broadcast to the simdgroup.
+inline bool split_arrive_last_simdgroup(device atomic_uint *counter, uint splits, uint lane) {
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                      thread_scope_device);
+  simdgroup_barrier(mem_flags::mem_none);
+  uint arrival = 0;
+  if (lane == 0)
+    arrival = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+  if (simd_broadcast(arrival, 0) != splits - 1)
+    return false;
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                      thread_scope_device);
+  return true;
+}
+
 // The splits' partials added in split order: `own` for split `self`,
 // `partial(s)` for every other split s.
 template <typename T, typename Partial>

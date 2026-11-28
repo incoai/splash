@@ -69,6 +69,7 @@ from .origins import ANY_ORIGIN
 from .output import (
     ReasoningSplitter,
     StreamingToolCallProjector,
+    rejected_calls_line,
     validate_response_content,
 )
 from .protocol import MAX_IMAGE_SPANS
@@ -200,17 +201,20 @@ class Collected:
     reasoning_open: bool
     # The token limit or a stop sequence ended the output inside a call.
     cut_in_call: bool
-    # The id of that call, whose arguments are unfinished; None when it cut
-    # none, or none whose name it had read.
-    cut_call: str | None
+    # The id of that call where it had started streaming, which then ends
+    # incomplete with the arguments it sent; None where the call was held,
+    # and is not returned (a call that did not close is not one).
+    cut_call: str | None = None
 
     @property
     def cut(self):
         """Whether the output's end cut its last block short: the token limit
-        cuts any block, a stop sequence only a call, as text may end where
-        the client asks. A call cut at its name has no block, and a stop
-        sequence there leaves the block before it whole."""
-        return self.result.reason == "length" or self.cut_call is not None
+        cuts any block, but a held call has none, so a call cut before it
+        streamed leaves the block before it whole; a stop sequence, which
+        text may end at where the client asks, cuts only a streamed call."""
+        if self.cut_call is not None:
+            return True
+        return self.result.reason == "length" and not self.cut_in_call
 
     @property
     def called(self):
@@ -500,7 +504,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             and "Access-Control-Request-Method" in self.headers
         ):
             # A browser's preflight, which asks what the request it holds back
-            # may use: every method the server has and, as in vLLM, any header.
+            # may use: every method the server has and any header.
             self.send_header("Access-Control-Allow-Methods", self.methods)
             requested = self.headers.get("Access-Control-Request-Headers")
             if requested is not None and requested.isprintable():
@@ -523,7 +527,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         """Serve a request of `method`, which carries no body, by its route."""
         route, captured = find_route(self.route, method)
         if route is None:
-            self.safe_error(APIError(404, "not found", "not_found"))
+            # A read of a path no route serves is a client probing for an API
+            # it might speak (Hermes tries five at each start): it is
+            # answered 404 without a console line. A DELETE, or a read of a
+            # path served under another method, is the client's mistake.
+            probe = method != "DELETE" and find_route(self.route)[0] is None
+            self.safe_error(APIError(404, "not found", "not_found"), log=not probe)
         else:
             route.handler(self, *captured)
 
@@ -747,8 +756,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 raise ConnectionResetError
             remaining = job.deadline - time.monotonic()
             if remaining <= 0:
-                self.app.backend.cancel(job)
-                raise APIError(504, "request timed out", "request_timeout")
+                # The job's end, this or the engine's own deadline, is its
+                # one line, which the backend prints.
+                error = APIError(504, "request timed out", "request_timeout")
+                error.logged = True
+                self.app.backend.cancel(job, error)
+                raise error
             try:
                 event = job.events.get(timeout=min(remaining, CLIENT_DISCONNECT_POLL))
             except queue.Empty:
@@ -813,6 +826,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         on_tool_delta=None,
         on_idle=None,
         on_progress=None,
+        streaming=False,
     ):
         """Gather a generation until it is done. The callbacks receive the
         start, each piece of output, the idle waits and prompt progress:
@@ -831,6 +845,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 job.response_validator is not None,
                 job.chat_format.call_syntax,
                 job.chat_format.think_close,
+                streaming=streaming,
             )
             if job.tool_policy is not None or job.reasoning is not None
             else None
@@ -875,6 +890,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "".join(content), job, result, projector, cut_in_call
         )
         publish(events)
+        if projector is not None and projector.rejections:
+            self._report_rejected_calls(job, projector.rejections)
+        if unenforced := getattr(job.response_validator, "unenforced", None):
+            self._report_unenforced(job, unenforced)
         return Collected(
             "".join(reasoning),
             content_text,
@@ -882,7 +901,31 @@ class FrontendHandler(BaseHTTPRequestHandler):
             result,
             splitter.reasoning,
             cut_in_call,
-            None if projector is None else projector.call_id,
+            None if projector is None else projector.cut_call,
+        )
+
+    @staticmethod
+    def _report(job, subject, said):
+        """One line on what the output of `job` was, which names the request
+        as the backend's lines do and never the model's text."""
+        engine_id = job.engine_request_id
+        request = "" if engine_id is None else f"request {engine_id} · "
+        print_status(f"{subject} · {request}{said}")
+
+    def _report_rejected_calls(self, job, reasons):
+        """Count the calls the output wrote that were not returned as calls,
+        and say so in one line (_report)."""
+        self.app.rejected_calls.add(reasons)
+        self._report(job, "Tool calls", rejected_calls_line(reasons))
+
+    def _report_unenforced(self, job, unenforced):
+        """Count the schema keywords a best-effort answer was generated
+        without, and name them in one line (_report): the keywords only,
+        never where the client's schema holds them."""
+        keywords = [keyword for keyword, _ in unenforced]
+        self.app.unenforced_keywords.add(keywords)
+        self._report(
+            job, "Schema keywords not enforced", ", ".join(dict.fromkeys(keywords))
         )
 
     def start_event_stream(self):
@@ -1302,6 +1345,33 @@ def _stop_with(pid):
     threading.Thread(target=watch, name="stop-with-app", daemon=True).start()
 
 
+def _drain(server, backend, seconds):
+    """The first stop signal's drain (--shutdown-timeout): the server goes on
+    answering, each new request with the 503 server_shutdown that waiting
+    ones get, while those the engine runs get `seconds` to finish
+    (NativeBackend.drain); then serving ends, and main stops as before,
+    ending what is left as it did. A second signal interrupts this serving
+    and stops at once."""
+    print_status(
+        f"Stopping · running requests get up to {seconds:g} s to finish; "
+        "a second stop signal ends them now"
+    )
+
+    def finish():
+        try:
+            left = backend.drain(seconds)
+            if left:
+                print_status(
+                    f"Stopping · {left} request{'s' if left != 1 else ''} still "
+                    f"running after {seconds:g} s end now"
+                )
+        finally:
+            server.shutdown()
+
+    threading.Thread(target=finish, name="splash-drain", daemon=True).start()
+    server.serve_forever()
+
+
 class ListenError(Exception):
     """The HTTP server cannot listen at its address."""
 
@@ -1503,8 +1573,8 @@ def main():
             tokenizer,
             backend,
             args.model,
-            # No deadline unless given, as in vLLM and SGLang; a request still
-            # ends when its client disconnects.
+            # No deadline unless given; a request still ends when its client
+            # disconnects.
             math.inf if args.request_timeout is None else args.request_timeout,
             constraint_factory=ConstraintFactory(grammar_table, served),
             chat_templates=chat_templates,
@@ -1536,7 +1606,14 @@ def main():
         context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
         mode = "" if served.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            # A stop the server did not make itself, for an engine stopped
+            # for good, drains first; a second signal stops at once.
+            if stopped is not None or not args.shutdown_timeout:
+                raise
+            _drain(server, backend, args.shutdown_timeout)
     except engine_runtime.EngineStartFailed as error:
         failure = serve_record.engine_failure(error.event, str(error))
         _start_failed(error)

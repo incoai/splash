@@ -3,7 +3,7 @@
 // SHA-256 of each: the release check records them (verify-models) and the
 // regression benchmarks compare them between builds (dev/benchmarks/weights.py).
 //
-//   weight-digests METALLIB MODEL_DIRECTORY [--expert-memory SIZE] [--ple-memory SIZE]
+//   weight-digests METALLIB MODEL_DIRECTORY [--weights original|auto] [--expert-memory SIZE] [--ple-memory SIZE]
 //
 // The options stream a MoE target's routed experts and a Qwen3.8-Flash-Next
 // target's PLE table from their files, as the runtime oracle's do
@@ -40,7 +40,8 @@ int main(int argc, char **argv) {
   @autoreleasepool {
     const auto usage = [] {
       std::fprintf(stderr,
-                   "usage: weight-digests METALLIB MODEL_DIRECTORY [--expert-memory SIZE] [--ple-memory SIZE]\n");
+                   "usage: weight-digests METALLIB MODEL_DIRECTORY [--weights original|auto] [--expert-memory SIZE] "
+                   "[--ple-memory SIZE]\n");
       return 2;
     };
     // Options come as option-value pairs.

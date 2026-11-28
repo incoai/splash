@@ -4,12 +4,13 @@
 // passes and, where the walks spread and the one-pass tile holds the rows, in one: pair), at every K split, the
 // measurements behind the tile rule and split law of runtime/ops/KernelCalibration.hpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
-//                             [prefill=R[,R...]]
+//                             [prefill=R[,R...]|rows=R[,R...]]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64 columns.
+// With rows=, it times the decode tiles at those row counts alone (each at most 64).
 // With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32), for R up to
 // 128 the staged tile of R rows (past 64 its two row groups, ops::stagedRowGroups) at every K split on the policy's
 // walk too, and past 64 the decode tiles' two passes, a plan of 64 rows and one of the rest (passes64), and for
-// segments the int8 prefill tile takes (af4g64, af5g64, q80) that tile (prefill int8) and its GEMM alone on the codes
+// segments the int8 prefill tile takes (quant_prefill_int8_format) that tile (prefill int8) and its GEMM alone on the codes
 // the scratch holds (int8 codes, as a SwiGLU's up runs on its gate's); gateup is then the up projection's gated
 // epilogue, and logits the vocabulary head's plain projection into fp32 rows, on the decode tiles alone. Each median
 // is followed by the first and third quartiles of its rounds. The weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each
@@ -17,7 +18,8 @@
 // activation table its producers write alongside their output (LinearBuffers::prepared), prepared once and not timed.
 // The cases run in ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection,
 // the device policy's choice marked with * (a prefill chunk's; ^ a decode step's where it differs). Widths emulate core counts: the policy's split law counts threadgroups per
-// core.
+// core. GGUF_PROJECTION_CASES=prefix[,prefix...] times only the decode cases whose label starts with one, and the
+// policy's.
 // PQ2_0 projections of whole rotation blocks run rotated, as Prism's are stored, their decode cases also on the int8
 // tiles of 16 rows on (int8, int8pair: LinearConfig::decodeInt8; past 32 rows in row groups, int8RowGroups), each time
 // including the input's rotation, and in prefill mode at each chunk of up to 128 rows (int8-<rows>).
@@ -36,6 +38,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <optional>
@@ -125,9 +128,10 @@ std::string heading(const MetalBackend &backend, const char *formats, const char
                     const std::string &epilogue, uint32_t copies, uint64_t bytes, uint32_t rounds) {
   const DeviceCapabilities &device = backend.capabilities();
   char line[512];
-  std::snprintf(line, sizeof line, "%s (GPU family %u, %u cores): %s %sx%u %s, %u weight copies of %.1f MB, median ms "
-                "of %u rounds:\n", device.deviceName.c_str(), device.appleGpuFamily, device.gpuCoreCount, formats,
-                widths, K, epilogue.c_str(), copies, bytes / 1e6, rounds);
+  std::snprintf(line, sizeof line, "%s (GPU family %u, %u cores, probed %.1f GB/s): %s %sx%u %s, %u weight copies of "
+                "%.1f MB, median ms of %u rounds:\n", device.deviceName.c_str(), device.appleGpuFamily,
+                device.gpuCoreCount, device.memoryBytesPerSecond / 1e9, formats, widths, K, epilogue.c_str(), copies,
+                bytes / 1e6, rounds);
   return line;
 }
 
@@ -218,20 +222,27 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
 
 int main(int argc, char **argv) {
   @autoreleasepool {
-    const std::string prefillOption = "prefill=";
-    const bool prefill = argc == 8;
-    if (argc < 5 || argc > 8 || (prefill && std::string(argv[7]).rfind(prefillOption, 0))) {
+    const std::string prefillOption = "prefill=", rowsOption = "rows=";
+    const std::string option = argc == 8 ? argv[7] : "";
+    const bool prefill = option.rfind(prefillOption, 0) == 0, decodeRows = option.rfind(rowsOption, 0) == 0;
+    if (argc < 5 || argc > 8 || (argc == 8 && !prefill && !decodeRows)) {
       std::cerr << "usage: gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> "
-                   "[none|residual|gateup] [rounds] [prefill=R[,R...]]\n";
+                   "[none|residual|gateup] [rounds] [prefill=R[,R...]|rows=R[,R...]]\n";
       return 2;
     }
     const std::vector<std::string> formats = split(argv[2], '+'), widths = split(argv[3], '+');
     const uint32_t K = uint32_t(std::stoul(argv[4])), rounds = argc > 6 ? uint32_t(std::stoul(argv[6])) : 20;
     const std::string epilogueName = argc > 5 ? argv[5] : "none";
-    std::vector<uint32_t> prefillRows;
+    // The decode rows timed: the row counts the decode tiles' plans step by, or rows= (each up to 64).
+    std::vector<uint32_t> prefillRows, rowCounts{1, 2, 8, 16, 24, 32, 40, 48, 56, 64};
     if (prefill)
-      for (const std::string &rows : split(argv[7] + prefillOption.size(), ','))
+      for (const std::string &rows : split(option.substr(prefillOption.size()), ','))
         prefillRows.push_back(uint32_t(std::stoul(rows)));
+    if (decodeRows) {
+      rowCounts.clear();
+      for (const std::string &rows : split(option.substr(rowsOption.size()), ','))
+        rowCounts.push_back(uint32_t(std::stoul(rows)));
+    }
     // logits: the vocabulary head's plain projection into fp32 rows (ops::Projection::destination).
     const bool logits = epilogueName == "logits";
     const FloatOutput destination = logits ? FloatOutput::Float32 : FloatOutput::BFloat16;
@@ -346,15 +357,27 @@ int main(int argc, char **argv) {
       }
       // The decode tiles at the row counts their plans step by.
       const Projection *pairGate = epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr;
-      for (const uint32_t rows : prefill ? std::vector<uint32_t>{} : std::vector<uint32_t>{1, 2, 8, 16, 24, 32, 40, 48,
-                                                                                            56, 64}) {
+      for (const uint32_t rows : prefill ? std::vector<uint32_t>{} : rowCounts) {
         const LinearWorkload w{{N, K}, rows, epilogue};
         const std::string line = "R" + std::to_string(rows);
         const LinearConfig policy = linear.plan(w, ring.front(), pairGate).configuration();
-        if (rows <= GGUF_COLUMN_ROWS) {
-          const LinearConfig column{.tile = LinearTile::GgufColumn, .oneGateUpPass = pairGate != nullptr};
-          cases.push_back({line, "column", Linear::plan(w, column, FloatOutput::BFloat16), column == policy, {}});
-          continue;
+        // The column tile at every K split that keeps a group per simdgroup.
+        for (uint32_t splits = 1; rows <= GGUF_COLUMN_ROWS && splits <= LinearConfig::kMaximumSplits &&
+                                  K / 32 >= splits * GGUF_COLUMN_SPLITS;
+             splits *= 2) {
+          const LinearConfig column{.tile = LinearTile::GgufColumn, .splits = splits,
+                                    .oneGateUpPass = pairGate != nullptr};
+          cases.push_back({line, "column S" + std::to_string(splits), Linear::plan(w, column, FloatOutput::BFloat16),
+                           column == policy, {}});
+        }
+        if (rows <= GGUF_COLUMN_ROWS) continue;
+        // The matrix tile at every K split that keeps a group per simdgroup (a gate/up as its two passes).
+        for (uint32_t splits = 1; rows <= kMaximumStagedRows && !pairGate && splits <= LinearConfig::kMaximumSplits &&
+                                  K / 32 >= splits * GGUF_COLUMN_SPLITS;
+             splits *= 2) {
+          const LinearConfig matrix{.tile = LinearTile::GgufMatrix, .splits = splits};
+          cases.push_back({line, "matrix S" + std::to_string(splits), Linear::plan(w, matrix, FloatOutput::BFloat16),
+                           matrix == policy, {}});
         }
         // The staged tile walks K as the policy's staged plans do (where the device registers a plan, those it
         // runs on more rows).
@@ -400,13 +423,26 @@ int main(int argc, char **argv) {
             }
           }
       }
+      // GGUF_PROJECTION_CASES=prefix[,prefix...] keeps the cases whose label starts with one of them, and the
+      // policy's: a tile's variants in one speed hold without the plans they do not change.
+      if (const char *only = std::getenv("GGUF_PROJECTION_CASES")) {
+        const std::vector<std::string> prefixes = split(only, ',');
+        std::erase_if(cases, [&](const Case &c) {
+          return !c.chosen && std::none_of(prefixes.begin(), prefixes.end(),
+                                           [&](const std::string &x) { return c.label.rfind(x, 0) == 0; });
+        });
+      }
       // Buffers of the widest plan; the scratch of the plan that needs the most.
       LinearScratchSize size;
       uint64_t rows = 0;
       for (const Case &c : cases) {
         size.include(c.plan.scratchSize());
         rows = std::max<uint64_t>(rows, c.plan.storageRows());
-        if (c.rest) size.include(c.rest->scratchSize());
+        // The second pass views the rows from kMaximumDecodeTileRows on, its plan's storage rows.
+        if (c.rest) {
+          size.include(c.rest->scratchSize());
+          rows = std::max<uint64_t>(rows, kMaximumDecodeTileRows + c.rest->storageRows());
+        }
       }
       const auto zeros = [&](uint64_t n) {
         if (!n) return MetalBuffer{};

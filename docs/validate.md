@@ -15,7 +15,10 @@ check-native-cpu` builds production and runs native CPU tests without a GPU;
 `make check-native-metal` requires a supported Metal device and runs the kernel
 tests under shader validation, and the Linear pipeline resource check without
 it, then `test-sanitizers-metal`. They include loading small synthetic MLX,
-GGUF and vision sources and the GGUF kernels on synthetic tensors. `make
+GGUF and vision sources and the GGUF kernels on synthetic tensors. On macOS
+27.2.1 run `gguf-projection` under shader validation alone, or with
+`MTL_SHADER_VALIDATION_GLOBAL_MEMORY=0`: validation with several GPU processes
+at once corrupts the int8 prefill tile's registers there. `make
 check-native-build` builds every native test, benchmark and tool and runs
 none. Hosted CI runs the CPU checks, `check-native-build` and `check-app` in
 one job and `test-sanitizers` in another beside it. `make test-sanitizers`
@@ -47,8 +50,8 @@ Makefiles and the real-model harnesses).
 The real-model targets run against an installation in this checkout's
 `install/models`: run `make install` with the same options first, or in the
 same command, as above. They take `MODEL` exactly as `splash serve --model`
-does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
-`--draft-model` and `--language-only`:
+does, and `REVISION`, `DRAFT_MODEL`, `DRAFT_REVISION` and `LANGUAGE_ONLY=1` as
+its `--revision`, `--draft-model`, `--draft-revision` and `--language-only`:
 
 | Target | Runs |
 | --- | --- |
@@ -199,9 +202,13 @@ the other. Per model, `release-check`:
   and requires the conversation's next turn to restore its prompt from disk
   (`test-http-real` with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`);
 - compares this build with `BASELINE`, which must have another build
-  identity, in ABBA order (`test-performance-real`), every round after the
-  first to report a [Neural Engine share](internals.md#neural-engine-prefill) running that
-  share: output tokens and acceptance must be
+  identity, in ABBA order (`test-performance-real`), every round at one
+  [Neural Engine split](internals.md#neural-engine-prefill): a start of this
+  build before the rounds calibrates it (or recalls this Mac's record), every
+  round runs its share from its least chunk rows (a calibrated split of two
+  shares, one in one step and one in two, at the larger in both), each must
+  report the same share and rows, and the result names the split each round's
+  start logged; output tokens and acceptance must be
   identical (`EXPECT_OUTPUT_CHANGE=1` allows changed outputs with acceptance
   within 0.02; the benchmark verifies every row of a draft's block a lane
   (`--verify-rows all`), so outputs repeat and its times measure the
@@ -215,7 +222,8 @@ the other. Per model, `release-check`:
   and this build's
   memory plan must hold, without the Neural Engine split, at least the
   context the baseline's holds without it. `ANE_FFN_SHARE=SHARE` runs
-  every round at that share instead (0: the GPU alone).
+  every round at that share instead, which the split rounds to whole channel
+  units (0.44 of the 27B's 34 runs as 15 of them, 0.441; 0: the GPU alone).
 
 Where the Mac's memory cannot hold a model's weight images, or its largest
 Metal buffer cannot hold one of them, as for Qwen3.8-Flash-Next,
@@ -333,7 +341,7 @@ a file of uint32 token ids (`dev/benchmarks/teacher_logits.mm`): for each
 window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
-also takes `--kv-format`, `--state-format`, `--activations`,
+also takes `--kv-format`, `--state-format`, `--activations`, `--weights`,
 `--expert-memory` and `--ple-memory`, and, with `--captures yes`, writes the
 rows of the target layers the model's draft reads (its `target_layer_ids`: each
 layer's output rows, or, for Inkling 2, the rows passed into each application
@@ -411,11 +419,10 @@ stops.
 reuse; run them with the cache options to measure, such as
 `--server-args '--persistent-cache --cache-dir DIR'`, and a `--max-memory`
 under which the cache gives states up, or its reclaims write nothing. A
-restore point is copied 10 s after its publication unless its conversation
-went on from it first, so `--gap` decides which writes a run measures: at
-`agent`'s default most points are gone on from in time and the states written
-are the reclaims', and at a gap past the delay, such as 15, every point is
-copied, as at `edit`'s. Each
+persistent cache copies a restore point every 2,048 tokens of a
+conversation whatever the gap between turns; a temporary cache copies one 10 s
+after its publication unless its conversation went on from it first, so there
+`--gap` decides which writes a run measures. Each
 request records its time to first token, to its first output of any kind (a
 turn may answer with reasoning and a tool call alone), and the server's count
 of its prompt: its tokens, those the cache held (`cached`), those whose KV it
@@ -434,9 +441,7 @@ per 1,000 prompt tokens, by cause as far as the counters tell: KV pages
 demoted by reclaims, copied ahead for restore points and written through by
 `spill` requests, each at the plan's page size, and the rest, the states,
 which no counter splits between the reclaims that wrote them and the restore
-points' copies (a model with sliding-window layers writes its Slim pages
-shorter than that, so its KV is overstated and its states understated, which
-the readouts say); the share of the prompts' tokens the cache held; and each
+points' copies; the share of the prompts' tokens the cache held; and each
 kind of turn's median and longest time to first token (`first` and `loop` in
 `agent`). The tool results and user messages are slices of the client
 interpreter's standard library sources, the same for every tree, whose digest
@@ -500,13 +505,15 @@ these do not excuse, notes them.
 | --- | --- |
 | G4 | the client gaps between token events (chunks less than half the shortest decode command apart are one event's; an unanswered request counts its open gap, up to when the client stopped waiting): the largest at most 10 s, the p99 at most 5 s; every gap past 2.5 s is listed |
 | G8 | no engine restart, failed request (an HTTP error but `context_length_exceeded`, an error event in a stream the server had begun, a request of a failed TTFT round, or one `/status` counts in `requests.failed`), unanswered request, Metal failure or loop tick of 5 s or more, no exit, late start or failed request that ended the run, and every server stopped by SIGINT alone with exit 0, the engine it started gone within SIGINT's grace too |
-| G9 | the memory accounts sum to `charged_bytes` in every sample, no claim waits 30 s, nothing is owed at the end |
+| G9 | the memory accounts sum to `charged_bytes` in every sample, no request waits 30 s for memory while nothing ahead of it makes progress (`admission.stalled_wait_ms`: how far into the engine's resource wait limit, which restarts while a lane ahead of the request works, the request furthest into it is), nothing is owed at the end; the longest wait for memory, whatever refused it and behind progress or not (`memory_governor.claims.oldest_ms`), is reported, and fails only a server that does not report `stalled_wait_ms`: a request that has waited is served in arrival order behind the work sent before it ([memory claims](internals.md#memory-claims)), as long as that work runs |
+| Conversation | each request of a turn that grows its conversation (an `agent` turn after the first, an `edit` build turn after a conversation's first) finds at least 90 % of the conversation's previous prompt cached, and each such turn's first tokens come within 3 times its new tokens' prefill at the run's median time per new token of such a turn, or within 10 s; a request answered without usage, and its conversation's next, is not judged |
 | Store | a regrown expert unit taken back within 60 s of its regrow is counted; a second such take back within 60 s of the one before is an oscillation and fails |
 | Churn | the run lasted its load window (`--minutes`) and every client completed a request |
 | First token | no answered request (G8 judges unanswered ones) waited for its first token more than twice the prefill time, at the run's own rate (the tokens its answered requests prefilled over the time from the first send to the last answer), of the work the scheduler may put ahead of it: the requests in flight at its send, 24,576 rows of later arrivals (three prefill commands of at most 8,192 rows, the most that may pass over it in a row) and its own prompt, each less its cached tokens; a starvation guard, not a speed check |
 
-G8 applies to every scenario, the others to churn runs, and the check of an
-`agent` or `edit` run notes what it measured. The check also counts
+G8 applies to every scenario, the conversation gate to `agent` and `edit`
+runs, the others to churn runs, and the check of an `agent` or `edit` run
+notes what it measured. The check also counts
 the client gaps past the decode gap target of 500 ms by cause, each taking the
 first of these that the `/status` samples from 2 s before it to 2 s after it
 show: a claim waiting for memory, the experts' size changing, a compaction, a

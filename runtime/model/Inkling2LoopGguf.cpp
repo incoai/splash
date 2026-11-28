@@ -154,24 +154,30 @@ void requireMetadata(const GgufFile &file, const Inkling2LoopLayout &layout, con
 // and up, ffn_gate_up_exps, each NVFP4 with an expert's F32 .scale in layers
 // 0-19), the router's bias (exp_probs_b) and the FFN output's convolution;
 // and in a loop layer its message queries and its q, k, v and FFN gates
-// (F32, or a quantized gate's F32 values), by the names of the file's layout.
-// The small F32 tensors as stored.
+// (F32, as BF16 rows where they hold BF16's values, or a quantized gate's F32
+// values), by the names of the file's layout. The small F32 tensors as
+// stored.
 // Whether a loop layer's call of message gates, its q, k and v gates or its
 // FFN gate (kInkling2LoopGateCalls), mixes formats as its image would store
-// them, BF16 as stored and any other as F32: the fused kernels take a call's
-// gates in one format, so such a call's BF16 gates widen to F32, exactly (some
-// quantized GGUFs keep BF16 gates beside Q8_0 ones).
-bool mixedCall(const GgufFile &file, const std::string &layer, const GgufLayout &gguf, Inkling2LoopGateCall call) {
+// them, BF16 as stored and F32 holding BF16's values as BF16
+// (gguf::floatKernelType), any other as F32: the fused kernels take a call's
+// gates in one format, so such a call's gates load as F32, its BF16 ones
+// widened exactly (some quantized GGUFs keep BF16 gates beside Q8_0 ones).
+bool mixedCall(const GgufFile &file, const std::string &layer, const GgufLayout &gguf, Inkling2LoopGateCall call,
+               const gguf::PlanOptions &options) {
   bool bfloat16 = false, other = false;
   for (size_t gate = call.first; gate < call.end; ++gate)
     for (const char *projection : {"down", "forget", "gain"})
       if (const GgufTensor *tensor = file.find(layer + std::string(gguf.gates[gate]) + projection + ".weight"))
-        (tensor->type == ggml::kBF16 ? bfloat16 : other) = true;
+        (gguf::floatKernelType(tensor->type, options, file.source(tensor->file), tensor->offset,
+                               tensor->elements()) == ggml::kBF16
+             ? bfloat16
+             : other) = true;
   return bfloat16 && other;
 }
 
 std::vector<gguf::Section> layerImage(const Inkling2LoopLayout &layout, const GgufLayout &gguf, uint32_t index,
-                                      const GgufFile *file = nullptr) {
+                                      const GgufFile *file = nullptr, const gguf::PlanOptions &options = {}) {
   using Kind = gguf::Section::Kind;
   const std::string p = "blk." + std::to_string(index) + ".";
   const uint64_t hidden = layout.hiddenSize, taps = layout.convolutionTaps, kvRows = layout.kvWidth();
@@ -212,7 +218,7 @@ std::vector<gguf::Section> layerImage(const Inkling2LoopLayout &layout, const Gg
   sections.push_back(messageQueries(layout, gguf, index));
   for (size_t gate = 0; gate < gguf.gates.size(); ++gate) {
     const std::string stem(gguf.gates[gate]);
-    const bool widened = file && mixedCall(*file, p, gguf, inkling2LoopGateCall(gate));
+    const bool widened = file && mixedCall(*file, p, gguf, inkling2LoopGateCall(gate), options);
     const size_t first = sections.size();
     add(Kind::FloatTensor, stem + "down.weight", layout.loopGateRank, 2 * hidden);
     add(Kind::FloatTensor, stem + "forget.weight", hidden, layout.loopGateRank);
@@ -249,7 +255,7 @@ GgufTargetPlan ggufTargetPlan(const Inkling2LoopLayout &layout) {
             requireMetadata(file, layout, gguf);
             return gguf::planTargetImages(
                 file, layout, layout.weightLayers, options,
-                [&](uint32_t index) { return layerImage(layout, gguf, index, &file); }, headImage(layout));
+                [&](uint32_t index) { return layerImage(layout, gguf, index, &file, options); }, headImage(layout));
           }};
 }
 

@@ -189,11 +189,14 @@ TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_TEACHER_LOGITS := $(ENGINE_TEST_BUILD)/teacher-logits
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
+TEST_DRAFT_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/draft-attention-sweep
+TEST_DRAFT_SELECTOR_SWEEP := $(ENGINE_TEST_BUILD)/draft-selector-sweep
 TEST_GRAPH_ENCODE_BENCHMARK := $(ENGINE_TEST_BUILD)/graph-encode-benchmark
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
 TEST_VISION_TOWER_BENCHMARK := $(ENGINE_TEST_BUILD)/vision-tower-benchmark
 TEST_DENSE_LINEAR_BENCHMARK := $(ENGINE_TEST_BUILD)/dense-linear-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
+TEST_MESSAGE_GATE_BENCHMARK := $(ENGINE_TEST_BUILD)/message-gate-benchmark
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 WEIGHT_DIGESTS := $(ENGINE_TEST_BUILD)/weight-digests
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
@@ -210,6 +213,8 @@ TEST_STATE_CODEC_AIR := $(ENGINE_TEST_BUILD)/state-codec-test.air
 # convolution-mix-kernels checks the fused gates against: in the
 # production-and-test library.
 TEST_MESSAGE_GATE_AIR := $(ENGINE_TEST_BUILD)/message-gate-test.air
+TEST_RMS_NORM_EPILOGUE_AIR := $(ENGINE_TEST_BUILD)/rms-norm-epilogue-test.air
+TEST_MIX_CONV_PRECISION_AIR := $(ENGINE_TEST_BUILD)/mix-conv-precision-test.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # Both Q8 tests share the attention kernels, the sparse ones included, and the
 # path commit, beside the tests' store.
@@ -340,11 +345,13 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
-	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) $(TEST_GRAPH_ENCODE_BENCHMARK) \
+	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) $(TEST_DRAFT_ATTENTION_SWEEP) \
+	$(TEST_DRAFT_SELECTOR_SWEEP) $(TEST_GRAPH_ENCODE_BENCHMARK) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK) \
+	$(TEST_MESSAGE_GATE_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) $(TEST_STATE_CODEC_AIR) \
-	$(TEST_MESSAGE_GATE_AIR)
+	$(TEST_MESSAGE_GATE_AIR) $(TEST_RMS_NORM_EPILOGUE_AIR) $(TEST_MIX_CONV_PRECISION_AIR)
 # Benchmarks and tools that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
@@ -581,6 +588,10 @@ $(TEST_TEACHER_LOGITS): dev/benchmarks/teacher_logits.mm \
 $(TEST_ATTENTION_SWEEP): dev/benchmarks/attention_sweep.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_DRAFT_ATTENTION_SWEEP): dev/benchmarks/draft_attention_sweep.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_DRAFT_SELECTOR_SWEEP): dev/benchmarks/draft_selector_sweep.mm \
+		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_GRAPH_ENCODE_BENCHMARK): dev/benchmarks/graph_encode_benchmark.mm \
 		$(ENGINE_LIBRARY) $(TEST_METAL_BACKEND_LIB)
 $(TEST_GGUF_PROJECTION_BENCHMARK): dev/benchmarks/gguf_projection_benchmark.mm \
@@ -588,6 +599,7 @@ $(TEST_GGUF_PROJECTION_BENCHMARK): dev/benchmarks/gguf_projection_benchmark.mm \
 $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_MESSAGE_GATE_BENCHMARK): dev/benchmarks/message_gate_benchmark.mm $(ENGINE_LIBRARY) $(LIB)
 $(TEST_VISION_TOWER_BENCHMARK): dev/benchmarks/vision_tower_benchmark.mm $(ENGINE_LIBRARY) $(LIB)
 $(TEST_DENSE_LINEAR_BENCHMARK): dev/benchmarks/dense_linear_benchmark.mm $(ENGINE_LIBRARY) $(LIB)
 
@@ -609,8 +621,10 @@ $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(
 		$(TEST_RELATIVE_ATTENTION) $(TEST_ROPE_TABLES) \
 		$(TEST_METAL_BACKEND_TEST) $(TEST_HANDOFF_TEST) $(TEST_PRESSURE_SERVING) $(TEST_VISION_ENCODER_TEST) \
 		$(TEST_MODEL_RUNTIME_ORACLE) \
-		$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) $(TEST_GRAPH_ENCODE_BENCHMARK) \
-		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK): | $(ENGINE_TEST_BUILD)
+		$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) $(TEST_DRAFT_ATTENTION_SWEEP) \
+		$(TEST_DRAFT_SELECTOR_SWEEP) $(TEST_GRAPH_ENCODE_BENCHMARK) \
+		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK) \
+		$(TEST_MESSAGE_GATE_BENCHMARK): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
@@ -635,8 +649,9 @@ $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 $(TEST_Q8_AIR): dev/tests/engine/q8_page_format_oracle.metal runtime/metal/abi/ExecutionGeometry.h
 $(TEST_METAL_BACKEND_AIR): dev/tests/engine/metal_backend_test.metal
 $(TEST_ATTENTION_STORE_AIR): dev/tests/engine/attention_store_test.metal $(KERNEL_HEADERS)
+$(TEST_RMS_NORM_EPILOGUE_AIR): dev/tests/engine/rms_norm_epilogue_test.metal $(KERNEL_HEADERS)
 
-$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR) $(TEST_ATTENTION_STORE_AIR): | $(ENGINE_TEST_BUILD)
+$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR) $(TEST_ATTENTION_STORE_AIR) $(TEST_RMS_NORM_EPILOGUE_AIR): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
 $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
@@ -657,7 +672,9 @@ $(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal
 $(TEST_GGUF_MOE_AIR): dev/tests/engine/gguf_moe_test.metal
 $(TEST_STATE_CODEC_AIR): dev/tests/engine/state_codec_test.metal
 $(TEST_MESSAGE_GATE_AIR): dev/tests/engine/message_gate_test.metal dev/tests/engine/message_gate_reference.h
-$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_STATE_CODEC_AIR) $(TEST_MESSAGE_GATE_AIR): $(KERNEL_HEADERS) \
+$(TEST_MIX_CONV_PRECISION_AIR): dev/tests/engine/mix_conv_precision_test.metal
+$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_STATE_CODEC_AIR) $(TEST_MESSAGE_GATE_AIR) \
+		$(TEST_MIX_CONV_PRECISION_AIR): $(KERNEL_HEADERS) \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
@@ -674,7 +691,7 @@ $(TEST_HOST_STEP_LIB): $(TEST_HOST_STEP_AIR)
 # message_gate_test.metal's reference path. It relinks whenever the
 # production library does.
 $(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) \
-		$(TEST_STATE_CODEC_AIR) $(TEST_MESSAGE_GATE_AIR) \
+		$(TEST_STATE_CODEC_AIR) $(TEST_MESSAGE_GATE_AIR) $(TEST_RMS_NORM_EPILOGUE_AIR) $(TEST_MIX_CONV_PRECISION_AIR) \
 		$(LIB)
 
 $(TEST_GGUF_DEQUANT_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_METAL_BACKEND_LIB) \
@@ -699,7 +716,7 @@ test-engine: test-engine-cpu test-engine-metal
 # engine-sim, the slowest, runs last.
 ENGINE_CPU_FAILED := $(ENGINE_TEST_BUILD)/test-engine-cpu.failed
 ENGINE_CPU_STEP = @step() { echo "$$*"; "$$@" || echo "$$*" >> $(ENGINE_CPU_FAILED); }; step
-test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK)
+test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK) $(TEST_DECODE_PROFILE)
 	@: > $(ENGINE_CPU_FAILED)
 	$(ENGINE_CPU_STEP) $(TEST_SLOT_FILE)
 	$(ENGINE_CPU_STEP) $(TEST_KV_SLOT_FORMAT)
@@ -724,6 +741,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_LINEAR_PLAN) --cpu
 	$(ENGINE_CPU_STEP) /bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP)
 	$(ENGINE_CPU_STEP) /bin/sh dev/tests/backend_benchmark_cli.sh $(TEST_BACKEND_BENCHMARK) $(MODEL_CONFIGS)
+	$(ENGINE_CPU_STEP) /bin/sh dev/tests/decode_profile_cli.sh $(TEST_DECODE_PROFILE) $(MODEL_CONFIGS)
 	$(ENGINE_CPU_STEP) $(TEST_OPERATOR_WORKSPACE)
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_CALIBRATION)
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_BREAKER)
@@ -870,9 +888,16 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	benchmark-gguf-projection benchmark-gguf-moe teacher-logits
 # decode-profile replays the installed model's prefill and decode commands as
 # separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles,
-# or --images HxW[,HxW...] for the vision encoder on synthetic images.
+# or --images HxW[,HxW...] for the vision encoder on synthetic images. A text
+# profile's chat requests go in the model's own tokens: chat_prompts renders
+# them with its tokenizer and chat template and gives --chat-tokens, the file
+# DECODE_PROFILE_CHAT_TOKENS, where they are not the built-in ones (another
+# family's than Qwen's or Flint's).
+DECODE_PROFILE_CHAT_TOKENS := $(ENGINE_TEST_BUILD)/decode-profile-chat-tokens.txt
 benchmark-decode-profile: preflight $(TARGET) $(TEST_DECODE_PROFILE) $(LIB)
-	$(TEST_DECODE_PROFILE) $(LIB) "$(MODEL_ROOT)" $(DECODE_PROFILE_ARGS)
+	chat_tokens=$$($(if $(filter --images,$(DECODE_PROFILE_ARGS)),true,$(PYTHON) -m dev.benchmarks.chat_prompts \
+		decode-profile "$(MODEL_ROOT)" $(DECODE_PROFILE_CHAT_TOKENS))) && \
+		$(TEST_DECODE_PROFILE) $(LIB) "$(MODEL_ROOT)" $$chat_tokens $(DECODE_PROFILE_ARGS)
 
 # The installed model's teacher-forced logits over windows of a token-id file,
 # for parity checks against another engine; TEACHER_LOGITS_ARGS passes
@@ -897,7 +922,7 @@ benchmark-graph-encode: $(TEST_GRAPH_ENCODE_BENCHMARK) $(TEST_METAL_BACKEND_LIB)
 # on the 128-row prefill tile at each chunk of R rows; the float formats
 # float-bf16 and float-f32 time the float projection on both float tiles.
 # GGUF_PROJECTION_ARGS passes <fmt[+fmt+fmt]> <N[+N+N]> <K>
-# [none|residual|gateup] [rounds] [prefill=R[,R...]].
+# [none|residual|gateup] [rounds] [prefill=R[,R...]|rows=R[,R...]].
 GGUF_PROJECTION_ARGS ?= q4k 5120 8192
 benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB) $(GGUF_PROJECTION_ARGS)
@@ -1078,16 +1103,17 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(ASAN_TEST_ENV) $(TEST_JSON_WRITER_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_LEDGER_ASAN)
 
-# The Metal tests of the backend, whose host-step runner shares each
-# command's steps with the thread that encodes it (its behaviour tests: its
-# latency tests bound the runner's times on the wall clock, which
-# ThreadSanitizer lengthens), and of the components whose host steps share
-# their state with the engine thread and the SSD readers, the hot block
-# cache, the history stream and the expert store, under ThreadSanitizer on a
-# Mac with a GPU: the engine library and the tests built with it, and their
-# metallibs, in a build of their own (the builds above link no framework),
-# and what it cannot see inside Metal suppressed (metal_tsan_suppressions.txt).
-# check-native-metal runs it.
+# The Metal tests of the backend, whose host-step runner shares each command's
+# steps with the thread that encodes it (its behaviour tests: its latency
+# tests bound the runner's times on the wall clock, which ThreadSanitizer
+# lengthens), of the components whose host steps share their state with the
+# engine thread and the SSD readers, the hot block cache, the history stream
+# and the expert store, and of the KV tier, whose SSD readers find a block's
+# extents beside the engine thread's allocations and releases, under
+# ThreadSanitizer on a Mac with a GPU: the engine library and the tests built
+# with it, and their metallibs, in a build of their own (the builds above link
+# no framework), and what it cannot see inside Metal suppressed
+# (metal_tsan_suppressions.txt). check-native-metal runs it.
 METAL_TSAN_BUILD := $(BUILD)/metal-tsan
 METAL_TSAN_CXXFLAGS := $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread
 METAL_TSAN_TEST_ENV := $(TSAN_TEST_ENV):suppressions=dev/tests/engine/metal_tsan_suppressions.txt
@@ -1098,9 +1124,12 @@ test-sanitizers-metal:
 		$(METAL_TSAN_BUILD)/splash.metallib $(METAL_TSAN_BUILD)/host-step.metallib \
 		$(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream \
 		$(METAL_TSAN_BUILD)/engine-tests/expert-store $(METAL_TSAN_BUILD)/engine-tests/metal-backend \
+		$(METAL_TSAN_BUILD)/engine-tests/kv-page-tier \
 		$(METAL_TSAN_BUILD)/engine-tests/metal-backend.metallib $(METAL_TSAN_BUILD)/engine-tests/host-step.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/splash.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream $(METAL_TSAN_BUILD)/splash.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/expert-store $(METAL_TSAN_BUILD)/splash.metallib
+	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-page-tier \
+		$(METAL_TSAN_BUILD)/engine-tests/metal-backend.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/metal-backend \
 		$(METAL_TSAN_BUILD)/engine-tests/metal-backend.metallib --filter behaviour/

@@ -58,6 +58,14 @@ struct MoeTileDescriptor {
 static_assert(sizeof(MoeTileDescriptor) == 12,
               "MoE tile descriptors are 12 bytes on both sides");
 
+// The rows of the matmul an expert pass runs for `rows` live rows of a tile
+// of at most tile_rows (kernels/common/moe_expert_slab.h): the fewest of 8,
+// 16, 32 and tile_rows that hold them.
+inline uint32_t moe_matmul_rows(uint32_t rows, uint32_t tile_rows) {
+  const uint32_t matmul = rows <= 8 ? 8u : rows <= 16 ? 16u : rows <= 32 ? 32u : tile_rows;
+  return matmul < tile_rows ? matmul : tile_rows;
+}
+
 // The staged GGUF expert passes (kernels/shared/moe_gguf.metal) run an
 // expert's only tile of at most GGUF_COLUMN_ROWS live rows on the column tile
 // (metal/abi/Gguf.h), which reads those rows alone, and every other tile on
@@ -98,6 +106,10 @@ struct MoeGroupParams {
 
 static_assert(sizeof(MoeGroupParams) == 32,
               "MoE grouping parameters are 32 bytes on both sides");
+
+// The most rows of a narrow step (a verify block, ops::MoePlan::narrow),
+// whose gate/up pass reads its rows in place (MoeGgufGateUpParams).
+#define MOE_NARROW_ROWS 16u
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, the tiles of experts resident before the step's
@@ -230,7 +242,10 @@ static_assert(sizeof(MoeGatherInt8Params) == 16,
 // The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up[_mixed]):
 // their sizes, expert count, floor and chunk slots, as MoeGgufExpertParams
 // holds them, and each pass's routed and shared formats. Gate reads
-// projection 0 and up projection 1 of the same chunk.
+// projection 0 and up projection 1 of the same chunk. A narrow step's pass
+// (ops::MoePlan::narrow) reads its input_rows rows in place, grouped row g
+// the row of route grouped_routes[g], route / routes_per_row; input_rows is
+// 0 for a pass that reads the grouped rows the gather wrote.
 struct MoeGgufGateUpParams {
   uint32_t input_size;
   uint32_t output_size; // per expert
@@ -242,10 +257,12 @@ struct MoeGgufGateUpParams {
   uint32_t floor_slots;
   uint32_t chunk_slots;
   uint32_t tiles; // MOE_TILES_*
+  uint32_t input_rows;
+  uint32_t routes_per_row;
 };
 
-static_assert(sizeof(MoeGgufGateUpParams) == 40,
-              "MoE GGUF gate/up parameters are 40 bytes on both sides");
+static_assert(sizeof(MoeGgufGateUpParams) == 48,
+              "MoE GGUF gate/up parameters are 48 bytes on both sides");
 
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,

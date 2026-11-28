@@ -247,6 +247,70 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(self.events(), [])
         self.assertIn("Fetching 2 file(s)", self.stdout.getvalue())
 
+    def test_the_console_counts_a_download_in_bytes(self):
+        """Not huggingface_hub's bar, which counts files (0/2 for a minute
+        of an 8 GB download): a log gets a line at each tenth of the bytes,
+        a terminal one line rewritten."""
+        listed = {name: 4 * 10**9 for name in WEIGHTS}
+        for terminal in (False, True):
+            self.stdout = Stdout()
+            self.stdout.isatty = lambda terminal=terminal: terminal
+            with self.subTest(terminal=terminal):
+                shutil.rmtree(self.snapshot, ignore_errors=True)
+                for name in WEIGHTS:
+                    self.blobs.joinpath(blob(name)).unlink(missing_ok=True)
+                self.download(json_progress=False, listed=listed)
+                written = self.stdout.getvalue().partition("reused.\n")[2]
+                self.assertTrue(
+                    written.endswith(
+                        f"Downloading {REPO}: 8.00 of 8.00 GB (100%)"
+                        + ("\x1b[K\n" if terminal else "\n")
+                    ),
+                    written,
+                )
+                if terminal:
+                    self.assertEqual(written.count("\n"), 1)
+                    self.assertTrue(written.startswith("\r"))
+                else:
+                    lines = written.splitlines()
+                    self.assertEqual(
+                        lines[0], f"Downloading {REPO}: 0.00 of 8.00 GB (0%)"
+                    )
+                    self.assertLessEqual(len(lines), 11)
+
+    def test_a_failed_download_ends_the_terminals_line(self):
+        self.stdout.isatty = lambda: True
+        self.after_chunk = lambda done: (_ for _ in ()).throw(OSError("cut"))
+        with self.assertRaises(OSError):
+            self.download(json_progress=False)
+        written = self.stdout.getvalue().partition("reused.\n")[2]
+        self.assertTrue(written.startswith("\r"), written)
+        self.assertTrue(written.endswith("\n"), written)
+        self.assertEqual(written.count("\n"), 1, written)
+
+    def test_a_log_gets_a_line_when_its_next_tenth_is_long_in_coming(self):
+        # 65 GB at 10 MB/s reaches a tenth every eleven minutes.
+        total = 65 * 10**9
+        progress = hub._ConsoleProgress()
+        with (
+            contextlib.redirect_stdout(self.stdout),
+            mock.patch.object(hub.time, "monotonic") as clock,
+        ):
+            for seconds in range(0, 121, 10):
+                clock.return_value = 1000 + seconds
+                progress(REPO, seconds * 10**7, total)
+        lines = self.stdout.getvalue().splitlines()
+        self.assertEqual(
+            [line.rpartition(": ")[2] for line in lines],
+            [
+                "0.00 of 65.00 GB (0%)",
+                "0.30 of 65.00 GB (0%)",
+                "0.60 of 65.00 GB (0%)",
+                "0.90 of 65.00 GB (1%)",
+                "1.20 of 65.00 GB (1%)",
+            ],
+        )
+
     def test_a_download_of_cached_blobs_reports_nothing(self):
         self.download({"config.json"})
         self.assertEqual(self.stdout.getvalue(), "")

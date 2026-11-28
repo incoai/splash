@@ -55,7 +55,7 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
 // writeGgufImage writes it, then `checkUnchanged` finds the sources it was
 // planned from unwritten since. The image holds both, to write it again on a
 // restore. Its record declares the image's resident bytes
-// (gguf::Image::residentBytes).
+// (gguf::Image::residentBytes) and its formats (gguf::imageFormats).
 [[nodiscard]] WeightFile loadImage(metal::MetalBackend &backend, WeightImages &images, std::string_view prefix,
                                    std::shared_ptr<const gguf::Image> plan, std::function<void()> checkUnchanged);
 // The record loadImage gives `plan`, for an image whose rows stream instead.
@@ -67,6 +67,18 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
 // are exactly an MXFP8 block's (gguf::mxfp8Block), read on a thread per core
 // the first time a process asks: a start's gguf::PlanOptions::exactlyMxfp8.
 [[nodiscard]] bool exactlyMxfp8(const WeightSource &file, uint64_t offset, uint64_t values, uint32_t type);
+// Whether every one of `values` F32 values at data offset `offset` of `file`
+// is a BF16 value (exactBfloat16), read as exactlyMxfp8 reads: a start's
+// gguf::PlanOptions::exactlyBfloat16.
+[[nodiscard]] bool exactlyBfloat16(const WeightSource &file, uint64_t offset, uint64_t values);
+// `options` with the readers of the values a start's plan holds exactly in
+// fewer bytes (exactlyMxfp8, exactlyBfloat16), which its sizing and its load
+// plan with alike.
+[[nodiscard]] inline gguf::PlanOptions readingValues(gguf::PlanOptions options) {
+  options.exactlyMxfp8 = exactlyMxfp8;
+  options.exactlyBfloat16 = exactlyBfloat16;
+  return options;
+}
 
 // Rows [first, first + count) of a repack (its sources' rows in order), whole
 // and back to back into `to`, count * ggufRowBytes(format, columns) bytes:

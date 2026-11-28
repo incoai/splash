@@ -612,6 +612,9 @@ enum class DecodeTensor : uint32_t {
   // (DraftTreeParams in metal/abi/Sampling.h), which the host writes.
   ChainTokens,
   ChainRates,
+  // Indexed by state lane: the lane's page tables, one of
+  // kMaximumPageTableEntries entries per page of a block
+  // (kv::Layout::blockPages), one after another.
   PageTable,
   // Indexed by state lane, like PageTable, for a layout with a block index:
   // the entries of the pages' index (kv::PageStorage::writeIndexEntries),
@@ -712,6 +715,10 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 // The arena's and the target's own decode scratch (qwenTargetScratchBytes).
 [[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
                                           const ops::ExecutionPlans &operators);
+// The bytes the arena's PageTable tensor takes with `pages` tables a lane
+// (DecodeTensor::PageTable: one a page of a block), in whole host pages.
+[[nodiscard]] uint64_t decodePageTableBytes(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators,
+                                            uint32_t pages);
 
 class DecodeArena final {
 public:

@@ -83,6 +83,21 @@ class OptionReportTests(unittest.TestCase):
             },
             {name: CONTEXT.get(name, (262144, 1010000)) for name in UNUSABLE},
         )
+        # Each family's default --activations, which the app's menu names.
+        self.assertEqual(
+            {name: family["activations"] for name, family in report.items()},
+            {name: "bf16" if name == "Inkling-2-Mini" else "auto" for name in UNUSABLE},
+        )
+        # The sampling a request gets unless it names its own, which the
+        # app's sampling fields show.
+        self.assertEqual(
+            report["Inkling-2-Mini"]["sampling"],
+            {"temperature": 1.0, "top_p": 1.0, "top_k": 0},
+        )
+        self.assertEqual(
+            report["Qwen3.6-35B-A3B"]["sampling"],
+            {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+        )
         # --max-context takes at most the most context any family serves.
         self.assertEqual(
             serve_options.MAX_YARN_CONTEXT_TOKENS,

@@ -1,6 +1,9 @@
 #include "ops/ExecutionPlans.hpp"
 
 #include "metal/abi/Gguf.h"
+#include "ops/BlockResidualMix.hpp"
+#include "ops/DraftSelector.hpp"
+#include "ops/MessageGate.hpp"
 #include "ops/RelativeAttention.hpp"
 
 #include <algorithm>
@@ -14,9 +17,50 @@
 namespace splash::ops {
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations)
-    : linear_(device, int8Activations, StepKind::Prefill), decodeLinear_(device, int8Activations, StepKind::Decode),
+    : taken_(std::make_shared<Int8PathsTaken>()), linear_(device, int8Activations, StepKind::Prefill, taken_),
+      decodeLinear_(device, int8Activations, StepKind::Decode, taken_),
       draftLinear_(device, Int8Activations::Off, StepKind::Prefill),
       draftDecodeLinear_(device, Int8Activations::Off, StepKind::Decode) {}
+
+std::string ExecutionPlans::activationsDescription(kv::Layout layout, uint32_t queryHeads, uint32_t contextTokens,
+                                                   std::span<const AttentionVariant> paged,
+                                                   std::span<const RelativeAttentionVariant> relative) const {
+  if (linear_.int8Activations() == Int8Activations::Off) return "bf16";
+  // Whether a chunk of 8 or 64 rows at the end of the context scores INT8
+  // queries in the attention the target runs: the plan names its split
+  // kernel q8q then (PagedAttention::plan, RelativeAttention::plan).
+  bool queries = false;
+  for (const uint32_t rows : {8U, 64U}) {
+    if (contextTokens <= rows) continue;
+    const uint32_t history = contextTokens - rows;
+    const std::array sequence{PagedAttention::chunkParams(history, rows, (rows + kv::kPageTokens - 1) /
+                                                                             kv::kPageTokens * kv::kPageTokens,
+                                                          (history + rows + kv::kPageTokens - 1) / kv::kPageTokens)};
+    const auto q8q = [](const std::string &pipeline) { return pipeline.find("q8q") != std::string::npos; };
+    for (const AttentionVariant &variant : paged)
+      queries |= q8q(attention(sequence, queryHeads, layout, sequenceAttentionWorkspace(queryHeads, layout), variant)
+                         .splitPipeline());
+    for (const RelativeAttentionVariant &variant : relative)
+      queries |= q8q(RelativeAttention::plan(sequence, layout, calibration().attention, linear_.int8Activations(),
+                                             RelativeAttention::sequenceWorkspace(layout), variant)
+                         .splitPipeline());
+  }
+  std::vector<std::string> paths;
+  if (taken_->prefillTile.load(std::memory_order_relaxed))
+    paths.push_back("prefill chunks of more than " + std::to_string(kMaximumDecodeTileRows) + " rows");
+  const bool decode = taken_->decodeTiles.load(std::memory_order_relaxed),
+             prefill = taken_->prefillDecodeTiles.load(std::memory_order_relaxed);
+  const std::string shortChunks = "prefill chunks of up to " + std::to_string(kMaximumInt8Rows) + " rows";
+  if (decode || prefill)
+    paths.push_back("rotated PQ2_0 projections in " +
+                    (decode && prefill ? "decode and " + shortChunks : decode ? std::string("decode") : shortChunks));
+  if (queries) paths.push_back("attention queries over long histories");
+  if (paths.empty()) return "auto, bf16 throughout for this model on this GPU";
+  std::string description = "auto, int8 in ";
+  for (size_t index = 0; index < paths.size(); ++index)
+    description += (index == 0 ? "" : index + 1 == paths.size() ? " and " : ", ") + paths[index];
+  return description;
+}
 
 namespace {
 
@@ -68,7 +112,8 @@ std::set<std::string> relativeKernels(const ExecutionPlans &plans, std::span<con
 // there took 0.15 s of Inkling-2-Mini's start) nor, where 129 rows' direct
 // kernel is the most rows', at 129. Every other
 // kernel a chunk's rows pick today changes once along them (selectFloatTile,
-// a MoE router's among them, the staged norm, the hyper-connection norm's
+// a MoE router's among them, a narrow MoE step's in-place gate/up reads, to
+// MOE_NARROW_ROWS rows, the staged norm, the hyper-connection norm's
 // quarters, the block residual mix's, a threadgroup a row from
 // BLOCK_RESIDUAL_MIX_QUERY_ROWS + 1 rows (65), Inkling-2-Mini's message
 // gates', message_gate_rows from MessageGate::kFusedRows + 1 (129), and the
@@ -87,8 +132,9 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
     const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
     const LinearTile tile = plan.configuration().tile;
-    // Only the staged and register tiles' kernels are named by their height.
-    const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
+    // Only the staged, register and matrix tiles' kernels are named by their height.
+    const bool named =
+        tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister || tile == LinearTile::GgufMatrix;
     MoeConfig config{};
     if (moe)
       config = selectMoe(calibration(), linear_.int8Activations(), StepKind::Prefill, moe->first, moe->second, rows);
@@ -111,24 +157,38 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<
 // (prefillRowClasses); a float projection's tile, which a step's rows move
 // only at the accelerator tile's fewest rows, as they fill one 64-row tile
 // (selectFloatTile); and a MoE target's expert tile (32-row tiles once its
-// rows' routes outnumber its experts). Its router's tile changes with them
-// on no device.
+// rows' routes outnumber its experts), its K partitions and whether the step
+// is narrow (MoePlan::narrow), which runs no gather. Its router's tile changes
+// with them on no device. Its message gates' kernels compute a group of rows
+// of the least power of two that holds a step's (MessageGate::groupRows), and
+// its block residual mixes run a threadgroup a row past 64 rows
+// (BlockResidualMix::rowKernels).
 std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
-                                                       std::optional<std::pair<MoeShape, uint32_t>> moe) const {
+                                                       std::optional<std::pair<MoeShape, uint32_t>> moe,
+                                                       DecodeRowKernels kernels, uint32_t lanes) const {
   if (mostRows > SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("a decode step holds at most a verify block of each of the most lanes");
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("a decode step takes one to the most lanes");
   const FloatTileCalibration &floats = calibration().floatTile;
   std::vector<uint32_t> first;
-  std::tuple<LinearTile, uint32_t, bool, uint32_t> last{};
+  std::tuple<LinearTile, uint32_t, bool, uint32_t, bool, uint32_t, uint32_t, uint32_t, bool, uint32_t> last{};
   for (uint32_t rows = 1; rows <= mostRows; ++rows) {
     const LinearPlan plan = decodeLinear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
     const LinearTile tile = plan.configuration().tile;
-    const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
+    const bool named =
+        tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister || tile == LinearTile::GgufMatrix;
     MoeConfig config{};
     if (moe)
       config = selectMoe(calibration(), linear_.int8Activations(), StepKind::Decode, moe->first, moe->second, rows);
     const std::tuple key{tile, named ? plan.storageRows() : 0, floats.neuralAccelerator && rows >= floats.minimumRows,
-                         uint32_t(config.expertTile)};
+                         uint32_t(config.expertTile), moe && MoE::plan(moe->first, rows, config).narrow(),
+                         uint32_t(config.gateUpPartitions), uint32_t(config.downPartitions),
+                         kernels.messageGates ? MessageGate::groupRows(rows) : 0u,
+                         kernels.blockResidualMixes && BlockResidualMix::rowKernels(rows),
+                         kernels.relativeAttention
+                             ? RelativeAttention::decodeTileRows(StepRows{lanes, rows, SPLASH_TARGET_VERIFY_ROWS})
+                             : 0u};
     if (first.empty() || key != last) first.push_back(rows);
     last = key;
   }
@@ -142,13 +202,24 @@ AttentionPlan ExecutionPlans::attention(std::span<const kv::ChunkedPrefillParams
                               capacity, variant);
 }
 
+// The draft's ring attention splits each (lane, KV head) four ways, 1.7.4's
+// count, until the modeled attention law takes the draft's ring as one of its
+// page sources (draft-attention-sweep measures the counts it weighs).
+constexpr uint32_t kDraftAttentionSplits = 4;
+
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
                                                  uint32_t lanes) const {
-  return DraftAttention::plan(shape, lanes);
+  return DraftAttention::plan(shape, lanes, kDraftAttentionSplits);
+}
+
+uint32_t ExecutionPlans::draftSelectorShards(uint32_t lanes) const {
+  return DraftSelector::shards(lanes, calibration().cores, calibration().draft.topThreadgroupsPerFourCores);
 }
 
 MoePlan ExecutionPlans::moe(MoeShape shape, uint32_t routerFormat, uint32_t rows, StepKind step) const {
-  return MoE::plan(shape, rows, selectMoe(calibration(), linear_.int8Activations(), step, shape, routerFormat, rows));
+  const MoeConfig config = selectMoe(calibration(), linear_.int8Activations(), step, shape, routerFormat, rows);
+  if (config.int8Passes) Int8PathsTaken::mark(taken_->prefillTile);
+  return MoE::plan(shape, rows, config);
 }
 
 AttentionWorkspace ExecutionPlans::sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const {
@@ -159,11 +230,11 @@ AttentionWorkspace ExecutionPlans::laneAttentionWorkspace(uint32_t queryHeads, k
   return PagedAttention::workspace(kv::kAttentionMaximumSplits, queryHeads, layout);
 }
 
-// The draft workspace is linear in the lanes: one lane's is every width's
-// share.
+// The draft workspace is linear in the lanes at a lane's splits, which never
+// grow with the lanes: one lane's is every width's share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
     DraftAttentionShape shape) const {
-  return DraftAttention::plan(shape, 1).workspace();
+  return draftAttention(shape, 1).workspace();
 }
 
 MoeWorkspace ExecutionPlans::moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows,

@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -18,16 +19,16 @@ namespace splash::kv {
 // An extent whose pages are all free stays allocated until a reclaim pass
 // between commands releases it (the memory ledger taking the cache's units,
 // engine::Cache); the cleanup after startup warmup keeps one. Inside an
-// extent every attention layer has a
-// region that holds the keys of all its pages, then their key scales, values
-// and value scales (abi/KvExtent.h), in the order Layout::region gives them:
-// a window's layers after the others. With a block index, the index plane
+// extent each of a page's slots (Layout::pageSlots) has a region that holds
+// the keys of all its pages, then their key scales, values and value scales
+// (abi/KvExtent.h). A layer sits in its slot (Layout::slot) on the page of
+// its block that holds it (Layout::blockPage): every layer's on the block's
+// one page without a window; with one, the layers no window bounds on the
+// base page and the windowed ones on the window unit's pages, in the order
+// Layout::region gives them. With a block index, the index plane
 // follows them: per layer a region of every page's pooled keys
 // (indexOffset). An extent holds pages of one form: a Full extent all of
-// that, a Slim extent the regions of the layers no window bounds and the
-// index plane, an Index extent only the index plane (kv::PageForm). A
-// layer's region sits at one offset in every extent that holds it, so its
-// SplashKvLayer serves a Full page and a Slim one alike. Kernels reach a
+// that, an Index extent only the index plane (kv::PageForm). Kernels reach a
 // page through its entries in a GPU table, so extents are allocated
 // metal::BufferReach::Addressed, and each table names the extents its
 // entries reach as it is written (metal::MetalBackend::setTableReach): a
@@ -68,9 +69,8 @@ public:
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept;
   [[nodiscard]] bool isAllocated(uint32_t page) const;
   // std::out_of_range for an extent past the pool; std::invalid_argument for
-  // Index pages of a layout that cannot spill (Layout::spillable) and Slim
-  // pages of one whose pages cannot give up a window's layers
-  // (Layout::slimmable). Under the storage's admission, or under `admit`.
+  // Index pages of a layout that cannot spill (Layout::spillable). Under the
+  // storage's admission, or under `admit`.
   [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent,
                                                        PageForm form = PageForm::Full) override;
   [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent, PageForm form,
@@ -81,16 +81,16 @@ public:
   // a request or the cache holds; GPU page tables rely on it (Runtime's
   // PageTableBinding).
   void releaseExtent(uint32_t extent) override;
-  // Copies what both pages hold: the K/V regions of the one that holds
-  // fewer (Layout::regions) and the index, which is all of spans() between
-  // pages of one form and indexSpans() between an Index page and another.
+  // Copies what both pages hold: all of spans() between pages of one form,
+  // and indexSpans() between an Index page and a Full one.
   // std::out_of_range for a page past the pool.
   void copyPages(std::span<const PageCopy> copies) override;
   // Zeroes everything each page holds (spans()). std::out_of_range for a
   // page past the pool.
   void clearPages(std::span<const uint32_t> pages) override;
-  // Where each attention layer's K/V region sits in every extent that holds
-  // it, by layer.
+  // Where each attention layer's K/V region sits in every extent, its slot's
+  // region, by layer: a kernel reaches it through the table of the block
+  // page that holds the layer (Layout::blockPage).
   [[nodiscard]] std::span<const SplashKvLayer> layers() const noexcept {
     return layers_;
   }
@@ -110,8 +110,7 @@ public:
   // Writes the entries kernels reach `pages`' K/V by, from index `first` on,
   // to a CPU-visible GPU page table, which must hold all of them; entries
   // before `first` are left as they are. An Index page's entry is
-  // SPLASH_KV_PAGE_ABSENT; a Slim page's reaches the regions it holds, all
-  // that a row its window has passed reads of it. The table then names the
+  // SPLASH_KV_PAGE_ABSENT. The table then names the
   // extents its entries reach, all of `pages` but Index ones
   // (metal::MetalBackend::setTableReach), which each encoder that uses it
   // makes resident. Throws std::logic_error for a table that is not
@@ -127,18 +126,26 @@ public:
   void writeIndexEntries(std::span<const uint32_t> pages, uint32_t first,
                          const metal::MetalBuffer &table) const;
   // The page's memory as the host reaches it, and the only code that names
-  // it: the bytes of each tensor in each region the page's form holds,
-  // region by region as keys, key scales, values and value scales, where
+  // it: the bytes of each tensor in each slot the page's form holds, slot
+  // by slot as keys, key scales, values and value scales, where
   // splash_kv_offset places them for the kernels, then each layer's pooled
-  // keys (indexOffset): a Slim page's are the first spans of a Full page's
-  // and its pooled keys, an Index page's its pooled keys alone. BF16 pages
+  // keys (indexOffset): an Index page's its pooled keys alone. BF16 pages
   // have no scale bytes. Throws std::logic_error for a page whose extent is
   // not allocated.
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const;
-  // The page's bytes of one layer's tensors, by SPLASH_KV_KEYS to
-  // SPLASH_KV_VALUE_SCALES (empty scales for BF16), and of each layer's
-  // pooled keys: the pieces of spans(). layerSpans() throws std::logic_error
-  // for a layer whose region the page's form does not hold and
+  // A block's memory, its Layout::blockPages() pages base page first: each
+  // layer's tensors in the order of their regions (Layout::region), each
+  // from the page that holds the layer, then the base page's pooled keys,
+  // what its tier slot holds (kv::SlotFormat). Without a window, the one
+  // page's spans(); for a block without its window unit, its base page
+  // alone, the layers no window bounds. std::invalid_argument for another
+  // count of pages. A tier's reader calls it beside the engine thread, under
+  // the lock the extents' allocations and releases take (records_).
+  [[nodiscard]] std::vector<std::span<std::byte>> blockSpans(std::span<const uint32_t> pages) const;
+  // The bytes of one layer's tensors on the page of its block that holds it
+  // (Layout::blockPage), by SPLASH_KV_KEYS to SPLASH_KV_VALUE_SCALES (empty
+  // scales for BF16), and of each layer's pooled keys: the pieces of
+  // spans(). layerSpans() throws std::logic_error for an Index page and
   // std::out_of_range for a layer past the layout; indexSpans() is empty
   // without an index.
   [[nodiscard]] std::array<std::span<std::byte>, 4> layerSpans(uint32_t page, uint32_t layer) const;
@@ -161,8 +168,9 @@ private:
   [[nodiscard]] uint64_t indexPlaneOffset(PageForm form) const noexcept {
     return uint64_t{extentPages_} * layout_.regions(form) * layout_.bytesPerLayerPage();
   }
-  // The page's spans of its first `regions` regions, then of its index.
+  // The page's spans of its first `regions` slots, then of its index.
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page, uint32_t regions) const;
+  [[nodiscard]] std::array<std::span<std::byte>, 4> slotSpans(uint32_t page, uint32_t slot) const;
   template <class Entry>
   void writeTable(std::span<const uint32_t> pages, uint32_t first, const metal::MetalBuffer &table,
                   Entry entry) const;
@@ -176,6 +184,12 @@ private:
   // The layer of each region, in region order (Layout::region).
   std::vector<uint32_t> regionLayers_;
   std::vector<Extent> extents_;
+  // Held where an extent's record changes (allocateExtent, releaseExtent)
+  // and where a tier's reader finds a block's spans (blockSpans): a window
+  // part's read holds the unit pages it fills but not its block's base page
+  // (engine::Cache::startUnitRead), whose extent a reclaim may release while
+  // the reader finds the base's spans, which it then leaves.
+  mutable std::mutex records_;
 };
 
 } // namespace splash::kv

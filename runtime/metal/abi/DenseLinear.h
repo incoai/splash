@@ -21,3 +21,15 @@ struct DenseLinearParams {
 
 static_assert(sizeof(DenseLinearParams) == 16,
               "dense projection parameters are 16 bytes on both sides");
+
+// A quantized projection's rows first_row <= r < rows on the GGUF prefill
+// tile (gguf_prefill_<format>_dense*, kernels/shared/gguf_linear.metal).
+struct DenseQuantizedParams {
+  uint32_t input_size;
+  uint32_t rows;
+  uint32_t first_row;
+  uint32_t output_size;
+};
+
+static_assert(sizeof(DenseQuantizedParams) == 16,
+              "quantized dense projection parameters are 16 bytes on both sides");

@@ -92,6 +92,13 @@ struct Runtime: Sendable {
         scriptCommand("install/cached.py", ["--models", models.path])
     }
 
+    /// The command line that only brings up to date the records of the installations an earlier
+    /// release made, by which the options of each are offered (`install/cached.py --records`),
+    /// those of the model `first` before the others'.
+    func recordsCommand(first: String?) -> [String] {
+        scriptCommand("install/cached.py", ["--models", models.path, "--records"] + (first.map { ["--first", $0] } ?? []))
+    }
+
     /// The command line of the Python `script` in the runtime: isolated from the user's Python
     /// settings and site-packages, unbuffered, and never writing bytecode into the signed bundle.
     private func scriptCommand(_ script: String, _ arguments: [String]) -> [String] {
@@ -212,9 +219,12 @@ struct Runtime: Sendable {
             let files: [String: File]
             let visionFormat: String?
             let visionUnavailable: String?
+            let quantizableWeights: Bool?
+            let reasoning: ModelReasoning?
 
             enum CodingKeys: String, CodingKey {
                 case model, family, files, visionFormat = "vision_format", visionUnavailable = "vision_unavailable"
+                case quantizableWeights = "quantizable_weights", reasoning
             }
         }
         let manager = FileManager.default
@@ -226,7 +236,8 @@ struct Runtime: Sendable {
             // An assembly can link one file under two names (a checkpoint's vision tower).
             let files = Dictionary(record.files.values.map { ($0.path, $0.bytes) }) { first, _ in first }
             return InstalledModel(id: record.model, bytes: files.values.reduce(0, +), family: record.family,
-                                  towerless: record.visionFormat == "none" && record.visionUnavailable == nil)
+                                  towerless: record.visionFormat == "none" && record.visionUnavailable == nil,
+                                  quantizableWeights: record.quantizableWeights, reasoning: record.reasoning)
         }
         let owners = (try? manager.contentsOfDirectory(at: models, includingPropertiesForKeys: nil)) ?? []
         let named = owners.filter { !$0.lastPathComponent.hasPrefix(".") }
@@ -427,6 +438,13 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
     /// (`vision_format`, `vision_unavailable`): of a family that serves images, an installation
     /// that a check for updates gives its tower (`AppState.awaitingVision`).
     var towerless = false
+    /// Whether Weights set to Auto loads any of its weights otherwise than as its files store them
+    /// (its record's `quantizable_weights`); nil for one no start of 1.7.4 has assembled yet, for one
+    /// the engine could not say it of, and for model files on this Mac not prepared.
+    var quantizableWeights: Bool?
+    /// What its own chat template makes of the reasoning efforts (its record's `reasoning`); nil
+    /// where its record doesn't say, as `quantizableWeights` is.
+    var reasoning: ModelReasoning?
 
     /// Whether it is model files on this Mac that are a GGUF file, or a folder holding one besides
     /// a projector, as they were measured; the vision projector they may be given is a GGUF's.

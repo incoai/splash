@@ -8,6 +8,8 @@
 // Keep the source order of float operations, which Metal's default fast math lets the compiler reassociate. Set
 // before the includes, so it also holds for the shared format and reduction code compiled here.
 #pragma clang fp reassociate(off)
+#include "metal/abi/DenseLinear.h"
+#include "metal/kernels/common/dense_epilogue.h"
 #include "metal/kernels/common/gguf_segments.h"
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/split_reduce.h"
@@ -76,10 +78,13 @@ inline void gguf_store_gate_up(thread Acc &gate, thread Acc &up, uint splits, ui
 // not a multiple of the tile) skip their matmuls and stores, so a chunk costs its rows rounded up to RowsPerSG rather
 // than to the tile (a 33-row chunk: 1.7x faster than a 128-row tile). Full tiles run this loop too; a branch-free copy
 // for them is no faster.
-template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
-inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
-                    uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
-                    uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr) {
+// gguf_prefill_sums hands store(row, column, sum) each sum of the simdgroups' rows, padding rows past `rows` in a
+// simdgroup that owns some among them, the row from the tile's first and the column from output_origin's tile's
+// first of the segment; gguf_prefill_tile stores them into bf16 rows through the GGUF epilogue.
+template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, class Store>
+inline void gguf_prefill_sums(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta,
+                              uint input_size, uint output_origin, uint rows, threadgroup half *stage,
+                              threadgroup half2 *tl, uint simd_lane, uint simd_group, Store store) {
   const bool owns_rows = simd_group * RowsPerSG < rows;   // uniform per simdgroup
   device bfloat *rows_input = input + ulong(simd_group) * RowsPerSG * input_size;
   auto acc = staged_accumulator<RowsPerSG, TileN, KS>(rows_input, input_size, stage);
@@ -92,9 +97,18 @@ inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uch
   for (ushort i = 0; i < acc.get_capacity(); ++i) {
     if (!acc.is_valid_element(i)) continue;
     auto index = acc.get_multidimensional_index(i);
-    const ulong o = (ulong(simd_group) * RowsPerSG + index[1]) * out_stride + out_offset + output_origin + index[0];
-    output[o] = gguf_epilogue<Ep>(acc[i], aux, o);
+    store(simd_group * RowsPerSG + index[1], output_origin + index[0], acc[i]);
   }
+}
+template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
+inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
+                    uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
+                    uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr) {
+  gguf_prefill_sums<F, RowsPerSG, Simdgroups, TileN, KS>(input, w0, w1, meta, input_size, output_origin, rows, stage, tl,
+                                                         simd_lane, simd_group, [&](uint row, uint column, float v) {
+    const ulong o = ulong(row) * out_stride + out_offset + column;
+    output[o] = gguf_epilogue<Ep>(v, aux, o);
+  });
 }
 
 // The two stages of a prefill tile.
@@ -225,21 +239,9 @@ QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
 // projection alone would, from the step staged_first_step gives the tile's index within the segment. The fused and
 // prefill kernels stay plain kernels: as template instantiations (weak_odr) the compiler infers fewer parameter
 // attributes and inlines differently.
-// A fused pipeline decodes its dispatch's segment formats alone, function constants 0-2 (ops::Linear: each once, the
-// last repeated past them): the GPU compiler builds a staged loop for each format a pipeline decodes, and a cold
-// 16-row fused pipeline took 18 s to build with all 44 on the 16-core M5 Pro, 0.5 s with three.
-// fused_formats runs body(F()) with the format type of `format`, one body per distinct format; an id the pipeline
-// does not decode decodes as its first, so every id runs one body.
-constant uint kFusedFormat0 [[function_constant(0)]];
-constant uint kFusedFormat1 [[function_constant(1)]];
-constant uint kFusedFormat2 [[function_constant(2)]];
-struct fused_formats {
-  template <class Body> void operator()(uint format, Body body) const {
-    if (kFusedFormat2 != kFusedFormat1 && format == kFusedFormat2) quant_format_switch(kFusedFormat2, body);
-    else if (kFusedFormat1 != kFusedFormat0 && format == kFusedFormat1) quant_format_switch(kFusedFormat1, body);
-    else quant_format_switch(kFusedFormat0, body);
-  }
-};
+// A fused pipeline decodes its dispatch's segment formats alone (fused_formats, kernels/common/gguf_segments.h): the
+// GPU compiler builds a staged loop for each format a pipeline decodes, and a cold 16-row fused pipeline took 18 s to
+// build with all 44 on the 16-core M5 Pro, 0.5 s with three.
 #define GGUF_DECODE_FUSED(R)                                                                                       \
   kernel void gguf_decode_fused_m##R(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                          \
                                      device bfloat *output [[buffer(10)]],                                        \
@@ -307,6 +309,42 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
   GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
 #undef GGUF_PREFILL_FORMAT
+
+// The dense instances (ops::DenseLinear), of a vision image's quantized format, Q8_0: each sum through the dense
+// epilogue (kernels/common/dense_epilogue.h) with the output's bias, and LayerScale for the scaled residual (buffer
+// 6, bias for the rest, which read none), into bf16 rows or the fp32 residual rows of p.output_size columns, for
+// rows p.first_row <= r < p.rows. The plain instances store every row of each simdgroup that owns one, so their
+// rows end on a simdgroup's 32; the _bounded ones store the rows below p.rows alone, testing each: run over all
+// the rows of a Q8_0 [3072 x 1024] projection of 2048 rows, they took 721 us against 550 (20-core M5 Pro), so
+// ops::DenseLinear runs them on the rows past the last whole 32 alone.
+#define GGUF_PREFILL_DENSE(F, f, ep, Epilogue, Output, bounded, Bounded)                                           \
+  kernel void gguf_prefill_##f##_dense##ep##bounded(                                                              \
+      device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],         \
+      device uchar *meta [[buffer(3)]], device Output *output [[buffer(4)]],                                      \
+      device const bfloat *bias [[buffer(5)]], device const bfloat *scale [[buffer(6)]],                          \
+      constant DenseQuantizedParams &p [[buffer(7)]], GGUF_PREFILL_THREAD) {                                       \
+    GGUF_PREFILL_TABLES(F);                                                                                        \
+    const uint first = p.first_row + group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;      \
+    device Output *out = output + ulong(first) * p.output_size;                                                    \
+    gguf_prefill_sums<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>( \
+        input + ulong(first) * p.input_size, w0, w1, meta, p.input_size, group.y * GGUF_TILE_COLUMNS, rows, stage,  \
+        tl, simd_lane, simd_group, [&](uint row, uint column, float v) {                                           \
+          if (!Bounded || row < rows)                                                                              \
+            dense_epilogue_store<Epilogue>(v, bias, scale, out + ulong(row) * p.output_size + column, column);     \
+        });                                                                                                        \
+  }
+#define GGUF_PREFILL_DENSE_EPILOGUE(F, f, ep, Epilogue, Output)                                                    \
+  GGUF_PREFILL_DENSE(F, f, ep, Epilogue, Output, , false) GGUF_PREFILL_DENSE(F, f, ep, Epilogue, Output, _bounded, true)
+#define GGUF_PREFILL_DENSE_FORMAT(F, f)                                                                            \
+  GGUF_PREFILL_DENSE_EPILOGUE(F, f, , DenseNone, bfloat)                                                           \
+  GGUF_PREFILL_DENSE_EPILOGUE(F, f, _gelu_tanh, DenseGeluTanh, bfloat)                                             \
+  GGUF_PREFILL_DENSE_EPILOGUE(F, f, _gelu_erf, DenseGeluErf, bfloat)                                               \
+  GGUF_PREFILL_DENSE_EPILOGUE(F, f, _residual, DenseResidual, float)                                               \
+  GGUF_PREFILL_DENSE_EPILOGUE(F, f, _scaled_residual, DenseScaledResidual, float)
+GGUF_PREFILL_DENSE_FORMAT(FmtQ80, q80)
+#undef GGUF_PREFILL_DENSE_FORMAT
+#undef GGUF_PREFILL_DENSE_EPILOGUE
+#undef GGUF_PREFILL_DENSE
 
 // The residual kernels over a view of the leading inputs of wider weight rows, for the Neural Engine FFN split's down
 // projection, one per format. Each runs the tile of its residual kernel on the planes advanced past the groups and

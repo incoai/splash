@@ -6,6 +6,16 @@
 
 namespace splash::benchmark {
 
+// The decode throughput prompt, in Qwen's chat template: one user message with
+// thinking off, for "Count upward from 1, writing each number and its English
+// name on a new line. Continue until you reach 200."
+// dev/benchmarks/chat_prompts.py reads these arrays for the built-in prompts.
+inline constexpr uint32_t kDecodeThroughputPrompt[] = {
+    248045, 846, 198, 2427, 38453, 494, 220, 16, 11, 4237, 1754, 1324, 321, 1141, 6163, 803, 383,
+    264, 491, 1500, 13, 14569, 2980, 488, 5372, 220, 17, 15, 15, 13, 248046, 198, 248045, 74455,
+    198, 248068, 271, 248069, 271
+};
+
 // Chat requests whose greedy answers move with any change in the target's
 // arithmetic, unlike the counting the decode throughput prompt asks for:
 // backend_benchmark's transcripts scenario runs them, and

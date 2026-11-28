@@ -107,24 +107,31 @@ PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuff
               {MESSAGE_GATE_TILE_THREADS, 1, 1});
     return {};
   }
+  const uint32_t group = groupRows(rows), groups = (rows + group - 1) / group;
   const metal::DispatchSize threads{MESSAGE_GATE_THREADS, 1, 1};
-  const uint32_t groups = (rows + MESSAGE_GATE_GROUP_ROWS - 1) / MESSAGE_GATE_GROUP_ROWS;
+  const std::string grouped = suffix + "_r" + std::to_string(group);
   const uint32_t slices = (hidden + MESSAGE_GATE_THREADS - 1) / MESSAGE_GATE_THREADS;
+  // The down projection reads each gate's x and message normalized, bf16
+  // rows of their strides, its columns of them.
+  for (uint32_t index = 0; index < count; ++index) {
+    const MessageGateInput &gate = gates[index];
+    requireBytes(buffers.normalizedX,
+                 rowBytes(rows, buffers.xStride, uint64_t{gate.xColumn} + hidden, sizeof(uint16_t)),
+                 "message gate normalized row");
+    requireBytes(buffers.normalizedMessage,
+                 rowBytes(rows, buffers.messageStride, uint64_t{gate.messageColumn} + hidden, sizeof(uint16_t)),
+                 "message gate normalized message");
+  }
   requireBytes(buffers.low, uint64_t{count} * rows * rank * sizeof(uint16_t), "message gate rank values");
-  // The normalized concatenations, bf16 [gates][rows][2 hidden], which the
-  // down projection reads before the apply writes the gated rows, fp32
-  // [gates][rows][hidden], over the same bytes of forget.
-  static_assert(2 * sizeof(uint16_t) == sizeof(float), "a gate's concatenation takes its gated rows' bytes");
   requireBytes(buffers.forget, uint64_t{count} * rows * hidden * sizeof(float), "message gate gated rows");
-  requireBytes(buffers.gain, uint64_t{count} * groups * slices * MESSAGE_GATE_GROUP_ROWS * sizeof(float),
+  requireBytes(buffers.gain, uint64_t{count} * groups * slices * group * sizeof(float),
                "message gate partial sums");
   requireBytes(buffers.counters, uint64_t{count} * groups * sizeof(uint32_t), "message gate counters");
-  graph.add("message_gate_normalize", {buffers.x, buffers.message, buffers.forget}, p, {rows, 1, count}, threads);
-  graph.add("message_gate_down" + suffix,
-            {buffers.forget, slot(0).weights.down.plane0, slot(1).weights.down.plane0, slot(2).weights.down.plane0,
-             buffers.low},
+  graph.add("message_gate_down" + grouped,
+            {buffers.normalizedX, buffers.normalizedMessage, slot(0).weights.down.plane0,
+             slot(1).weights.down.plane0, slot(2).weights.down.plane0, buffers.low},
             p, {(rank + MESSAGE_GATE_DOWN_OUTPUTS - 1) / MESSAGE_GATE_DOWN_OUTPUTS, groups, count}, threads);
-  graph.add("message_gate_apply" + suffix,
+  graph.add("message_gate_apply" + grouped,
             {buffers.x, buffers.message, slot(0).weights.forget.plane0, slot(1).weights.forget.plane0,
              slot(2).weights.forget.plane0, slot(0).weights.gain.plane0, slot(1).weights.gain.plane0,
              slot(2).weights.gain.plane0, buffers.low, slot(0).norm.buffer, slot(1).norm.buffer,

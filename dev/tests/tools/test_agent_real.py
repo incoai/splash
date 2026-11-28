@@ -1218,6 +1218,24 @@ class AgentRunnerTests(unittest.TestCase):
                 timeout=20,
             )
 
+    def test_a_version_probe_killed_once_is_run_again(self):
+        killed = subprocess.CompletedProcess([], 137, "", "")
+        answered = subprocess.CompletedProcess([], 0, "codex-cli 0.130.0", "")
+        with (
+            mock.patch.object(
+                agent.subprocess, "run", side_effect=[killed, answered]
+            ) as run,
+            mock.patch.object(agent.time, "sleep"),
+        ):
+            self.assertEqual(agent.client_version("/test/codex"), answered)
+        self.assertEqual(run.call_count, 2)
+        with (
+            mock.patch.object(agent.subprocess, "run", return_value=killed) as run,
+            mock.patch.object(agent.time, "sleep"),
+        ):
+            self.assertEqual(agent.client_version("/test/codex").returncode, 137)
+        self.assertEqual(run.call_count, agent.VERSION_PROBES)
+
     def test_preflight_runs_the_installed_client_tests_of_the_clients_found(self):
         tests = [
             "dev.tests.install.test_clients.InstalledCodexTests",

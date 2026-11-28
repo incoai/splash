@@ -297,7 +297,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::DraftTreeSizes, sizeof(uint32_t));
   put(DecodeTensor::ChainTokens, bytesFor<uint32_t>(SPLASH_TREE_CHAIN_TOKENS));
   put(DecodeTensor::ChainRates, bytesFor<float>(uint64_t{SPLASH_TREE_CHAIN_TOKENS} * SPLASH_TREE_AGREEMENTS));
-  put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
+  put(DecodeTensor::PageTable,
+      bytesFor<SplashKvPage>(uint64_t{kMaximumPageTableEntries} * geometry.target.kvLayout.blockPages()));
   if (geometry.target.kvLayout.indexDimension)
     put(DecodeTensor::IndexTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
   // A verify lane's list of a tile of its rows holds each row's selected
@@ -398,6 +399,13 @@ uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
                                  linear.partials, linear.counters, linear.rotated})
     bytes = checkedAdd(bytes, alignUp(scratch), "decode scratch");
   return bytes;
+}
+
+uint64_t decodePageTableBytes(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators,
+                              uint32_t pages) {
+  const uint32_t shares = decodeTensorLanes(DecodeTensor::PageTable, decodeArenaLanes(geometry, operators));
+  return alignUp(
+      checkedMultiply(bytesFor<SplashKvPage>(uint64_t{kMaximumPageTableEntries} * pages), shares, "decode tensor"));
 }
 
 uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,

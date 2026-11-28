@@ -60,9 +60,9 @@ void checkBlockNvfp4(void *ggml, const Goldens &hashes) {
                                      official.size() * sizeof(float)}).c_str());
 }
 
-// The GGUF Q8_0 quantization, which the loader applies to Qwen3.8-Flash-Next's BF16 and F16 hyper-connection
-// projections (model/GgufPreparation.cpp): the reference's block_q8_0 rows of q8_0Values against their golden hash,
-// and against the oracle library's own (quantize_row_q8_0_ref).
+// The GGUF Q8_0 quantization, which the loader's Q8_0 rows of BF16 and F16 values are built by
+// (model/GgufPreparation.cpp quantizeQ8_0Block): the reference's block_q8_0 rows of q8_0Values against their golden
+// hash, and against the oracle library's own (quantize_row_q8_0_ref).
 void checkQ8_0Quantization(void *ggml, const Goldens &hashes) {
   const std::vector<float> values = q8_0Values(uint64_t{kRows} * kColumns, kSeed + GGUF_FMT_Q80);
   const std::vector<uint8_t> blocks = quantizeQ8_0(values);

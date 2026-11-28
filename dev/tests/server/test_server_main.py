@@ -41,7 +41,8 @@ GOLDEN = Path(__file__).parent
 
 class ServerMainTests(unittest.TestCase):
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
-        args = main_args()
+        # Without a drain (--shutdown-timeout 0), as before drains existed.
+        args = main_args(shutdown_timeout=0)
         runtime = mock.Mock()
         runtime.capabilities = engine_ready(262144)
         backend = mock.Mock()
@@ -136,6 +137,87 @@ class ServerMainTests(unittest.TestCase):
         server.server_bind.assert_called_once_with()
         server.server_activate.assert_called_once_with()
         self.assertEqual(order, ["bind", "runtime"])
+
+    def test_a_first_stop_signal_drains_and_a_second_stops_at_once(self):
+        # The first SIGTERM drains: serving goes on, so that new requests get
+        # 503 server_shutdown, while the backend lets running requests finish
+        # for --shutdown-timeout; then the server stops as before, its
+        # engine's flush included. A second signal during the drain stops at
+        # once.
+        for second in (False, True):
+            with self.subTest(second_signal=second):
+                args = main_args(shutdown_timeout=4.5)
+                runtime = mock.Mock()
+                runtime.capabilities = engine_ready(262144)
+                backend = mock.Mock()
+                server = mock.Mock(server_port=8000)
+                handlers = {}
+                serving = []
+                drained = threading.Event()
+
+                def install(signum, handler):
+                    handlers[signum] = handler
+
+                def drain(seconds):
+                    drained.set()
+                    return 1
+
+                backend.drain.side_effect = drain
+                shut = threading.Event()
+                server.shutdown.side_effect = shut.set
+
+                def serve():
+                    serving.append(len(serving))
+                    if len(serving) == 1:
+                        handlers[signal.SIGTERM](signal.SIGTERM, None)
+                    elif second:
+                        handlers[signal.SIGINT](signal.SIGINT, None)
+                    else:
+                        # Serving goes on until the drain ends it.
+                        self.assertTrue(shut.wait(2))
+
+                server.serve_forever.side_effect = serve
+                with (
+                    mock.patch.object(api, "parse_args", return_value=args),
+                    unprepared_hold(),
+                    mock.patch.object(api, "load_thinking_key", return_value=None),
+                    mock.patch.object(
+                        transformers.AutoTokenizer,
+                        "from_pretrained",
+                        return_value=object(),
+                    ),
+                    mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "check_capabilities"),
+                    mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+                    mock.patch.object(
+                        api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+                    ),
+                    mock.patch.object(api, "NativeBackend", return_value=backend),
+                    mock.patch.object(api, "ConstraintFactory", return_value=object()),
+                    mock.patch.object(api, "Frontend", return_value=mock.Mock()),
+                    mock.patch.object(api, "FrontendServer", return_value=server),
+                    mock.patch.object(api.signal, "signal", side_effect=install),
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+                ):
+                    api.main()
+                    # The drain's last line is printed before it ends serving
+                    # (server.shutdown, which the second serve waits on), and
+                    # the console thread writes it after: wait for that write.
+                    console_written()
+                self.assertEqual(serving, [0, 1])
+                if not second:
+                    backend.drain.assert_called_once_with(4.5)
+                    self.assertIn(
+                        "Stopping · running requests get up to 4.5 s to finish",
+                        output.getvalue(),
+                    )
+                    self.assertIn(
+                        "Stopping · 1 request still running after 4.5 s end now",
+                        output.getvalue(),
+                    )
+                backend.close.assert_called_once()
+                server.server_close.assert_called_once()
+                runtime.kill.assert_not_called()
 
     def test_main_takes_vision_from_the_ready_event(self):
         args = main_args()

@@ -224,26 +224,34 @@ ShortConvolutionParams ShortConvolution::verifyParams(const ShortConvBuffers &bu
                                                       std::span<const metal::MetalBuffer> stateIn,
                                                       ShortConvState state, metal::MetalBuffer layout,
                                                       const LayoutRows &rows, metal::MetalBuffer tree,
-                                                      metal::MetalBuffer tape) {
+                                                      metal::MetalBuffer tape, ShortConvOutput output) {
   requireShape(shape);
   requireState(shape, state);
   // A verify block's paths are row masks of 32 rows.
   requireLayoutRows(rows, 32);
-  // It convolves the rows it computes: no view of wider input rows.
-  if (shape.dynamic() || stateIn.size() != rows.sequences || !buffers.residual || !tree || !tape ||
-      buffers.inputStride || buffers.inputColumn)
-    throw std::invalid_argument("invalid short convolution of a verify step's computed rows");
+  // RoundedSum convolves the rows its kernel computes: no view of wider
+  // input rows. Sum convolves its input's rows.
+  const bool computed = output == ShortConvOutput::RoundedSum;
+  if (shape.dynamic() || output == ShortConvOutput::Plain || stateIn.size() != rows.sequences || !tree || !tape ||
+      (computed && (!buffers.residual || buffers.inputStride || buffers.inputColumn)))
+    throw std::invalid_argument("invalid short convolution of a verify step that another kernel runs");
   requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "short convolution layout");
-  requireBytes(buffers.taps, uint64_t{shape.channels} * kTaps * sizeof(float), "short convolution taps");
-  requireBytes(buffers.residual, floatRows(rows.rows, shape.channels), "short convolution residual");
-  requireBytes(buffers.output, bfloat16Rows(rows.rows, shape.channels), "short convolution output");
+  if (computed) {
+    requireBytes(buffers.taps, uint64_t{shape.channels} * kTaps * sizeof(float), "short convolution taps");
+    requireBytes(buffers.residual, floatRows(rows.rows, shape.channels), "short convolution residual");
+    requireBytes(buffers.output, bfloat16Rows(rows.rows, shape.channels), "short convolution output");
+  } else {
+    requireBuffers(buffers, shape, output, rows.rows);
+  }
   for (const metal::MetalBuffer &s : stateIn) requireBytes(s, stateExtent(shape, state), "short convolution state");
   requireTape(tree, tape, shape, state, rows.rows);
   ShortConvolutionParams p = convolutionParams(shape, rows.rows, state);
-  p.output = SHORT_CONVOLUTION_OUTPUT_ROUNDED_SUM;
-  p.residual = 1;
+  p.output = static_cast<uint32_t>(output);
+  p.residual = buffers.residual ? 1u : 0u;
   p.tree = 1;
   p.sequences = rows.sequences;
+  p.input_stride = inputStride(buffers, shape);
+  p.input_column = buffers.inputColumn;
   return p;
 }
 

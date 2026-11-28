@@ -209,6 +209,7 @@ def selection(root, model=MODEL, **options):
         revision=options.get("revision"),
         language_only=options.get("language_only", True),
         draft_model=options.get("draft_model"),
+        draft_revision=options.get("draft_revision"),
     )
 
 

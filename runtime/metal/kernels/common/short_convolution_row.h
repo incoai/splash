@@ -13,11 +13,17 @@
 // sequence, before its first row its state's), plus its own input `own`,
 // over the divisor, rounded to bf16, then onto the residual where p.residual
 // adds one, into the row's output (`packed`, its place in the command's rows).
+// Its sums keep their order (reassociate(off)) and each tap's product and
+// sum are one fma, which the compiler would otherwise contract or not by the
+// kernel around it, so that every kernel that runs it, short_convolution's
+// and the kernels it runs inside (moe_combine_convolution,
+// block_residual_mix_convolved), writes the same bits.
 template <class Out, class Residual, class At>
 inline void short_convolution_output(At at, device const float *taps, device const bfloat *dynamic,
                                      device const Residual *residual, device Out *output,
                                      constant ShortConvolutionParams &p, uint c, uint packed, uint path, int depth,
                                      bfloat own) {
+#pragma clang fp reassociate(off)
   constexpr uint kTaps = SHORT_CONVOLUTION_TAPS;
   float sum = 0.0f;
   // Lag k's static tap is column kTaps - 1 - k of the channel's (the stored
@@ -25,7 +31,7 @@ inline void short_convolution_output(At at, device const float *taps, device con
   for (uint k = 0; k < kTaps; ++k) {
     const int back = depth - int(k);
     const float weight = taps[ulong(c) * kTaps + (kTaps - 1 - k)] + (p.heads ? float(dynamic[k]) : 0.0f);
-    sum += weight * float(at(back >= 0 && p.tree ? int(splash_path_row(path, uint(back))) : back));
+    sum = fma(weight, float(at(back >= 0 && p.tree ? int(splash_path_row(path, uint(back))) : back)), sum);
   }
   const float y = float(bfloat((sum + float(own)) / p.divisor));
   const ulong i = ulong(packed) * p.channels + c;

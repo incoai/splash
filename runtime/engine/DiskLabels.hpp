@@ -1,7 +1,6 @@
 #pragma once
 
 #include "engine/KvCache.hpp"
-#include "ops/PagedKv.hpp"
 
 #include <array>
 #include <bit>
@@ -57,35 +56,37 @@ template <typename Label>
   return label;
 }
 
-// A KV slot's label: its block's, then for a windowed layout (kv::Layout::
-// windowedLayers) the form of the page the slot holds, one byte: a build
-// whose windowed pages take another form keeps the namespace, and a build
-// that cannot restore that form drops those copies. Other layouts' slots
-// hold Full pages alone and keep the label they always had.
+// A KV slot's label: its block's, then for a layout whose copies have two
+// parts (kv::Layout::components) the copy's serial, which each part's label
+// carries and no other copy of any process has, so that the next process
+// pairs a block's parts by its id, identity and serial alone, whatever else
+// of their labels differs, and pairs no part with another copy's. Other
+// layouts' slots keep the label they always had.
 struct KvSlotLabel final {
   KvBlockLabel block;
-  kv::PageForm form = kv::PageForm::Full;
+  uint64_t copy = 0;
 };
 
-[[nodiscard]] constexpr uint32_t kvSlotLabelBytes(bool windowed) noexcept {
-  return sizeof(KvBlockLabel) + (windowed ? sizeof(kv::PageForm) : 0);
+[[nodiscard]] constexpr uint32_t kvSlotLabelBytes(bool parts) noexcept {
+  return sizeof(KvBlockLabel) + (parts ? sizeof(uint64_t) : 0);
 }
 
-[[nodiscard]] inline std::vector<std::byte> encodeKvSlotLabel(const KvSlotLabel &label,
-                                                             bool windowed) {
+[[nodiscard]] inline std::vector<std::byte> encodeKvSlotLabel(const KvSlotLabel &label, bool parts) {
   std::vector<std::byte> bytes = encodeLabel(label.block);
-  if (windowed)
-    bytes.push_back(static_cast<std::byte>(label.form));
+  if (parts) {
+    const std::vector<std::byte> copy = encodeLabel(label.copy);
+    bytes.insert(bytes.end(), copy.begin(), copy.end());
+  }
   return bytes;
 }
 
-[[nodiscard]] inline std::optional<KvSlotLabel>
-decodeKvSlotLabel(std::span<const std::byte> bytes, bool windowed) noexcept {
-  if (bytes.size() != kvSlotLabelBytes(windowed))
+[[nodiscard]] inline std::optional<KvSlotLabel> decodeKvSlotLabel(std::span<const std::byte> bytes,
+                                                                 bool parts) noexcept {
+  if (bytes.size() != kvSlotLabelBytes(parts))
     return std::nullopt;
   KvSlotLabel label{*decodeLabel<KvBlockLabel>(bytes.first(sizeof(KvBlockLabel)))};
-  if (windowed)
-    label.form = static_cast<kv::PageForm>(bytes.back());
+  if (parts)
+    label.copy = *decodeLabel<uint64_t>(bytes.subspan(sizeof(KvBlockLabel)));
   return label;
 }
 

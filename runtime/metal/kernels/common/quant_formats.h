@@ -529,7 +529,7 @@ struct FmtMXFP8 {
   static QuantCoef coef(Meta e, ushort) { return {float2(quant_mxfp8_scale(e))}; }
 };
 // BF16, F16: plane0 the group's 16-bit values (16 bytes 16c..16c+15 = chunk c); meta the FP32 scale g of 256
-// elements (1 for a GGUF tensor). value = g * x.
+// elements, 64 in their forms of 64-element blocks (1 for a GGUF tensor). value = g * x.
 template <uint F, class V> struct FmtFloat16 {
   QUANT_FORMAT(F, QuantFloat16, 0, 32 * MetaGroups, false);
   typedef V Value;
@@ -546,6 +546,9 @@ template <uint F, class V> struct FmtFloat16 {
 };
 typedef FmtFloat16<GGUF_FMT_BF16, bfloat> FmtBF16;
 typedef FmtFloat16<GGUF_FMT_F16, half> FmtF16;
+// Their forms of 64-element blocks: a meta unit of two groups.
+typedef FmtFloat16<GGUF_FMT_BF1664, bfloat> FmtBF1664;
+typedef FmtFloat16<GGUF_FMT_F1664, half> FmtF1664;
 // PQ2_0 (GGUF tensor type 142) and Q2_0 (type 42): plane0 2-bit codes as Q2_K's; meta the
 // half d of the native block, four groups (PQ2_0's 128 elements) or two (Q2_0's 64). value = d * (q - 1).
 template <uint F> struct FmtTwoBit {
@@ -610,8 +613,9 @@ QUANT_AFFINE_GROUPS(8)
   X(FmtAF3G128, af3g128) X(FmtAF4G32, af4g32) X(FmtAF4G64, af4g64) X(FmtAF4G128, af4g128) X(FmtAF5G32, af5g32)    \
   X(FmtAF5G64, af5g64) X(FmtAF5G128, af5g128) X(FmtAF6G32, af6g32) X(FmtAF6G64, af6g64) X(FmtAF6G128, af6g128)    \
   X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)            \
-  X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16) X(FmtQ20, q20) X(FmtNVFP464, nvfp464) X(FmtMXFP8, mxfp8)
-#define QUANT_FORMATS(X) QUANT_REGISTER_FORMATS(X) X(FmtF16, f16)
+  X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16) X(FmtQ20, q20) X(FmtNVFP464, nvfp464) X(FmtMXFP8, mxfp8)      \
+  X(FmtBF1664, bf1664)
+#define QUANT_FORMATS(X) QUANT_REGISTER_FORMATS(X) X(FmtF16, f16) X(FmtF1664, f1664)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time: any format (quant_format_switch), or one of the register tile's

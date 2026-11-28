@@ -76,7 +76,7 @@ class ModelFamily:
     # the order it prefers them when a repository holds several
     # (upstream.select_vision). Qwen's tower loads only exact ones, which
     # preparation copies or converts without rounding; Inkling's also Q8_0,
-    # last, whose values preparation rounds to BF16.
+    # last, whose projections preparation keeps in Q8_0.
     image_format: ImageFormat = QWEN_IMAGES
     projectors: tuple[str, ...] = ("BF16", "F32", "F16")
     # Whether a source whose tower the installer refuses serves text, with
@@ -138,8 +138,9 @@ def option_report(engine_facts):
     the model, and whether it turns the reasoning on and off). Each family's
     report holds the flags of the options that need a fact it lacks
     (ServeOption.needs, LAUNCHER_NEEDS), which act on none of its models,
-    and the context its models serve: their native window, and the most past
-    it, with YaRN."""
+    the context its models serve: their native window, and the most past
+    it, with YaRN; its models' default --activations; and the sampling a
+    request of them gets where it names none."""
     needs = {
         option.flag: option.needs
         for option in serve_options.SERVE_OPTIONS
@@ -157,6 +158,12 @@ def option_report(engine_facts):
             "unusable": [flag for flag, fact in needs.items() if not facts[fact]],
             "context_tokens": engine["context_tokens"],
             "max_context_tokens": engine["max_context_tokens"],
+            "activations": engine["activations"],
+            "sampling": {
+                "temperature": family.sampling.temperature,
+                "top_p": family.sampling.top_p,
+                "top_k": family.sampling.top_k,
+            },
         }
     return report
 

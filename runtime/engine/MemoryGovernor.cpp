@@ -400,7 +400,7 @@ Need MemoryGovernor::need(ClaimId claim, const std::optional<Need> &inPlace) con
   return need;
 }
 
-std::array<uint32_t, 3> MemoryGovernor::heldPages(ClaimId claim) const {
+std::array<uint32_t, kv::kPageForms> MemoryGovernor::heldPages(ClaimId claim) const {
   const std::optional<HostMemory> host = sampleHost();
   const uint64_t headroom = hostHeadroomBytes(host, reservedBytes_ + unseenGrowthBytes(host));
   const uint64_t hostRoom =

@@ -232,9 +232,13 @@ final class AppState {
     }
 
     /// What the family of `model`, a listed one, makes of the launch options; unknown for model
-    /// files on this Mac not prepared yet, or before the runtime has reported its families.
+    /// files on this Mac not prepared yet, or before the runtime has reported its families. Only a
+    /// model whose record says Weights set to Auto would load some of its weights otherwise can use
+    /// that option, and Thinking offers what its record says its chat template renders.
     func family(of model: String?) -> ModelFamily {
-        installed.first { $0.id == model }?.family.flatMap { families[$0] } ?? .unknown
+        let listed = installed.first { $0.id == model }
+        return (listed?.family.flatMap { families[$0] } ?? .unknown)
+            .weights(quantizable: listed?.quantizableWeights).thinking(listed?.reasoning)
     }
 
     /// The name to show for model `id`; its variant tells installed variants of a model apart.
@@ -279,11 +283,23 @@ final class AppState {
     /// Installs, without downloading, the models other tools or a source checkout of Splash left
     /// in the Hugging Face cache that Splash serves (`install/cached.py`), then lists them.
     private func installCached() {
-        cachedInstaller = try? ChildProcess(command: runtime.cachedInstallCommand, environment: runtime.environment,
-                                            log: URL(filePath: "/dev/null")) { [weak self] _ in
-            self?.cachedInstaller = nil
-            self?.refresh()
+        // First the records of the installations an earlier release made, the model picked's
+        // before the others', which takes a second; then the installations, which can take long.
+        let null = URL(filePath: "/dev/null")
+        let install = { [weak self] in
+            guard let self else { return }
+            self.cachedInstaller = try? ChildProcess(command: self.runtime.cachedInstallCommand, environment: self.runtime.environment,
+                                                     log: null) { [weak self] _ in
+                self?.cachedInstaller = nil
+                self?.refresh()
+            }
         }
+        cachedInstaller = try? ChildProcess(command: runtime.recordsCommand(first: selection), environment: runtime.environment,
+                                            log: null) { [weak self] _ in
+            self?.refresh()
+            install()
+        }
+        if cachedInstaller == nil { install() }
     }
 
     /// Reads the API key kept; a Keychain that doesn't give it is a problem to solve first.

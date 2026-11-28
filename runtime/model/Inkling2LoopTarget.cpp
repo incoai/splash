@@ -8,11 +8,13 @@
 #include "ops/RowCopy.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace splash::model {
 namespace {
@@ -101,10 +103,13 @@ void Inkling2LoopTarget::planRelativeAttention(PrefillStep &step) const {
   const ops::AttentionWorkspace workspace{step.buffers.attentionPartials.sizeBytes(),
                                           step.buffers.attentionStatistics.sizeBytes()};
   const ops::Linear &linear = this->linear(step);
+  // A decode step's lanes run the tile of its most rows a lane (ops::RelativeAttention::decodeLaneRows).
+  const uint32_t laneRows = step.decode ? ops::RelativeAttention::decodeLaneRows(step.decode->step) : 0;
   const auto plan = [&](ops::RelativeAttentionVariant variant) {
     return ops::RelativeAttention::plan(step.attentionSequences(), geometry_.kvLayout,
                                         operators_.calibration().attention, linear.int8Activations(), workspace,
-                                        variant, step.decode ? ops::StepKind::Decode : ops::StepKind::Prefill);
+                                        variant, step.decode ? ops::StepKind::Decode : ops::StepKind::Prefill,
+                                        laneRows);
   };
   // The full layers' variant and the sliding layers', as its layout states
   // them (Inkling2LoopLayout::relativeAttention).
@@ -158,7 +163,10 @@ void Inkling2LoopTarget::addRestart(const PrefillStep &step) const {
 // alone (the layer's input is its stack plane already), otherwise the input
 // plus it, in fp32; then the FFN's input, the mix of the stack, its own push
 // included, and the residual, gated by its message in a later pass, through
-// ffn_norm, and its routing.
+// ffn_norm, and its routing. A decode step's mix runs the convolution itself,
+// each row's threadgroup its row's (ops::BlockResidualStates::convolution),
+// the same bits in one dispatch fewer an application; a prompt chunk's,
+// which writes the states after its rows, stays a dispatch of its own.
 void Inkling2LoopTarget::addPrefillLayer(PrefillStep &step, uint32_t application) const {
   const Inkling2LoopLayerWeights &layer = weights_.layers[schedule_.weightLayer(application)];
   const QwenTargetPrefillBuffers &b = step.buffers;
@@ -170,17 +178,47 @@ void Inkling2LoopTarget::addPrefillLayer(PrefillStep &step, uint32_t application
   // residual's partial sum, not the mixes its norms read of them.
   addDraftCapture(step, application, input);
   addAttention(step, application, addMixerInputs(step, application, input));
-  addConvolution(step, application, Inkling2LoopConvolution::Mixer,
-                 {.input = b.attentionOutput,
-                  .taps = layer.mixer.outputConvolution,
-                  .residual = schedule_.boundary(application) ? metal::MetalBuffer{} : input,
-                  .output = s.residual},
-                 {.channels = hidden}, ops::ShortConvOutput::Sum);
-  const ops::BlockResidualStates states{
-      .stack = s.stack, .planeRows = s.planeRows, .current = s.residual, .currentFloat = true};
+  const ops::ShortConvBuffers convolution{.input = b.attentionOutput,
+                                          .taps = layer.mixer.outputConvolution,
+                                          .residual = schedule_.boundary(application) ? metal::MetalBuffer{} : input,
+                                          .output = s.residual};
+  const ops::ShortConvShape convolutionShape{.channels = hidden};
+  std::vector<metal::MetalBuffer> stateIn;
+  std::optional<ops::ShortConvVerify> convolved;
+  // A decode step's mix runs the convolution itself where a threadgroup mixes a row and query; a step of more
+  // rows, whose mix is a threadgroup a row, runs the convolution's dispatch as a prompt chunk does
+  // (ops::BlockResidualMix::convolves).
+  if (const QwenTargetDecodeBuffers *d = step.decode; d && ops::BlockResidualMix::convolves(step.rows)) {
+    for (const QwenTargetPrefillSequence &sequence : step.sequences) stateIn.push_back(sequence.auxiliaryIn);
+    convolved.emplace(ops::ShortConvVerify{
+        .buffers = convolution,
+        .shape = convolutionShape,
+        .stateIn = stateIn,
+        .state = {.column = schedule_.convolutionColumn(application, Inkling2LoopConvolution::Mixer),
+                  .stride = schedule_.stateColumns()},
+        .layout = b.laneRows,
+        .rows = step.layoutRows,
+        .tree = d->tree,
+        .tape = s.tape});
+  } else {
+    addConvolution(step, application, Inkling2LoopConvolution::Mixer, convolution, convolutionShape,
+                   ops::ShortConvOutput::Sum);
+  }
+  const ops::BlockResidualStates states{.stack = s.stack,
+                                        .planeRows = s.planeRows,
+                                        .current = s.residual,
+                                        .currentFloat = true,
+                                        .convolution = convolved ? &*convolved : nullptr};
   const ops::BlockResidualShape shape{.hidden = hidden, .stack = schedule_.ffnStates(application), .queries = 1};
   if (schedule_.gated(application)) {
-    ops::BlockResidualMix::addMix(step.graph, states, layer.ffnQuery, s.mixed, shape, step.rows);
+    // Its gate reads the mix's rows normalized where the mix writes them.
+    const ops::BlockResidualMixInput mix{
+        .states = states,
+        .queries = layer.ffnQuery,
+        .shape = shape,
+        .output = s.mixed,
+        .normalized = ops::MessageGate::readsNormalized(step.rows) ? s.normalizedMixed : metal::MetalBuffer{}};
+    ops::BlockResidualMix::addMix(step.graph, std::span(&mix, 1), step.rows);
     const Gate gate{.message = 3, .column = 0, .norm = layer.ffnNorm, .output = b.normalized};
     addGates(step, application, 1, std::span(&gate, 1));
   } else {
@@ -201,7 +239,8 @@ void Inkling2LoopTarget::addPrefillLayer(PrefillStep &step, uint32_t application
 // one norm takes for its q, k and v inputs alike; a full layer three, each
 // through its own norm. In a later pass each input is first gated by its
 // message, the pass before's states mixed by the layer's message queries
-// (Inkling2LoopTextModel.forward's message_input).
+// (Inkling2LoopTextModel.forward's message_input), the two mixes, which read
+// nothing of each other's, in one dispatch.
 std::array<metal::MetalBuffer, 3> Inkling2LoopTarget::addMixerInputs(PrefillStep &step, uint32_t application,
                                                                     metal::MetalBuffer input) const {
   const uint32_t weightLayer = schedule_.weightLayer(application);
@@ -224,15 +263,25 @@ std::array<metal::MetalBuffer, 3> Inkling2LoopTarget::addMixerInputs(PrefillStep
   const ops::BlockResidualShape shape{.hidden = hidden, .stack = schedule_.mixerStates(application),
                                       .queries = queries};
   if (schedule_.gated(application)) {
-    // The pass before's block states, then its output, the mix's current rows.
+    // The messages mix the pass before's block states, then its output, the
+    // mix's current rows; the gates read both mixes' rows normalized where the
+    // mixes write them.
     const uint32_t planes = schedule_.previousPlanes();
-    ops::BlockResidualMix::addMix(step.graph,
-                                  {.stack = s.previous,
-                                   .planeRows = s.planeRows,
-                                   .current = rows(step, {Inkling2LoopRowsKind::Previous, planes - 1})},
-                                  layer.messages->queries, s.messages,
-                                  {.hidden = hidden, .stack = planes - 1, .queries = 4}, step.rows);
-    ops::BlockResidualMix::addMix(step.graph, states, layer.mixerQueries, s.mixed, shape, step.rows);
+    const bool normalize = ops::MessageGate::readsNormalized(step.rows);
+    const std::array<ops::BlockResidualMixInput, 2> mixes{
+        {{.states = {.stack = s.previous,
+                     .planeRows = s.planeRows,
+                     .current = rows(step, {Inkling2LoopRowsKind::Previous, planes - 1})},
+          .queries = layer.messages->queries,
+          .shape = {.hidden = hidden, .stack = planes - 1, .queries = 4},
+          .output = s.messages,
+          .normalized = normalize ? s.normalizedMessages : metal::MetalBuffer{}},
+         {.states = states,
+          .queries = layer.mixerQueries,
+          .shape = shape,
+          .output = s.mixed,
+          .normalized = normalize ? s.normalizedMixed : metal::MetalBuffer{}}}};
+    ops::BlockResidualMix::addMix(step.graph, mixes, step.rows);
     std::array<Gate, 3> gates;
     for (uint32_t index = 0; index < 3; ++index)
       gates[index] = {.message = index, .column = full ? index : 0, .norm = norms[index], .output = separate[index]};
@@ -263,11 +312,14 @@ void Inkling2LoopTarget::addGates(const PrefillStep &step, uint32_t application,
                      .messageColumn = gate.message * hidden,
                      .output = gate.output};
   }
+  const bool normalized = ops::MessageGate::readsNormalized(step.rows);
   ops::MessageGate::add(step.graph,
                         {.x = s.mixed,
                          .xStride = queries * hidden,
                          .message = s.messages,
                          .messageStride = 4 * hidden,
+                         .normalizedX = normalized ? s.normalizedMixed : metal::MetalBuffer{},
+                         .normalizedMessage = normalized ? s.normalizedMessages : metal::MetalBuffer{},
                          .concat = s.gateConcat,
                          .low = s.gateLow,
                          .forget = s.gateForget,
@@ -339,7 +391,8 @@ void Inkling2LoopTarget::addAttention(PrefillStep &step, uint32_t application,
   }
 
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
-  const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
+  const std::span<const metal::MetalBuffer> pageTables =
+      std::span(step.pageTables[geometry_.kvLayout.blockPage(kvLayer)]).first(sequences.size());
   const ops::AttentionRows attentionRows{b.laneRows, rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
   const ops::RelativeAttentionRows layerRows{b.fullPacked, s.convolvedKeys, s.convolvedValues};
   const ops::RelativeAttentionWeights weights{mixer.queryScale, mixer.relativeScale, mixer.relativeBias};
@@ -366,7 +419,7 @@ void Inkling2LoopTarget::addAttention(PrefillStep &step, uint32_t application,
       const PrefillKv history =
           step.spilled.prefill(step.graph, kvLayer, sequence.lane, firstPage,
                                kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
-                               {sequence.pageTable, step.kvLayers[kvLayer]});
+                               {pageTables[index], step.kvLayers[kvLayer]});
       histories[index] = {history.kv, history.table, {}};
     }
     gated = ops::RelativeAttention::addAttention(step.graph, plan, staging, weights, b.attentionPartials,
@@ -481,11 +534,11 @@ void Inkling2LoopTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFold
                                  schedule_.stateColumns(), std::move(buffers.laneRows), step.rows, rows);
 }
 
-void Inkling2LoopTarget::addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+void Inkling2LoopTarget::addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t regions, uint32_t extentPages,
                                          std::span<const metal::MetalBuffer> pageTables,
                                          std::span<const uint32_t> committed, uint32_t laneRows,
                                          const metal::MetalBuffer &paths) const {
-  ops::RelativeAttention::addPathCommit(graph, layout, extentPages, pageTables, committed, laneRows, paths);
+  ops::RelativeAttention::addPathCommit(graph, layout, regions, extentPages, pageTables, committed, laneRows, paths);
 }
 
 std::unique_ptr<QwenTarget> makeQwenTarget(const Inkling2LoopWeights &weights, const QwenTargetGeometry &geometry,

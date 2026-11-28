@@ -79,14 +79,15 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 }
 
 // Loads every image of the GGUF at path into images: the layers', the head's
-// and the embedding's.
+// and the embedding's, its 16-bit projections as `weights` says.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
-                const model::QwenTargetDimensions &geometry) {
+                const model::QwenTargetDimensions &geometry,
+                model::gguf::Float16Weights weights = model::gguf::Float16Weights::Q8_0) {
   const model::GgufTargetPlan plan{geometry.layers, geometry.leadingDenseLayers,
                                    [&](const model::GgufFile &file, model::gguf::PlanOptions options) {
                                      return model::gguf::planImages(file, architecture(geometry), geometry, options);
                                    }};
-  model::GgufTargetLoader loader(backend, images, {path}, plan);
+  model::GgufTargetLoader loader(backend, images, {path}, plan, {}, {}, weights);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
   static_cast<void>(loader.embedding());
@@ -98,11 +99,13 @@ std::vector<std::vector<uint8_t>> bytesOf(const model::WeightImages &images) {
   return result;
 }
 
-// Every byte of each image the loader writes.
-std::vector<std::vector<uint8_t>> preparedImages(MetalBackend &backend, const std::filesystem::path &path,
-                                                 const model::QwenTargetDimensions &geometry) {
+// Every byte of each image the loader writes, its 16-bit projections as
+// `weights` says.
+std::vector<std::vector<uint8_t>>
+preparedImages(MetalBackend &backend, const std::filesystem::path &path, const model::QwenTargetDimensions &geometry,
+               model::gguf::Float16Weights weights = model::gguf::Float16Weights::Q8_0) {
   model::WeightImages images(backend, "fixture");
-  loadImages(backend, images, path, geometry);
+  loadImages(backend, images, path, geometry, weights);
   return bytesOf(images);
 }
 
@@ -398,6 +401,87 @@ void checkQuantizedRouter(MetalBackend &backend, const std::filesystem::path &di
   }
 }
 
+// The MoE layer's F32 router and alpha/beta, every value a BF16 value (each
+// fixture value's low 16 bits cleared), as a BF16 release's that a conversion
+// writes as F32 (gguf::floatKernelType): planned with the loader's look at the
+// values (readingValues), the router loads as its values' BF16 halves and the
+// pair as one BF16 tensor of the beta then the alpha rows in grouped head
+// order, under either --weights; planned from the header alone, as stored. A
+// router holding one value BF16 does not hold loads as stored, and a pair whose
+// alpha does loads as one F32 tensor, both as stored.
+void checkBfloat16Values(MetalBackend &backend, const std::filesystem::path &directory) {
+  using model::gguf::Conversion;
+  using model::gguf::Float16Weights;
+  SmallTarget target = smallTarget(true);
+  const model::QwenTargetDimensions &g = target.geometry;
+  const std::string router = "blk.0.ffn_gate_inp.weight", beta = "blk.0.ssm_beta.weight",
+                    alpha = "blk.0.ssm_alpha.weight";
+  for (const std::string &name : {router, beta, alpha}) {
+    Tensor &tensor = tensorNamed(target.tensors, name);
+    if (tensor.type != model::ggml::kF32) throw std::runtime_error("the MoE fixture's " + name + " is not F32");
+    for (size_t value = 0; value < tensor.data.size(); value += 4) tensor.data[value] = tensor.data[value + 1] = 0;
+  }
+  const auto plan = [&](const std::filesystem::path &path, model::gguf::PlanOptions options) {
+    model::WeightSource source(path);
+    return model::gguf::planImages(model::GgufFile(source), architecture(g), g, options);
+  };
+  // The bytes the image holds of an F32 tensor's copy: its rows in the copy's
+  // order, as their BF16 halves where it narrows them.
+  const auto expected = [](const std::vector<uint8_t> &values, const model::gguf::Copy &copy) {
+    const std::vector<uint8_t> ordered = orderedRows(values, values.size() / copy.source.rows, copy.source.order);
+    return copy.conversion == Conversion::NarrowToBfloat16 ? bfloat16Halves(ordered) : ordered;
+  };
+  const auto path = directory / "moe-bfloat16-values.gguf";
+  writeGguf(path, target.tensors, g);
+  for (const Float16Weights weights : {Float16Weights::Q8_0, Float16Weights::Published}) {
+    const std::string mode = weights == Float16Weights::Q8_0 ? " under q8" : " as published";
+    const std::vector<model::gguf::Image> reading = plan(path, model::readingValues({.weights = weights})),
+                                          header = plan(path, {.weights = weights});
+    const std::vector<uint8_t> image = preparedImages(backend, path, g, weights).front();
+    const model::gguf::Copy *routerCopy = copyOf(reading[0], router), *routerHeader = copyOf(header[0], router);
+    check(routerCopy && routerCopy->conversion == Conversion::NarrowToBfloat16 && routerHeader &&
+              routerHeader->conversion == Conversion::None &&
+              slice(image, routerCopy->destination, target.data(router).size() / 2) ==
+                  expected(target.data(router), *routerCopy),
+          "an F32 router of BF16's values alone loads as its BF16 rows, from its header alone as stored" + mode);
+    const model::gguf::Copy *betaCopy = copyOf(reading[0], beta), *alphaCopy = copyOf(reading[0], alpha),
+                            *betaHeader = copyOf(header[0], beta);
+    bool pair = betaCopy && alphaCopy && betaHeader && betaCopy->conversion == Conversion::NarrowToBfloat16 &&
+                alphaCopy->conversion == Conversion::NarrowToBfloat16 && betaHeader->conversion == Conversion::None;
+    if (pair) {
+      std::vector<uint8_t> rows = expected(target.data(beta), *betaCopy);
+      const std::vector<uint8_t> alphaRows = expected(target.data(alpha), *alphaCopy);
+      rows.insert(rows.end(), alphaRows.begin(), alphaRows.end());
+      pair = alphaCopy->destination == betaCopy->destination + alphaRows.size() &&
+             slice(image, betaCopy->destination, rows.size()) == rows;
+    }
+    check(pair, "an F32 alpha/beta pair of BF16's values alone loads as one BF16 tensor of the beta then the alpha "
+                "rows in grouped head order, from its header alone as F32" +
+                    mode);
+  }
+
+  std::vector<Tensor> other = target.tensors;
+  const float value = 1.0f + 0x1p-10f;
+  for (const std::string &name : {router, alpha}) std::memcpy(tensorNamed(other, name).data.data() + 12, &value, 4);
+  const auto otherPath = directory / "moe-one-other-value.gguf";
+  writeGguf(otherPath, other, g);
+  const std::vector<model::gguf::Image> otherPlans = plan(otherPath, model::readingValues({}));
+  const std::vector<uint8_t> otherImage = preparedImages(backend, otherPath, g).front();
+  const model::gguf::Copy *routerCopy = copyOf(otherPlans[0], router), *betaCopy = copyOf(otherPlans[0], beta),
+                          *alphaCopy = copyOf(otherPlans[0], alpha);
+  check(routerCopy && routerCopy->conversion == Conversion::None &&
+            slice(otherImage, routerCopy->destination, tensorNamed(other, router).data.size()) ==
+                expected(tensorNamed(other, router).data, *routerCopy),
+        "an F32 router holding one value BF16 does not hold loads as stored");
+  check(betaCopy && alphaCopy && betaCopy->conversion == Conversion::None &&
+            alphaCopy->conversion == Conversion::None &&
+            slice(otherImage, betaCopy->destination, tensorNamed(other, beta).data.size()) ==
+                expected(tensorNamed(other, beta).data, *betaCopy) &&
+            slice(otherImage, alphaCopy->destination, tensorNamed(other, alpha).data.size()) ==
+                expected(tensorNamed(other, alpha).data, *alphaCopy),
+        "an F32 alpha/beta pair whose alpha holds one value BF16 does not hold loads as one F32 tensor as stored");
+}
+
 // MXFP8's block of 32 values by a search of every E8M0 exponent, the smallest
 // first, for one at which each value is an E4M3 code's (the reference's
 // e4m3); none when no exponent holds them all.
@@ -468,11 +552,14 @@ void checkMxfp8Blocks() {
 // A MoE layer's routed experts of BF16 values, 320 inputs wide but down's 256,
 // as Unsloth's UD-Q8_K_XL widens a release's MXFP8 experts: of MXFP8's values
 // (the reference's MXFP8 rows), each tensor MXFP8 planes of the blocks a
-// search of every exponent finds; of other values, BF16 planes as stored where
-// a tensor's rows are whole 256-value blocks (down) and the reference
-// quantization's Q8_0 where they are not (gate and up). A plan without the
-// loader's look at the values (exactlyMxfp8), as of a header alone, takes the
-// latter for both.
+// search of every exponent finds, under either --weights; of other values,
+// BF16 or F16, under q8 Q8_0 planes of the reference
+// quantization of the values, and as published their values as stored, in
+// their type's planes where a tensor's rows are whole 256-value blocks (down)
+// and in its form of 64-element blocks where they are not (gate and up, 320
+// inputs). A plan without the loader's look at the values (exactlyMxfp8), as
+// of a header alone, takes the latter for both. Rows that are not whole
+// 64-value blocks are refused.
 void checkFloatExperts(MetalBackend &backend, const std::filesystem::path &directory) {
   SmallTarget target = smallTarget(true);
   model::QwenTargetDimensions &g = target.geometry;
@@ -492,61 +579,97 @@ void checkFloatExperts(MetalBackend &backend, const std::filesystem::path &direc
   } experts[] = {{"blk.0.ffn_gate_exps.weight", g.experts * width, g.hiddenSize},
                  {"blk.0.ffn_up_exps.weight", g.experts * width, g.hiddenSize},
                  {"blk.0.ffn_down_exps.weight", g.experts * g.hiddenSize, width}};
-  for (const bool mxfp8 : {true, false}) {
-    std::mt19937 rng(1410);
-    std::map<std::string, Packed> expected;
-    for (const Expert &e : experts) {
-      Tensor &tensor = tensorNamed(target.tensors, e.name);
-      std::vector<float> values(uint64_t{e.rows} * e.columns);
-      if (mxfp8) {
-        const std::vector<uint8_t> native = makeNative(MXFP8, e.rows, e.columns, rng);
-        for (uint32_t row = 0; row < e.rows; ++row)
-          rowValues(MXFP8, native.data() + uint64_t{row} * rowBytes(MXFP8, e.columns), e.columns,
-                    values.data() + uint64_t{row} * e.columns);
-        for (size_t i = 0; i < values.size(); ++i) {
-          const uint16_t bits = f2bf(values[i]);
-          std::memcpy(tensor.data.data() + 2 * i, &bits, 2);
-          if (bf2f(bits) != values[i]) throw std::runtime_error("an MXFP8 value no BF16 holds");
+  // Each case: MXFP8's values in BF16, then other values in BF16 and in F16, and the format each tensor's planes
+  // take (320-input rows in the 64-element form, 256-input ones in the type's own).
+  struct Case {
+    bool mxfp8;
+    Fmt type, wide, narrow;
+  };
+  using model::gguf::Float16Weights;
+  for (const Float16Weights weights : {Float16Weights::Q8_0, Float16Weights::Published})
+    for (const Case c :
+         {Case{true, BF16, MXFP8, MXFP8}, Case{false, BF16, BF16, BF1664}, Case{false, F16, F16, F1664}}) {
+      const bool mxfp8 = c.mxfp8, q8 = weights == Float16Weights::Q8_0;
+      std::mt19937 rng(1410);
+      std::map<std::string, Packed> expected;
+      for (const Expert &e : experts) {
+        Tensor &tensor = tensorNamed(target.tensors, e.name);
+        tensor.type = *ggufType(c.type);
+        std::vector<float> values(uint64_t{e.rows} * e.columns);
+        if (mxfp8) {
+          const std::vector<uint8_t> native = makeNative(MXFP8, e.rows, e.columns, rng);
+          for (uint32_t row = 0; row < e.rows; ++row)
+            rowValues(MXFP8, native.data() + uint64_t{row} * rowBytes(MXFP8, e.columns), e.columns,
+                      values.data() + uint64_t{row} * e.columns);
+          for (size_t i = 0; i < values.size(); ++i) {
+            const uint16_t bits = f2bf(values[i]);
+            std::memcpy(tensor.data.data() + 2 * i, &bits, 2);
+            if (bf2f(bits) != values[i]) throw std::runtime_error("an MXFP8 value no BF16 holds");
+          }
+        } else {
+          // Values of the scale makeNative draws for a 16-bit tensor, which F16 and Q8_0 hold.
+          tensor.data = makeNative(c.type, e.rows, e.columns, rng);
+          for (size_t i = 0; i < values.size(); ++i) {
+            uint16_t bits;
+            std::memcpy(&bits, tensor.data.data() + 2 * i, 2);
+            values[i] = c.type == F16 ? h2f(bits) : bf2f(bits);
+          }
         }
-      } else {
-        tensor.data = fixture(BF16, e.rows, e.columns, uint32_t(rng()));
-        for (size_t i = 0; i < values.size(); ++i) {
-          uint16_t bits;
-          std::memcpy(&bits, tensor.data.data() + 2 * i, 2);
-          values[i] = bf2f(bits);
+        std::vector<uint8_t> rows;
+        if (mxfp8) {
+          for (size_t at = 0; at < values.size(); at += 32) {
+            const auto block = searchedMxfp8Block(values.data() + at);
+            if (!block) throw std::runtime_error("no exponent holds an MXFP8 block");
+            rows.insert(rows.end(), block->begin(), block->end());
+          }
         }
+        const Fmt format = mxfp8 ? MXFP8 : q8 ? Q80 : e.columns == 256 ? c.wide : c.narrow;
+        expected[e.name] =
+            repack(format, mxfp8 ? rows : q8 ? quantizeQ8_0(values) : tensor.data, e.rows, e.columns, nullptr);
       }
-      std::vector<uint8_t> rows;
-      if (mxfp8) {
-        for (size_t at = 0; at < values.size(); at += 32) {
-          const auto block = searchedMxfp8Block(values.data() + at);
-          if (!block) throw std::runtime_error("no exponent holds an MXFP8 block");
-          rows.insert(rows.end(), block->begin(), block->end());
-        }
+      const std::string kind = std::string(mxfp8 ? "mxfp8" : fmtName(c.type)) + (q8 ? "-q8" : "-published");
+      const auto path = directory / ("moe-16-bit-experts-" + kind + ".gguf");
+      writeGguf(path, target.tensors, g);
+      model::WeightSource source(path);
+      const model::GgufFile gguf(source);
+      const std::vector<model::gguf::Image> images =
+          model::gguf::planImages(gguf, architecture(g), g, {.weights = weights, .exactlyMxfp8 = model::exactlyMxfp8});
+      const std::vector<model::gguf::Image> headerOnly =
+          model::gguf::planImages(gguf, architecture(g), g, {.weights = weights});
+      const std::vector<uint8_t> image = preparedImages(backend, path, g, weights).front();
+      for (const Expert &e : experts) {
+        const model::gguf::Repack *planes = repackOf(images[0], e.name), *fallback = repackOf(headerOnly[0], e.name);
+        const Fmt format = mxfp8 ? MXFP8 : q8 ? Q80 : e.columns == 256 ? c.wide : c.narrow;
+        // A plan of the header alone loads the values as other values do.
+        const Fmt stored =
+            q8 ? Q80 : c.type == F16 ? (e.columns == 256 ? F16 : F1664) : (e.columns == 256 ? BF16 : BF1664);
+        const Packed &want = expected[e.name];
+        check(planes && planes->format == format && fallback && fallback->format == stored &&
+                  slice(image, planes->plane0, want.w0.size()) == want.w0 &&
+                  slice(image, planes->meta, want.meta.size()) == want.meta,
+              std::string(fmtName(c.type)) + " experts of " + (mxfp8 ? "MXFP8's" : "other") + " values prepare into " +
+                  fmtName(format) + " planes " + (q8 ? "under q8" : "as published") + ": " + e.name);
       }
-      const Fmt format = mxfp8 ? MXFP8 : e.columns % 256 ? Q80 : BF16;
-      expected[e.name] = repack(format, mxfp8 ? rows : format == Q80 ? quantizeQ8_0(values) : tensor.data, e.rows,
-                                e.columns, nullptr);
     }
-    const auto path = directory / (std::string("moe-bf16-experts-") + (mxfp8 ? "mxfp8" : "other") + ".gguf");
-    writeGguf(path, target.tensors, g);
-    model::WeightSource source(path);
-    const model::GgufFile gguf(source);
-    const std::vector<model::gguf::Image> images =
-        model::gguf::planImages(gguf, architecture(g), g, {.exactlyMxfp8 = model::exactlyMxfp8});
-    const std::vector<model::gguf::Image> headerOnly = model::gguf::planImages(gguf, architecture(g), g);
-    const std::vector<uint8_t> image = preparedImages(backend, path, g).front();
-    for (const Expert &e : experts) {
-      const model::gguf::Repack *planes = repackOf(images[0], e.name), *fallback = repackOf(headerOnly[0], e.name);
-      const Fmt format = mxfp8 ? MXFP8 : e.columns % 256 ? Q80 : BF16;
-      const Packed &want = expected[e.name];
-      check(planes && planes->format == format && fallback && fallback->format == (e.columns % 256 ? Q80 : BF16) &&
-                slice(image, planes->plane0, want.w0.size()) == want.w0 &&
-                slice(image, planes->meta, want.meta.size()) == want.meta,
-            std::string("BF16 experts of ") + (mxfp8 ? "MXFP8's" : "other") + " values prepare into " +
-                fmtName(format) + " planes: " + e.name);
-    }
+  // Experts of 16-bit rows that are not whole 64-value blocks (a down
+  // projection of 96 inputs) are refused, naming the tensor and its width.
+  SmallTarget narrow = smallTarget(true);
+  narrow.geometry.hiddenSize = 320;
+  narrow.geometry.expertIntermediateSize = 96;
+  narrow.tensors = targetTensors(narrow.geometry, types);
+  randomize(narrow.tensors, 1420);
+  const auto path = directory / "moe-bf16-experts-narrow.gguf";
+  writeGguf(path, narrow.tensors, narrow.geometry);
+  model::WeightSource source(path);
+  const model::GgufFile gguf(source);
+  std::string error;
+  try {
+    static_cast<void>(model::gguf::planImages(gguf, architecture(narrow.geometry), narrow.geometry));
+  } catch (const model::GgufError &refusal) {
+    error = refusal.what();
   }
+  check(error.find("blk.0.ffn_down_exps.weight") != std::string::npos && error.find("96 inputs") != std::string::npos,
+        "BF16 experts of rows that are not whole 64-value blocks are refused by name and width: " + error);
 }
 
 // The MoE layer with BF16 or F16 alpha/beta: a BF16 pair stays one BF16
@@ -625,7 +748,8 @@ bool blockProjection(const ops::Projection &p, uint32_t n, uint32_t k, std::vect
 // projection a block projection of the layout's sizes, a fused one a segment
 // per tensor in the layout's padded width, the norms F32 and the GDN output in
 // the GGUF's tiled head order; the head and token table as the GGUF stores them.
-// Its FFN gate is F16 and its up Q4_K, a gate/up pair the target geometry takes.
+// Its FFN gate is F16, loaded as published, and its up Q4_K, a gate/up pair the
+// target geometry takes.
 void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &directory) {
   model::Qwen3_8Layout layout;
   layout.layers = 4;
@@ -665,7 +789,9 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
   model::WeightImages images(backend, "fixture");
-  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), model::ggufTargetPlan(layout));
+  const model::gguf::Float16Weights published = model::gguf::Float16Weights::Published;
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), model::ggufTargetPlan(layout), {}, {},
+                                published);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
@@ -686,7 +812,8 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
     const uint64_t before = backend.memoryStats().allocatedBytes;
     model::WeightImages reserved(backend, "fixture");
     reserved.release();
-    model::GgufTargetLoader planned(backend, reserved, model::findTargetGgufs(target), model::ggufTargetPlan(layout));
+    model::GgufTargetLoader planned(backend, reserved, model::findTargetGgufs(target), model::ggufTargetPlan(layout),
+                                    {}, {}, published);
     const model::QwenTargetGeometry read =
         model::qwenTargetGeometry(model::loadQwen3_8Weights(backend, layout, planned), captured);
     check(backend.memoryStats().allocatedBytes == before && read.prefillProjections == geometry.prefillProjections &&
@@ -825,12 +952,16 @@ void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory
   const Shape shapes[] = {{512, 1024, {}}, {768, 1280, {256, 16, 8, 4}}, {768, 8448, {128, 16, 8, 5}}};
   for (int s = 0; s < 3; ++s)
     for (int f = 0; f < FMT_COUNT; ++f) checkRepack(backend, directory, Fmt(f), shapes[s], 100 + 8 * s + f);
-  // Widths of 64-column spans not a whole superblock, in every format whose
-  // width is a multiple of 64; an odd number of 64-row tiles by an odd number
-  // of spans leaves half a threadgroup of (row, group) items in the last one.
+  // Widths not a whole superblock, in every format whose column unit
+  // (ggufColumnUnit) divides them: 64-column spans, and the 128-column blocks
+  // of PQ2_0 and the MLX groups of 128 at 128, 384 and 640 (Flash-Next's
+  // shared-expert down projection, affine 8 bits in groups of 128); an odd
+  // number of 64-row tiles by an odd number of spans leaves half a threadgroup
+  // of (row, group) items in the last one.
   for (int f = 0; f < FMT_COUNT; ++f)
-    if (model::ggufColumnUnit(kQuantFormats[f]) == 64)
-      for (const Shape &shape : {Shape{192, 320, {}}, Shape{64, 64, {}}, Shape{192, 640, {}}})
+    for (const Shape &shape : {Shape{192, 320, {}}, Shape{64, 64, {}}, Shape{192, 640, {}}, Shape{64, 128, {}},
+                               Shape{192, 384, {}}})
+      if (shape.K % 256 && shape.K % model::ggufColumnUnit(kQuantFormats[f]) == 0)
         checkRepack(backend, directory, Fmt(f), shape, 300 + f + shape.K);
   // Several bounded row batches, and rows wider than one staging step.
   for (Fmt format : {Q3K, Q80}) {
@@ -1315,13 +1446,15 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
 // its convolutions' shapes, oMLX's fused projections and its message gates
 // packed and transposed, the experts' gate and up interleaved a row each
 // (mlx-lm's apart), the release's message queries in two lists of every loop
-// layer's. Every checkpoint's
+// layer's. Under either --weights, every checkpoint's
 // images are the release's bit for bit, and the release's are those of its
-// GGUF as llama.cpp's converter writes it (Q8_0 projections and head of the
-// reference quantization, NVFP4 output projections and experts and their
-// .scale, BF16 sinks, tap projections, router and token table, F32 the rest),
-// but the last block's, whose MXFP8 experts no GGUF type holds. The
-// release's own gates, BF16 in every call, stay BF16, as its GGUF's do.
+// GGUF of the same values as stored (BF16 projections, head, sinks, tap
+// projections, router and token table, NVFP4 output projections and experts
+// and their .scale, F32 the rest): every source loads its 16-bit projections
+// and head alike, as the reference Q8_0 of their values under q8 and as
+// stored as published, and its other 16-bit weights as stored, but the last
+// block's, whose MXFP8 experts no GGUF type holds. The release's own gates,
+// BF16 in every call, stay BF16, as its GGUF's do.
 void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path &directory) {
   model::Inkling2LoopLayout g = inkling2EngineLayout();
   g.attentionWidth = 512;
@@ -1456,19 +1589,16 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
         bf16(prefixed(p, {input + "_input_norm.weight", input + "_input_norm.weight", input + "_input_layernorm.weight",
                           input + "_input_layernorm.weight"}),
              {hidden}, gp + "attn_" + input + "_inp_norm.weight", 1, hidden, 1.0f);
-    // A projection of the release and mlx-vlm and mlx-lm (self_attn.<mlx>);
-    // the GGUF's Q8_0 rows of the reference quantization, BF16 the sinks and
-    // the taps' projections.
+    // A projection of the release and mlx-vlm and mlx-lm (self_attn.<mlx>),
+    // BF16; the GGUF's the same BF16 values, which every source loads as
+    // stored.
     const auto attention = [&](const char *release, const char *mlx, const std::string &ggufName, uint64_t rows,
                                uint64_t columns) {
-      auto [values, bytes] = projection(rows, columns);
+      const std::vector<uint8_t> bytes = projection(rows, columns).second;
       put(Release, p[Release] + release + ".weight", "BF16", {rows, columns}, bytes);
       for (const Naming naming : {MlxVlm, MlxLm})
         put(naming, p[naming] + "self_attn." + mlx + ".weight", "BF16", {rows, columns}, bytes);
-      if (ggufName == "attn_sink_proj" || ggufName.ends_with("_conv_proj"))
-        gguf.push_back({gp + ggufName + ".weight", {columns, rows}, model::ggml::kBF16, bytes});
-      else
-        gguf.push_back({gp + ggufName + ".weight", {columns, rows}, kQ8_0, quantizeQ8_0(values)});
+      gguf.push_back({gp + ggufName + ".weight", {columns, rows}, model::ggml::kBF16, bytes});
       return bytes;
     };
     const std::vector<uint8_t> q = attention("attn.wq_du", "q_proj", "attn_q", width, hidden),
@@ -1717,7 +1847,7 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
       {hidden}, "output_res_query.weight", {hidden}, 0.5f);
   bf16(prefixed(models, {"norm.weight", "norm.weight", "norm.weight", "norm.weight"}), {hidden}, "output_norm.weight",
        1, hidden, 1.0f);
-  const auto [head, headBytes] = projection(vocabulary, hidden);
+  const std::vector<uint8_t> headBytes = projection(vocabulary, hidden).second;
   const auto [table, tableBytes] = projection(vocabulary, hidden);
   const Names headNames{models[Release] + "unembed.weight", "lm_head.weight", "lm_head.weight",
                         "language_model.lm_head.weight"};
@@ -1726,7 +1856,7 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
     put(Naming(naming), headNames[naming], "BF16", {vocabulary, hidden}, headBytes);
     put(Naming(naming), tableNames[naming], "BF16", {vocabulary, hidden}, tableBytes);
   }
-  gguf.push_back({"output.weight", {hidden, vocabulary}, kQ8_0, quantizeQ8_0(head)});
+  gguf.push_back({"output.weight", {hidden, vocabulary}, model::ggml::kBF16, headBytes});
   gguf.push_back({"token_embd.weight", {hidden, vocabulary}, model::ggml::kBF16, tableBytes});
 
   // Each image of a plan, as written, by its digest.
@@ -1739,50 +1869,63 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
     }
     return digests;
   };
-  std::vector<std::string> release;
+  std::vector<std::string> release, converted;
   const std::array<const char *, kNamings> namings{"its release's", "oMLX's", "mlx-vlm's", "mlx-lm's"};
-  for (int naming = 0; naming < kNamings; ++naming) {
-    const auto root = directory / ("inkling2-" + std::to_string(naming));
-    splash::test::writeSyntheticShard(root / "target" / "model.safetensors", shards[naming]);
-    const model::SafetensorsCheckpoint checkpoint(root / "target");
-    const std::vector<model::gguf::Image> plans = model::safetensorsTargetPlan(g).images(checkpoint, {}).images;
-    const std::vector<std::string> digests = written(plans);
-    if (naming == Release) release = digests;
-    check(digests.size() == g.weightLayers + 2 && digests == release,
-          std::string("an Inkling-2-Mini checkpoint in ") + namings[naming] +
-              " names and layouts writes the release's images");
-    // A model of it, with a draft, is sized as its plan loads it
-    // (streamableWeights), as the server sizes the model it serves.
-    if (naming != Release) continue;
-    model::DFlashDraftLayout draft;
-    draft.layers = 2;
-    draft.hiddenSize = g.hiddenSize;
-    draft.vocabularySize = g.vocabularySize;
-    draft.dynamicSize = draft.qkvSize = 256;
-    draft.attentionSize = draft.intermediateSize = draft.selectorRank = 256;
-    draft.attentionHeadDimension = 64;
-    draft.kvHeads = 2;
-    draft.targetLayers = {1, 3};
-    draft.targetLayerCount = 2;
-    splash::test::writeSyntheticShard(root / "draft" / "model.safetensors", splash::test::draftTensors(draft));
-    const model::ModelDescriptor descriptor =
-        model::makeModelDescriptor("Inkling-2-Mini", g, draft, ops::visionLayout(g.visionTower, g.hiddenSize),
-                                   model::TargetSource::Safetensors,
-                                   model::VisionSource::None);
-    uint64_t planned = model::draftImageBytes(root / "draft", draft);
-    for (const model::gguf::Image &plan : plans) planned += model::gguf::loadedBytes(plan);
-    check(model::streamableWeights(root, descriptor, {}).loadedBytes == planned,
-          "an Inkling-2-Mini checkpoint is sized as its plan loads it");
-  }
   const auto path = directory / "inkling2.gguf";
   splash::test::writeFile(path, test_gguf::file(inkling2Metadata(g), gguf));
-  model::WeightSource source(path);
-  const std::vector<std::string> converted = written(model::ggufTargetPlan(g).images(model::GgufFile(source), {}));
-  bool same = converted.size() == release.size();
-  for (size_t image = 0; same && image < converted.size(); ++image)
-    same = converted[image] == release[image] ||
-           (image < g.weightLayers && image + g.blockResidualPeriod >= g.weightLayers);
-  check(same, "Inkling-2-Mini's release writes its GGUF's images, but its MXFP8 experts'");
+  using model::gguf::Float16Weights;
+  for (const Float16Weights weights : {Float16Weights::Published, Float16Weights::Q8_0}) {
+    const std::string mode = weights == Float16Weights::Q8_0 ? " under q8" : " as published";
+    for (int naming = 0; naming < kNamings; ++naming) {
+      const auto root = directory / ("inkling2-" + std::to_string(naming));
+      splash::test::writeSyntheticShard(root / "target" / "model.safetensors", shards[naming]);
+      const model::SafetensorsCheckpoint checkpoint(root / "target");
+      const std::vector<model::gguf::Image> plans =
+          model::safetensorsTargetPlan(g).images(checkpoint, {.weights = weights}).images;
+      const std::vector<std::string> digests = written(plans);
+      if (naming == Release) release = digests;
+      check(digests.size() == g.weightLayers + 2 && digests == release,
+            std::string("an Inkling-2-Mini checkpoint in ") + namings[naming] +
+                " names and layouts writes the release's images" + mode);
+      // A model of it, with a draft, is sized as its plan loads it
+      // (streamableWeights), as the server sizes the model it serves.
+      if (naming != Release) continue;
+      model::DFlashDraftLayout draft;
+      draft.layers = 2;
+      draft.hiddenSize = g.hiddenSize;
+      draft.vocabularySize = g.vocabularySize;
+      draft.dynamicSize = draft.qkvSize = 256;
+      draft.attentionSize = draft.intermediateSize = draft.selectorRank = 256;
+      draft.attentionHeadDimension = 64;
+      draft.kvHeads = 2;
+      draft.targetLayers = {1, 3};
+      draft.targetLayerCount = 2;
+      splash::test::writeSyntheticShard(root / "draft" / "model.safetensors", splash::test::draftTensors(draft));
+      const model::ModelDescriptor descriptor =
+          model::makeModelDescriptor("Inkling-2-Mini", g, draft, ops::visionLayout(g.visionTower, g.hiddenSize),
+                                     model::TargetSource::Safetensors,
+                                     model::VisionSource::None);
+      // Sizing and the load plan alike with the look at the values
+      // (readingValues), which takes the fixture's F32 gates, of BF16's
+      // values, as BF16 rows under either mode.
+      uint64_t planned = model::draftImageBytes(root / "draft", draft), header = planned;
+      for (const model::gguf::Image &plan :
+           model::safetensorsTargetPlan(g).images(checkpoint, model::readingValues({.weights = weights})).images)
+        planned += model::gguf::loadedBytes(plan);
+      for (const model::gguf::Image &plan : plans) header += model::gguf::loadedBytes(plan);
+      check(model::streamableWeights(root, descriptor, {.weights = weights}).loadedBytes == planned &&
+                planned < header,
+            "an Inkling-2-Mini checkpoint is sized as its plan loads it, its F32 gates of BF16's values as BF16" +
+                mode);
+    }
+    model::WeightSource source(path);
+    converted = written(model::ggufTargetPlan(g).images(model::GgufFile(source), {.weights = weights}));
+    bool same = converted.size() == release.size();
+    for (size_t image = 0; same && image < converted.size(); ++image)
+      same = converted[image] == release[image] ||
+             (image < g.weightLayers && image + g.blockResidualPeriod >= g.weightLayers);
+    check(same, "Inkling-2-Mini's release writes its GGUF's images, but its MXFP8 experts'" + mode);
+  }
 
   // The release's own format, BF16 gates in every call: kept as stored, so
   // its images are not the F32 release's but those of its GGUF of BF16 gates.
@@ -1826,6 +1969,51 @@ void checkInkling2Checkpoints(MetalBackend &backend, const std::filesystem::path
   model::WeightSource mixedSource(mixedPath);
   check(written(model::ggufTargetPlan(g).images(model::GgufFile(mixedSource), {})) == converted,
         "an Inkling-2-Mini GGUF whose gates mix BF16 and F32 widens them to its F32 GGUF's images");
+
+  // The fixture's F32 gates hold BF16's values, as a GGUF's and
+  // mlx-community's conversions write a BF16 release's: planned with the
+  // loader's look at the values (readingValues) they load as BF16 rows, so
+  // the GGUF and an mlx-vlm checkpoint (forget and gain F32, down BF16) write
+  // the BF16 gates' images, and the plan of the header alone keeps them F32.
+  // A call of gates one of which holds another value loads every gate of the
+  // call F32, as stored.
+  const std::vector<Tensor> &exactGguf = gguf;
+  model::WeightSource exactSource(path);
+  const model::GgufFile exactFile(exactSource);
+  const model::gguf::PlanOptions reading = model::readingValues({});
+  const std::vector<model::gguf::Image> exactPlans = model::ggufTargetPlan(g).images(exactFile, reading),
+                                        headerPlans = model::ggufTargetPlan(g).images(exactFile, {});
+  const std::string firstGate = "blk." + std::to_string(g.loopFirstLayer) + ".loop_q_ctrl_down.weight";
+  const auto conversionOf = [&](const std::vector<model::gguf::Image> &plans, const std::string &name) {
+    for (const model::gguf::Image &image : plans)
+      if (const model::gguf::Copy *copy = copyOf(image, name)) return std::optional(copy->conversion);
+    return std::optional<model::gguf::Conversion>();
+  };
+  check(written(exactPlans) == keptConverted &&
+            conversionOf(exactPlans, firstGate) == model::gguf::Conversion::NarrowToBfloat16 &&
+            conversionOf(headerPlans, firstGate) == model::gguf::Conversion::None,
+        "an Inkling-2-Mini GGUF of F32 gates holding BF16's values loads them as BF16 rows, its BF16 gates' images; "
+        "planned from its header alone, as stored");
+  const model::SafetensorsCheckpoint exactCheckpoint(directory / ("inkling2-" + std::to_string(MlxVlm)) / "target");
+  check(written(model::safetensorsTargetPlan(g).images(exactCheckpoint, reading).images) == kept,
+        "an mlx-vlm Inkling-2-Mini checkpoint of F32 gates holding BF16's values beside BF16 down projections loads "
+        "them all as BF16 rows, its release's BF16 gates' images");
+  std::vector<Tensor> oneOther = exactGguf;
+  {
+    Tensor &gate = tensorNamed(oneOther, firstGate);
+    const float other = 1.0f + 0x1p-10f;
+    std::memcpy(gate.data.data(), &other, 4);
+  }
+  const auto otherPath = directory / "inkling2-one-other-gate.gguf";
+  splash::test::writeFile(otherPath, test_gguf::file(inkling2Metadata(g), oneOther));
+  model::WeightSource otherSource(otherPath);
+  const std::vector<model::gguf::Image> otherPlans =
+      model::ggufTargetPlan(g).images(model::GgufFile(otherSource), reading);
+  const std::string layer = "blk." + std::to_string(g.loopFirstLayer) + ".";
+  check(conversionOf(otherPlans, layer + "loop_v_ctrl_gain.weight") == model::gguf::Conversion::None &&
+            conversionOf(otherPlans, layer + "loop_ffn_ctrl_gain.weight") == model::gguf::Conversion::NarrowToBfloat16,
+        "an Inkling-2-Mini GGUF call of gates one of which holds another value loads them all F32, as stored; "
+        "its other calls as BF16 rows");
 }
 
 } // namespace
@@ -1852,6 +2040,7 @@ int main(int argc, char **argv) {
               for (const Fmt gate : {BF16, Q80}) checkSixteenBitFloats(backend, directory.path(), gate);
             });
     guarded("preparation of quantized routers", [&] { checkQuantizedRouter(backend, directory.path()); });
+    guarded("preparation of F32 tensors of BF16's values", [&] { checkBfloat16Values(backend, directory.path()); });
     guarded("preparation of BF16 experts", [&] { checkFloatExperts(backend, directory.path()); });
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });

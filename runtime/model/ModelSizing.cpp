@@ -55,7 +55,8 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
   result.loadedBytes = loadedBytes(streamed);
   for (const gguf::Image &image : streamed)
     if (image.streamedRows) {
-      result.tableBytes = loadedBytes(plan({.streamExperts = streams.streamExperts})) - result.loadedBytes;
+      result.tableBytes =
+          loadedBytes(plan({.streamExperts = streams.streamExperts, .weights = streams.weights})) - result.loadedBytes;
       const SparseRowStoreOptions rows = streamedTableRows(layout);
       result.tableRowBytes = image.streamedRows->rowBytes;
       const uint64_t working =
@@ -68,8 +69,9 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
                         image.streamedRows->rowBytes);
     }
   if (streams.streamExperts) {
-    result.expertBytes = loadedBytes(plan({.streamTable = result.tableBytes != 0})) - result.loadedBytes +
-                         residentExpertSlotsBytes(layout.experts);
+    result.expertBytes =
+        loadedBytes(plan({.streamTable = result.tableBytes != 0, .weights = streams.weights})) - result.loadedBytes +
+        residentExpertSlotsBytes(layout.experts);
     StreamedBlocks blocks;
     blocks.blocks = gguf::streamedExperts(
         std::span(streamed).subspan(firstMoeLayer, layerImages - firstMoeLayer));
@@ -90,25 +92,21 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
           const GgufTargetPlan plan = ggufTargetPlan(layout);
           return targetWeights(
               layout,
-              [&](gguf::PlanOptions options) {
-                options.exactlyMxfp8 = exactlyMxfp8;
-                return plan.images(target.file(), options);
-              },
+              [&](gguf::PlanOptions options) { return plan.images(target.file(), readingValues(options)); },
               streams, plan.layerImages, plan.firstMoeLayer);
         }
         const SafetensorsCheckpoint checkpoint(directory);
         const SafetensorsTargetPlan plan = safetensorsTargetPlan(layout);
         return targetWeights(
             layout,
-            [&](gguf::PlanOptions options) {
-              options.exactlyMxfp8 = exactlyMxfp8;
-              return plan.images(checkpoint, options).images;
-            },
+            [&](gguf::PlanOptions options) { return plan.images(checkpoint, readingValues(options)).images; },
             streams, plan.layerImages, plan.firstMoeLayer);
       },
       descriptor.target);
   result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
-  if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
+  // The tower's image as its source writes it: an Inkling mmproj's Q8_0
+  // projections make its image 329 MiB against the BF16 one's 610.
+  if (const auto vision = planVisionLoader(root, descriptor)) result.loadedBytes += vision->image().bytes;
   return result;
 }
 

@@ -38,7 +38,7 @@ kernel void moe_gather_int8(device const char *codes [[buffer(0)]], device const
 // one row tile, its sums times its expert's scale of the projection (moe_expert_scale). The up pass (EpUpWithGate)
 // multiplies by the gate the gate pass wrote to `output`, each element in place: the thread that writes an element
 // has read its gate there.
-template <int BITS, GgufEpilogue Ep, uint Shared, uint Projection>
+template <uint F, GgufEpilogue Ep, uint Shared, uint Projection>
 kernel void moe_expert_int8(device const char *codes [[buffer(0)]], device const float2 *scales [[buffer(1)]],
                             device const MoeTileDescriptor *tiles [[buffer(2)]],
                             device const uint *tile_count [[buffer(3)]], device uchar *sw0 [[buffer(4)]],
@@ -56,11 +56,11 @@ kernel void moe_expert_int8(device const char *codes [[buffer(0)]], device const
       moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
                                slots, chunks, p.floor_slots, p.chunk_slots, Projection, sw0, sw1, smeta);
   const ulong out = ulong(tile.first_row) * p.output_size;
-  prefill_int8_tile<BITS, Ep>(codes + ulong(tile.first_row) * p.input_size, scales + tile.first_row, s.w0, s.w1,
-                              s.meta, output + out, output + out,
-                              {p.input_size, tile.rows, p.routes, p.output_size, 0, p.input_size},
-                              uint2(group.x, 0), lane, simd_group,
-                              moe_expert_scale(expert_scales, tile.expert, p.experts, Projection));
+  prefill_int8_tile<F, Ep>(codes + ulong(tile.first_row) * p.input_size, scales + tile.first_row, s.w0, s.w1,
+                           s.meta, output + out, output + out,
+                           {p.input_size, tile.rows, p.routes, p.output_size, 0, p.input_size},
+                           uint2(group.x, 0), lane, simd_group,
+                           moe_expert_scale(expert_scales, tile.expert, p.experts, Projection));
 }
 
 using MoeExpertInt8Kernel = void(device const char *, device const float2 *, device const MoeTileDescriptor *,
@@ -68,15 +68,15 @@ using MoeExpertInt8Kernel = void(device const char *, device const float2 *, dev
                                  device const uint *, device const float *, constant MoeInt8ExpertParams &,
                                  constant ulong *, uint2, ushort, ushort);
 // moe_expert_int8_<format>_<pass><slices suffix>: the gate (plain), up (times the gate's SiLU) and down passes.
-#define MOE_EXPERT_INT8(B, f, Shared, suffix)                                                                         \
+#define MOE_EXPERT_INT8(F, f, Shared, suffix)                                                                         \
   template [[host_name("moe_expert_int8_" #f "_gate" suffix)]] kernel MoeExpertInt8Kernel                            \
-      moe_expert_int8<B, EpNone, Shared, 0>;                                                                         \
+      moe_expert_int8<F, EpNone, Shared, 0>;                                                                         \
   template [[host_name("moe_expert_int8_" #f "_up" suffix)]] kernel MoeExpertInt8Kernel                              \
-      moe_expert_int8<B, EpUpWithGate, Shared, 1>;                                                                   \
+      moe_expert_int8<F, EpUpWithGate, Shared, 1>;                                                                   \
   template [[host_name("moe_expert_int8_" #f "_down" suffix)]] kernel MoeExpertInt8Kernel                            \
-      moe_expert_int8<B, EpNone, Shared, 2>;
-MOE_EXPERT_INT8(4, af4g64, 1, "")
-MOE_EXPERT_INT8(5, af5g64, 1, "")
-MOE_EXPERT_INT8(4, af4g64, 2, "_s2")
-MOE_EXPERT_INT8(5, af5g64, 2, "_s2")
+      moe_expert_int8<F, EpNone, Shared, 2>;
+MOE_EXPERT_INT8(GGUF_FMT_AF4G64, af4g64, 1, "")
+MOE_EXPERT_INT8(GGUF_FMT_AF5G64, af5g64, 1, "")
+MOE_EXPERT_INT8(GGUF_FMT_AF4G64, af4g64, 2, "_s2")
+MOE_EXPERT_INT8(GGUF_FMT_AF5G64, af5g64, 2, "_s2")
 #undef MOE_EXPERT_INT8

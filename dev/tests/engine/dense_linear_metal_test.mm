@@ -13,7 +13,11 @@
 // - each buffer at the extent the operators require, refused one element
 //   short;
 // - the LayerNorm into bf16 rows and into fp32 rows, its input's own among
-//   them.
+//   them;
+// - Q8_0 weights (an Inkling 2 mmproj's), as the planes a GGUF image holds,
+//   at every epilogue and those rows and more, on the bf16 prefill tile,
+//   against fp64 of the Q8_0 values within the tile's error, its fp16 stage
+//   of each weight (2^-11 of it).
 //
 //   dense-linear METALLIB
 #include "LinearNumerics.hpp"
@@ -21,6 +25,7 @@
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/QuantFormat.h"
 #include "ops/DenseLinear.hpp"
 #include "ops/Normalization.hpp"
 
@@ -49,6 +54,7 @@ using splash::ops::DenseLinear;
 using splash::ops::DenseWeights;
 using splash::ops::elementBytes;
 using splash::ops::FloatOutput;
+using splash::ops::QuantizedSegment;
 using splash::ops::KernelCalibration;
 using splash::ops::LayerNormWeights;
 using splash::ops::Normalization;
@@ -122,6 +128,34 @@ const char *epilogueName(DenseEpilogue epilogue) {
   return "";
 }
 
+// Random Q8_0 weights of `outputs` x `inputs` (an F16 scale of 2^-10 to
+// 2^-8 and 32 int8 codes a block) as the planes of a GGUF image
+// (metal/abi/QuantFormat.h), and their values, each exact in fp32.
+struct Q8Weights final {
+  QuantizedSegment segment;
+  std::vector<float> values;
+};
+Q8Weights q8Weights(MetalBackend &backend, uint32_t outputs, uint32_t inputs) {
+  const uint32_t groups = inputs / 32;
+  MetalBuffer plane0 = sharedBuffer(backend, size_t(outputs) * inputs);
+  MetalBuffer meta = sharedBuffer(backend, size_t(outputs) * groups * 2);
+  std::uniform_int_distribution<int> code(-127, 127);
+  std::uniform_real_distribution<float> exponent(-10.0F, -8.0F);
+  std::vector<float> values(size_t(outputs) * inputs);
+  for (uint32_t n = 0; n < outputs; ++n)
+    for (uint32_t g = 0; g < groups; ++g) {
+      const _Float16 d = static_cast<_Float16>(std::exp2(exponent(rng)));
+      const uint64_t record = quant_tile_index(n, g, groups);
+      std::memcpy(static_cast<uint8_t *>(meta.contents()) + record * 2, &d, 2);
+      for (uint32_t e = 0; e < 32; ++e) {
+        const int q = code(rng);
+        static_cast<int8_t *>(plane0.contents())[record * 32 + quant_slot(e)] = static_cast<int8_t>(q);
+        values[size_t(n) * inputs + g * 32 + e] = static_cast<float>(d) * static_cast<float>(q);
+      }
+    }
+  return {QuantizedSegment::planes(GGUF_FMT_Q80, outputs, inputs, plane0, {}, meta), std::move(values)};
+}
+
 // What a projection stored and the kernel it ran.
 struct Projected final {
   std::vector<uint8_t> bits;
@@ -135,14 +169,17 @@ struct Projected final {
 // holds whole row tiles, the rows past `rows` large finite values; NaN follows
 // the output's rows, which must survive.
 Projected testProjection(MetalBackend &backend, const DenseLinear &dense, uint32_t rows, uint32_t outputs,
-                         uint32_t inputs, DenseEpilogue epilogue, bool exact = true, uint32_t seed = 17) {
-  const std::string label = std::string(epilogueName(epilogue)) + " rows " + std::to_string(rows) + " " +
-                            std::to_string(outputs) + "x" + std::to_string(inputs);
+                         uint32_t inputs, DenseEpilogue epilogue, bool exact = true, uint32_t seed = 17,
+                         bool q8 = false) {
+  const std::string label = std::string(q8 ? "q8_0 " : "") + epilogueName(epilogue) + " rows " +
+                            std::to_string(rows) + " " + std::to_string(outputs) + "x" + std::to_string(inputs);
   rng.seed(seed);
   const uint32_t padded = DenseLinear::paddedRows(rows);
   std::vector<float> x = randomBf16(size_t(padded) * inputs, 1.0F);
   std::fill(x.begin() + size_t(rows) * inputs, x.end(), 64.0F);
-  const std::vector<float> w = randomBf16(size_t(outputs) * inputs, 0.1F), b = randomBf16(outputs, 0.5F);
+  const Q8Weights quantized = q8 ? q8Weights(backend, outputs, inputs) : Q8Weights{};
+  const std::vector<float> w = q8 ? quantized.values : randomBf16(size_t(outputs) * inputs, 0.1F),
+                           b = randomBf16(outputs, 0.5F);
   const std::vector<float> r = randomBf16(size_t(rows) * outputs, 1.0F);
   const bool scaled = epilogue == DenseEpilogue::ScaledResidual;
   const bool residual = scaled || epilogue == DenseEpilogue::Residual;
@@ -150,11 +187,17 @@ Projected testProjection(MetalBackend &backend, const DenseLinear &dense, uint32
   const size_t tail = size_t(64) * outputs;
   const MetalBuffer output = residual ? f32Buffer(backend, r, tail)
                                       : bf16Buffer(backend, std::vector<float>(size_t(rows) * outputs, 0.0F), tail);
-  const DenseWeights weights{bf16Buffer(backend, w), bf16Buffer(backend, b), bf16Buffer(backend, scale)};
+  const DenseWeights weights{q8 ? MetalBuffer{} : bf16Buffer(backend, w), bf16Buffer(backend, b),
+                             bf16Buffer(backend, scale), quantized.segment};
+  DenseLinear::requireWeights(weights, outputs, inputs, label);
   CommandGraph graph;
   dense.add(graph, weights, outputs, inputs, bf16Buffer(backend, x),
             backend.view(output, 0, size_t(rows) * outputs * (residual ? 4 : 2)), rows, epilogue);
-  const std::string kernel = graph.dispatches().back().pipelineName;
+  // A Q8_0 projection's rows past its whole 32 run the bounded instance.
+  const std::string kernel = graph.dispatches().front().pipelineName;
+  const std::string selected = dense.kernel(rows, outputs, inputs, epilogue, q8 ? GGUF_FMT_Q80 : QuantizedSegment::kFloat32);
+  require(kernel == selected || (q8 && rows < 32 && kernel == selected + "_bounded"),
+          label + ": ran " + kernel + ", not its selection");
   run(backend, graph);
   for (uint32_t m = 0; m < (exact ? rows : 0); ++m)
     for (uint32_t n = 0; n < outputs; ++n) {
@@ -163,16 +206,21 @@ Projected testProjection(MetalBackend &backend, const DenseLinear &dense, uint32
         sum += double(x[size_t(m) * inputs + k]) * w[size_t(n) * inputs + k];
         magnitude += std::fabs(double(x[size_t(m) * inputs + k]) * w[size_t(n) * inputs + k]);
       }
+      // The tile stages each Q8_0 weight in fp16.
+      double rounding = q8 ? 0x1p-11 * magnitude : 0.0;
       double expected = sum;
-      if (epilogue == DenseEpilogue::GeluTanh || epilogue == DenseEpilogue::GeluErf) expected = gelu(epilogue, sum);
-      if (scaled) expected *= scale[n], magnitude *= std::fabs(scale[n]);
+      if (epilogue == DenseEpilogue::GeluTanh || epilogue == DenseEpilogue::GeluErf) {
+        expected = gelu(epilogue, sum);
+        rounding *= 1.13; // GELU's steepest slope
+      }
+      if (scaled) expected *= scale[n], magnitude *= std::fabs(scale[n]), rounding *= std::fabs(scale[n]);
       if (residual) expected += r[size_t(m) * outputs + n];
       const size_t index = size_t(m) * outputs + n;
       const double got = residual ? static_cast<const float *>(output.contents())[index]
                                   : bf16ToFloat(static_cast<const uint16_t *>(output.contents())[index]);
       const double bound = (residual ? 0x1p-22 : 0x1p-8) * std::fabs(expected) +
                            (scaled ? 0x1p-22 * std::fabs(r[size_t(m) * outputs + n]) : 0.0) +
-                           inputs * 0x1p-24 * magnitude + 1e-6;
+                           inputs * 0x1p-24 * magnitude + rounding + 1e-6;
       if (!(std::fabs(got - expected) <= bound))
         throw std::runtime_error(label + " [" + std::to_string(m) + "," + std::to_string(n) + "]: " +
                                  std::to_string(got) + " vs " + std::to_string(expected));
@@ -369,6 +417,11 @@ int main(int argc, char **argv) {
         for (const uint32_t rows : {1U, 5U, 63U, 64U, 65U, 130U}) {
           (void)testProjection(backend, dense, rows, 128, 128, epilogue);
           (void)testProjection(backend, dense, rows, 384, 512, epilogue);
+        }
+      for (const DenseEpilogue epilogue : kEpilogues)
+        for (const uint32_t rows : {1U, 5U, 63U, 64U, 65U, 130U, 257U}) {
+          (void)testProjection(backend, dense, rows, 128, 128, epilogue, true, 17, true);
+          (void)testProjection(backend, dense, rows, 384, 1024, epilogue, true, 17, true);
         }
       testTiles(backend);
       testOffsets(backend, dense);

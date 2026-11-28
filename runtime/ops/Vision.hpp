@@ -69,7 +69,8 @@ inline constexpr VisionLayout kInklingVisionLayout{.tower = VisionTower::Inkling
   return layout;
 }
 
-// A block's weights, every one bf16. Inkling's tower scales its attention's
+// A block's weights, bf16, or an Inkling projector's projections Q8_0
+// (DenseWeights::quantized). Inkling's tower scales its attention's
 // and MLP's outputs per channel before each residual add (LayerScale, its
 // output projections' DenseWeights::scale); Qwen's has no scales.
 struct VisionBlock final {
@@ -81,7 +82,8 @@ struct VisionBlock final {
   DenseWeights downProjection;
 };
 
-// A tower's weights, every one bf16. Qwen's merger norms the blocks' output
+// A tower's weights, bf16 but for an Inkling projector's Q8_0 projections.
+// Qwen's merger norms the blocks' output
 // (mergerNorm). Inkling's prepends a class token, its embedding and its
 // position as two rows (classToken), and norms the embeddings before the
 // blocks (inputNorm); its merger projections have zero biases, as its patch

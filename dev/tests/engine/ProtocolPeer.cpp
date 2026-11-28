@@ -191,6 +191,8 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.prefixTokens = in.u32();
     event.stateSource = static_cast<engine::StateSource>(in.u8());
     event.lostState = in.u8() != 0;
+    event.reuseEnd = static_cast<engine::ReuseEnd>(in.u8());
+    event.reuseEndTokens = in.u32();
     return event;
   }
   case FrameType::PromptProgress: {
@@ -240,6 +242,8 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.retryable = in.u8() != 0;
     event.retryAfterSeconds = in.u32();
     event.requestId = in.u64();
+    event.capacity.limit = static_cast<engine::CapacityLimit>(in.u8());
+    event.capacity.fitsTokens = in.u32();
     const uint32_t codeBytes = in.u32();
     const uint32_t messageBytes = in.u32();
     event.code = in.text(codeBytes);

@@ -44,7 +44,7 @@ struct StreamableWeights final {
 // The model's weights in `root`, planned from its files' metadata as its
 // loaders plan them, without loading them, with the parts `streams` lets
 // stream as parts of their own: one it does not is among the images that
-// load.
+// load. Its 16-bit projections take the planes streams.weights gives them.
 [[nodiscard]] StreamableWeights streamableWeights(const std::filesystem::path &root,
                                                   const ModelDescriptor &descriptor, gguf::PlanOptions streams);
 

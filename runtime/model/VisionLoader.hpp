@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model/ModelDescriptor.hpp"
+#include "model/VisionPreparation.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/Vision.hpp"
@@ -24,6 +25,8 @@ public:
   VisionLoader &operator=(const VisionLoader &) = delete;
 
   [[nodiscard]] const ops::VisionLayout &layout() const noexcept;
+  // The image's sections, bound to the source.
+  [[nodiscard]] const vision::Plan &imagePlan() const noexcept;
   // The image of vision/model.bin.
   [[nodiscard]] ImagePlan image() const;
   // Writes the image once with its writer (image), into memory it frees
@@ -36,9 +39,6 @@ private:
   struct Planned;
   std::shared_ptr<const Planned> planned_;
 };
-
-// The bytes of the image a source is written into.
-[[nodiscard]] uint64_t visionImageBytes(const ops::VisionLayout &layout);
 
 // A loaded vision tower: its weights, views of its image, the image's record
 // and the bytes its load allocated.

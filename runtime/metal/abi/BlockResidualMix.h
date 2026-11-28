@@ -9,6 +9,7 @@
 // among them, runs a threadgroup of BLOCK_RESIDUAL_MIX_THREADS threads a row
 // and query, a call of more, a prompt chunk's or a decode step's alike, one
 // of BLOCK_RESIDUAL_MIX_ROW_THREADS a row (the _rows kernels).
+#include "metal/abi/ShortConvolution.h"
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #else
@@ -63,3 +64,42 @@ struct BlockResidualMixParams {
 };
 
 static_assert(sizeof(BlockResidualMixParams) == 24, "block residual mix parameters are 24 bytes on both sides");
+
+// The most mixes one dispatch of block_residual_mix runs, each its own
+// states, queries and outputs over the same rows (a gated application's
+// messages and its mixer's inputs, which read no state of each other's):
+// their threadgroups run side by side where two dispatches of them ran one
+// after the other.
+#define BLOCK_RESIDUAL_MIX_MAXIMUM_MIXES 2u
+
+// A dispatch's mixes: `mixes` mixes of the same rows and hidden size, mix
+// m's parameters mix[m], past them the first's (block_residual_mix's two at
+// most, every other kernel's one). A threadgroup of block_residual_mix runs
+// one mix's query of a row (grid y the first mix's queries, then the
+// second's) or, of the _rows kernels, one mix of a row (grid y the mix).
+// With `normalized` block_residual_mix also writes each query's output
+// through the message gates' input normalization into bf16 rows
+// [rows][queries][hidden] (kernels/common/message_gate_normalize.h), which a
+// call of the fused gates reads (ops::MessageGate::readsNormalized).
+struct BlockResidualMixesParams {
+  struct BlockResidualMixParams mix[BLOCK_RESIDUAL_MIX_MAXIMUM_MIXES];
+  uint32_t mixes;
+  uint32_t normalized;
+};
+
+static_assert(sizeof(BlockResidualMixesParams) == 56, "block residual mixes parameters are 56 bytes on both sides");
+
+// A decode step's mix of one query whose current rows are its mixer's output
+// convolution (the _convolved kernels, ops::BlockResidualStates::convolution):
+// the mix's, and the convolution's of static taps (heads 0) along the lanes'
+// trees (tree 1), SHORT_CONVOLUTION_OUTPUT_SUM onto a bf16 residual or none,
+// into the fp32 current rows, its sequences the step's lanes. Each row's
+// threadgroup convolves its row first, a thread the columns it then mixes:
+// the convolution's dispatch fewer, the same bits.
+struct BlockResidualMixConvolutionParams {
+  struct BlockResidualMixesParams mixes;
+  struct ShortConvolutionParams convolution;
+};
+
+static_assert(sizeof(BlockResidualMixConvolutionParams) == 160,
+              "block residual mix convolution parameters are 160 bytes on both sides");

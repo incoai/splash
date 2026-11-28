@@ -52,8 +52,8 @@ public:
   // them.
   Builder(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, ModuleNames names,
           Conversion norms, std::string name, uint32_t layer, uint32_t type, gguf::PlanOptions options = {})
-      : checkpoint_(checkpoint), geometry_(geometry), names_(names), norms_(norms),
-        exactlyMxfp8_(std::move(options.exactlyMxfp8)), image_(std::move(name), layer, type, options.streamExperts) {}
+      : checkpoint_(checkpoint), geometry_(geometry), names_(names), norms_(norms), options_(std::move(options)),
+        image_(std::move(name), layer, type, options_.streamExperts) {}
 
   // An RMSNorm's weight, which the norm kernels read (ops::NormWeights), as
   // the image holds norms.
@@ -92,7 +92,7 @@ public:
   // (gguf::TensorRows::windows; a shared expert's down projection as slices
   // of the routed experts' width, ops::MoeShape::sharedSlices).
   void projection(const std::string &module, uint64_t rows, uint64_t columns, uint32_t windows = 1) {
-    const TensorRows source = projectionRows(module, rows, windows * columns);
+    const TensorRows source = projectionRows(module, rows, windows * columns, 1, columns);
     Repack repack = image_.planes(gguf_format_of(source.type), windows * rows, columns, module);
     for (uint32_t window = 0; window < windows; ++window) {
       TensorRows rows = source;
@@ -112,7 +112,7 @@ public:
     const uint64_t count = geometry_.experts;
     if (names_ != ModuleNames::Transformers) {
       const std::string module = mlp + "switch_mlp." + projection;
-      const TensorRows source = projectionRows(module, rows, columns, count);
+      const TensorRows source = projectionRows(module, rows, columns, count, 0, true);
       Repack repack = image_.expertPlanes(gguf_format_of(source.type), count * rows, columns, module);
       repack.sources.push_back(source);
       image_.expertRepack(std::move(repack));
@@ -120,7 +120,8 @@ public:
     }
     std::vector<TensorRows> sources;
     for (uint64_t e = 0; e < count; ++e) {
-      sources.push_back(projectionRows(mlp + "experts." + std::to_string(e) + "." + projection, rows, columns));
+      sources.push_back(
+          projectionRows(mlp + "experts." + std::to_string(e) + "." + projection, rows, columns, 1, 0, true));
       if (sources.back().type != sources.front().type)
         throw WeightStoreError(sources.back().name + " is in another format than its layer's first expert");
     }
@@ -165,7 +166,8 @@ public:
 
   // The MoE router [rows, columns], which the float projection runs in the
   // format the checkpoint holds it (ops::QuantizedSegment): a quantized
-  // tensor's native rows, or its bf16 or F32 values, as stored.
+  // tensor's native rows, or its bf16 or F32 values, as a float kernel runs
+  // them (floatKernelRows).
   void router(const std::string &module, uint64_t rows, uint64_t columns) {
     if (const std::optional<TensorRows> source = quantized(module, rows, columns)) {
       image_.descriptor(source->type, rows, columns, {}, {rows * source->rowBytes, 0, 0}, module);
@@ -174,8 +176,23 @@ public:
     }
     const SourceTensor &weight = require(module + ".weight", {"BF16", "F32"}, {rows, columns});
     const uint32_t type = weight.dtype == "BF16" ? ggml::kBF16 : ggml::kF32;
-    image_.descriptor(type, rows, columns, {}, {weight.bytes, 0, 0}, module);
-    image_.copy(this->rows(module, weight, type, rows, weight.bytes / rows));
+    floatKernelRows(weight, this->rows(module, weight, type, rows, weight.bytes / rows), rows, columns, module);
+  }
+
+  // The rows `part` of tensor `tensor`, F32 or BF16, of a [rows, columns]
+  // tensor a float kernel runs (a float projection or a message gate, which
+  // widen BF16 rows to the fp32 values F32 rows hold), after their
+  // descriptor, in the type the kernel reads them in (gguf::floatKernelType):
+  // BF16 as stored, and F32 as BF16 rows where every value of the tensor is a
+  // BF16 value (lossless, half the bytes, the same outputs bit for bit), else
+  // as stored; `narrows` false keeps F32 as stored (a widened source).
+  void floatKernelRows(const SourceTensor &tensor, const TensorRows &part, uint64_t rows, uint64_t columns,
+                       const std::string &name, bool narrows = true) {
+    const uint32_t type =
+        narrows ? gguf::floatKernelType(part.type, options_, *tensor.file, tensor.offset, tensor.bytes / sizeof(float))
+                : part.type;
+    image_.descriptor(type, rows, columns, {}, {rows * columns * (type == ggml::kF32 ? 4 : 2), 0, 0}, name);
+    image_.copy(part, type != part.type ? Conversion::NarrowToBfloat16 : Conversion::None);
   }
 
   // An F32 [rows, columns] tensor (the shared-expert scalar gate, which the
@@ -327,18 +344,18 @@ private:
   }
 
   // A FloatTensor section [rows, columns]: its source's F32 or BF16 rows as
-  // stored after their descriptor (a widened source's BF16 rows as F32), or
-  // the F32 values of a transposed source.
+  // a float kernel runs them after their descriptor (floatKernelRows; a
+  // widened source's BF16 rows as F32, and its F32 as stored), or the F32
+  // values of a transposed source.
   void sectionFloatTensor(const SectionSource &source, uint64_t rows, uint64_t columns) {
     const TensorRows part = floatSourceRows(source);
     const uint64_t partColumns = part.imageRowBytes() / valueBytes(part);
     if (source.transposed ? part.rows != columns || partColumns != rows : part.rows != rows || partColumns != columns)
       throw WeightStoreError("source tensor type or shape does not match: " + source.name);
-    const uint32_t type = source.transposed || source.widened ? ggml::kF32 : part.type;
-    image_.descriptor(type, rows, columns, {}, {rows * columns * (type == ggml::kF32 ? 4 : 2), 0, 0}, source.name);
-    image_.copy(part, source.transposed  ? Conversion::TransposeToFloat32
-                      : type != part.type ? Conversion::WidenToFloat32
-                                          : Conversion::None);
+    if (!source.transposed && !(source.widened && part.type == ggml::kBF16))
+      return floatKernelRows(checkpoint_.require(source.name), part, rows, columns, source.name, !source.widened);
+    image_.descriptor(ggml::kF32, rows, columns, {}, {rows * columns * 4, 0, 0}, source.name);
+    image_.copy(part, source.transposed ? Conversion::TransposeToFloat32 : Conversion::WidenToFloat32);
   }
 
   // A FloatTensor section [rows, columns] of its source's rows of a module
@@ -384,7 +401,7 @@ private:
     for (size_t projection = 0; projection < sources.size(); ++projection) {
       const SectionSource &source = sources[projection];
       const uint64_t rows = projection == 2 ? hidden : width, columns = projection == 2 ? width : hidden;
-      TensorRows part = projectionRows(source.name, source.windows * rows, columns, experts);
+      TensorRows part = projectionRows(source.name, source.windows * rows, columns, experts, 0, true);
       if (part.scale.rowsPerValue % source.windows || !source.windows || source.window >= source.windows)
         throw WeightStoreError("source tensor type or shape does not match: " + source.name);
       part.rows /= source.windows;
@@ -503,27 +520,23 @@ private:
   }
 
   // The rows a projection's planes take of a module of `experts` [rows,
-  // columns] matrices: its quantization's native rows, or the native rows the
-  // writer builds from its BF16 or F16 weight's values
-  // (gguf::TensorRows::float16RowBytes), as a GGUF's 16-bit tensors build:
-  // experts holding MXFP8's values exactly as MXFP8 (exactlyMxfp8: lossless,
-  // half the bytes, as a release's MXFP8 experts widened to BF16 are), else
-  // the Q8_0 rows the reference GGUF quantization of Q8_0 makes, as for
-  // Qwen3.8-Flash-Next's BF16 hyper-connection projections: every decode
-  // cycle reads a projection whole, and Q8_0 holds a value in little more
-  // than half the bytes of a 16-bit float.
-  TensorRows projectionRows(const std::string &module, uint64_t rows, uint64_t columns, uint64_t experts = 1) const {
+  // columns] matrices: its quantization's native rows, or those
+  // gguf::float16Planes takes of its BF16 or F16 weight's values, as a GGUF's
+  // 16-bit tensors load (`routed` experts' as theirs, a stack of them or one
+  // expert's module): rows of the `planeColumns` inputs the planes hold, a
+  // column window's where they hold windows of each row, whole native blocks
+  // of their format (requireWholeBlocks).
+  TensorRows projectionRows(const std::string &module, uint64_t rows, uint64_t columns, uint64_t experts = 1,
+                            uint64_t planeColumns = 0, bool routed = false) const {
     if (const std::optional<TensorRows> source = quantized(module, rows, columns, experts)) return *source;
     std::vector<uint64_t> shape{rows, columns};
     if (experts > 1) shape.insert(shape.begin(), experts);
     const SourceTensor &weight = require(module + ".weight", {"BF16", "F16"}, shape);
     const uint32_t float16Type = weight.dtype == "BF16" ? ggml::kBF16 : ggml::kF16;
-    const bool mxfp8 = experts > 1 && !(columns % ggufColumnUnit(kQuantFormats[GGUF_FMT_MXFP8])) && exactlyMxfp8_ &&
-                       exactlyMxfp8_(*weight.file, weight.offset, weight.bytes / 2, float16Type);
-    const QuantFormat &format = kQuantFormats[mxfp8 ? GGUF_FMT_MXFP8 : GGUF_FMT_Q80];
-    TensorRows source = this->rows(module, weight, format.ggml_type, experts * rows, ggufRowBytes(format, columns));
-    source.float16Type = float16Type;
-    source.float16RowBytes = columns * 2;
+    const uint64_t width = planeColumns ? planeColumns : columns;
+    const TensorRows source = gguf::float16Planes(this->rows(module, weight, float16Type, experts * rows, columns * 2),
+                                                  width, routed, options_);
+    requireWholeBlocks(module, gguf_format_of(source.type), width);
     return source;
   }
 
@@ -655,12 +668,13 @@ private:
                    checkpoint_.require(name).shape.empty() ? std::vector<uint64_t>{} : std::vector<uint64_t>{1});
   }
 
-  // Native rows hold whole native blocks of the module's format; only fp8's,
-  // of 256 elements, and NVFP4's (whose rows of 64 take NVFP4_64's) are wider
-  // than its groups.
+  // Native rows hold whole native blocks of the module's format; only fp8's
+  // and 16-bit floats', of 256 elements, and NVFP4's (whose rows of 64 take
+  // NVFP4_64's) are wider than its groups.
   static void requireWholeBlocks(const std::string &module, uint32_t format, uint64_t columns) {
     if (columns % kQuantFormats[format].block_elements)
-      throw WeightStoreError(module + "'s rows are not whole " + kQuantFormats[format].name + " blocks of " +
+      throw WeightStoreError(module + "'s rows of " + std::to_string(columns) + " values are not whole " +
+                             kQuantFormats[format].name + " blocks of " +
                              std::to_string(kQuantFormats[format].block_elements) + " elements");
   }
 
@@ -681,7 +695,7 @@ private:
   const QwenTargetDimensions &geometry_;
   const ModuleNames names_;
   const Conversion norms_;
-  const std::function<bool(const WeightSource &, uint64_t, uint64_t, uint32_t)> exactlyMxfp8_;
+  const gguf::PlanOptions options_;
   gguf::ImageBuilder image_;
   std::optional<gguf::StreamedRows> streamedRows_;
 };

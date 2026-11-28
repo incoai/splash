@@ -761,7 +761,8 @@ void testACommandOutOfMemoryIsCommandMemory() {
                     report.commandOutOfMemory == outOfMemory &&
                     report.resourceStage == RuntimeResourceStage::StorageAllocation &&
                     report.resourceFailure == RuntimeResourceFailure::Other &&
-                    report.message == "Metal command 2 failed: Insufficient Memory" &&
+                    report.message == (outOfMemory ? startMemoryRefusal("Metal command 2 failed: Insufficient Memory")
+                                                   : "Metal command 2 failed: Insufficient Memory") &&
                     report.budgetDescription == "budget",
                 "a start whose split's " + what + " failed as kind " +
                     std::to_string(static_cast<int>(kind)) + (report.commandOutOfMemory ? ", out of memory" : ""));

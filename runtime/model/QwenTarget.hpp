@@ -89,15 +89,17 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 
 // The rows every tensor a decode step's plans store rows in holds, for steps
 // of up to `lanes` lanes: the most the decode tiles store a step of the most
-// rows in (ops::stagedStorageRows), its rows on the staged tile and its row
-// groups, and past 32 rows the int8 tiles' groups of 32 (96 rows at five
-// lanes, 128 at seven): the decode arena's row and target step tensors, and a
-// target's own step scratch (Qwen4Steps).
+// rows in (ops::stagedStorageRows, ops::matrixStorageRows), its rows on the
+// staged tile and its row groups, past 32 rows the int8 tiles' groups of 32
+// (96 rows at five lanes, 128 at seven), and the matrix tile's 16-row
+// fragments: the decode arena's row and target step tensors, and a target's
+// own step scratch (Qwen4Steps).
 [[nodiscard]] constexpr uint32_t decodeStorageRows(uint32_t lanes) noexcept {
   static_assert(ExecutionLimits::stepRows(SPLASH_MAXIMUM_BATCH_WIDTH) <= ops::kMaximumStagedRows,
                 "the decode tiles hold a decode step of the most lanes");
   const uint32_t rows = ExecutionLimits::stepRows(lanes);
-  return std::max(ops::stagedStorageRows(rows, false), ops::stagedStorageRows(rows, false, true));
+  return std::max({ops::stagedStorageRows(rows, false), ops::stagedStorageRows(rows, false, true),
+                   ops::matrixStorageRows(rows)});
 }
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
@@ -270,7 +272,9 @@ struct QwenTargetPrefillSequence final {
   std::span<const uint32_t> tokens;
   QwenTargetRequest request;
   kv::ChunkedPrefillParams chunk;
-  metal::MetalBuffer pageTable;
+  // Its page tables, one per page of a block (kv::Layout::blockPages): a
+  // layer reads the table of the page that holds it (kv::Layout::blockPage).
+  std::span<const metal::MetalBuffer> pageTables;
   // Its pages' block index, for a layout with one (ops::BlockIndex::tables).
   metal::MetalBuffer indexTable;
   std::span<const metal::MetalBuffer> convolutionIn;
@@ -590,7 +594,7 @@ public:
   // every attention layer (ops::PagedAttention::addPathCommit, whose
   // arguments these are): the shared attention's, or a family's that stores
   // its K/V through its own operator.
-  virtual void addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+  virtual void addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t regions, uint32_t extentPages,
                                std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
                                uint32_t laneRows, const metal::MetalBuffer &paths) const;
   // The table rows a lane's rows of the last step read (`rows`, its rows of
@@ -615,10 +619,11 @@ protected:
     uint32_t rows;
     std::span<const SplashKvLayer> kvLayers;
     SpilledKvReads &spilled;
-    // Each sequence's chunk and page table, in sequence order, as the
-    // attention layers take them.
+    // Each sequence's chunk, and its page table of each page of a block, in
+    // sequence order, as the attention layers take them: those of the page
+    // that holds a layer (layerTables).
     std::array<kv::ChunkedPrefillParams, ExecutionLimits::maximumBatchWidth> chunks{};
-    std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pageTables{};
+    std::vector<std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>> pageTables{};
     // The sequences' attention plan, which every attention layer runs, and
     // with a sliding window (kv::Layout::windowTokens) their windowed plan,
     // which the sliding layers run instead (planAttention).

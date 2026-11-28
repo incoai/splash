@@ -455,8 +455,8 @@ void testHeldPagesFollowRank() {
   ledger.addSource(none);
   waitForItsCopies(ledger, high, {.pages = 6, .form = kv::PageForm::Index});
   waitForItsCopies(ledger, mid, {.pages = 4});
-  const std::array<uint32_t, 3> forLow = ledger.heldPages(low, 0);
-  const std::array<uint32_t, 3> forMid = ledger.heldPages(mid, 0);
+  const std::array<uint32_t, kv::kPageForms> forLow = ledger.heldPages(low, 0);
+  const std::array<uint32_t, kv::kPageForms> forMid = ledger.heldPages(mid, 0);
   require(forLow[static_cast<size_t>(kv::PageForm::Index)] == 6 && forLow[static_cast<size_t>(kv::PageForm::Full)] == 4,
           "a lower-ranked claim is not held the pages of both claims above it");
   require(forMid[static_cast<size_t>(kv::PageForm::Index)] == 6 && forMid[static_cast<size_t>(kv::PageForm::Full)] == 0,
@@ -464,10 +464,10 @@ void testHeldPagesFollowRank() {
 }
 
 // A waiting claim's bytes are held as each form's pages against lower-ranked claims (10,000 bytes: 3 Full pages of
-// 4096, 4 Slim of 3000); a claim free() found short is held against no one, and nothing is held at or above its rank.
+// 4096, 4 Index of 3000); a claim free() found short is held against no one, and nothing is held at or above its rank.
 void testWaitingBytesHoldPagesOfEachForm() {
   MemoryLedger ledger;
-  ledger.setPageBytes({4096, 0, 3000});
+  ledger.setPageBytes({4096, 3000});
   const ClaimId waiting = ledger.open(request(5, RequestPriority::Normal));
   const ClaimId shortClaim = ledger.open(request(4, RequestPriority::Normal));
   const ClaimId same = ledger.open(request(5, RequestPriority::Normal));
@@ -476,9 +476,9 @@ void testWaitingBytesHoldPagesOfEachForm() {
   require(ledger.free(shortClaim, {.bytes = 20'000}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Short,
           "a claim nothing covers did not find free() short");
   waitForItsCopies(ledger, waiting, {.bytes = 10'000});
-  require(ledger.heldPages(below, 0) == std::array<uint32_t, 3>{3, 0, 4},
+  require(ledger.heldPages(below, 0) == std::array<uint32_t, kv::kPageForms>{3, 4},
           "a lower-ranked claim was not held the pages of the bytes a claim above it waits for");
-  require(ledger.heldPages(same, 0) == std::array<uint32_t, 3>{} && ledger.heldPages(above, 0) == std::array<uint32_t, 3>{},
+  require(ledger.heldPages(same, 0) == std::array<uint32_t, kv::kPageForms>{} && ledger.heldPages(above, 0) == std::array<uint32_t, kv::kPageForms>{},
           "a claim of the waiting claim's rank or above it was held its pages");
 }
 
@@ -1141,7 +1141,7 @@ void testLandingCountsBeforeVictimsInPart() {
     MemoryLedger ledger;
     TestSource cache("cache");
     ledger.addSource(cache);
-    ledger.setReturning([] { return Returning{.landingPages = {2, 0, 0}}; },
+    ledger.setReturning([] { return Returning{.landingPages = {2, 0}}; },
                         [](std::span<const uint64_t>) { return Returning{}; });
     if (heldAbove) {
       const ClaimId high = ledger.open(request(2, RequestPriority::Foreground));
@@ -1161,10 +1161,10 @@ void testLandingCountsBeforeVictimsInPart() {
   // that land, as with nothing above it.
   {
     MemoryLedger ledger;
-    ledger.setPageBytes({4096, 0, 0});
+    ledger.setPageBytes({4096, 0});
     TestSource cache("cache");
     ledger.addSource(cache);
-    ledger.setReturning([] { return Returning{.landingPages = {2, 0, 0}}; }, [](std::span<const uint64_t> lanes) {
+    ledger.setReturning([] { return Returning{.landingPages = {2, 0}}; }, [](std::span<const uint64_t> lanes) {
       return std::ranges::find(lanes, 2) != lanes.end() ? Returning{.owedBytes = 8192} : Returning{};
     });
     const ClaimId high = ledger.open(request(2, RequestPriority::Foreground));
@@ -1599,6 +1599,31 @@ void testGrowthRetakesFreeRoomBeyondLaneDemand() {
   fixture.ledger().close(claim);
   require(unitsAt(5 * kRegrowQuietSeconds - 0.5) == 4, "the pool grew within the quiet time after a request lacked room");
   require(unitsAt(5 * kRegrowQuietSeconds) == 5, "the pool did not grow back after the quiet time");
+}
+
+// A pool whose cap falls below what it holds, as the SSD cache's state staging's does while its tier takes no cache
+// write, gives the rest back at the next control pass, while a request's claim waits too; once its cap is back it
+// grows again as any pool does.
+void testAPoolGivesBackWhatItHoldsAboveItsCap() {
+  Fixture fixture(host(32 * kGiB), 8 * kGiB);
+  FakeElasticPool staging("staging", fixture.memory, 20 * kMiB, 0, 1, 1, 1);
+  staging.rebuildOnly = true;
+  fixture.memory.hold("weights", 3 * kGiB);
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addPool(staging);
+  const ClaimId waiting = ledger.open(request(1, RequestPriority::Normal));
+  ledger.setWaiting(waiting, true);
+  static_cast<void>(fixture.pass(1.0));
+  require(staging.units() == 1 && !staging.shrinks, "a pool within its cap gave a unit back");
+  staging.setCap(0);
+  static_cast<void>(fixture.pass(1.5));
+  require(staging.units() == 0 && staging.shrinks == 1 && fixture.memory.held("staging") == 0,
+          "a pool above its cap kept what it holds above it while a claim waited");
+  ledger.setWaiting(waiting, false);
+  ledger.close(waiting);
+  staging.setCap(1);
+  static_cast<void>(fixture.pass(1.5 + kRegrowQuietSeconds));
+  require(staging.units() == 1 && staging.grows == 1, "a pool whose cap came back did not grow again");
 }
 
 // After a burst shrank the store, each quiet period regrows a unit from cache that frees now, never what is in use,
@@ -2153,6 +2178,51 @@ void testARequestMetFromCacheLogsNothing() {
               (lines.empty() ? std::string() : lines[0]));
 }
 
+// A grant of a request's other memory leaves the lines of its KV need standing: a start is granted its lane's state
+// at each attempt, and its restore, refused at each, logged "met past the host" 1,007 times in one second. A grant
+// of KV pages lets the need log afresh.
+void testAGrantOfOtherMemoryKeepsAKvNeedsLines() {
+  MemoryLedger ledger;
+  std::vector<std::string> lines;
+  ledger.setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
+  const ClaimId claim = ledger.open(request(9, RequestPriority::Normal));
+  const Need restore{.bytes = 198 * kMiB, .hostRefused = true, .pages = 537, .kv = true};
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    ledger.granted(claim);
+    require(ledger.free(claim, restore, 0, MemoryPressure::Normal, true).outcome == FreeOutcome::Met,
+            "a restore the host refused a request in service was not met past the host");
+  }
+  require(lines.size() == 1 && lines[0].find("537 pages: met past the host") != std::string::npos,
+          "a restore's need logged " + std::to_string(lines.size()) + " lines over three attempts of its start");
+  ledger.granted(claim, true);
+  static_cast<void>(ledger.free(claim, restore, 0, MemoryPressure::Normal, true));
+  require(lines.size() == 2, "a KV need did not log afresh after its pages were granted");
+}
+
+// A grant of KV pages ends the logged wait of the KV need, whatever else the
+// claim logged after it: here a wait for pages, logged once it lasted, then a need of other memory met past the host.
+void testAKvGrantEndsTheKvNeedsLoggedWait() {
+  MemoryLedger ledger;
+  std::vector<std::string> lines;
+  ledger.setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
+  ledger.setReturning([&] { return Returning{.landingBytes = kGiB}; },
+                      [](std::span<const uint64_t>) { return Returning{}; });
+  const ClaimId claim = ledger.open(request(9, RequestPriority::Normal));
+  const Need pages{.bytes = kGiB, .pages = 4, .kv = true};
+  require(ledger.free(claim, pages, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending,
+          "fixture: a KV need what lands covers did not wait");
+  ledger.setNow(1.5);
+  static_cast<void>(ledger.free(claim, pages, 0, MemoryPressure::Normal));
+  require(lines.size() == 1 && lines[0].find(": pending") != std::string::npos, "fixture: the KV wait did not log");
+  require(ledger.free(claim, {.bytes = 198 * kMiB, .hostRefused = true}, 0, MemoryPressure::Normal, true).outcome ==
+              FreeOutcome::Met && lines.size() == 2,
+          "fixture: the other need was not met past the host, or did not log");
+  ledger.granted(claim, true);
+  require(lines.size() == 3 && lines[2].find("claim of request 9: granted") != std::string::npos,
+          "a grant of KV pages did not end the KV need's logged wait: " + std::to_string(lines.size()) + " lines, last: " +
+              lines.back());
+}
+
 // The grant after a logged wait logs that the wait ended, which no met can say: an attempt granted as the pages it
 // waited for landed runs no free() at all. A grant after no logged wait, or after a met that cost work later, logs
 // nothing.
@@ -2656,6 +2726,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testAvailableCountsWhatLandsForAClaimThatCanWait", testAvailableCountsWhatLandsForAClaimThatCanWait},
       {"testGrowthRetakesFreeRoomBeyondLaneDemand", testGrowthRetakesFreeRoomBeyondLaneDemand},
       {"testGrowthTakesIdleCacheAfterABurst", testGrowthTakesIdleCacheAfterABurst},
+      {"testAPoolGivesBackWhatItHoldsAboveItsCap", testAPoolGivesBackWhatItHoldsAboveItsCap},
       {"testCriticalTakesTheMarginASettledSecondInTheOrder", testCriticalTakesTheMarginASettledSecondInTheOrder},
       {"testCriticalTakesWhatItFindsWhateverLands", testCriticalTakesWhatItFindsWhateverLands},
       {"testWarningWithoutADeficitTakesNothing", testWarningWithoutADeficitTakesNothing},
@@ -2680,6 +2751,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testPoolFloorBoundsEveryTake", testPoolFloorBoundsEveryTake},
       {"testEachDecisionLogsOneLine", testEachDecisionLogsOneLine},
       {"testARequestMetFromCacheLogsNothing", testARequestMetFromCacheLogsNothing},
+      {"testAGrantOfOtherMemoryKeepsAKvNeedsLines", testAGrantOfOtherMemoryKeepsAKvNeedsLines},
+      {"testAKvGrantEndsTheKvNeedsLoggedWait", testAKvGrantEndsTheKvNeedsLoggedWait},
       {"testAGrantEndsALoggedWait", testAGrantEndsALoggedWait},
       {"testABriefWaitLogsNothing", testABriefWaitLogsNothing},
       {"testAMetRefusedAgainLogsOnce", testAMetRefusedAgainLogsOnce},

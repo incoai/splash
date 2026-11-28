@@ -33,6 +33,10 @@ struct WeightFileRecord final {
   uint64_t declaredBytes = 0;
   // What the image was written from (ModelDescriptor::sourceIdentity).
   std::string contentIdentity{};
+  // Each tensor it holds and the format it loads in (gguf::imageFormats,
+  // vision::imageFormats): two builds that load a source in other formats
+  // compute other caches from it.
+  std::string formats{};
 };
 
 // The lowercase hex SHA-256 of bytes or text.
@@ -62,7 +66,7 @@ public:
              std::string relativePath, std::string_view expectedMagic,
              uint32_t expectedLayer, uint32_t expectedType,
              uint64_t declaredBytes, std::string contentIdentity,
-             std::shared_ptr<const std::vector<gguf::Fill>> planned = {});
+             std::shared_ptr<const std::vector<gguf::Fill>> planned = {}, std::string formats = {});
   ~WeightFile();
 
   WeightFile(const WeightFile &) = delete;

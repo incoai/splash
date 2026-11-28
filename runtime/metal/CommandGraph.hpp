@@ -119,6 +119,25 @@ public:
     dispatches_.back().constants.assign(constants.begin(), constants.end());
   }
 
+  // Marks a graph that is encoded only for its pipelines
+  // (MetalBackend::preparePipelines) and never runs, as a start's
+  // preparations are. Its ops then add their plans' alternates too
+  // (alternate()).
+  void prepareAlternates() noexcept { preparesAlternates_ = true; }
+  [[nodiscard]] bool preparesAlternates() const noexcept { return preparesAlternates_; }
+  // In a graph that prepares alternates, adds a copy of the last dispatch
+  // that names `pipeline`: a pipeline the dispatch's op picks for the same
+  // step on other inputs, which a start creates too (a decode attention's
+  // other form or query format, which a step's histories pick). In any other
+  // graph it does nothing.
+  void alternate(PipelineName pipeline) {
+    if (!preparesAlternates_) return;
+    if (dispatches_.empty()) throw std::logic_error("an alternate needs a dispatch");
+    ComputeDispatch copy = dispatches_.back();
+    copy.pipelineName = std::move(pipeline.value);
+    dispatches_.push_back(std::move(copy));
+  }
+
   // Event steps after the dispatches added so far (EventStep): signal once
   // all earlier work has completed, or hold all later work until the event
   // reaches value.
@@ -224,6 +243,7 @@ private:
   size_t payloadUsed_ = 0;
   std::vector<ComputeDispatch> dispatches_;
   std::vector<EventStep> events_;
+  bool preparesAlternates_ = false;
 };
 
 } // namespace splash::metal

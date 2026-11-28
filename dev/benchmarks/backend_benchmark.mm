@@ -7,6 +7,8 @@
 #include "PrefillWork.hpp"
 #include "TranscriptPrompts.hpp"
 
+#include <CommonCrypto/CommonDigest.h>
+
 #include <algorithm>
 #include <iterator>
 #include <array>
@@ -24,6 +26,8 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -109,7 +113,7 @@ public:
   }
 
   void failed(uint64_t requestId, LaneOutcome outcome, std::string message,
-              uint32_t) override {
+              uint32_t, CapacityShortfall) override {
     observations_[requestId].failure =
         std::string(laneOutcomeWire(outcome).code) + ":" + message;
   }
@@ -375,7 +379,7 @@ private:
   [[nodiscard]] bool drained() const {
     const engine::EngineSnapshot counts = engine_.snapshot();
     return counts.submitted ==
-               counts.completed + counts.cancelled + counts.failed &&
+               counts.completed + counts.cancelled + counts.timedOut + counts.failed &&
            !engine_.commandInFlight();
   }
 
@@ -384,14 +388,97 @@ private:
   std::shared_ptr<WakeState> wake_ = std::make_shared<WakeState>();
 };
 
+// The ids random prompts draw from, from 100: 200,000 of them, or the
+// model's vocabulary past 100 where it holds fewer (main sets it), so that
+// a vocabulary of 200,100 or more draws the same tokens whatever its size.
+uint32_t randomTokenIds = 200000;
+
 std::vector<uint32_t> prompt(uint32_t length, uint64_t salt) {
   std::vector<uint32_t> result(length);
   uint64_t state = salt ^ 0x9e3779b97f4a7c15ULL;
   for (uint32_t &token : result) {
     state = state * 6364136223846793005ULL + 1442695040888963407ULL;
-    token = 100 + static_cast<uint32_t>((state >> 17) % 200000);
+    token = 100 + static_cast<uint32_t>((state >> 17) % randomTokenIds);
   }
   return result;
+}
+
+// The chat requests the decode, context, transcripts and logits scenarios
+// send: the decode throughput prompt, which asks for counting, and the
+// transcripts' requests (TranscriptPrompts.hpp), each one user message with
+// thinking off in the model's chat template. The built-in ones are Qwen's
+// tokens; --prompts gives a model's own, which backend_regression renders
+// with its tokenizer and chat template (dev/benchmarks/chat_prompts.py).
+struct BenchmarkPrompts final {
+  std::vector<uint32_t> decode;
+  std::vector<std::vector<uint32_t>> transcripts;
+  // built-in, file, or random: random tokens of the built-in ones' lengths,
+  // for a model whose vocabulary lacks Qwen's tokens and no --prompts.
+  std::string_view source;
+};
+
+// The digest of the built-in decode throughput prompt's tokens as
+// little-endian uint32s, as the report gives a prompt's.
+constexpr std::string_view kDecodeThroughputPromptSha256 =
+    "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982";
+
+std::string tokensSha256(std::span<const uint32_t> tokens) {
+  std::vector<uint8_t> bytes;
+  bytes.reserve(tokens.size() * 4);
+  for (const uint32_t token : tokens)
+    for (uint32_t shift = 0; shift != 32; shift += 8)
+      bytes.push_back(static_cast<uint8_t>(token >> shift));
+  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256(bytes.data(), static_cast<CC_LONG>(bytes.size()), digest);
+  std::ostringstream hex;
+  for (const unsigned char byte : digest)
+    hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(byte);
+  return hex.str();
+}
+
+std::vector<std::vector<uint32_t>> readNumberLines(const std::filesystem::path &path);
+
+// The prompts of a run on a model of `vocabularySize` tokens: those of
+// --prompts, a file of the decode prompt's tokens on its first line and
+// each transcript request's on the next six; else the built-in ones, which
+// a model without Qwen's tokens replaces by random ones of their lengths.
+BenchmarkPrompts benchmarkPrompts(const std::optional<std::filesystem::path> &path, uint32_t vocabularySize) {
+  BenchmarkPrompts prompts;
+  if (path) {
+    std::vector<std::vector<uint32_t>> lines = readNumberLines(*path);
+    if (lines.size() != 1 + benchmark::kTranscriptPrompts.size() ||
+        std::any_of(lines.begin(), lines.end(), [](const auto &line) { return line.empty(); }))
+      throw std::invalid_argument("--prompts takes 7 lines of tokens: the decode prompt and the 6 transcript requests");
+    for (const std::vector<uint32_t> &line : lines)
+      for (const uint32_t token : line)
+        if (token >= vocabularySize)
+          throw std::invalid_argument("--prompts token " + std::to_string(token) +
+                                      " lies outside the model's vocabulary of " +
+                                      std::to_string(vocabularySize) + " tokens");
+    prompts.decode = std::move(lines.front());
+    prompts.transcripts.assign(std::make_move_iterator(lines.begin() + 1), std::make_move_iterator(lines.end()));
+    prompts.source = "file";
+    return prompts;
+  }
+  prompts.decode.assign(std::begin(benchmark::kDecodeThroughputPrompt), std::end(benchmark::kDecodeThroughputPrompt));
+  for (const std::span<const uint32_t> request : benchmark::kTranscriptPrompts)
+    prompts.transcripts.emplace_back(request.begin(), request.end());
+  prompts.source = "built-in";
+  const auto inVocabulary = [&](std::span<const uint32_t> tokens) {
+    return std::all_of(tokens.begin(), tokens.end(), [&](uint32_t token) { return token < vocabularySize; });
+  };
+  if (inVocabulary(prompts.decode) && std::all_of(prompts.transcripts.begin(), prompts.transcripts.end(),
+                                                  [&](const auto &request) { return inVocabulary(request); }))
+    return prompts;
+  std::cerr << "backend-benchmark: the built-in chat prompts are Qwen's tokens, outside this model's vocabulary of "
+            << vocabularySize << " tokens; the decode, context, transcripts and logits scenarios send random tokens "
+               "of their lengths instead (--prompts, as backend_regression passes, sends the model's own)\n";
+  prompts.decode = prompt(static_cast<uint32_t>(prompts.decode.size()), 0x4445434f4445ULL);
+  for (uint32_t index = 0; index < prompts.transcripts.size(); ++index)
+    prompts.transcripts[index] =
+        prompt(static_cast<uint32_t>(prompts.transcripts[index].size()), uint64_t{index} << 32 | 0x43484154ULL);
+  prompts.source = "random";
+  return prompts;
 }
 
 // What each lookup of a cache check found, for its failure: under host
@@ -761,6 +848,13 @@ ops::Int8Activations parseInt8Activations(std::string_view value) {
   return value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
 }
 
+// --weights, as serve's: whether the target's 16-bit projections load as
+// Q8_0 or as their files store them.
+model::gguf::Float16Weights parseWeights(std::string_view value) {
+  if (value != "auto" && value != "original") throw std::invalid_argument("--weights requires original or auto");
+  return value == "auto" ? model::gguf::Float16Weights::Q8_0 : model::gguf::Float16Weights::Published;
+}
+
 // --ane-ffn-minimum-rows: the least rows of a chunk the prefill FFN's Neural
 // Engine split takes, a positive count.
 uint32_t parseAneFfnMinimumRows(std::string_view value) {
@@ -944,9 +1038,9 @@ int main(int argc, char **argv) {
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--ane-calibration again] [--max-context TOKENS] "
-                   "[--activations auto|bf16] [--verify-rows all|auto] "
+                   "[--activations auto|bf16] [--weights original|auto] [--verify-rows all|auto] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES] [--logits-cache evict|keep]] "
-                   "[--context-lengths TOKENS[,TOKENS...]] [--short-idle SECONDS]\n"
+                   "[--context-lengths TOKENS[,TOKENS...]] [--short-idle SECONDS] [--prompts PATH]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
@@ -958,7 +1052,8 @@ int main(int argc, char **argv) {
                    "  TOKENS: the context the engine serves, as serve's "
                    "--max-context, with YaRN past the model's native window "
                    "(default: what memory holds)\n"
-                   "  --activations: as serve's (default: auto)\n"
+                   "  --activations: as serve's (default: the model's)\n"
+                   "  --weights: as serve's (default: auto)\n"
                    "  --verify-rows: as serve's (default: all, so that the times measure the "
                    "backend and outputs repeat, where the verify budget's rows follow the "
                    "cycles before them)\n"
@@ -972,7 +1067,11 @@ int main(int argc, char **argv) {
                    "  TOKENS: the context and exact scenarios' lengths, ascending "
                    "(default: 2048,10000,50000,128000)\n"
                    "  SECONDS: how long the short scenario leaves the engine idle before each "
-                   "prompt (default: 0)\n";
+                   "prompt (default: 0)\n"
+                   "  PATH: the chat requests' tokens in the model's chat template, the decode prompt's "
+                   "on the first line and the 6 transcript requests' on the next, as backend_regression "
+                   "writes them (default: the built-in Qwen ones, or random tokens of their lengths for "
+                   "a model without Qwen's tokens)\n";
       return 2;
     }
     uint32_t samples = 1;
@@ -984,9 +1083,10 @@ int main(int argc, char **argv) {
     bool recalibrateAne = false;
     std::vector<uint32_t> contextLengths{2048, 10000, 50000, 128000};
     uint32_t maxContext = 0;
-    ops::Int8Activations int8Activations = ops::Int8Activations::On;
+    std::optional<ops::Int8Activations> int8Activations;
+    model::gguf::Float16Weights weights = model::gguf::Float16Weights::Q8_0;
     model::VerifyRows verifyRows = model::VerifyRows::All;
-    std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
+    std::optional<std::filesystem::path> logitsDirectory, logitsFrom, promptsPath;
     uint32_t logitsWidth = 1;
     bool logitsKeepCache = false;
     bool logitsOptions = false;
@@ -1012,6 +1112,8 @@ int main(int argc, char **argv) {
         maxContext = parseMaxContext(argv[index + 1]);
       } else if (option == "--activations") {
         int8Activations = parseInt8Activations(argv[index + 1]);
+      } else if (option == "--weights") {
+        weights = parseWeights(argv[index + 1]);
       } else if (option == "--verify-rows") {
         const std::string_view value(argv[index + 1]);
         if (value != "all" && value != "auto")
@@ -1021,6 +1123,8 @@ int main(int argc, char **argv) {
         contextLengths = parseContextLengths(argv[index + 1]);
       } else if (option == "--short-idle") {
         shortIdleSeconds = parseShortIdle(argv[index + 1]);
+      } else if (option == "--prompts") {
+        promptsPath = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits") {
         logitsDirectory = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits-from") {
@@ -1057,10 +1161,16 @@ int main(int argc, char **argv) {
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
     config.aneFfn.recalibrate = recalibrateAne;
     config.int8Activations = int8Activations;
+    config.weights = weights;
     config.verifyRows = verifyRows;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
+    randomTokenIds = std::min<uint32_t>(randomTokenIds, capabilities.vocabularySize - 100);
+    const BenchmarkPrompts prompts = benchmarkPrompts(promptsPath, capabilities.vocabularySize);
+    if (prompts.source == "built-in" && tokensSha256(prompts.decode) != kDecodeThroughputPromptSha256)
+      throw std::logic_error("the built-in decode throughput prompt changed");
+    const std::span<const uint32_t> decodeThroughputPrompt = prompts.decode;
     // Complete production warmup and memory audit before measuring. A start
     // refused memory the host or Metal may give back, as while the previous
     // engine's memory settles, retries as serve's does (main.mm): within the
@@ -1126,11 +1236,16 @@ int main(int argc, char **argv) {
     // one; a warmup retries none, so like a start's warmup they run inside a
     // Floor claim: only the engine's limit and macOS's critical pressure
     // refuse what they allocate. Like a start's warmup too, they hold the KV
-    // runway they run on.
+    // runway they run on: all its pages, named, so that the hold allocates
+    // again the extents of it the start's audit released, as the Neural
+    // Engine split's set-up after that audit does (requireWarmup). The audit
+    // keeps one empty extent, and a windowed layout's runway, a block's
+    // pages times the warmup's blocks, takes more than one.
     MemoryGovernor &governor = resources->memoryGovernor();
     const ClaimId warmups = governor.ledger().open({.cls = ClaimClass::Floor});
     std::optional<MemoryGovernor::Scope> warmupScope(std::in_place, governor, warmups);
-    std::optional<engine::KvPool::RunwayHold> runway(std::in_place, resources->kvPool());
+    std::optional<engine::KvPool::RunwayHold> runway(std::in_place, resources->kvPool(),
+                                                     resources->kvPool().runwayPages());
     if (progress)
       progress->begin("warmup", "prefill_2048", 0,
                       model::ExecutionLimits::prefillTokenBudget);
@@ -1174,14 +1289,6 @@ int main(int argc, char **argv) {
     // This executable characterizes one source identity and checks internal
     // invariants; a source-regression claim requires a separately captured
     // baseline report and an explicit comparison outside this process.
-    constexpr std::array<uint32_t, 39> decodeThroughputPrompt{
-        248045, 846,   198,   2427, 38453, 494,   220,   16,
-        11,     4237,  1754,  1324, 321,   1141,  6163,  803,
-        383,    264,   491,   1500, 13,    14569, 2980,  488,
-        5372,   220,   17,    15,   15,    13,    248046, 198,
-        248045, 74455, 198,   248068, 271,  248069, 271};
-    constexpr std::string_view decodeThroughputPromptSha256 =
-        "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982";
     std::vector<DecodeThroughputMeasurement> decodeThroughput;
     decodeThroughput.reserve(size_t{lanes} * samples);
     uint64_t requestId = 1;
@@ -1503,7 +1610,7 @@ int main(int argc, char **argv) {
         for (uint32_t index = 0; index < transcriptCases.size(); ++index) {
           const auto [request, context] = transcriptCases[index];
           std::vector<uint32_t> tokens = prompt(context, uint64_t{index} << 32 | 0x5452414e53ULL);
-          const std::span<const uint32_t> question = benchmark::kTranscriptPrompts[request];
+          const std::span<const uint32_t> question = prompts.transcripts[request];
           tokens.insert(tokens.end(), question.begin(), question.end());
           evictAllCache(resources->cache());
           Measurement result =
@@ -1529,7 +1636,7 @@ int main(int argc, char **argv) {
       if (logitsFrom) {
         dump = readLogitDump(*logitsFrom);
       } else {
-        for (const std::span<const uint32_t> question : benchmark::kTranscriptPrompts) {
+        for (const std::span<const uint32_t> question : prompts.transcripts) {
           evictAllCache(resources->cache());
           const Measurement answer =
               runRequest(engine, driver, *executor, events, progress.get(), requestId++, "logits_answer", 0,
@@ -1541,7 +1648,7 @@ int main(int argc, char **argv) {
         // holds as many sequences.
         for (uint32_t prefix = 0; prefix < kPrefixes; ++prefix)
           for (uint32_t sequence = 0; sequence < dump.sequences.size(); ++sequence) {
-            const uint32_t question = static_cast<uint32_t>(benchmark::kTranscriptPrompts[sequence].size());
+            const uint32_t question = static_cast<uint32_t>(prompts.transcripts[sequence].size());
             const uint32_t answered = static_cast<uint32_t>(dump.sequences[sequence].size()) - question;
             if (answered)
               dump.records.emplace_back(sequence, question + prefix * answered / kPrefixes);
@@ -1687,7 +1794,8 @@ int main(int argc, char **argv) {
     }
     std::cout << "]},\"decode_throughput\":{\"prompt_tokens\":"
               << decodeThroughputPrompt.size()
-              << ",\"prompt_sha256\":\"" << decodeThroughputPromptSha256
+              << ",\"prompt_sha256\":\"" << tokensSha256(decodeThroughputPrompt)
+              << "\",\"prompt_source\":\"" << prompts.source
               << "\",\"output_tokens_per_lane\":64,\"samples\":[";
     for (size_t index = 0; index < decodeThroughput.size(); ++index) {
       if (index)

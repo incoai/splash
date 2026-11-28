@@ -629,6 +629,9 @@ class GgufMetadataTests(unittest.TestCase):
         )
         record = assembly.verify(chosen.link, full=True)
         self.assertEqual(record["family"], FLASH_NEXT.name)
+        # None of its tensors is 16-bit: --weights auto loads it as the
+        # default does, as the engine's check of its headers says.
+        self.assertIs(record["quantizable_weights"], False)
         self.assertEqual(
             record["sources"]["draft"], {"repo": draft, "revision": DRAFT_COMMIT}
         )
@@ -636,6 +639,27 @@ class GgufMetadataTests(unittest.TestCase):
             models.read_json(chosen.link / "draft" / "config.json"),
             family_config(FLASH_NEXT, "draft/config.json"),
         )
+
+    def test_a_start_gives_an_older_record_what_weights_auto_changes(self):
+        fake = self.gguf_repository()
+        chosen = selection(self.root, GGUF_REPO + ":Q4_K_M", language_only=True)
+        # An assembly made before 1.7.4 records nothing of --weights.
+        build = assembly.build
+
+        def older(models_root, record, files):
+            del record["quantizable_weights"]
+            return build(models_root, record, files)
+
+        with mock.patch.object(assembly, "build", older):
+            self.prepare(chosen)
+        self.assertNotIn("quantizable_weights", assembly.verify(chosen.link))
+        fake.downloads.clear()
+        # The next start assembles it again from the snapshots it links.
+        output = self.prepare(chosen)
+        self.assertIn("its record gains what the app offers its options by", output)
+        self.assertIs(assembly.verify(chosen.link)["quantizable_weights"], False)
+        self.assertEqual(fake.downloads, [])
+        self.assertIn("is already installed", self.prepare(chosen))
 
     def test_a_gguf_splash_cannot_serve_is_refused_before_its_projector(self):
         # Another architecture, with a projector Splash would not take either.
@@ -814,6 +838,77 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual(warnings, "")
         self.assertEqual(fake.downloads, [f"{GGUF_REPO}/mmproj-F32.gguf"])
         self.assertEqual(assembly.verify(chosen.link)["vision_format"], "gguf")
+
+    def test_offline_the_newest_cached_snapshot_holding_the_variant_installs(self):
+        """The cache's record of the default branch names a newer commit an
+        interrupted download left with the projector alone: offline, the
+        older snapshot that holds the GGUF installs, named in the log."""
+        fake = self.gguf_repository()
+        self.prepare(selection(self.root / "first", GGUF_REPO + ":Q4_K_M"))
+        repository = self.root / "hub" / hub.folder_name(GGUF_REPO)
+        moved = repository / "snapshots" / ("b" * 40)
+        moved.mkdir()
+        (moved / "mmproj-F32.gguf").write_bytes(b"the projector, fetched first")
+        (repository / "refs" / "main").write_text("b" * 40)
+        fake.requests.clear()
+        chosen = selection(self.root / "second", GGUF_REPO + ":Q4_K_M")
+        with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
+            output = self.prepare(chosen)
+            self.assertIn(
+                f"The Hub cache's {GGUF_REPO}@{'b' * 12}, its record of the default "
+                f"branch, lacks {GGUF_REPO}:Q4_K_M; taking {'a' * 40}, the newest "
+                "cached snapshot that holds it.",
+                output,
+            )
+            self.assertEqual(
+                assembly.verify(chosen.link)["sources"]["target"]["revision"],
+                "a" * 40,
+            )
+            # A selection that names no variant never takes another
+            # snapshot's GGUF: the one it holds is not what the Hub selects.
+            with self.assertRaisesRegex(models.ModelError, "no single GGUF|select"):
+                self.prepare(selection(self.root / "unnamed", GGUF_REPO))
+            # With no snapshot that holds it, the refusal says so.
+            (repository / "snapshots" / ("a" * 40) / "model-Q4_K_M.gguf").unlink()
+            with self.assertRaisesRegex(
+                models.ModelError,
+                f"cannot install {GGUF_REPO}:Q4_K_M: could not reach the Hub "
+                f"[(]HF_HUB_OFFLINE is set[)], and no cached commit of {GGUF_REPO} "
+                f"holds :Q4_K_M whole [(]looked at {'b' * 12}, {'a' * 12}[)]",
+            ):
+                self.prepare(selection(self.root / "third", GGUF_REPO + ":Q4_K_M"))
+        self.assertEqual(fake.requests, [])
+
+    def test_offline_a_snapshot_holds_the_variant_only_with_its_tower(self):
+        """The record's snapshot holds the GGUF without its projector, an
+        older one both: offline, a selection with vision installs the older
+        one; a text-only selection the record's."""
+        fake = self.gguf_repository()
+        self.prepare(
+            selection(self.root / "first", GGUF_REPO + ":Q4_K_M", language_only=False)
+        )
+        repository = self.root / "hub" / hub.folder_name(GGUF_REPO)
+        older = repository / "snapshots" / ("a" * 40)
+        moved = repository / "snapshots" / ("b" * 40)
+        moved.mkdir()
+        (moved / "model-Q4_K_M.gguf").symlink_to(older / "model-Q4_K_M.gguf")
+        (repository / "refs" / "main").write_text("b" * 40)
+        fake.requests.clear()
+        with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
+            for language_only, commit in ((False, "a" * 40), (True, "b" * 40)):
+                with self.subTest(language_only=language_only):
+                    chosen = selection(
+                        self.root / f"text{language_only}",
+                        GGUF_REPO + ":Q4_K_M",
+                        language_only=language_only,
+                    )
+                    self.prepare(chosen)
+                    record = assembly.verify(chosen.link)
+                    self.assertEqual(record["sources"]["target"]["revision"], commit)
+                    self.assertEqual(
+                        record["vision_format"] != "none", not language_only
+                    )
+        self.assertEqual(fake.requests, [])
 
     def test_offline_an_installation_without_its_tower_serves_text_quietly(self):
         fake = self.gguf_repository()

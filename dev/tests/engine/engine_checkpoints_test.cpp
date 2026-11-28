@@ -105,8 +105,8 @@ void testSharedCheckpointSurvivesPeerRollingReplacement() {
   runUntilCheckpoint(h, 2);
   require(resources.lookup(original, {}).resumeBoundary() == kPrefillCheckpointTokens,
           "rolling a shared checkpoint retired the paused peer's recovery point");
-  engine.cancel(412);
-  engine.cancel(413);
+  engine.cancel(412, 0.0);
+  engine.cancel(413, 0.0);
   h.runUntilIdle();
   require(events.failedCount == 0, "shared checkpoint cancellation failed");
 }
@@ -125,7 +125,7 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
                 resources.snapshot().stateCache.entries == 1 &&
                 resources.snapshot().stateCache.checkpointEntries == 1,
             "retry promoted or accumulated intermediate checkpoints");
-    engine.cancel(500 + attempt);
+    engine.cancel(500 + attempt, 0.0);
     h.runUntilIdle();
   }
   engine.submit(request(503, prompt));
@@ -147,14 +147,14 @@ void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
   const std::vector<uint32_t> prompt(25001, 32);
   engine.submit(request(510, prompt));
   runUntilCheckpoint(h, 1);
-  engine.cancel(510);
+  engine.cancel(510, 0.0);
   h.runUntilIdle();
   for (uint32_t id : {511U, 512U}) {
     engine.submit(request(id, prompt));
     require(tickAt(h, 1) && engine.commandInFlight() &&
                 events.starts.back() == kPrefillCheckpointTokens,
             "retry did not restore the previous progress point");
-    engine.cancel(id);
+    engine.cancel(id, 0.0);
     h.runUntilIdle();
     require(resources.lookup(prompt, {}).resumeBoundary() ==
                     kPrefillCheckpointTokens &&
@@ -186,7 +186,7 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
       const std::vector<uint32_t> prompt(25001, 33);
       engine.submit(request(520, prompt));
       runUntilCheckpoint(h, 1);
-      engine.cancel(520);
+      engine.cancel(520, 0.0);
       h.runUntilIdle();
       const uint32_t taken = executor.reservations + executor.diskSnapshots;
       std::vector<uint32_t> shorter(
@@ -227,7 +227,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
   require(tickAt(h, 50) && tickAt(h, 51) && !engine.commandInFlight() &&
               executor.requests.at(530).position == 18432,
           "fixture did not commit past the last recovery point");
-  engine.cancel(530);
+  engine.cancel(530, 0.0);
   h.runUntilIdle();
   // Another conversation leaves the prompt at 18432 and goes on to a state
   // of its own, so the retry's matched KV ends at a branch point.
@@ -295,7 +295,7 @@ void testPinnedPredecessorTakesNoRoomFromOtherStates() {
   const std::vector<uint32_t> other(25001, 41);
   engine.submit(request(1, other));
   runUntilCheckpoint(h, 1);
-  engine.cancel(1);
+  engine.cancel(1, 0.0);
   h.runUntilIdle();
   const std::vector<uint32_t> prompt(18001, 42);
   engine.submit(request(2, prompt));
@@ -321,7 +321,7 @@ void testPinnedPredecessorTakesNoRoomFromOtherStates() {
               resources.lookup(other, {}).resumeBoundary() == kPrefillCheckpointTokens,
           "a checkpoint that could not be published recycled another lane's");
   pinned = {};
-  engine.cancel(2);
+  engine.cancel(2, 0.0);
   h.runUntilIdle();
 }
 
@@ -453,7 +453,7 @@ void testCheckpointRetiresOnceItsSuccessorIsPublished() {
               resources.snapshot().stateCache.checkpointRetirements == 1 &&
               engine.snapshot().checkpointPublicationFailures == 0,
           "the lane's checkpoint did not retire once the next one was published");
-  engine.cancel(430);
+  engine.cancel(430, 0.0);
   h.runUntilIdle();
 }
 
@@ -501,7 +501,7 @@ void testInterruptedCommandKeepsTheLanesCheckpoint() {
                   resources.snapshot().stateCache.checkpointEntries == 1,
               "the command took the lane's checkpoint before it ran");
       if (end == End::Cancelled)
-        engine.cancel(1);
+        engine.cancel(1, 0.0);
       if (end == End::Expired)
         static_cast<void>(tickAt(h, now = 1'000));
       *executor.holdPrefillUntil = true;
@@ -555,7 +555,7 @@ void testRefusedStateTakesTheCheckpointAfterItsCommand() {
       const std::vector<uint32_t> other(25001, 41);
       engine.submit(request(1, other));
       runUntilCheckpoint(h, 1);
-      engine.cancel(1);
+      engine.cancel(1, 0.0);
       h.runUntilIdle();
       // Resuming at 64, the prompt's commands end at 2112, 4160, 6208 and
       // 8256: the checkpoint at 4096 lies in the second, and the junction at
@@ -616,7 +616,7 @@ void testRefusedStateTakesTheCheckpointAfterItsCommand() {
                resources.snapshot().stateCache.evictions == 0;
       };
       if (cancelled) {
-        engine.cancel(3);
+        engine.cancel(3, 0.0);
         *executor.holdPrefillUntil = true;
         tickUntil(h, now, [&] { return idle(engine); }, "the request did not end");
         require(executor.snapshots == 0 &&
@@ -940,7 +940,7 @@ void testReplayPointWithoutRoomTakesItsOwnCheckpoint() {
     require(resources.probe(branch, {}).cachedTokens() == (full ? 0U : 8192U),
             full ? "a replay point refused room kept its checkpoint"
                  : "a replay point with room retired its checkpoint");
-    engine.cancel(2);
+    engine.cancel(2, 0.0);
     tickUntil(h, now, [&] { return idle(engine); }, "the lanes did not end");
   }
 }
@@ -1081,7 +1081,7 @@ void testShortSuffixContinuesCheckpointDraftState() {
   const std::vector<uint32_t> prompt(18001, 30);
   engine.submit(request(480, prompt));
   runUntilCheckpoint(h, 1);
-  engine.cancel(480);
+  engine.cancel(480, 0.0);
   h.runUntilIdle();
   std::vector<uint32_t> shorter(
       prompt.begin(), prompt.begin() + kPrefillCheckpointTokens + 209);
@@ -1124,7 +1124,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
     require(lookup.kvBoundary == 22528 && lookup.resumeBoundary() == 20480,
             "completed KV tail did not retain its preceding 4K checkpoint");
   }
-  engine.cancel(600);
+  engine.cancel(600, 0.0);
   h.runUntilIdle();
   require(engine.snapshot().cancelled == 1 &&
               resources.snapshot().stateCache.checkpointEntries == 1,

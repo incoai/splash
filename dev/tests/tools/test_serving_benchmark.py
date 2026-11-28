@@ -90,6 +90,12 @@ class ClientRequestTests(unittest.TestCase):
         self.assertTrue(
             clients.busy({**idle, "requests": {"submitted": 3, "completed": 2}})
         )
+        # A request its deadline ended has ended.
+        self.assertFalse(
+            clients.busy(
+                {**idle, "requests": {"submitted": 3, "completed": 2, "timed_out": 1}}
+            )
+        )
 
     def test_serve1_samples_its_idle_status_and_fails_on_an_error(self):
         # serve1 records the /status each request waited idle for and one
@@ -755,7 +761,17 @@ class CheckTests(unittest.TestCase):
 
     def test_g9_fails_a_starved_claim_unsummed_accounts_and_owed_memory(self):
         failing = {
+            # 30 s into its resource wait limit: nothing ahead of it worked.
             "starved": [
+                store(0, 8),
+                status(
+                    60,
+                    memory_governor__claims__oldest_ms=30_000,
+                    admission__stalled_wait_ms=30_000,
+                ),
+            ],
+            # A server that cannot tell the two waits apart is held to any.
+            "starved, without stalled_wait_ms": [
                 store(0, 8),
                 status(60, memory_governor__claims__oldest_ms=30_000),
             ],
@@ -775,6 +791,28 @@ class CheckTests(unittest.TestCase):
                 self.assertTrue(
                     any(f.startswith("G9") for f in check.check_run(run)["failures"])
                 )
+
+    def test_g9_reports_a_wait_behind_progress_and_fails_nothing(self):
+        # A request waited 45 s for memory behind lanes that worked: the
+        # limit restarted whenever one did, so it was never more than 2 s
+        # into it.
+        samples = [
+            store(0, 8),
+            status(
+                30,
+                memory_governor__claims__oldest_ms=20_000,
+                admission__stalled_wait_ms=1_500,
+            ),
+            status(
+                60,
+                memory_governor__claims__oldest_ms=45_000,
+                admission__stalled_wait_ms=2_000,
+            ),
+            status(90, admission__stalled_wait_ms=0),
+        ]
+        result = check.check_run(self.served("behind", samples=samples))
+        self.assertFalse([f for f in result["failures"] if f.startswith("G9")])
+        self.assertIn("G9: the longest wait for memory 45000 ms", result["notes"])
 
     def test_a_clients_own_last_request_is_not_in_flight(self):
         # A send is kept to 0.1 s and an answer to 0.01 s, so w0's second
@@ -1459,14 +1497,12 @@ class FakeCachingServer:
     counts, per request answered, 10 MiB written, of them two KV pages of
     1 MiB copied ahead and the rest one state, and after `requests`
     requests 1 MiB more at each of its next reads past the first, up to
-    `late`. With `slim_page_bytes` its plan is a target's whose windows leave
-    Slim pages of that size."""
+    `late`."""
 
-    def __init__(self, requests=0, late=0, calls=True, slim_page_bytes=None):
+    def __init__(self, requests=0, late=0, calls=True):
         self.lock = threading.Lock()
         self.bodies: list[dict] = []
         self.requests, self.late, self.calls = requests, late, calls
-        self.slim_page_bytes = slim_page_bytes
         self.reads_after = 0
 
     def answer(self, text):
@@ -1489,13 +1525,9 @@ class FakeCachingServer:
             if self.requests and answered == self.requests:
                 self.reads_after += 1
             late = min(self.late, max(0, self.reads_after - 1))
-        window = {"kv_window": {"slim_page_bytes": self.slim_page_bytes}}
         return {
             "requests": {"submitted": answered, "completed": answered},
-            "memory_plan": {
-                "model": {"kv_page_bytes": MIB},
-                "budget": window if self.slim_page_bytes else {},
-            },
+            "memory_plan": {"model": {"kv_page_bytes": MIB}, "budget": {}},
             "disk": {
                 "written_bytes": (10 * answered + late) * MIB,
                 "kv_copies": 2 * answered,
@@ -1741,27 +1773,6 @@ class ConversationScenarioTests(unittest.TestCase):
             [json.loads(line).get("turn") for line in samples], [0, 1, 2, 3, None]
         )
 
-    def test_the_check_says_that_slim_pages_count_whole(self):
-        # No counter tells a Slim page's write from a whole page's, so the
-        # KV by cause is overstated for a target that writes them.
-        fake = FakeCachingServer(requests=2, slim_page_bytes=MIB // 4)
-        summary = self.run_scenario(
-            clients.run_agent, fake, "s", conversations=1, turns=2
-        )
-        self.assertEqual(
-            (summary["kv_page_bytes"], summary["slim_page_bytes"]), (MIB, MIB // 4)
-        )
-        directory = Path(self.directory)
-        (directory / "s.out").write_text("DONE\n")
-        (directory / "s.meta.json").write_text(
-            json.dumps({"scenario": "agent", "build_id": "b1"})
-        )
-        self.assertIn(
-            "KV by cause counts every page at 1.0 MiB: this target's Slim pages "
-            "store 0.2 MiB, so its KV is overstated and its states understated",
-            check.check_run(check.Run(directory, "s"))["notes"],
-        )
-
     def test_an_edit_run_branches_from_the_middle_and_returns(self):
         fake = FakeCachingServer()
         self.run_scenario(clients.run_edit, fake, "e", conversations=2, turns=4)
@@ -1832,6 +1843,73 @@ class ConversationScenarioTests(unittest.TestCase):
                     text=synthetic_corpus(),
                 )
         self.assertEqual(len(self.events("f", "turn")), 1)
+
+    def test_a_conversation_that_lost_its_cache_fails(self):
+        """An agent run whose conversation 1 found nothing of its previous
+        prompt cached at turn 2, and waited for its whole prompt's prefill."""
+        directory = Path(self.directory)
+
+        def request(turn, conv, prompt, cached, ttft_ms):
+            return {
+                "kind": "request",
+                "turn": turn,
+                "turn_kind": "first" if turn == 0 else "loop",
+                "conv": conv,
+                "prompt": prompt,
+                "cached": cached,
+                "ttft_ms": ttft_ms,
+            }
+
+        def events(lost):
+            for turn in range(4):
+                for conv in range(2):
+                    prompt = 4000 + 2000 * turn
+                    cached = 0 if turn == 0 else prompt - 1000
+                    ttft_ms = 3000 + 1000 * turn
+                    if lost and (turn, conv) == (2, 1):
+                        cached, ttft_ms = 0, 60_000
+                    yield request(turn, conv, prompt, cached, ttft_ms)
+            yield {"kind": "end", "t": 100}
+
+        # An answer without usage leaves its request, and its conversation's
+        # next, unjudged.
+        unmeasured = [
+            {**record, "prompt": None, "cached": None}
+            if (record.get("turn"), record.get("conv")) == (1, 0)
+            else record
+            for record in events(False)
+        ]
+        write_jsonl(directory / "nousage.events.jsonl", unmeasured)
+        write_jsonl(directory / "nousage.status.jsonl", [])
+        (directory / "nousage.out").write_text("DONE\n")
+        (directory / "nousage.meta.json").write_text(
+            json.dumps({"scenario": "agent", "build_id": "b1"})
+        )
+        self.assertEqual(
+            check.check_run(check.Run(directory, "nousage"))["failures"], []
+        )
+        for lost in (False, True):
+            label = f"lost{int(lost)}"
+            write_jsonl(directory / f"{label}.events.jsonl", list(events(lost)))
+            write_jsonl(directory / f"{label}.status.jsonl", [])
+            (directory / f"{label}.out").write_text("DONE\n")
+            (directory / f"{label}.meta.json").write_text(
+                json.dumps({"scenario": "agent", "build_id": "b1"})
+            )
+            failures = check.check_run(check.Run(directory, label))["failures"]
+            with self.subTest(lost=lost):
+                if not lost:
+                    self.assertEqual(failures, [])
+                    continue
+                self.assertEqual(
+                    failures,
+                    [
+                        "conversation: turn 2, conversation 1 found 0 of its "
+                        "previous 6000 prompt tokens cached, under 90%",
+                        "conversation: turn 2's first tokens took 60.0 s, past "
+                        "3 x 6.0 s, its 4000 new tokens at the run's median pace",
+                    ],
+                )
 
     def test_the_check_notes_what_a_run_measured(self):
         fake = FakeCachingServer(requests=6, late=2)

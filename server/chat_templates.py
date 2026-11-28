@@ -43,6 +43,7 @@ tokenizer's.
 import json
 import re
 import sys
+import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -219,6 +220,43 @@ class ChatTemplate:
         key = _generation_key(options)
         found = self.generation_prompts.get(key)
         return found if found is not None else self.probe(key)
+
+
+# What /v1/models reports of reasoning where a request's effort decides
+# nothing: no efforts, so that a client offers none.
+NO_REASONING = {"thinks": None, "efforts": [], "default": None}
+
+
+def tokenizer_reasoning(directory, chat_format):
+    """What /v1/models reports of reasoning for a model no server has started
+    (Frontend.reasoning, under no server default): its tokenizer's default
+    template's (ChatTemplate.reasoning). The tokenizer is loaded from
+    directory as a start loads it, but for its vocabulary, which no template
+    reads and which takes the load's time (0.3 to 0.8 s of it, against
+    0.05): an empty tokenizer.json stands in for its own. The installer
+    records the report for the desktop app."""
+    if not chat_format.reasoning_switch:
+        return dict(NO_REASONING)
+    from tokenizers import Tokenizer, models
+    from transformers import AutoTokenizer
+
+    directory = Path(directory)
+    with tempfile.TemporaryDirectory(prefix="splash-template-") as scratch:
+        if (directory / "tokenizer.json").exists():
+            for file in directory.iterdir():
+                if file.name != "tokenizer.json":
+                    (Path(scratch) / file.name).symlink_to(file.resolve())
+            (Path(scratch) / "tokenizer.json").write_text(
+                Tokenizer(models.BPE()).to_str()
+            )
+            directory = Path(scratch)
+        tokenizer = AutoTokenizer.from_pretrained(
+            directory, local_files_only=True, trust_remote_code=False
+        )
+    templates = ChatTemplates(
+        tokenizer, opens_own_message=chat_format.opens_own_message
+    )
+    return dict(templates.select(None).reasoning)
 
 
 class ChatTemplates:

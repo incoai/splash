@@ -356,7 +356,7 @@ public:
   // slots of laneRows rows from committed[lane], the most rows a lane's
   // block held. `paths` holds each lane's path (a row mask, metal/abi/
   // VerifyTree.h), as acceptance wrote it; a chain's moves nothing.
-  static void addPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+  static void addPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t regions, uint32_t extentPages,
                             std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
                             uint32_t laneRows, const metal::MetalBuffer &paths);
 

@@ -4,8 +4,8 @@
 // mmproj (GGUF, as ggml-org's and Unsloth's releases convert it) or a
 // safetensors checkpoint (the release's, an MLX conversion's): its image's
 // plan, a source's binding to that plan, and its weights read back from the
-// image. The image (vision/model.bin, every tensor BF16) holds, in
-// order:
+// image. The image (vision/model.bin, every tensor BF16 but a Q8_0
+// mmproj's projections) holds, in order:
 //  - the patch embedding [1024][1200] as the GGUF orders a patch's values
 //    ([channel, patch-row, patch-col]), stored with zero columns to 1280,
 //    and its zero bias;
@@ -18,7 +18,9 @@
 //    biases, and its LayerScale;
 //  - the projector's two matrices, each with a zero bias.
 // Every tensor of an F32, F16 or BF16 mmproj is exact in BF16; a Q8_0
-// matrix's values are rounded to it (vision::writeVision).
+// mmproj's projections (q, k and v, the attention output, up, down and the
+// projector's two) are its Q8_0 blocks as a GGUF image's planes, and a Q8_0
+// tensor that is none of them is refused (vision::placeQ8Matrices).
 
 #include "model/GgufFile.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
@@ -32,7 +34,8 @@ namespace splash::model {
 [[nodiscard]] vision::Plan inklingVisionPlan(const ops::VisionLayout &layout);
 
 // Binds every section of plan to its tensors in gguf, an inkling2v mmproj of
-// the layout's tower, whose every tensor the tower uses.
+// the layout's tower, whose every tensor the tower uses; a projection of
+// Q8_0 tensors is stored as their planes (vision::placeQ8Matrices).
 void bindInklingMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, vision::Plan &plan);
 
 // Binds every section of plan to its unquantized tensors in a safetensors
@@ -42,7 +45,8 @@ void bindInklingMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, vi
 void bindInklingCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLayout &layout,
                            vision::Plan &plan);
 
-// The tower's weights as views of its image.
-[[nodiscard]] ops::VisionWeights readInklingVision(WeightFile &file, const ops::VisionLayout &layout);
+// The tower's weights as views of its image, written from `plan`.
+[[nodiscard]] ops::VisionWeights readInklingVision(WeightFile &file, const ops::VisionLayout &layout,
+                                                   const vision::Plan &plan);
 
 } // namespace splash::model

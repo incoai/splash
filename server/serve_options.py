@@ -242,6 +242,33 @@ def parse_request_timeout(value):
     return seconds
 
 
+# What a stop lets the requests the engine runs finish in by default, and at
+# most. Five seconds give a stream 400 to 500 more tokens at four lanes'
+# 80-100 tokens a second (Qwen3.6-35B-A3B on a 48 GB M5 Pro), about 1,000
+# alone, which ends most chat replies in flight, and keep a model switch in
+# the app short. The most and the engine's own stop after it, up to 15 s
+# (runtime/Supervision.hpp kStop), fit the 30 s after which the app kills
+# the process group of the server it stops (app Server.killAfter); only the
+# server's wait for an engine that outlives its SIGKILL, up to 15 s more,
+# would run past them, 45 s in all.
+DEFAULT_SHUTDOWN_TIMEOUT = 5.0
+MAX_SHUTDOWN_TIMEOUT = 15.0
+
+
+def parse_shutdown_timeout(value):
+    """--shutdown-timeout in seconds: 0 (or off) ends running requests at
+    once, as before drains existed."""
+    if value.strip().lower() in ("0", "off"):
+        return 0.0
+    seconds = _duration_seconds(value)
+    if seconds is None or seconds > MAX_SHUTDOWN_TIMEOUT:
+        raise argparse.ArgumentTypeError(
+            f"must be off, 0 or a duration of at most {MAX_SHUTDOWN_TIMEOUT:g} "
+            "seconds such as 5 or 10s"
+        )
+    return seconds
+
+
 def parse_idle_release(value):
     """--idle-release in seconds, math.inf for off."""
     if value.strip().lower() == "off":
@@ -362,9 +389,8 @@ def parse_reasoning_effort(value):
 def parse_sampling_default(value):
     """A --sampling-default NAME=VALUE as (name, number), a number a request
     may set (request_fields.sampling_refusal): `splash serve` refuses one
-    before it downloads anything. The app's Sampling defaults field
-    (LaunchOption.samplingDefaults) takes the same names and forms, and
-    leaves the ranges to this check."""
+    before it downloads anything. The app's sampling fields (Sampling.parse)
+    take the same names, forms and ranges."""
     name, separator, number = value.partition("=")
     if not separator or name not in SAMPLING_FIELDS:
         raise argparse.ArgumentTypeError(
@@ -409,7 +435,7 @@ class EngineArgument:
     """How the server passes an option on to the engine's serve-native. The
     server leaves out an optional one at the option's default, which must
     equal the engine's own (native_arguments_test.cpp pins the KV and state
-    formats, verify rows, image patches and activations)."""
+    formats, verify rows, image patches, activations and weights)."""
 
     # The engine's flag, or the slot of its positional argument after
     # MODEL_DIRECTORY. An optional positional comes after every required
@@ -600,6 +626,21 @@ SERVE_OPTIONS = (
         needs="sparse_kv",
     ),
     ServeOption(
+        "--weights",
+        "memory",
+        dict(
+            choices=("original", "auto"),
+            default="original",
+            help="how a model's weights load (default: original): original loads "
+            "every weight as the model's files store it; auto loads the BF16 "
+            "and F16 projections, experts and output head in the form the "
+            "engine picks, Q8_0 at about half their memory and of the bytes "
+            "a token reads, as Splash 1.7.3 loaded a checkpoint's; experts "
+            "MXFP8 holds exactly load as MXFP8 under either",
+        ),
+        engine=EngineArgument("--weights"),
+    ),
+    ServeOption(
         "--kv-format",
         "memory",
         dict(
@@ -672,8 +713,8 @@ SERVE_OPTIONS = (
             type=parse_max_cache_disk_writes,
             default=0,
             metavar="SIZE",
-            help="the most the SSD cache writes a day, e.g. 200G; the state a "
-            "conversation resumes from and KV pages pass it (default: 0, no "
+            help="the most the SSD cache writes a day, e.g. 200G; once it is "
+            "spent the cache keeps to memory until it refills (default: 0, no "
             "limit)",
         ),
         engine=EngineArgument("--max-cache-disk-writes"),
@@ -849,6 +890,20 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--shutdown-timeout",
+        "requests",
+        dict(
+            type=parse_shutdown_timeout,
+            default=DEFAULT_SHUTDOWN_TIMEOUT,
+            metavar="DURATION",
+            help="on a stop (SIGTERM or Ctrl+C), the time requests already "
+            "running get to finish while new and waiting ones get 503; a second "
+            "signal stops at once: seconds, or with an s suffix, at most "
+            f"{MAX_SHUTDOWN_TIMEOUT:g}; 0 or off ends them at once (default: "
+            f"{DEFAULT_SHUTDOWN_TIMEOUT:g})",
+        ),
+    ),
+    ServeOption(
         "--queue-size",
         "requests",
         dict(
@@ -917,13 +972,14 @@ SERVE_OPTIONS = (
         "requests",
         dict(
             choices=("auto", "bf16"),
-            default="auto",
             help="auto rounds activations to 8 bits where the GPU multiplies "
             "them twice as fast (M5 and later) and leaves the others bf16: "
             "long prompts through MLX 4- and 5-bit weights (about a quarter "
             "less time to the first token) and Q8_0 ones, rotated PQ2_0 decode "
             "and attention over the INT8 KV cache; bf16 keeps every activation "
-            "bf16, for evaluations and bf16 parity (default: auto)",
+            "bf16, for evaluations and bf16 parity (default: the model's: bf16 "
+            "for Inkling-2, whose prompts gain little from auto, and auto for "
+            "every other model)",
         ),
         engine=EngineArgument("--activations"),
     ),

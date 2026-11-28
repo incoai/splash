@@ -79,6 +79,9 @@ public:
   [[nodiscard]] const std::filesystem::path &path() const noexcept { return path_; }
   [[nodiscard]] std::filesystem::path kvSlots() const { return path_ / "kv.slots"; }
   [[nodiscard]] std::filesystem::path kvRecords() const { return path_ / "kv.records"; }
+  // A windowed layout's window parts of its KV copies (kv::Component).
+  [[nodiscard]] std::filesystem::path kvWindowSlots() const { return path_ / "kv-window.slots"; }
+  [[nodiscard]] std::filesystem::path kvWindowRecords() const { return path_ / "kv-window.records"; }
   [[nodiscard]] std::filesystem::path stateSlots() const { return path_ / "state.slots"; }
   [[nodiscard]] std::filesystem::path stateRecords() const { return path_ / "state.records"; }
   // Why this start found the cache emptied: starts failed within their

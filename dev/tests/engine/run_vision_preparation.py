@@ -2,8 +2,10 @@
 a GGUF and compare them with an independently serialized vision/model.bin;
 check the exact-BF16 rule, that invalid sources fail naming what is wrong, and
 that a padded section written after another keeps its padding zero. Then the
-same for a tiny Inkling tower: an inkling2v mmproj whose matrices include Q8_0
-ones, each value rounded to the nearest BF16, and the release's and
+same for a tiny Inkling tower: an inkling2v mmproj whose projection of whole
+64-row tiles and 64-value spans may be Q8_0, kept as a GGUF image's Q8_0
+planes, block for block, and any other Q8_0 tensor refused by name, and the
+release's and
 transformers' checkpoints and the two that rename the release's model.visual.
 vision_tower., whose patch embedding orders a patch's values [row, column,
 channel], each with its q, k and v stacked, its class token's two rows and
@@ -231,6 +233,32 @@ def q8_0(rows, columns, seed):
     return bytes(raw), values
 
 
+def quant_slot(e):
+    """The chunk-order slot of element e of a 32-value group
+    (metal/abi/QuantFormat.h)."""
+    return 8 * ((e >> 2) & 3) + 4 * (e >> 4) + (e & 3)
+
+
+def q8_planes(raw, rows, columns):
+    """A Q8_0 tensor's sections in a GGUF image: its descriptor (ggml type,
+    rows, columns, 32 plane0 and 0 plane1 bytes a block, 2 meta bytes a block
+    of one group, then the planes' totals), plane0 [rows / 64][G][64][32] of
+    the codes at their slots and meta [rows / 64][G][64] of the F16 scales,
+    each the source's bytes."""
+    groups = columns // 32
+    plane0, meta = bytearray(rows * groups * 32), bytearray(rows * groups * 2)
+    for row in range(rows):
+        for group in range(groups):
+            block = raw[(row * groups + group) * 34 :][:34]
+            record = ((row // 64) * groups + group) * 64 + row % 64
+            for e in range(32):
+                plane0[record * 32 + quant_slot(e)] = block[2 + e]
+            meta[record * 2 : record * 2 + 2] = block[:2]
+    descriptor = struct.pack("<7I", GGML_TYPES["Q8_0"], rows, columns, 32, 0, 2, 1)
+    descriptor += bytes(4) + struct.pack("<3Q", len(plane0), 0, len(meta))
+    return [descriptor, bytes(plane0), bytes(meta)]
+
+
 # A tiny Inkling tower: depth 2, width 32, 2x2 patches (12 values, stored
 # 16 wide), an MLP of 64, a 2x2 position grid, a merged width of 128 and a
 # text width of 32 (inkling_layout in vision_preparation_test.cpp).
@@ -320,12 +348,19 @@ def inkling_fixture(root, source="gguf", shift=0, case=None):
         # Exact in every float dtype, as the Qwen fixture's.
         return [((i * 7 + index * 11) % 255 - 127) / 64 for i in range(count)]
 
-    def tensor(name, rows, columns):
-        """The GGUF tensor `name` of rows x columns and its values."""
+    def tensor(name, rows, columns, planes=False):
+        """The GGUF tensor `name` of rows x columns and its values: Q8_0 in
+        the dtype cycle only where its section takes Q8_0 planes (`planes`),
+        or where a case makes it Q8_0 elsewhere, which preparation refuses."""
         index = len(tensors)
         vector = rows == 1 or columns == 1
-        quantizable = quantized and not vector and columns % 32 == 0
+        quantizable = quantized and planes
         dtype = dtypes[(index + shift) % (4 if quantizable else 3)]
+        if (case, name) in (
+            ("q8-mixed", "v.blk.0.attn_q.weight"),
+            ("q8-position", "v.position_embd.weight"),
+        ):
+            dtype = "Q8_0"
         shape = [rows * columns] if vector else [columns, rows]
         if name == "v.patch_embd.weight":
             shape = [2, 2, 3, rows]
@@ -350,6 +385,16 @@ def inkling_fixture(root, source="gguf", shift=0, case=None):
 
     def single(name, rows, columns=1, stored_columns=None):
         section(tensor(name, rows, columns), rows, columns, stored_columns)
+
+    def projection(name, rows, columns):
+        """A projection's matrix: Q8_0 planes where it is Q8_0 of whole
+        64-row tiles and 64-value pairs of blocks (merger.1's 128 x 128)."""
+        values = tensor(name, rows, columns, rows % 64 == 0 and columns % 64 == 0)
+        _, dtype, raw, _ = tensors[name]
+        if dtype == "Q8_0" and rows % 64 == 0 and columns % 64 == 0:
+            sections.extend(q8_planes(raw, rows, columns))
+        else:
+            section(values, rows, columns)
 
     def stacked(names, rows, columns=1):
         values = []
@@ -380,18 +425,18 @@ def inkling_fixture(root, source="gguf", shift=0, case=None):
         stacked(
             [g + p + ".bias" for p in ("attn_q", "attn_k", "attn_v")], INKLING_HIDDEN
         )
-        single(g + "attn_out.weight", INKLING_HIDDEN, INKLING_HIDDEN)
+        projection(g + "attn_out.weight", INKLING_HIDDEN, INKLING_HIDDEN)
         single(g + "attn_out.bias", INKLING_HIDDEN)
         single(g + "ls1.weight", INKLING_HIDDEN)
         norm(g + "ln2")
-        single(g + "ffn_up.weight", INKLING_FFN, INKLING_HIDDEN)
+        projection(g + "ffn_up.weight", INKLING_FFN, INKLING_HIDDEN)
         single(g + "ffn_up.bias", INKLING_FFN)
-        single(g + "ffn_down.weight", INKLING_HIDDEN, INKLING_FFN)
+        projection(g + "ffn_down.weight", INKLING_HIDDEN, INKLING_FFN)
         single(g + "ffn_down.bias", INKLING_HIDDEN)
         single(g + "ls2.weight", INKLING_HIDDEN)
-    single("mm.1.weight", INKLING_MERGED, INKLING_MERGED)
+    projection("mm.1.weight", INKLING_MERGED, INKLING_MERGED)
     zero(INKLING_MERGED)
-    single("mm.2.weight", INKLING_HIDDEN, INKLING_MERGED)
+    projection("mm.2.weight", INKLING_HIDDEN, INKLING_MERGED)
     zero(INKLING_HIDDEN)
     (root / "expected.bin").write_bytes(weight_file("MDFV0001", 2, 0, sections))
     if source != "gguf":
@@ -502,6 +547,8 @@ def check_inkling(binary, root):
         ("gguf", "unused"): ("v.post_ln.weight", "{}", "does not use"),
         ("gguf", "shape"): ("v.blk.1.attn_k.weight", "shape"),
         ("gguf", "q8-bias"): ("v.blk.0.attn_out.bias", "{}", "blocks of 32"),
+        ("gguf", "q8-mixed"): ("v.blk.0.attn_q.weight", "{}", "is Q8_0", "planes"),
+        ("gguf", "q8-position"): ("v.position_embd.weight", "{}", "is Q8_0", "planes"),
     }
     for source in INKLING_NAMES:
         key = inkling_name(source, "v.blk.1.attn_k.weight")

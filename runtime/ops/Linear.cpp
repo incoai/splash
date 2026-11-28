@@ -190,8 +190,10 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations, StepKind step) noexcept
-    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations), step_(step) {}
+Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations, StepKind step,
+               std::shared_ptr<Int8PathsTaken> taken) noexcept
+    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations), step_(step),
+      taken_(std::move(taken)) {}
 
 uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -232,6 +234,10 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
                                    pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
                   p.destination);
   plan.rotated_ = static_cast<bool>(p.rotation);
+  if (const LinearConfig &config = plan.configuration(); taken_ && config.tile == LinearTile::GgufPrefillInt8)
+    Int8PathsTaken::mark(taken_->prefillTile);
+  else if (taken_ && config.decodeInt8)
+    Int8PathsTaken::mark(step_ == StepKind::Decode ? taken_->decodeTiles : taken_->prefillDecodeTiles);
   return plan;
 }
 
@@ -259,10 +265,11 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
         bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, unitFormats(shape), shape.planOutputs));
   // A plan stores at most its rows' tiles: the decode tiles' up to their rows
   // (a decode step's kMaximumStagedRows, a chunk's kMaximumDecodeTileRows),
-  // the prefill tiles' whole 128-row tiles.
+  // the staged tile's or the matrix tile's fragments, the prefill tiles'
+  // whole 128-row tiles.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
   const uint32_t storage = rows <= (step_ == StepKind::Decode ? kMaximumStagedRows : kMaximumDecodeTileRows)
-                               ? std::max(rows, stagedStorageRows(rows, true))
+                               ? std::max({rows, stagedStorageRows(rows, true), matrixStorageRows(rows)})
                                : (rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, storage);
   // The most rows' plan, whose codes and scales the int8 prefill tile holds

@@ -1,6 +1,7 @@
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
+#include "model/WeightStore.hpp"
 
 #include <array>
 #include <cstring>
@@ -67,6 +68,20 @@ int main() {
     shard(root / "model.safetensors", valid, 8);
     rejects([&] { SafetensorsCheckpoint invalid(root); }, "safetensors data range is invalid",
             "truncated tensor accepted");
+    // A part of an installed model that is absent, or holds no shard, is a
+    // weight error that names its directory, never the filesystem's.
+    std::filesystem::create_directories(root / "empty");
+    for (const auto &[part, error] : std::initializer_list<std::pair<std::filesystem::path, std::string>>{
+             {root / "vision", "no safetensors weights in " + (root / "vision").string() + ": "},
+             {root / "empty", "no safetensors weights in " + (root / "empty").string()}}) {
+      try {
+        SafetensorsCheckpoint missing(part);
+        throw std::runtime_error("a source without shards was read: " + part.string());
+      } catch (const WeightStoreError &refused) {
+        require(std::string_view(refused.what()).find(error) != std::string_view::npos,
+                "a source without shards was refused as \"" + std::string(refused.what()) + "\"");
+      }
+    }
     std::cout << "safetensors checkpoint: bounded reads, metadata, written and malformed sources PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

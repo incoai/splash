@@ -35,6 +35,7 @@ REQUIRED_EXPORTS = (
     ("scheduler", "bound_cuts"),
     ("scheduler", "index_page_conflicts"),
     ("scheduler", "replans"),
+    ("requests", "timed_out"),
     ("memory_governor", "owed", "bytes"),
     ("memory_governor", "claims", "waiting"),
     ("streamed_experts", "shrinks"),
@@ -70,6 +71,38 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn("splash_disk_written_bytes_total 67890", lines)
         self.assertIn("splash_disk_written_last_hour_bytes 16384", lines)
         self.assertIn("splash_disk_written_last_day_bytes 65536", lines)
+        self.assertIn("splash_cache_token_hit_ratio 0.25", lines)
+        self.assertIn(
+            'splash_cache_reuse_ends_total{reason="nothing_matched"} 2', lines
+        )
+        self.assertIn('splash_disk_quota_given_up_total{kind="kv_copies"} 4', lines)
+        self.assertIn('splash_disk_quota_given_up_total{kind="states_in_use"} 0', lines)
+
+    def test_every_metric_has_its_type_before_its_samples(self):
+        # A scraper reads a metric without a type as untyped: a counter's
+        # rate() then holds no reset rule.
+        status = json.loads(GOLDEN.read_text())
+        types = {}
+        untyped = []
+        for line in prometheus_metrics(status).splitlines():
+            if line.startswith("# TYPE "):
+                _, _, name, kind = line.split()
+                self.assertNotIn(name, types)
+                types[name] = kind
+            elif not line.startswith("#"):
+                name = re.sub(
+                    r"(_bucket|_count|_sum)$", "", line.split("{")[0].split()[0]
+                )
+                if name not in types:
+                    untyped.append(name)
+        self.assertEqual(untyped, [])
+        self.assertEqual(types["splash_requests_failed_total"], "counter")
+        self.assertEqual(types["splash_scheduler_queued"], "gauge")
+        self.assertEqual(types["splash_memory_account_bytes"], "gauge")
+        self.assertEqual(
+            [name for name, kind in types.items() if kind == "counter"],
+            [name for name in types if name.endswith("_total")],
+        )
 
     def test_required_leaves_are_exported(self):
         status = json.loads(GOLDEN.read_text())
@@ -120,6 +153,17 @@ class StatusContractTests(unittest.TestCase):
 
 
 class StatusRouteTests(HarnessTestCase):
+    def test_ready_is_503_while_a_stop_drains(self):
+        # A draining server answers every new request with 503
+        # server_shutdown, and /ready says it is not ready for one.
+        harness = self.harness(FakeRuntime())
+        self.assertEqual(harness.request("GET", "/ready")[0], 200)
+        self.assertEqual(harness.backend.drain(0), 0)
+        status, _, payload = harness.request("GET", "/ready")
+        self.assertEqual(
+            (status, json.loads(payload)), (503, {"status": "unavailable"})
+        )
+
     def test_probes_and_status_report_a_ready_engine(self):
         harness = self.harness(FakeRuntime())
         status, _, payload = harness.request("GET", "/health")
@@ -236,6 +280,15 @@ class StatusRouteTests(HarnessTestCase):
                 "hits": 7,
                 "cold_misses": 4,
                 "reused_tokens": 1024,
+                "prompt_tokens": 4096,
+                "reused_disk_tokens": 256,
+                "token_hit_rate": 0.25,
+                "reuse_ends": {
+                    "nothing_matched": 4,
+                    "prefix_end": 5,
+                    "kv_without_state": 1,
+                    "disk_read_failed": 1,
+                },
                 "lazy_junctions": 2,
                 "priority_suspensions": 3,
             },
@@ -310,6 +363,16 @@ class StatusRouteTests(HarnessTestCase):
         self.assertIn("splash_cache_hits_total 7", metrics)
         self.assertIn("splash_cache_cold_misses_total 4", metrics)
         self.assertIn("splash_cache_reused_tokens_total 1024", metrics)
+        # The token hit rate is one division, and each start's reuse end is
+        # counted by its reason.
+        self.assertIn("splash_cache_prompt_tokens_total 4096", metrics)
+        self.assertIn("splash_cache_reused_disk_tokens_total 256", metrics)
+        self.assertIn("splash_cache_token_hit_ratio 0.25", metrics)
+        self.assertIn("# TYPE splash_cache_reuse_ends_total counter", metrics)
+        self.assertIn('splash_cache_reuse_ends_total{reason="prefix_end"} 5', metrics)
+        self.assertIn(
+            'splash_cache_reuse_ends_total{reason="disk_read_failed"} 1', metrics
+        )
         self.assertIn("splash_cache_lazy_junctions_total 2", metrics)
         self.assertIn("splash_cache_priority_suspensions_total 3", metrics)
         self.assertIn("splash_target_prefill_rows_total 10000", metrics)

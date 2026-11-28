@@ -22,6 +22,13 @@
 // Each command runs layers of their own routes and buffers over one set of weights larger than the system cache, so a
 // layer streams its experts from DRAM: kDecodeLayers per decode step, kPrefillLayers per prefill chunk. Printed are
 // medians of GPU ms per layer over `rounds` (20) commands.
+//   gguf-moe-benchmark <metallib> partitions [35b|flash-next|flint|HxIxExK] [rounds] [gate/up format] [down format]
+//                      [shared format]
+// - decode steps of 1, 2, 3, 4, 8 and 16 rows routed at random and pooled, on the 8-row expert tiles of one K
+//   partition, of two in the gate/up pass, in the down pass and in both (MoeConfig::gateUpPartitions,
+//   downPartitions), timed in the order 1/1, 2/1, 1/2, 2/2, 2/2, 1/2, 2/1, 1/1, with the threadgroups a core each
+//   pass launches on one partition (its column tiles times the tiles the step fills, over the cores), the share of
+//   tiles on the column tile and the plan's partitions: the numbers behind MoeCalibration's law.
 //   gguf-moe-benchmark <metallib> int8 [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
 // - prefill chunks of 64 to 2048 rows routed at random, on the staged expert passes and on the int8 passes
 //   (MoeConfig::int8Passes, MLX affine 4- and 5-bit formats, af4g64 throughout by default), with the routes per
@@ -91,7 +98,7 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
 enum class Routing { Random, Pooled };
 
 int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool int8, Fmt gateUpFormat, Fmt downFormat,
-           Fmt sharedFormat, bool tiles) {
+           Fmt sharedFormat, bool tiles, bool partitions) {
   const uint32_t H = shape.hiddenSize, I = shape.expertIntermediateSize, E = shape.experts,
                  topK = shape.expertsPerToken;
   std::mt19937 local(9);
@@ -144,7 +151,8 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
     Layers l;
     l.buffers.resize(plan.rows() <= (tiles ? 8 : 4) * kLaneRows ? kDecodeLayers : kPrefillLayers);
     for (MoeBuffers &b : l.buffers) {
-      b.input = bfloatBuffer(backend, input(plan.rows(), routing, laneRows), "input");
+      // The rows a narrow step's passes read in place (MoePlan::inputRows), past its own unrouted.
+      b.input = bfloatBuffer(backend, input(plan.inputRows(), routing, laneRows), "input");
       b.residual = zeros(backend, uint64_t{plan.rows()} * H * 2, "residual");
       b.output = zeros(backend, uint64_t{plan.rows()} * H * 2, "output");
       allocate(backend, b, plan);
@@ -179,6 +187,41 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
          backend.capabilities().gpuCoreCount, H, I, E, topK,
          shape.router == splash::ops::MoeRouter::Softmax ? "softmax" : "sigmoid", shape.sharedSlices,
          shape.sharedGate ? " gated" : "", fmtName(gateUpFormat), fmtName(downFormat), fmtName(sharedFormat), rounds);
+  if (partitions) {
+    const auto partitioned = [&](uint32_t rows, uint8_t gateUp, uint8_t down) {
+      splash::ops::MoeConfig config = plans.moe(shape, routerFormat, rows, splash::ops::StepKind::Decode).configuration();
+      config.gateUpPartitions = gateUp;
+      config.downPartitions = down;
+      return MoE::plan(shape, rows, config);
+    };
+    // The live tiles of a command's layers, on average.
+    const auto liveTiles = [&](const Layers &l) {
+      double sum = 0.0;
+      for (const MoeBuffers &b : l.buffers) sum += *static_cast<const uint32_t *>(b.scratch.tileCount.contents());
+      return sum / l.buffers.size();
+    };
+    static_cast<void>(time(layers(plans.moe(shape, routerFormat, 2048, splash::ops::StepKind::Prefill), Routing::Random)));
+    const uint32_t cores = backend.capabilities().gpuCoreCount;
+    printf("  rows | routing | tiles | threadgroups a core gate/up, down | column tiles | ms 1/1 | 2/1 | 1/2 | 2/2 | "
+           "2/1, 1/2, 2/2 over 1/1 | plan\n");
+    for (const uint32_t rows : {1u, 2u, 3u, 4u, 8u, 16u})
+      for (const Routing routing : {Routing::Random, Routing::Pooled}) {
+        const Layers one = layers(partitioned(rows, 1, 1), routing, 16), gateUp = layers(partitioned(rows, 2, 1), routing, 16),
+                     down = layers(partitioned(rows, 1, 2), routing, 16), both = layers(partitioned(rows, 2, 2), routing, 16);
+        double ms[4] = {time(one), time(gateUp), time(down), time(both)};
+        ms[3] = (ms[3] + time(both)) / 2;
+        ms[2] = (ms[2] + time(down)) / 2;
+        ms[1] = (ms[1] + time(gateUp)) / 2;
+        ms[0] = (ms[0] + time(one)) / 2;
+        const double live = liveTiles(one);
+        const splash::ops::MoeConfig plan = plans.moe(shape, routerFormat, rows, splash::ops::StepKind::Decode).configuration();
+        printf("  %4u | %s | %5.1f | %5.1f, %5.1f | %3.0f%% | %.4f | %.4f | %.4f | %.4f | %.3f, %.3f, %.3f | %u/%u\n", rows,
+               routing == Routing::Random ? "random" : "pooled", live, I / GGUF_STAGED_COLUMNS * live / cores,
+               H / GGUF_TILE_COLUMNS * live / cores, columnShare(one), ms[0], ms[1], ms[2], ms[3], ms[1] / ms[0],
+               ms[2] / ms[0], ms[3] / ms[0], unsigned(plan.gateUpPartitions), unsigned(plan.downPartitions));
+      }
+    return 0;
+  }
   if (tiles) {
     // The rows each expert a step's layers routed takes on average: its routes over its distinct experts.
     const auto rowsPerExpert = [&](const Layers &l, uint32_t rows) {
@@ -494,11 +537,12 @@ int main(int argc, const char *argv[]) {
         return 1;
       }
     }
-    // `tiles` or `int8` before the shape picks the expert tiles' or passes' comparison.
+    // `tiles`, `int8` or `partitions` before the shape picks the expert tiles', passes' or K partitions' comparison.
     std::vector<const char *> args(argv, argv + argc);
     const bool tiles = args.size() > 2 && std::string(args[2]) == "tiles";
     const bool int8 = args.size() > 2 && std::string(args[2]) == "int8";
-    if (tiles || int8) args.erase(args.begin() + 2);
+    const bool partitions = args.size() > 2 && std::string(args[2]) == "partitions";
+    if (tiles || int8 || partitions) args.erase(args.begin() + 2);
     const size_t count = args.size();
     const std::string shapeName = count > 2 ? args[2] : "35b";
     // The int8 passes take MLX affine 4- and 5-bit experts alone (quant_moe_int8_format): int8 runs af4g64
@@ -512,7 +556,7 @@ int main(int argc, const char *argv[]) {
     const bool sized = std::sscanf(shapeName.c_str(), "%ux%ux%ux%u", &custom[0], &custom[1], &custom[2], &custom[3]) == 4;
     if (count < 2 || count > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint" && !sized) ||
         gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles|int8] [35b|flash-next|flint|HxIxExK] [rounds] "
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles|int8|partitions] [35b|flash-next|flint|HxIxExK] [rounds] "
                    "[gate/up format] [down format] [shared format]\n";
       return 2;
     }
@@ -524,9 +568,19 @@ int main(int argc, const char *argv[]) {
       shape.sharedSlices = 2;
       shape.sharedGate = false;
     }
+    // A format's native blocks tile the K it multiplies, gate/up's H and down's I (the shared slices' both): the
+    // fixtures draw whole blocks, and a 1,152-wide down in Q5_K (256-element blocks) read past them.
+    const auto blocksTile = [](Fmt f, uint32_t K) { return K % kQuantFormats[f].block_elements == 0; };
+    if (!blocksTile(gateUp, H) || !blocksTile(down, I) || !blocksTile(shared, H) || !blocksTile(shared, I)) {
+      std::cerr << "gguf-moe-benchmark: " << fmtName(gateUp) << "/" << fmtName(down) << "/" << fmtName(shared)
+                << " do not tile " << H << "x" << I << ": gate/up's blocks divide H, down's I and the shared "
+                << "format's both (e.g. 2304x1152x128x8 q4k iq4nl q80)\n";
+      return 2;
+    }
     try {
       MetalBackend backend(args[1]);
-      return timing(backend, shape, count > 3 ? std::stoul(args[3]) : 20, int8, gateUp, down, shared, tiles);
+      return timing(backend, shape, count > 3 ? std::stoul(args[3]) : 20, int8, gateUp, down, shared, tiles,
+                    partitions);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
       return 1;

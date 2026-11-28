@@ -23,12 +23,17 @@
 #include "metal/BackendInstrumentation.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "model/Model.hpp"
 #include "model/ModelDescriptor.hpp"
+#include "model/StepCosts.hpp"
 #include "ops/AneFfn.hpp"
+#include "ops/BlockResidualMix.hpp"
 #include "ops/BlockIndexer.hpp"
+#include "ops/DenseLinear.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/KernelSelection.hpp"
 #include "ops/LaneRows.hpp"
+#include "ops/MessageGate.hpp"
 #include "ops/RelativeAttention.hpp"
 
 #include "metal/abi/Gguf.h"
@@ -65,10 +70,13 @@ constexpr std::pair<uint32_t, uint32_t> kDevices[] = {
     {9, 0},   {9, 1},   {9, 10},  {9, 11},  {9, 14},  {9, 16},  {9, 20},  {9, 40},
     {10, 10}, {10, 16}, {10, 20}, {10, 32}, {10, 40}, {11, 12}, {11, 20}};
 
+// Each streams 13.5 GB/s a core, the plain read the backend measures on the
+// 12-core M6 (161.9 GB/s), which the matrix tile's split law reads.
 DeviceCapabilities device(uint32_t family, uint32_t cores) {
   DeviceCapabilities result;
   result.appleGpuFamily = family;
   result.gpuCoreCount = cores;
+  result.memoryBytesPerSecond = uint64_t{13'500'000'000} * result.plannedGpuCores();
   return result;
 }
 
@@ -156,6 +164,8 @@ public:
                  Linear::plan(workload, plan.configuration(), plan.destination()), gateTwin ? &*gateTwin : nullptr);
     });
   }
+  // A kernel a plan names alone, as a dense projection's (ops::DenseLinear).
+  void kernel(const std::string &where, const std::string &name) { names_.try_emplace(name, where); }
   // An attention plan's split and reduce kernels; the reduce also writes the
   // out-projection's register-tile table wherever that plan reads one.
   void attention(const std::string &where, const AttentionPlan &plan) {
@@ -182,7 +192,7 @@ public:
       const std::array<uint32_t, 1> committed{0};
       RelativeAttention::addProjection(graph, {b, b, b}, {b, b, b}, {b, b, b}, SplashKvLayer{}, tables, sequences,
                                        {b, kv::kPageTokens}, layout, variant);
-      RelativeAttention::addPathCommit(graph, layout, 1, tables, committed, SPLASH_TARGET_VERIFY_ROWS, b);
+      RelativeAttention::addPathCommit(graph, layout, layout.pageSlots(), 1, tables, committed, SPLASH_TARGET_VERIFY_ROWS, b);
     });
   }
   // A layer's q/k norms and RoPE (PagedAttention::addProjection) for norms
@@ -499,6 +509,42 @@ void floatTiles(Golden &golden, const std::string &name, const Linear &linear) {
   }
 }
 
+// ---- Dense projections -------------------------------------------------------
+
+// The kernel of each projection of Inkling 2's vision tower (ops::DenseLinear),
+// of bf16 weights and of Q8_0 ones, at its encoder's rows: an image's tokens
+// or merged tokens, from a 2x2 grid to the most patches.
+void denseProjections(Golden &golden, const std::string &name, const DeviceCapabilities &d, Pipelines *library) {
+  struct Shape final {
+    uint32_t outputs, inputs;
+    DenseEpilogue epilogue;
+    const char *name;
+  };
+  constexpr Shape kShapes[] = {{1024, 1280, DenseEpilogue::Residual, "patch"},
+                               {3072, 1024, DenseEpilogue::None, "qkv"},
+                               {1024, 1024, DenseEpilogue::ScaledResidual, "out"},
+                               {4096, 1024, DenseEpilogue::GeluErf, "up"},
+                               {1024, 4096, DenseEpilogue::ScaledResidual, "down"},
+                               {4096, 4096, DenseEpilogue::GeluErf, "merger-up"},
+                               {2304, 4096, DenseEpilogue::None, "merger-down"},
+                               {1024, 1024, DenseEpilogue::GeluTanh, "gelu-tanh"}};
+  const DenseLinear dense(d);
+  for (const uint32_t format : {QuantizedSegment::kFloat32, GGUF_FMT_Q80}) {
+    const std::string group = format == GGUF_FMT_Q80 ? "q80" : "bf16";
+    Group &lines = golden.group(name, "dense-projection", group);
+    for (const Shape &shape : kShapes)
+      for (const uint32_t rows : {1U, 5U, 17U, 64U, 65U, 101U, 257U, 1025U, 4097U, 16385U}) {
+        const std::string kernel = dense.kernel(rows, shape.outputs, shape.inputs, shape.epilogue, format);
+        const std::string line = std::string(shape.name) + " " + std::to_string(rows) + ": " + kernel;
+        lines.add(line);
+        if (library) library->kernel(name + " dense " + group + " " + line, kernel);
+        // A quantized projection's rows past its whole 32 (ops::DenseLinear).
+        if (library && format != QuantizedSegment::kFloat32)
+          library->kernel(name + " dense " + group + " " + line + " bounded", kernel + "_bounded");
+      }
+  }
+}
+
 // ---- MoE ------------------------------------------------------------------
 
 // The formats of a target's MoE blocks, whose plans follow the routers'
@@ -594,7 +640,8 @@ std::string describe(const MoePlan &plan) {
   const MoeConfig c = plan.configuration();
   std::ostringstream line;
   line << "tile " << unsigned(c.expertTile) << " router " << unsigned(c.ggufRouterTile) << " int8 " << c.int8Passes
-       << " tiles "
+       << " partitions " << unsigned(c.gateUpPartitions) << "/" << unsigned(c.downPartitions) << " narrow "
+       << plan.narrow() << " tiles "
        << plan.maximumTiles() << " workspace";
   for (const auto field : kMoeWorkspaceFields) line << " " << plan.workspace().*field;
   return line.str();
@@ -1218,9 +1265,14 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
 // (ExecutionPlans::decodeRowClasses, model::StepCosts): so a step of any rows,
 // up to a verify block a lane, selects what a step of its class's last rows
 // does, of every kernel a step's rows pick: its projections' tile and staged
-// height in each set of formats the plans tell apart, its float tiles, and a
-// MoE target's plan (MoeConfig). Adds each class that holds a change
-// to `misses`.
+// height in each set of formats the plans tell apart, its float tiles, a
+// MoE target's plan (MoeConfig) and whether it is narrow (MoePlan::narrow),
+// and a target's message gates' group of rows (MessageGate::groupRows),
+// block residual mixes' launch (BlockResidualMix::rowKernels) and relative
+// attention's tile (RelativeAttention::decodeTileRows), each width's classes;
+// and a MoE target's classes, its tables the most points, fit the startup
+// runway its start measures them on. Adds each class that holds a change,
+// and each start whose runway does not hold them, to `misses`.
 void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
   constexpr uint32_t most = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
   const auto check = [&](const std::string &what, std::span<const uint32_t> classes, const auto &select) {
@@ -1238,7 +1290,8 @@ void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std
   const Linear &linear = plans.decodeLinear();
   const auto tile = [](const LinearPlan &plan) {
     const LinearTile t = plan.configuration().tile;
-    return uint32_t(t) << 8 | (t == LinearTile::GgufStaged || t == LinearTile::GgufRegister ? plan.storageRows() : 0);
+    const bool named = t == LinearTile::GgufStaged || t == LinearTile::GgufRegister || t == LinearTile::GgufMatrix;
+    return uint32_t(t) << 8 | (named ? plan.storageRows() : 0);
   };
   std::vector<UnitFormats> units;
   for (const FormatSet &set : formatSets()) {
@@ -1260,6 +1313,28 @@ void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std
     for (const uint32_t columns : kFloatColumns)
       check("float tile " + formatName(format) + " columns " + std::to_string(columns), dense,
             [&](uint32_t rows) { return linear.ggufFloatTile(rows, columns, format); });
+  const auto gateGroup = [](uint32_t rows) { return MessageGate::groupRows(rows); };
+  const auto mixLaunch = [](uint32_t rows) { return BlockResidualMix::rowKernels(rows); };
+  const std::vector<uint32_t> looped = plans.decodeRowClasses(most, std::nullopt, {true, true});
+  check("message gates", looped, gateGroup);
+  check("block residual mixes", looped, mixLaunch);
+  // Relative attention's tile at each lane cap a step of `lanes` lanes runs
+  // at its rows: the wide cap at any rows, the narrow cap up to a draft's
+  // block a lane (verifyLaneCap), where the start prepares the class's last
+  // rows or a draft's block a lane, the fewer (model::Runtime's
+  // preparedSteps).
+  const auto attentionTile = [](uint32_t lanes, uint32_t cap) {
+    return [=](uint32_t rows) {
+      return RelativeAttention::decodeTileRows(StepRows{lanes, std::min(rows, lanes * cap), cap});
+    };
+  };
+  const auto attentionTilesHold = [&](const std::string &at, std::span<const uint32_t> classes, uint32_t lanes) {
+    for (const uint32_t cap : {kNarrowLaneRows, uint32_t{SPLASH_TARGET_VERIFY_ROWS}})
+      check("relative attention tile" + at + " cap " + std::to_string(cap), classes, attentionTile(lanes, cap));
+  };
+  for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+    attentionTilesHold(" B" + std::to_string(lanes),
+                       plans.decodeRowClasses(most, std::nullopt, {.relativeAttention = true}, lanes), lanes);
   model::forEachFamily([&](const auto &family) {
     if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
     const std::string f(family.family);
@@ -1267,9 +1342,34 @@ void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std
       MoeShape shape = family.moeBlockShape();
       const auto [routerFormat, int8Experts] = routerFormatOf(shape, moeBlocks(shape, set));
       shape.int8Experts = int8Experts;
-      const std::vector<uint32_t> classes = plans.decodeRowClasses(most, std::pair{shape, routerFormat});
-      check("moe plan " + f + " " + set.name, classes,
-            [&](uint32_t rows) { return plans.moe(shape, routerFormat, rows, StepKind::Decode).configuration(); });
+      // Each width's classes (a kernel may pick by a step's rows and lanes).
+      std::array<std::vector<uint32_t>, SPLASH_MAXIMUM_BATCH_WIDTH> widths;
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
+        const bool attends = !family.relativeAttention().empty();
+        const std::vector<uint32_t> &classes = widths[lanes - 1] = plans.decodeRowClasses(
+            most, std::pair{shape, routerFormat}, {family.messageGates(), family.blockResidualMixes(), attends}, lanes);
+        const std::string at = " " + f + " " + set.name + " B" + std::to_string(lanes);
+        check("moe plan" + at, classes, [&](uint32_t rows) {
+          const MoePlan plan = plans.moe(shape, routerFormat, rows, StepKind::Decode);
+          return std::pair{plan.configuration(), plan.narrow()};
+        });
+        if (family.messageGates()) check("message gates" + at, classes, gateGroup);
+        if (family.blockResidualMixes()) check("block residual mixes" + at, classes, mixLaunch);
+        if (attends) attentionTilesHold(at, classes, lanes);
+      }
+      // A start of any lanes measures its lane counts' steps of these
+      // classes on the least startup runway its extents give it, from page 5
+      // (model::Runtime's measureDecodeSteps), which refuses a table that
+      // runs past it (StepCosts::requireRunway).
+      const model::StepCosts costs(widths, most, true);
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
+        try {
+          costs.requireRunway(5, model::ExecutionLimits::runwayPages(1, lanes, 1), lanes);
+        } catch (const std::logic_error &) {
+          misses.push_back(name + " " + f + " " + set.name + ": a start of " + std::to_string(lanes) +
+                           " lanes measures more steps than its startup runway holds");
+        }
+      }
     }
   });
 }
@@ -1338,6 +1438,7 @@ Golden selections(bool dump, Pipelines *library) {
     const ExecutionPlans plans(device(family, cores), Int8Activations::On);
     projections(golden, name, plans, library);
     floatTiles(golden, name, plans.linear());
+    denseProjections(golden, name, device(family, cores), library);
     moePlans(golden, name, plans);
     attentionPlans(golden, name, plans, library);
     relativeAttentionPlans(golden, name, plans, library);

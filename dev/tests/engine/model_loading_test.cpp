@@ -763,6 +763,16 @@ void testSyntheticModel(MetalBackend &backend,
         require(weightManifestFingerprint(records) !=
                     model.manifestFingerprintSha256,
                 "manifest fingerprint ignores the sources' identity");
+        records.front().contentIdentity = "sources";
+        // Every image, the target's, the draft's and the tower's, names the
+        // formats its tensors load in, and another format is another manifest.
+        require(std::all_of(records.begin(), records.end(),
+                            [](const WeightFileRecord &record) { return !record.formats.empty(); }),
+                "an image does not record the formats it loads in");
+        records.front().formats += "x";
+        require(weightManifestFingerprint(records) !=
+                    model.manifestFingerprintSha256,
+                "manifest fingerprint ignores the images' formats");
 
         require(model.draft.layers[0].attentionDynamic.outputSize ==
                         draft.dynamicSize &&
@@ -836,9 +846,10 @@ ModelDescriptor writeBlockModel(const std::filesystem::path &root, const Layout 
 // its tensors, GDN alpha and beta of two formats as F32, bf16 norms and
 // grouped GDN value heads, and streamableWeights plans the bytes it loads. A
 // raw checkpoint, whose convolution mlx-lm has not sanitized, is refused; a
-// head mlx-lm left unquantized, BF16 or F16, loads as the Q8_0 rows the
-// reference GGUF quantization of Q8_0 makes of its values, and a bf16 token
-// table as its bf16 rows.
+// head mlx-lm left unquantized, BF16 or F16, loads under --weights auto, the
+// default, as the Q8_0 rows the reference GGUF quantization of Q8_0 makes of
+// its values, and under original as its values as stored, in its own format;
+// a bf16 token table as its bf16 rows.
 void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path &root) {
     const Qwen3_8Layout target = syntheticTarget();
     // Bits and group size by module, every MLX affine bit width and group size among them.
@@ -924,10 +935,12 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
             }
         splash::test::writeSyntheticShard(root / "target" / "model.safetensors", tensors);
     };
-    // A head of random values, BF16 then F16, loads as Q8_0: its planned rows are those
-    // gguf_reference::quantizeQ8_0 writes from the values.
+    // A head of random values, BF16 then F16, loads under auto as Q8_0, its planned rows those
+    // gguf_reference::quantizeQ8_0 writes from the values, and under original in its own format, its planned
+    // rows its values as stored.
     std::mt19937 rng(11);
     std::normal_distribution<float> weight(0.0f, 0.02f);
+    using splash::model::gguf::Float16Weights;
     for (const bool float16 : {false, true}) {
         std::vector<uint16_t> bits(uint64_t{target.vocabularySize} * target.hiddenSize);
         std::vector<float> values(bits.size());
@@ -936,19 +949,28 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
             values[i] = float16 ? gguf_reference::h2f(bits[i]) : gguf_reference::bf2f(bits[i]);
         }
         unquantized("language_model.lm_head", float16 ? "F16" : "BF16", bits);
-        const std::string name = std::string("a ") + (float16 ? "F16" : "BF16") + " head";
-        require(segmentFormats(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).logitsProjection) ==
-                    std::vector<uint32_t>{GGUF_FMT_Q80},
-                name + " did not load as Q8_0");
-        const splash::model::SafetensorsCheckpoint checkpoint(root / "target");
-        const std::vector<splash::model::gguf::Image> images = splash::model::safetensors::planImages(
-            checkpoint, target, splash::model::safetensors::normStorage(checkpoint, target));
-        const splash::model::gguf::Repack &head = images[target.layers].repacks.front();
-        std::vector<uint8_t> rows(uint64_t{target.vocabularySize} *
-                                  splash::model::ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], target.hiddenSize));
-        splash::model::readRepackRows(head, 0, target.vocabularySize, rows.data());
-        require(head.format == GGUF_FMT_Q80 && rows == gguf_reference::quantizeQ8_0(values),
-                name + "'s Q8_0 rows are not the reference quantization of its values");
+        for (const Float16Weights weights : {Float16Weights::Q8_0, Float16Weights::Published}) {
+            const bool q8 = weights == Float16Weights::Q8_0;
+            const std::string name = std::string("a ") + (float16 ? "F16" : "BF16") + " head" +
+                                     (q8 ? " under q8" : " as published");
+            const uint32_t format = q8 ? GGUF_FMT_Q80 : float16 ? GGUF_FMT_F16 : GGUF_FMT_BF16;
+            require(segmentFormats(std::get<Qwen3_8Weights>(
+                                       loadModel(backend, root, descriptor, {.weights = weights}).target)
+                                       .logitsProjection) == std::vector<uint32_t>{format},
+                    name + " did not load in " + kQuantFormats[format].name);
+            const splash::model::SafetensorsCheckpoint checkpoint(root / "target");
+            const std::vector<splash::model::gguf::Image> images = splash::model::safetensors::planImages(
+                checkpoint, target, splash::model::safetensors::normStorage(checkpoint, target), {.weights = weights});
+            const splash::model::gguf::Repack &head = images[target.layers].repacks.front();
+            std::vector<uint8_t> rows(uint64_t{target.vocabularySize} *
+                                      splash::model::ggufRowBytes(kQuantFormats[format], target.hiddenSize));
+            splash::model::readRepackRows(head, 0, target.vocabularySize, rows.data());
+            const std::vector<uint8_t> stored(reinterpret_cast<const uint8_t *>(bits.data()),
+                                              reinterpret_cast<const uint8_t *>(bits.data() + bits.size()));
+            require(head.format == format && rows == (q8 ? gguf_reference::quantizeQ8_0(values) : stored),
+                    name + "'s planned rows are not " +
+                        (q8 ? "the reference Q8_0 of its values" : "its values as stored"));
+        }
     }
     // A module the checkpoint lacks altogether is missing, not unquantized.
     std::vector<splash::test::SyntheticTensor> lacking;

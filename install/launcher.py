@@ -39,6 +39,10 @@ RUNTIME_DIR = paths.RUNTIME
 # meanwhile waits for its handler instead of being lost or ending the
 # program in a traceback. make and the device check run with them unblocked.
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+# Seconds a held program has to end after the launcher passes it a stop, as
+# an installer removing its scratch folder does (within 0.1 s here), before
+# it is killed.
+HELD_STOP_SECONDS = 2
 
 
 class LauncherError(RuntimeError):
@@ -76,22 +80,12 @@ class _Parser(argparse.ArgumentParser):
             raise ArgumentRefusal(message) from None
 
 
-class StopSignal(KeyboardInterrupt):
-    """One of STOP_SIGNALS, raised where it arrives, as Ctrl+C is."""
-
-    def __init__(self, number):
-        super().__init__(number)
-        self.number = number
-
-
-def _interrupt(number, _frame):
-    raise StopSignal(number)
-
-
 def _run_held(command, *, relay=None, **options):
     """Run a program that unblocks the stop signals itself, holding them from
-    its spawn. One the launcher takes meanwhile ends the program too. With
-    `relay`, each line of its output goes there as it comes."""
+    its spawn. One the launcher takes meanwhile is passed to the program as
+    SIGTERM, which has HELD_STOP_SECONDS to end, removing what it made, then
+    is killed. With `relay`, each line of its output goes there as it
+    comes."""
     signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     if relay is not None:
         options |= {"stdout": subprocess.PIPE, "text": True, "errors": "replace"}
@@ -103,7 +97,14 @@ def _run_held(command, *, relay=None, **options):
                     relay(line)
                 return program.wait()
             except BaseException:
-                program.kill()
+                program.terminate()
+                try:
+                    program.wait(HELD_STOP_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+                finally:
+                    # Nothing for a program that has ended.
+                    program.kill()
                 raise
     finally:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
@@ -192,6 +193,7 @@ def _ensure_installed(selection):
     for flag, value in (
         ("--revision", selection.revision),
         ("--draft-model", selection.draft_model),
+        ("--draft-revision", selection.draft_revision),
     ):
         if value is not None:
             command[-1:-1] = [flag, value]
@@ -385,6 +387,7 @@ def _prepare_start(args):
         revision=args.revision,
         language_only=args.language_only,
         draft_model=args.draft_model,
+        draft_revision=args.draft_revision,
     )
     _ensure_installed(selection)
     return selection.link
@@ -452,9 +455,9 @@ def _record_refusal(port, failure):
 
 def serve(args):
     # Started in the background from a non-interactive shell, the launcher
-    # inherits SIGINT as ignored; take both stop signals from the start.
-    for number in STOP_SIGNALS:
-        signal.signal(number, _interrupt)
+    # inherits SIGINT as ignored; take both stop signals from the start, as
+    # the installer takes them.
+    model_artifacts.take_stop_signals()
     if args.offline:
         # The installer and the server both read it.
         os.environ["HF_HUB_OFFLINE"] = "1"
@@ -730,6 +733,11 @@ def parse_args(argv=None):
         "automatically selected one (a local directory with --model-dir)",
     )
     model.add_argument(
+        "--draft-revision",
+        metavar="REVISION",
+        help="draft repository branch, tag or commit (default: its default branch)",
+    )
+    model.add_argument(
         "--language-only",
         action="store_true",
         help="skip vision preparation and loading; image and PDF input is refused",
@@ -772,14 +780,22 @@ def parse_args(argv=None):
             parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve":
         if args.model_dir is not None:
-            if args.revision is not None:
-                parser.error("--revision cannot be used with --model-dir")
+            for flag, value in (
+                ("--revision", args.revision),
+                ("--draft-revision", args.draft_revision),
+            ):
+                if value is not None:
+                    parser.error(f"{flag} cannot be used with --model-dir")
             if args.draft_model is not None and not Path(args.draft_model).is_dir():
                 parser.error(
                     "--draft-model must be a local DFlash2 draft directory with --model-dir"
                 )
         elif args.mmproj is not None:
             parser.error("--mmproj requires --model-dir")
+        elif args.draft_revision is not None and model_artifacts.local_draft(
+            args.draft_model
+        ):
+            parser.error(model_artifacts.DRAFT_REVISION_OF_A_DIRECTORY)
         if args.mmproj is not None and args.language_only:
             parser.error("--mmproj cannot be used with --language-only")
         serve_options.check_serve_arguments(parser, args)
@@ -837,7 +853,7 @@ def main(argv=None):
     except (clients.ClientError, OSError, serve_record.NotRecorded) as error:
         diagnostics.print_line(f"error: {error}", error=True)
         return 1
-    except StopSignal as stop:
+    except model_artifacts.Stopped as stop:
         # The status a shell gives a program the signal ends: 130 for
         # SIGINT, 143 for SIGTERM.
         return 128 + stop.number

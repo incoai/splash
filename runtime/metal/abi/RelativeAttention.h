@@ -34,7 +34,15 @@
 #define SPLASH_RELATIVE_ATTENTION_DECODE_SPLITS 32u
 
 // A prompt chunk's dispatch whose tiles each read their history in one split
-// (ops::RelativeAttention::addAttention) runs them as tiles of
-// SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS rows, two of the paged attention's,
-// each of which writes its output rows itself (the direct kernels).
-#define SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS 16u
+// (ops::RelativeAttention::addAttention) runs them as tiles each of which
+// writes its output rows itself (the direct kernels), of the rows the GPU
+// family takes (ops::AttentionCalibration::directRows): the most whole rows
+// whose fused rows (3 a row) fit the 64 a tile's softmax holds,
+// SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS, multiplied as 64, or two of the
+// paged attention's tiles, SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS_R16 (the
+// kernels named _r16), the same bits. A page's loop costs a threadgroup much
+// that does not grow with its rows: at 8 KV heads of 128 a page took 2.17 ms
+// a query head over 24 fused rows, 1.91 over 48 and 1.39 over 64 (2,048-row
+// chunks after 32K, 20-core M5 Pro).
+#define SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS 21u
+#define SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS_R16 16u

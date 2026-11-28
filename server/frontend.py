@@ -19,6 +19,7 @@ from .chat_format import REASONING_EFFORTS
 from .chat_messages import normalize_messages, template_messages
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
+    NO_REASONING,
     RESERVED_TEMPLATE_KWARGS,
     render_chat_template,
     template_options,
@@ -34,7 +35,7 @@ from .errors import (
 )
 from .latency import LatencyMetrics
 from .metrics import is_finite_number
-from .output import MAX_STOP_CHARACTERS
+from .output import MAX_STOP_CHARACTERS, KeywordCounts, RejectedCalls
 from .tokenization import PromptTokenizer, tokenizable, unquoted
 from .tool_schema import (
     ToolPolicy,
@@ -46,12 +47,11 @@ from .tool_schema import (
 
 PREPARATION_WAIT_SECONDS = 30.0
 
-# vLLM raises a nonzero temperature below this to it (_MAX_TEMP in
-# vllm/sampling_params.py); Splash does the same.
+# A nonzero temperature below this samples at it.
 MIN_SAMPLING_TEMPERATURE = 0.01
 
 # Text completions' output budget when max_tokens is omitted: OpenAI's
-# default for the endpoint, which vLLM and SGLang also use.
+# default for the endpoint.
 COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 
@@ -252,6 +252,10 @@ class Frontend:
         # The Responses API's stored responses, which /status reports.
         self.response_store = response_store
         self.thinking_codec = thinking_codec
+        # The calls the model wrote that the server did not return as calls.
+        self.rejected_calls = RejectedCalls()
+        # The schema keywords best-effort answers were generated without.
+        self.unenforced_keywords = KeywordCounts()
 
     def accepts_model(self, model):
         """Whether a request may name `model`: a name the server answers to,
@@ -296,7 +300,7 @@ class Frontend:
         (ChatFormat.reasoning_switch) or replaced by the server's, so that a
         client offers none."""
         if not self.chat_format.reasoning_switch or self.reasoning_effort is not None:
-            return {"thinks": None, "efforts": [], "default": None}
+            return dict(NO_REASONING)
         template = self.chat_templates.select(None)
         reasoning = dict(template.reasoning)
         if (effort := self.default_reasoning_effort) is not None:
@@ -321,6 +325,10 @@ class Frontend:
             }
         status["grammar_cache"] = self.constraint_factory.stats()
         status["response_store"] = self.response_store.stats()
+        status["tool_calls"] = {"rejected": self.rejected_calls.stats()}
+        status["structured_output"] = {
+            "keywords_not_enforced": self.unenforced_keywords.stats()
+        }
         status["image_cache"] = self.images.stats()
         status["tokenizer_cache"] = self.prompt_tokenizer.stats()
         status["latency"] = self.latencies.snapshot()
@@ -652,6 +660,18 @@ class Frontend:
             raise APIError(
                 400, "chat_template_kwargs enable_thinking must be a boolean"
             )
+        # A top-level enable_thinking is the template variable's switch sent
+        # outside it: one value, sent either way.
+        top_level = body.get("enable_thinking")
+        if top_level is not None:
+            if not isinstance(top_level, bool):
+                raise APIError(400, "enable_thinking must be a boolean")
+            if enable_thinking not in (None, top_level):
+                raise APIError(
+                    400,
+                    "enable_thinking and chat_template_kwargs enable_thinking differ",
+                )
+            enable_thinking = top_level
         if self.reasoning_effort is not None:
             # The server's effort is every request's, as though each had sent
             # it and nothing else of reasoning: it replaces the request's
@@ -826,8 +846,11 @@ class Frontend:
             or isinstance(n, bool)
             or n != 1
             or (logprobs is not None and (not isinstance(logprobs, bool) or logprobs))
+            or body.get("top_logprobs") is not None
         ):
-            raise APIError(400, "n and logprobs are not currently supported")
+            raise APIError(
+                400, "n, logprobs and top_logprobs are not currently supported"
+            )
         prompt = self._prepare_prompt(
             body, tool_namespaces, deadline=deadline, without_slot=without_slot
         )

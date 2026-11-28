@@ -115,8 +115,8 @@ cached prefixes, and writes whenever memory runs short: serving
 Ternary-Bonsai-2-27B PQ2_0 to six clients' mixed traffic for 30 minutes, a
 16 GiB SSD cache on the M6 wrote 26 GB, about 50 GB an hour, and read 36 GB.
 `--max-cache-disk-writes` sets a write budget to spare the drive, such as
-`25G` a day on a 256 GB Mac: once it is spent, states other than the ones
-conversations resume from are dropped instead of written.
+`25G` a day on a 256 GB Mac: once it is spent, the cache writes nothing and
+keeps to memory until the budget refills.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and

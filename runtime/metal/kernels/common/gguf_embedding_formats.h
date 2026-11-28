@@ -402,7 +402,9 @@ GGUF_EMBED_AFFINE(8)
   X(af5g32, GgufEmbedAF5G32) X(af5g64, GgufEmbedAF5G64) X(af5g128, GgufEmbedAF5G128)                               \
   X(af6g32, GgufEmbedAF6G32) X(af6g64, GgufEmbedAF6G64) X(af6g128, GgufEmbedAF6G128)                               \
   X(af8g32, GgufEmbedAF8G32) X(af8g64, GgufEmbedAF8G64) X(af8g128, GgufEmbedAF8G128)
-#define GGUF_EMBEDDING_FORMATS(X) GGUF_QUANTIZED_EMBEDDING_FORMATS(X) X(bf16, GgufEmbedBF16) X(f16, GgufEmbedF16)
+#define GGUF_EMBEDDING_FORMATS(X)                                                                                  \
+  GGUF_QUANTIZED_EMBEDDING_FORMATS(X) X(bf16, GgufEmbedBF16) X(f16, GgufEmbedF16) X(bf1664, GgufEmbedBF16)         \
+  X(f1664, GgufEmbedF16)
 #define GGUF_EMBEDDING_ONE(f, F) +1
 static_assert(0 GGUF_EMBEDDING_FORMATS(GGUF_EMBEDDING_ONE) == GGUF_FMT_COUNT, "GGUF_EMBEDDING_FORMATS lists every format");
 #undef GGUF_EMBEDDING_ONE

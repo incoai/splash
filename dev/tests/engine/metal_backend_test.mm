@@ -3299,6 +3299,22 @@ void run(const std::string &metallibPath) {
                 probed.macosVersion() == capabilities.macosVersion() &&
                 !probed.validationMessage(),
             "the device check read the device differently from the backend");
+    // The memory rate is the device class's constant (DeviceCapabilities::classMemoryBytesPerSecond), which the
+    // backend and the device check read alike: no start measures it.
+    require(capabilities.memoryBytesPerSecond ==
+                    splash::DeviceCapabilities::classMemoryBytesPerSecond(capabilities.gpuClass(),
+                                                                          capabilities.gpuCoreCount) &&
+                probed.memoryBytesPerSecond == capabilities.memoryBytesPerSecond,
+            "the device's memory rate is not its class's");
+    static_assert(splash::DeviceCapabilities::classMemoryBytesPerSecond(splash::GpuClass::Apple10, 20) ==
+                          290'677'085'356ULL &&
+                      splash::DeviceCapabilities::classMemoryBytesPerSecond(splash::GpuClass::Apple10, 16) ==
+                          290'677'085'356ULL &&
+                      splash::DeviceCapabilities::classMemoryBytesPerSecond(splash::GpuClass::Apple9, 10) ==
+                          109'553'136'383ULL &&
+                      splash::DeviceCapabilities::classMemoryBytesPerSecond(splash::GpuClass::Apple10, 24) == 0 &&
+                      splash::DeviceCapabilities::classMemoryBytesPerSecond(splash::GpuClass::Apple11, 0) == 0,
+                  "a listed class has its rate and any other class none");
     require(backend.healthy(), "new backend is unhealthy");
     require(BackendInstrumentation::submittedCommands(backend) == 0,
             "new backend has submissions");

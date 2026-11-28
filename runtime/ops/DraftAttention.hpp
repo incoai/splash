@@ -29,22 +29,25 @@ struct DraftAttentionWorkspace final {
   uint64_t queryValuesBytes = 0;
 };
 
-// Constructed only by DraftAttention::plan so the shape, physical rows and
-// workspace cannot disagree. The grouped-queries tensor also carries the
-// split partials of the attention core behind the query rows, so the core
-// needs no device scratch beyond these tensors.
+// Constructed only by DraftAttention::plan so the shape, physical rows, split
+// count and workspace cannot disagree. The grouped-queries tensor also
+// carries the split partials of the attention core behind the query rows, so
+// the core needs no device scratch beyond these tensors.
 class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
+  // The attention core's history splits of each (lane, KV head).
+  [[nodiscard]] uint32_t splits() const noexcept { return splits_; }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
-  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes)
-      : shape_(shape), lanes_(lanes) {}
+  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes, uint32_t splits)
+      : shape_(shape), lanes_(lanes), splits_(splits) {}
 
   DraftAttentionShape shape_;
   uint32_t lanes_;
+  uint32_t splits_;
 
   friend class DraftAttention;
 };
@@ -83,8 +86,9 @@ struct DraftDecodeAttentionBuffers final {
 
 class DraftAttention final {
 public:
-  [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
-                                               uint32_t lanes);
+  // `lanes` lanes' plan whose attention core splits each (lane, KV head)'s
+  // history `splits` ways (1 to SPLASH_DRAFT_ATTENTION_MOST_SPLITS).
+  [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape, uint32_t lanes, uint32_t splits);
 
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,

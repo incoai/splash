@@ -177,20 +177,27 @@ static_assert(sizeof(ThinkingCutoffParams) == 16 + (16 + 4 * SPLASH_TARGET_VERIF
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
-// are zero and unread. The draft's logits rows hold `columns` tokens of the
-// vocabulary's (ops::DraftVocabulary): column c is token c below `leading`
-// and token c - leading + trailing from there; the codebooks hold a row of
-// each of the `vocabulary` tokens.
+// are zero and unread. The draft's logits rows, `stride` floats apart (the
+// head's outputs, whole tiles of a padded head's rows), hold `columns`
+// tokens of the vocabulary's (ops::DraftVocabulary) first: column c is token
+// c below `leading` and token c - leading + trailing from there. A row's
+// columns past them are a padded head's rows of no token, which the selector
+// never reads. The codebooks hold a row of each of the `vocabulary` tokens.
+// Each proposal row's top-16 takes `shards` shards of its columns, a power of
+// two from 2 to SPLASH_DRAFT_SAMPLING_MOST_SHARDS; their partials fill the
+// first of the partial values, and the edge tables follow the most shards'.
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   uint32_t vocabulary;
   uint32_t columns;
+  uint32_t stride;
   uint32_t leading;
   uint32_t trailing;
+  uint32_t shards;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 20 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(SelectorBatchParams) == 28 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Draft selector parameters are the same size on both sides");
 
 // The most tokens a host chain proposes: a verify block's rows after its
@@ -232,8 +239,14 @@ static_assert(sizeof(SelectorBatchParams) == 20 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH
 // next, one row for each token path (a step to a token its parent already
 // has a child of joins that child), until it holds the lane's rows, or
 // depth[l] + 1 rows, as many as the tokens a walk of it may retain, or none
-// no deeper than depth[l] is left. A greedy lane's row (temperature[l] 0)
-// takes its most
+// no deeper than depth[l] is left. A row of one of the target's stop tokens
+// (stop_tokens, as ops::StopTokens pads them) grows no children, as
+// acceptance retains no token past a stop (AcceptBatchParams), and a greedy
+// lane takes no row of one: its parent's argmax selects the stop with or
+// without the row, so the row adds no token, while its estimate still
+// counts against its later siblings' caps. A sampled lane keeps the row, as
+// its parent's rejection sampling tests every child it drew. A greedy lane's
+// row (temperature[l] 0) takes its most
 // likely candidates; a sampled lane's draws them without replacement from
 // q_T, the candidates' probabilities at the lane's temperature T, its
 // Gumbel-top-k: the largest log q_T + G, G a Gumbel of the row's key and the
@@ -249,13 +262,15 @@ struct DraftTreeParams {
   uint32_t children[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   float softcap;
+  uint32_t stop_tokens[SPLASH_STOP_TOKENS];
   float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
   float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
 };
 
-static_assert(sizeof(DraftTreeParams) == 8 + (32 + 4 * SPLASH_DRAFT_PROPOSAL_TOKENS) * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(DraftTreeParams) ==
+                  8 + 4 * SPLASH_STOP_TOKENS + (32 + 4 * SPLASH_DRAFT_PROPOSAL_TOKENS) * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Draft tree parameters are the same size on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): the `rows` rows of its
@@ -300,6 +315,11 @@ struct VerifyRowsParams {
   uint32_t lane_cap;
   float floor;
 };
+
+// The threads that lay a cycle's rows out (draft_verify_rows): a thread for
+// each of the most lanes' verify block rows, so that every candidate row and
+// every row of a step has one.
+#define SPLASH_VERIFY_ROWS_THREADS (SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS)
 
 static_assert(sizeof(VerifyRowsParams) == 16, "Verify rows parameters are 16 bytes on both sides");
 

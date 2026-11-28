@@ -8,8 +8,10 @@
 // tensors hold: MLX affine (metal/abi/QuantFormat.h), mxfp4, mxfp8 or nvfp4
 // as MLX infers it, or NVFP4 or FP8 as the other two store them: projections
 // and experts as planes, a quantized token table as native rows. A projection
-// or expert of BF16 or F16 weights takes Q8_0's planes, quantized from its
-// values as the reference GGUF quantization of Q8_0 rounds them; an unquantized
+// or expert of BF16 or F16 weights takes the planes gguf::float16Planes gives
+// it: Q8_0's, quantized from its values as the reference GGUF quantization of
+// Q8_0 rounds them, or with --weights original its own format's, its values
+// as stored (experts exactly MXFP8's take MXFP8's, lossless); an unquantized
 // token table is copied as its bf16 rows. Norms are bf16 as stored, or the
 // F32 1 + w of a w stored 1 below, or widened (float32Norms); the convolution and
 // dt_bias are copied as stored, and the GDN decay is
@@ -128,7 +130,7 @@ using SectionSources = std::function<std::vector<SectionSource>(const gguf::Sect
 // the sources `sources` names, its values in the kind of section's form:
 // Norm and Values the F32 values of F32 or BF16 tensors (gathered, or a
 // transposed one's); Quantized the planes of a quantized or BF16 module's
-// rows (projection rows, Q8_0 for BF16); FloatTensor a tensor's or an
+// rows (projection rows, gguf::float16Planes's for BF16); FloatTensor a tensor's or an
 // unquantized module's F32 or BF16 rows as stored (a widened source's as F32),
 // a quantized module's F32 values or a transposed tensor's; SmallProjection a
 // float module's rows as stored or a quantized one's planes padded to whole

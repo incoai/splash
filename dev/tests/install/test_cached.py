@@ -89,6 +89,54 @@ class CachedTest(unittest.TestCase):
         self.assertNotIn(MODEL, [call.args[0].model for call in prepare.call_args_list])
         self.assertEqual((fake.requests, fake.downloads), ([], []))
 
+    def test_installations_of_an_earlier_release_gain_their_option_records(self):
+        """What the app runs as it launches gives an installation made
+        before 1.7.4 the record its options are offered by, from the files
+        it links and without the Hub; one whose record has it is not
+        touched, nor one whose files are gone."""
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "d" * 40, vision_target)
+        fake.publish("owner/other", "e" * 40, vision_target)
+        app = (self.root / "app").resolve()
+        build = assembly.build
+
+        def older(models_root, record, files):
+            for key in upstream.OPTION_KEYS:
+                del record[key]
+            return build(models_root, record, files)
+
+        chosen = [selection(app, language_only=False)]
+        chosen.append(selection(app, "owner/other", language_only=False))
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(assembly, "build", older),
+        ):
+            for one in chosen:
+                upstream.prepare(one)
+        shutil.rmtree(fake.snapshot("owner/other", "e" * 40))
+        before = [one.link.resolve() for one in chosen]
+        fake.requests.clear(), fake.downloads.clear()
+        with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
+            upstream.bring_records_current(chosen[0].models_root)
+            record = assembly.verify(chosen[0].link)
+            self.assertLessEqual(upstream.OPTION_KEYS, record.keys())
+            self.assertNotEqual(chosen[0].link.resolve(), before[0])
+            # The other's files are gone: it stays as it was.
+            self.assertEqual(chosen[1].link.resolve(), before[1])
+            current = chosen[0].link.resolve()
+            # As the app runs it, for the records alone: nothing is installed.
+            with mock.patch.object(cached, "install_cached") as installs:
+                cached.main(
+                    ["--models", str(chosen[0].models_root), "--records"]
+                    + ["--first", MODEL]
+                )
+            installs.assert_not_called()
+            self.assertEqual(chosen[0].link.resolve(), current)
+        self.assertEqual((fake.requests, fake.downloads), ([], []))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            upstream.prepare(chosen[0])
+        self.assertIn("is already installed", output.getvalue())
+
     def test_an_installation_whose_files_are_gone_installs_again(self):
         """An installation whose snapshot was deleted from the cache, which
         the app then no longer lists, is not present, and installs again

@@ -17,15 +17,16 @@ from . import runtime as engine_runtime
 from .chat_format import ChatFormat
 from .constraints import TokenConstraint
 from .diagnostics import print_status
-from .errors import APIError, ConstraintError
+from .errors import APIError, CapacityError, ConstraintError
 from .latency import RequestLatency
 from .metrics import metrics_dict
 from .output import StopSearch
 from .tool_schema import ToolPolicy
 
 # Engine outcomes whose message the engine words from its own limits and
-# counts, never from a request: the client gets it as it is, and the console
-# prints it beside the code.
+# counts, never from a request: the console prints it beside the code, and
+# the client gets it as it is, or for a request that cannot fit even alone
+# as a prompt over the context (CapacityError).
 _ENGINE_RESOURCE_CODES = frozenset(
     {"capacity_exhausted", "kv_disk_quota", "kv_write_budget", "resource_timeout"}
 )
@@ -70,6 +71,14 @@ _STATE_SOURCES = {
     wire.StateSource.MEMORY: "memory",
     wire.StateSource.DISK: "disk",
 }
+# Why a start's reuse stopped (wire.ReuseEnd), as usage, the log and /status
+# name it.
+REUSE_ENDS = {
+    wire.ReuseEnd.NOTHING_MATCHED: "nothing_matched",
+    wire.ReuseEnd.PREFIX_END: "prefix_end",
+    wire.ReuseEnd.KV_WITHOUT_STATE: "kv_without_state",
+    wire.ReuseEnd.DISK_READ_FAILED: "disk_read_failed",
+}
 
 
 @dataclass(frozen=True)
@@ -82,10 +91,15 @@ class CacheInfo:
     deduplicated_tokens: int = 0
     # What its start found beside the cached prefix (wire.StartEvent): how
     # far the cache matched its prompt's KV, where the state it resumed from
-    # was, and whether a state past it was lost.
+    # was, whether a state past it was lost, and why its reuse stopped
+    # (REUSE_ENDS) with that end's tokens: where the matched KV ends at a
+    # prefix end, the matched KV past the state, the tokens a failed SSD read
+    # would have restored, 0 where nothing matched.
     prefix_tokens: int = 0
     state_source: str | None = None
     lost_state: bool = False
+    reuse_end: str | None = None
+    reuse_end_tokens: int = 0
 
     def reuse(self):
         """The usage fields that say what the request reused, beside each
@@ -94,6 +108,8 @@ class CacheInfo:
             "prefix_tokens": self.prefix_tokens,
             "state_source": self.state_source,
             "lost_state": self.lost_state,
+            "reuse_end": self.reuse_end,
+            "reuse_end_tokens": self.reuse_end_tokens,
         }
 
 
@@ -164,6 +180,8 @@ class Job:
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
+    # The failure the server cancelled the job for (NativeBackend.cancel).
+    ended_by: APIError | None = None
     tool_policy: ToolPolicy | None = None
     response_validator: object | None = None
     response_format: dict | None = None
@@ -317,7 +335,7 @@ class CallbackStreamer:
             raise RuntimeError("incremental tokenizer output diverged")
         # Bytes of a multi-byte character the output ends inside decode to
         # U+FFFD; DecodeStream held them back for the rest. Drop the trailing
-        # U+FFFD, as vLLM's detokenizer does; one that text follows stays.
+        # U+FFFD; one that text follows stays.
         self._emit(decoded[len(handled) :].rstrip("\ufffd"))
         if self.stop_sequence is None:
             self._send(self.pending_text)
@@ -406,6 +424,9 @@ class _JobState:
     detached: bool = False
     shutdown_requested: bool = False
     first_token_batch_tokens: int = 0
+    # Whether the engine has started it (its StartEvent): a drain lets such
+    # a request finish and ends one still waiting (NativeBackend.drain).
+    started: bool = False
 
     def detach(self):
         self.detached = True
@@ -446,7 +467,11 @@ class NativeBackend:
         self.thinking_end = thinking_end
         self.active = {}
         self.closing = False
+        # Set by drain(): no request is admitted any more, and those running
+        # may finish; `drained` is told whenever `active` empties.
+        self.draining = False
         self.lock = threading.RLock()
+        self.drained = threading.Condition(self.lock)
         self.status_snapshot = None
         self.status_snapshot_at = None
         # Since when the engine loop has left status probes unanswered.
@@ -751,7 +776,7 @@ class NativeBackend:
         """The error a request not yet admitted gets now; None while the
         engine serves."""
         with self.lock:
-            if self.closing or self.stop_reason is not None:
+            if self.closing or self.draining or self.stop_reason is not None:
                 return self._closed_error_locked()
             self._ensure_recovery_locked()
             if self.runtime.ready:
@@ -767,7 +792,12 @@ class NativeBackend:
         )
 
     def is_ready(self):
-        # The engine's own ready folds in memory pressure and Metal health.
+        # A server that admits nothing, draining for a stop or closing, is
+        # not ready; else the engine's own ready folds in memory pressure and
+        # Metal health.
+        with self.lock:
+            if self.draining or self.closing:
+                return False
         return self.status()["ready"] is True
 
     @staticmethod
@@ -1036,7 +1066,7 @@ class NativeBackend:
     def _admit(self, state, request, on_event, on_complete):
         job = state.job
         with self.lock:
-            if self.closing:
+            if self.closing or self.draining:
                 state.detach()
                 job.events.put(("error", self._closed_error_locked()))
                 return
@@ -1093,10 +1123,13 @@ class NativeBackend:
         state.detach()
         if self.active.get(state.job.request_id) is state:
             del self.active[state.job.request_id]
+            if not self.active:
+                self.drained.notify_all()
 
     def _on_event(self, state, event):
         job = state.job
         if isinstance(event, wire.StartEvent):
+            state.started = True
             cache = CacheInfo(
                 "hit" if event.matched_prompt_tokens else "miss",
                 event.matched_prompt_tokens,
@@ -1104,6 +1137,8 @@ class NativeBackend:
                 prefix_tokens=event.prefix_tokens,
                 state_source=_STATE_SOURCES[event.state_source],
                 lost_state=event.lost_state,
+                reuse_end=REUSE_ENDS[event.reuse_end],
+                reuse_end_tokens=event.reuse_end_tokens,
             )
             with self.lock:
                 job.cache = cache
@@ -1112,6 +1147,8 @@ class NativeBackend:
                 "request_id": event.request_id,
                 "prompt_tokens": len(job.prompt_tokens),
                 "cached_tokens": cache.matched_tokens,
+                "reuse_end": cache.reuse_end,
+                "reuse_end_tokens": cache.reuse_end_tokens,
             }
             if job.reasoning is not None:
                 record["reasoning"] = {
@@ -1151,9 +1188,14 @@ class NativeBackend:
                 job.constraint.commit(event.tokens)
             state.streamer.put_tokens(event.tokens)
 
-    def cancel(self, job):
+    def cancel(self, job, error=None):
+        """Cancel job; with `error`, the failure that ends it, as the server
+        ended it at its deadline, which its record names in place of a
+        cancel: the request's one line says why it ended."""
         call = None
         with self.lock:
+            if error is not None and not job.cancelled.is_set():
+                job.ended_by = error
             job.cancelled.set()
             state = self.active.get(job.request_id)
             if state is not None:
@@ -1240,6 +1282,15 @@ class NativeBackend:
                         "runtime_unavailable",
                         self._recovery_retry_after_locked(),
                     )
+        except engine_runtime.RequestFailed as failure:
+            # A request that does not fit even alone, as the engine says, is
+            # answered as a prompt over the context; the console keeps the
+            # engine's sentence (_record).
+            error = (
+                CapacityError(len(job.prompt_tokens), failure)
+                if failure.capacity_limit
+                else self._api_error(failure)
+            )
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:
@@ -1250,6 +1301,8 @@ class NativeBackend:
                     state.shutdown_requested and self.stop_reason is None
                 )
                 self._detach_locked(state)
+        if result is not None and result.reason == "cancelled" and job.ended_by:
+            result, error = None, job.ended_by
         if shutdown_requested:
             # Once close() has claimed an active HTTP request, its public
             # terminal is deterministic even if the native cancellation and
@@ -1269,13 +1322,11 @@ class NativeBackend:
         if isinstance(error, engine_runtime.RequestFailed):
             code = error.code.decode("ascii", "replace")
             message = error.message_bytes.decode("utf-8", "replace")
+            # The request's deadline, met in the engine, is worded as the
+            # server words one it meets itself, a stream's among them: one
+            # timeout, one message.
             if code == "deadline_exceeded":
-                return APIError(504, message, "request_timeout")
-            # A request that does not fit even alone, in memory or in the SSD
-            # cache, fails the same way on a retry; the engine's message names
-            # what it lacked and the limits that would fit it.
-            if code in ("capacity_exhausted", "kv_disk_quota"):
-                return APIError(400, message, code)
+                return APIError(504, "request timed out", "request_timeout")
             request_codes = {
                 "invalid_constraint",
                 "invalid_count",
@@ -1329,7 +1380,11 @@ class NativeBackend:
             }
         if error:
             record["error_code"] = error.code
-            if error.code in _ENGINE_RESOURCE_CODES:
+            if isinstance(error, CapacityError):
+                record["error_code"] = error.engine_code
+                record["engine_reason"] = error.engine_reason
+                record["remedy"] = error.remedy
+            elif error.code in _ENGINE_RESOURCE_CODES:
                 record["engine_reason"] = error.message
             error.logged = True
         self._log(record)
@@ -1340,6 +1395,26 @@ class NativeBackend:
             self.request_logger(record)
         except Exception:
             pass
+
+    def drain(self, seconds):
+        """The first stop signal's drain: admits no request from now on (each
+        gets the 503 server_shutdown a closing server answers with), ends at
+        once those the engine has not started, with that error, and waits up
+        to `seconds` for those it started to finish. Returns how many are
+        still running; close() then ends them as it ends any."""
+        error = APIError(503, "server is shutting down", "server_shutdown")
+        deadline = time.monotonic() + seconds
+        with self.lock:
+            if self.closing or self.stop_reason is not None:
+                return len(self.active)
+            self.draining = True
+            waiting = [state for state in self.active.values() if not state.started]
+        for state in waiting:
+            self.cancel(state.job, error)
+        with self.lock:
+            while self.active and (remaining := deadline - time.monotonic()) > 0:
+                self.drained.wait(remaining)
+            return len(self.active)
 
     def close(self):
         with self.lock:

@@ -54,10 +54,9 @@ struct KvPoolSnapshot {
   // Extents emptied by moving their pages, and the pages moved.
   uint64_t extentCompactions = 0;
   uint64_t pagesMoved = 0;
-  // The same pages and bytes of the extents of Index pages alone and of Slim
-  // pages alone, which the counts above include.
+  // The same pages and bytes of the extents of Index pages alone, which the
+  // counts above include.
   KvPoolFormSnapshot index{};
-  KvPoolFormSnapshot slim{};
 };
 
 // Where moved pages went: an emptied extent's, or pages moved to another
@@ -103,8 +102,7 @@ struct KvPageMoveResult final {
 // directly allocate or release Metal memory. Every extent holds pages of one
 // form (kv::PageForm) from its allocation to its release, and the forms
 // share one id space: a page's content goes to a page of another form when
-// its K/V leaves memory or comes back, or when it gives up a window's layers
-// (movePages). Free pages of a form are handed out from the extents of the
+// its K/V leaves memory or comes back (movePages). Free pages of a form are handed out from the extents of the
 // form that hold a page a request holds first, then from the others, and
 // among those from the one with the most live pages first: a request's new
 // page joins an extent commands already reach rather than one only the
@@ -156,6 +154,8 @@ public:
   [[nodiscard]] uint32_t pageCount() const noexcept;
   [[nodiscard]] uint64_t bytesPerPage(kv::PageForm form = kv::PageForm::Full) const noexcept;
   [[nodiscard]] uint32_t extentPages() const noexcept { return extentPages_; }
+  // The runway's pages, from page 0 (RunwayHold).
+  [[nodiscard]] uint32_t runwayPages() const noexcept { return runwayPages_; }
   // Free pages of the form's allocated extents; acquisition hands these out
   // first.
   [[nodiscard]] uint32_t freePageCount(kv::PageForm form = kv::PageForm::Full) const noexcept;
@@ -200,23 +200,23 @@ public:
 
   // Releases completely unreferenced extents, of the form or of any, at
   // most `limit` of them, and returns the bytes released. keepRunway keeps
-  // one empty extent of each form warm, so the next request, spill or trim
-  // does not wait for an allocation; unlike the runway the constructor
+  // one empty extent of each form warm, so the next request or spill does
+  // not wait for an allocation; unlike the runway the constructor
   // allocates, it is always a single extent.
   [[nodiscard]] uint64_t reclaimEmptyExtents(bool keepRunway, uint32_t limit,
                                              std::optional<kv::PageForm> form = std::nullopt);
   // Allocates an empty extent of the form unless one is allocated already:
   // the runway the next pages of the form come from without an allocation,
   // as a spill at the memory wall needs its Index pages to free its Full
-  // ones, and a trim its Slim pages. Granted, or the budget's refusal with
+  // ones. Granted, or the budget's refusal with
   // nothing allocated.
   [[nodiscard]] metal::AllocationResult fillRunway(kv::PageForm form);
   // Empties the allocated extent, of the form or of any, that holds the
   // fewest pages, by moving each of them to a free page of the other extents
   // of its form that hold pages, fullest first: free pages scattered over the
   // pool become an empty extent, which a reclaim releases. Of any form, a
-  // Full extent goes before a Slim one and a Slim one before an Index one, as
-  // reclaimEmptyExtents() releases them; a caller that needs the memory of
+  // Full extent goes before an Index one, as reclaimEmptyExtents() releases
+  // them; a caller that needs the memory of
   // one form names it. References move with their pages, and the result
   // says where each went, for the caller to re-point whoever names them.
   // Nothing moves, and the result is empty, unless those free pages cover
@@ -357,7 +357,7 @@ private:
   std::vector<PageRecord> pages_;
   std::vector<ExtentRecord> extents_;
   // By kv::PageForm.
-  std::array<FormRecord, 3> forms_;
+  std::array<FormRecord, kv::kPageForms> forms_;
   std::function<void(uint32_t page)> activity_;
 };
 

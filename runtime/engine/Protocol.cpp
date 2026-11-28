@@ -30,12 +30,12 @@ constexpr uint64_t kMaskResponseFixedBytes = 24;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReleaseRequestFixedBytes = 8;
 constexpr uint64_t kReadyFixedBytes = 21;
-constexpr uint64_t kStartFixedBytes = 22;
+constexpr uint64_t kStartFixedBytes = 27;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 62;
-constexpr uint64_t kErrorFixedBytes = 22;
+constexpr uint64_t kErrorFixedBytes = 27;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 constexpr uint64_t kStartFailedFixedBytes = 26;
 // The most words of a mask response's forced tokens: a row and a token for
@@ -451,6 +451,10 @@ std::optional<ProtocolIssue> validateStart(const StartEvent &event) {
     return invalidEvent(IssueCode::InvalidCount, event.requestId,
                         "start event lane is invalid");
   }
+  if (static_cast<size_t>(event.reuseEnd) >= engine::kReuseEnds) {
+    return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
+                        "start event reuse end is invalid");
+  }
   return std::nullopt;
 }
 
@@ -583,6 +587,19 @@ std::optional<ProtocolIssue> validateError(const ErrorEvent &event,
     return invalidEvent(IssueCode::InvalidErrorClassification, event.requestId,
                         "only a retryable error says when to retry");
   }
+  using Limit = engine::CapacityLimit;
+  if (!validEnum(static_cast<uint8_t>(event.capacity.limit),
+                 {Limit::None, Limit::Memory, Limit::ImageMemory,
+                  Limit::ClosedDisk, Limit::DiskQuota})) {
+    return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
+                        "error event capacity limit is invalid");
+  }
+  if ((event.capacity.limit != Limit::None &&
+       event.failureClass != FailureClass::RequestError) ||
+      (event.capacity.fitsTokens && event.capacity.limit == Limit::None)) {
+    return invalidEvent(IssueCode::InvalidErrorClassification, event.requestId,
+                        "only a request's capacity failure says what fits");
+  }
   return std::nullopt;
 }
 
@@ -654,6 +671,8 @@ EncodedEvent encodeStart(const StartEvent &event) {
   writer.u32(event.prefixTokens);
   writer.u8(static_cast<uint8_t>(event.stateSource));
   writer.u8(event.lostState);
+  writer.u8(static_cast<uint8_t>(event.reuseEnd));
+  writer.u32(event.reuseEndTokens);
   return success(writer.take());
 }
 
@@ -738,6 +757,8 @@ EncodedEvent encodeError(const ErrorEvent &event,
   writer.u8(event.retryable ? 1 : 0);
   writer.u32(event.retryAfterSeconds);
   writer.u64(event.requestId);
+  writer.u8(static_cast<uint8_t>(event.capacity.limit));
+  writer.u32(event.capacity.fitsTokens);
   writer.u32(static_cast<uint32_t>(event.code.size()));
   writer.u32(static_cast<uint32_t>(event.message.size()));
   writer.text(event.code);

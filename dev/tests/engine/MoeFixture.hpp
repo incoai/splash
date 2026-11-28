@@ -130,9 +130,9 @@ struct Model {
 
 // The first format from id i on, cyclically, in rows of K values: one whose
 // column unit divides K (a GGUF stores no 256-value blocks in rows of 640,
-// Qwen3.8-Flash-Next's expert down projections, which take 32- or 64-value
-// blocks, and preparation takes PQ2_0's 128-value blocks and the MLX affine
-// formats' groups of 128 only in rows of whole superblocks).
+// Qwen3.8-Flash-Next's expert down projections, which take 32-, 64- or
+// 128-value blocks: its MLX shared-expert down projection is affine 8 bits in
+// groups of 128).
 inline gguf_reference::Fmt fitting(size_t i, uint32_t K) {
   for (size_t j = 0; j < gguf_reference::FMT_COUNT; ++j) {
     const gguf_reference::Fmt g = gguf_reference::Fmt((i + j) % gguf_reference::FMT_COUNT);

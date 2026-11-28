@@ -177,6 +177,10 @@ struct QwenTargetDimensions {
   uint32_t pleHeadsPerNgram = 0;
   uint32_t pleHeadDimension = 0;
   uint32_t pleConvolutionTaps = 0;
+  // The activations its plans take where a start gives no --activations (ModelDescriptor::activations): auto's,
+  // rounded to int8 where an int8-activation path takes them (ops::Int8Activations), unless the family's default is
+  // bf16 because those paths gain it little.
+  ops::Int8Activations activations = ops::Int8Activations::On;
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
@@ -281,8 +285,10 @@ struct QwenTargetDimensions {
 // (ops::RelativeAttention) its layers attend in, each layer one of them, or
 // none where they attend through the shared attention (ops::PagedAttention).
 // Each architecture's target is compiled against it, the start warms each
-// variant's kernels (ops::ExecutionPlans::prefillRowClasses), and the kernel
-// tests take the families' attention kernels from it.
+// variant's kernels (ops::ExecutionPlans::prefillRowClasses), a target that
+// runs any splits its decode step classes at their tile's changes
+// (decodeRowClasses), and the kernel tests take the families' attention
+// kernels from it.
 struct QwenHybridLayout : QwenTargetDimensions {
   static constexpr bool flatConfig = false;
   // The vision tower of the family's models, which an installation loads
@@ -297,6 +303,11 @@ struct QwenHybridLayout : QwenTargetDimensions {
   [[nodiscard]] constexpr std::array<ops::RelativeAttentionVariant, 0> relativeAttention() const noexcept {
     return {};
   }
+  // Its layers run no message gates (ops::MessageGate) and no block
+  // residual mixes (ops::BlockResidualMix), whose decode kernels follow a
+  // step's rows (ops::ExecutionPlans::decodeRowClasses).
+  [[nodiscard]] constexpr bool messageGates() const noexcept { return false; }
+  [[nodiscard]] constexpr bool blockResidualMixes() const noexcept { return false; }
 
   // The KV pages, which also hold a QSA indexer's pooled keys; a QSA target's
   // attention reads the blocks its indexer selects, in the value order that

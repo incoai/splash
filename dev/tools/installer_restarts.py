@@ -92,6 +92,7 @@ def check(arguments, run=run_installer, hub_cache=None):
         revision=options.revision,
         language_only=options.language_only,
         draft_model=options.draft_model,
+        draft_revision=options.draft_revision,
     )
     installer(run, arguments, ["prepare"], ONLINE)
     if hub_cache is None:

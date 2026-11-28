@@ -27,6 +27,9 @@ struct ExpertStoreStats final {
   uint64_t slots = 0;    // the live chunks'
   uint64_t experts = 0;  // every block's routed experts
   uint64_t resident = 0; // slots holding an expert
+  // Each streamed size's bytes a slot, one expert's planes; the store sizes
+  // each at one share of its experts, its chunks' regions whole.
+  std::vector<uint64_t> slotBytes;
   // The chunks given back while memory was short, and taken back after.
   uint64_t shrinks = 0;
   uint64_t regrows = 0;

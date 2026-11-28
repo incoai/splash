@@ -66,7 +66,7 @@ public:
     speculativeCounts[id] = speculation;
   }
   void failed(uint64_t, engine::LaneOutcome outcome, std::string message,
-              uint32_t retryAfterSeconds) override {
+              uint32_t retryAfterSeconds, engine::CapacityShortfall capacity) override {
     ++failedCount;
     if (outcome == engine::LaneOutcome::CapacityExhausted)
       ++capacityExhaustedCount;
@@ -74,6 +74,7 @@ public:
     failures.emplace_back(wire.code);
     failureDetails.emplace_back(std::move(message), wire.retryable);
     retryAfters.push_back(retryAfterSeconds);
+    capacities.push_back(capacity);
   }
 
   // With a clock, the time of each request's token events.
@@ -98,6 +99,8 @@ public:
   std::vector<std::pair<std::string, bool>> failureDetails;
   // When each failure said a retry may succeed, in seconds.
   std::vector<uint32_t> retryAfters;
+  // What each failure that cannot fit even alone lacked, and what fits.
+  std::vector<engine::CapacityShortfall> capacities;
   uint32_t emitted = 0;
   uint32_t completedCount = 0;
   uint32_t failedCount = 0;
@@ -113,7 +116,7 @@ public:
 // Every submitted request has ended and no command is in flight.
 inline bool idle(const engine::Engine &engine) {
   const engine::EngineSnapshot counts = engine.snapshot();
-  return counts.submitted == counts.completed + counts.cancelled + counts.failed &&
+  return counts.submitted == counts.completed + counts.cancelled + counts.timedOut + counts.failed &&
          !engine.commandInFlight();
 }
 
@@ -143,6 +146,15 @@ inline std::vector<engine::CacheLookup> runUntilStatesHeld(engine::Engine &engin
   for (uint64_t id : ids)
     held.push_back(cache.lookup(std::vector<uint32_t>(65, static_cast<uint32_t>(id)), {}));
   return held;
+}
+
+// The block of the state `length` tokens into `tokens`, or 0: the state a
+// prompt that goes on past it resumes from, if one resumes there.
+inline uint64_t stateAt(engine::Cache &cache, const std::vector<uint32_t> &tokens, uint32_t length) {
+  std::vector<uint32_t> probe(tokens.begin(), tokens.begin() + length);
+  probe.push_back(9);
+  const engine::CacheLookup lookup = cache.lookup(probe, {});
+  return lookup.resumeBoundary() == length ? lookup.state->kvBlock() : 0;
 }
 
 inline void runUntilIdle(engine::Engine &engine) {

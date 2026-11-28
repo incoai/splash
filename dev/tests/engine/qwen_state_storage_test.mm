@@ -3,6 +3,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "tests/engine/ClaimScope.hpp"
+#include "model/ModelPools.hpp"
 #include "model/QwenState.hpp"
 #include "tests/engine/StateCodecReference.hpp"
 #include "tests/engine/TestChecks.hpp"
@@ -443,7 +444,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
                                         std::make_shared<model::DiskBudget>(kStateSlotBytes)));
-  require(storage.canSnapshotToDisk(false), "a state file that holds one state refuses writes");
+  require(storage.canSnapshotToDisk(), "a state file that holds one state refuses writes");
   require(static_cast<bool>(storage.tryActivateLane(0, 321)), "lane activation failed");
   storage.swapParity(0);
   const model::GdnParityBuffers &current = storage.current(0);
@@ -493,8 +494,8 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
 }
 
 // A state's write, from a lane or from a cached copy, takes its slot from
-// the write budget. Overdrawn, the budget holds back writes not in use
-// until it refills, and lets those in use pass.
+// the write budget. Overdrawn, the budget holds back every state write
+// until it refills.
 void testStateWritesDrawOnTheWriteBudget(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
@@ -508,19 +509,93 @@ void testStateWritesDrawOnTheWriteBudget(metal::MetalBackend &backend) {
   require(static_cast<bool>(storage.tryActivateLane(0, 456)), "lane activation failed");
   storage.updateLengths(0, published(4096));
   auto cached = storage.snapshot(0);
-  require(cached && storage.canSnapshotToDisk(false) && cached->canOffload(false),
+  require(cached && storage.canSnapshotToDisk() && cached->canOffload(),
           "a write budget with room held a state back");
   auto write = storage.snapshotToDisk(0, {});
   require(write && finishWhenReady(*write), "the lane's state was not written");
-  require(!storage.canSnapshotToDisk(false) && storage.canSnapshotToDisk(true) &&
-              !cached->canOffload(false) && cached->canOffload(true),
-          "an overdrawn write budget did not hold back only what is not in use");
-  now = 86'400'000.0 / 4 + 1.0;
-  require(storage.canSnapshotToDisk(false) && cached->canOffload(false),
+  require(!storage.canSnapshotToDisk() && !cached->canOffload(),
+          "an overdrawn write budget took a state's write");
+  // Overdrawn by half a slot, it reopens at an eighth of its half slot: 9/32 of a day.
+  now = 9 * 86'400'000.0 / 32 + 1.0;
+  require(storage.canSnapshotToDisk() && cached->canOffload(),
           "the write budget did not admit writes once it refilled");
   write.reset();
   cached.reset();
   storage.releaseLane(0, 456);
+}
+
+// The staging is held only while the tier takes cache writes. A spent write budget gives it back, once no write
+// reads it, as memory a state's buffers take where it held them; nothing staged starts meanwhile, and a write in
+// place does. Reopened, it comes back under the admission, refused while memory holds none and with no state given
+// up for it, and once memory frees the staged writes go on.
+void testTheStagingIsHeldWhileTheTierTakesWrites(metal::MetalBackend &backend) {
+  double now = 0.0;
+  auto budget = std::make_shared<model::DiskBudget>(16 * kStateSlotBytes, [&now] { return now; });
+  // Two slots a day, half a slot at once.
+  budget->setWriteBudget(2 * kStateSlotBytes);
+  // Admits what fits under `limit` beside what the backend holds.
+  uint64_t limit = std::numeric_limits<uint64_t>::max();
+  const metal::AllocationAdmission admit = [&](uint64_t bytes, const std::function<void()> &allocate) {
+    if (backend.memoryStats().allocatedBytes + bytes > limit)
+      return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
+    allocate();
+    return metal::AllocationResult();
+  };
+  model::QwenStateStorage storage(backend, admit, kStateLayout,
+                                  std::make_shared<model::SlotFile>(kStateSlotBytes, budget));
+  model::StateStagingPool staging(storage);
+  const uint64_t bytes = kStateLayout.cachedBytes();
+  require(staging.state().floorBytes == bytes && staging.state().capBytes == bytes && !staging.release(bytes) &&
+              storage.stagingBytes() == bytes,
+          "the staging was not held while the tier takes writes");
+  require(static_cast<bool>(storage.tryActivateLane(0, 9)), "lane activation failed");
+  fillState(storage.current(0), kTargetState, 70);
+  fill(storage.window(0), 71);
+  const auto images = restoredImage(storage, 0);
+  storage.updateLengths(0, published(4096));
+  auto first = storage.snapshot(0);
+  auto write = storage.snapshotToDisk(0, {});
+  require(first && write && !storage.canSnapshotToDisk() && !first->canOffload() && !first->canPersist(),
+          "the budget's last write left it open");
+  require(!staging.state().capBytes && !staging.release(bytes), "the staging went while a write read it");
+  require(finishWhenReady(*write), "the lane's state was not written");
+  write.reset();
+  // Memory holds two host pages more, the most a state's two buffers round up past the staging's one: the staging
+  // is the room a state's buffers take.
+  limit = backend.memoryStats().allocatedBytes + 2 * kHostPageBytes;
+  require(!storage.snapshot(0), "a state's buffers were admitted past the limit");
+  require(staging.release(bytes) == bytes && !storage.stagingBytes() && !staging.state().currentBytes,
+          "a spent budget kept the staging");
+  auto second = storage.snapshot(0);
+  require(second != nullptr, "the staging's memory did not take a state's buffers");
+  // Reopened, with the staging's room in use: refused, nothing given up, nothing staged; a write in place goes on.
+  now = 9 * 86'400'000.0 / 32 + 1.0;
+  require(staging.state().growUnitBytes == bytes && !staging.grow(admit) && !storage.stagingBytes(),
+          "the staging came back past the limit");
+  require(first && second && !storage.canSnapshotToDisk() && !second->canOffload() && second->canPersist(),
+          "a staged write could start without the staging, or a write in place could not");
+  auto kept = second->persist({});
+  require(kept && finishWhenReady(*kept), "the state's write in place failed");
+  // The written state leaves RAM, its buffers go back to macOS, and once the budget has refilled again the staging
+  // comes back.
+  second.reset();
+  now += 86'400'000.0;
+  while (storage.releaseOneIdle(false)) {
+  }
+  require(staging.grow(admit) && storage.stagingBytes() == bytes && staging.state().floorBytes == bytes &&
+              storage.canSnapshotToDisk() && first->canOffload(),
+          "the staging did not come back once memory freed");
+  auto offload = first->offload({});
+  require(offload && finishWhenReady(*offload), "a staged write did not go on once the staging came back");
+  fill(storage.current(0).stateBase, 99);
+  auto read = storage.beginRestore(0, *kept->state(), true, {}, [] {});
+  require(read && finishWhenReady(*read) && stateImage(storage, 0) == images,
+          "the state written in place did not come back");
+  read.reset();
+  offload.reset();
+  kept.reset();
+  first.reset();
+  storage.releaseLane(0, 9);
 }
 
 // A state need not fill its slot: it comes back exactly from a slot one host
@@ -764,7 +839,7 @@ void testReservations(metal::MetalBackend &backend) {
     reservation.reset();
     require(storage.idleCachedCells() == 0 && storage.idleWindows() == 0,
             "a sealed reservation returned the buffers its state holds");
-    require(state->canOffload(false), "a sealed state cannot be written to the disk tier");
+    require(state->canOffload(), "a sealed state cannot be written to the disk tier");
     auto write = state->offload({});
     require(write && finishWhenReady(*write), "a sealed state's disk write failed");
     fill(storage.current(0).stateBase, 99);
@@ -1016,7 +1091,7 @@ void testAccountingAcrossCapturesAndRestores(metal::MetalBackend &backend) {
         } else if (auto state = storage.snapshot(lane)) {
           ram.push_back({state, image});
         }
-        if (step % 3 == 2 && !ram.empty() && ram.front().state->canOffload(false)) {
+        if (step % 3 == 2 && !ram.empty() && ram.front().state->canOffload()) {
           auto write = ram.front().state->offload({});
           require(write && finishWhenReady(*write), "a demotion failed");
           disk.push_back({write->state(), ram.front().image});
@@ -1087,6 +1162,7 @@ void run(const std::string &metallib) {
   testExactCachedStatesRestoreEveryByte(backend);
   testDirectDiskSnapshot(backend);
   testStateWritesDrawOnTheWriteBudget(backend);
+  testTheStagingIsHeldWhileTheTierTakesWrites(backend);
   testStateSmallerThanSlot(backend);
   testPersistentStateComesBack(backend);
   testPersistKeepsTheRamCopy(backend);

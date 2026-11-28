@@ -157,6 +157,10 @@ inline void relative_attention_prepare_phase(
 
 // ---- Page loop ------------------------------------------------------------
 
+// The rows a tile of `fused` fused rows multiplies: a multiple of 8, as MPP's
+// matmul2d takes them.
+constexpr uint relative_attention_matmul_rows(uint fused) { return (fused + 7) / 8 * 8; }
+
 // A softmax lane's bias: its fused row's relative states, in registers for
 // the tile's whole page loop, the layer's table, and the row's position. Each
 // of the lane's eight keys at a backward distance d below the extent adds the
@@ -365,12 +369,14 @@ inline RelativeAttentionPages relative_attention_pages(uint first_position, uint
 // position (a tree's anchor's, as its window's) take the bias, the pages
 // below it, past every row's extent, none. Int8Queries writes the tile's
 // query codes to `query_codes` (M x HeadDim bytes the threadgroup owns).
-// Then `store` stores the running output of the tile's fused rows (an
+// BoundedRescale bounds the running output's rescale by the tile's fused
+// rows, the form the GPU family takes for the tile's shape (below). Then
+// `store` stores the running output of the tile's fused rows (an
 // M x HeadDim cooperative tensor, its argument, every element of which
 // running_full says is valid) and their statistics, which row_max and row_sum
 // hold.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          uint Window, typename CacheElement, bool Int8Queries, class Store>
+          uint Window, typename CacheElement, bool Int8Queries, bool BoundedRescale, class Store>
 inline void relative_attention_page_loop(
     device bfloat *tile_queries, device int8_t *query_codes, device const float *states,
     device const float *table, device const SplashKvPage *page_table,
@@ -380,10 +386,12 @@ inline void relative_attention_page_loop(
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     SplashAttentionTree tree, uint thread_index, Store store) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
+  constexpr ushort MM = relative_attention_matmul_rows(M);
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr ushort N = SplashKvPageTokens;
   constexpr ushort D = HeadDim;
   constexpr uint States = SPLASH_RELATIVE_ATTENTION_STATES;
+  const uint fused_rows = active_rows * QueryHeadsPerKVHead;
   const bool in_tree = tree.rows != nullptr;
   const uint visible_tokens = committed_tokens + active_rows;
   static_assert(Quantized || !Int8Queries, "INT8 queries take INT8 keys");
@@ -393,13 +401,17 @@ inline void relative_attention_page_loop(
   float score_scale = splash_attention_scale<HeadDim>();
   if constexpr (Int8Queries) {
     queries = query_codes;
-    score_scale *= splash_attention_query_codes<M, HeadDim>(tile_queries, queries, thread_index);
+    if (thread_index / SplashAttentionLanesPerRow < fused_rows)
+      score_scale *= splash_attention_query_codes<M, HeadDim>(tile_queries, queries, thread_index);
   } else {
     queries = tile_queries;
   }
   if (thread_index < M) {
     row_max[thread_index] = -INFINITY;
     row_sum[thread_index] = 0.0f;
+  } else if (thread_index < MM) {
+    // A pad row, which no softmax lane owns, keeps its running output's scale.
+    previous_scale[thread_index] = 1.0f;
   }
   uint ancestors = 0, depth = 0;
   if (in_tree && thread_index < SplashAttentionLanesPerRow * M) {
@@ -433,30 +445,35 @@ inline void relative_attention_page_loop(
                                   : mem_flags::mem_threadgroup);
 
   threadgroup Score *page_score_tile = reinterpret_cast<threadgroup Score *>(scores);
-  auto qt = tensor(queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
-  auto st = tensor(page_score_tile, dextents<int, 2>{N, M}, array<int, 2>{1, N});
-  auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
-  auto p0 = pt.slice<N, M>(0, 0);
+  // The queries' tensor spans the MM rows its static slice multiplies, past
+  // the active ones (their rows of the staging or of the codes' slot, which
+  // no active row's scores read): a static slice is not checked against its
+  // tensor's extents, and one past them is an invalid tensor argument, whose
+  // reads macOS 27's shader validation returns as zeros.
+  auto qt = tensor(queries, dextents<int, 2>{D, MM}, array<int, 2>{1, D});
+  auto st = tensor(page_score_tile, dextents<int, 2>{N, MM}, array<int, 2>{1, N});
+  auto pt = tensor(probabilities, dextents<int, 2>{N, MM}, array<int, 2>{1, N});
+  auto p0 = pt.slice<N, MM>(0, 0);
   auto key_type = tensor(static_cast<device CacheElement *>(nullptr),
                          dextents<int, 2>{D, N}, array<int, 2>{1, D});
   auto value_type = tensor(static_cast<device CacheElement *>(nullptr),
                            dextents<int, 2>{N, D}, array<int, 2>{1, N});
   const SplashKvAddressing<KVHeads, HeadDim, CacheElement> addressing(kv, kv_head);
-  auto q0 = qt.template slice<D, M>(0, 0);
+  auto q0 = qt.template slice<D, MM>(0, 0);
   auto k0 = key_type.template slice<D, N>(0, 0);
   auto v0 = value_type.template slice<N, D>(0, 0);
   constexpr auto qk_descriptor =
-      matmul2d_descriptor(M, N, D, false, true, false,
+      matmul2d_descriptor(MM, N, D, false, true, false,
                           matmul2d_descriptor::mode::multiply);
   constexpr auto pv_descriptor =
-      matmul2d_descriptor(M, D, N, false, true, true,
+      matmul2d_descriptor(MM, D, N, false, true, true,
                           matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_descriptor, execution_simdgroups<8>> qk;
   matmul2d<pv_descriptor, execution_simdgroups<8>> pv;
   auto running = pv.template get_destination_cooperative_tensor<
       decltype(p0), decltype(v0), float>();
   const bool running_full =
-      uint(running.get_capacity()) * (8u * 32u) == uint(M) * D;
+      uint(running.get_capacity()) * (8u * 32u) == uint(MM) * D;
 #pragma unroll
   for (ushort index = 0; index < running.get_capacity(); ++index) {
     if (running_full || running.is_valid_element(index))
@@ -476,7 +493,7 @@ inline void relative_attention_page_loop(
         decltype(q0), decltype(k0), Score>();
     auto ks = kt.template slice<D, N>(0, 0);
     qk.run(q0, ks, page_scores);
-    page_scores.store(st.template slice<N, M>(0, 0));
+    page_scores.store(st.template slice<N, MM>(0, 0));
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -492,13 +509,22 @@ inline void relative_attention_page_loop(
           tensors.key_scales, tensors.value_scales, token_start, visible_tokens, committed_tokens, active_rows,
           in_tree, tree.anchor, ancestors, depth, lane, thread_index);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The running output's rescale, every element by its row's scale. The
+    // compiler schedules this loop by its form, and which form runs faster
+    // depends on the tile's rows and the GPU family, so the host chooses it
+    // for each tile shape (BoundedRescale; ops::AttentionCalibration::
+    // boundedRescaleRows): the rows' bound, which every element of a tile of
+    // whole matmul rows meets, or none (a pad row's scale is 1). Unrolled in
+    // full the bounded loop took the split's tiles of 24 rows 8-14% less time
+    // again (20-core M5 Pro; 2-12% on a 10-core M4).
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
-#pragma unroll
+#pragma clang loop unroll(full)
       for (ushort index = 0; index < running.get_capacity(); ++index) {
         if (!running_full && !running.is_valid_element(index))
           continue;
         auto coordinates = running.get_multidimensional_index(index);
-        running[index] *= previous_scale[coordinates[1]];
+        if (!BoundedRescale || coordinates[1] < M)
+          running[index] *= previous_scale[coordinates[1]];
       }
     }
     auto vs = vt.template slice<N, D>(0, 0);

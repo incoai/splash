@@ -238,13 +238,14 @@ public:
   // Whether the disk tier can take this state's write at all: a RAM copy of
   // a model with a state tier.
   [[nodiscard]] virtual bool writable() const noexcept { return false; }
-  // Whether the disk tier takes this state's write now, for a state in use
-  // or not: a writable copy, the tier's state file takes writes, its limit
-  // holds a state's slot, and the write budget admits one of the class
-  // (model::SlotFile::takesWrite). Of a writable copy it depends on the tier
-  // and the class alone, the same for every such copy, so the cache asks one
-  // for all (StateCache::takesWrite).
-  [[nodiscard]] virtual bool canOffload(bool) const noexcept { return false; }
+  // Whether the disk tier takes this state's write now: a writable copy, the
+  // tier's state file takes writes, its limit holds a state's slot, and the
+  // write budget admits a cache write (model::SlotFile::takesWrite), and for
+  // offload() the tier holds the staging buffer its copy goes through. Of a
+  // writable copy each depends on the tier alone, the same for every such
+  // copy, so the cache asks one for all (StateCache::takesWrite).
+  [[nodiscard]] virtual bool canOffload() const noexcept { return false; }
+  [[nodiscard]] virtual bool canPersist() const noexcept { return canOffload(); }
   // Starts writing this state to the disk tier and returns the ticket that
   // carries its disk copy; the source is free as soon as the call returns.
   // A null ticket means that the disk quota cannot admit another state.
@@ -401,8 +402,9 @@ struct ModelBatchItem final {
   uint64_t logicalPosition = 0;
   uint32_t tokenCount = 0;
   std::span<const uint32_t> pageTable;
-  // pageTableRevision names the page list and is nonzero; the list equals
-  // the one at revision - 1 below pageTableFirstChanged.
+  // pageTableRevision names the page lists, pageTable and windowTables, and
+  // is nonzero; each list equals its own at revision - 1 below
+  // pageTableFirstChanged.
   uint64_t pageTableRevision = 0;
   uint32_t pageTableFirstChanged = 0;
   // Where each page of the list reads its K/V from, cut with the list
@@ -417,6 +419,11 @@ struct ModelBatchItem final {
   // cycle's: at most one, the page boundary past logicalPosition that the
   // rows the lane may retain reach (Model::capturesInDecode).
   std::vector<StateCapture> stateCaptures{};
+  // With a window, a table per page of a block's window unit
+  // (kv::Layout::windowUnitPages), each as long as pageTable: table j holds,
+  // by logical page, the j-th page of each block's window unit. Empty
+  // without a window.
+  std::span<const std::vector<uint32_t>> windowTables{};
 };
 
 struct ModelStepResult final {
@@ -686,8 +693,13 @@ struct ExecutionLimits final {
   // the 64 pages and eight 69 of 128. 16 pages a lane hold tables of up to
   // 28 points (StepCosts::requireRunway refuses more) and keep eight lanes'
   // runway to 128 pages: one extent where extents are 128 pages or more.
-  [[nodiscard]] static constexpr uint32_t runwayPages(uint32_t extentPages, uint32_t lanes) noexcept {
-    const uint32_t pages = warmupKvPages * (lanes > defaultLanes ? lanes : defaultLanes) / defaultLanes;
+  // A block takes `blockPages` pages (kv::Layout::blockPages): warmup's
+  // block b takes the runway's pages from b x blockPages, its base page and
+  // then its window unit's.
+  [[nodiscard]] static constexpr uint32_t runwayPages(uint32_t extentPages, uint32_t lanes,
+                                                      uint32_t blockPages) noexcept {
+    const uint32_t pages =
+        warmupKvPages * (lanes > defaultLanes ? lanes : defaultLanes) / defaultLanes * blockPages;
     return (pages + extentPages - 1) / extentPages * extentPages;
   }
   // The most rows of a decode step of `lanes` lanes: a verify block a lane,
@@ -778,6 +790,12 @@ struct ModelMemoryPlan final {
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
   // The lanes the arenas hold (QwenTargetGeometry::lanes).
   uint32_t lanes = ExecutionLimits::defaultLanes;
+  // The decode arena's page tables of one page a lane, as a layout without a
+  // window holds them, and what a windowed layout's tables of its window
+  // unit's pages add to them, in sharedDecodePlannedAllocatedBytes
+  // (DecodeTensor::PageTable holds one a page of a block).
+  uint64_t pageTableBytes = 0;
+  uint64_t windowTableBytes = 0;
 };
 
 // Fixed reserves the memory plan carries beside the planned arenas: Metal
@@ -942,10 +960,10 @@ public:
   // need.pages pages, which holds Index pages, the request's while its
   // prompt goes on, also once refused (model::KvHistoryStream::reserve).
   [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t, SpilledReadNeed) { return {.ok = true}; }
-  // Whether the disk tier takes a state written from a lane now, for a
-  // state in use or not, as CompositeState::canOffload. Room in the quota is
-  // the write's own concern.
-  [[nodiscard]] virtual bool canSnapshotToDisk(bool) const noexcept { return false; }
+  // Whether the disk tier takes a state written from a lane now, as
+  // CompositeState::canOffload. Room in the quota is the write's own
+  // concern.
+  [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
   // Writes the request's committed state at its current page-aligned
   // boundary to the disk tier from the lane's own buffers, for a state no
   // cached state's buffers could be reserved for; the ticket carries its disk
@@ -979,6 +997,14 @@ public:
   // The state bytes a lane's start allocates: the buffers the idle pool
   // lacks for its lane. Zero by default.
   [[nodiscard]] virtual uint64_t startStateBytes() const noexcept { return 0; }
+  // What a start of `request` builds for its images at most, as though none
+  // were held or encoded yet: the vision scratch of its largest image past
+  // its restored prefix and each such image's pixel and embedding buffers.
+  // Zero without images, and by default.
+  [[nodiscard]] virtual uint64_t imageStartBytes(const ModelRequest &request) const {
+    static_cast<void>(request);
+    return 0;
+  }
   // What one prefill command may hold (commandViolation): by default a
   // chunk's rows in one pass over one layer, one lane past a chunk and no
   // lane whose history holds Index pages, as a model without readers of
@@ -1021,9 +1047,17 @@ public:
   // warms (ops::ExecutionPlans::prefillRowClasses, of the target's MoE
   // blocks and relative attention).
   [[nodiscard]] virtual std::vector<uint32_t> prefillRowClasses() const = 0;
+  // What the target's plans round to int8 activations so far, at a context
+  // of `contextTokens` (ops::ExecutionPlans::activationsDescription).
+  [[nodiscard]] virtual std::string activationsDescription(uint32_t contextTokens) const = 0;
   // Actual rows, not padded dispatch rows; valid range is 1..prefillTokenBudget.
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;
+  // Creates the pipelines of every decode cycle of `width` lanes without
+  // running one and without the lanes' state (Runtime::prepareDecodeBatch):
+  // a width whose warmup the start's memory does not afford, which the
+  // engine may still admit, so its first cycle creates none while serving.
+  virtual WarmupStepResult prepareDecodeBatch(uint32_t width) = 0;
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;
   [[nodiscard]] virtual ModelTelemetry telemetry() const noexcept = 0;

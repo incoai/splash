@@ -21,6 +21,10 @@
 
 namespace {
 
+// The devices stream 13.5 GB/s a core, the plain read the backend measures on the 12-core M6 (161.9 GB/s), which
+// the matrix tile's split law reads (KernelCalibration::memoryBytesPerSecond).
+constexpr uint64_t kBytesPerSecondPerCore = 13'500'000'000;
+
 using namespace splash;
 
 using splash::test::rejects;
@@ -107,7 +111,8 @@ model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
 
 // A layer's gate and up projections run as one gate/up plan, so their shapes
 // must match, though not their formats: a pair with an F16 tensor, which the
-// Apple9 register tile does not take, stages. The vocabulary head reserves
+// Apple9 register tile does not take, stages on Apple9 and runs the matrix
+// tile on Apple10 and Apple11, as every pair does there. The vocabulary head reserves
 // workspace only in decode, and the arenas hold a gate/up layer's decode and
 // short-prefill plans and a mixed pair's decode plans at the rows they store.
 void checkGateUpLayers() {
@@ -133,6 +138,7 @@ void checkGateUpLayers() {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
     ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     for (const uint32_t runtimeLanes : {model::ExecutionLimits::defaultLanes, model::kLaneCount}) {
       const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8, ops::GdnStateFormat::Float32,
@@ -158,8 +164,9 @@ void checkGateUpLayers() {
                     scratch.partials >= required.partials && scratch.counters >= required.counters,
                 "the decode arena is below a gate/up layer's scratch");
         require(model::DecodeArena::gateScratchBytes(geometry, plans) >= gate, "the gate/up workspace is too small");
-        // The F16 and Q8_0 pair stages, at rows the storage of the target's
-        // projections over a step's rows holds (ops::Linear::storageRows).
+        // The F16 and Q8_0 pair stages on Apple9 and runs the matrix tile on
+        // Apple10 and Apple11, at rows the storage of the target's projections
+        // over a step's rows holds (ops::Linear::storageRows).
         if (rows > ops::kMaximumDecodeTileRows) continue;
         const auto pair = plans.decodeLinear().plan(mixed.upProjection, rows,
                                                     ops::LinearEpilogue::GateUp, &mixed.gateProjection);
@@ -167,8 +174,10 @@ void checkGateUpLayers() {
         uint32_t storage = 0;
         for (const auto &shape : geometry.target.decodeProjections)
           storage = std::max(storage, plans.decodeLinear().storageRows(rows, shape));
-        require(pair.configuration().tile == ops::LinearTile::GgufStaged && pair.storageRows() <= storage,
-                "a gate/up pair with an F16 gate did not stage within the decode storage");
+        require(pair.configuration().tile ==
+                        (family == 9 ? ops::LinearTile::GgufStaged : ops::LinearTile::GgufMatrix) &&
+                    pair.storageRows() <= storage,
+                "a gate/up pair with an F16 gate did not run its device's tile within the decode storage");
         require(scratch.input >= paired.input && scratch.sums >= paired.sums && scratch.partials >= paired.partials &&
                     scratch.counters >= paired.counters &&
                     model::DecodeArena::gateScratchBytes(geometry, plans) >= pair.gateScratchBytes(),
@@ -201,6 +210,7 @@ void checkDraftGateScratch(const model::LoadedModel &loaded) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
+      device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
       const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
       for (uint32_t runtimeLanes = 1; runtimeLanes <= model::kLaneCount; ++runtimeLanes) {
         const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts,
@@ -229,6 +239,7 @@ void checkPrefillInt8Scratch() {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = 20;
+      device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
       const ops::ExecutionPlans plans(device, setting);
       // The arena's codes and scales for `loaded`, and the tables of its plans
       // on the decode tiles.
@@ -263,6 +274,54 @@ void checkPrefillInt8Scratch() {
     }
 }
 
+// Where a start gives no --activations its model's family gives the default (ModelDescriptor::activations):
+// bf16 for Inkling-2, auto's int8 paths for every other family. So on a GPU with int8-activation paths (Apple10,
+// Apple11) Inkling-2's plans by default run an af4g64 projection's 2048-row chunk on the bf16 prefill tile and score
+// no INT8 queries after 32K tokens, --activations auto gives it both as it gives every family, and a Qwen
+// target's default takes both as it did.
+void checkFamilyActivations() {
+  uint32_t families = 0;
+  model::forEachFamily([&](const auto &layout) {
+    model::ModelDescriptor descriptor;
+    descriptor.target = layout;
+    const bool inkling = std::is_same_v<std::decay_t<decltype(layout)>, model::Inkling2LoopLayout>;
+    require(descriptor.activations() == (inkling ? ops::Int8Activations::Off : ops::Int8Activations::On),
+            std::string(layout.family) + " has another default of --activations than its family's");
+    ++families;
+  });
+  require(families == std::tuple_size_v<decltype(model::kFamilies)>, "a family's activations were not read");
+  model::ModelDescriptor inkling, qwen;
+  inkling.target = model::Inkling2LoopLayout{};
+  qwen.target = model::Qwen3_8Layout{};
+  const ops::Projection af4(5120, 17408,
+                            ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_AF4G64, 5120, 17408, {}, {}, {})}});
+  const kv::Layout layout{1, 2, 256};
+  const std::array sequence{ops::PagedAttention::chunkParams(32768, 64, 64, (32768 + 64 + 31) / 32)};
+  for (uint32_t family : {9U, 10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    // Whether the plans of a start that gave `given`, or nothing, take the int8 paths.
+    const auto int8Paths = [&](std::optional<ops::Int8Activations> given, const model::ModelDescriptor &model) {
+      const ops::ExecutionPlans plans(device, given.value_or(model.activations()));
+      const bool tile = plans.linear().plan(af4, 2048, ops::LinearEpilogue::Residual).configuration().tile ==
+                        ops::LinearTile::GgufPrefillInt8;
+      const bool queries = plans.attention(sequence, 16, layout, plans.sequenceAttentionWorkspace(16, layout))
+                               .splitPipeline()
+                               .find("q8q") != std::string::npos;
+      require(tile == queries && tile == (plans.linear().int8Activations() == ops::Int8Activations::On && family >= 10),
+              "the int8 prefill tile and INT8 queries do not follow the plans' activations");
+      return tile;
+    };
+    const bool int8 = family >= 10;
+    require(!int8Paths({}, inkling) && int8Paths(ops::Int8Activations::On, inkling) == int8 &&
+                !int8Paths(ops::Int8Activations::Off, inkling),
+            "Inkling-2 took int8 activations by default, or --activations auto did not give it them");
+    require(int8Paths({}, qwen) == int8 && int8Paths(ops::Int8Activations::On, qwen) == int8 &&
+                !int8Paths(ops::Int8Activations::Off, qwen),
+            "a Qwen target's default left the int8 activations it took, or bf16 did not turn them off");
+  }
+}
+
 // A decode arena, of four lanes or eight, serves every lane count up to its
 // own, and a staged plan's partials grow with its rows. It must hold every lane's plan of every target
 // projection and the draft's context projections, over a lane's most rows,
@@ -291,6 +350,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
+      device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
       const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
       for (const auto &[matrix, laneRows] : matrices)
@@ -320,6 +380,7 @@ void checkDecodeStepMoe(const model::LoadedModel &loaded) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 20;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
     const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     const model::TargetRows step = model::decodeTargetRows(geometry, plans);
     require(step.rows == stepRows, "the decode arena does not hold a step's rows");
@@ -346,6 +407,7 @@ void checkDecodeStepRows(const model::LoadedModel &loaded) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 20;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
     const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
       const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts,
@@ -396,6 +458,7 @@ void checkMoeInt8Passes(const model::LoadedModel &loaded) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 20;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
     const ops::ExecutionPlans plans(device, ops::Int8Activations::Off), int8(device, ops::Int8Activations::On);
     ops::MoeShape shape = geometry.target.moeBlockShape();
     shape.int8Experts = true;
@@ -428,6 +491,7 @@ void checkDecodeArenaPages(const model::LoadedModel &loaded) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 20;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
     const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     const ops::LinearScratchSize linear = model::DecodeArena::linearScratchSize(geometry, plans);
     uint64_t pages = model::decodeArenaBaseBytes(geometry, plans);
@@ -461,6 +525,7 @@ void checkArenasHoldTheirLanes(const char *name, const model::LoadedModel &loade
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
   const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   require(four.target.lanes == model::ExecutionLimits::defaultLanes &&
               model::plannedDecodeBytes(eight, plans) > model::plannedDecodeBytes(four, plans) &&
@@ -522,6 +587,7 @@ uint64_t decodeBytes(const model::RuntimeGeometry &geometry, model::DecodeTensor
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
   return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device, ops::Int8Activations::On))[static_cast<uint32_t>(tensor)];
 }
 
@@ -583,6 +649,7 @@ void checkArenasWithoutGdnLayers() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
   const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   // Whether `bytes` are the hybrid's but for the GDN tensors, which only the
   // hybrid's arena holds.
@@ -630,6 +697,7 @@ void checkDenseHalves() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
   const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   auto single = dense;
   single.prefillChunks = 1;
@@ -746,6 +814,7 @@ void checkPrefillAttentionHistory() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
   const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   const uint32_t heads = geometry.target.attentionQueryHeads;
   const kv::Layout &layout = geometry.target.kvLayout;
@@ -776,15 +845,18 @@ int main() {
     checkArenasWithoutGdnLayers();
     checkDenseHalves();
     checkPrefillInt8Scratch();
+    checkFamilyActivations();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
-    checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {450'576'384, 434'864'128},
-                              {749'715'456, 733'609'984, 733'609'984});
-    checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {279'281'664, 273'874'944},
-                              {539'017'216, 533'610'496, 533'446'656});
+    // Decode arenas: 98,304 bytes over 1.7.4's on every model and family, the draft selector's partial ids and
+    // values sized for its most shards (32, where 1.7.4 held 8), two buffers of four lanes' 28 positions.
+    checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {450'674'688, 431'947'776},
+                              {749'715'456, 730'988'544, 730'988'544});
+    checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {279'379'968, 272'760'832},
+                              {539'017'216, 532'561'920, 532'398'080});
     checkArenasHoldTheirLanes("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>(),
-                              {409'796'608, 403'963'904}, {1'124'614'144, 1'118'781'440, 1'118'781'440});
+                              {409'894'912, 401'965'056}, {1'124'614'144, 1'116'684'288, 1'116'684'288});
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepRows(loadedModel<model::Qwen3_8Weights>());

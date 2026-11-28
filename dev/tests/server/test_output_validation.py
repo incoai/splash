@@ -41,7 +41,9 @@ class OutputValidationTests(unittest.TestCase):
     def test_reference_lookup_crashes_are_evaluation_failures(self):
         # referencing's draft 3 crawls an extends object's keys as schemas once a
         # lookup scans the document, here for the nested id; the AttributeError
-        # escaped validation as an internal server error.
+        # escaped validation as an internal server error. A response format
+        # holding extends is refused before generation (the grammar does not
+        # enforce it), so the validator is built directly.
         schema = {
             "$schema": "http://json-schema.org/draft-03/schema#",
             "type": "object",
@@ -55,9 +57,15 @@ class OutputValidationTests(unittest.TestCase):
                 }
             },
         }
-        _, validator = tool_schema.normalize_response_format(
-            {"type": "json_schema", "json_schema": {"schema": schema}}
-        )
+        with self.assertRaises(api.APIError) as caught:
+            tool_schema.normalize_response_format(
+                {
+                    "type": "json_schema",
+                    "json_schema": {"schema": schema, "strict": True},
+                }
+            )
+        self.assertEqual(caught.exception.status, 400)
+        validator = schema_validation.build_validator(schema)
         with self.assertRaises(api.APIError) as caught:
             model_output.validate_response_content('{"a": {"b": "y"}}', validator)
         self.assertEqual(caught.exception.status, 500)

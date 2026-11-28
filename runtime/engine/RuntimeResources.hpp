@@ -61,31 +61,37 @@ struct RuntimeCacheIdentity {
   model::RopeScaling ropeScaling;
   // The target model's manifest.
   std::string targetModelSha256;
+  // --cached-states (none without GDN layers) and --activations, which
+  // every cached page and state was computed at.
+  std::string_view cachedStates = "int8";
+  ops::Int8Activations activations = ops::Int8Activations::On;
 };
 
-[[nodiscard]] RuntimeCacheIdentity
-makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
-                         std::string_view targetManifestSha256,
-                         std::string_view buildId,
-                         kv::Layout targetKvLayout,
-                         model::RopeScaling ropeScaling);
+[[nodiscard]] RuntimeCacheIdentity makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
+                                                            std::string_view targetManifestSha256,
+                                                            std::string_view buildId, kv::Layout targetKvLayout,
+                                                            model::RopeScaling ropeScaling);
 
 // The name of the directory a persistent cache tier keeps its files in:
 // what its copies hold, from the models that computed them, the KV and
-// state layouts, the target's RoPE scaling and the format of the cache's
-// files. The build is not part of it; a change to what a copy holds bumps
+// state layouts, the target's RoPE scaling, bf16 activations and the format
+// of the cache's files. The build is not part of it; a change to what a copy holds bumps
 // the cache's format instead.
-[[nodiscard]] std::string
-persistentCacheNamespace(const RuntimeCacheIdentity &identity,
-                         const model::CompositeStateLayout &states);
+[[nodiscard]] std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
+                                                   const model::CompositeStateLayout &states);
 
-// A persistent cache tier's directory, and the files of its KV pages and
+// A persistent cache tier's directory, and the files of its KV copies, one
+// for each component of a block (kv::Component), base first, and of its
 // states there.
 struct PersistentCacheFiles final {
   std::unique_ptr<CacheDirectory> directory;
-  std::shared_ptr<model::SlotFile> kv;
+  std::vector<std::shared_ptr<model::SlotFile>> kv;
   std::shared_ptr<model::SlotFile> states;
 };
+
+// A start refused for want of memory, by the host's reserve or a command out of
+// GPU memory (RuntimeBootstrapReport::commandOutOfMemory): why, and what to do.
+[[nodiscard]] std::string startMemoryRefusal(std::string_view why);
 
 // The memory plan counts each weight category from the loaded model, so
 // every category the model has must report its allocation and identity.
@@ -159,19 +165,21 @@ struct RuntimeResourcesConfig {
   // --kv-spill always: every request of a spill-capable target spills, for
   // validation (EngineSpillConfig::always).
   bool kvSpillAlways = false;
-  // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
-  // for validation that trimming changes no output (CacheWindowPolicy::trim).
-  bool kvWindowTrim = true;
   // --verify-rows: the rows a decode cycle verifies (reportVerifyRows); a
   // benchmark round verifies every row of a draft's block a lane (all) so
   // that rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
   // --max-concurrent-requests: the lanes the runtime runs and plans for.
   uint32_t lanes = model::ExecutionLimits::defaultLanes;
-  // --activations: whether the plans may round activations to int8
-  // where an int8-activation path takes them, or keep every activation bf16
-  // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
-  ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  // --activations: whether the plans may round activations to int8 where
+  // an int8-activation path takes them (ops::Int8Activations), for the
+  // engine's life; none, not given, is ModelDescriptor::activations.
+  std::optional<ops::Int8Activations> int8Activations;
+  // --weights: whether the target's 16-bit projections load as Q8_0 or as
+  // their files store them (model::gguf::float16Planes), which the sizing,
+  // the planned geometry and the load all take, and so the weights' manifest
+  // and the persistent cache's namespace.
+  model::gguf::Float16Weights weights = model::gguf::Float16Weights::Published;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
