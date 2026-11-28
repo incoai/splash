@@ -1195,6 +1195,16 @@ class InklingCallReadingTests(unittest.TestCase):
                     '{"city":"Paris","days":3}{}',
                 )
 
+    def test_json_call_with_whitespace_after_wrapper_close(self):
+        call = inkling2_call("weather", {"city": "Paris"})
+        text = call.removesuffix(END) + " " + END
+        expected = '{"city":"Paris"}'
+        for size in (1, len(text)):
+            with self.subTest(size=size):
+                _, _, calls, events = self.read(text, size)
+                self.assertEqual(calls[0]["function"]["arguments"], expected)
+                self.assertEqual(streamed_arguments(events), expected)
+
     def test_a_cut_call_is_not_a_call(self):
         # Its arguments do not read as the object a call carries, and it
         # streamed nothing.
