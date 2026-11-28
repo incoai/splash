@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 namespace splash::ops {
 namespace {
@@ -192,8 +191,7 @@ void DraftAttention::addDecode(
   DraftAttentionBatchParams params{kWindow, lanes, {}};
   std::copy(cacheLengths.begin(), cacheLengths.end(),
             std::begin(params.cache_length));
-  std::vector<metal::MetalBuffer> bindings{buffers.groupedQueries};
-  bindings.reserve(2 * kMaximumLanes + 3);
+  metal::BufferList bindings{buffers.groupedQueries};
   appendLaneBindings(bindings, buffers.persistentKeys,
                      buffers.persistentValues);
   bindings.push_back(buffers.queryKeys);
@@ -252,10 +250,9 @@ void DraftAttention::addContextCommit(
   DraftContextBatchParams params{};
   std::copy(startPositions.begin(), startPositions.end(),
             std::begin(params.start_position));
-  std::vector<metal::MetalBuffer> bindings{
+  metal::BufferList bindings{
       std::move(contextKv), std::move(keyNorm), std::move(ropeCos),
       std::move(ropeSin)};
-  bindings.reserve(2 * kMaximumLanes + 6);
   appendLaneBindings(bindings, persistentKeys, persistentValues);
   bindings.push_back(std::move(retainedRows));
   bindings.push_back(std::move(laneRows));

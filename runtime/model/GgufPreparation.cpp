@@ -853,7 +853,8 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
       },
       [&](size_t index, unsigned buffer) {
         const GpuChunk &chunk = gpuChunks[index];
-        std::vector<metal::BufferBinding> buffers = chunk.buffers;
+        decltype(metal::ComputeDispatch::buffers) buffers;
+        buffers.insert(buffers.end(), chunk.buffers.begin(), chunk.buffers.end());
         buffers.push_back({chunk.input, inputs[buffer]});
         const metal::ComputeDispatch dispatch{chunk.pipeline,
                                               std::move(buffers),

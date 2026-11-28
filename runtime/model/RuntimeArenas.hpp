@@ -722,6 +722,8 @@ public:
                                       "qwen-shared-decode")),
         target_(backend_, base_, 0, geometry_.target, decodeTargetRows(geometry_, operators)),
         held_(decodeArenaLanes(geometry_, operators)) {
+    if (held_ > kLaneCount)
+      throw std::logic_error("decode arena holds more lanes than its slices");
     auto sizes = decodeTensorBytes(geometry_, operators);
     uint64_t cursor = TargetArena::bytes(geometry_.target, target_.shape());
     for (uint32_t tensor = 0; tensor < sizes.size(); ++tensor) {
@@ -733,6 +735,10 @@ public:
         for (uint32_t lane = 0; lane < shares; ++lane) {
           tensors_[lane][tensor] = backend_.view(
               base_, cursor + uint64_t{lane} * stride, sizes[tensor]);
+        }
+        for (uint32_t lanes = 1; lanes <= held_; ++lanes) {
+          slices_[lanes - 1][tensor] = backend_.view(
+              base_, cursor, uint64_t{decodeTensorLanes(static_cast<DecodeTensor>(tensor), lanes)} * stride);
         }
       }
       cursor += alignUp(checkedMultiply(stride, shares, "decode tensor"));
@@ -775,16 +781,15 @@ public:
     return tensors_[lane][static_cast<uint32_t>(tensor)];
   }
 
-  [[nodiscard]] metal::MetalBuffer batchSlice(DecodeTensor tensor, uint32_t lanes) const {
+  // The first `lanes` lanes of `tensor`, a view built with the arena: a
+  // decode step binds dozens of these, so none allocates.
+  [[nodiscard]] const metal::MetalBuffer &batchSlice(DecodeTensor tensor, uint32_t lanes) const {
     if (!lanes || lanes > held_)
       throw std::out_of_range("invalid decode batch width");
-    const uint32_t index = static_cast<uint32_t>(tensor);
     // Model-specific scratch is represented by an empty buffer.  The
     // selected target graph consumes either dense-FFN or MoE tensors, never
     // both, so no dummy allocation is needed for the inactive operator.
-    if (!sizes_[index])
-      return {};
-    return backend_.view(base_, offsets_[index], uint64_t{decodeTensorLanes(tensor, lanes)} * sizes_[index]);
+    return slices_[lanes - 1][static_cast<uint32_t>(tensor)];
   }
   // A tensor's slice of every lane the arena holds.
   [[nodiscard]] metal::MetalBuffer all(DecodeTensor tensor) const { return batchSlice(tensor, geometry_.target.lanes); }
@@ -862,6 +867,9 @@ private:
   // The lanes its tensors hold (decodeArenaLanes).
   uint32_t held_ = 0;
   std::array<std::array<metal::MetalBuffer, decodeTensorCount>, kLaneCount> tensors_{};
+  // slices_[lanes - 1][tensor]: batchSlice's views, empty for an unused
+  // tensor.
+  std::array<std::array<metal::MetalBuffer, decodeTensorCount>, kLaneCount> slices_{};
   std::array<uint64_t, decodeTensorCount> offsets_{};
   std::array<uint64_t, decodeTensorCount> sizes_{};
   metal::MetalBuffer gateScratch_;

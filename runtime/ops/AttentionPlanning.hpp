@@ -14,7 +14,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <vector>
 
 // The planning the attention operators share, which every split and reduce
 // of the paged attention (ops::PagedAttention) and of relative attention
@@ -181,7 +180,8 @@ inline void addKvPathCommit(metal::CommandGraph &graph, std::string (*kernel)(kv
   }
   requireBytes(paths, uint64_t{lanes} * sizeof(uint32_t), "KV path commit paths");
   const auto tables = laneBindings(pageTables);
-  std::vector<metal::MetalBuffer> bindings(tables.begin(), tables.end());
+  metal::BufferList bindings;
+  bindings.insert(bindings.end(), tables.begin(), tables.end());
   bindings.push_back(paths);
   graph.add(kernel(layout), std::move(bindings), params, {uint64_t{layout.attentionLayers} * layout.kvHeads, lanes, 1},
             {layout.headDimension, 1, 1});
