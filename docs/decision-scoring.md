@@ -39,7 +39,7 @@ readout.
      accumulation),
    - the 20 highest logits, with ties broken toward the lower id.
 
-   The `DoneEvent` carries both. The native protocol (version 15) appends
+   The `DoneEvent` carries both. The native protocol (version 17) appends
    `f64 log_normalizer, u32 top_count, u32 ids[], f32 logits[]` after the
    option logits, only when there are option logits; generation Done events
    keep their bytes. CPU cost is about 1 ms per score request.
