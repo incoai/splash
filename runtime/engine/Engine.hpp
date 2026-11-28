@@ -570,6 +570,7 @@ private:
     bool replaying = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;
+    ScoreReadout scoreReadout;
     // The tokens a restore that failed would have resumed from, until the
     // start that follows reports it (ReuseEnd::DiskReadFailed); and the
     // final lookup's restored KV that only the SSD cache held.
@@ -1348,7 +1349,7 @@ private:
                                           metal::AllocationFailure failure,
                                           std::string_view detail = {}) const;
   void finish(Request &request, EngineFinishReason reason,
-              std::span<const float> optionLogits);
+              std::span<const float> optionLogits, const ScoreReadout &score = {});
   void finishFailure(Request &request, LaneEnd end);
   // Gives back what a lane holds: the command between its passes that
   // holds it, given up, its planned state boundaries, its

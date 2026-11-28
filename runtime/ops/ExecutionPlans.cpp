@@ -20,7 +20,8 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations
     : taken_(std::make_shared<Int8PathsTaken>()), linear_(device, int8Activations, StepKind::Prefill, taken_),
       decodeLinear_(device, int8Activations, StepKind::Decode, taken_),
       draftLinear_(device, Int8Activations::Off, StepKind::Prefill),
-      draftDecodeLinear_(device, Int8Activations::Off, StepKind::Decode) {}
+      draftDecodeLinear_(device, Int8Activations::Off, StepKind::Decode),
+      scoreLinear_(device, Int8Activations::Off, StepKind::Prefill, {}, true) {}
 
 std::string ExecutionPlans::activationsDescription(kv::Layout layout, uint32_t queryHeads, uint32_t contextTokens,
                                                    std::span<const AttentionVariant> paged,

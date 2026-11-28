@@ -49,6 +49,12 @@ public:
   // The draft's plans of a decode step's rows (its context projections over the
   // step's rows, DFlashDraft::addContextCommit): draftLinear's in a decode step.
   [[nodiscard]] const Linear &draftDecodeLinear() const noexcept { return draftDecodeLinear_; }
+  // A score request's prefill chunk's plans (POST /v1/score): split-free in
+  // bf16 activations (Linear::splitFree), so its logits do not depend on the
+  // rows that share its ragged prefill or where the prefix cache resumes it.
+  // Its plans bind the chunk's prefill buffers, which hold the prefill
+  // budget's rows, and no split partials or table.
+  [[nodiscard]] const Linear &scoreLinear() const noexcept { return scoreLinear_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
   // What the target's plans round to int8 activations, as the start's
   // precision line names it: `bf16` with int8 activations off; else `auto`
@@ -142,6 +148,7 @@ private:
   Linear decodeLinear_;
   Linear draftLinear_;
   Linear draftDecodeLinear_;
+  Linear scoreLinear_;
 };
 
 } // namespace splash::ops

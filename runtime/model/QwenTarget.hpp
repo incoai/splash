@@ -299,6 +299,10 @@ struct QwenTargetPrefillSequence final {
 struct QwenTargetPrefillBuffers final {
   // Split projections of the chunks the staged tile runs (LinearGguf.cpp).
   ops::LinearScratch linearScratch{};
+  // Run the chunk's projections split-free (ops::LinearWorkload::splitFree):
+  // set when it prefills a score request, whose final-position logits must
+  // not depend on the rows that share its ragged prefill.
+  bool splitFree = false;
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
   metal::MetalBuffer captured;
@@ -642,6 +646,10 @@ protected:
     std::vector<uint32_t> readRows{};
     // A decode step's own buffers; none for a prompt chunk.
     const QwenTargetDecodeBuffers *decode = nullptr;
+    // The plans of the step's projections and of what their producers write:
+    // ExecutionPlans::scoreLinear for a chunk that prefills a score request
+    // (QwenTargetPrefillBuffers::splitFree), linear(step) otherwise.
+    const ops::Linear *linear = nullptr;
     [[nodiscard]] uint32_t outputRows() const noexcept {
       return readRows.empty() ? rows : static_cast<uint32_t>(readRows.size());
     }

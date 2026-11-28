@@ -330,6 +330,8 @@ class Plan:
         matched_tokens=1,
         logits=None,
         start=None,
+        normalizer=0.0,
+        top=(),
     ):
         self.batches = list(batches)
         self.reason = reason
@@ -354,6 +356,8 @@ class Plan:
         else:
             end = (wire.ReuseEnd.PREFIX_END, prefix)
         self.start = (prefix, source, lost, *end)
+        self.normalizer = normalizer
+        self.top = tuple(top)
         self.started = threading.Event()
         self.release = threading.Event()
         if not block:
@@ -579,6 +583,13 @@ class FakeRuntime:
             3_000,
             tuple(plan.logits) if plan.logits is not None else (),
             bounded=reason == wire.FinishReason.LENGTH and plan.reason == "bounded",
+            log_normalizer=float(plan.normalizer) if plan.logits is not None else 0.0,
+            top_token_ids=tuple(token for token, _ in plan.top)
+            if plan.logits is not None
+            else (),
+            top_logits=tuple(float(value) for _, value in plan.top)
+            if plan.logits is not None
+            else (),
         )
         call.complete(result=done)
 

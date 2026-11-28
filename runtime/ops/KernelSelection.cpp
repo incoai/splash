@@ -255,6 +255,12 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, StepKind step,
   const auto [n, k] = w.matrix;
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
+  // A split-free workload (a score request's prefill) keeps one K pass,
+  // whose outputs equal the prefill tile's bit for bit: the staged tile
+  // unsplit, unspread and on its own height up to kMaximumDecodeTileRows rows
+  // (one row group), the prefill tile past them.
+  if (w.splitFree)
+    return {.tile = w.rows <= kMaximumDecodeTileRows ? LinearTile::GgufStaged : LinearTile::GgufPrefill};
   if (w.rows > decodeTileRows(step)) return {.tile = LinearTile::GgufPrefill};
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp;
   // A plan of at most GGUF_COLUMN_ROWS rows runs the column tile, which reads
@@ -368,7 +374,10 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations, StepKind step,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   LinearConfig config = bf16Projection(calibration, step, w, unit, pairTensors);
-  if (int8Activations == Int8Activations::Off) return config;
+  // A split-free workload stays in bf16: the staged tile's int8 decode tiles
+  // and the int8 prefill tile would round its activations by the chunk's
+  // plan, so a score would not read the same logits in any chunk.
+  if (int8Activations == Int8Activations::Off || w.splitFree) return config;
   if (w.rows > kMaximumDecodeTileRows && int8PrefillPaths(calibration, int8Activations, step) && unit.prefillInt8Takes)
     return {.tile = LinearTile::GgufPrefillInt8};
   config.decodeInt8 = unit.decodeInt8Takes && decodeInt8(calibration.projection, step, w, config);

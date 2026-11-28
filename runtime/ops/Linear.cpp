@@ -191,9 +191,9 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
 }
 
 Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations, StepKind step,
-               std::shared_ptr<Int8PathsTaken> taken) noexcept
+               std::shared_ptr<Int8PathsTaken> taken, bool splitFree) noexcept
     : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations), step_(step),
-      taken_(std::move(taken)) {}
+      taken_(std::move(taken)), splitFree_(splitFree) {}
 
 uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -214,6 +214,7 @@ uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
+  workload.splitFree = workload.splitFree || splitFree_;
   validate(workload);
   return LinearPlan(workload, selectProjection(calibration_, int8Activations_, step_, workload, {}));
 }
@@ -221,6 +222,7 @@ LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutpu
   return LinearPlan(workload, config, destination);
 }
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
+  w.splitFree = w.splitFree || splitFree_;
   validate(w);
   const LinearWorkload selected = selectedWorkload(w, p.planOutputs());
   validate(selected);
@@ -335,14 +337,16 @@ void Linear::addResidualProjection(metal::CommandGraph &graph, metal::MetalBuffe
 // A chunk's rows decide whether its plans run the pair as one, so that a plan
 // of some of its rows computes them as the chunk's does.
 LinearInput Linear::swiGluInput(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows) const {
-  if ((chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows)
+  if (!splitFree_ && (chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows)
     return plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows).input();
   return plan(*ffn.gate, rows, LinearEpilogue::None, nullptr, chunkRows).input();
 }
 void Linear::addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &b,
                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, uint32_t chunkRows,
                        PreparedInput normalized) const {
-  if ((chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows) {
+  // A split-free SwiGLU runs gate then up at any rows, the plans a chunk past
+  // the decode tiles runs, so that a row's output is the same bits in any chunk.
+  if (!splitFree_ && (chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows) {
     add(graph,
         {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
          .prepared = normalized},

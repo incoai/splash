@@ -158,7 +158,11 @@ ops::AneFfn *QwenTarget::splitOf(std::span<const QwenTargetPrefillChunk> chunks,
                                  ops::AneFfn *aneFfn) const {
   uint32_t rows = 0;
   for (const QwenTargetPrefillChunk &chunk : chunks) rows += chunk.rows;
-  if (!aneFfn || !aneFfn->splits(rows)) return nullptr;
+  // A command that prefills a score request runs on the GPU alone: the Neural
+  // Engine's fp16 share of the dense FFN would make its logits depend on the split.
+  if (!aneFfn || !aneFfn->splits(rows) ||
+      std::ranges::any_of(chunks, [](const QwenTargetPrefillChunk &chunk) { return chunk.buffers.splitFree; }))
+    return nullptr;
   const uint32_t first = aneFfn->firstStepRows(rows);
   if (layers.first || layers.end != geometry_.layers || chunks.front().rows != first ||
       chunks.size() != (first < rows ? 2u : 1u))
@@ -174,6 +178,8 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     throw std::invalid_argument("invalid Qwen prefill chunk");
   PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers(), spilled};
   step.decode = chunk.decode;
+  if (step.decode && chunk.buffers.splitFree) throw std::invalid_argument("a Qwen decode step is not split-free");
+  step.linear = chunk.buffers.splitFree ? &operators_.scoreLinear() : &linear(step);
   if (step.decode && (step.decode->step.lanes != chunk.sequences.size() || step.decode->step.rows != chunk.rows))
     throw std::invalid_argument("a Qwen decode step's lanes or rows do not match its chunk");
   for (size_t index = 0; index < chunk.sequences.size(); ++index) {
@@ -240,7 +246,7 @@ void QwenTarget::addReadRows(const PrefillStep &step, const metal::MetalBuffer &
 void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
                                  BlockOutput output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  const ops::Linear &linear = this->linear(step);
+  const ops::Linear &linear = *step.linear;
   const uint32_t layer = step.gdnLayer++;
   linear.add(step.graph,
              {.input = b.normalized, .output = b.gdnPacked, .scratch = b.linearScratch,
@@ -297,7 +303,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
 void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
                                  BlockOutput output, std::span<const ops::AttentionBlocks> blocks) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  const ops::Linear &linear = this->linear(step);
+  const ops::Linear &linear = *step.linear;
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
   if (!blocks.empty() && blocks.size() != step.sequences.size())
@@ -387,7 +393,7 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
                                     ops::SwiGluProjections ffn, metal::MetalBuffer residual,
                                     metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  const ops::Linear &linear = this->linear(step);
+  const ops::Linear &linear = *step.linear;
   const uint32_t rows = step.outputRows();
   const ops::PrefillFfnBuffers buffers = b.ffn();
   // The other step's split FFN joins once this step's mixer is encoded
@@ -542,7 +548,7 @@ private:
         [&](const auto &mixer) {
           const ops::PreparedInput normalized = ops::Normalization::addRms(
               step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch,
-              linear(step).plan(mixer.inputProjection, step.rows).input());
+              step.linear->plan(mixer.inputProjection, step.rows).input());
           const BlockOutput block{mixerOutput(b, mixer), input};
           addPrefillMixer(step, mixer, normalized, block);
           return block.rows;

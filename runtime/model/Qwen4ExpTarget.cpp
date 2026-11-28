@@ -134,7 +134,7 @@ ops::PreparedInput Qwen4ExpTarget::addMix(PrefillStep &step, const Qwen4HyperWei
                                           metal::MetalBuffer output, const ops::Projection *next) const {
   const Qwen4Scratch &h = step.scratch;
   const ops::LinearScratch scratch = step.buffers.linearScratch;
-  const ops::Linear &linear = this->linear(step);
+  const ops::Linear &linear = *step.linear;
   const ops::HyperShape hs = hyperShape(geometry_);
   ops::HyperConnection::addNorm(step.graph, h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
                                 step.rows);
@@ -171,7 +171,7 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
   if (layer.ple) {
     const Qwen4PleWeights &ple = *layer.ple;
     const ops::NgramShape ps = ngramShape(geometry_);
-    const ops::Linear &linear = this->linear(step);
+    const ops::Linear &linear = *step.linear;
     addPleGather(step.graph, h, rows * geometry_.pleHeads());
     linear.addProjection(step.graph, h.pleRows, ple.key, h.gate, rows, b.linearScratch);
     linear.addProjection(step.graph, h.pleRows, ple.value, h.pleValue, rows, b.linearScratch);

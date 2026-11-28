@@ -210,6 +210,12 @@ struct LinearWorkload final {
   LinearMatrix matrix;
   uint32_t rows = 0;
   LinearEpilogue epilogue = LinearEpilogue::None;
+  // A score request's prefill (Linear::splitFree): one K pass on the staged
+  // tile up to kMaximumDecodeTileRows rows, the prefill tile past them, in
+  // bf16 activations, so each row's output is the same bits whatever chunk or
+  // ragged prefill it is in (scoring reads final-position logits that must not
+  // depend on other requests).
+  bool splitFree = false;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -384,9 +390,13 @@ struct Int8PathsTaken final {
 // compute.
 class Linear final {
 public:
-  // `taken`, where given, records the int8 paths its plans select.
+  // `taken`, where given, records the int8 paths its plans select. With
+  // splitFree, every plan is split-free (LinearWorkload::splitFree) and a
+  // SwiGLU runs as a gate plan and an up plan at any rows, as past the decode
+  // tiles: ExecutionPlans::scoreLinear, a prefill chunk's.
   explicit Linear(const DeviceCapabilities &device, Int8Activations int8Activations, StepKind step,
-                  std::shared_ptr<Int8PathsTaken> taken = {}) noexcept;
+                  std::shared_ptr<Int8PathsTaken> taken = {}, bool splitFree = false) noexcept;
+  [[nodiscard]] bool splitFree() const noexcept { return splitFree_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
   [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
@@ -483,6 +493,7 @@ private:
   Int8Activations int8Activations_;
   StepKind step_;
   std::shared_ptr<Int8PathsTaken> taken_;
+  bool splitFree_ = false;
 };
 
 } // namespace splash::ops
