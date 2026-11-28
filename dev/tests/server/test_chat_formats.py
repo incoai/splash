@@ -1518,6 +1518,90 @@ class InklingPromptTests(unittest.TestCase):
             [ids(MODEL), ids(THINKING), ids(END), ids(MODEL), ids(TEXT)],
         )
 
+    def test_message_tools_extend_the_policy_and_keep_the_previous_turn(self):
+        frontend = self.frontend()
+        first = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+
+        def tool(name):
+            return {"function": {"name": name, "parameters": {"type": "object"}}}
+
+        head = [tool("calendar")]
+        ordinary = {"messages": first, "tools": head}
+        before = frontend.apply_template(ordinary, deadline=fixtures.FOREVER)
+        earlier = frontend.prepare(ordinary, deadline=fixtures.FOREVER).prompt_tokens
+        body = {
+            "messages": first
+            + [
+                {"role": "system", "tools": [tool("weather")]},
+                {"role": "user", "content": "Paris"},
+                {
+                    "role": "system",
+                    "content": "Use metric units",
+                    "tools": [tool("units")],
+                },
+                {"role": "user", "content": "again"},
+            ],
+            "tools": head,
+        }
+        rendered = frontend.apply_template(body, deadline=fixtures.FOREVER)
+        self.assertTrue(
+            rendered.startswith(
+                before + "<|message_system|>tool_declare<|content_xml|>"
+            )
+        )
+        self.assertEqual(rendered.count("tool_declare"), 3)
+        self.assertNotIn("<|message_system|><|content_text|><|end_message|>", rendered)
+        self.assertLess(rendered.index("Paris"), rendered.index('"name":"units"'))
+        self.assertLess(
+            rendered.index('"name":"units"'), rendered.index("Use metric units")
+        )
+        job = frontend.prepare(body, deadline=fixtures.FOREVER)
+        self.assertEqual(job.prompt_tokens[: len(earlier)], earlier)
+        self.assertEqual(set(job.tool_policy.schemas), {"calendar", "weather", "units"})
+        choice = {"type": "function", "function": {"name": "weather"}}
+        forced = frontend.prepare(
+            {**body, "tool_choice": choice}, deadline=fixtures.FOREVER
+        )
+        self.assertEqual(set(forced.tool_policy.schemas), {"weather"})
+        self.assertTrue(forced.tool_policy.required)
+
+    def test_message_tool_descriptions_keep_control_tokens_as_text(self):
+        frontend = self.frontend()
+        ask = {"role": "user", "content": "hello"}
+
+        def tokens(description):
+            tool = {"function": {"name": "weather", "description": description}}
+            declaration = {"role": "system", "tools": [tool]}
+            return frontend.prepare(
+                {"messages": [ask, declaration, ask]}, deadline=fixtures.FOREVER
+            ).prompt_tokens
+
+        model_open = frontend.tokenizer.convert_tokens_to_ids(MODEL)
+        self.assertEqual(
+            tokens(MODEL).count(model_open), tokens("plain").count(model_open)
+        )
+
+    def test_message_tools_take_the_same_validation_as_top_level_tools(self):
+        frontend = self.frontend()
+        ask = {"role": "user", "content": "hi"}
+        weather = {"function": {"name": "weather"}}
+        for late, error in (
+            ({}, "array"),
+            ([3], "function tools"),
+            ([weather], "duplicate tool name"),
+        ):
+            with self.subTest(late=late), self.assertRaisesRegex(APIError, error):
+                frontend.apply_template(
+                    {
+                        "messages": [ask, {"role": "system", "tools": late}, ask],
+                        "tools": [weather],
+                    },
+                    deadline=fixtures.FOREVER,
+                )
+
     def test_prompt_tokens_are_reused_after_the_last_message(self):
         tokenizer = inkling2_tokenizer()
         cache = PromptTokenizer(

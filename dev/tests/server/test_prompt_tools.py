@@ -146,6 +146,21 @@ class PromptToolsTests(unittest.TestCase):
                 self.assertEqual("<think>" in rendered, effort != "none")
         self.assertFalse(self.runtime.requests)
 
+    def test_message_tools_require_a_template_that_can_declare_them_in_place(self):
+        ask = {"role": "user", "content": "hello"}
+        data = self.post(
+            "/apply-template",
+            {
+                "messages": [
+                    ask,
+                    {"role": "system", "tools": [{"function": {"name": "weather"}}]},
+                    ask,
+                ]
+            },
+            400,
+        )
+        self.assertIn("system message tools", str(data))
+
     def test_template_without_generation_prefix_and_with_tools(self):
         body = {
             "messages": [{"role": "user", "content": "hello"}],
