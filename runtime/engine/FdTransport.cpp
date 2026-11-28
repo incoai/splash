@@ -9,6 +9,8 @@
 #include <climits>
 #include <cmath>
 #include <condition_variable>
+#include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
@@ -437,5 +439,44 @@ void FdTransport::outputFailed(int error) {
   outputError_ = error;
   throw std::system_error(error, std::generic_category(), "write(native output)");
 }
+
+namespace {
+
+std::atomic<FdTransport *> gStoppingTransport{nullptr};
+// The Splash server that started this engine, while it was alive when the
+// signals were installed; zero for none.
+pid_t gStoppingParent = 0;
+
+void requestShutdownFromSignal(int number, siginfo_t *info, void *) {
+  const int savedErrno = errno;
+  const bool parentAlive = gStoppingParent != 0 && ::getppid() == gStoppingParent;
+  if (number == SIGHUP || !parentAlive || (info && info->si_pid == gStoppingParent)) {
+    if (FdTransport *transport = gStoppingTransport.load(std::memory_order_acquire))
+      transport->requestShutdown();
+  }
+  errno = savedErrno;
+}
+
+} // namespace
+
+StopSignals::StopSignals(FdTransport &transport) {
+  gStoppingTransport.store(&transport, std::memory_order_release);
+  // A parent already gone left the engine to launchd (pid 1).
+  if (const char *parent = std::getenv("SPLASH_ENGINE_STOPPED_BY_PARENT"); parent && *parent == '1')
+    gStoppingParent = ::getppid() != 1 ? ::getppid() : 0;
+  struct sigaction action {};
+  action.sa_sigaction = requestShutdownFromSignal;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = SA_SIGINFO;
+  for (const int number : {SIGTERM, SIGINT, SIGHUP}) {
+    struct sigaction inherited {};
+    if (number == SIGHUP && sigaction(number, nullptr, &inherited) == 0 && inherited.sa_handler == SIG_IGN)
+      continue;
+    sigaction(number, &action, nullptr);
+  }
+  std::signal(SIGPIPE, SIG_IGN);
+}
+
+StopSignals::~StopSignals() { gStoppingTransport.store(nullptr, std::memory_order_release); }
 
 } // namespace splash::engine

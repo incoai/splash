@@ -29,7 +29,9 @@ void RoPE::addTables(
     metal::MetalBuffer targetCosine, metal::MetalBuffer targetSine,
     metal::MetalBuffer draftCosine, metal::MetalBuffer draftSine,
     RopeTableParams rows, uint32_t maximumRows, uint32_t targetPairs) {
-  const std::string kernel = tableKernel("rope_build_tables", targetPairs);
+  // A target's pairs choose the kernel of its rows; draft rows alone, of a
+  // target without RoPE among them, take the default kernel's.
+  const std::string kernel = tableKernel("rope_build_tables", rows.target_rows ? targetPairs : SPLASH_TARGET_ROPE_PAIRS);
   if ((!rows.target_rows && !rows.draft_rows) || rows.target_rows > maximumRows ||
       rows.draft_rows > maximumRows) {
     throw std::invalid_argument("invalid RoPE table row count");

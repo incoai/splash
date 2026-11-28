@@ -9,6 +9,7 @@ from ..documents import document_parts
 from ..errors import APIError, ContextLengthError, ErrorDialect
 from ..metrics import timings_dict
 from ..output import BlockSequencer
+from ..protocol import MAX_IMAGE_SPANS
 from ..tool_schema import TAG_NAME_RULE, is_tag_name
 
 
@@ -222,6 +223,15 @@ def _chat(body, thinking_resolver):
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
+    # More images than a request holds: the refusal names the oldest, as
+    # Anthropic's API names a block it refuses. Claude Code replaces the block
+    # named with a note and sends the request again; the count alone ended
+    # its session, as every later request holds the same images.
+    images = _image_paths(messages)
+    if len(images) > MAX_IMAGE_SPANS:
+        raise APIError(
+            400, f"{images[0]}: requests support at most {MAX_IMAGE_SPANS} images"
+        )
     system = body.get("system")
     system_text = None if system is None else _system_text(system, "system")
     translated = [
@@ -248,6 +258,26 @@ def _chat(body, thinking_resolver):
     return chat, omitted
 
 
+def _image_paths(messages):
+    """Where each image block of messages lies, in their order, as Anthropic's
+    API names a block in an error: messages.I.content.J.image, or in a tool
+    result's content, messages.I.content.J.tool_result.content.K.image."""
+    paths = []
+    for i, message in enumerate(messages):
+        content = message.get("content") if isinstance(message, dict) else None
+        for j, block in enumerate(content if isinstance(content, list) else ()):
+            kind = block.get("type") if isinstance(block, dict) else None
+            if kind == "image":
+                paths.append(f"messages.{i}.content.{j}.image")
+            elif kind == "tool_result" and isinstance(block.get("content"), list):
+                paths += [
+                    f"messages.{i}.content.{j}.tool_result.content.{k}.image"
+                    for k, inner in enumerate(block["content"])
+                    if isinstance(inner, dict) and inner.get("type") == "image"
+                ]
+    return paths
+
+
 def _response_format(body, output_config):
     """The format of a Messages request's output, in output_config.format or
     output_format, as a Chat response_format; None without one."""
@@ -263,7 +293,12 @@ def _response_format(body, output_config):
         or not isinstance(output_format.get("schema"), (dict, bool))
     ):
         raise APIError(400, "output format must be a json_schema object with a schema")
-    return {"type": "json_schema", "json_schema": {"schema": output_format["schema"]}}
+    # Messages structured outputs are always strict: a schema keyword the
+    # grammar cannot enforce is refused, as Anthropic's API refuses one.
+    return {
+        "type": "json_schema",
+        "json_schema": {"schema": output_format["schema"], "strict": True},
+    }
 
 
 def _message(message, thinking_resolver):
@@ -422,12 +457,15 @@ def _tools(tools):
             or not isinstance(field_value(tool, "input_schema", {}), (dict, bool))
         ):
             raise APIError(400, "invalid Anthropic tool")
-        function = {
-            "name": tool["name"],
-            "parameters": field_value(tool, "input_schema", {}),
-        }
+        # The keys in the order Chat clients send them, name, description,
+        # parameters, strict, which a template that prints a tool's JSON as
+        # it is keeps: the same tool renders the same tokens through either
+        # dialect, and Responses, so one dialect's cached prompt serves the
+        # others.
+        function = {"name": tool["name"]}
         if isinstance(tool.get("description"), str):
             function["description"] = tool["description"]
+        function["parameters"] = field_value(tool, "input_schema", {})
         if "strict" in tool:
             function["strict"] = tool["strict"]
         functions.append({"type": "function", "function": function})
@@ -531,9 +569,6 @@ def complete(exchange, job, *, omitted):
     )
     result = collected.result
     blocks = sequencer.finish(collected.cut, collected.reasoning_open)
-    if collected.cut_call is not None:
-        # A complete message leaves out the call the output cut.
-        blocks = [block for block in blocks if block.call_id != collected.cut_call]
     signature = (
         app.thinking_codec.encode(collected.reasoning)
         if collected.reasoning and omitted
@@ -626,6 +661,7 @@ def stream(exchange, job, *, omitted):
         collected = exchange.collect(
             job,
             on_start=start,
+            streaming=True,
             on_text=sequencer.text,
             on_tool_delta=sequencer.tool,
             on_idle=keepalive,
@@ -683,6 +719,7 @@ def message_usage(prompt_tokens, output_tokens, cache, thinking_tokens=None):
     usage = {
         "input_tokens": prompt_tokens - cache.matched_tokens,
         "cache_read_input_tokens": cache.matched_tokens,
+        **cache.reuse(),
         "output_tokens": output_tokens,
     }
     if thinking_tokens is not None:
@@ -693,10 +730,10 @@ def message_usage(prompt_tokens, output_tokens, cache, thinking_tokens=None):
 def content_block(block, omitted, signature=""):
     """The Messages content block of `block` as a complete response shows it
     or, while it is in progress, as a stream starts it, before its text or
-    input. Reasoning whose display is `omitted` shows only `signature`. A call
-    no longer in progress has complete arguments: the projector writes each
-    call it closes as JSON, and a complete response leaves out a call the
-    token limit or a stop sequence cut."""
+    input. Reasoning whose display is `omitted` shows only `signature`. A
+    complete response's call has closed with arguments that read as a JSON
+    object, as the projector returns one there; a stream starts each call
+    in progress, and one that streamed ends with the input it sent."""
     if block.kind == "reasoning":
         thinking = "" if omitted else block.text
         return {"type": "thinking", "thinking": thinking, "signature": signature}
@@ -749,12 +786,7 @@ class AnthropicErrors(ErrorDialect):
     def payload(self, error):
         message = error.message
         if isinstance(error, ContextLengthError):
-            message = (
-                f"prompt is too long: {error.input_tokens} tokens > "
-                f"{error.maximum_input_tokens} maximum input tokens"
-            )
-            if error.image_tokens_only:
-                message += " (image tokens alone; text not yet counted)"
+            message = error.anthropic_message()
         error_type = self.TYPES.get(
             error.status,
             "api_error" if error.status >= 500 else "invalid_request_error",

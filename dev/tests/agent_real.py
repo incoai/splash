@@ -504,6 +504,106 @@ print('independent oracle passed')
     }
 
 
+# The bug-fix phase's project (dev/tests/fixtures/agent_bugfix/project): a
+# shop package whose money.to_cents reads "8.5" as 805 cents. Its own money
+# tests use two-digit fractions and pass; three cart tests fail on totals, so
+# the cause is found only by running the tests and following the cart into
+# shop/money.py, and the fix is one line there. Unlike the ledger it is
+# existing code: the client must read it, edit a line inside a file and keep
+# everything else, driven by what its tool results say.
+BUGFIX_FIXTURE = ROOT / "dev/tests/fixtures/agent_bugfix"
+BUGFIX_SOURCE = "shop/money.py"
+BUGFIX_PROMPT = (
+    f"The project's tests fail. Run {TEST_COMMAND}, find the cause of the "
+    "failures and fix it with the smallest change to the library. Do not change "
+    f"the tests. Run {TEST_COMMAND} again to confirm, and report the cause in "
+    "one sentence."
+)
+# Amounts the fixture's tests do not use, with their cents: a fix that
+# special-cases the tests' prices fails them.
+BUGFIX_ORACLE = {
+    "0.5": 50,
+    "-3.1": -310,
+    "$2.": 200,
+    "10": 1000,
+    "10.05": 1005,
+    " 4.9 ": 490,
+    "-$0.7": -70,
+    ".5": 50,
+    "123.45": 12345,
+    "0.07": 7,
+}
+
+
+def bugfix_fixture(workspace):
+    shutil.copytree(
+        BUGFIX_FIXTURE / "project",
+        workspace,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    git = ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@localhost"]
+    for arguments in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "fixture"]):
+        subprocess.run([*git, *arguments], cwd=workspace, check=True)
+
+
+def bugfix_changes(workspace):
+    """The tracked files the client changed, each with its changed lines."""
+    numstat = subprocess.run(
+        ["git", "diff", "--numstat", "HEAD"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    changes = {}
+    for line in numstat.splitlines():
+        added, deleted, path = line.split("\t", 2)
+        changes[path] = int(added) + int(deleted) if added != "-" else 0
+    return changes
+
+
+def check_bugfix(workspace, executed):
+    """Fails unless the client ran the tests, changed shop/money.py alone,
+    and the fixture's tests and the held-out amounts pass: a fix of any size
+    that reads every amount right passes, and one that special-cases the
+    tests' prices fails the held-out amounts."""
+    if not any(RAN_TESTS.search(command) for command in executed):
+        raise AgentFailure(
+            "client did not successfully execute the project test command"
+        )
+    changes = bugfix_changes(workspace)
+    if set(changes) != {BUGFIX_SOURCE}:
+        raise AgentFailure(
+            f"the fix changed {changes}: only {BUGFIX_SOURCE} may change"
+        )
+    oracle = """import json, sys
+from shop.money import to_cents
+for text, cents in json.load(sys.stdin).items():
+    assert to_cents(text) == cents, (text, to_cents(text), cents)
+"""
+
+    def run(name, arguments, seconds, given=None):
+        """Python with `arguments` in the workspace; one that fails, or runs
+        past `seconds` as a fix that loops does, fails the client."""
+        try:
+            result = subprocess.run(
+                [sys.executable, *arguments],
+                cwd=workspace,
+                input=given,
+                text=True,
+                capture_output=True,
+                timeout=seconds,
+            )
+        except subprocess.TimeoutExpired:
+            raise AgentFailure(f"{name} ran past {seconds} s") from None
+        if result.returncode:
+            raise AgentFailure(f"{name} failed: " + result.stderr[-2000:])
+
+    run("held-out amounts", ["-c", oracle], 15, json.dumps(BUGFIX_ORACLE))
+    run("the fixture's tests", TEST_ARGUMENTS, 20)
+    return {"changes": changes, "oracle": "pass", "unit_tests": "pass"}
+
+
 class ClientRun:
     def __init__(
         self,
@@ -515,6 +615,7 @@ class ClientRun:
         timeout,
         input_modalities,
         version=None,
+        project=fixture,
     ):
         self.name, self.path, self.folder = name, path, folder
         self.model, self.context, self.timeout = model, context, timeout
@@ -539,7 +640,7 @@ class ClientRun:
         # OpenCode's record of the session, as the last phase exported it.
         self.opencode = {"turns": [], "compactions": []}
         folder.mkdir(parents=True)
-        fixture(self.workspace)
+        project(self.workspace)
 
     def argv(self):
         if self.name == "claude":
@@ -793,8 +894,12 @@ class ClientRun:
             )
         if not self.session:
             raise AgentFailure("client did not expose a real session id")
-        if after["requests"]["failed"] != before["requests"]["failed"]:
-            raise AgentFailure("native request failed")
+        # A request its deadline ended counts timed out, not failed.
+        if any(
+            after["requests"].get(key, 0) != before["requests"].get(key, 0)
+            for key in ("failed", "timed_out")
+        ):
+            raise AgentFailure("native request failed or timed out")
         reuse = row["reuse"]
         # Running work takes the replay points unfinished requests hold after
         # everything else; at a tight --max-memory that is legitimate, so it
@@ -1018,6 +1123,69 @@ class ClientRun:
         return {"artifact_checks": checks, "automatic_compaction": compact}
 
 
+def engine_deltas(row):
+    """What the engine's /status says changed over a phase, as a failure
+    reports it: requests completed and failed, restarts, cached prompt
+    tokens reused and replay points lost."""
+    before, after = row.get("before"), row.get("after")
+    if before is None or after is None:
+        return {"status": row.get("error") or "no engine status"}
+    reuse = prefix_reuse(before, after)
+    return {
+        "requests_completed": reuse["completed"],
+        "requests_failed": after["requests"]["failed"] - before["requests"]["failed"],
+        "restarts": after["transport"]["restarts"] - before["transport"]["restarts"],
+        "reused_tokens": reuse["reused_tokens"],
+        "lost_state_misses": reuse["lost_state_misses"],
+    }
+
+
+def run_bugfix(name, client, folder, model, context, timeout, modalities):
+    """One bug fix in a fresh project and session: it passes when
+    check_bugfix does. A failure prints what the engine's /status says
+    changed over the phase, which tells an engine fault from the model's
+    answer."""
+    runner = ClientRun(
+        name,
+        client["path"],
+        folder,
+        model,
+        context,
+        timeout,
+        modalities,
+        version=client.get("major_version"),
+        project=bugfix_fixture,
+    )
+    failure = None
+    try:
+        try:
+            runner.phase("bugfix", BUGFIX_PROMPT)
+        except AgentFailure as error:
+            failure = str(error)
+        row = runner.phases[-1] if runner.phases else {"error": failure}
+        if failure is None:
+            try:
+                check_bugfix(runner.workspace, row["executed_commands"])
+            except AgentFailure as error:
+                failure = str(error)
+    finally:
+        runner.finish_hermes()
+    engine = engine_deltas(row)
+    print(
+        f"{name}/bugfix: "
+        + (f"FAIL: {failure}; engine: {engine}" if failure else "pass"),
+        flush=True,
+    )
+    return {
+        "folder": str(folder),
+        "result": "fail" if failure else "pass",
+        "error": failure,
+        "engine": engine,
+        "wall_seconds": row.get("wall_seconds"),
+        "changes": bugfix_changes(runner.workspace),
+    }
+
+
 def reference_fixture(tokenizer_path, context):
     # Size data with the installed model tokenizer, without loading weights.
     # The client's native history, not this size estimate, proves compaction.
@@ -1065,6 +1233,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--draft-model", type=launcher.model_artifacts.parse_draft_model
     )
+    parser.add_argument("--draft-revision")
     parser.add_argument("--language-only", action="store_true")
     parser.add_argument("--model-root", type=Path)
     parser.add_argument("--max-context", default="100K")
@@ -1084,8 +1253,29 @@ def parse_args(argv=None):
             revision=args.revision,
             language_only=args.language_only,
             draft_model=args.draft_model,
+            draft_revision=args.draft_revision,
         ).link
     return args
+
+
+# How many times a client's --version is run before its failure stands, a
+# second apart: in the seconds after a large server exits, macOS killed one
+# (codex, rc 137) that answered at once when run again (2 of 4 starts).
+VERSION_PROBES = 3
+
+
+def client_version(path):
+    """The client at path's answer to --version, run again after a failure
+    up to VERSION_PROBES times."""
+    for probe in range(VERSION_PROBES):
+        if probe:
+            time.sleep(1)
+        result = subprocess.run(
+            [path, "--version"], text=True, capture_output=True, timeout=20
+        )
+        if result.returncode == 0:
+            break
+    return result
 
 
 def main(argv=None):
@@ -1100,9 +1290,7 @@ def main(argv=None):
     versions = {}
     for name in selected:
         path = clients.find_executable(name)
-        result = subprocess.run(
-            [path, "--version"], text=True, capture_output=True, timeout=20
-        )
+        result = client_version(path)
         if result.returncode:
             raise AgentFailure(f"cannot determine {name} version")
         versions[name] = {
@@ -1149,6 +1337,11 @@ def main(argv=None):
                 args.model,
                 *(("--revision", args.revision) if args.revision else ()),
                 *(("--draft-model", args.draft_model) if args.draft_model else ()),
+                *(
+                    ("--draft-revision", args.draft_revision)
+                    if args.draft_revision
+                    else ()
+                ),
                 *(("--language-only",) if args.language_only else ()),
             ]
             with (directory / "server.log").open("x") as log:
@@ -1213,6 +1406,18 @@ def main(argv=None):
                 print(f"{name}: FAIL: {error}", flush=True)
             finally:
                 runner.finish_hermes()
+            entry["bugfix"] = run_bugfix(
+                name,
+                versions[name],
+                directory / f"{name}-bugfix",
+                model,
+                context,
+                args.client_timeout,
+                served["input_modalities"],
+            )
+            if entry["bugfix"]["result"] == "fail":
+                failure = f"bugfix failed: {entry['bugfix']['error']}"
+                entry.update(result="fail", error=entry.get("error") or failure)
             atomic_json(args.output, document)
             remaining = selected[selected.index(name) + 1 :]
             if remaining and memory_sample()["pressure"] >= pressure_stop_level():

@@ -65,7 +65,8 @@ enum class NeedTiming : uint8_t { CanWait, Immediate };
 // then the earlier submission (Engine::laneToYield's tie).
 struct ClaimRank final {
   uint8_t priority = 0;          // 2 - RequestPriority: Foreground 2, Background 0
-  bool decoding = false;         // at equal priority a decoding lane outranks a prefill
+  uint64_t queued = 0;           // then a request queued for memory by its earliness (Engine::rankOf), 0 for none
+  bool decoding = false;         // then a decoding lane outranks a prefill
   uint64_t completedTokens = 0;  // then more completed work
   uint64_t earliness = 0;        // then earlier submission: UINT64_MAX - Scheduler::submissionOrder
   auto operator<=>(const ClaimRank &) const = default;
@@ -118,7 +119,10 @@ struct ClaimId final {
 
 // What a refused claim lacks. bytes and hostRefused come from the admission
 // refused inside its scope. The caller sets pages and the state buffers for
-// needs met in place (TokenAdmission::additionalPages,
+// needs met in place (TokenAdmission::additionalPages: pages of `form` its
+// attempt takes free before it allocates an extent, so that the cache keeps
+// the pages of that form it frees for it, landing or not, and releases only
+// other forms' extents; either measure meets it, Cache::reach and take),
 // Model::statesToActivate), and for a KV need keptPages: the free pages of
 // each other form its attempt takes, which units taken for it keep as they
 // keep `form`'s (TokenAdmission::keptPages, Cache::walkFor). A need of state
@@ -138,7 +142,7 @@ struct Need final {
   kv::PageForm form = kv::PageForm::Full;
   uint32_t stateBuffers = 0;
   bool unheldStateBuffer = false;
-  std::array<uint32_t, 3> keptPages{};
+  std::array<uint32_t, kv::kPageForms> keptPages{};
   bool afterStart = false;
   bool kv = false;
   [[nodiscard]] bool lacksStateBuffers() const noexcept { return stateBuffers || unheldStateBuffer; }
@@ -155,6 +159,15 @@ struct FreeResult final {
   // free()'s units.
   uint32_t pages = 0;
   uint32_t stateBuffers = 0;
+  // Of what it released, the landing it cancelled that the claim was
+  // credited (VictimQuery::landingCredited, or the ledger's count of what
+  // lands, returning), in neither nowBytes nor laterBytes: its release took
+  // the free pages that landing was to complete an extent with.
+  uint64_t nettedBytes = 0;
+  // Of those, what stood for the landing the claim's own takes credited
+  // (VictimQuery::landingCredited), netted against that credit first; the
+  // rest stood for the ledger's count of what lands.
+  uint64_t nettedCredited = 0;
 
   // It gave something: met, or memory, pages or buffers.
   [[nodiscard]] bool gave() const noexcept {
@@ -250,11 +263,9 @@ struct TakeRights final {
 // claim but a pool's growth, which takes none of it, optional work, which
 // takes the resume point alone, and the host's pass short of critical
 // pressure with no start it refused waiting, which takes none: the KV of the
-// lanes in service is the only cache no claim takes outside them, as in vLLM
-// (blocks no running request holds stay free to evict, in LRU order) and
-// SGLang (only running requests lock their radix paths), and a start written
-// to the SSD cache first, where the tier takes the write, costs its request
-// a read-back, not its prefill. Kept from starts, queued chains made
+// lanes in service is the only cache no claim takes outside them, and a start
+// written to the SSD cache first, where the tier takes the write, costs its
+// request a read-back, not its prefill. Kept from starts, queued chains made
 // sessions arriving together take turns (#758). The host waits for writes
 // short of critical pressure and never for landings, which its pass's target
 // is net of; at critical pressure it is Immediate but takes the store and
@@ -287,7 +298,7 @@ struct VictimQuery final {
   // The free pages of each form a source's units for the claim move pages
   // into (VictimSource::movesInto), which every other unit keeps as it keeps
   // those the need's attempt takes (Cache::walkFor).
-  std::array<uint32_t, 3> movedInto{};
+  std::array<uint32_t, kv::kPageForms> movedInto{};
   // The claimant: its request (0 for none) and priority, which the lanes it
   // releases follow (TakeRights::lanes).
   uint64_t requestId = 0;
@@ -297,6 +308,11 @@ struct VictimQuery final {
   // that frees a unit in part, a lane's release, frees that much.
   uint64_t lackingBytes = 0;
   uint32_t lackingPages = 0;
+  // The landing the units taken before it credited the claim
+  // (FreeResult::laterBytes) and no release netted since
+  // (FreeResult::nettedCredited), which a release that cancels that landing
+  // nets; landing no take credited it cancels nothing of the claim's.
+  uint64_t landingCredited = 0;
 
   // Whether the claim's rights reach the lane of request `lane`, of
   // `lanePriority`, whose pages it may release.
@@ -320,8 +336,12 @@ struct VictimQuery final {
 // This is the one peek contract: free() counts with it (bound) and takes
 // nothing unless the count covers the need, the claim's retries taking what
 // a take fell short by, and every reader of peek relies on it alone (the
-// cache's units, WriteBehind::demanded). take takes the unit, or one step of
-// it where the source frees it a step at a time (the cache's reclaims), and
+// cache's units, WriteBehind::demanded). take takes the unit, or steps of
+// it where the source frees it a step at a time (the cache's reclaims): as
+// many as free what the claim lacks (VictimQuery::lackingBytes) within the
+// unit's count, and only while the order would choose the same unit again
+// after each (a unit of the first stage, none of another source's before it
+// appearing), else one; and
 // reports what that freed, the pages of the need's form and the state
 // buffers too: Met, or Pending on the transfers it started, when
 // it took something; else Pending while a transfer in flight holds the unit,
@@ -338,6 +358,16 @@ struct VictimQuery final {
 // the ledger passes over those that land later for a claim that does not
 // wait for writes. take reads what the claim lacks still in its query
 // (VictimQuery::lackingBytes), every other field as peek did.
+// Two things a take frees lie outside the bound, as no count can know them:
+// what a write's room on the SSD gives up (a full quota's give-ups and the
+// units those let go, the cache's unitsFreedElsewhere), which only a take
+// that writes may free; and the landing a release cancels, which the take
+// reports netted (FreeResult::nettedBytes) once over all its steps, no more
+// than the claim was credited and the drop its own steps made in the count
+// of what lands (Cache::take). Each take is judged against the units as then
+// offered: a unit offered again counts afresh. A unit that needs no write
+// frees all it counted when first offered, but where a transfer in flight
+// holds the rest (Pending) or where it netted.
 class VictimSource {
 public:
   virtual ~VictimSource() = default;
@@ -346,7 +376,7 @@ public:
   virtual FreeResult take(const VictimQuery &query, const Victim &victim) = 0;
   // The free pages of each form the source's units for `query` count on
   // moving pages into (VictimQuery::movedInto); none by default.
-  [[nodiscard]] virtual std::array<uint32_t, 3> movesInto(const VictimQuery &) const { return {}; }
+  [[nodiscard]] virtual std::array<uint32_t, kv::kPageForms> movesInto(const VictimQuery &) const { return {}; }
 };
 
 // What transfers free when they land (Cache::returning). Landing: in flight
@@ -356,10 +386,10 @@ public:
 struct Returning final {
   // By kv::PageForm: demotions, and under --kv-spill always Spill landings
   // as far as free Index pages take them.
-  std::array<uint32_t, 3> landingPages{};
+  std::array<uint32_t, kv::kPageForms> landingPages{};
   // Full: owed copies of pages that spill once copied, all of them (the
   // Full extents they empty fund their Index pages).
-  std::array<uint32_t, 3> owedPages{};
+  std::array<uint32_t, kv::kPageForms> owedPages{};
   // The extents the landing pages complete (compaction), and the state
   // write's buffers.
   uint64_t landingBytes = 0;
@@ -387,6 +417,9 @@ struct ClaimState final {
   // the wait ends. It holds no room, since the host, not the engine's
   // limit, refused it.
   bool hostRefusedWaiting = false;
+  // Its request waits for memory, by any refusal (Engine::syncClaims), since
+  // then: what /status counts as a waiting claim, held room or not.
+  std::optional<double> memoryWaitSinceSeconds;
   // The host refused it after in-place units could not meet it: the
   // allocation's retries pass the host with each of their reservations (an
   // InService claim, or an Optional one its lane needs) until the
@@ -401,7 +434,7 @@ struct ClaimState final {
   // (MemoryLedger::granted).
   struct Logged final {
     struct Lack final {
-      bool bytes = false, hostRefused = false, pages = false, stateBuffers = false;
+      bool bytes = false, hostRefused = false, pages = false, stateBuffers = false, kv = false;
       kv::PageForm form = kv::PageForm::Full;
       friend bool operator==(const Lack &, const Lack &) = default;
     };
@@ -455,7 +488,7 @@ public:
   void setBufferBytes(std::function<uint64_t(uint32_t states, bool afterStart, bool keepLane)> bytes);
   // The bytes of a KV page of each kv::PageForm (Cache::bytesPerPage), in
   // which the bytes waiting claims hold are held as pages (heldPages).
-  void setPageBytes(const std::array<uint64_t, 3> &bytes) noexcept;
+  void setPageBytes(const std::array<uint64_t, kv::kPageForms> &bytes) noexcept;
   // The control clock the ledger dates waits, copy demand and regrowth by.
   void setNow(double nowSeconds) noexcept;
   // The lanes in service: their projected growth, which pools' growth leaves
@@ -478,6 +511,7 @@ public:
   void allocationRefused() noexcept;
   void setWaiting(ClaimId claim, bool waiting);
   void setHostRefusedWaiting(ClaimId claim, bool waiting);
+  void setWaitsForMemory(ClaimId claim, bool waits);
   void setHostExempt(ClaimId claim, bool exempt);
   void close(ClaimId claim) noexcept;
   [[nodiscard]] const ClaimState &claim(ClaimId claim) const;
@@ -492,7 +526,7 @@ public:
   // bytes they lack beyond `roomBytes` (room admission already holds for
   // them) in that form's pages, since a page from a kept extent's free pages
   // takes room they wait for.
-  [[nodiscard]] std::array<uint32_t, 3> heldPages(ClaimId claim, uint64_t roomBytes) const;
+  [[nodiscard]] std::array<uint32_t, kv::kPageForms> heldPages(ClaimId claim, uint64_t roomBytes) const;
   // Whether a claim waits; the bytes the host refused the claims that wait
   // or whose requests wait to retry.
   [[nodiscard]] bool claimWaiting() const noexcept;
@@ -538,17 +572,21 @@ public:
                                 bool exempts = false);
   [[nodiscard]] uint64_t available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes,
                                    MemoryPressure pressure, const RestoredChains *kept = nullptr) const;
-  // An allocation of the claim was granted: what it lacks next logs afresh
-  // (free), and a wait a line of the claim's logged since its last grant
-  // logs that it ended, which no met can say: a wait may end in an attempt
-  // that runs no free() at all, as the pages it waited for land.
-  void granted(ClaimId claim);
+  // An allocation of the claim was granted, of KV pages (`kv`) or of its
+  // other memory: what it lacks next of that logs afresh (free), and a wait
+  // for it a line of the claim's logged since logs that it ended, which no
+  // met can say: a wait may end in an attempt that runs no free() at all, as
+  // the pages it waited for land. The other kind's lines stand: a start's
+  // lane state, granted at each attempt, logged its restore's need again
+  // each time.
+  void granted(ClaimId claim, bool kv = false);
   // The engine refused an allocation of the claim again after free() met
   // its need (Engine::allocate): the ledger counted room the attempt did not
   // find. A request's claim logs it once since its last grant, any other
   // claim each time.
   void refusedAfterMet(ClaimId claim, const Need &need);
-  // One growth pass. True when a pool grew.
+  // One growth pass, which first takes from each pool what it holds above
+  // its cap. True when a pool grew.
   bool grow(uint64_t freeBytes, const GrowthHost &host);
 
   // The accounts, owed bytes, claims and count checks.
@@ -610,7 +648,7 @@ private:
   std::function<Returning()> returning_;
   std::function<Returning(std::span<const uint64_t>)> returningFor_;
   std::function<uint64_t(uint32_t, bool, bool)> bufferBytes_;
-  std::array<uint64_t, 3> pageBytes_{};
+  std::array<uint64_t, kv::kPageForms> pageBytes_{};
   uint64_t laneDemandBytes_ = 0;
   std::optional<RequestPriority> lanePriority_;
   std::function<void(std::string_view)> log_;

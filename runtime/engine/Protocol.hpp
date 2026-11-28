@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 14;
+inline constexpr uint16_t kProtocolVersion = 17;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -115,6 +115,7 @@ struct ProtocolLimits {
   uint32_t maxSimulationTokens = 32;
   uint32_t maxMaskWords = 1U << 20;
   uint32_t maxImageSpans = 64;
+  uint32_t imagePatchPixels = ops::kImagePatchPixels; // the side of a grid's patch (ImageSpan)
 };
 
 [[nodiscard]] std::optional<ProtocolIssue>
@@ -138,9 +139,12 @@ validateLimits(const ProtocolLimits &limits);
 //  102 u32 thinkingBudget.tokens, kNoThinkingBudget for none
 //  106 u32 thinking end token count, u32 thinkingBudget.alsoEnds, zero
 //      without a budget
-// then the prompt tokens, the 32-byte image spans, the image pixels, the
-// score tokens and the thinking end tokens.
-inline constexpr uint64_t kRequestFixedBytes = 114;
+//  114 u32 headTokens
+// then the prompt tokens, the 40-byte image spans (u32 offset, tokens, grid
+// height and width in patches, content height and width in pixels, u64 digest
+// low and high halves), the image pixels, the score tokens and the thinking
+// end tokens.
+inline constexpr uint64_t kRequestFixedBytes = 118;
 inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
 // A thinking budget's end holds 1 to this many tokens.
 inline constexpr uint32_t kMaximumThinkingEndTokens = 64;
@@ -162,8 +166,8 @@ struct RequestFrame {
 
   uint32_t logicalMaxOutputTokens = 0;
   std::vector<uint32_t> promptTokens;
-  // Sorted, non-overlapping image spans and their resized uint8 RGB pixels,
-  // concatenated in span order (gridHeight*16 x gridWidth*16 x 3 each).
+  // Sorted, non-overlapping image spans and their prepared uint8 RGB pixels,
+  // concatenated in span order (each its grid's patches, imagePatchPixels).
   // Both are empty for text-only requests.
   std::vector<ImageSpan> imageSpans;
   std::vector<uint8_t> imagePixels;
@@ -178,6 +182,9 @@ struct RequestFrame {
   // Trailing prompt tokens of the chat template's generation prompt; zero
   // when unknown. It must leave at least one prompt token.
   uint32_t generationPromptTokens = 0;
+  // Where the prompt's head (a system prompt and tools) ends; zero
+  // without one. It must leave at least one prompt token.
+  uint32_t headTokens = 0;
   // RequestFlag bits and kReturnProgressFlag.
   uint32_t flags = 0;
   // The request's cache_salt as the server hashed it; zero without one.
@@ -200,7 +207,9 @@ struct RequestFrame {
 //   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision,
 //                  u32 vocabularySize, u32 maskRows, u32 stop token count,
 //                  u32 stop tokens
-//   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
+//   Start          u64 requestId, u32 lane, u32 matchedPromptTokens,
+//                  u32 prefixTokens, u8 stateSource, u8 lostState, u8 reuseEnd,
+//                  u32 reuseEndTokens
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
 //   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
@@ -211,8 +220,8 @@ struct RequestFrame {
 //                  u32 acceptedDraftTokens, u32 speculative cycles, u32 count,
 //                  f32 option logits
 //   Error          u8 failureClass, u8 retryable, u32 retryAfterSeconds,
-//                  u64 requestId, u32 code bytes, u32 message bytes, the code,
-//                  the message
+//                  u64 requestId, u8 capacityLimit, u32 fitsTokens, u32 code
+//                  bytes, u32 message bytes, the code, the message
 //   StatusJson     u64 correlationId, the JSON
 //   StartFailed    u8 kind, u8 bound, u64 requiredBytes, u64 budgetBytes,
 //                  u32 planContextTokens, u32 message bytes, the message
@@ -293,8 +302,13 @@ struct ReadyEvent {
 struct StartEvent {
   uint64_t requestId = 0;
   uint32_t lane = 0;
-  // The cached prefix the request starts from; zero for a cold start.
+  // What the request found in the cache (engine::StartFound).
   uint32_t matchedPromptTokens = 0;
+  uint32_t prefixTokens = 0;
+  engine::StateSource stateSource = engine::StateSource::None;
+  bool lostState = false;
+  engine::ReuseEnd reuseEnd = engine::ReuseEnd::NothingMatched;
+  uint32_t reuseEndTokens = 0;
 
   bool operator==(const StartEvent &) const = default;
 };
@@ -370,6 +384,9 @@ struct ErrorEvent {
   // For a retryable request error, the seconds after which a retry may
   // succeed, as when the SSD cache's write budget refills; 0 for at once.
   uint32_t retryAfterSeconds = 0;
+  // For a request that cannot fit even alone, what it lacked and the prompt
+  // tokens that fit (engine::CapacityShortfall); none otherwise.
+  engine::CapacityShortfall capacity{};
 
   bool operator==(const ErrorEvent &) const = default;
 };

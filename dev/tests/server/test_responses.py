@@ -59,6 +59,11 @@ class ResponsesTests(HarnessTestCase):
                 "input_tokens_details": {
                     "cached_tokens": 1,
                     "cache_write_tokens": 0,
+                    "prefix_tokens": 1,
+                    "state_source": "memory",
+                    "lost_state": False,
+                    "reuse_end": "prefix_end",
+                    "reuse_end_tokens": 1,
                 },
                 "output_tokens": 3,
                 "output_tokens_details": {"reasoning_tokens": 3},
@@ -427,9 +432,12 @@ class ResponsesTests(HarnessTestCase):
                 if stream
                 else json.loads(payload)
             )
+            # The call the token limit cut is no call in a complete response,
+            # where the empty message stands for the answer; a stream, which
+            # sent its start, ends it incomplete.
             expected_items = [
                 ("reasoning", "completed"),
-                ("function_call", "incomplete"),
+                ("function_call", "incomplete") if stream else ("message", "completed"),
             ]
             self.assertEqual(
                 [(item["type"], item["status"]) for item in response["output"]],

@@ -50,6 +50,9 @@ inline half4 quant_e4m3_word(uint word) {
   const half2 even = quant_e4m3_pair(word & 0x00FF00FFu), odd = quant_e4m3_pair((word >> 8) & 0x00FF00FFu);
   return half4(even.x, odd.x, even.y, odd.y);
 }
+// The scale of quant_e4m3_pair's halves in an MXFP8 group of E8M0 exponent e: 2^(e - 127) 2^8 = 2^(e - 119), a
+// normal float for every e below 247 and infinite from there (255 is E8M0's NaN; no weight's scale is near 2^120).
+inline float quant_mxfp8_scale(uint e) { return as_type<float>(min(e + 8u, 255u) << 23); }
 
 // s.x scales and m.x offsets pairs 0, 1, s.y and m.y pairs 2, 3 (equal where
 // one coefficient covers 32 elements or more: the register tile then reads the
@@ -485,6 +488,22 @@ struct FmtNVFP4 {
     return {float2(quant_e4m3_pair(quant_byte_pairs(pair).x)) * (128.0f * mt.g)};
   }
 };
+// NVFP4_64: NVFP4's codes and value in 64-element blocks (a row that is not whole 256-element ones); meta the 4
+// E4M3 scales of the unit's 16-groups (bytes 2j, 2j + 1 of group j), then g.
+struct FmtNVFP464 {
+  QUANT_FORMAT(GGUF_FMT_NVFP464, QuantCodebook, 0, 16, false);
+  struct Payload { uint4 a; }; typedef uint Chunk; struct Meta { uint sc; float g; }; typedef float Scale;
+  static half value(uint i) { return half(kFP4Values[i]); }
+  static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
+  static Meta loadMeta(device uchar *m) { Meta r; r.sc = *((device uint *)m); r.g = *((device float *)(m + 4)); return r; }
+  static Chunk chunk(Payload w, ushort c) { return w.a[c]; }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint *)(p0 + 4 * c)); }
+  static uint indices(Chunk q) { return q; }
+  static QuantCoef coef(Meta mt, ushort j) {
+    const uint pair = mt.sc >> (16u * (j & 1));   // the E4M3 scales of both 16-groups
+    return {float2(quant_e4m3_pair(quant_byte_pairs(pair).x)) * (128.0f * mt.g)};
+  }
+};
 // FP8: plane0 E4M3 values (bytes 8c..8c+7 = chunk c, as Q8_0's); meta the tensor's FP32 scale g. value = g * e4m3,
 // whose scale is 256 g.
 struct FmtFP8 {
@@ -497,8 +516,20 @@ struct FmtFP8 {
   static uint2 values(Chunk q) { return q; }
   static QuantCoef coef(Meta g, ushort) { return {float2(256.0f * g)}; }
 };
+// MXFP8: FP8's planes; meta the E8M0 exponent e of the group, as MXFP4's. value = 2^(e - 127) e4m3, whose scale is
+// quant_mxfp8_scale(e).
+struct FmtMXFP8 {
+  QUANT_FORMAT(GGUF_FMT_MXFP8, QuantFloat8, 0, 32, false);
+  typedef FmtFP8::Payload Payload; typedef FmtFP8::Chunk Chunk; typedef uchar Meta;
+  static Payload load(device uchar *p0, device uchar *p1) { return FmtFP8::load(p0, p1); }
+  static Meta loadMeta(device uchar *m) { return *m; }
+  static Chunk chunk(Payload w, ushort c) { return FmtFP8::chunk(w, c); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return FmtFP8::loadChunk(p0, p1, c); }
+  static uint2 values(Chunk q) { return q; }
+  static QuantCoef coef(Meta e, ushort) { return {float2(quant_mxfp8_scale(e))}; }
+};
 // BF16, F16: plane0 the group's 16-bit values (16 bytes 16c..16c+15 = chunk c); meta the FP32 scale g of 256
-// elements (1 for a GGUF tensor). value = g * x.
+// elements, 64 in their forms of 64-element blocks (1 for a GGUF tensor). value = g * x.
 template <uint F, class V> struct FmtFloat16 {
   QUANT_FORMAT(F, QuantFloat16, 0, 32 * MetaGroups, false);
   typedef V Value;
@@ -515,6 +546,9 @@ template <uint F, class V> struct FmtFloat16 {
 };
 typedef FmtFloat16<GGUF_FMT_BF16, bfloat> FmtBF16;
 typedef FmtFloat16<GGUF_FMT_F16, half> FmtF16;
+// Their forms of 64-element blocks: a meta unit of two groups.
+typedef FmtFloat16<GGUF_FMT_BF1664, bfloat> FmtBF1664;
+typedef FmtFloat16<GGUF_FMT_F1664, half> FmtF1664;
 // PQ2_0 (GGUF tensor type 142) and Q2_0 (type 42): plane0 2-bit codes as Q2_K's; meta the
 // half d of the native block, four groups (PQ2_0's 128 elements) or two (Q2_0's 64). value = d * (q - 1).
 template <uint F> struct FmtTwoBit {
@@ -579,8 +613,9 @@ QUANT_AFFINE_GROUPS(8)
   X(FmtAF3G128, af3g128) X(FmtAF4G32, af4g32) X(FmtAF4G64, af4g64) X(FmtAF4G128, af4g128) X(FmtAF5G32, af5g32)    \
   X(FmtAF5G64, af5g64) X(FmtAF5G128, af5g128) X(FmtAF6G32, af6g32) X(FmtAF6G64, af6g64) X(FmtAF6G128, af6g128)    \
   X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)            \
-  X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16) X(FmtQ20, q20)
-#define QUANT_FORMATS(X) QUANT_REGISTER_FORMATS(X) X(FmtF16, f16)
+  X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16) X(FmtQ20, q20) X(FmtNVFP464, nvfp464) X(FmtMXFP8, mxfp8)      \
+  X(FmtBF1664, bf1664)
+#define QUANT_FORMATS(X) QUANT_REGISTER_FORMATS(X) X(FmtF16, f16) X(FmtF1664, f1664)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time: any format (quant_format_switch), or one of the register tile's

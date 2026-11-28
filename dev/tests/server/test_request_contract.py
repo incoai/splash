@@ -161,7 +161,8 @@ class RequestContractTests(HarnessTestCase):
             ({"temperature": 5}, "temperature must be"),
             ({"seed": -(2**63) - 1}, "seed must be"),
             ({"priority": "urgent"}, "priority must be"),
-            ({"n": 2}, "n and logprobs"),
+            ({"n": 2}, "n, logprobs and top_logprobs"),
+            ({"top_logprobs": 3}, "n, logprobs and top_logprobs"),
         )
         # The valid request shows that the PDF otherwise reaches the renderer.
         for fields, message in (*invalid, ({}, rendering)):
@@ -235,6 +236,18 @@ class RequestContractTests(HarnessTestCase):
             )[1]["tool_calls"][0]["id"],
             "call_42",
         )
+
+    def test_a_message_of_an_unknown_role_is_refused_not_dropped(self):
+        for role in ("usr", "assistan", "USER", None):
+            with self.subTest(role=role):
+                with self.assertRaisesRegex(APIError, "unsupported message role"):
+                    normalize_messages(
+                        [
+                            {"role": "user", "content": "Hi"},
+                            {"role": role, "content": "lost?"},
+                        ],
+                        vision=True,
+                    )
 
     def test_history_reads_reasoning_and_text_parts_as_clients_send_them(self):
         image = "data:image/png;base64,AAAA"

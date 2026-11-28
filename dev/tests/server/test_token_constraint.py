@@ -251,50 +251,83 @@ class TokenConstraintTest(unittest.TestCase):
             ),
         )
 
-    def test_a_rollback_the_grammar_refuses_fails_the_request(self):
-        """A rollback the grammar refused would leave every later sibling's
-        mask and forced tokens computed from the wrong state: the request
-        fails instead."""
+    def test_masks_walk_forward_without_advancing_the_committed_matcher(self):
+        """No matcher takes a token back (masks()): the walk goes forward on
+        copies of the committed matcher, which moves only by commits."""
 
-        class Stuck:
-            """The matcher, refusing every rollback."""
+        class ForwardOnly:
+            """A matcher, and every copy of it, refusing to roll back."""
 
             def __init__(self, matcher):
                 self.matcher = matcher
 
             def rollback(self, _count):
-                return False
-
-            def __getattr__(self, name):
-                return getattr(self.matcher, name)
-
-        a, b = self.a, self.b
-        constraint = constraints.TokenConstraint(
-            Stuck(self.matcher.deep_copy()), self.ready
-        )
-        with self.assertRaises(ConstraintError):
-            constraint.masks((a, b), chain((a, b)))
-
-    def test_masks_validate_drafts_without_copying_or_advancing_the_matcher(self):
-        class Uncopyable:
-            """The matcher, which masks() must not copy."""
-
-            def __init__(self, matcher):
-                self.matcher = matcher
+                raise AssertionError("masks() rolled a matcher back")
 
             def deep_copy(self):
-                raise AssertionError("masks() copied the matcher")
+                return ForwardOnly(self.matcher.deep_copy())
 
             def __getattr__(self, name):
                 return getattr(self.matcher, name)
 
         a, b, c, z = self.a, self.b, self.c, self.z
         constraint = constraints.TokenConstraint(
-            Uncopyable(self.matcher.deep_copy()), self.ready
+            ForwardOnly(self.matcher.deep_copy()), self.ready
         )
         rows = self.rows(constraint.masks((a, b, z, c), (NO_PARENT, 0, 0, 0))[0])
         constraint.commit([a])
         self.assertEqual(self.rows(constraint.masks((), ())[0]), rows[1:2])
+
+    def test_the_next_row_0_is_the_committed_path_s_mask(self):
+        """#790: LLGuidance 1.8.0 keeps the last mask it computed, keyed
+        by its lexer state and parser row index alone; after a rollback
+        another branch that reaches the same key gets the mask of the branch
+        it left. Under an array of at most three arrays of at most two
+        integers, after "[[1" the branches ",2],[3" and "],[2,3" each end
+        inside an integer after as many lexemes, but only the first lets a
+        "," follow. When the tree's walk rolled back, its last mask, the
+        second branch's, stayed cached: the cycle retained the first branch
+        and drew "," as its anchor under that branch's row, and the next
+        request's row 0, after the commit, was the cached mask, which
+        refused it: "verify mask is not synchronized to the pending anchor".
+        Every row is a fresh matcher's mask after its path, and the next row
+        0 admits the anchor."""
+        guidance = grammar_tokenizers()[1]
+        schema = {
+            "type": "array",
+            "maxItems": 3,
+            "items": {"type": "array", "maxItems": 2, "items": {"type": "integer"}},
+        }
+        grammar = LLMatcher.grammar_from_json_schema(schema)
+
+        def tokens(text):
+            return [self.tokenizer.token_to_id(char) for char in text]
+
+        def fresh(text):
+            matcher = LLMatcher(guidance, grammar, log_level=0)
+            self.assertTrue(matcher.consume_tokens(tokens(text)))
+            bitmask = allocate_token_bitmask(1, self.ready.vocabulary_size)
+            fill_next_token_bitmask(matcher, bitmask, 0)
+            return self.rows(bitmask[0].tobytes())[0]
+
+        retained, other = ",2],[3", "],[2,3"
+        constraint = self.constraint(LLMatcher(guidance, grammar, log_level=0), rows=17)
+        constraint.commit(tokens("[["))
+        # The anchor "1", then both branches below it, the retained one first.
+        tree = tokens("1" + retained + other)
+        parents = (NO_PARENT, *range(6), 0, *range(7, 12))
+        rows = self.rows(constraint.masks(tuple(tree), parents)[0])
+        paths = ["[[", *("[[" + "1" + retained[:depth] for depth in range(7))]
+        paths += ["[[1" + other[: depth + 1] for depth in range(6)]
+        self.assertEqual(rows, [fresh(path) for path in paths])
+        # The retained branch's last row admits ",", which the target draws
+        # as its anchor.
+        comma = tokens(",")[0]
+        self.assertIn(comma, rows[7])
+        constraint.commit(tokens("1" + retained))
+        row0 = self.rows(constraint.masks((comma,), (NO_PARENT,))[0])[0]
+        self.assertEqual(row0, fresh("[[1" + retained))
+        self.assertIn(comma, row0)
 
     def test_generated_tokens_advance_the_grammar_and_end_with_eos(self):
         a, b, c, eos = self.a, self.b, self.c, self.eos

@@ -26,7 +26,8 @@ constexpr char kProbation[] = "probation";
 constexpr char kFailedProbation[] = "failed-probation";
 // What a cache holds, and every file a cache directory may hold: nothing
 // else in one is ever touched.
-constexpr const char *kCacheFiles[] = {"kv.slots", "kv.records", "state.slots", "state.records"};
+constexpr const char *kCacheFiles[] = {"kv.slots",    "kv.records",    "kv-window.slots",
+                                       "kv-window.records", "state.slots", "state.records"};
 constexpr const char *kMarks[] = {kServing, kProbation, kFailedProbation, kLock};
 
 [[noreturn]] void fail(const char *operation) {

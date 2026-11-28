@@ -14,9 +14,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import transformers
+
+from dev.tests import native_peer
 from dev.tests.installer_fixtures import DENSE, MODEL, family_config
 from dev.tests.server_fixtures import (
     NO_THINKING_END,
+    FakeFactory,
     FakeRuntime,
     console_written,
     engine_ready,
@@ -37,7 +41,8 @@ GOLDEN = Path(__file__).parent
 
 class ServerMainTests(unittest.TestCase):
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
-        args = main_args()
+        # Without a drain (--shutdown-timeout 0), as before drains existed.
+        args = main_args(shutdown_timeout=0)
         runtime = mock.Mock()
         runtime.capabilities = engine_ready(262144)
         backend = mock.Mock()
@@ -80,7 +85,7 @@ class ServerMainTests(unittest.TestCase):
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=tokenizer
+                transformers.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "check_capabilities"),
@@ -133,6 +138,87 @@ class ServerMainTests(unittest.TestCase):
         server.server_activate.assert_called_once_with()
         self.assertEqual(order, ["bind", "runtime"])
 
+    def test_a_first_stop_signal_drains_and_a_second_stops_at_once(self):
+        # The first SIGTERM drains: serving goes on, so that new requests get
+        # 503 server_shutdown, while the backend lets running requests finish
+        # for --shutdown-timeout; then the server stops as before, its
+        # engine's flush included. A second signal during the drain stops at
+        # once.
+        for second in (False, True):
+            with self.subTest(second_signal=second):
+                args = main_args(shutdown_timeout=4.5)
+                runtime = mock.Mock()
+                runtime.capabilities = engine_ready(262144)
+                backend = mock.Mock()
+                server = mock.Mock(server_port=8000)
+                handlers = {}
+                serving = []
+                drained = threading.Event()
+
+                def install(signum, handler):
+                    handlers[signum] = handler
+
+                def drain(seconds):
+                    drained.set()
+                    return 1
+
+                backend.drain.side_effect = drain
+                shut = threading.Event()
+                server.shutdown.side_effect = shut.set
+
+                def serve():
+                    serving.append(len(serving))
+                    if len(serving) == 1:
+                        handlers[signal.SIGTERM](signal.SIGTERM, None)
+                    elif second:
+                        handlers[signal.SIGINT](signal.SIGINT, None)
+                    else:
+                        # Serving goes on until the drain ends it.
+                        self.assertTrue(shut.wait(2))
+
+                server.serve_forever.side_effect = serve
+                with (
+                    mock.patch.object(api, "parse_args", return_value=args),
+                    unprepared_hold(),
+                    mock.patch.object(api, "load_thinking_key", return_value=None),
+                    mock.patch.object(
+                        transformers.AutoTokenizer,
+                        "from_pretrained",
+                        return_value=object(),
+                    ),
+                    mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "check_capabilities"),
+                    mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+                    mock.patch.object(
+                        api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+                    ),
+                    mock.patch.object(api, "NativeBackend", return_value=backend),
+                    mock.patch.object(api, "ConstraintFactory", return_value=object()),
+                    mock.patch.object(api, "Frontend", return_value=mock.Mock()),
+                    mock.patch.object(api, "FrontendServer", return_value=server),
+                    mock.patch.object(api.signal, "signal", side_effect=install),
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+                ):
+                    api.main()
+                    # The drain's last line is printed before it ends serving
+                    # (server.shutdown, which the second serve waits on), and
+                    # the console thread writes it after: wait for that write.
+                    console_written()
+                self.assertEqual(serving, [0, 1])
+                if not second:
+                    backend.drain.assert_called_once_with(4.5)
+                    self.assertIn(
+                        "Stopping · running requests get up to 4.5 s to finish",
+                        output.getvalue(),
+                    )
+                    self.assertIn(
+                        "Stopping · 1 request still running after 4.5 s end now",
+                        output.getvalue(),
+                    )
+                backend.close.assert_called_once()
+                server.server_close.assert_called_once()
+                runtime.kill.assert_not_called()
+
     def test_main_takes_vision_from_the_ready_event(self):
         args = main_args()
         for vision in (True, False):
@@ -144,7 +230,9 @@ class ServerMainTests(unittest.TestCase):
                     unprepared_hold(),
                     mock.patch.object(api, "load_thinking_key", return_value=None),
                     mock.patch.object(
-                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                        transformers.AutoTokenizer,
+                        "from_pretrained",
+                        return_value=object(),
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
                     mock.patch.object(api, "check_capabilities"),
@@ -195,7 +283,9 @@ class ServerMainTests(unittest.TestCase):
             unprepared_hold(family),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=tokenizer or object()
+                transformers.AutoTokenizer,
+                "from_pretrained",
+                return_value=tokenizer or object(),
             ),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
@@ -274,7 +364,7 @@ class ServerMainTests(unittest.TestCase):
         for fault, ends, written in (
             (
                 mock.patch.object(
-                    api.AutoTokenizer,
+                    transformers.AutoTokenizer,
                     "from_pretrained",
                     side_effect=KeyError("added_tokens"),
                 ),
@@ -463,7 +553,7 @@ class ServerMainTests(unittest.TestCase):
             status = stack.enter_context(mock.patch.object(api, "print_status"))
             with self.assertRaises(SystemExit):
                 api.main()
-            api.AutoTokenizer.from_pretrained.assert_not_called()
+            transformers.AutoTokenizer.from_pretrained.assert_not_called()
         message = (
             "--reasoning-effort cannot set how test-model reasons: a Flint model "
             "decides each turn whether to reason, whatever effort its prompt names"
@@ -567,7 +657,7 @@ class ServerMainTests(unittest.TestCase):
             ),
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(transformers.AutoTokenizer, "from_pretrained"),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
@@ -626,7 +716,7 @@ class ServerMainTests(unittest.TestCase):
             ),
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(transformers.AutoTokenizer, "from_pretrained"),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
@@ -730,7 +820,7 @@ class ServerMainTests(unittest.TestCase):
         for fault, ends in (
             (
                 mock.patch.object(
-                    api.AutoTokenizer,
+                    transformers.AutoTokenizer,
                     "from_pretrained",
                     side_effect=KeyError("added_tokens"),
                 ),
@@ -826,7 +916,9 @@ class ServerMainTests(unittest.TestCase):
                     unprepared_hold(),
                     mock.patch.object(api, "load_thinking_key", return_value=None),
                     mock.patch.object(
-                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                        transformers.AutoTokenizer,
+                        "from_pretrained",
+                        return_value=object(),
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
                     mock.patch.object(api, "check_capabilities"),
@@ -864,7 +956,7 @@ class ServerMainTests(unittest.TestCase):
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
+                transformers.AutoTokenizer, "from_pretrained", return_value=object()
             ),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "check_capabilities"),
@@ -873,6 +965,7 @@ class ServerMainTests(unittest.TestCase):
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ),
             mock.patch.object(api, "NativeBackend", return_value=backend),
+            mock.patch.object(api, "ConstraintFactory"),
             mock.patch.object(api, "FrontendServer", return_value=server),
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
@@ -886,33 +979,106 @@ class ServerMainTests(unittest.TestCase):
         console_written()
         self.assertIn("Error · late", stderr.getvalue())
 
-    def test_main_rejects_an_unservable_chat_template_before_starting_native(self):
+    def test_main_stops_the_engine_it_started_for_an_unservable_chat_template(self):
+        """The engine starts before the tokenizer loads, so that it reads its
+        weights meanwhile; a tokenizer whose template the server cannot serve
+        stops it and reports the template's error, in the record once the
+        engine has stopped, whose warm-up would otherwise record over it."""
         server = mock.Mock()
+        order = []
+        runtime = mock.Mock()
+        runtime.start.side_effect = lambda: order.append("engine start")
+        runtime.close.side_effect = lambda: order.append("engine close")
+
+        def tokenizer(*_, **__):
+            order.append("tokenizer")
+            return SimpleNamespace(chat_template=None)
+
         with (
             mock.patch.object(api, "parse_args", return_value=main_args()),
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer,
-                "from_pretrained",
-                return_value=SimpleNamespace(chat_template=None),
+                transformers.AutoTokenizer, "from_pretrained", side_effect=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "check_capabilities"),
-            mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
             mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(
+                api.serve_record,
+                "failed",
+                side_effect=lambda *_: order.append("failure recorded"),
+            ),
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
             self.assertRaisesRegex(SystemExit, "1"),
         ):
             api.main()
-        runtime.assert_not_called()
+        self.assertEqual(
+            order, ["engine start", "tokenizer", "engine close", "failure recorded"]
+        )
+        runtime.wait_ready.assert_not_called()
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
         console_written()
         self.assertIn(
             "Error · the tokenizer defines no chat template", stderr.getvalue()
         )
+
+    def test_an_engine_that_fails_while_the_tokenizer_loads_reports_its_error(self):
+        """The engine started first fails while the server loads its
+        tokenizer: the start reports the engine's error once, from the one
+        engine it started, and serves nothing."""
+        message = "--max-context 1000000 exceeds what this Mac's memory allows"
+        failed = native_wire.StartFailedEvent(
+            native_wire.StartFailureKind.CONTEXT_BUDGET,
+            native_wire.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            790_521,
+            message.encode(),
+        )
+        factory = FakeFactory(initial_output=native_peer.serialize_event(failed))
+        runtimes = []
+        multiplexed = api.engine_runtime.MultiplexedRuntime
+
+        def runtime(*_, **__):
+            runtimes.append(multiplexed(process_factory=factory))
+            return runtimes[-1]
+
+        def tokenizer(*_, **__):
+            # The engine's failure has ended its start before the server
+            # waits for it.
+            self.assertTrue(runtimes[0]._startup_attempt.event.wait(5))
+            return object()
+
+        server = mock.Mock()
+        with (
+            mock.patch.object(api, "parse_args", return_value=main_args()),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                transformers.AutoTokenizer, "from_pretrained", side_effect=tokenizer
+            ),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", side_effect=runtime
+            ),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaisesRegex(SystemExit, "1"),
+        ):
+            api.main()
+        self.assertEqual(len(factory.processes), 1)
+        server.server_activate.assert_not_called()
+        console_written()
+        self.assertEqual(stderr.getvalue().count(f"Error · {message}"), 1)
 
     def test_main_rejects_port_conflict_before_loading_or_starting_native(self):
         args = main_args(port=8000)
@@ -921,7 +1087,9 @@ class ServerMainTests(unittest.TestCase):
         with (
             mock.patch.object(api, "parse_args", return_value=args),
             mock.patch.object(api, "FrontendServer", return_value=server),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained") as tokenizer,
+            mock.patch.object(
+                transformers.AutoTokenizer, "from_pretrained"
+            ) as tokenizer,
             mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
@@ -940,6 +1108,8 @@ class ServerMainTests(unittest.TestCase):
         served = models / ".resolved/assembly"
         served.mkdir(parents=True)
         (served / "model.json").write_text("{}")
+        (served / "draft").mkdir()
+        (served / "draft/config.json").write_text('{"vocab_size": 248320}')
         link = models / "owner/model"
         link.parent.mkdir()
         link.symlink_to(served, target_is_directory=True)
@@ -958,7 +1128,7 @@ class ServerMainTests(unittest.TestCase):
             ),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
+                transformers.AutoTokenizer, "from_pretrained", return_value=object()
             ) as tokenizer,
             # The record names the family the model was installed as, whose
             # sampling requests get unless they name their own.
@@ -1054,7 +1224,9 @@ class ServerMainTests(unittest.TestCase):
             ),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(api, "FrontendServer", return_value=server),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained") as tokenizer,
+            mock.patch.object(
+                transformers.AutoTokenizer, "from_pretrained"
+            ) as tokenizer,
             mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stdout", new_callable=io.StringIO),
@@ -1093,7 +1265,7 @@ class CustomTemplateStartupTests(unittest.TestCase):
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
+                transformers.AutoTokenizer, "from_pretrained", return_value=object()
             ) as tokenizer,
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "check_capabilities"),
@@ -1126,12 +1298,14 @@ class CustomTemplateStartupTests(unittest.TestCase):
         path = self.template("custom template.jinja", data)
         templates, tokenizer, _, status = self.start(main_args(chat_template_file=path))
         templates.assert_called_once_with(
-            tokenizer.return_value, override=data.decode()
+            tokenizer.return_value, override=data.decode(), opens_own_message=False
         )
         self.assertEqual(self.file_lines(status), [f"Chat template file · {path}"])
         # Without one, the tokenizer's templates, and no line.
         templates, tokenizer, _, status = self.start(main_args())
-        templates.assert_called_once_with(tokenizer.return_value, override=None)
+        templates.assert_called_once_with(
+            tokenizer.return_value, override=None, opens_own_message=False
+        )
         self.assertEqual(self.file_lines(status), [])
 
     def test_a_template_file_it_cannot_use_stops_startup_first(self):

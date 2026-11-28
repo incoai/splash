@@ -66,6 +66,10 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --ane-calibration again: the split's start calibrates again instead of
+  // taking this Mac's record (splash serve --recalibrate-ane,
+  // AneFfnSetting::recalibrate).
+  bool recalibrateAne = false;
   // --ple-memory BYTES|auto|off and --expert-memory BYTES|auto|off: a
   // target's per-layer embedding (PLE) table through a row cache of BYTES and
   // a MoE target's routed experts through a store of BYTES, which
@@ -81,18 +85,19 @@ struct NativeArguments final {
   // KV on the SSD cache, for validation; without it, the requests memory
   // cannot hold (EngineSpillConfig::always).
   bool kvSpillAlways = false;
-  // --kv-window-trim on|off: whether a windowed target's pages give up their
-  // windowed layers' K/V once every window has passed them; off, for
-  // validation, keeps them Full, which changes no output
-  // (RuntimeResourcesConfig::kvWindowTrim).
-  bool kvWindowTrim = true;
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --max-concurrent-requests REQUESTS: the lanes the runtime runs, 1 to
+  // ExecutionLimits::maximumBatchWidth (RuntimeResourcesConfig::lanes).
+  uint32_t lanes = model::ExecutionLimits::defaultLanes;
   // --activations auto|bf16: whether activations may round to int8 where
-  // an int8-activation path takes them
+  // an int8-activation path takes them; none where it is not given
   // (RuntimeResourcesConfig::int8Activations).
-  ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  std::optional<ops::Int8Activations> int8Activations;
+  // --weights original|auto: whether the target's 16-bit projections load as
+  // Q8_0 or as their files store them (RuntimeResourcesConfig::weights).
+  model::gguf::Float16Weights weights = model::gguf::Float16Weights::Published;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

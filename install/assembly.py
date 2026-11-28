@@ -54,6 +54,16 @@ RECORD_KEYS = {
     "sources",
     "files",
 }
+# A text-only assembly of a family that serves images may record why the
+# Hub's listing of its commit gave no tower Splash serves (vision_unavailable),
+# so that later starts do not ask again until the commit moves
+# (upstream._lacks_tower). One also records whether --weights auto loads any
+# of its weights in another format than the default (quantizable_weights; null
+# where the engine could not say), by which the app offers that option, and
+# what its chat template makes of the reasoning efforts (reasoning, as
+# /v1/models reports it; null where its tokenizer does not load), by which
+# the app offers Thinking's choices; an assembly made before 1.7.4 does not.
+OPTIONAL_RECORD_KEYS = {"vision_unavailable", "quantizable_weights", "reasoning"}
 FILE_RECORD_KEYS = {"path", "bytes", "mtime_ns", "ctime_ns", "digest"}
 
 
@@ -175,7 +185,14 @@ def _well_formed(record):
     sources = record.get("sources")
     files = record.get("files")
     return (
-        set(record) == RECORD_KEYS | ({"metadata"} if gguf_target else set())
+        set(record) - OPTIONAL_RECORD_KEYS
+        == RECORD_KEYS | ({"metadata"} if gguf_target else set())
+        and isinstance(record.get("vision_unavailable", ""), str)
+        and isinstance(record.get("quantizable_weights"), bool | None)
+        and isinstance(record.get("reasoning"), dict | None)
+        and (
+            "vision_unavailable" not in record or record.get("vision_format") == "none"
+        )
         and type(record["version"]) is int
         and record["version"] == 1
         and isinstance(record["model"], str)
@@ -273,6 +290,16 @@ def family(path: Path):
     for a family this release does not serve."""
     record = recorded(path)
     return record and families.named(record["family"])
+
+
+def vocabulary(path: Path) -> int:
+    """The vocabulary the assembly path names serves: its DFlash2 draft's
+    (draft/config.json), which the engine refuses unless it is its target's
+    (ModelDescriptor.mm readDraftLayout)."""
+    size = models.read_json(Path(path) / "draft/config.json").get("vocab_size")
+    if type(size) is not int or size <= 0:
+        raise models.ModelError(f"{path}/draft/config.json names no vocabulary size")
+    return size
 
 
 def _metadata_inputs(files):

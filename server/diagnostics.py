@@ -312,7 +312,8 @@ def _reasoning_parts(reasoning):
     effort, which the template renders over the others, named as such, or
     the server's (its default for an absent one, or the one it sets for
     every request); its enable_thinking where it set one that counted, and
-    whether it thinks."""
+    whether it thinks, where its prompt decides that: a model that opens its
+    own reasoning (thinking None) decides it itself."""
     sent, effort = reasoning["sent_effort"], reasoning["effort"]
     if (template := reasoning.get("template_effort")) is not None:
         rendered = f"{template} (chat_template_kwargs)"
@@ -327,8 +328,21 @@ def _reasoning_parts(reasoning):
             parts[0] += f" → {effort}"
     if reasoning["enable_thinking"] is not None:
         parts.append(f"enable_thinking {str(reasoning['enable_thinking']).lower()}")
-    parts.append("thinking on" if reasoning["thinking"] else "thinking off")
+    if reasoning["thinking"] is not None:
+        parts.append("thinking on" if reasoning["thinking"] else "thinking off")
     return parts
+
+
+def _reuse_end(end, tokens):
+    """Where a start's reuse stopped (backend.REUSE_ENDS), with that end's
+    tokens."""
+    if end == "prefix_end":
+        return f"reuse ended: prompt parts from the cache at {tokens:,}"
+    if end == "kv_without_state":
+        return f"reuse ended: KV matched {tokens:,} tokens past the last state"
+    if end == "disk_read_failed":
+        return f"reuse ended: an SSD read to {tokens:,} failed"
+    return "reuse ended: nothing matched"
 
 
 def _request(record):
@@ -348,6 +362,10 @@ def print_request(record):
         # request's error message, which may quote it.
         if record.get("engine_reason"):
             parts.append(record["engine_reason"])
+        # What helps a request that cannot fit even alone, as its client is
+        # told (errors.CapacityError).
+        if record.get("remedy"):
+            parts.append(record["remedy"])
         print_status(" · ".join(parts), error=True)
         return
     if outcome == "started":
@@ -359,6 +377,8 @@ def print_request(record):
             f"input {record['prompt_tokens']:,}",
             f"cached {record['cached_tokens']:,}",
         ]
+        if record.get("reuse_end"):
+            parts.append(_reuse_end(record["reuse_end"], record["reuse_end_tokens"]))
         if "reasoning" in record:
             parts.extend(_reasoning_parts(record["reasoning"]))
         print_status(" · ".join(parts))

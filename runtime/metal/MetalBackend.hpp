@@ -3,6 +3,7 @@
 #include "Supervision.hpp"
 #include "metal/Allocation.hpp"
 #include "metal/DeviceCapabilities.hpp"
+#include "metal/InlineVector.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -136,6 +137,14 @@ struct IndirectGrid {
   uint64_t offsetBytes = 0;
 };
 
+// Dispatches up to these binding counts keep their bindings inline, so
+// encoding one allocates nothing; a dispatch past them moves to the heap. 28
+// buffers covers the widest production dispatches of eight lanes: the batched
+// GDN decode (two inputs, a current and a next state per lane, its tensors and
+// scratch), the short convolution and the block indexer commit.
+inline constexpr size_t kInlineBufferBindings = 28;
+// Production dispatches bind at most one parameter struct.
+inline constexpr size_t kInlineBytesBindings = 1;
 // Buffers a dispatch reaches through their GPU addresses: the backend writes
 // each one's address at encode time, in order, as a constant ulong table at
 // `index` (setBytes, so at most 512 of them), and makes their memory resident
@@ -155,8 +164,8 @@ struct AddressTable {
 
 struct ComputeDispatch {
   std::string pipelineName;
-  std::vector<BufferBinding> buffers;
-  std::vector<BytesBinding> bytes;
+  InlineVector<BufferBinding, kInlineBufferBindings> buffers;
+  InlineVector<BytesBinding, kInlineBytesBindings> bytes;
   // With a buffer in indirectThreadgroups the dispatch runs the grid it
   // holds, which its writer keeps within threadgroups.
   DispatchSize threadgroups;
@@ -288,6 +297,13 @@ struct CommandTiming {
   // time its later buffers wait for the other agent or its host steps.
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
+  // Of gpuSeconds, the image encodes' a prefill command ran after
+  // (Runtime.cpp), which the command reports with its own.
+  double encodeGpuSeconds = 0.0;
+  // Of a command split at event signals, its longest buffer and its buffers'
+  // median, each from its GPU start to its end: a buffer's wait for the other
+  // agent counts in it.
+  double longestBufferSeconds = 0.0, medianBufferSeconds = 0.0;
 };
 
 // Move-only ownership of one submitted Metal command. Completion is signalled

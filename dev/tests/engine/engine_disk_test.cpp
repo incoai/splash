@@ -1,5 +1,6 @@
 #include "EngineHarness.hpp"
 #include "EngineTestSupport.hpp"
+#include "GovernedHost.hpp"
 #include "MemoryPasses.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
@@ -8,9 +9,11 @@
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
 #include "TestRegistry.hpp"
+#include "TestWriteBudget.hpp"
 #include "engine/Engine.hpp"
 
 #include <algorithm>
+#include <ranges>
 #include <array>
 #include <functional>
 #include <limits>
@@ -170,7 +173,7 @@ void testCancelledPrefillRecoversFromItsDiskCheckpoint() {
               counters.resources.stateCache.checkpointEntries == 1 &&
               counters.resources.stateCache.bytes == 0,
           "the checkpoint did not go to disk");
-  engine.cancel(600);
+  engine.cancel(600, 0.0);
   runUntilIdle(engine);
   require(engine.snapshot().cancelled == 1 &&
               cache.snapshot().stateCache.checkpointEntries == 1,
@@ -235,7 +238,7 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
                 counters.resources.stateCache.checkpointRetirements == 0,
             "the final boundary retired the checkpoint it could not replace");
     if (cancel)
-      engine.cancel(610);
+      engine.cancel(610, 0.0);
     executor.stateTier->ready = true;
     runUntilIdle(engine);
     require(engine.snapshot().completed == (cancel ? 1U : 2U) &&
@@ -295,7 +298,7 @@ void testDiskCheckpointStaysUntilItsSuccessorIsPublished() {
               counters.resources.stateCache.checkpointRetirements == 0 &&
               cache.probe(prompt, {}).cachedTokens() == kPrefillCheckpointTokens,
           "a checkpoint that was not published retired the one on disk");
-  engine.cancel(620);
+  engine.cancel(620, 0.0);
   executor.stateTier->ready = true;
   runUntilIdle(engine);
   engine.submit(request(622, prompt));
@@ -386,7 +389,7 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
                 before.resources.stateCache.checkpointRetirements == 0 &&
                 executor.diskSnapshots == (disk ? 1 : 0),
             "a near-final checkpoint was planned or replaced its predecessor");
-    engine.cancel(1);
+    engine.cancel(1, 0.0);
     runUntilIdle(engine);
     engine.submit(request(2, prompt));
     runUntilIdle(engine);
@@ -519,7 +522,7 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
                 executor.prefillRows == 1,
             "the stream idled while a prefill waited for its pages");
     runWithTransfers(engine, tier, now, [&] { return events.outputs.contains(1); });
-    engine.cancel(2);
+    engine.cancel(2, 0.0);
     tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
     require(events.failedCount == 0 && executor.prefillRows == 98,
             "the lanes did not finish their prompts");
@@ -630,17 +633,12 @@ void testReplayPointsAreWrittenBehind() {
     uint64_t diskBytes = 0;
   };
   {
+    // A persistent tier copies a point kMinimumTokens deep at once, waiting
+    // for no delay, a quarter of the tier's writes at a time.
     Fixture fixture(true, false);
-    const std::optional<double> due = fixture.engine.nextWakeupMilliseconds();
-    require(fixture.engine.snapshot().writeBehind.waiting == 1 && fixture.tier.demotions == fixture.writes &&
-                due && *due > fixture.now && *due <= fixture.now + WriteBehind::kDelayMilliseconds,
-            "the replay point did not wait for its delay");
-    static_cast<void>(fixture.engine.tick(*due - 1));
-    require(fixture.tier.demotions == fixture.writes, "the replay point was written before its delay");
-    double now = *due;
-    static_cast<void>(fixture.engine.tick(now));
     require(fixture.tier.demotions == fixture.writes + 16,
-            "the replay point's copies did not start a few at a time");
+            "the replay point's copies did not start at once, a few at a time");
+    double now = fixture.now;
     for (uint32_t step = 0; step < 16 && !fixture.durableInRam(); ++step) {
       fixture.tier.complete();
       static_cast<void>(fixture.engine.tick(++now));
@@ -664,7 +662,7 @@ void testReplayPointsAreWrittenBehind() {
             "the replay point's copies did not start a few at a time once the lane ahead asked for memory");
     tickBesideALaneAhead(fixture.engine, fixture.tier, now, [&] { return fixture.durableInRam(); });
     require(fixture.durableInRam(), "the replay point did not become durable in RAM on the memory's demand");
-    fixture.engine.cancel(2);
+    fixture.engine.cancel(2, 0.0);
     tickUntil(fixture.engine, now, [&] { return idle(fixture.engine); }, "the lane ahead did not end");
   }
   {
@@ -761,7 +759,7 @@ void testFinishedConversationsLeaveAtOnce() {
                 tier.demotions == writes + (persistent ? 16u : 0u),
             persistent ? "a persistent tier did not write a point in use"
                        : "a temporary tier wrote a point its running request holds");
-    engine.cancel(1);
+    engine.cancel(1, 0.0);
     tickUntil(engine, now, [&] { return idle(engine); }, "the request did not end");
     if (!persistent) {
       EngineRequest ahead = request(2, std::vector<uint32_t>(16384, 9));
@@ -775,7 +773,7 @@ void testFinishedConversationsLeaveAtOnce() {
                 copied.stateCache.diskBytes == before.stateCache.diskBytes + 64,
             "the finished conversation's point was not copied behind it");
     if (!persistent) {
-      engine.cancel(2);
+      engine.cancel(2, 0.0);
       tickUntil(engine, now, [&] { return idle(engine); }, "the lane ahead did not end");
       continue;
     }
@@ -809,12 +807,15 @@ void testCopiesAheadWaitForALaneRefusedBesideOthers() {
   guardReleases(storage, engine);
   // The leaf the refusal demotes, under a state on the SSD.
   cacheBlocksUnderDiskStates(cache, 1);
+  // A persistent tier copies the point at once (WriteBehind); no share of
+  // Persist writes holds its chain back until the test lets it go, at `due`.
+  tier.writeLimits[1] = 0;
   engine.submit(request(9, std::vector<uint32_t>(2060, 9)));
   double now = 1;
   tickUntil(engine, now, [&] { return idle(engine); }, "the conversation did not finish");
-  const std::optional<double> due = engine.nextWakeupMilliseconds();
-  require(due && engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
-          "the finished conversation's point did not wait for its delay");
+  const std::optional<double> due = now + WriteBehind::kDelayMilliseconds;
+  require(engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
+          "the finished conversation's point was copied while held back");
   // Lane 1's decode needs a fourth page two tokens in, lane 2's 24 tokens in.
   executor.decodeFinishes = false;
   const auto promptTokens = [](uint64_t id) { return id == 1 ? 87U : 65U; };
@@ -839,6 +840,7 @@ void testCopiesAheadWaitForALaneRefusedBesideOthers() {
   const uint32_t demotions = tier.demotions;
   require(held.granted() && engine.commandInFlight() && demotions == 1 && !executor.suspensions,
           "lane 1 was not refused its page beside lane 2 while the leaf's demotion is in flight");
+  tier.writeLimits[1] = 16;
   static_cast<void>(engine.tick(*due));
   const std::optional<double> wakeup = engine.nextWakeupMilliseconds();
   require(tier.demotions == demotions && engine.snapshot().writeBehind.waiting == 1 &&
@@ -874,12 +876,15 @@ void testCopiesAheadWaitNoLongerThanTheWaitsLimit() {
   guardReleases(storage, engine);
   // The leaf the refusal demotes, under a state on the SSD.
   cacheBlocksUnderDiskStates(cache, 1);
+  // A persistent tier copies the point at once (WriteBehind); no share of
+  // Persist writes holds its chain back until the test lets it go, at `due`.
+  tier.writeLimits[1] = 0;
   engine.submit(request(9, std::vector<uint32_t>(2060, 9)));
   double now = 1;
   tickUntil(engine, now, [&] { return idle(engine); }, "the conversation did not finish");
-  const std::optional<double> due = engine.nextWakeupMilliseconds();
-  require(due && engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
-          "the finished conversation's point did not wait for its delay");
+  const std::optional<double> due = now + WriteBehind::kDelayMilliseconds;
+  require(engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
+          "the finished conversation's point was copied while held back");
   // Lane 1's decode needs a fourth page two tokens in, lane 2's 24 tokens in.
   executor.decodeFinishes = false;
   const auto promptTokens = [](uint64_t id) { return id == 1 ? 87U : 65U; };
@@ -906,6 +911,7 @@ void testCopiesAheadWaitNoLongerThanTheWaitsLimit() {
   const size_t decoded = events.outputs[1].size();
   require(held.granted() && engine.commandInFlight() && demotions == 1 && !executor.suspensions,
           "lane 1 was not refused its page beside lane 2 while the leaf's demotion is in flight");
+  tier.writeLimits[1] = 16;
   static_cast<void>(engine.tick(*due));
   const std::optional<double> wakeup = engine.nextWakeupMilliseconds();
   require(tier.demotions == demotions && engine.snapshot().writeBehind.waiting == 1 &&
@@ -943,12 +949,15 @@ void testCopiesAheadDoNotWaitForALaneBelowThePriorityThatRuns() {
   guardReleases(storage, engine);
   // The leaf the refusal demotes, under a state on the SSD.
   cacheBlocksUnderDiskStates(cache, 1);
+  // A persistent tier copies the point at once (WriteBehind); no share of
+  // Persist writes holds its chain back until the test lets it go, at `due`.
+  tier.writeLimits[1] = 0;
   engine.submit(request(9, std::vector<uint32_t>(2060, 9)));
   double now = 1;
   tickUntil(engine, now, [&] { return idle(engine); }, "the conversation did not finish");
-  const std::optional<double> due = engine.nextWakeupMilliseconds();
-  require(due && engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
-          "the finished conversation's point did not wait for its delay");
+  const std::optional<double> due = now + WriteBehind::kDelayMilliseconds;
+  require(engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
+          "the finished conversation's point was copied while held back");
   executor.decodeFinishes = false;
   const auto decoding = [&](uint64_t id, uint32_t tokens, RequestPriority priority) {
     auto value = request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
@@ -980,6 +989,7 @@ void testCopiesAheadDoNotWaitForALaneBelowThePriorityThatRuns() {
             "the Foreground request did not decode");
   require(now < *due && events.outputs[1].size() == decoded && tier.demotions == 1,
           "the Normal lane decoded beside the Foreground request, or the point was copied early");
+  tier.writeLimits[1] = 16;
   static_cast<void>(engine.tick(*due));
   require(tier.demotions > 1, "the point waited for a lane of a priority the scheduler does not plan");
   executor.decodeFinishes = true;
@@ -1062,7 +1072,7 @@ void testARefusalAfterProgressRestartsTheWaitLimit() {
   for (const uint32_t page : held)
     pool.releasePage(page, false);
   storage.growthBlocked = false;
-  engine.cancel(2);
+  engine.cancel(2, 0.0);
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
 }
 
@@ -1097,13 +1107,16 @@ void testCopiesAheadDoNotWaitForARequestHeldBehindARefusal() {
   lane(4, 5, RequestPriority::Normal);
   double now = 1;
   tickUntil(engine, now, [&] { return events.outputs.contains(4); }, "the Normal lane did not decode");
+  // A persistent tier copies the point at once (WriteBehind); no share of
+  // Persist writes holds its chain back until the test lets it go, at `due`.
+  tier.writeLimits[1] = 0;
   lane(1, 2060, RequestPriority::Foreground);
   lane(2, 9, RequestPriority::Foreground);
   lane(3, 9, RequestPriority::Foreground);
   tickUntil(engine, now, [&] { return events.outputs.contains(1) && events.outputs.contains(3); },
             "the Foreground lanes did not decode");
-  const std::optional<double> due = engine.nextWakeupMilliseconds();
-  require(due && engine.snapshot().writeBehind.waiting == 1, "the first lane's point did not wait for its delay");
+  const std::optional<double> due = now + WriteBehind::kDelayMilliseconds;
+  require(engine.snapshot().writeBehind.waiting == 1, "the first lane's point was copied while held back");
   lane(5, 9, RequestPriority::Foreground, 2);
   tickUntil(engine, now, [&] { return events.usage.contains(5) && !engine.commandInFlight(); },
             "the arrival did not finish");
@@ -1129,6 +1142,7 @@ void testCopiesAheadDoNotWaitForARequestHeldBehindARefusal() {
               events.startIds.back() != 6 && engine.resourceWaitSnapshot(now).heldBehindRefusal == 1,
           "the resume was not held behind the Foreground request's refusal");
   const uint32_t demotions = tier.demotions;
+  tier.writeLimits[1] = 16;
   static_cast<void>(engine.tick(*due));
   require(tier.demotions > demotions, "the point waited for a request held behind a refusal");
   executor.beginGrowthBlocked = {};
@@ -1154,12 +1168,15 @@ void testCopiesAheadWaitForALaneRefusedDuringARecovery() {
   guardReleases(storage, engine);
   // The leaf the refusal demotes, under a state on the SSD.
   cacheBlocksUnderDiskStates(cache, 1);
+  // A persistent tier copies the point at once (WriteBehind); no share of
+  // Persist writes holds its chain back until the test lets it go, at `due`.
+  tier.writeLimits[1] = 0;
   engine.submit(request(9, std::vector<uint32_t>(2060, 9)));
   double now = 1;
   tickUntil(engine, now, [&] { return idle(engine); }, "the conversation did not finish");
-  const std::optional<double> due = engine.nextWakeupMilliseconds();
-  require(due && engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
-          "the finished conversation's point did not wait for its delay");
+  const std::optional<double> due = now + WriteBehind::kDelayMilliseconds;
+  require(engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
+          "the finished conversation's point was copied while held back");
   executor.decodeFinishes = false;
   const auto promptTokens = [](uint64_t id) { return id == 1 ? 87U : id == 2 ? 65U : 9U; };
   const auto decoding = [&](uint64_t id, RequestPriority priority, uint32_t output) {
@@ -1194,6 +1211,7 @@ void testCopiesAheadWaitForALaneRefusedDuringARecovery() {
   const uint32_t demotions = tier.demotions;
   require(held.granted() && engine.commandInFlight() && demotions == 1 && executor.suspensions == 1,
           "lane 1 was not refused its page beside lane 2 while the leaf's demotion is in flight");
+  tier.writeLimits[1] = 16;
   static_cast<void>(engine.tick(*due));
   require(tier.demotions == demotions && engine.snapshot().writeBehind.waiting == 1,
           "the point was copied while a lane refused during a recovery waited for memory");
@@ -1358,12 +1376,15 @@ void testCopiesAheadDoNotWaitForARequestARecoveryLeavesUntried() {
   // The leaves the refusal demotes, under states on the SSD.
   cacheBlocksUnderDiskStates(cache, 3);
   const uint32_t written = tier.demotions;
+  // A persistent tier copies the point at once (WriteBehind); no share of
+  // Persist writes holds its chain back until the test lets it go, at `due`.
+  tier.writeLimits[1] = 0;
   engine.submit(request(9, std::vector<uint32_t>(2060, 9)));
   double now = 1;
   tickUntil(engine, now, [&] { return idle(engine); }, "the conversation did not finish");
-  const std::optional<double> due = engine.nextWakeupMilliseconds();
-  require(due && engine.snapshot().writeBehind.waiting == 1 && tier.demotions == written,
-          "the finished conversation's point did not wait for its delay");
+  const std::optional<double> due = now + WriteBehind::kDelayMilliseconds;
+  require(engine.snapshot().writeBehind.waiting == 1 && tier.demotions == written,
+          "the finished conversation's point was copied while held back");
   executor.decodeFinishes = false;
   const auto decoding = [&](uint64_t id, const std::vector<uint32_t> &prompt, RequestPriority priority) {
     auto value = request(id, prompt);
@@ -1401,6 +1422,7 @@ void testCopiesAheadDoNotWaitForARequestARecoveryLeavesUntried() {
   const uint32_t demotions = tier.demotions;
   require(now < *due && !cache.transfersInFlight() && !executor.requests.contains(4),
           "the demotions did not land, or the Normal request started, before the point's time");
+  tier.writeLimits[1] = 16;
   static_cast<void>(engine.tick(*due));
   require(tier.demotions > demotions, "the point waited for a request the recovery leaves untried");
   executor.decodeFinishes = true;
@@ -1449,7 +1471,8 @@ void testABatchRefusalOfNothingOnItsWayBackHoldsNoOne() {
   const auto outputs = [&](uint64_t id) {
     return events.outputs.contains(id) ? events.outputs.at(id).size() : 0;
   };
-  const auto waiting = [&] { return config.governor->snapshot().claims.waiting; };
+  // Whether a claim holds room for memory on its way back.
+  const auto waiting = [&] { return config.governor->ledger().claimWaiting(); };
   // The lane beside it holds four pages; the waiting lane holds two, which
   // the 16 rows its verify block may hold outgrow first.
   engine.submit(prompt(1, std::vector<uint32_t>(97, 1)));
@@ -1461,13 +1484,13 @@ void testABatchRefusalOfNothingOnItsWayBackHoldsNoOne() {
   storage.budgetPages = storage.allocatedPages();
   for (uint32_t step = 0; step < 100 && !tier.demotions; ++step)
     static_cast<void>(engine.tick(now += 150));
-  require(tier.demotions == 1 && pages(2) == 2 && waiting() == 1,
+  require(tier.demotions == 1 && pages(2) == 2 && waiting(),
           "the lane did not wait on its claim for a page on its way back");
   engine.submit(prompt(3, std::vector<uint32_t>(4097, 3)));
   for (uint32_t step = 0; step < 4; ++step)
     static_cast<void>(engine.tick(now += 150));
   require(!executor.requests.at(3).resident && engine.snapshot().resourceSuspensions == 1 && pages(2) == 2 &&
-              waiting() == 1,
+              waiting(),
           "the prompt refused what nothing returns took the page held for the waiting lane, waited, or did "
           "not yield its lane");
   // The page lands as the start arrives.
@@ -1484,6 +1507,49 @@ void testABatchRefusalOfNothingOnItsWayBackHoldsNoOne() {
   storage.budgetPages = std::numeric_limits<uint32_t>::max();
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.failedCount == 0 && events.completedCount == 4, "the requests did not complete");
+}
+
+// /status memory_governor.claims counts every request that waits for memory, one refused memory
+// that nothing returns as well as one whose memory is on its way back: a start refused so waited
+// 76 s while claims.waiting read 0.
+void testAStartRefusedMemoryNothingReturnsIsAWaitingClaim() {
+  test::TestKvStorage storage(256, 4096, 1);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  const EngineConfig config = test::engineConfig({.maxContext = 102400});
+  engine::Engine engine(config, cache, executor, events);
+  guardReleases(storage, engine);
+  const auto prompt = [](uint64_t id, uint32_t tokens) {
+    EngineRequest result = request(id, std::vector<uint32_t>(tokens, uint32_t(id)));
+    result.maxNewTokens = 1000;
+    result.deadlineMilliseconds = 1e9;
+    return result;
+  };
+  engine.submit(prompt(1, 97));
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.outputs.contains(1); }, "the lane did not decode");
+  storage.budgetPages = storage.allocatedPages();
+  engine.submit(prompt(2, 4097));
+  for (uint32_t step = 0; step < 8; ++step) {
+    static_cast<void>(engine.tick(now += 150));
+    static_cast<void>(config.governor->controlPass(now));
+  }
+  const engine::MemoryClaimsSnapshot claims = config.governor->snapshot().claims;
+  require(engine.resourceWaitSnapshot(now).memory == 1 && !config.governor->ledger().claimWaiting(),
+          "the start did not wait for memory nothing returns");
+  require(claims.waiting == 1 && claims.oldestMilliseconds >= 900.0,
+          "a start waiting for memory nothing returns was not a waiting claim: " +
+              std::to_string(claims.waiting) + " waiting, the oldest " +
+              std::to_string(claims.oldestMilliseconds) + " ms");
+  storage.budgetPages = std::numeric_limits<uint32_t>::max();
+  engine.cancel(1, 0.0);
+  tickUntil(engine, now, [&] { return events.outputs.contains(2); }, "the start did not run once memory came back");
+  require(config.governor->snapshot().claims.waiting == 0, "a claim that runs still waits");
+  engine.cancel(2, 0.0);
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
 }
 
 // A disk restore holds its lane until the read lands, and completion, cancellation, expiry, a
@@ -1509,7 +1575,7 @@ void testAsyncRestoreLifecycle() {
     engine.submit(request(2, std::vector<uint32_t>(3, 99)));
     for (int tick = 2; tick < 8; ++tick) static_cast<void>(engine.tick(tick));
     require(events.outputs.contains(2), "restore blocked independent model work");
-    if (outcome == 1) engine.cancel(1);
+    if (outcome == 1) engine.cancel(1, 0.0);
     if (outcome == 2) {
       // Expired, it keeps its waiting phase until the read drains.
       static_cast<void>(engine.tick(10001));
@@ -1594,7 +1660,7 @@ void testStopWhileRestoringFinishesAfterTheRestore() {
   executor.restoreControl->ready = true;
   tickUntil(engine, now, [&] { return events.reasons.contains(1); }, "the stopped request did not end");
   for (uint64_t id = 2; id <= 4; ++id)
-    engine.cancel(id);
+    engine.cancel(id, 0.0);
   tickUntil(engine, now, [&] { return idle(engine); }, "the engine did not become idle");
 
   const EngineSnapshot counts = engine.snapshot();
@@ -1649,6 +1715,18 @@ void testRepeatedDiskHitPromotesToMemory() {
   require(executor.diskReads == 1 && cache.snapshot().stateCache.promotions == 1 &&
               cache.snapshot().lookup.stateDiskHits == 1 && events.failedCount == 0,
           "hot restored prefix continued to read from disk");
+  // Each start says where its state was: the first one's on disk, the later ones' in RAM, each as
+  // deep as the prompt's KV it matched.
+  require(events.startsFound.size() == 4 && events.startsFound[0].stateSource == engine::StateSource::Disk &&
+              std::ranges::all_of(events.startsFound | std::views::drop(1),
+                                  [](const engine::StartFound &found) {
+                                    return found.stateSource == engine::StateSource::Memory;
+                                  }) &&
+              std::ranges::all_of(events.startsFound,
+                                  [](const engine::StartFound &found) {
+                                    return found.matchedPromptTokens == 64 && found.prefixTokens == 64 && !found.lostState;
+                                  }),
+          "a start did not say where its state was");
 }
 
 // A failed disk read falls back to the next match, a shallower state in RAM, not a cold start.
@@ -1674,6 +1752,54 @@ void testFailedDiskRestoreKeepsShallowerState() {
   require(executor.diskReads == 1 && events.failedCount == 0 && executor.restored == 32 &&
               executor.prefillRows == 33,
           "failed disk restore discarded the shallower RAM state");
+}
+
+// Each start says why its reuse stopped, with that end's tokens, and /status counts starts by it beside
+// the prompts' tokens: KV matched past the state the start resumed from (64 matched, a state at 32); nothing
+// matched; the prompt parting from the cache where the matched KV ends, all of it reused; and a read from the
+// SSD that failed (the state at 64), the start resuming from the shallower state at 32.
+void testStartsSayWhyTheirReuseStopped() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> stateless(65, 5);
+  const std::vector<uint32_t> fresh(65, 1);
+  const std::vector<uint32_t> unread(65, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  cache.publishCommittedBlocks(999, unread, 64, {});
+  demoteState(cache, cache.blockAt(999, 64));
+  cache.publishCompositeState(cache.blockAt(999, 32), std::make_shared<State>(), false);
+  cache.endRequest(999);
+  cache.beginRequest(998);
+  require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
+  cache.publishCommittedBlocks(998, stateless, 64, {});
+  cache.publishCompositeState(cache.blockAt(998, 32), std::make_shared<State>(), false);
+  cache.endRequest(998);
+  executor.restoreControl->ready = true;
+  executor.restoreControl->success = false;
+  uint64_t id = 0;
+  for (const auto *prompt : {&stateless, &fresh, &fresh, &unread}) {
+    engine.submit(request(++id, *prompt));
+    runUntilIdle(engine);
+  }
+  using engine::ReuseEnd;
+  const std::vector<std::pair<ReuseEnd, uint32_t>> expected{
+      {ReuseEnd::KvWithoutState, 32}, {ReuseEnd::NothingMatched, 0}, {ReuseEnd::PrefixEnd, 64},
+      {ReuseEnd::DiskReadFailed, 64}};
+  std::vector<std::pair<ReuseEnd, uint32_t>> ends;
+  for (const engine::StartFound &found : events.startsFound)
+    ends.emplace_back(found.reuseEnd, found.reuseEndTokens);
+  require(events.failedCount == 0 && ends == expected && events.starts == std::vector<uint32_t>{32, 0, 64, 32},
+          "a start did not say why its reuse stopped");
+  const engine::EngineSnapshot snapshot = engine.snapshot();
+  require(snapshot.reuseEnds == std::array<uint64_t, engine::kReuseEnds>{1, 1, 1, 1} &&
+              snapshot.promptTokens == 4 * 65 && snapshot.reusedTokens == 128 && snapshot.reusedDiskTokens == 0,
+          "/status did not count the starts by why their reuse stopped beside the prompts' tokens");
 }
 
 // A prefix whose state and KV are on disk comes back, state and pages, before the lane runs.
@@ -1725,6 +1851,10 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   require(stats.kvTier.restores == 2 &&
               stats.pool.pagesPrefix == 2 && stats.kvTier.diskBlocks == 2,
           "restore accounting is off");
+  // Every token it reused came back from the SSD.
+  require(engine.snapshot().reusedTokens == 64 && engine.snapshot().reusedDiskTokens == 64 &&
+              engine.snapshot().promptTokens == 65,
+          "the tokens the SSD restored were not counted");
 }
 
 // Siblings wait for a producer restoring their shared prefix: the state is read once and the
@@ -1776,7 +1906,7 @@ void testCancelledRestoringProducerReleasesItsWaiter() {
   static_cast<void>(engine.tick(1));
   require(executor.diskReads == 1 && engine.snapshot().scheduler.waitingPrefix == 1,
           "the sibling did not wait for the restoring producer");
-  engine.cancel(1);
+  engine.cancel(1, 0.0);
   executor.restoreControl = std::make_shared<RestoreControl>();
   static_cast<void>(engine.tick(2));
   require(executor.diskReads == 2 && engine.resourceWaitSnapshot(2).restoring == 2 &&
@@ -1848,93 +1978,106 @@ void testALaterPromptWaitsForARestoringPromptThatLeadsIt() {
   }
 }
 
-// A request that skips the cache waits for no restoring producer, and no producer plans a junction
-// for it.
-void testSkipCacheRequestDoesNotWaitForAProducer() {
-  test::TestKvStorage storage(128, 4096, 4);
-  KvPool pool(storage, 0);
-  test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
-  Executor executor;
-  Events events;
-  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
-  guardReleases(storage, engine);
-  // The state at 64 and both blocks of KV under it are on disk.
-  std::vector<uint32_t> prompt(226);
-  std::iota(prompt.begin(), prompt.end(), 1);
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
+// The prefix of 64 tokens on the SSD, its two blocks and its state, nothing of it in memory.
+void prefixOnDisk(engine::Cache &cache, test::TestKvStorage &storage, test::TestKvTier &tier,
+                  const std::vector<uint32_t> &prompt) {
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  const auto block = test::publishBlocks(cache, 999, prompt, 64);
-  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer), false);
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
-  require(test::evictStep(cache).stateBuffers && cache.pollTransfers(),
-          "state was not demoted");
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(test::evictStep(cache).gave() && tier.demotions == written,
-            "KV block was not written");
+    require(test::evictStep(cache).gave(), "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
-  while (pool.snapshot().pagesAllocated)
-    require(test::releaseStep(cache).gave(),
-            "an empty extent was not released");
-  // Alone, with no page the budget grants, its restore fails: it skips the
-  // cache from then on.
-  storage.growthBlocked = true;
-  engine.submit(request(1, prompt));
-  static_cast<void>(engine.tick(1));
-  require(engine.resourceWaitSnapshot(1).memory == 1 && executor.diskReads == 0,
-          "the restore that could not fit did not wait for memory");
-  storage.growthBlocked = false;
-  // A foreground request sharing its first 192 tokens is admitted first and
-  // restores the prefix. It plans a junction at 160 for a sibling sharing
-  // that much with it, and none at 192 for the request that skips the cache.
-  std::vector<uint32_t> producer = prompt;
-  std::fill(producer.begin() + 192, producer.end(), 7);
-  auto foreground = request(2, producer);
-  foreground.priority = RequestPriority::Foreground;
-  engine.submit(std::move(foreground));
-  std::vector<uint32_t> sibling = producer;
-  std::fill(sibling.begin() + 160, sibling.end(), 9);
-  engine.submit(request(3, sibling));
-  // While the producer restores, the request that skips the cache starts:
-  // the producer runs in no command before its read lands, and the request's
-  // prompt ends in its own. It never waits for the
-  // producer's prefix.
-  double now = 101;
-  bool prefixWait = false;
-  tickUntil(engine, now,
-            [&] {
-              for (const ActiveRequestSnapshot &active : engine.snapshot().activeRequests)
-                prefixWait = prefixWait || (active.id == 1 && active.phase == Phase::WaitingPrefix);
-              return std::find(events.startIds.begin(), events.startIds.end(), 1) !=
-                     events.startIds.end();
-            },
-            "the request that skips the cache did not start");
-  require(!prefixWait && events.starts.front() == 0 &&
-              executor.diskReads == 1 && executor.restored == 0,
-          "the request that skips the cache waited for the restoring producer, or for its prefix");
+  require(test::releaseStep(cache).gave() && storage.allocatedPages() == 0 &&
+              cache.snapshot().kvTier.diskBlocks == 2,
+          "the prefix did not move to disk whole");
+}
+
+// Two queued restores whose chains together exceed memory: the first conversation's prefix is on the SSD, the
+// second's KV in memory (its state on the SSD), and memory holds one chain and a page. Both start at once. The
+// first takes the memory the second's chain held (a queued request's wanted chain keeps nothing from a start's
+// claim, TakeRights::CertainReuse::All), which a write frees; the second restores its chain from the SSD once the
+// first is done. Neither times out, neither starts cold.
+void testTwoQueuedRestoresBeyondMemoryBothResume() {
+  constexpr double kLimit = 400;
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
   executor.restoreControl->ready = true;
-  for (; now < 300 && !idle(engine); ++now) {
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400, .resourceWaitTimeoutMilliseconds = kLimit}), cache,
+                        executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> first(65, 17), second(65, 23);
+  prefixOnDisk(cache, storage, tier, first);
+  cache.beginRequest(998);
+  require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
+  demoteState(cache, test::publishBlocks(cache, 998, second, 64));
+  cache.endRequest(998);
+  require(storage.allocatedPages() > 0 && cache.snapshot().kvTier.diskBlocks == 2,
+          "the second chain is not in memory beside the first on the SSD");
+  // One extent: the second's chain and a free page or two, short of the first's restore and its page.
+  storage.budgetPages = 4;
+  engine.submit(request(1, first));
+  engine.submit(request(2, second));
+  double now = 1;
+  for (; now < 10 * kLimit && !idle(engine); ++now) {
     static_cast<void>(engine.tick(now));
     tier.complete();
   }
-  require(idle(engine) && events.completedCount == 3 && events.failedCount == 0,
-          "the requests did not finish");
-  const auto &boundaries = executor.plans.at(2).boundaries;
-  require(events.starts.back() == 160 &&
-              std::none_of(boundaries.begin(), boundaries.end(),
-                           [](const DraftBoundaryPlan &boundary) {
-                             return boundary.boundary == 192;
-                           }),
-          "the producer planned a junction for the request that skips the cache");
+  require(idle(engine) && events.completedCount == 2 && events.failedCount == 0,
+          "a queued restore timed out or failed");
+  for (const uint64_t id : {1, 2}) {
+    const auto at = std::ranges::find(events.startIds, id);
+    require(at != events.startIds.end(), "a request did not start");
+    const size_t index = static_cast<size_t>(at - events.startIds.begin());
+    require(events.starts.at(index) == 64 && !events.startsFound.at(index).lostState,
+            "a queued restore started without its prefix");
+  }
 }
 
-// A request whose prefix restore cannot fit alone is not probed again, and starts cold.
-void testSkipCacheCandidateIsNotProbed() {
+// A restore refused at one moment, alone and with nothing in flight, waits and retries as a queued start does, and
+// resumes from its prefix on the SSD once memory comes, rather than give the prefix up: a recall that gave it up
+// recomputed 262K tokens in 197 s where its prefix was on the SSD (Qwen3.6-35B).
+void testARestoreRefusedForAMomentWaitsAndResumes() {
   test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  executor.restoreControl->ready = true;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(65, 17);
+  prefixOnDisk(cache, storage, tier, prompt);
+  // No page until its second attempt.
+  storage.growthBlocked = true;
+  executor.beginObserver = [&] { storage.growthBlocked = executor.beginAttempts < 2; };
+  engine.submit(request(1, prompt));
+  static_cast<void>(engine.tick(1));
+  require(events.starts.empty() && engine.resourceWaitSnapshot(1).memory == 1,
+          "the refused restore did not wait");
+  double now = 2;
+  tickUntil(engine, now, [&] {
+    tier.complete();
+    return idle(engine);
+  }, "engine did not reach idle");
+  require(events.starts.size() == 1 && events.starts[0] == 64 && !events.startsFound[0].lostState &&
+              executor.beginAttempts == 2 && tier.restores == 2 && executor.prefillRows == 1 &&
+              events.completedCount == 1 && events.failedCount == 0,
+          "a restore refused for a moment gave its prefix up");
+}
+
+// A start whose restore is in flight when a later allocation of its attempt is refused waits for the reads: its
+// next attempt finds the room and resumes from its prefix. Only writes counted as in flight, so it gave the prefix
+// up and started cold; two starts at once each did so over the other's reads.
+void testAStartWaitsWhileARestoreIsInFlight() {
+  test::TestKvStorage storage(128, 4096, 1);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   engine::Cache cache(pool, &tier, test::ampleDiskBudget());
@@ -1942,7 +2085,6 @@ void testSkipCacheCandidateIsNotProbed() {
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
   guardReleases(storage, engine);
-  const auto hashed = [&] { return cache.snapshot().lookup.probeHashedBlocks; };
   const std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
@@ -1953,24 +2095,27 @@ void testSkipCacheCandidateIsNotProbed() {
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
-  require(test::releaseStep(cache).gave() &&
-              storage.allocatedPages() == 0 && cache.snapshot().kvTier.diskBlocks == 2,
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  require(storage.allocatedPages() == 0 && cache.snapshot().kvTier.diskBlocks == 2,
           "the prefix did not move to disk whole");
-  // No page can be allocated until the request starts again.
-  storage.growthBlocked = true;
-  executor.beginObserver = [&] { storage.growthBlocked = executor.beginAttempts < 2; };
+  // Memory holds the prefix's two pages and not the page of its first work, until the second attempt.
+  executor.restoreControl->ready = true;
+  storage.budgetPages = 2;
+  executor.beginObserver = [&] { storage.budgetPages = executor.beginAttempts < 2 ? 2 : 3; };
   engine.submit(request(1, prompt));
   static_cast<void>(engine.tick(1));
-  require(hashed() == 2 && events.starts.empty() && engine.resourceWaitSnapshot(1).memory == 1,
-          "the restore that cannot fit alone did not wait");
+  require(events.starts.empty() && tier.inFlight() == 2 && engine.resourceWaitSnapshot(1).memory == 1,
+          "the start refused its first work's page did not wait with its restore in flight");
   double now = 2;
-  tickUntil(engine, now, [&] { return !events.starts.empty(); },
-            "the request did not start without its prefix");
-  require(hashed() == 2 && events.starts[0] == 0,
-          "a request that ignores the cache was probed or ranked by its prefix");
+  tickUntil(engine, now, [&] {
+    tier.complete();
+    return !events.starts.empty();
+  }, "the request did not start");
+  require(events.starts[0] == 64 && !events.startsFound[0].lostState,
+          "a start gave up the prefix its restore in flight was reading");
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
-  require(events.completedCount == 1 && executor.prefillRows == 65 && tier.restores == 0,
-          "the request did not finish cold");
+  require(events.completedCount == 1 && executor.prefillRows == 1 && tier.restores == 2,
+          "the request did not finish from its restored prefix");
 }
 
 // A restore refused pages suspends a lower-priority lane when nothing is on its way back, and waits
@@ -2029,7 +2174,7 @@ void testRefusedPrefixRestorePreemptsLowerResident() {
                 engine.snapshot().prioritySuspensions == (written ? 0U : 1U),
             "the request did not start from its restored prefix");
     for (uint64_t id : {1, 2})
-      engine.cancel(id);
+      engine.cancel(id, 0.0);
     tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
     require(events.failedCount == 0, "a request failed");
   }
@@ -2092,7 +2237,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   static_cast<void>(engine.tick(1));
   require(tier.restores == 1 && executor.diskReads == 1,
           "restore did not start within the tier's limit");
-  engine.cancel(1);
+  engine.cancel(1, 0.0);
   executor.restoreControl->ready = true;
   static_cast<void>(engine.tick(2));
   for (int tick = 3; tick < 16; ++tick) {
@@ -2176,7 +2321,7 @@ void testARetryPastTheWaitLimitHoldsNothing() {
   other.deadlineMilliseconds = 1e9;
   engine.submit(std::move(other));
   static_cast<void>(engine.tick(29'000));
-  engine.cancel(2);
+  engine.cancel(2, 0.0);
   static_cast<void>(engine.tick(29'001));
   static_cast<void>(engine.tick(29'002));
   static_cast<void>(engine.tick(1 + kResourceWaitTimeoutMilliseconds + 500));
@@ -2230,15 +2375,14 @@ void testAStartQueuedBetweenRefusalsHoldsFromTheFirst() {
   engine.submit(std::move(foreground));
   static_cast<void>(engine.tick(2));
   static_cast<void>(engine.tick(4'999));
-  engine.cancel(2);
+  engine.cancel(2, 0.0);
   static_cast<void>(engine.tick(5'000));
   static_cast<void>(engine.tick(1 + kResourceWaitTimeoutMilliseconds + 500));
   require(events.failedCount == 0 && !config.governor->ledger().claimWaiting(),
           "a start queued between pending refusals held its room past the wait limit from its first");
 }
 
-// A burst of completions queues their points together, copies them all, and delays no decode
-// command.
+// A burst of completions has every point copied as it falls due, and delays no decode command.
 void testACompletionBurstIsCopiedWithoutDelayingDecode() {
   test::EngineHarness harness(
       {.pages = 256,
@@ -2252,31 +2396,29 @@ void testACompletionBurstIsCopiedWithoutDelayingDecode() {
   decoding.maxNewTokens = 100'000;
   decoding.deadlineMilliseconds = 1e9;
   harness.engine.submit(std::move(decoding));
-  // A prompt deep enough to be copied behind (WriteBehind::kMinimumTokens),
-  // cached with its replay point at 2048.
-  std::vector<uint32_t> shared(2060);
+  // A prompt too short to be copied behind (WriteBehind::kMinimumTokens),
+  // cached with its replay point at 1024; the burst's prompts go on from it
+  // past 2048 tokens, so that each point falls due as it is published.
+  std::vector<uint32_t> shared(1036);
   std::iota(shared.begin(), shared.end(), 10'000);
   EngineRequest first = harness.request(2, shared);
   first.deadlineMilliseconds = 1e9;
   harness.engine.submit(std::move(first));
   harness.runUntil([&] { return harness.events.usage.contains(2); }, "the first prompt did not finish");
   for (uint32_t id = 3; id <= 5; ++id) {
-    std::vector<uint32_t> prompt(shared.begin(), shared.begin() + 2048);
-    for (uint32_t token = 0; token < 60; ++token)
+    std::vector<uint32_t> prompt(shared.begin(), shared.begin() + 1024);
+    for (uint32_t token = 0; token < 1084; ++token)
       prompt.push_back(id * 1000 + token);
     EngineRequest ending = harness.request(id, prompt);
     ending.maxNewTokens = 4;
     ending.deadlineMilliseconds = 1e9;
     harness.engine.submit(std::move(ending));
   }
-  uint64_t mostWaiting = 0;
   harness.runUntil(
       [&] {
-        mostWaiting = std::max<uint64_t>(mostWaiting, harness.engine.snapshot().writeBehind.waiting);
-        return harness.events.completedCount == 4 && harness.engine.snapshot().writeBehind.durable == 4;
+        return harness.events.completedCount == 4 && harness.engine.snapshot().writeBehind.durable == 3;
       },
       "the burst's points were not all copied behind it");
-  require(mostWaiting >= 3, "the three points did not wait at once: most waiting " + std::to_string(mostWaiting));
   const std::vector<test::EngineHarness::Command> &commands = harness.commands();
   for (size_t index = 1; index < commands.size(); ++index)
     require(commands[index].startMilliseconds ==
@@ -2284,8 +2426,202 @@ void testACompletionBurstIsCopiedWithoutDelayingDecode() {
             "a command waited after the one before it ended");
   require(!harness.events.usage.contains(1) && harness.events.failedCount == 0,
           "the decoding lane did not decode throughout");
-  harness.engine.cancel(1);
+  harness.engine.cancel(1, 0.0);
   harness.runUntilIdle();
+}
+
+// The SSD cache's state staging as the model holds it (model::QwenStateStorage::stagingState): one state's buffer
+// in FakeMemory, held while the tier's write budget admits cache writes, which the engine gives back once it admits
+// none (its cap) and takes back under its admission once it admits them again.
+class BudgetedStaging final : public model::ElasticPool {
+public:
+  BudgetedStaging(test::FakeMemory &memory, std::shared_ptr<const model::DiskBudget> budget)
+      : memory_(memory), budget_(std::move(budget)) {
+    memory_.hold("staging", kBytes);
+  }
+  [[nodiscard]] model::PoolState state() const override {
+    const bool takes = budget_->admits();
+    return {.name = "state_staging",
+            .floorBytes = held && takes ? kBytes : 0,
+            .currentBytes = held ? kBytes : 0,
+            .capBytes = takes ? kBytes : 0,
+            .releaseUnitBytes = held && !takes ? kBytes : 0,
+            .growUnitBytes = takes && !held ? kBytes : 0,
+            .rebuildOnly = true};
+  }
+  [[nodiscard]] uint64_t release(uint64_t bytes) override {
+    if (!bytes || !state().releaseUnitBytes)
+      return 0;
+    memory_.release("staging", kBytes);
+    held = false;
+    return kBytes;
+  }
+  [[nodiscard]] metal::AllocationResult grow(const metal::AllocationAdmission &admit) override {
+    if (!state().growUnitBytes)
+      return {};
+    const metal::AllocationResult result = memory_.allocate(admit, "staging", kBytes);
+    held = static_cast<bool>(result);
+    return result;
+  }
+
+  static constexpr uint64_t kBytes = 64;  // a fake state's (test::State)
+  bool held = true;
+
+private:
+  test::FakeMemory &memory_;
+  std::shared_ptr<const model::DiskBudget> budget_;
+};
+
+// Two conversations take turns at a memory limit that holds their newest states and one more, beside the SSD
+// cache's state staging while its tier takes writes. Once the write budget is spent the staging goes back and the
+// engine keeps the states it keeps with no tier: the next turn captures its state as it does without one. When the
+// budget reopens the staging comes back before the tier takes a staged write, its room taken by use: the third
+// turn's state is the first conversation's newest point, which a finished request's last point alone supersedes
+// nothing below, so of three points no write can keep the one used longest ago leaves, the second conversation's,
+// whose next turn computes its prompt again while the first resumes at its newest.
+void testASpentWriteBudgetCostsStateMemoryNothing() {
+  const auto keptStates = [](bool tiered, uint32_t untiered) {
+    test::GovernedHost host;
+    test::TestKvStorage storage(1024, 16, 4);
+    KvPool pool(storage, 0);
+    test::WriteBudget writes;
+    test::TestKvTier tier;
+    engine::Cache cache(pool, tiered ? &tier : nullptr, tiered ? writes.budget : nullptr);
+    Executor executor;
+    host.bookStates(executor);
+    std::optional<BudgetedStaging> staging;
+    MemoryLedger &ledger = host.governor.ledger();
+    ledger.addAccount("states", [&executor] { return executor.heldStateBytes; });
+    if (tiered)
+      ledger.addPool(staging.emplace(host.memory, writes.budget));
+    Events events;
+    engine::Engine engine(host.connect({}), cache, executor, events);
+    guardReleases(storage, engine);
+    double now = 1;
+    const auto turn = [&](uint64_t id, uint32_t tokens, uint32_t word) {
+      EngineRequest value = request(id, std::vector<uint32_t>(tokens, word));
+      value.deadlineMilliseconds = 1e9;
+      engine.submit(std::move(value));
+      tickUntil(engine, now, [&] { return idle(engine); }, "a turn did not end");
+    };
+    turn(1, 65, 1);
+    turn(2, 65, 2);
+    require(cache.snapshot().stateCache.entries == 2 && engine.snapshot().replayStatePublicationFailures == 0,
+            "fixture: the conversations' first turns did not keep their states");
+    if (tiered)
+      writes.spend();
+    // The limit leaves one state's room beside the engine's memory without the staging.
+    host.leaveRoom(tiered ? 0 : BudgetedStaging::kBytes);
+    static_cast<void>(host.governor.controlPass(now));
+    turn(3, 129, 1);
+    const uint32_t kept = cache.snapshot().stateCache.entries;
+    require(engine.snapshot().replayStatePublicationFailures == 0 && events.completedCount == 3,
+            std::string("a turn's state capture fell short ") +
+                (tiered ? "while the write budget was spent" : "with no tier") + ": " +
+                std::to_string(engine.snapshot().replayStatePublicationFailures) + " short, " +
+                std::to_string(kept) + " states kept");
+    if (!tiered)
+      return kept;
+    require(kept == untiered, "a spent write budget kept " + std::to_string(kept) + " states where no tier keeps " +
+                                  std::to_string(untiered));
+    // The budget reopens. Growth takes the staging back by use, the state used longest ago, and the cache takes
+    // writes again: the second conversation's next turn starts over, the first resumes from its newest point.
+    writes.refill();
+    now += 1000.0 * kRegrowQuietSeconds;
+    static_cast<void>(host.governor.controlPass(now));
+    require(staging->held && cache.takesCacheWrites(), "the staging did not come back once the budget reopened");
+    turn(4, 65, 2);
+    turn(5, 129, 1);
+    require(events.starts.size() == 5 && events.starts[3] == 0 && events.starts[4] == 128 &&
+                events.failedCount == 0,
+            "taking the staging back took other than the state used longest ago: turns resumed at " +
+                std::to_string(events.starts.size() > 3 ? events.starts[3] : 0) + " and " +
+                std::to_string(events.starts.size() > 4 ? events.starts[4] : 0));
+    return kept;
+  };
+  static_cast<void>(keptStates(true, keptStates(false, 0)));
+}
+
+// The state at a prompt's head, which the engine keeps a draft window past where the request resumes, is queued
+// behind its request beside its replay point, though the conversation went on from it, as new conversations start
+// from it and so no later turn supersedes it; a persistent tier then copies both.
+void testKeptHeadsAreWrittenBehind() {
+  for (const bool persistent : {true, false}) {
+    test::TestKvStorage storage{1024, 4096, 4};
+    KvPool pool{storage, 0};
+    test::TestKvTier tier(persistent);
+    tier.transferLimit = 64;
+    tier.capacity = 512;
+    engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+    Executor executor;
+    executor.keptTier = std::make_shared<OffloadControl>();
+    executor.keptTier->ready = true;
+    Events events;
+    const EngineConfig config = test::engineConfig({.maxContext = 102400});
+    engine::Engine engine(config, cache, executor, events);
+    guardReleases(storage, engine);
+    EngineRequest headed = request(1, std::vector<uint32_t>(6000, 7));
+    headed.headTokens = 3000;
+    engine.submit(std::move(headed));
+    double now = 1;
+    tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+    require(engine.snapshot().writeBehind.waiting == 2, "the head was not queued beside the replay point");
+    if (!persistent)
+      continue;
+    now += WriteBehind::kDelayMilliseconds;
+    tickBesideALaneAhead(engine, tier, now, [&] { return engine.snapshot().writeBehind.durable == 2; });
+    require(engine.snapshot().writeBehind.durable == 2 && !engine.snapshot().writeBehind.unneeded,
+            "the head was not written behind its request");
+  }
+}
+
+// The block of the state `length` tokens into `tokens`, or 0.
+uint64_t stateAtDepth(engine::Cache &cache, const std::vector<uint32_t> &tokens, uint32_t length) {
+  std::vector<uint32_t> probe(tokens.begin(), tokens.begin() + length);
+  probe.push_back(9);
+  const engine::CacheLookup lookup = cache.lookup(probe, {});
+  return lookup.resumeBoundary() == length ? lookup.state->kvBlock() : 0;
+}
+
+// The checkpoint a head's state keeps below it (Engine::keepsCheckpoint) is a checkpoint still: a persistent tier
+// copies the head behind its request, one of the test's 64-byte states, and leaves the checkpoint in RAM alone. The
+// replay point, 992 tokens past the head, is less than WriteBehind::kMinimumTokens deeper, so it waits for a clean
+// stop.
+void testAHeadsKeptCheckpointIsNotWrittenBehind() {
+  test::TestKvStorage storage{1024, 4096, 4};
+  KvPool pool{storage, 0};
+  test::TestKvTier tier(true);
+  tier.transferLimit = 64;
+  tier.capacity = 1024;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  executor.keptTier = std::make_shared<OffloadControl>();
+  executor.keptTier->ready = true;
+  Events events;
+  const EngineConfig config = test::engineConfig({.maxContext = 102400});
+  engine::Engine engine(config, cache, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(14000, 7);
+  EngineRequest headed = request(1, prompt);
+  headed.headTokens = 13000;
+  engine.submit(std::move(headed));
+  double now = 1;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+  const uint32_t head = 13000 / engine::KvCache::pageTokens * engine::KvCache::pageTokens;
+  uint32_t kept = 0;
+  for (uint32_t depth = head - engine::KvCache::pageTokens; depth > 0 && !kept; depth -= engine::KvCache::pageTokens)
+    if (stateAtDepth(cache, prompt, depth))
+      kept = depth;
+  require(kept != 0 && cache.checkpointState(stateAtDepth(cache, prompt, kept)),
+          "fixture: the head's state kept no checkpoint below it");
+  tickBesideALaneAhead(engine, tier, now, [&] { return engine.snapshot().writeBehind.durable == 1; });
+  const StateCacheSnapshot states = cache.snapshot().stateCache;
+  require(engine.snapshot().writeBehind.durable == 1 && engine.snapshot().writeBehind.waiting == 1 &&
+              states.diskBytes == 64,
+          "write-behind did not copy the head alone, with the replay point waiting (" +
+              std::to_string(states.diskBytes) + " bytes on disk)");
+  require(cache.stateResident(stateAtDepth(cache, prompt, kept)) && states.checkpointEntries == 1,
+          "the head's kept checkpoint left RAM");
 }
 
 } // namespace
@@ -2294,17 +2630,22 @@ std::span<const test::TestCase> diskTests() {
   static constexpr test::TestCase kTests[] = {
       {"testAPendingRefusalHoldsItsClaimForTheWaitLimit", testAPendingRefusalHoldsItsClaimForTheWaitLimit},
       {"testARetryPastTheWaitLimitHoldsNothing", testARetryPastTheWaitLimitHoldsNothing},
+      {"testKeptHeadsAreWrittenBehind", testKeptHeadsAreWrittenBehind},
+      {"testASpentWriteBudgetCostsStateMemoryNothing", testASpentWriteBudgetCostsStateMemoryNothing},
+      {"testAHeadsKeptCheckpointIsNotWrittenBehind", testAHeadsKeptCheckpointIsNotWrittenBehind},
       {"testAStartQueuedBetweenRefusalsHoldsFromTheFirst", testAStartQueuedBetweenRefusalsHoldsFromTheFirst},
       {"testDiskKvPrefixIsRestoredBeforeTheLaneRuns", testDiskKvPrefixIsRestoredBeforeTheLaneRuns},
-      {"testSkipCacheCandidateIsNotProbed", testSkipCacheCandidateIsNotProbed},
+      {"testARestoreRefusedForAMomentWaitsAndResumes", testARestoreRefusedForAMomentWaitsAndResumes},
+      {"testTwoQueuedRestoresBeyondMemoryBothResume", testTwoQueuedRestoresBeyondMemoryBothResume},
+      {"testAStartWaitsWhileARestoreIsInFlight", testAStartWaitsWhileARestoreIsInFlight},
       {"testRefusedPrefixRestorePreemptsLowerResident", testRefusedPrefixRestorePreemptsLowerResident},
       {"testRestoringRequestIsNotWaitingForMemory", testRestoringRequestIsNotWaitingForMemory},
       {"testSharedPrefillWaitsForARestoringProducer", testSharedPrefillWaitsForARestoringProducer},
       {"testCancelledRestoringProducerReleasesItsWaiter", testCancelledRestoringProducerReleasesItsWaiter},
       {"testALaterPromptWaitsForARestoringPromptThatLeadsIt", testALaterPromptWaitsForARestoringPromptThatLeadsIt},
-      {"testSkipCacheRequestDoesNotWaitForAProducer", testSkipCacheRequestDoesNotWaitForAProducer},
       {"testCancelledDiskPrefixStopsQueuedReads", testCancelledDiskPrefixStopsQueuedReads},
       {"testFailedDiskRestoreKeepsShallowerState", testFailedDiskRestoreKeepsShallowerState},
+      {"testStartsSayWhyTheirReuseStopped", testStartsSayWhyTheirReuseStopped},
       {"testRepeatedDiskHitPromotesToMemory", testRepeatedDiskHitPromotesToMemory},
       {"testGrowthWaitsForTheStateWriteInFlight", testGrowthWaitsForTheStateWriteInFlight},
       {"testPageShortfallDemotesInBulk", testPageShortfallDemotesInBulk},
@@ -2328,6 +2669,7 @@ std::span<const test::TestCase> diskTests() {
       {"testStopWhileRestoringFinishesAfterTheRestore", testStopWhileRestoringFinishesAfterTheRestore},
       {"testDiskHitWithNoActiveMemory", testDiskHitWithNoActiveMemory},
       {"testABatchRefusalOfNothingOnItsWayBackHoldsNoOne", testABatchRefusalOfNothingOnItsWayBackHoldsNoOne},
+      {"testAStartRefusedMemoryNothingReturnsIsAWaitingClaim", testAStartRefusedMemoryNothingReturnsIsAWaitingClaim},
       {"testStateWithoutACacheSlotGoesToDisk", testStateWithoutACacheSlotGoesToDisk},
       {"testStateAlreadyOnDiskIsDeduplicated", testStateAlreadyOnDiskIsDeduplicated},
       {"testCancelledPrefillRecoversFromItsDiskCheckpoint", testCancelledPrefillRecoversFromItsDiskCheckpoint},

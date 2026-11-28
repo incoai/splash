@@ -24,8 +24,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from transformers import AutoTokenizer
-
 from install import assembly
 from install.models import ModelError
 
@@ -64,13 +62,14 @@ from .http_security import (
     socket_hosts,
     validate_headers,
 )
-from .images import MAX_IMAGE_BYTES
+from .images import MAX_ASPECT, MAX_IMAGE_BYTES
 from .latency import RequestLatency
 from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
 from .output import (
     ReasoningSplitter,
     StreamingToolCallProjector,
+    rejected_calls_line,
     validate_response_content,
 )
 from .protocol import MAX_IMAGE_SPANS
@@ -202,17 +201,20 @@ class Collected:
     reasoning_open: bool
     # The token limit or a stop sequence ended the output inside a call.
     cut_in_call: bool
-    # The id of that call, whose arguments are unfinished; None when it cut
-    # none, or none whose name it had read.
-    cut_call: str | None
+    # The id of that call where it had started streaming, which then ends
+    # incomplete with the arguments it sent; None where the call was held,
+    # and is not returned (a call that did not close is not one).
+    cut_call: str | None = None
 
     @property
     def cut(self):
         """Whether the output's end cut its last block short: the token limit
-        cuts any block, a stop sequence only a call, as text may end where
-        the client asks. A call cut at its name has no block, and a stop
-        sequence there leaves the block before it whole."""
-        return self.result.reason == "length" or self.cut_call is not None
+        cuts any block, but a held call has none, so a call cut before it
+        streamed leaves the block before it whole; a stop sequence, which
+        text may end at where the client asks, cuts only a streamed call."""
+        if self.cut_call is not None:
+            return True
+        return self.result.reason == "length" and not self.cut_in_call
 
     @property
     def called(self):
@@ -502,7 +504,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             and "Access-Control-Request-Method" in self.headers
         ):
             # A browser's preflight, which asks what the request it holds back
-            # may use: every method the server has and, as in vLLM, any header.
+            # may use: every method the server has and any header.
             self.send_header("Access-Control-Allow-Methods", self.methods)
             requested = self.headers.get("Access-Control-Request-Headers")
             if requested is not None and requested.isprintable():
@@ -525,7 +527,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         """Serve a request of `method`, which carries no body, by its route."""
         route, captured = find_route(self.route, method)
         if route is None:
-            self.safe_error(APIError(404, "not found", "not_found"))
+            # A read of a path no route serves is a client probing for an API
+            # it might speak (Hermes tries five at each start): it is
+            # answered 404 without a console line. A DELETE, or a read of a
+            # path served under another method, is the client's mistake.
+            probe = method != "DELETE" and find_route(self.route)[0] is None
+            self.safe_error(APIError(404, "not found", "not_found"), log=not probe)
         else:
             route.handler(self, *captured)
 
@@ -585,12 +592,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _limits(self):
         """What a request may carry, which a client can check an attachment
         against before it sends: its bytes (--max-request-size); its images,
-        a PDF's pages counted among them; an image's bytes; a PDF's bytes,
-        which the request's PDFs share, and its pages."""
+        a PDF's pages counted among them; an image's bytes and its longer
+        side over its shorter; a PDF's bytes, which the request's PDFs share,
+        and its pages."""
         return {
             "request_bytes": self.server.max_request_bytes,
             "images": MAX_IMAGE_SPANS,
             "image_bytes": MAX_IMAGE_BYTES,
+            "image_aspect": MAX_ASPECT,
             "pdf_bytes": MAX_PDF_BYTES,
             "pdf_pages": MAX_PAGES,
         }
@@ -747,8 +756,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 raise ConnectionResetError
             remaining = job.deadline - time.monotonic()
             if remaining <= 0:
-                self.app.backend.cancel(job)
-                raise APIError(504, "request timed out", "request_timeout")
+                # The job's end, this or the engine's own deadline, is its
+                # one line, which the backend prints.
+                error = APIError(504, "request timed out", "request_timeout")
+                error.logged = True
+                self.app.backend.cancel(job, error)
+                raise error
             try:
                 event = job.events.get(timeout=min(remaining, CLIENT_DISCONNECT_POLL))
             except queue.Empty:
@@ -813,6 +826,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         on_tool_delta=None,
         on_idle=None,
         on_progress=None,
+        streaming=False,
     ):
         """Gather a generation until it is done. The callbacks receive the
         start, each piece of output, the idle waits and prompt progress:
@@ -820,15 +834,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
         output into blocks."""
         splitter = ReasoningSplitter(job.thinking, job.may_call_tools, job.chat_format)
         # A chat answer is parsed as it arrives whether it streams or not:
-        # its calls where tools may be called, and in any answer, a </think>
-        # the model writes after its reasoning ended is dropped. A text
-        # completion, without a chat template, is its text as written.
+        # its calls where tools may be called, and in any answer, a close of
+        # the reasoning the model writes after its reasoning ended is
+        # dropped. A text completion, without a chat template, is its text as
+        # written.
         projector = (
             StreamingToolCallProjector(
                 job.tool_policy,
                 job.public_id,
                 job.response_validator is not None,
                 job.chat_format.call_syntax,
+                job.chat_format.think_close,
+                streaming=streaming,
             )
             if job.tool_policy is not None or job.reasoning is not None
             else None
@@ -873,6 +890,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "".join(content), job, result, projector, cut_in_call
         )
         publish(events)
+        if projector is not None and projector.rejections:
+            self._report_rejected_calls(job, projector.rejections)
+        if unenforced := getattr(job.response_validator, "unenforced", None):
+            self._report_unenforced(job, unenforced)
         return Collected(
             "".join(reasoning),
             content_text,
@@ -880,7 +901,31 @@ class FrontendHandler(BaseHTTPRequestHandler):
             result,
             splitter.reasoning,
             cut_in_call,
-            None if projector is None else projector.call_id,
+            None if projector is None else projector.cut_call,
+        )
+
+    @staticmethod
+    def _report(job, subject, said):
+        """One line on what the output of `job` was, which names the request
+        as the backend's lines do and never the model's text."""
+        engine_id = job.engine_request_id
+        request = "" if engine_id is None else f"request {engine_id} · "
+        print_status(f"{subject} · {request}{said}")
+
+    def _report_rejected_calls(self, job, reasons):
+        """Count the calls the output wrote that were not returned as calls,
+        and say so in one line (_report)."""
+        self.app.rejected_calls.add(reasons)
+        self._report(job, "Tool calls", rejected_calls_line(reasons))
+
+    def _report_unenforced(self, job, unenforced):
+        """Count the schema keywords a best-effort answer was generated
+        without, and name them in one line (_report): the keywords only,
+        never where the client's schema holds them."""
+        keywords = [keyword for keyword, _ in unenforced]
+        self.app.unenforced_keywords.add(keywords)
+        self._report(
+            job, "Schema keywords not enforced", ", ".join(dict.fromkeys(keywords))
         )
 
     def start_event_stream(self):
@@ -1238,6 +1283,13 @@ def parse_args(argv=None):
     return args
 
 
+def _sampling_defaults(family, args):
+    """What a request gets for each sampling field it leaves out: the
+    family's published sampling, with --sampling-default's values over it,
+    the last of a name winning."""
+    return {**asdict(family.sampling), **dict(args.sampling_default)}
+
+
 def _native_command(args, model_root, relaunch_context=None):
     """The engine's command line serving model_root, a relaunch's with
     `relaunch_context`, the context the first engine served. A relaunch is
@@ -1295,6 +1347,33 @@ def _stop_with(pid):
     threading.Thread(target=watch, name="stop-with-app", daemon=True).start()
 
 
+def _drain(server, backend, seconds):
+    """The first stop signal's drain (--shutdown-timeout): the server goes on
+    answering, each new request with the 503 server_shutdown that waiting
+    ones get, while those the engine runs get `seconds` to finish
+    (NativeBackend.drain); then serving ends, and main stops as before,
+    ending what is left as it did. A second signal interrupts this serving
+    and stops at once."""
+    print_status(
+        f"Stopping · running requests get up to {seconds:g} s to finish; "
+        "a second stop signal ends them now"
+    )
+
+    def finish():
+        try:
+            left = backend.drain(seconds)
+            if left:
+                print_status(
+                    f"Stopping · {left} request{'s' if left != 1 else ''} still "
+                    f"running after {seconds:g} s end now"
+                )
+        finally:
+            server.shutdown()
+
+    threading.Thread(target=finish, name="splash-drain", daemon=True).start()
+    server.serve_forever()
+
+
 class ListenError(Exception):
     """The HTTP server cannot listen at its address."""
 
@@ -1303,11 +1382,11 @@ class OptionError(Exception):
     """An option the served model's family cannot follow."""
 
 
-def _start_failed(args, error, failure):
-    """End a start that failed, saying why in the log and, for the app, in
-    the launcher's serve record (serve_record)."""
+def _start_failed(error):
+    """End a start that failed, saying why in the log; main says it for the
+    app in the launcher's serve record (serve_record) once the engine has
+    stopped."""
     print_status(f"Error · {error}", error=True)
-    serve_record.failed(args.serve_record, failure)
     raise SystemExit(1) from None
 
 
@@ -1318,6 +1397,10 @@ def main():
     backend = None
     # Why the backend stopped restarting the engine, once it has.
     stopped = None
+    # Why the start failed, which the record says once the engine has stopped
+    # (finally, below): the engine's warm-up, which records its steps from the
+    # reader thread, would otherwise record over it.
+    failure = None
 
     def stop_serving(reason):
         nonlocal stopped
@@ -1375,11 +1458,13 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
+        # Its vocabulary, which the grammars' table covers (ConstraintFactory).
+        vocabulary = assembly.vocabulary(model_root)
         if args.reasoning_effort is not None and not (
             family.chat_format.reasoning_switch
         ):
-            # No effort reaches a model that opens its reasoning itself, so
-            # the server cannot set every request's.
+            # No effort reaches a model its format gives no reasoning switch,
+            # so the server cannot set every request's.
             raise OptionError(
                 f"--reasoning-effort cannot set how {args.model} reasons: a "
                 f"{family.name} model decides each turn whether to reason, "
@@ -1392,6 +1477,35 @@ def main():
         if args.chat_template_file is not None:
             custom = read_template_file(args.chat_template_file)
             print_status(f"Chat template file · {args.chat_template_file}")
+
+        def warming(event):
+            # As the warm-up begins and as each of its steps ends: it can take
+            # minutes on the first start after an update, so the console and
+            # the record, which the app shows, say how far it is. It runs on
+            # the reader thread, which must not block (on_warming):
+            # print_status only queues the line for the console's one writer,
+            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
+            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
+            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+
+        # The engine starts now and reads its weights while this process
+        # imports the tokenizer's library and loads the tokenizer and the
+        # chat template, which it needs none of: on a 32-core M5 Max, with
+        # the 27B and the 35B, they take 1.2-1.3 s of a 12.2 s start. A
+        # failure here closes the engine (finally, below); one of the
+        # engine's is raised by wait_ready.
+        runtime = engine_runtime.MultiplexedRuntime(
+            _native_command(args, model_root),
+            relaunch_command=lambda first: _native_command(
+                args, model_root, first.max_context_tokens
+            ),
+            pending_limit=args.queue_size,
+        )
+        runtime.on_warming = warming
+        runtime.start()
+        # Imported here, while the engine loads: transformers takes 0.35-0.75 s.
+        from transformers import AutoTokenizer
+
         # A tokenizer the loader cannot read fails with whatever its parsers
         # raise, such as a KeyError for a tokenizer.json without added_tokens:
         # each is the model's.
@@ -1408,7 +1522,11 @@ def main():
         thinking_end = thinking_end_tokens(
             tokenizer, args.thinking_end_text, family.chat_format
         )
-        chat_templates = ChatTemplates(tokenizer, override=custom)
+        chat_templates = ChatTemplates(
+            tokenizer,
+            override=custom,
+            opens_own_message=family.chat_format.opens_own_message,
+        )
         print_status(f"Chat template · {chat_templates.describe()}")
         # Unset, a budget ends thinking as the template closes it, so that the
         # next request renders that close back as the tokens the reply ended
@@ -1418,25 +1536,13 @@ def main():
             thinking_end = thinking_end_tokens(
                 tokenizer, chat_templates.select(None).thinking_end, family.chat_format
             )
-        runtime = engine_runtime.MultiplexedRuntime(
-            _native_command(args, model_root),
-            relaunch_command=lambda first: _native_command(
-                args, model_root, first.max_context_tokens
-            ),
-            pending_limit=args.queue_size,
+        # The grammars' table, built while the engine loads (0.82 s on a
+        # 32-core M5 Max): its vocabulary is the draft's, which the engine
+        # holds to its target's as it loads, and its stop tokens those
+        # check_capabilities holds to the Ready's.
+        grammar_table = ConstraintFactory.table(
+            tokenizer, family.chat_format, vocabulary
         )
-
-        def warming(event):
-            # As the warm-up begins and as each of its steps ends: it can take
-            # minutes on the first start after an update, so the console and
-            # the record, which the app shows, say how far it is. It runs on
-            # the reader thread, which must not block (on_warming):
-            # print_status only queues the line for the console's one writer,
-            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
-            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
-            serve_record.warming(args.serve_record, event.steps_done, event.steps)
-
-        runtime.on_warming = warming
 
         def engine_recovering(recovering):
             # The record follows the engine once the server is ready, for
@@ -1458,7 +1564,9 @@ def main():
         # ENGINE_STOPPED_STATUS below.
         backend.on_stopped = stop_serving
         if not runtime.wait_ready():
-            raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
+            raise engine_runtime.EngineUnhealthy(
+                "native runtime failed after it became ready"
+            )
         # The engine is authoritative for what it serves: it refuses a
         # --max-context it cannot serve.
         served = runtime.capabilities
@@ -1467,14 +1575,15 @@ def main():
             tokenizer,
             backend,
             args.model,
-            # No deadline unless given, as in vLLM and SGLang; a request still
-            # ends when its client disconnects.
+            # No deadline unless given; a request still ends when its client
+            # disconnects.
             math.inf if args.request_timeout is None else args.request_timeout,
-            constraint_factory=ConstraintFactory(tokenizer, served),
+            constraint_factory=ConstraintFactory(grammar_table, served),
             chat_templates=chat_templates,
             chat_format=family.chat_format,
-            sampling_defaults=asdict(family.sampling),
+            sampling_defaults=_sampling_defaults(family, args),
             max_image_pixels=args.max_image_pixels,
+            image_format=family.image_format,
             thinking_codec=thinking_codec,
             response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,
@@ -1499,26 +1608,34 @@ def main():
         context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
         mode = "" if served.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            # A stop the server did not make itself, for an engine stopped
+            # for good, drains first; a second signal stops at once.
+            if stopped is not None or not args.shutdown_timeout:
+                raise
+            _drain(server, backend, args.shutdown_timeout)
     except engine_runtime.EngineStartFailed as error:
-        _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
+        failure = serve_record.engine_failure(error.event, str(error))
+        _start_failed(error)
     except ListenError as error:
-        _start_failed(args, error, serve_record.failure(serve_record.PORT, str(error)))
+        failure = serve_record.failure(serve_record.PORT, str(error))
+        _start_failed(error)
     except OptionError as error:
-        _start_failed(
-            args, error, serve_record.failure(serve_record.CONFIGURATION, str(error))
-        )
+        failure = serve_record.failure(serve_record.CONFIGURATION, str(error))
+        _start_failed(error)
     except (
         ModelError,
         ChatTemplateError,
         ThinkingEndError,
         TokenizerContractError,
     ) as error:
-        _start_failed(args, error, serve_record.failure(serve_record.MODEL, str(error)))
+        failure = serve_record.failure(serve_record.MODEL, str(error))
+        _start_failed(error)
     except (engine_runtime.EngineRuntimeError, ThinkingKeyError, OSError) as error:
-        _start_failed(
-            args, error, serve_record.failure(serve_record.INTERNAL, str(error))
-        )
+        failure = serve_record.failure(serve_record.INTERNAL, str(error))
+        _start_failed(error)
     except serve_record.NotRecorded as error:
         # The record that cannot say ready cannot say why either: the app
         # takes the exit for the failure, which the log words.
@@ -1528,11 +1645,8 @@ def main():
         # An error no clause above names is a bug: the record still names the
         # failure, so that the app reports it instead of a crash, and the
         # traceback reaches the log.
-        serve_record.failed(
-            args.serve_record,
-            serve_record.failure(
-                serve_record.INTERNAL, f"{type(error).__name__}: {error}"
-            ),
+        failure = serve_record.failure(
+            serve_record.INTERNAL, f"{type(error).__name__}: {error}"
         )
         raise
     except KeyboardInterrupt:
@@ -1557,10 +1671,15 @@ def main():
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()
+            elif runtime is not None:
+                # A start that failed while the engine loaded stops it.
+                runtime.close()
         finally:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
                 server.server_close()
+            if failure is not None:
+                serve_record.failed(args.serve_record, failure)
     if stopped is not None:
         serve_record.failed(
             args.serve_record, serve_record.failure(serve_record.STOPPED, stopped)

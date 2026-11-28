@@ -564,8 +564,8 @@ class ToolCallTests(HarnessTestCase):
 
     def test_stop_cuts_output_beside_tools_as_the_token_limit_does(self):
         # A stop sequence ends the output wherever the model writes it. One
-        # inside a call cuts it as the token limit would: the call keeps the
-        # arguments it has, unfinished, and does not count as made. A
+        # inside a call cuts it as the token limit would: a call that did not
+        # close is not a call, and the finish reason is the stop. A
         # structured answer it cuts goes unvalidated.
         factory = FakeConstraintFactory()
         harness = self.harness(
@@ -587,8 +587,7 @@ class ToolCallTests(HarnessTestCase):
 
         choice = chat(tools=tools, stop=["ris"])
         self.assertEqual(choice["finish_reason"], "stop")
-        call = choice["message"]["tool_calls"][0]["function"]
-        self.assertEqual((call["name"], call["arguments"]), ("weather", '{"city":"Pa'))
+        self.assertNotIn("tool_calls", choice["message"])
         choice = chat(tools=tools, stop=["answer"])
         self.assertEqual(choice["finish_reason"], "tool_calls")
         call = choice["message"]["tool_calls"][0]["function"]
@@ -616,11 +615,8 @@ class ToolCallTests(HarnessTestCase):
         )
         self.assertEqual(status, 200, payload)
         response = json.loads(payload)
-        self.assertEqual(
-            (response["status"], response["output"][-1]["type"]),
-            ("completed", "function_call"),
-        )
-        self.assertEqual(response["output"][-1]["status"], "incomplete")
+        self.assertEqual(response["status"], "completed")
+        self.assertNotIn("function_call", [item["type"] for item in response["output"]])
         schema = {"type": "object", "required": ["x"]}
         choice = chat(
             response_format={"type": "json_schema", "json_schema": {"schema": schema}},

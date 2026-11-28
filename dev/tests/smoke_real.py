@@ -128,11 +128,17 @@ class RealServer:
             command.extend(("--expert-memory", arguments.expert_memory))
         if arguments.verify_rows is not None:
             command.extend(("--verify-rows", arguments.verify_rows))
+        if arguments.max_concurrent_requests is not None:
+            command.extend(
+                ("--max-concurrent-requests", str(arguments.max_concurrent_requests))
+            )
         if cache_dir is not None:
             command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
             command.extend(("--max-image-pixels", str(arguments.max_image_pixels)))
         command.extend(("--kv-format", arguments.kv_format))
+        if arguments.cached_states is not None:
+            command.extend(("--cached-states", arguments.cached_states))
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -282,7 +288,7 @@ def answer_text(chat: dict) -> str:
     ).lower()
 
 
-def run_images(port: int, model: str, nonce: str) -> None:
+def run_images(port: int, model: str, nonce: str, switch: bool = True) -> None:
     # More than a block of tokens follows the image, so the replay point a
     # repeat restores lies past it.
     question = (
@@ -290,13 +296,17 @@ def run_images(port: int, model: str, nonce: str) -> None:
         "word naming the color, with no punctuation, explanation or other words. "
         f"Request {nonce}."
     )
+    # Room for the reasoning of a model that reasons whatever it is asked.
+    limit = output_limit(32, switch)
     code, start = request(port, "GET", "/status")
     require(code == 200 and "images" in start, "status lacks image telemetry")
     code, red = request(
         port,
         "POST",
         "/v1/chat/completions",
-        image_chat_body(model, question, image_data_url("red")),
+        image_chat_body(
+            model, question, image_data_url("red"), max_completion_tokens=limit
+        ),
     )
     require(code == 200, f"image Chat failed with HTTP {code}: {red!r}")
     require("red" in answer_text(red), f"red image was not described as red: {red!r}")
@@ -325,7 +335,9 @@ def run_images(port: int, model: str, nonce: str) -> None:
         port,
         "POST",
         "/v1/chat/completions",
-        image_chat_body(model, question, image_data_url("red")),
+        image_chat_body(
+            model, question, image_data_url("red"), max_completion_tokens=limit
+        ),
     )
     require(
         code == 200 and "red" in answer_text(repeat), "repeated image request failed"
@@ -344,7 +356,9 @@ def run_images(port: int, model: str, nonce: str) -> None:
         f"a prefix covering the image used its rows: {before['images']} -> "
         f"{after['images']}",
     )
-    body = image_chat_body(model, question, image_data_url("red"))
+    body = image_chat_body(
+        model, question, image_data_url("red"), max_completion_tokens=limit
+    )
     body["messages"].insert(
         0, {"role": "system", "content": "You describe images for a test."}
     )
@@ -372,7 +386,9 @@ def run_images(port: int, model: str, nonce: str) -> None:
         port,
         "POST",
         "/v1/chat/completions",
-        image_chat_body(model, question, image_data_url("blue")),
+        image_chat_body(
+            model, question, image_data_url("blue"), max_completion_tokens=limit
+        ),
     )
     require(code == 200, f"blue image Chat failed with HTTP {code}")
     require(
@@ -419,7 +435,7 @@ def run_images(port: int, model: str, nonce: str) -> None:
                     ],
                 }
             ],
-            "max_tokens": 32,
+            "max_tokens": limit,
             "temperature": 0,
             "thinking": {"type": "disabled"},
         },
@@ -451,7 +467,7 @@ def run_images(port: int, model: str, nonce: str) -> None:
             ],
             # Responses requests reason by default, and the thinking before
             # the one-word answer can take more than 256 tokens.
-            "max_output_tokens": 1024,
+            "max_output_tokens": output_limit(1024, switch),
             "temperature": 0,
             "store": False,
         },
@@ -910,7 +926,7 @@ def run(port: int, model: str) -> None:
     run_sampling(port, model, switch)
     vision = "image" in modalities
     if vision:
-        run_images(port, model, nonce)
+        run_images(port, model, nonce, switch)
     else:
         run_text_only(port, model, nonce)
     run_protocol_extensions(port, model, vision, switch)
@@ -1421,19 +1437,17 @@ def wait_for_timeout_cleanup(port: int, before: dict) -> None:
         )
         delta = {
             key: after["requests"][key] - before["requests"][key]
-            for key in ("submitted", "completed", "cancelled", "failed")
+            for key in ("submitted", "completed", "cancelled", "timed_out", "failed")
         }
+        # Whether the frontend's cancel or the native deadline finishes it, the
+        # engine counts a request its deadline ended timed out, and only so.
         require(
-            delta["submitted"] == 1 and delta["completed"] == 0,
-            f"unexpected scoring timeout outcome: {delta!r}",
+            delta["submitted"] == 1
+            and delta["completed"] == delta["cancelled"] == delta["failed"] == 0
+            and delta["timed_out"] in (0, 1),
+            f"score did not end timed out exactly once: {delta!r}",
         )
-        terminal = (delta["cancelled"], delta["failed"])
-        require(
-            terminal in ((0, 0), (1, 0), (0, 1)),
-            f"score did not terminate exactly once: {delta!r}",
-        )
-        # Frontend cancellation or the native deadline can finish first.
-        if terminal != (0, 0) and after["transport"]["pending"] == 0:
+        if delta["timed_out"] and after["transport"]["pending"] == 0:
             return
         require(time.monotonic() < limit, "scoring timeout cleanup did not finish")
         time.sleep(0.5)
@@ -1750,6 +1764,12 @@ def run_persistent_cache(arguments) -> None:
             )
             reused = after["cache"]["reused_tokens"] - before["cache"]["reused_tokens"]
             require(states >= 1, "the next turn restored no state from disk")
+            # Its usage says so: the state it resumed from was the SSD cache's.
+            details = reply["usage"]["prompt_tokens_details"]
+            require(
+                details["state_source"] == "disk" and not details["lost_state"],
+                f"the next turn's usage said {details!r}",
+            )
             # The tail past the restore point's block boundary is recomputed.
             require(
                 min(restored, reused) * 10 >= prompt_tokens * 9,
@@ -1792,8 +1812,20 @@ def add_server_arguments(parser):
         help="the rows of each draft block decode verifies (splash serve "
         "--verify-rows); a MoE model's greedy output repeats only with all",
     )
+    parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        help="the requests the engine runs at once (splash serve "
+        "--max-concurrent-requests)",
+    )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
+    parser.add_argument(
+        "--cached-states",
+        choices=("int8", "exact"),
+        help="the format of cached recurrent states (splash serve "
+        "--cached-states); exact restores a state as it ran",
+    )
     parser.add_argument("--startup-timeout", type=float, default=1800)
 
 

@@ -14,6 +14,32 @@ from server.chat_format import QWEN
 
 
 class ChatCompletionTests(HarnessTestCase):
+    def test_usage_says_what_the_request_reused(self):
+        # A state read back from the SSD cache, the prompt's KV matched past
+        # it where a state was lost: each in usage beside cached_tokens.
+        from server import protocol as wire
+
+        runtime = FakeRuntime(
+            Plan([[1], [2]], matched_tokens=1, start=(2, wire.StateSource.DISK, True))
+        )
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", chat_body(seed=7)
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(payload)["usage"]["prompt_tokens_details"],
+            {
+                "cached_tokens": 1,
+                "prefix_tokens": 2,
+                "state_source": "disk",
+                "lost_state": True,
+                # Matched KV past the state it resumed from.
+                "reuse_end": "kv_without_state",
+                "reuse_end_tokens": 1,
+            },
+        )
+
     def test_nonstream_reasoning_usage_metrics_and_seed(self):
         runtime = FakeRuntime(Plan([[1], [2], [3]]))
         harness = self.harness(runtime)
@@ -31,7 +57,14 @@ class ChatCompletionTests(HarnessTestCase):
                 "prompt_tokens": 2,
                 "completion_tokens": 3,
                 "total_tokens": 5,
-                "prompt_tokens_details": {"cached_tokens": 1},
+                "prompt_tokens_details": {
+                    "cached_tokens": 1,
+                    "prefix_tokens": 1,
+                    "state_source": "memory",
+                    "lost_state": False,
+                    "reuse_end": "prefix_end",
+                    "reuse_end_tokens": 1,
+                },
                 "completion_tokens_details": {"reasoning_tokens": 3},
             },
         )

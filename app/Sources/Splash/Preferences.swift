@@ -121,9 +121,11 @@ struct ServeSettings: Equatable {
     }
 
     /// The options a model of `family` starts with: those set but the ones it does not take
-    /// (`ModelFamily.takes`), whose values stay kept for a model that does.
+    /// (`ModelFamily.takes`), whose values stay kept for a model that does, and the ones set to
+    /// the family's own default (`ModelFamily.standard`), which a start need not pass.
     func usable(by family: ModelFamily) -> ServeSettings {
-        ServeSettings(values: values.filter { family.takes($0.key, $0.value) }, apiKey: apiKey, projector: projector, draft: draft)
+        ServeSettings(values: values.filter { family.takes($0.key, $0.value) && family.standard($0.key) != $0.value },
+                      apiKey: apiKey, projector: projector, draft: draft)
     }
 
     /// These options with the ones a model of `family` can use, those the card shows, back at their
@@ -159,8 +161,8 @@ struct ServeSettings: Equatable {
 /// A `splash serve` option the Server screen offers: its flag, its words, its part of the screen,
 /// and how its value is chosen. `all` holds every option `splash serve` takes but those the app
 /// sets itself (`--model`, `--model-dir`, `--offline`), those of one model rather than every
-/// start (`--revision`, `--draft-model`, `--mmproj`, `--chat-template-file`) and
-/// `--reasoning-effort`, which it leaves to the command line.
+/// start (`--revision`, `--draft-model`, `--draft-revision`, `--mmproj`, `--chat-template-file`)
+/// and `--reasoning-effort`, which it leaves to the command line.
 struct LaunchOption: Identifiable, Sendable {
     enum Section: String, CaseIterable {
         case main = "Launch Options", memory = "Memory", cache = "SSD Cache"
@@ -255,10 +257,30 @@ struct LaunchOption: Identifiable, Sendable {
         }
     }
 
-    /// The choices its menu offers for a model of `family`: those its models take.
+    /// The choices its menu offers for a model of `family`: those its models take, but the one
+    /// that is the family's default, which the menu's default item names (`standard(for:)`).
     func choices(for family: ModelFamily) -> [(value: String, title: String)] {
         guard case .choice(_, let choices, _) = kind else { return [] }
-        return choices.filter { family.takes(flag, $0.value) }
+        // Thinking for a model whose efforts all render alike: its one other state.
+        if flag == ModelFamily.effort, family.efforts() == [ModelFamily.thinkingOn], family.reasoning?.efforts.isEmpty == true {
+            return [(ModelFamily.thinkingOn, "Thinking")]
+        }
+        // Thinking's efforts in the model's order.
+        if flag == ModelFamily.effort, let efforts = family.efforts() {
+            return efforts.compactMap { effort in choices.first { $0.value == effort } }
+        }
+        return choices.filter { family.takes(flag, $0.value) && $0.value != family.standard(flag) }
+    }
+
+    /// What its menu calls the default for a model of `family`: the choice that is the family's
+    /// default, where the default is the family's, else its own name for it.
+    func standard(for family: ModelFamily) -> String {
+        guard case .choice(let standard, let choices, _) = kind else { return "" }
+        // Thinking for a model that thinks unasked and whose efforts all render alike.
+        if flag == ModelFamily.effort, let reasoning = family.reasoning, reasoning.efforts.isEmpty, reasoning.thinks != false {
+            return "Thinking"
+        }
+        return choices.first { $0.value == family.standard(flag) }?.title ?? standard
     }
 
     /// Whether `value` is one this option takes: a choice, or a value typed in as its field shows it.
@@ -284,15 +306,86 @@ struct LaunchOption: Identifiable, Sendable {
 /// screen leaves out and a start doesn't pass, and the context they serve: their own window, and
 /// the most past it, as far as YaRN stretches it; a longer context length set stays kept for a
 /// model that serves it, and a start passes Auto. Every option is used by a family not known.
+/// What a model's own chat template makes of the reasoning efforts, as its server reports it at
+/// `/v1/models` and its installation records it: whether a request that sends none thinks, the
+/// efforts the template renders differently (none where they all render alike), and the one it
+/// renders for a request that sends none.
+struct ModelReasoning: Decodable, Hashable, Sendable {
+    var thinks: Bool?
+    var efforts: [String] = []
+    var standard: String?
+
+    enum CodingKeys: String, CodingKey {
+        case thinks, efforts, standard = "default"
+    }
+}
+
 struct ModelFamily: Decodable, Equatable, Sendable {
     var unusable: Set<String> = []
     var contextTokens: Int?
     var maxContextTokens: Int?
+    /// Its models' default `--activations`; nil for a family not known, whose is the engine's, Auto.
+    var activations: String?
+    /// The sampling a request of its models gets where it names none, by setting (`temperature`,
+    /// `top_p`, `top_k`): its publisher's; nil for a family not known.
+    var sampling: [String: Double]?
 
     static let unknown = ModelFamily()
 
     enum CodingKeys: String, CodingKey {
-        case unusable, contextTokens = "context_tokens", maxContextTokens = "max_context_tokens"
+        case unusable, contextTokens = "context_tokens", maxContextTokens = "max_context_tokens", activations, sampling
+    }
+
+    /// The model picked's reasoning, where its record says it (`thinking`); nil for a family alone.
+    var reasoning: ModelReasoning?
+
+    /// The option that sets how much a model thinks for requests that don't say.
+    static let effort = "--default-reasoning-effort"
+    /// The effort Thinking passes to turn on the thinking of a model whose efforts all render alike.
+    static let thinkingOn = "medium"
+
+    /// This family for a model whose chat template makes `reasoning` of the efforts.
+    func thinking(_ reasoning: ModelReasoning?) -> ModelFamily {
+        var family = self
+        family.reasoning = reasoning
+        return family
+    }
+
+    /// The value its models start with where the option `flag` is not set, for an option whose
+    /// default is the family's or the model's: `--activations`, and Thinking where the model's
+    /// template renders a request that sends no effort like one of its efforts, or doesn't think.
+    /// nil for any other.
+    func standard(_ flag: String) -> String? {
+        if flag == "--activations" { return activations ?? "auto" }
+        guard flag == Self.effort, let reasoning else { return nil }
+        return reasoning.standard ?? (reasoning.thinks == false ? "none" : nil)
+    }
+
+    /// The efforts Thinking offers besides its default for the model picked, as its template
+    /// renders them, in the Chat's order: each effort it renders differently from the most to the
+    /// least, then No Thinking; or where they all render alike the one other state, thinking on or
+    /// off. nil where its record doesn't say.
+    func efforts() -> [String]? {
+        guard let reasoning else { return nil }
+        if reasoning.efforts.isEmpty { return [reasoning.thinks == false ? Self.thinkingOn : "none"] }
+        return (reasoning.efforts.reversed() + ["none"]).filter { $0 != standard(Self.effort) }
+    }
+
+    /// Where the default stands among the choices of the option `flag`'s menu: first, but for
+    /// Thinking of a model whose record says its efforts, where it stands in their order.
+    func standardIndex(_ flag: String) -> Int {
+        guard flag == Self.effort, let reasoning else { return 0 }
+        if reasoning.efforts.isEmpty { return reasoning.thinks == false ? 1 : 0 }
+        return (reasoning.efforts.reversed() + ["none"]).firstIndex { $0 == standard(flag) } ?? 0
+    }
+
+    /// This family for a model whose weights `--weights auto` loads otherwise or not (`quantizable`;
+    /// nil where its record doesn't say, as before a start of 1.7.4 has assembled it, and for no
+    /// model): only one with weights to load otherwise can use `--weights`.
+    func weights(quantizable: Bool?) -> ModelFamily {
+        var family = self
+        if quantizable != true { family.unusable.insert("--weights") }
+        return family
     }
 
     /// Whether its models can use the option `flag`.
@@ -300,9 +393,12 @@ struct ModelFamily: Decodable, Equatable, Sendable {
         !unusable.contains(flag)
     }
 
-    /// Whether its models take `value` for the option `flag`: one they can use, and no refusal.
+    /// Whether its models take `value` for the option `flag`: one they can use, and no refusal;
+    /// for Thinking, an effort the model picked has (`efforts`), or its default.
     func takes(_ flag: String, _ value: String) -> Bool {
-        uses(flag) && refusal(flag, value) == nil
+        guard uses(flag), refusal(flag, value) == nil else { return false }
+        guard flag == Self.effort, let efforts = efforts() else { return true }
+        return efforts.contains(value) || standard(flag) == value
     }
 
     /// Why its models don't take `value` for the option `flag`: a context length past the most
@@ -343,6 +439,11 @@ extension LaunchOption {
                                         parse: { Int($0.trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? "\($0)G" : nil } },
                                         text: { String($0.dropLast()) }, title: { "\($0.dropLast()) GB" }))),
         LaunchOption(
+            flag: "--max-concurrent-requests", title: "Concurrency limit",
+            help: "How many requests the model answers at the same time. More give many chats or agents more words a second together, each a little slower, and take memory, which can stream more of the model from the disk or leave less context: where it leaves less, the app says how much while the model runs.",
+            section: .main,
+            kind: .choice(standard: "4", choices: [1, 2, 3, 5, 6, 7, 8].map { (String($0), String($0)) }, custom: nil)),
+        LaunchOption(
             flag: "--idle-release", title: "Free memory when idle",
             help: "An idle model frees its memory and loads again with the next message.",
             section: .main,
@@ -356,6 +457,10 @@ extension LaunchOption {
     ]
 
     private static let memory: [LaunchOption] = [
+        LaunchOption(
+            flag: "--weights", title: "Weights",
+            help: "Original loads every weight as the model’s files store it. Auto loads a model’s BF16 and F16 projections and head in 8 bits: about half their memory and faster answers, at a small cost in precision.",
+            section: .memory, kind: .choice(standard: "Original", choices: [("auto", "Auto")], custom: nil)),
         LaunchOption(
             flag: "--kv-format", title: "KV cache",
             help: "How the model keeps what it has read in memory. 16-bit takes twice the memory.",
@@ -476,6 +581,13 @@ extension LaunchOption {
             help: "Replies and the model list give the first served model name rather than the model’s own.",
             section: .api, kind: .toggle(on: true),
             requires: [Requirement("Needs a served model name.") { $0["--served-model-name"] != nil }]),
+        LaunchOption(
+            flag: "--sampling-default", title: "Sampling defaults",
+            help: "The sampling of requests that set none; the Server page shows a field for each setting (`Sampling`).",
+            section: .api,
+            kind: .text(Value(prompt: "temperature=0.7",
+                              message: "Name=value pairs, split at commas, each name one of \(samplingNames.formatted(.list(type: .or))); top_k a whole number.",
+                              parse: { samplingDefaults($0) }), list: true)),
     ]
 
     private static let requests: [LaunchOption] = [
@@ -485,6 +597,15 @@ extension LaunchOption {
             section: .requests,
             kind: .choice(standard: "None", choices: [("5m", "5 Minutes"), ("30m", "30 Minutes"), ("1h", "1 Hour")],
                           custom: duration(message: "Seconds, or with s, m or h, such as 10m."))),
+        LaunchOption(
+            flag: "--shutdown-timeout", title: "Stop grace",
+            help: "How long a stop or a model switch lets answers being written finish; new and waiting requests are turned away meanwhile.",
+            section: .requests,
+            kind: .choice(standard: "5 Seconds", choices: [("0", "None"), ("10", "10 Seconds"), ("15", "15 Seconds")],
+                          custom: Value(prompt: "8", message: "Seconds, 0 to 15.", parse: { text in
+                              let value = text.trimmingCharacters(in: .whitespaces)
+                              return Double(value).map { (0...15).contains($0) } == true ? value : nil
+                          }))),
         LaunchOption(
             flag: "--queue-size", title: "Queue limit",
             help: "Requests taken at once, running or waiting; more are turned away.",
@@ -516,9 +637,14 @@ extension LaunchOption {
             help: "Reads long prompts faster on models that can use it.",
             section: .requests, kind: .toggle(on: false)),
         LaunchOption(
+            flag: "--recalibrate-ane", title: "Recalibrate Neural Engine",
+            help: "Measures again at each start how much of a long prompt the Neural Engine reads, which makes the start longer. Turn it on if long prompts read slower than they should, start the model once, then turn it off.",
+            section: .requests, kind: .toggle(on: true),
+            requires: [Requirement("Needs Neural Engine for long prompts on.") { $0["--disable-ane"] != "true" }]),
+        LaunchOption(
             flag: "--activations", title: "Activations",
             help: "Auto does some of the GPU’s math in 8 bits where M5 and later Macs run it faster, at a small cost in precision. 16-bit does none.",
-            section: .requests, kind: .choice(standard: "Auto", choices: [("bf16", "16-bit")], custom: nil)),
+            section: .requests, kind: .choice(standard: "Auto", choices: [("auto", "Auto"), ("bf16", "16-bit")], custom: nil)),
         LaunchOption(
             flag: "--allow-idle-sleep", title: "Keep Mac awake while answering",
             help: "The Mac doesn’t sleep in the middle of an answer; the display still may.",
@@ -547,7 +673,95 @@ extension LaunchOption {
               })
     }
 
+    /// The sampling settings server/serve_options.py's `parse_sampling_default` takes.
+    private static let samplingNames = ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty", "min_p"]
+
+    /// `text` as name=value pairs split at commas and spaces, each a sampling setting and a number,
+    /// a whole one for top_k, as the server parses them, or nil for anything else. The server
+    /// refuses a value out of a setting's range as it starts.
+    private static let samplingDefaults: @Sendable (String) -> String? = { text in
+        let pairs = items(text)
+        let valid = pairs.allSatisfy { pair in
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, samplingNames.contains(String(parts[0])) else { return false }
+            return parts[0] == "top_k" ? Int(parts[1]) != nil : Double(parts[1]) != nil
+        }
+        return !pairs.isEmpty && valid ? pairs.joined(separator: ", ") : nil
+    }
+
     private static let whole: @Sendable (String) -> String? = { Int($0.trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? String($0) : nil } }
+}
+
+/// The sampling settings of `--sampling-default`, which the Server page shows a field each: what a
+/// request that names none gets. They are kept as the option keeps them, name=value pairs split
+/// at commas, so that what 1.7.3's one field kept reads into the fields.
+enum Sampling {
+    struct Setting: Identifiable, Sendable {
+        let name: String
+        let title: String
+        let help: String
+        /// The value that leaves the model's choice as it is, which a family that publishes none has.
+        let neutral: String
+        /// What the server takes for it, as its refusal says, and whether a number is that.
+        let message: String
+        let accepts: @Sendable (Double) -> Bool
+        var id: String { name }
+    }
+
+    /// Those shown first, whose defaults a model's family publishes.
+    static let main = [
+        Setting(name: "temperature", title: "Temperature", help: "How freely the model picks its words: 0 always takes the likeliest, higher values vary more.",
+                neutral: "1", message: "A number from 0 to 2.", accepts: { 0...2 ~= $0 }),
+        Setting(name: "top_p", title: "Top P", help: "Picks only among the likeliest words that together make up this share of the probability.",
+                neutral: "1", message: "A number above 0, up to 1.", accepts: { $0 > 0 && $0 <= 1 }),
+        Setting(name: "top_k", title: "Top K", help: "Picks only among this many of the likeliest words; 0 sets no limit.",
+                neutral: "0", message: "A whole number, 0 for no limit.", accepts: { $0 >= -1 && $0 == $0.rounded() }),
+    ]
+    /// The others, under More sampling.
+    static let more = [
+        Setting(name: "presence_penalty", title: "Presence penalty", help: "Makes words already used less likely, however often they were.",
+                neutral: "0", message: "A number from -2 to 2.", accepts: { -2...2 ~= $0 }),
+        Setting(name: "frequency_penalty", title: "Frequency penalty", help: "Makes words less likely the more often they were used.",
+                neutral: "0", message: "A number from -2 to 2.", accepts: { -2...2 ~= $0 }),
+        Setting(name: "repetition_penalty", title: "Repetition penalty", help: "Divides the likelihood of words already in the conversation; 1 changes nothing.",
+                neutral: "1", message: "A number above 0.", accepts: { $0 > 0 }),
+        Setting(name: "min_p", title: "Min P", help: "Drops words less likely than this share of the likeliest one.",
+                neutral: "0", message: "A number from 0 to 1.", accepts: { 0...1 ~= $0 }),
+    ]
+
+    /// The settings kept in `stored`, the option's value, by name.
+    static func values(_ stored: String?) -> [String: String] {
+        var values: [String: String] = [:]
+        for pair in LaunchOption.items(stored ?? "") {
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            if parts.count == 2 { values[String(parts[0])] = String(parts[1]) }
+        }
+        return values
+    }
+
+    /// `values` as the option keeps them, in the settings' order; nil for none.
+    static func stored(_ values: [String: String]) -> String? {
+        let pairs = (main + more).compactMap { setting in values[setting.name].map { "\(setting.name)=\($0)" } }
+        return pairs.isEmpty ? nil : pairs.joined(separator: ", ")
+    }
+
+    /// `text` as `setting` takes it: a number in its range, a whole one for top_k, as the server
+    /// reads it; nil for anything else.
+    static func parse(_ setting: Setting, _ text: String) -> String? {
+        let text = text.trimmingCharacters(in: .whitespaces)
+        guard let number = Double(text), number.isFinite, setting.accepts(number) else { return nil }
+        return setting.name == "top_k" ? String(Int(number)) : text
+    }
+
+    /// What `setting`'s empty field shows for a model of `family`: the value its requests get, its
+    /// family's published one or the neutral one; Off for no top_k limit; for a family not known,
+    /// that the model's default applies.
+    static func placeholder(_ setting: Setting, _ family: ModelFamily) -> String {
+        guard main.contains(where: { $0.name == setting.name }) else { return setting.neutral }
+        guard let value = family.sampling?[setting.name] else { return "Model’s Default" }
+        if setting.name == "top_k" { return value <= 0 ? "Off" : String(Int(value)) }
+        return value == value.rounded() ? String(Int(value)) : String(value)
+    }
 }
 
 /// How long a model's context may grow, in tokens, as `--max-context` takes it; the server fits

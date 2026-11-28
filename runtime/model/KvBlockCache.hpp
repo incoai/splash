@@ -62,6 +62,8 @@ struct KvBlockCacheOptions final {
   std::shared_ptr<SsdReaders> readers;
   // The pool layout's (kv::SlotFormat(layout)).
   kv::SlotFormat format;
+  // The lanes whose floors it may hold at once: the runtime's.
+  uint32_t lanes = ExecutionLimits::defaultLanes;
 };
 
 class KvBlockCache final {
@@ -84,9 +86,9 @@ public:
   // plan, made before the pool's, counts it (KvSpillPlan::tableBytes);
   // 49,152 bytes for Qwen3.8-Flash-Next's eighteen 256-page extents of int8 KV.
   [[nodiscard]] static constexpr uint64_t tableBytes(const kv::Layout &layout, const SparseKvShape &shape,
-                                                     uint64_t targetBytes) {
+                                                     uint64_t targetBytes, uint32_t lanes) {
     return layout.mostOverExtents([&](uint32_t extentPages) {
-      return alignUp(mostPages(layout, extentPages, shape, targetBytes) * sizeof(SplashKvPage));
+      return alignUp(mostPages(layout, extentPages, shape, targetBytes, lanes) * sizeof(SplashKvPage));
     });
   }
 
@@ -145,7 +147,7 @@ private:
   // shape.requiredSlots(lanes) slots a layer at
   // 2^SPLASH_ATTENTION_LOCATION_BLOCK_BITS a page; those of a target of
   // `targetBytes`; and the pages of the most it holds, its target's or the
-  // floors of every lane at once.
+  // floors of `lanes` lanes at once.
   [[nodiscard]] static constexpr uint32_t floorExtents(uint32_t lanes, const SparseKvShape &shape,
                                                        uint32_t extentPages) noexcept {
     const uint64_t extentSlots = uint64_t{extentPages} << SPLASH_ATTENTION_LOCATION_BLOCK_BITS;
@@ -156,9 +158,10 @@ private:
     return static_cast<uint32_t>(targetBytes / (uint64_t{extentPages} * layout.kvBytesPerModelPage()));
   }
   [[nodiscard]] static constexpr uint64_t mostPages(const kv::Layout &layout, uint32_t extentPages,
-                                                    const SparseKvShape &shape, uint64_t targetBytes) noexcept {
+                                                    const SparseKvShape &shape, uint64_t targetBytes,
+                                                    uint32_t lanes) noexcept {
     return uint64_t{std::max(targetExtents(layout, extentPages, targetBytes),
-                             floorExtents(ExecutionLimits::maximumBatchWidth, shape, extentPages))} *
+                             floorExtents(lanes, shape, extentPages))} *
            extentPages;
   }
 

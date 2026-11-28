@@ -60,23 +60,11 @@ using splash::test::reading;
 using splash::test::rejects;
 using splash::test::require;
 
-// The target and draft checkpoints of `model` under root, which weight
-// planning reads; its vision tower stays absent, so loading stops there.
-void writeCheckpoints(const std::filesystem::path &root, const model::ModelDescriptor &model) {
-  std::visit([&](const auto &target) { test::writeSyntheticCheckpoints(root, target, model.draft); },
+// The whole installed model of `model` under root, its vision tower with
+// its target and draft: weight planning reads every part before any loads.
+void writeModel(const std::filesystem::path &root, const model::ModelDescriptor &model) {
+  std::visit([&](const auto &target) { test::writeSyntheticModel(root, target, model.draft, model.vision); },
              model.target);
-}
-
-RuntimeResourcesConfig budgetConfig(const char *metallibPath, const std::filesystem::path &root) {
-  const PlannedModel planned = plannedModel();
-  RuntimeResourcesConfig config;
-  config.metallibPath = metallibPath;
-  config.modelRoot = root;
-  config.model = model::makeModelDescriptor("budget-test", planned.target, planned.draft, planned.vision,
-                                            model::TargetSource::Safetensors, model::VisionSource::Safetensors);
-  config.buildId = "budget-test";
-  writeCheckpoints(root, config.model);
-  return config;
 }
 
 // What a start sized: its context, the least memory its plan needs, its
@@ -132,9 +120,7 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t reque
 // extents hold them as one request's KV capacity rounds them
 // (kvCapacityPagesFor), with their tokens' lookup index, less the runway
 // among the floors. A part loads whole only where the budget holds its
-// floors, all of it and this allowance. It is not the allowance a store's
-// growth above its smallest is priced with, which in a windowed layout also
-// keeps a streamed command's pages Full.
+// floors, all of it and this allowance.
 uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   kv::Layout layout = config.model.targetKvLayout;
   layout.format = config.kvFormat;
@@ -144,8 +130,9 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   uint64_t budget = pages;
   while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
   const uint64_t index = kv::kPageTokens * model::kLookupIndexTokenBytes;
-  return kvPagesBytes(layout, budget, kvWindowFloorPages(layout, 0), layout.extentPagesFor(budget)) + budget * index -
-         kvRunwayPages(layout.minimumExtentPages()) * (layout.bytesPerModelPage() + index);
+  const uint64_t runway = model::ExecutionLimits::runwayPages(layout.minimumExtentPages(), config.lanes, layout.blockPages());
+  return kvPagesBytes(layout, budget, layout.extentPagesFor(budget)) + budget * index -
+         runway * (layout.bytesPerModelPage() + index);
 }
 
 // The runtime memory a start plans of a model of `config` before its weights
@@ -158,11 +145,13 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
 // bytes an expert.
 void requireArenasPlannedFromTheFiles(metal::MetalBackend &backend, const RuntimeResourcesConfig &config,
                                       std::span<const model::LoadedModel *const> loaded, uint64_t table) {
-  const ops::ExecutionPlans operators(backend.capabilities(), config.int8Activations);
+  const ops::ExecutionPlans operators(backend.capabilities(),
+                                       config.int8Activations.value_or(config.model.activations()));
   const metal::MetalMemoryStats before = backend.refreshMemoryStats();
   backend.restartPeaks();
-  const model::QwenTargetGeometry planned = model::plannedTargetGeometry(
-      backend, config.modelRoot, config.model, table, std::make_shared<model::SsdReaders>(model::kSsdReaders));
+  const model::QwenTargetGeometry planned =
+      model::plannedTargetGeometry(backend, config.modelRoot, config.model, table,
+                                   std::make_shared<model::SsdReaders>(model::kSsdReaders), config.weights);
   const metal::MetalMemoryStats after = backend.refreshMemoryStats();
   require(after.allocatedBytes == before.allocatedBytes &&
               after.peakAllocatedBytes <= before.allocatedBytes + static_cast<uint64_t>(getpagesize()),
@@ -223,7 +212,8 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
           "the smallest store did not hold a layer's experts within its bytes");
   const std::array<const model::LoadedModel *, 2> loads{&whole, &streamed};
   requireArenasPlannedFromTheFiles(backend, config, loads, 0);
-  const ops::ExecutionPlans operators(backend.capabilities(), config.int8Activations);
+  const ops::ExecutionPlans operators(backend.capabilities(),
+                                       config.int8Activations.value_or(config.model.activations()));
   const auto arenas = [&](model::StreamedParts parts) {
     const model::ModelMemoryPlan plan =
         model::plannedRuntimeMemory(whole, operators, config.kvFormat, config.stateFormat, parts);
@@ -443,21 +433,13 @@ void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
                "a dense target's steps did not follow the verify budget");
 }
 
-// Startup fails at the loader, whose vision weight files are deliberately
-// absent. Reaching it is the assertion: everything the engine checks before
-// loading the weights let this configuration through.
-void requireReachesModelLoader(RuntimeResourcesConfig config,
-                               const std::filesystem::path &root,
-                               const char *message) {
+// The start of config loads its weights and assembles its resources:
+// everything the engine checks before and after loading them let it through.
+void requireStarts(const RuntimeResourcesConfig &config, const std::string &message) {
   try {
-    auto resources = RuntimeResources::create(config, 0);
-    throw std::runtime_error("a model without weights unexpectedly loaded");
+    require(RuntimeResources::create(config, 0) != nullptr, message);
   } catch (const RuntimeResourcesError &error) {
-    const std::string_view text = error.what();
-    require(error.failure() == RuntimeResourceFailure::Other &&
-                error.stage() == RuntimeResourceStage::ModelLoading &&
-                text.find(root.string()) != std::string_view::npos,
-            message);
+    throw std::runtime_error(message + ": " + error.what());
   }
 }
 
@@ -466,16 +448,17 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
 // state and the KV runway.
 uint64_t minimumBytes(const RuntimeResourcesConfig &config) {
   metal::MetalBackend backend(config.metallibPath.string());
-  const ops::ExecutionPlans operators(backend.capabilities(), config.int8Activations);
+  const ops::ExecutionPlans operators(backend.capabilities(),
+                                       config.int8Activations.value_or(config.model.activations()));
   const model::ModelMemoryPlan arenas = model::plannedRuntimeMemory(
-      config.model, model::plannedTargetGeometry(backend, config.modelRoot, config.model, 0, nullptr), operators,
-      config.kvFormat, config.stateFormat, {});
+      config.model, model::plannedTargetGeometry(backend, config.modelRoot, config.model, 0, nullptr, config.weights),
+      operators, config.kvFormat, config.stateFormat, {}, config.lanes);
   return minimumRequiredBytes(model::streamableWeights(config.modelRoot, config.model, {}).loadedBytes +
                                   arenas.sharedPrefillPlannedAllocatedBytes +
                                   arenas.sharedDecodePlannedAllocatedBytes + model::kPipelineReserveBytes +
                                   model::kRuntimeOverheadReserveBytes,
                               config.model.stateLayout.laneBytes(),
-                              config.model.targetKvLayout)
+                              config.model.targetKvLayout, config.lanes)
       .value();
 }
 
@@ -513,6 +496,18 @@ void testPersistentCacheNamespace() {
   // whatever the lanes' state format, so both formats read one namespace:
   // the dense layout's, whose change would leave every 27B's and 35B's
   // persistent cache cold.
+  // bf16 activations (--activations bf16) compute other pages and states
+  // than auto's, whatever the KV format: each mode has a namespace of its
+  // own, and auto's is the one 1.7.3 named (above).
+  for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+    RuntimeCacheIdentity automatic = identity('a', "build", format), bf16 = automatic;
+    bf16.activations = ops::Int8Activations::Off;
+    RuntimeCacheIdentity otherBuild = identity('a', "another build", format);
+    otherBuild.activations = ops::Int8Activations::Off;
+    require(persistentCacheNamespace(bf16, model.stateLayout) != persistentCacheNamespace(automatic, model.stateLayout) &&
+                persistentCacheNamespace(bf16, model.stateLayout) == persistentCacheNamespace(otherBuild, model.stateLayout),
+            "bf16 activations shared auto's cache namespace, or the build changed theirs");
+  }
   require(name == "88a6a28cadb13dc02b99998aa48baa72" &&
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) == name,
           "a dense layout's cache namespace is not the one its codes name");
@@ -560,9 +555,13 @@ void testPersistentCacheNamespace() {
           "a window, or another window or windowed layers, shared a cache namespace");
 }
 
+// A whole model under macOS's critical pressure is refused as host
+// capacity, which a client retries, before its weights load; under a
+// ceiling one byte short of all it needs it is refused by the engine's
+// budget; under any ceiling that holds that, it starts.
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
-  RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "budget-test");
 
   {
     config.memoryPressure = [] { return MemoryPressure::Critical; };
@@ -580,50 +579,59 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   config.memoryPressure = [] { return MemoryPressure::Warning; };
 
   // The low ceiling is one byte short of the minimum, so admission must
-  // charge the weights and all a model needs beside them. The other ceilings
-  // must reach the real loader, whose expected weight files are deliberately
-  // absent.
+  // charge the weights and all a model needs beside them.
   const uint64_t minimum = minimumBytes(config);
-  for (uint64_t ceiling : {minimum - 1, minimum, uint64_t{0}}) {
-    config.maximumMemoryBytes = ceiling;
-    try {
-      auto resources = RuntimeResources::create(config, 0);
-      throw std::runtime_error("a model without weights unexpectedly loaded");
-    } catch (const RuntimeResourcesError &error) {
-      if (ceiling == minimum - 1) {
-        require(error.failure() == RuntimeResourceFailure::EngineCapacity,
-                "hard weight budget lost its engine-capacity classification");
-        const std::string_view text = error.what();
-        require(error.stage() == RuntimeResourceStage::MemoryPlanning &&
-                    text.find("require " + std::to_string(minimum) + " bytes") !=
-                        std::string_view::npos &&
-                    text.find("budget is " + std::to_string(minimum - 1) +
-                              " bytes") != std::string_view::npos,
-                "weight loading began before checking the memory ceiling");
-        // What the start reports in place of Ready (engine::startFailedEvent).
-        require(error.shortfall() ==
-                    protocol::StartShortfall{.bound = protocol::ShortfallBound::MaxMemory,
-                                             .requiredBytes = minimum,
-                                             .budgetBytes = minimum - 1},
-                "the refusal lost what the plan's floors require against the ceiling");
-      } else {
-        require(error.failure() == RuntimeResourceFailure::Other,
-                "missing model file was misclassified as allocation pressure");
-      }
-    }
+  config.maximumMemoryBytes = minimum - 1;
+  try {
+    auto resources = RuntimeResources::create(config, 0);
+    throw std::runtime_error("a model beyond its ceiling started");
+  } catch (const RuntimeResourcesError &error) {
+    require(error.failure() == RuntimeResourceFailure::EngineCapacity,
+            "hard weight budget lost its engine-capacity classification");
+    const std::string_view text = error.what();
+    require(error.stage() == RuntimeResourceStage::MemoryPlanning &&
+                text.find("require " + std::to_string(minimum) + " bytes") != std::string_view::npos &&
+                text.find("budget is " + std::to_string(minimum - 1) + " bytes") != std::string_view::npos,
+            "weight loading began before checking the memory ceiling");
+    // What the start reports in place of Ready (engine::startFailedEvent).
+    require(error.shortfall() == protocol::StartShortfall{.bound = protocol::ShortfallBound::MaxMemory,
+                                                          .requiredBytes = minimum,
+                                                          .budgetBytes = minimum - 1},
+            "the refusal lost what the plan's floors require against the ceiling");
   }
-  // Without a ceiling, or with one above this Mac's budget, which only a
-  // notice names, the start reaches the loader.
-  for (const uint64_t ceiling : {uint64_t{0}, 1024 * kGiB}) {
+  // At the minimum, without a ceiling, or with one above the most it can set
+  // on this Mac, which a notice names, the model starts.
+  for (const uint64_t ceiling : {minimum, uint64_t{0}, 1024 * kGiB}) {
     config.maximumMemoryBytes = ceiling;
     const std::string log = test::capturedStderr([&] {
-      requireReachesModelLoader(config, root.path(),
-                                "a sufficient weight budget did not reach the "
-                                "model loader");
+      requireStarts(config, "a sufficient weight budget did not start the model");
     });
-    require((log.find("--max-memory ignored: its 1024.0 GiB exceed this Mac's Metal budget of ") !=
-             std::string::npos) == (ceiling != 0),
-            "a ceiling above the budget was ignored without a notice, or no ceiling was named");
+    require((log.find("--max-memory capped: its 1024.0 GiB exceed the most it can set on this Mac, ") !=
+             std::string::npos) == (ceiling == 1024 * kGiB),
+            "a ceiling above the budget was capped without a notice, or no ceiling was named");
+  }
+}
+
+// A model whose vision tower is not installed is refused before its
+// weights load, under any pressure, as the model it is: an error that names
+// the model and the directory that is missing, which no retry changes.
+void testIncompleteModelIsNamed(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-incomplete");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "incomplete-test");
+  std::filesystem::remove_all(root.path() / "vision");
+  for (const MemoryPressure pressure : {MemoryPressure::Normal, MemoryPressure::Critical}) {
+    config.memoryPressure = [pressure] { return pressure; };
+    try {
+      auto resources = RuntimeResources::create(config, 0);
+      throw std::runtime_error("a model without its vision tower started");
+    } catch (const RuntimeResourcesError &error) {
+      const std::string_view text = error.what();
+      require(error.failure() == RuntimeResourceFailure::Other && error.stage() == RuntimeResourceStage::ModelLoading &&
+                  text.find("incomplete-test") != std::string_view::npos &&
+                  text.find("no safetensors weights in " + (root.path() / "vision").string()) !=
+                      std::string_view::npos,
+              "a model without its vision tower was refused as \"" + std::string(text) + "\"");
+    }
   }
 }
 
@@ -634,14 +642,13 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
 // notices and the refusal name the tier as users know it, the SSD cache.
 void testStateStagingNeedsAStartedTier(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
-  RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "budget-test");
   const uint64_t minimum = minimumBytes(config);
   const uint64_t stateBytes = config.model.stateLayout.cachedBytes();
   config.maximumMemoryBytes = minimum;
   config.cacheDisk = {.bytes = stateBytes - 1};
   const std::string notice = test::capturedStderr([&] {
-    requireReachesModelLoader(config, root.path(),
-                              "a quota that holds no state set staging aside");
+    requireStarts(config, "a quota that holds no state set staging aside");
   });
   require(notice.find("SSD cache off: its quota holds no state of " +
                       std::to_string(stateBytes >> 20) + " MiB") != std::string::npos,
@@ -651,8 +658,7 @@ void testStateStagingNeedsAStartedTier(const char *metallibPath) {
   // and says why it is off.
   config.cacheDisk = {.automatic = true};
   const std::string automatic = test::capturedStderr([&] {
-    requireReachesModelLoader(config, root.path(),
-                              "the automatic tier's staging refused a start");
+    requireStarts(config, "the automatic tier's staging refused a start");
   });
   require(automatic.find("SSD cache off: the memory budget has no room for its " +
                          std::to_string(stateBytes >> 20) +
@@ -662,7 +668,7 @@ void testStateStagingNeedsAStartedTier(const char *metallibPath) {
   config.cacheDisk = {.bytes = stateBytes};
   try {
     auto resources = RuntimeResources::create(config, 0);
-    throw std::runtime_error("a model without weights unexpectedly loaded");
+    throw std::runtime_error("a model beyond its ceiling started");
   } catch (const RuntimeResourcesError &error) {
     require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
                 error.stage() == RuntimeResourceStage::MemoryPlanning &&
@@ -673,9 +679,7 @@ void testStateStagingNeedsAStartedTier(const char *metallibPath) {
             "a started tier's staging was not counted by name before loading");
   }
   config.maximumMemoryBytes = minimum + stateBytes;
-  requireReachesModelLoader(config, root.path(),
-                            "a budget with room for the staging did not "
-                            "reach the model loader");
+  requireStarts(config, "a budget with room for the staging did not start the model");
 }
 
 // The image patch limit is a positive multiple of four up to the
@@ -683,7 +687,7 @@ void testStateStagingNeedsAStartedTier(const char *metallibPath) {
 // is created.
 void testImagePatchCapIsBounded(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
-  RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "budget-test");
   for (const uint32_t patches : {ops::kMaximumImagePatches + 4, 6U}) {
     config.maximumImagePatches = patches;
     try {
@@ -695,8 +699,7 @@ void testImagePatchCapIsBounded(const char *metallibPath) {
     }
   }
   config.maximumImagePatches = 4096;
-  requireReachesModelLoader(config, root.path(),
-                            "a smaller image patch cap did not reach the model loader");
+  requireStarts(config, "a smaller image patch cap did not start the model");
 }
 
 // Startup and the governor sample host memory through the config's probe,
@@ -705,7 +708,7 @@ void testImagePatchCapIsBounded(const char *metallibPath) {
 void testHostMemoryProbeIsRequired(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
   for (const bool memory : {true, false}) {
-    RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
+    RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "budget-test");
     if (memory)
       config.hostMemory = {};
     else
@@ -723,19 +726,20 @@ void testHostMemoryProbeIsRequired(const char *metallibPath) {
 
 // The 27B under a budget half a GiB above its weights: the weights alone fit,
 // but not with what the runtime needs beside them. Startup refuses it before
-// any weight is loaded, against the bound that binds: --max-memory, or this
-// Mac's Metal budget where that is lower (a 16 GB Mac's 10.8 GiB), which
-// --max-memory can only lower. There, a --max-memory half a GiB below the
-// Metal budget binds instead.
+// any weight is loaded, against the bound that binds: --max-memory, or the
+// most it can set on this Mac where that is lower, the recommended working
+// set less its margin (a 16 GB Mac's 10.8 GiB). There, a --max-memory half a
+// GiB below that binds instead.
 void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
-  RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "budget-test");
   config.model = model::makeModelDescriptor("budget-test", model::Qwen3_8Layout{}, test::qwen3_8Draft(),
                                             test::qwen3_8Vision(), model::TargetSource::Safetensors,
                                             model::VisionSource::Safetensors);
-  writeCheckpoints(root.path(), config.model);
-  const uint64_t device =
-      EngineMemoryPolicy::hardBudgetBytes(metal::probeDeviceCapabilities().recommendedMaxWorkingSetBytes, 0);
+  writeModel(root.path(), config.model);
+  const DeviceCapabilities capabilities = metal::probeDeviceCapabilities();
+  const uint64_t device = EngineMemoryPolicy::hardBudgetBytes(capabilities.recommendedMaxWorkingSetBytes,
+                                                              UINT64_MAX, capabilities.physicalMemoryBytes);
   const uint64_t above = model::streamableWeights(root.path(), config.model, {}).loadedBytes + kGiB / 2;
   std::vector<uint64_t> limits{above};
   if (above >= device)
@@ -769,20 +773,18 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
 // budget of a 24 GB Mac.
 void testStartupAdmissionIgnoresModelSize(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
-  RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "budget-test");
   model::Qwen3_8Layout target;
   target.layers = 16;
   model::DFlashDraftLayout draft = test::qwen3_8Draft();
   draft.targetLayers = {1, 4, 7, 10, 13};
   config.model = model::makeModelDescriptor("budget-test", target, draft, test::qwen3_8Vision(),
                                             model::TargetSource::Safetensors, model::VisionSource::Safetensors);
-  writeCheckpoints(root.path(), config.model);
+  writeModel(root.path(), config.model);
   require(model::streamableWeights(root.path(), config.model, {}).loadedBytes > 3 * kGiB,
           "the model must exceed the sample");
   config.hostMemory = [] { return std::optional<HostMemory>(HostMemory{3 * kGiB, 3 * kGiB}); };
-  requireReachesModelLoader(config, root.path(),
-                            "a model larger than reclaimable host memory "
-                            "refused to start");
+  requireStarts(config, "a model larger than reclaimable host memory refused to start");
 
   // Below the reserve macOS is the one at risk, so startup waits instead.
   // Unmeasurable telemetry waits the same way.
@@ -910,7 +912,8 @@ void testACommandOutOfMemoryInAssemblyIsCommandMemory(const char *metallibPath) 
       const Kind kind = startFailedEvent(report).kind;
       require(report.resourceStage == RuntimeResourceStage::StorageAllocation &&
                   kind == (outOfMemory ? Kind::CommandMemory : Kind::Internal) &&
-                  report.message == "Metal command 2 failed: Insufficient Memory",
+                  report.message == (outOfMemory ? startMemoryRefusal("Metal command 2 failed: Insufficient Memory")
+                                                 : "Metal command 2 failed: Insufficient Memory"),
               "a start whose command failed " + what + " in resource assembly failed as kind " +
                   std::to_string(static_cast<int>(kind)));
       require(!StartupRetryWindow(30s).retryUntil(report, StartupRetryWindow::Clock::time_point{}),
@@ -997,12 +1000,22 @@ void testStartChecksTheReserveWithWhatItServes(const char *metallibPath) {
   };
   std::unique_ptr<ServingRuntime> bootstrap;
   std::vector<uint8_t> output;
-  static_cast<void>(test::capturedStderr([&] {
+  const std::string started = test::capturedStderr([&] {
     bootstrap = ServingRuntime::start(
         config, [&](std::span<const uint8_t> bytes) { output.insert(output.end(), bytes.begin(), bytes.end()); },
         [] { return 0.0; });
     bootstrap->announceReady();
-  }));
+  });
+  // Once warmup has planned every class, the start names the precision it
+  // runs at, its 16-bit projections' --weights first (ExecutionPlans::
+  // activationsDescription checks the activations' clauses).
+  const size_t at = started.find("Runtime precision on GPU family ");
+  require(at != std::string::npos && started.find("Weights loaded") < at &&
+              started.find(" cores: weights original, as their files store them (--weights), KV cache int8 "
+                           "(--kv-format), cached states ",
+                           at) != std::string::npos &&
+              started.find(" (--activations)", at) != std::string::npos,
+          "a start did not name the precision it runs at after its warmup:\n" + started);
   require(refused == 2, "the start checked the host before it gave back its warmups' idle state");
   // The warmups leave three lanes' state idle beside the lane the engine
   // keeps. Under shader validation (MTL_SHADER_VALIDATION), less than a lane
@@ -1080,7 +1093,7 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
           "the runtime's arenas were refused");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1088,6 +1101,135 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
   const std::string log = test::capturedStderr([&] { static_cast<void>(runtime->warmupCompositeStateRestore()); });
   require(backend.pipelinesCreatedWhileServing() == 0,
           "a restore after the start's other warmups created pipelines: " + log);
+}
+
+// A start of any lanes the option offers is a runtime that warms as a start
+// does: its arenas, its sampling policies' pipelines, its prefill and every
+// decode width up to its lanes (a draft step of one lane may store two
+// lanes' rows, decodeArenaLanes) and the state restore, which moves a state
+// to another state lane where it has one. One, two, three and five lanes.
+void testRuntimesOfOtherLanesWarm(const char *metallibPath) {
+  for (const uint32_t lanes : {1U, 2U, 3U, 5U}) {
+    const test::TemporaryDirectory root("splash-lanes-" + std::to_string(lanes));
+    RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "lanes-test");
+    config.lanes = lanes;
+    std::unique_ptr<RuntimeResources> resources;
+    static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+    const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+    require(budget.maximumBatchWidth == lanes, "a start of " + std::to_string(lanes) + " lanes planned others");
+    std::unique_ptr<model::RuntimeModel> runtime;
+    require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+                budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+                [&] { runtime = model::createRuntime(resources->modelContext()); })),
+            "the runtime's arenas were refused");
+    require(runtime->commandLimits().lanes == lanes, "a runtime of " + std::to_string(lanes) + " lanes runs others");
+    const KvPool::RunwayHold runway(resources->kvPool());
+    static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+    for (uint32_t width = 1; width <= lanes; ++width) static_cast<void>(runtime->warmupDecodeBatch(width));
+    static_cast<void>(test::capturedStderr([&] { static_cast<void>(runtime->warmupCompositeStateRestore()); }));
+    rejects([&] { static_cast<void>(runtime->warmupDecodeBatch(lanes + 1)); }, "invalid decode warmup width",
+            "a runtime of " + std::to_string(lanes) + " lanes warmed a wider batch");
+  }
+}
+
+// A width the start's memory does not afford to warm, which the engine still
+// admits (Bootstrap): with its pipelines created at the start without a step
+// run or a lane of its own (RuntimeModel::prepareDecodeBatch), its cycles
+// create none while serving; without, a cycle of it creates them, which the
+// check must see for it to test anything. Three lanes, width 1 warmed, 2 and
+// 3 prepared or not; then a cycle of two lanes and one of three, every lane
+// its whole verify block (--verify-rows all), the lanes' pages the runway's.
+void testAPreparedWidthCreatesNothingWhileServing(const char *metallibPath) {
+  for (const bool prepared : {false, true}) {
+    const test::TemporaryDirectory root(std::string("splash-prepared-width-") + (prepared ? "on" : "off"));
+    RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "prepared-width-test");
+    config.lanes = 3;
+    config.verifyRows = model::VerifyRows::All;
+    std::unique_ptr<RuntimeResources> resources;
+    static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+    const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+    std::unique_ptr<model::RuntimeModel> runtime;
+    require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+                budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+                [&] { runtime = model::createRuntime(resources->modelContext()); })),
+            "the runtime's arenas were refused");
+    const KvPool::RunwayHold runway(resources->kvPool());
+    static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+    for (const uint32_t rows : runtime->prefillRowClasses()) static_cast<void>(runtime->warmupPrefill(rows));
+    static_cast<void>(runtime->warmupDecodeBatch(1));
+    static_cast<void>(test::capturedStderr([&] {
+      if (prepared)
+        for (uint32_t width = 2; width <= config.lanes; ++width) static_cast<void>(runtime->prepareDecodeBatch(width));
+      static_cast<void>(runtime->warmupCompositeStateRestore());
+    }));
+    metal::MetalBackend &backend = resources->backend();
+    backend.beginServing();
+    auto &executor = dynamic_cast<model::Runtime &>(*runtime);
+    const std::vector<uint32_t> prompt{11, 12, 13, 14, 15, 16, 17, 18};
+    const std::string log = test::capturedStderr([&] {
+      std::vector<ModelBatchItem> items;
+      for (uint32_t lane = 0; lane < config.lanes; ++lane) {
+        const uint64_t id = 900 + lane;
+        // Two pages a lane: its prompt and two verify blocks.
+        const std::vector<uint32_t> pages{2 * lane, 2 * lane + 1};
+        executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 64}, lane);
+        ModelBatchItem item{.requestId = id,
+                            .logicalPosition = 0,
+                            .tokenCount = static_cast<uint32_t>(prompt.size()),
+                            .pageTable = pages,
+                            .pageTableRevision = 1};
+        item.inputTokens = prompt;
+        const auto prefilled = executor.prefill(
+            {.kind = WorkKind::Prefill, .items = {{id, static_cast<uint32_t>(prompt.size())}}},
+            std::span<const ModelBatchItem>(&item, 1));
+        require(prefilled.size() == 1 && prefilled[0].failure.empty(), "a lane's prompt failed");
+        items.push_back({.requestId = id,
+                         .logicalPosition = prompt.size(),
+                         .pageTable = pages,
+                         .pageTableRevision = 1});
+      }
+      for (const uint32_t width : {2u, 3u}) {
+        BatchPlan plan{.kind = WorkKind::Decode};
+        for (uint32_t lane = 0; lane < width; ++lane) plan.items.push_back({items[lane].requestId, 0});
+        const auto decoded = executor.decode(plan, std::span(items).first(width));
+        require(decoded.size() == width, "a wider cycle failed");
+        for (uint32_t lane = 0; lane < width; ++lane) {
+          require(decoded[lane].failure.empty() && !decoded[lane].outputTokens.empty(), "a lane's cycle failed");
+          items[lane].logicalPosition += decoded[lane].outputTokens.size() - decoded[lane].outputTokensWithoutKv;
+        }
+      }
+      for (const ModelBatchItem &item : items) executor.end(item.requestId);
+    });
+    if (prepared)
+      require(backend.pipelinesCreatedWhileServing() == 0,
+              "a width prepared without its warmup created pipelines while serving: " + log);
+    else
+      require(backend.pipelinesCreatedWhileServing() > 0,
+              "a width neither warmed nor prepared created no pipeline serving: the check sees nothing");
+  }
+}
+
+// Where eight lanes leave less context than four would, the start says so
+// (EngineMemoryBreakdown::defaultLanesContextTokens), and a relaunch, which
+// serves its first engine's context, says it again: four's context is capped
+// by --max-context alone, never by the relaunch's.
+void testARelaunchKeepsTheLanesNote(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-lanes-note");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "lanes-note");
+  config.lanes = 8;
+  const auto start = [&] {
+    std::unique_ptr<RuntimeResources> resources;
+    static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+    return std::pair(resources->aneFfnOutcome().context, resources->memoryPlan().breakdown());
+  };
+  // A budget whose memory, not the window, bounds the context.
+  config.maximumMemoryBytes = start().second.minimumRequiredBytes + 64 * kMiB;
+  const auto [served, first] = start();
+  require(first.defaultLanesContextTokens > served,
+          "eight lanes that leave less context than four did not carry four's");
+  config.relaunchContext = served;
+  require(start().second.defaultLanesContextTokens == first.defaultLanesContextTokens,
+          "a relaunch of eight lanes did not carry four lanes' context");
 }
 
 // A verify's kernels follow its lanes' history, which the decode warmups'
@@ -1112,7 +1254,7 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
           "the runtime's arenas were refused");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1172,7 +1314,7 @@ void testAReplyCaptureAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   require(runtime->capturesInDecode(), "the reply capture's model captures no state in decode");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1312,6 +1454,35 @@ void testStaleCachesGoAtEveryStart(const char *metallibPath) {
           "a start without a persistent cache kept a stale cache under its root, or removed another");
 }
 
+// A start's persistent cache is its options' namespace: one with
+// --activations bf16 opens a directory of its own, which another bf16 start
+// takes again, and an auto start the namespace persistentCacheNamespace gives
+// without an activations line, 1.7.3's (testPersistentCacheNamespace pins it).
+void testActivationsKeepCachesApart(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-activations-model"), caches("splash-activations");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "activations-test");
+  config.cacheDisk = {.bytes = kGiB};
+  config.persistentCache = true;
+  config.cacheRoot = caches.path() / "prefix-cache";
+  const auto start = [&](ops::Int8Activations activations) {
+    config.int8Activations = activations;
+    std::unique_ptr<RuntimeResources> resources;
+    static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+    RuntimeCacheIdentity automatic = resources->cacheIdentity();
+    automatic.activations = ops::Int8Activations::On;
+    std::set<std::string> names;
+    for (const auto &entry : std::filesystem::directory_iterator(config.cacheRoot))
+      names.insert(entry.path().filename().string());
+    return std::pair{names, persistentCacheNamespace(automatic, config.model.stateLayout)};
+  };
+  const auto [first, automatic] = start(ops::Int8Activations::On);
+  const auto [second, unused] = start(ops::Int8Activations::Off);
+  const auto [third, again] = start(ops::Int8Activations::Off);
+  require(first == std::set<std::string>{automatic} && second.size() == 2 && second.contains(automatic) &&
+              third == second,
+          "an auto start did not open 1.7.3's namespace, or a bf16 start shared it or did not keep its own");
+}
+
 // A cache root the engine makes for a persistent cache stays out of Time
 // Machine backups; one that was there keeps its own setting.
 void testMadeCacheRootStaysOutOfBackups(const char *metallibPath) {
@@ -1345,6 +1516,8 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "automatic-test");
   config.diskVolume = reading(localVolume(500 * kGiB));
   uint64_t minimumRequired = 0;
+  // The status's off_reason of the last start.
+  std::string offReason;
   const auto start = [&](uint32_t requestedContextTokens, uint32_t &contextTokens,
                          bool &tier) {
     return test::capturedStderr([&] {
@@ -1352,6 +1525,7 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
       contextTokens = resources->memoryPlan().maximumContextTokens();
       minimumRequired = resources->memoryPlan().breakdown().minimumRequiredBytes;
       tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+      offReason = resources->cache().snapshot().kvTier.offReason;
     });
   };
   uint32_t without = 0, with = 0, yielded = 0;
@@ -1365,13 +1539,14 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
   require(!tier && without, "a start without the SSD cache had one, or no context");
   config.cacheDisk = {.automatic = true};
   static_cast<void>(start(0, with, tier));
-  require(tier && with < without,
+  require(tier && with < without && offReason.empty(),
           "the automatic tier did not start, or its staging cost the plan no context");
   const std::string off = start(without, yielded, tier);
-  require(!tier && yielded == without &&
-              off.find("SSD cache off: the memory plan cannot hold a " + std::to_string(without) +
-                       "-token context beside its state staging") != std::string::npos,
-          "the automatic tier kept staging the requested context needs");
+  const std::string reason =
+      "the memory plan cannot hold a " + std::to_string(without) + "-token context beside its state staging";
+  require(!tier && yielded == without && off.find("SSD cache off: " + reason) != std::string::npos &&
+              offReason == reason,
+          "the automatic tier kept staging the requested context needs, or its status did not say why");
 }
 
 // The automatic tier's staging is decided by memory alone, so a start serves
@@ -1388,7 +1563,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
     uint32_t context = 0, planContext = 0;
     uint64_t staging = 0, minimumRequired = 0;
     bool tier = false, persistent = false;
-    std::string log;
+    std::string log, offReason;
   };
   const auto start = [&] {
     Started started;
@@ -1401,6 +1576,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
       const CacheSnapshot cache = resources->cache().snapshot();
       started.tier = cache.kvTier.capacityBytes != 0;
       started.persistent = cache.persistent;
+      started.offReason = cache.kvTier.offReason;
     });
     return started;
   };
@@ -1420,7 +1596,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
   config.diskVolume = reading(localVolume(500 * kGiB));
   const Started room = start();
   require(!off.tier && room.tier && room.staging == config.model.stateLayout.cachedBytes() &&
-              room.context == room.planContext && room.context < off.context,
+              room.context == room.planContext && room.context < off.context && room.offReason.empty(),
           "the automatic tier did not start beside its staging, or the staging cost no context");
   // A cached state in the running format (--cached-states exact) stages and
   // counts as a lane's cell and window, more than its codes.
@@ -1444,9 +1620,10 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
     config.diskVolume = reading(volume);
     const Started refused = start();
     require(!refused.tier && refused.staging == room.staging && refused.context == room.context &&
-                refused.planContext == room.planContext && offOnce(refused, reason),
+                refused.planContext == room.planContext && offOnce(refused, reason) &&
+                refused.offReason.find(reason) == 0,
             "a volume without room changed the automatic context, or did not leave the tier off "
-            "once (" + reason + ")");
+            "once, saying why in its status (" + reason + ")");
   }
   // A persistent cache's root without room leaves the tier temporary files;
   // with no room for those either, it is off.
@@ -1802,7 +1979,7 @@ void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
   const model::DecodeArena arena(backend, geometry, operators);
-  constexpr uint32_t kStepRows = model::kLaneCount * model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kStepRows = 64;
   const auto at = [](const metal::MetalBuffer &buffer) { return static_cast<const std::byte *>(buffer.contents()); };
   // A lane's rows after lanes of 16 and 5.
   constexpr ops::LaneRows lane{21, 11};
@@ -1815,7 +1992,7 @@ void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
       {model::DecodeTensor::FinalHidden, hiddenRow},
       {model::DecodeTensor::CapturedTargetHidden, uint64_t{geometry.target.capturedHiddenSize()} * sizeof(uint16_t)}};
   for (const auto &[tensor, row] : rowTensors) {
-    const metal::MetalBuffer step = arena.batchSlice(tensor, model::kLaneCount);
+    const metal::MetalBuffer step = arena.all(tensor);
     const metal::MetalBuffer rows = arena.rows(tensor, lane);
     require(step.sizeBytes() == kStepRows * row && arena.rows(tensor, {0, kStepRows}).sizeBytes() == step.sizeBytes() &&
                 at(rows) == at(step) + lane.first * row && rows.sizeBytes() == lane.rows * row,
@@ -2054,6 +2231,8 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
                                                            .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 0,
                                                            .attentionPairs = kLayerPairs},
           "a resident dense runtime's command limits are not a chunk in a pass a layer, with the per-layer bound");
@@ -2086,6 +2265,8 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
                                                            .layers = kMoeLayers,
                                                            .maximumPasses = kMoeLayers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 0,
                                                            .streamsWeights = true,
                                                            .attentionPairs = kLayerPairs},
@@ -2117,9 +2298,11 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
 
 // A Flash-Next start whose K/V spills: its commands hold a prefill group's
 // rows, stream one lane's history, and run a pass per layer. Its pools are
-// its store's where the plan streams its experts, its hot block cache's and
-// its history's staging; of them only the staging, which no lane in service
-// reads through, costs only its rebuild (model::PoolState::rebuildOnly), and
+// its SSD cache's state staging, which it holds while its tier takes cache
+// writes (a9b33e9e), its store's where the plan streams its experts, its hot
+// block cache's and its history's staging; of them only the stagings and the
+// hot blocks, which no lane in service reads through, cost only their rebuild
+// (model::PoolState::rebuildOnly), and
 // its value is its reservations and the time allocating it took, which the
 // next reservation pays once it went. A lane's decode reads and a prompt's staging lack
 // what a reservation of them then allocates, and nothing once they hold it;
@@ -2149,22 +2332,26 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
                                                            .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 1,
                                                            .streamsWeights = streamsExperts,
                                                            .attentionPairs = kLayerPairs},
           "a spilling Flash-Next runtime's command limits do not stream one lane's history");
-  std::vector<std::string> pools{"hot_kv", "kv_staging"};
-  if (streamsExperts) pools.insert(pools.begin(), "experts");
-  require(poolNames(*runtime) == pools,
-          "a spilling Flash-Next runtime's pools are not its store's, hot block cache's and staging's");
+  std::vector<std::string> pools{"state_staging", "hot_kv", "kv_staging"};
+  if (streamsExperts) pools.insert(pools.begin() + 1, "experts");
+  require(poolNames(*runtime) == pools && runtime->pools()[0]->state().currentBytes &&
+              runtime->pools()[0]->state().rebuildOnly,
+          "a spilling Flash-Next runtime's pools are not its state staging's, store's, hot block cache's and "
+          "staging's, or its tier, which takes writes, holds no state staging");
   ModelRequest request;
   const std::vector<uint32_t> prompt(2 * kChunk, 7);
   request.id = 911;
   request.prompt = prompt;
   request.maxNewTokens = 4;
-  model::ElasticPool &hot = *runtime->pools()[streamsExperts], &staging = *runtime->pools()[streamsExperts + 1];
+  model::ElasticPool &hot = *runtime->pools()[1 + streamsExperts], &staging = *runtime->pools()[2 + streamsExperts];
   require(staging.state().rebuildOnly && hot.state().rebuildOnly &&
-              !(streamsExperts && runtime->pools()[0]->state().rebuildOnly),
+              !(streamsExperts && runtime->pools()[1]->state().rebuildOnly),
           "the staging or the hot block cache no lane reads is not a pool whose units cost only their rebuild, "
           "or the store, which the lanes in service read through, is");
   const struct {
@@ -2258,6 +2445,7 @@ int main(int argc, char **argv) {
       testPersistentCacheNamespace();
       testArenasArePlannedFromTheFiles(argv[1]);
       testWeightBudgetBeforeLoading(argv[1]);
+      testIncompleteModelIsNamed(argv[1]);
       testStateStagingNeedsAStartedTier(argv[1]);
       testImagePatchCapIsBounded(argv[1]);
       testHostMemoryProbeIsRequired(argv[1]);
@@ -2274,6 +2462,7 @@ int main(int argc, char **argv) {
       testADecodeCapturePastItsCycleWaits(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
+      testActivationsKeepCachesApart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);
       testAutomaticTierYieldsToTheContext(argv[1]);
       testAutomaticContextIgnoresTheVolume(argv[1]);
@@ -2287,6 +2476,9 @@ int main(int argc, char **argv) {
       testThePlanCountsEveryBuffer(argv[1]);
       testDecodeArenaHoldsAStepsPackedRows(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
+      testRuntimesOfOtherLanesWarm(argv[1]);
+      testAPreparedWidthCreatesNothingWhileServing(argv[1]);
+      testARelaunchKeepsTheLanesNote(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
       testThePlanCountsTheSpilledKvReadersTables(argv[1]);
       {

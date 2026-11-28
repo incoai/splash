@@ -26,6 +26,13 @@
 #include <vector>
 
 namespace splash {
+namespace metal {
+class MetalBuffer;
+} // namespace metal
+namespace ops {
+class AneFfn;
+struct PrefillFfnBuffers;
+} // namespace ops
 
 namespace model {
 class KvPageSources;
@@ -162,9 +169,11 @@ struct ModelRequest final {
 
 // One image in the prompt: the run of placeholder tokens it occupies (one per
 // merged 2x2 patch group, row-major over the merged grid), the patch grid of
-// the image's resized pixels, and a 128-bit digest of that content.
-// Placeholder token ids are identical for every image, so cache identity keys
-// on the digest as well as the tokens.
+// the image's prepared pixels, in patches of the model's tower's side
+// (ModelCapabilities::imagePatchPixels), the image's own pixels at its top
+// left, before the padding to that grid (zero: the whole grid), and a 128-bit
+// digest of that content. Placeholder token ids are identical for every
+// image, so cache identity keys on the digest as well as the tokens.
 struct ImageSpan final {
   uint32_t offset = 0;
   uint32_t tokens = 0;
@@ -172,13 +181,15 @@ struct ImageSpan final {
   uint32_t gridWidth = 0;
   uint64_t digestLo = 0;
   uint64_t digestHi = 0;
+  uint32_t contentHeight = 0;
+  uint32_t contentWidth = 0;
 
   [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
   [[nodiscard]] ops::ImageGrid grid() const noexcept {
-    return {gridHeight, gridWidth};
+    return {gridHeight, gridWidth, contentHeight, contentWidth};
   }
-  [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return grid().pixelBytes();
+  [[nodiscard]] uint64_t pixelBytes(uint32_t patchPixels) const noexcept {
+    return grid().pixelBytes(patchPixels);
   }
   bool operator==(const ImageSpan &) const = default;
 };
@@ -186,10 +197,10 @@ struct ImageSpan final {
 // The first rule a request's image spans break, or none: each covers a valid
 // grid within the patch limit with one token per merged patch group, the
 // runs are sorted, disjoint and inside the prompt, and the pixels are the
-// grids' own.
+// grids' own, in patches of `patchPixels` a side.
 [[nodiscard]] inline std::optional<std::string_view>
 imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
-                          uint64_t pixelBytes) noexcept {
+                          uint64_t pixelBytes, uint32_t patchPixels) noexcept {
   uint64_t previousEnd = 0;
   uint64_t gridPixelBytes = 0;
   for (const ImageSpan &span : spans) {
@@ -198,13 +209,16 @@ imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
       return "image grid must be even-sided and within the patch limit";
     if (span.tokens != grid.mergedTokens())
       return "image span tokens must equal the merged grid size";
+    if (uint64_t{span.contentHeight} > uint64_t{span.gridHeight} * patchPixels ||
+        uint64_t{span.contentWidth} > uint64_t{span.gridWidth} * patchPixels)
+      return "image content must lie inside its grid";
     const uint64_t end = uint64_t{span.offset} + span.tokens;
     if (span.offset < previousEnd || end > promptTokens) {
       return "image spans must be sorted, non-overlapping runs inside the "
              "prompt";
     }
     previousEnd = end;
-    gridPixelBytes += grid.pixelBytes();
+    gridPixelBytes += grid.pixelBytes(patchPixels);
   }
   if (pixelBytes != gridPixelBytes)
     return "image pixels do not match the image grids";
@@ -224,13 +238,14 @@ public:
   // Whether the disk tier can take this state's write at all: a RAM copy of
   // a model with a state tier.
   [[nodiscard]] virtual bool writable() const noexcept { return false; }
-  // Whether the disk tier takes this state's write now, for a state in use
-  // or not: a writable copy, the tier's state file takes writes, its limit
-  // holds a state's slot, and the write budget admits one of the class
-  // (model::SlotFile::takesWrite). Of a writable copy it depends on the tier
-  // and the class alone, the same for every such copy, so the cache asks one
-  // for all (StateCache::takesWrite).
-  [[nodiscard]] virtual bool canOffload(bool) const noexcept { return false; }
+  // Whether the disk tier takes this state's write now: a writable copy, the
+  // tier's state file takes writes, its limit holds a state's slot, and the
+  // write budget admits a cache write (model::SlotFile::takesWrite), and for
+  // offload() the tier holds the staging buffer its copy goes through. Of a
+  // writable copy each depends on the tier alone, the same for every such
+  // copy, so the cache asks one for all (StateCache::takesWrite).
+  [[nodiscard]] virtual bool canOffload() const noexcept { return false; }
+  [[nodiscard]] virtual bool canPersist() const noexcept { return canOffload(); }
   // Starts writing this state to the disk tier and returns the ticket that
   // carries its disk copy; the source is free as soon as the call returns.
   // A null ticket means that the disk quota cannot admit another state.
@@ -387,8 +402,9 @@ struct ModelBatchItem final {
   uint64_t logicalPosition = 0;
   uint32_t tokenCount = 0;
   std::span<const uint32_t> pageTable;
-  // pageTableRevision names the page list and is nonzero; the list equals
-  // the one at revision - 1 below pageTableFirstChanged.
+  // pageTableRevision names the page lists, pageTable and windowTables, and
+  // is nonzero; each list equals its own at revision - 1 below
+  // pageTableFirstChanged.
   uint64_t pageTableRevision = 0;
   uint32_t pageTableFirstChanged = 0;
   // Where each page of the list reads its K/V from, cut with the list
@@ -403,6 +419,11 @@ struct ModelBatchItem final {
   // cycle's: at most one, the page boundary past logicalPosition that the
   // rows the lane may retain reach (Model::capturesInDecode).
   std::vector<StateCapture> stateCaptures{};
+  // With a window, a table per page of a block's window unit
+  // (kv::Layout::windowUnitPages), each as long as pageTable: table j holds,
+  // by logical page, the j-th page of each block's window unit. Empty
+  // without a window.
+  std::span<const std::vector<uint32_t>> windowTables{};
 };
 
 struct ModelStepResult final {
@@ -536,6 +557,9 @@ struct ModelCapabilities final {
   uint32_t maximumContextTokens = 0;
   // Set for a block-sparse target.
   std::optional<SparseKvShape> sparseKv;
+  // The side of the square pixel patches of an image's grid (ImageSpan): its
+  // vision tower's (ops::VisionLayout::patchSize).
+  uint32_t imagePatchPixels = ops::kImagePatchPixels;
 };
 
 // A tier copy of one block's page, as reads of spilled K/V reach it on any
@@ -662,6 +686,40 @@ struct ExecutionLimits final {
   // (engine::KvPool::RunwayHold).
   static constexpr uint32_t warmupKvPages =
       (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
+  // The lanes a runtime runs unless its start asks for others
+  // (RuntimeResourcesConfig::lanes).
+  static constexpr uint32_t defaultLanes = SPLASH_DEFAULT_LANES;
+  // The startup runway of a runtime of `lanes` lanes in extents of
+  // `extentPages` pages: the whole extents that hold warmupKvPages, and 16
+  // pages a lane past the default's four. A start measures each lane count's
+  // decode steps on it from page 5 (Runtime::measureDecodeSteps), a lane
+  // taking StepCosts::lanePages of its table's points: 8 pages for the 14
+  // points of a MoE target's table, the most today, so four lanes take 37 of
+  // the 64 pages and eight 69 of 128. 16 pages a lane hold tables of up to
+  // 28 points (StepCosts::requireRunway refuses more) and keep eight lanes'
+  // runway to 128 pages: one extent where extents are 128 pages or more.
+  // A block takes `blockPages` pages (kv::Layout::blockPages): warmup's
+  // block b takes the runway's pages from b x blockPages, its base page and
+  // then its window unit's.
+  [[nodiscard]] static constexpr uint32_t runwayPages(uint32_t extentPages, uint32_t lanes,
+                                                      uint32_t blockPages) noexcept {
+    const uint32_t pages =
+        warmupKvPages * (lanes > defaultLanes ? lanes : defaultLanes) / defaultLanes * blockPages;
+    return (pages + extentPages - 1) / extentPages * extentPages;
+  }
+  // The most rows of a decode step of `lanes` lanes: a verify block a lane,
+  // 64 at four lanes and 128 at eight. A step of 64 rows bound five
+  // to eight lanes of predictable text (2K-token code prompts on a 64 GB M5
+  // Pro: 53-100% of the steps of Qwen3.6-35B-A3B and Qwen3.8-27B took all 64,
+  // chat at most 48). Past 64 rows a step's projections run two row groups of
+  // the staged decode tile (ops::stagedRowGroups) and its head passes of at
+  // most 64 rows, every one on a decode step's plans (ops::StepKind), which
+  // take no int8 prefill path at any rows: a lane's logits keep their
+  // precision whatever the other lanes' load, but where a rotated PQ2_0
+  // unit's plan stores fewer than 16 rows (one or two rows on the column
+  // tile, three to eight split: a lone lane's short step, a head's short last
+  // pass), which keeps bf16 activations.
+  [[nodiscard]] static constexpr uint32_t stepRows(uint32_t lanes) noexcept { return lanes * targetVerifyRows; }
   static constexpr uint32_t draftQueryRows = SPLASH_DRAFT_QUERY_ROWS;
   static constexpr uint32_t draftProposalTokens = SPLASH_DRAFT_PROPOSAL_TOKENS;
   // The most rows of a lane's verify block, which every target kernel takes.
@@ -685,7 +743,7 @@ static_assert(ExecutionLimits::draftQueryRows ==
               ExecutionLimits::draftProposalTokens + 1);
 static_assert(ExecutionLimits::draftQueryRows <= ExecutionLimits::targetVerifyRows);
 
-// The first rule a command breaks, or none: at most maximumBatchWidth
+// The first rule a command breaks, or none: at most the runtime's
 // lanes; and for a prefill, pass `pass` of at most maximumPasses passes,
 // from layer 0 for the first and past it for a later one, with no more
 // passes left than layers left of the target's `layers`, at most
@@ -699,7 +757,7 @@ static_assert(ExecutionLimits::draftQueryRows <= ExecutionLimits::targetVerifyRo
 [[nodiscard]] inline std::optional<std::string_view>
 commandViolation(const CommandLimits &limits, const BatchPlan &plan,
                  std::span<const ModelBatchItem> items) noexcept {
-  if (items.size() > ExecutionLimits::maximumBatchWidth)
+  if (items.size() > limits.lanes)
     return "a command's lanes exceed the batch width";
   if (plan.kind != WorkKind::Prefill)
     return std::nullopt;
@@ -737,6 +795,14 @@ struct ModelMemoryPlan final {
   uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
+  // The lanes the arenas hold (QwenTargetGeometry::lanes).
+  uint32_t lanes = ExecutionLimits::defaultLanes;
+  // The decode arena's page tables of one page a lane, as a layout without a
+  // window holds them, and what a windowed layout's tables of its window
+  // unit's pages add to them, in sharedDecodePlannedAllocatedBytes
+  // (DecodeTensor::PageTable holds one a page of a block).
+  uint64_t pageTableBytes = 0;
+  uint64_t windowTableBytes = 0;
 };
 
 // Fixed reserves the memory plan carries beside the planned arenas: Metal
@@ -901,10 +967,10 @@ public:
   // need.pages pages, which holds Index pages, the request's while its
   // prompt goes on, also once refused (model::KvHistoryStream::reserve).
   [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t, SpilledReadNeed) { return {.ok = true}; }
-  // Whether the disk tier takes a state written from a lane now, for a
-  // state in use or not, as CompositeState::canOffload. Room in the quota is
-  // the write's own concern.
-  [[nodiscard]] virtual bool canSnapshotToDisk(bool) const noexcept { return false; }
+  // Whether the disk tier takes a state written from a lane now, as
+  // CompositeState::canOffload. Room in the quota is the write's own
+  // concern.
+  [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
   // Writes the request's committed state at its current page-aligned
   // boundary to the disk tier from the lane's own buffers, for a state no
   // cached state's buffers could be reserved for; the ticket carries its disk
@@ -938,6 +1004,14 @@ public:
   // The state bytes a lane's start allocates: the buffers the idle pool
   // lacks for its lane. Zero by default.
   [[nodiscard]] virtual uint64_t startStateBytes() const noexcept { return 0; }
+  // What a start of `request` builds for its images at most, as though none
+  // were held or encoded yet: the vision scratch of its largest image past
+  // its restored prefix and each such image's pixel and embedding buffers.
+  // Zero without images, and by default.
+  [[nodiscard]] virtual uint64_t imageStartBytes(const ModelRequest &request) const {
+    static_cast<void>(request);
+    return 0;
+  }
   // What one prefill command may hold (commandViolation): by default a
   // chunk's rows in one pass over one layer, one lane past a chunk and no
   // lane whose history holds Index pages, as a model without readers of
@@ -976,12 +1050,38 @@ class RuntimeModel : public Model {
 public:
   ~RuntimeModel() override = default;
 
+  // The fewest rows of each class of prefill chunk whose kernels the start
+  // warms (ops::ExecutionPlans::prefillRowClasses, of the target's MoE
+  // blocks and relative attention).
+  [[nodiscard]] virtual std::vector<uint32_t> prefillRowClasses() const = 0;
+  // What the target's plans round to int8 activations so far, at a context
+  // of `contextTokens` (ops::ExecutionPlans::activationsDescription).
+  [[nodiscard]] virtual std::string activationsDescription(uint32_t contextTokens) const = 0;
   // Actual rows, not padded dispatch rows; valid range is 1..prefillTokenBudget.
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;
+  // Creates the pipelines of every decode cycle of `width` lanes without
+  // running one and without the lanes' state (Runtime::prepareDecodeBatch):
+  // a width whose warmup the start's memory does not afford, which the
+  // engine may still admit, so its first cycle creates none while serving.
+  virtual WarmupStepResult prepareDecodeBatch(uint32_t width) = 0;
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;
   [[nodiscard]] virtual ModelTelemetry telemetry() const noexcept = 0;
+  // The prefill FFN's Neural Engine split the runtime's next commands take,
+  // set between commands, and the command limits that follow from it
+  // (commandLimits()); none for the GPU alone. A runtime without a dense
+  // target's prefill ignores it.
+  virtual void setAneFfn(ops::AneFfn *split) { static_cast<void>(split); }
+  // Runs `use` between commands on the runtime's own prefill buffers of a
+  // dense FFN and the hidden rows its layers alternate between, which `use`
+  // may overwrite: the split's set-up. Throws for a runtime without them.
+  using PrefillFfnUse =
+      std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)>;
+  virtual void withPrefillFfn(const PrefillFfnUse &use) {
+    static_cast<void>(use);
+    throw std::logic_error("the runtime has no prefill buffers of a dense FFN");
+  }
 };
 
 } // namespace model

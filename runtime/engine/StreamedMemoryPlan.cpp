@@ -79,7 +79,7 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
 // tableBytes), as they allocate them: the hot block cache's at a target of
 // `hotTargetBytes` and one for each of `buffers` buffers of staged history.
 uint64_t readerTableBytes(const StreamedMemoryInputs &in, uint64_t hotTargetBytes, uint32_t buffers) {
-  return model::KvBlockCache::tableBytes(in.kvLayout, *in.sparseKv, hotTargetBytes) +
+  return model::KvBlockCache::tableBytes(in.kvLayout, *in.sparseKv, hotTargetBytes, in.lanes) +
          buffers * model::KvHistoryStream::tableBytes(in.kvLayout);
 }
 
@@ -135,7 +135,7 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
     else
       high = middle - 1;
   }
-  const uint64_t states = uint64_t{model::ExecutionLimits::maximumBatchWidth} * in.stateSlotBytes;
+  const uint64_t states = uint64_t{in.lanes} * in.stateSlotBytes;
   spill.enabled = true;
   spill.memoryTokens = low;
   // The room only bounds a first start's context: it follows the volume's
@@ -158,7 +158,7 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   spill.laneSlots = shape.laneSlots();
   spill.hotFloorBytes = spill.hotTargetBytes = spillFloors.hotFloorBytes;
   spill.hotLimitBytes = extentsBytes(
-      layout, shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+      layout, shape.requiredSlots(in.lanes) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
       layout.kvBytesPerModelPage());
   spill.indexRunwayBytes = spillFloors.indexRunwayBytes;
   spill.stagingBytes = spillFloors.stagingBytes(spill.floorTokens, spill.stagingBuffers);
@@ -180,7 +180,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   uint64_t loaded = 0;
   for (const uint64_t bytes : {in.fixedBytes, arenaBytes, experts.charged, table.charged})
     if (!checkedAdd(loaded, bytes, loaded)) return overflow();
-  const std::optional<uint64_t> minimum = minimumRequiredBytes(loaded, in.laneStateBytes, layout);
+  const std::optional<uint64_t> minimum = minimumRequiredBytes(loaded, in.laneStateBytes, layout, in.lanes);
   if (!minimum) return overflow();
   const uint64_t runwayBytes = *minimum - loaded - in.laneStateBytes;
   uint64_t floors = *minimum;
@@ -255,19 +255,28 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   // Every target keeps 64K tokens, or the requested context: a target that
   // cannot spill holds all of it, and a spill-capable one no more than 64K,
   // as more is KV no request can use.
-  const auto allowance = [&](bool streaming) -> int64_t {
+  // A windowed layout's blocks past its lane's floor take their base pages
+  // alone, and the floor's command is a streamed group's where the experts
+  // stream (kvWindowFloorBlocks).
+  // The allowance's K/V capacity, in pages.
+  const auto allowancePages = [&](bool streaming) {
     const uint64_t cap = std::min<uint64_t>(in.windowTokens, kResidentAllowanceTokens);
     const uint64_t requested = in.requestedContextTokens;
     const uint64_t tokens = !requested ? cap : spill.enabled ? std::min(cap, requested) : requested;
-    const uint64_t pages = pagesOf(kvTokens(tokens));
+    const uint32_t floorBlocks = kvWindowFloorBlocks(layout, streaming ? in.groupPages : 0);
+    const uint64_t pages = kvBlockPages(layout, pagesOf(kvTokens(tokens)), floorBlocks);
     uint64_t budget = pages;
     while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
-    // A windowed layout's KV beyond its lane's Full pages is Slim, in
-    // extents of its own.
-    const uint32_t floorPages = kvWindowFloorPages(layout, streaming ? in.groupPages : 0);
-    const uint64_t index = budget * kv::kPageTokens * model::kLookupIndexTokenBytes;
-    return static_cast<int64_t>(saturatingSubtract(
-        kvPagesBytes(layout, budget, floorPages, layout.extentPagesFor(budget)) + index, runwayBytes));
+    return budget;
+  };
+  // Its bytes are those in which the engine's plan finds that capacity
+  // (kvPagesCost), the lookup index priced as it prices it: the context
+  // served is the one requested by construction, not by what the stores'
+  // rounding leaves over.
+  const auto allowance = [&](bool streaming) -> int64_t {
+    const uint32_t floorBlocks = kvWindowFloorBlocks(layout, streaming ? in.groupPages : 0);
+    return static_cast<int64_t>(
+        saturatingSubtract(kvPagesCost(layout, allowancePages(streaming), floorBlocks), runwayBytes));
   };
   const int64_t tableShare =
       table.automatic
@@ -280,10 +289,20 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     if (rest - allowance(false) - tableShare >= above) {
       rest -= above;
     } else {
+      // The states' room at a cap is never what an exact K/V reservation
+      // leaves past its last extent: beside the allowance the plan holds the
+      // cached states its capacity holds the tails of (kvCachedStates), after
+      // the K/V and before the experts, so that the K/V reaches its capacity
+      // with them held.
       expertsStream = true;
-      const int64_t bytes = std::clamp<int64_t>(rest - allowance(true) - tableShare, 0, above);
+      const int64_t room = std::clamp<int64_t>(
+          rest - allowance(true) - tableShare, 0,
+          static_cast<int64_t>(kvCachedStates(layout, kvCapacityPagesFor(layout, allowancePages(true))) *
+                               in.cachedStateBytes));
+      const int64_t bytes = std::clamp<int64_t>(rest - allowance(true) - room - tableShare, 0, above);
       plan.expertBytes = experts.charged + static_cast<uint64_t>(bytes);
-      rest -= bytes;
+      plan.cachedStatesBytes = static_cast<uint64_t>(room);
+      rest -= bytes + room;
     }
   }
   // The store's floor: every slot of a store a size sets, which is all of

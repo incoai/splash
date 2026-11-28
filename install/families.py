@@ -26,7 +26,8 @@ if __name__ == "__main__" and not __package__:
     __package__ = "install"
 
 from server import serve_options
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, INKLING2, QWEN, ChatFormat
+from server.images import INKLING_IMAGES, QWEN_IMAGES, ImageFormat
 
 from . import models
 
@@ -46,12 +47,16 @@ QWEN_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
 # What Flint's GGUF release states (general.sampling.temp, top_p, top_k),
 # which are Qwen's numbers.
 FLINT_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
+# What Inkling 2's GGUF release states (general.sampling.temp, top_p, top_k):
+# temperature 1.0 over every token.
+INKLING2_SAMPLING = SamplingDefaults(temperature=1.0, top_p=1.0, top_k=0)
 
 
 @dataclass(frozen=True)
 class ModelFamily:
     # The family's name, as the engine names it (each target layout's family,
-    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp and Flint.hpp).
+    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp, Flint.hpp and
+    # Inkling2Loop.hpp).
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
@@ -66,6 +71,19 @@ class ModelFamily:
     # loads from the target repository unless --language-only. The models of
     # a family without one serve text only, whatever their repository holds.
     vision: bool = True
+    # How its tower takes images (server/images.py), and the weight types of
+    # the GGUF vision projectors (mmproj) an installation loads for it, in
+    # the order it prefers them when a repository holds several
+    # (upstream.select_vision). Qwen's tower loads only exact ones, which
+    # preparation copies or converts without rounding; Inkling's also Q8_0,
+    # last, whose projections preparation keeps in Q8_0.
+    image_format: ImageFormat = QWEN_IMAGES
+    projectors: tuple[str, ...] = ("BF16", "F32", "F16")
+    # Whether a source whose tower the installer refuses serves text, with
+    # the refusal noted, rather than being refused: Inkling 2's, many of whose
+    # conversions hold no tower, and which 1.7.2 served as text only. Another
+    # family's such source asks for --language-only.
+    text_fallback: bool = False
 
 
 FAMILIES = (
@@ -86,6 +104,18 @@ FAMILIES = (
     ),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
+    # Its vision tower is its release's and its MLX conversions' own, and an
+    # inkling2v projector beside its GGUFs: Unsloth publishes it in BF16, F16
+    # and F32, ggml-org in BF16 and Q8_0.
+    ModelFamily(
+        "Inkling-2-Mini",
+        "incoai/Inkling-2-Mini-DFlash2",
+        INKLING2,
+        INKLING2_SAMPLING,
+        image_format=INKLING_IMAGES,
+        projectors=("BF16", "F32", "F16", "Q8_0"),
+        text_fallback=True,
+    ),
 )
 
 
@@ -104,10 +134,13 @@ def option_report(engine_facts):
     """What each family, by name, makes of the options of `splash serve`,
     from its facts: engine_facts, each family's facts of its layout by name,
     as the engine's families command gives them, and its own vision tower
-    and reasoning switch. Each family's report holds the flags of the
-    options that need a fact it lacks (ServeOption.needs, LAUNCHER_NEEDS),
-    which act on none of its models, and the context its models serve:
-    their native window, and the most past it, with YaRN."""
+    and what a request's effort does to its reasoning (whether it reaches
+    the model, and whether it turns the reasoning on and off). Each family's
+    report holds the flags of the options that need a fact it lacks
+    (ServeOption.needs, LAUNCHER_NEEDS), which act on none of its models,
+    the context its models serve: their native window, and the most past
+    it, with YaRN; its models' default --activations; and the sampling a
+    request of them gets where it names none."""
     needs = {
         option.flag: option.needs
         for option in serve_options.SERVE_OPTIONS
@@ -119,11 +152,18 @@ def option_report(engine_facts):
         facts = engine | {
             "vision": family.vision,
             "reasoning_switch": family.chat_format.reasoning_switch,
+            "prompt_switches_reasoning": family.chat_format.prompt_switches_reasoning,
         }
         report[family.name] = {
             "unusable": [flag for flag, fact in needs.items() if not facts[fact]],
             "context_tokens": engine["context_tokens"],
             "max_context_tokens": engine["max_context_tokens"],
+            "activations": engine["activations"],
+            "sampling": {
+                "temperature": family.sampling.temperature,
+                "top_p": family.sampling.top_p,
+                "top_k": family.sampling.top_k,
+            },
         }
     return report
 

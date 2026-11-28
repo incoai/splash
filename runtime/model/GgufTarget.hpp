@@ -5,6 +5,7 @@
 // weights (BlockTargetFormat).
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -14,8 +15,7 @@
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
 #include "model/QwenHybridLayout.hpp"
-#include "model/SparseRowStore.hpp"
-#include "model/WeightImages.hpp"
+#include "model/TargetImages.hpp"
 
 namespace splash::model {
 
@@ -24,38 +24,37 @@ namespace splash::model {
 // split order.
 [[nodiscard]] std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &directory);
 
-class GgufTargetLoader final {
-public:
-  // A table whose rows stream from the GGUF (streamTable()): the store that
-  // reads them, their format (GGUF_FMT_*), and the record of its image, which
-  // the weights' fingerprint takes as when the table loads, as the rows
-  // gathered are the same.
-  struct StreamedTable final {
-    std::shared_ptr<SparseRowStore> store;
-    uint32_t format = 0;
-    WeightFileRecord record;
-  };
+// How a family's GGUFs plan (GgufTargetLoader): its images, from a GGUF's
+// metadata with what streams, its layer images first, `layerImages` of them,
+// the first MoE layer's `firstMoeLayer`.
+struct GgufTargetPlan final {
+  uint32_t layerImages = 0;
+  uint32_t firstMoeLayer = 0;
+  std::function<std::vector<gguf::Image>(const GgufFile &, gguf::PlanOptions)> images;
+};
+// A family whose GGUFs gguf::planImages plans as its layout's
+// ggufArchitecture, an image a layer; a family that plans its own declares
+// its overload beside its layout.
+template <class Layout> [[nodiscard]] GgufTargetPlan ggufTargetPlan(const Layout &layout) {
+  return {layout.layers, layout.leadingDenseLayers, [layout](const GgufFile &file, gguf::PlanOptions options) {
+            return gguf::planImages(file, Layout::ggufArchitecture, layout, options);
+          }};
+}
 
-  // Plans every image of the GGUF of `architecture` (its family's layout's
-  // ggufArchitecture) from its metadata once. With a table store
+class GgufTargetLoader final : public TargetImages {
+public:
+  // Plans every image of the GGUF as its family's `plan` does from its
+  // metadata once. With a table store
   // (table.cacheBytes), the rows of a table the family's GGUF holds stream
   // through it (streamTable()) instead of loading (table()). With expert
   // memory (experts.memoryBytes), a MoE target's routed experts stream
-  // (streamedExperts()) instead of loading with their layers.
+  // (streamedExperts()) instead of loading with their layers. 16-bit
+  // projections load as `weights` says (gguf::float16Planes).
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
-                   const std::vector<std::filesystem::path> &paths, std::string_view architecture,
-                   const QwenTargetDimensions &geometry, SparseRowStoreOptions table = {},
-                   ExpertStoreOptions experts = {});
-  GgufTargetLoader(const GgufTargetLoader &) = delete;
-  GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
+                   const std::vector<std::filesystem::path> &paths, const GgufTargetPlan &plan,
+                   SparseRowStoreOptions table = {}, ExpertStoreOptions experts = {},
+                   gguf::Float16Weights weights = gguf::Float16Weights::Published);
 
-  [[nodiscard]] WeightFile layer(uint32_t index);
-  [[nodiscard]] WeightFile head();
-  [[nodiscard]] WeightFile embedding();
-  // The image of the table the family's GGUF holds after the embedding
-  // (gguf::planImages: Qwen3.8-Flash-Next's PLE n-gram table), refused when
-  // its rows stream.
-  [[nodiscard]] WeightFile table();
   // The streamed table, its store reading the open file the metadata was
   // parsed from; none when the table loads.
   [[nodiscard]] std::optional<StreamedTable> streamTable() const;
@@ -65,33 +64,18 @@ public:
   // The input rotation of a Prism ML GGUF, which planImages checked names
   // every quantized tensor of the target and its token table.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return file().rotation(); }
-  // Whether the routed experts stream, then the store's options and every
-  // MoE layer's experts (a block each, those of the leading dense layers'
-  // none), which read the open files the metadata was parsed from.
-  [[nodiscard]] bool streamsExperts() const noexcept { return planned_->experts.memoryBytes != 0; }
-  [[nodiscard]] const ExpertStoreOptions &expertStoreOptions() const noexcept { return planned_->experts; }
-  [[nodiscard]] StreamedBlocks streamedExperts() const;
 
 private:
   // The GGUF's files and its images, which their writers share.
   struct Planned {
     explicit Planned(const std::vector<std::filesystem::path> &paths) : source(paths) {}
     OpenGguf source;
-    // Each layer's image, then the head's, the embedding's and a table's
-    // (gguf::planImages).
     std::vector<gguf::Image> images;
-    uint32_t layers = 0;
-    // The first MoE layer (QwenTargetDimensions::leadingDenseLayers).
-    uint32_t firstMoeLayer = 0;
-    SparseRowStoreOptions table;
-    ExpertStoreOptions experts;
   };
-  [[nodiscard]] WeightFile open(size_t index);
-  // The plan of the table's image, or null for a family without one.
-  [[nodiscard]] const gguf::Image *tablePlan() const noexcept;
+  GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images, std::shared_ptr<Planned> planned,
+                   const GgufTargetPlan &plan, SparseRowStoreOptions table, ExpertStoreOptions experts,
+                   gguf::Float16Weights weights);
 
-  metal::MetalBackend &backend_;
-  WeightImages &images_;
   std::shared_ptr<Planned> planned_;
 };
 

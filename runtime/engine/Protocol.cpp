@@ -30,12 +30,12 @@ constexpr uint64_t kMaskResponseFixedBytes = 24;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReleaseRequestFixedBytes = 8;
 constexpr uint64_t kReadyFixedBytes = 21;
-constexpr uint64_t kStartFixedBytes = 16;
+constexpr uint64_t kStartFixedBytes = 27;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 62;
-constexpr uint64_t kErrorFixedBytes = 22;
+constexpr uint64_t kErrorFixedBytes = 27;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 constexpr uint64_t kStartFailedFixedBytes = 26;
 // The most words of a mask response's forced tokens: a row and a token for
@@ -336,14 +336,16 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::LimitExceeded,
                    "image span count exceeds its limit");
   }
-  if (auto error = imageSpansValidationError(request.imageSpans,
-                                             request.promptTokens.size(),
-                                             request.imagePixels.size())) {
+  if (auto error = imageSpansValidationError(request.imageSpans, request.promptTokens.size(),
+                                             request.imagePixels.size(), limits.imagePatchPixels)) {
     return invalid(IssueCode::InvalidCount, std::string(*error));
   }
   if (request.generationPromptTokens >= request.promptTokens.size()) {
     return invalid(IssueCode::InvalidCount,
                    "generation prompt must leave a prompt token");
+  }
+  if (request.headTokens >= request.promptTokens.size()) {
+    return invalid(IssueCode::InvalidCount, "head must leave a prompt token");
   }
   if (scoring) {
     // Score requests may carry images: prefill encodes them as for
@@ -447,6 +449,10 @@ std::optional<ProtocolIssue> validateStart(const StartEvent &event) {
   if (event.lane >= ExecutionLimits::maximumBatchWidth) {
     return invalidEvent(IssueCode::InvalidCount, event.requestId,
                         "start event lane is invalid");
+  }
+  if (static_cast<size_t>(event.reuseEnd) >= engine::kReuseEnds) {
+    return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
+                        "start event reuse end is invalid");
   }
   return std::nullopt;
 }
@@ -596,6 +602,19 @@ std::optional<ProtocolIssue> validateError(const ErrorEvent &event,
     return invalidEvent(IssueCode::InvalidErrorClassification, event.requestId,
                         "only a retryable error says when to retry");
   }
+  using Limit = engine::CapacityLimit;
+  if (!validEnum(static_cast<uint8_t>(event.capacity.limit),
+                 {Limit::None, Limit::Memory, Limit::ImageMemory,
+                  Limit::ClosedDisk, Limit::DiskQuota})) {
+    return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
+                        "error event capacity limit is invalid");
+  }
+  if ((event.capacity.limit != Limit::None &&
+       event.failureClass != FailureClass::RequestError) ||
+      (event.capacity.fitsTokens && event.capacity.limit == Limit::None)) {
+    return invalidEvent(IssueCode::InvalidErrorClassification, event.requestId,
+                        "only a request's capacity failure says what fits");
+  }
   return std::nullopt;
 }
 
@@ -664,6 +683,11 @@ EncodedEvent encodeStart(const StartEvent &event) {
   writer.u64(event.requestId);
   writer.u32(event.lane);
   writer.u32(event.matchedPromptTokens);
+  writer.u32(event.prefixTokens);
+  writer.u8(static_cast<uint8_t>(event.stateSource));
+  writer.u8(event.lostState);
+  writer.u8(static_cast<uint8_t>(event.reuseEnd));
+  writer.u32(event.reuseEndTokens);
   return success(writer.take());
 }
 
@@ -760,6 +784,8 @@ EncodedEvent encodeError(const ErrorEvent &event,
   writer.u8(event.retryable ? 1 : 0);
   writer.u32(event.retryAfterSeconds);
   writer.u64(event.requestId);
+  writer.u8(static_cast<uint8_t>(event.capacity.limit));
+  writer.u32(event.capacity.fitsTokens);
   writer.u32(static_cast<uint32_t>(event.code.size()));
   writer.u32(static_cast<uint32_t>(event.message.size()));
   writer.text(event.code);
@@ -822,7 +848,8 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
       !reader.u32(request.generationPromptTokens) ||
       !reader.u32(request.flags) || !reader.u64(request.cacheSalt.lo) ||
       !reader.u64(request.cacheSalt.hi) || !reader.u32(thinking.tokens) ||
-      !reader.u32(thinkingEndCount) || !reader.u32(thinking.alsoEnds)) {
+      !reader.u32(thinkingEndCount) || !reader.u32(thinking.alsoEnds) ||
+      !reader.u32(request.headTokens)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "request fixed payload is truncated"));
@@ -864,8 +891,9 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   for (ImageSpan &span : request.imageSpans) {
     if (!reader.u32(span.offset) || !reader.u32(span.tokens) ||
         !reader.u32(span.gridHeight) || !reader.u32(span.gridWidth) ||
+        !reader.u32(span.contentHeight) || !reader.u32(span.contentWidth) ||
         !reader.u64(span.digestLo) || !reader.u64(span.digestHi) ||
-        !checkedAdd(pixelBytes, span.pixelBytes(), pixelBytes)) {
+        !checkedAdd(pixelBytes, span.pixelBytes(limits.imagePatchPixels), pixelBytes)) {
       return failure<ClientMessage>(
           requestIssue(IssueCode::InvalidPayloadLength, request.requestId,
                        "image span payload is malformed"));
@@ -1040,7 +1068,7 @@ std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
   }
   if (!limits.maxPromptTokens || !limits.maxLogicalOutputTokens ||
       !limits.maxTokenBatch || !limits.maxSimulationTokens ||
-      !limits.maxMaskWords || !limits.maxImageSpans) {
+      !limits.maxMaskWords || !limits.maxImageSpans || !limits.imagePatchPixels) {
     return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
                      "all configured token, mask, and image limits must be "
                      "non-zero");

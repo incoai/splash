@@ -341,6 +341,11 @@ class StreamKeepaliveTests(HarnessTestCase):
                     {
                         "input_tokens": 1,
                         "cache_read_input_tokens": 1,
+                        "prefix_tokens": 1,
+                        "state_source": "memory",
+                        "lost_state": False,
+                        "reuse_end": "prefix_end",
+                        "reuse_end_tokens": 1,
                         "output_tokens": 0,
                     },
                 )

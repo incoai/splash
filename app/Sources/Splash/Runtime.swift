@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Synchronization
 
@@ -56,13 +57,21 @@ struct Runtime: Sendable {
 
     /// The command line that downloads and installs `model`, the installer `splash serve` runs
     /// before it serves, reporting download progress as JSON lines.
-    func installCommand(_ model: String) -> [String] {
-        scriptCommand("install/models.py", ["--model", model, "prepare", "--json-progress"])
+    func installCommand(_ model: String, textOnly: Bool = false) -> [String] {
+        scriptCommand("install/models.py",
+                      ["--model", model] + sourceFlags(textOnly) + ["prepare", "--json-progress"])
     }
 
-    /// The command line of the installer removing `model`, an installed one.
-    func removeCommand(_ model: String) -> [String] {
-        scriptCommand("install/models.py", ["--model", model, "remove"])
+    /// The command line of the installer removing `model`, an installed one. Named alone, the model
+    /// takes every installation of it, Text only's included (`install/upstream.py` `_selections_of`);
+    /// `textOnly` names the one a model installed with Text only alone has (`InstalledModel.textOnly`),
+    /// as the model alone names no installation then.
+    func removeCommand(_ model: String, textOnly: Bool = false) -> [String] {
+        scriptCommand("install/models.py", ["--model", model] + sourceFlags(textOnly) + ["remove"])
+    }
+
+    private func sourceFlags(_ textOnly: Bool) -> [String] {
+        textOnly ? ["--language-only"] : []
     }
 
     /// Whether `pid` runs this runtime's installer as an app starts it (`installCommand`), for any
@@ -73,13 +82,21 @@ struct Runtime: Sendable {
         guard let arguments = processArguments(pid), let flag = arguments.firstIndex(of: "--model"),
               flag + 1 < arguments.endIndex
         else { return false }
-        return arguments.dropFirst() == installCommand(arguments[flag + 1]).dropFirst()
+        return arguments.dropFirst()
+            == installCommand(arguments[flag + 1], textOnly: arguments.contains("--language-only")).dropFirst()
     }
 
     /// The command line of the installer of the models the Hugging Face cache holds whole that
     /// Splash serves, without the Hub (`install/cached.py`).
     var cachedInstallCommand: [String] {
         scriptCommand("install/cached.py", ["--models", models.path])
+    }
+
+    /// The command line that only brings up to date the records of the installations an earlier
+    /// release made, by which the options of each are offered (`install/cached.py --records`),
+    /// those of the model `first` before the others'.
+    func recordsCommand(first: String?) -> [String] {
+        scriptCommand("install/cached.py", ["--models", models.path, "--records"] + (first.map { ["--first", $0] } ?? []))
     }
 
     /// The command line of the Python `script` in the runtime: isolated from the user's Python
@@ -89,10 +106,16 @@ struct Runtime: Sendable {
     }
 
     /// The environment of the programs the app runs: `userEnvironment`, kept from the user's
-    /// site-packages in the programs Python starts. Run with -B, the launcher keeps them from
-    /// writing bytecode.
+    /// site-packages in the programs Python starts, with the app's own home as their HOME. Run
+    /// with -B, the launcher keeps them from writing bytecode.
+    ///
+    /// A packaged runtime keeps its data in its HOME's Application Support (install/paths.py),
+    /// the serve records the app reads among them, and the app reads them in its own home, which
+    /// Foundation gives whatever HOME says: the account's. Told it, the runtime writes where the
+    /// app reads, whatever HOME the app was opened with (open --env HOME=…).
     var environment: [String: String] {
         var environment = userEnvironment
+        environment["HOME"] = URL.homeDirectory.path
         // Where the Hugging Face cache is, the token and the like, as `splash` in a terminal has them.
         environment.merge(shellSettings.values) { $1 }
         environment["PYTHONNOUSERSITE"] = "1"
@@ -184,28 +207,59 @@ struct Runtime: Sendable {
     /// family; the model is on this Mac while every file the record names is, its links followed
     /// (as `present` in `install/cached.py` has it): a model whose files were deleted, as from the
     /// Hugging Face cache, is not listed, and installs again once the cache holds it again or it is
-    /// downloaded again.
+    /// downloaded again. A model installed with Text only alone, as the app downloads one with it on
+    /// (`installCommand`), is listed by the selection link of that option's hash
+    /// (`textOnlySelection`): a GGUF without a vision projector of a family with a vision tower
+    /// installs no other way. A selection with other options than the app's is not listed.
     func installedModels() -> [InstalledModel] {
         struct Record: Decodable {
             struct File: Decodable { let path: String; let bytes: Int64 }
             let model: String
             let family: String?
             let files: [String: File]
+            let visionFormat: String?
+            let visionUnavailable: String?
+            let quantizableWeights: Bool?
+            let reasoning: ModelReasoning?
+
+            enum CodingKeys: String, CodingKey {
+                case model, family, files, visionFormat = "vision_format", visionUnavailable = "vision_unavailable"
+                case quantizableWeights = "quantizable_weights", reasoning
+            }
         }
         let manager = FileManager.default
+        let installed = { (link: URL) -> InstalledModel? in
+            guard let data = try? Data(contentsOf: link.appending(path: "model.json")),
+                  let record = try? JSONDecoder().decode(Record.self, from: data),
+                  record.files.values.allSatisfy({ manager.fileExists(atPath: $0.path) })
+            else { return nil }
+            // An assembly can link one file under two names (a checkpoint's vision tower).
+            let files = Dictionary(record.files.values.map { ($0.path, $0.bytes) }) { first, _ in first }
+            return InstalledModel(id: record.model, bytes: files.values.reduce(0, +), family: record.family,
+                                  towerless: record.visionFormat == "none" && record.visionUnavailable == nil,
+                                  quantizableWeights: record.quantizableWeights, reasoning: record.reasoning)
+        }
         let owners = (try? manager.contentsOfDirectory(at: models, includingPropertiesForKeys: nil)) ?? []
-        return owners.filter { !$0.lastPathComponent.hasPrefix(".") }
+        let named = owners.filter { !$0.lastPathComponent.hasPrefix(".") }
             .flatMap { (try? manager.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)) ?? [] }
-            .compactMap { link in
-                guard let data = try? Data(contentsOf: link.appending(path: "model.json")),
-                      let record = try? JSONDecoder().decode(Record.self, from: data),
-                      record.files.values.allSatisfy({ manager.fileExists(atPath: $0.path) })
-                else { return nil }
-                // An assembly can link one file under two names (a checkpoint's vision tower).
-                let files = Dictionary(record.files.values.map { ($0.path, $0.bytes) }) { first, _ in first }
-                return InstalledModel(id: record.model, bytes: files.values.reduce(0, +), family: record.family)
-            }
-            .sorted { $0.id < $1.id }
+            .compactMap(installed)
+        let selections = (try? manager.contentsOfDirectory(at: models.appending(path: ".selections"),
+                                                           includingPropertiesForKeys: nil)) ?? []
+        let textOnly = selections.compactMap { link -> InstalledModel? in
+            guard var model = installed(link), !model.local, link.lastPathComponent == Self.textOnlySelection(model.id),
+                  !named.contains(where: { $0.id == model.id })
+            else { return nil }
+            model.textOnly = true
+            return model
+        }
+        return (named + textOnly).sorted { $0.id < $1.id }
+    }
+
+    /// The name of the selection link `install/models.py` gives `model` with Text only alone
+    /// (`--language-only`, `selection_link`): the SHA-256 of its options' compact JSON. A model ID
+    /// holds nothing JSON escapes.
+    static func textOnlySelection(_ model: String) -> String {
+        SHA256.hash(data: Data(#"["\#(model)",null,true,null]"#.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     /// The family of each model prepared here under a selection link of its options' hash
@@ -377,6 +431,20 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
     var missing = false
     /// Its family, as its assembly record names it; nil for model files on this Mac not prepared yet.
     var family: String?
+    /// Whether it is installed with Text only alone (`Runtime.installedModels`): what removes it names
+    /// that option.
+    var textOnly = false
+    /// Whether its record names no vision tower, nor why its repository has none Splash serves
+    /// (`vision_format`, `vision_unavailable`): of a family that serves images, an installation
+    /// that a check for updates gives its tower (`AppState.awaitingVision`).
+    var towerless = false
+    /// Whether Weights set to Auto loads any of its weights otherwise than as its files store them
+    /// (its record's `quantizable_weights`); nil for one no start of 1.7.4 has assembled yet, for one
+    /// the engine could not say it of, and for model files on this Mac not prepared.
+    var quantizableWeights: Bool?
+    /// What its own chat template makes of the reasoning efforts (its record's `reasoning`); nil
+    /// where its record doesn't say, as `quantizableWeights` is.
+    var reasoning: ModelReasoning?
 
     /// Whether it is model files on this Mac that are a GGUF file, or a folder holding one besides
     /// a projector, as they were measured; the vision projector they may be given is a GGUF's.

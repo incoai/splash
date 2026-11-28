@@ -2,9 +2,10 @@
 
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
+#include "model/GgufPreparation.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/ModelFactory.hpp"
-#include "model/SafetensorsImage.hpp"
+#include "model/SafetensorsTarget.hpp"
 #include "model/SparseRowStore.hpp"
 #include "model/VisionLoader.hpp"
 
@@ -32,9 +33,11 @@ uint64_t loadedBytes(std::span<const gguf::Image> images) {
 // What a target of `layout` whose images `plan` plans for what streams
 // takes, while their sources are open: what loads while every part `streams`
 // lets stream does, and what each such part adds where it loads instead,
-// the routed experts' slot table with them.
+// the routed experts' slot table with them. Its images begin with
+// `layerImages` layer images, the first MoE layer's `firstMoeLayer`.
 template <class Layout, class Plan>
-StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::PlanOptions streams) {
+StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::PlanOptions streams,
+                                uint32_t layerImages, uint32_t firstMoeLayer) {
   streams.streamExperts = streams.streamExperts && layout.ffnKind == QwenFfnKind::SparseMoe;
   StreamableWeights result;
   std::vector<gguf::Image> streamed;
@@ -52,7 +55,8 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
   result.loadedBytes = loadedBytes(streamed);
   for (const gguf::Image &image : streamed)
     if (image.streamedRows) {
-      result.tableBytes = loadedBytes(plan({.streamExperts = streams.streamExperts})) - result.loadedBytes;
+      result.tableBytes =
+          loadedBytes(plan({.streamExperts = streams.streamExperts, .weights = streams.weights})) - result.loadedBytes;
       const SparseRowStoreOptions rows = streamedTableRows(layout);
       result.tableRowBytes = image.streamedRows->rowBytes;
       const uint64_t working =
@@ -65,11 +69,12 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
                         image.streamedRows->rowBytes);
     }
   if (streams.streamExperts) {
-    result.expertBytes = loadedBytes(plan({.streamTable = result.tableBytes != 0})) - result.loadedBytes +
-                         residentExpertSlotsBytes(layout.experts);
+    result.expertBytes =
+        loadedBytes(plan({.streamTable = result.tableBytes != 0, .weights = streams.weights})) - result.loadedBytes +
+        residentExpertSlotsBytes(layout.experts);
     StreamedBlocks blocks;
     blocks.blocks = gguf::streamedExperts(
-        std::span(streamed).subspan(layout.leadingDenseLayers, layout.layers - layout.leadingDenseLayers));
+        std::span(streamed).subspan(firstMoeLayer, layerImages - firstMoeLayer));
     result.expertMinimumBytes = ExpertStore::minimumBytes(blocks, layout.moeBlockShape());
   }
   return result;
@@ -84,21 +89,24 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
         const std::filesystem::path directory = root / "target";
         if (descriptor.targetSource == TargetSource::Gguf) {
           const OpenGguf target(findTargetGgufs(directory));
+          const GgufTargetPlan plan = ggufTargetPlan(layout);
           return targetWeights(
               layout,
-              [&](gguf::PlanOptions options) {
-                return gguf::planImages(target.file(), layout.ggufArchitecture, layout, options);
-              },
-              streams);
+              [&](gguf::PlanOptions options) { return plan.images(target.file(), readingValues(options)); },
+              streams, plan.layerImages, plan.firstMoeLayer);
         }
         const SafetensorsCheckpoint checkpoint(directory);
+        const SafetensorsTargetPlan plan = safetensorsTargetPlan(layout);
         return targetWeights(
-            layout, [&](gguf::PlanOptions options) { return safetensors::planImages(checkpoint, layout, options); },
-            streams);
+            layout,
+            [&](gguf::PlanOptions options) { return plan.images(checkpoint, readingValues(options)).images; },
+            streams, plan.layerImages, plan.firstMoeLayer);
       },
       descriptor.target);
   result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
-  if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
+  // The tower's image as its source writes it: an Inkling mmproj's Q8_0
+  // projections make its image 329 MiB against the BF16 one's 610.
+  if (const auto vision = planVisionLoader(root, descriptor)) result.loadedBytes += vision->image().bytes;
   return result;
 }
 

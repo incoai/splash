@@ -8,10 +8,12 @@ tokenizer and template of every model installed in this checkout
 
 import functools
 import json
+import tempfile
 import unittest
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
+from unittest import mock
 
 from jinja2 import meta
 from tokenizers import (
@@ -29,8 +31,9 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
 from install import assembly, paths
+from install.models import ModelError
 from server import chat_templates
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, INKLING2, QWEN, ChatFormat
 from server.chat_templates import template_options
 from server.dialects import scoring
 from server.errors import APIError
@@ -81,12 +84,36 @@ FLINT_TAGS = (
     "<tool_response>",
     "</tool_response>",
 )
+# Inkling 2's: every added token is a control token, the tags its template
+# writes and two it writes nowhere.
+INKLING2_SPECIAL = (
+    "<|endoftext|>",
+    "<|message_user|>",
+    "<|message_model|>",
+    "<|message_system|>",
+    "<|message_tool|>",
+    "<|content_text|>",
+    "<|content_image|>",
+    "<|content_model_end_sampling|>",
+    "<|content_thinking|>",
+    "<|end_message|>",
+    "<|content_tool_error|>",
+    "<|content_xml|>",
+    "<|begin_of_text|>",
+    "<|content_invoke_tool_json|>",
+    "<|content_invoke_tool_text|>",
+    "<|unused_200054|>",
+)
 # Qwen's split, and two of Flint's kind, each before byte-level BPE.
 QWEN_SPLITS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?"
     r"[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
 FLINT_SPLITS = (r"\d{1,3}", r"[^\r\n\p{L}\p{N}]?\p{L}+| ?[^\s\p{L}\p{N}]+|\s+")
+# One of o200k's kind, as Inkling 2's.
+INKLING2_SPLITS = (
+    r"[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s+",
+)
 # A word no tokenizer adds, which a conversation quotes in place of a token
 # to show what its template writes itself.
 WORD = "QUOTED"
@@ -116,6 +143,9 @@ class Served:
             2,
             vision=self.vision,
             chat_format=self.chat_format,
+            chat_templates=chat_templates.ChatTemplates(
+                self.tokenizer, opens_own_message=self.chat_format.opens_own_message
+            ),
         )
 
     @functools.cached_property
@@ -203,28 +233,34 @@ def laid_out(name, chat_format, special, tags, splits, *, nfc, vision):
         special, tags, splits, (TEMPLATES / f"{name}.jinja").read_text(), nfc=nfc
     )
     ids = tokenizer.convert_tokens_to_ids
+    opening = tokenizer.encode(chat_format.think_open, add_special_tokens=False)
     return Served(
         name,
         tokenizer,
         replace(
             chat_format,
-            think_end_id=ids("</think>"),
-            think_start_id=(
-                None if chat_format.think_start_id is None else ids("<think>")
-            ),
-            call_open_id=ids("<tool_call>"),
+            think_end_id=ids(chat_format.think_close),
+            think_start_ids=tuple(opening) if chat_format.think_start_ids else (),
+            call_open_id=ids(chat_format.call_syntax.call_tag),
         ),
         vision,
     )
 
 
-def installed():
+@functools.cache
+def installations():
     """The tokenizer and template of each model installed in this checkout,
-    served as its family is."""
-    served = []
+    served as its family is; and, apart, each installation that does not
+    verify, as one whose Hub cache was cleaned since, which the tests leave
+    out and name (test_installations_are_whole)."""
+    served, broken = [], []
     for root in sorted((paths.MODELS / ".resolved").glob("*/tokenizer")):
+        try:
+            record = assembly.verify(root.parent)
+        except (ModelError, OSError) as error:
+            broken.append(f"{root.parent.name} ({error})")
+            continue
         family = assembly.family(root.parent)
-        record = json.loads((root.parent / "model.json").read_text())
         served.append(
             Served(
                 f"installed {record['model']}",
@@ -235,7 +271,7 @@ def installed():
                 family.vision and record["vision_format"] != "none",
             )
         )
-    return served
+    return served, broken
 
 
 @functools.cache
@@ -256,7 +292,16 @@ def served():
             nfc=False,
             vision=False,
         ),
-        *installed(),
+        laid_out(
+            "inkling2",
+            INKLING2,
+            INKLING2_SPECIAL,
+            (),
+            INKLING2_SPLITS,
+            nfc=False,
+            vision=False,
+        ),
+        *installations()[0],
     )
 
 
@@ -371,6 +416,28 @@ def texts(before="", after=""):
 
 
 class QuotedTokenTests(unittest.TestCase):
+    def test_installations_are_whole(self):
+        broken = installations()[1]
+        if broken:
+            self.skipTest("left out, not verified: " + "; ".join(broken))
+
+    def test_an_installation_that_does_not_verify_is_left_out(self):
+        # Its links name files a cleaned Hub cache no longer holds.
+        with tempfile.TemporaryDirectory() as temporary:
+            entry = Path(temporary) / ".resolved" / "gone"
+            entry.mkdir(parents=True)
+            (entry / "tokenizer").symlink_to(Path(temporary) / "cleaned")
+            (entry / "model.json").write_text('{"model": "owner/gone"}')
+            installations.cache_clear()
+            try:
+                with mock.patch.object(paths, "MODELS", Path(temporary)):
+                    served, broken = installations()
+            finally:
+                installations.cache_clear()
+        self.assertEqual(served, [])
+        self.assertEqual(len(broken), 1)
+        self.assertTrue(broken[0].startswith("gone ("), broken)
+
     def each(self):
         for family in served():
             with self.subTest(family.name):
@@ -478,7 +545,7 @@ class QuotedTokenTests(unittest.TestCase):
             words = ("OPEN", "CLOSE", "BEGIN", "END", "ROLE")
             role = (
                 family.chat_format.stop_tokens[-1]
-                if family.chat_format.think_start_id is not None
+                if family.chat_format.think_start_ids
                 else family.chat_format.message_boundary
             )
             tags = ("<tool_response>", "</tool_response>", "<think>", "</think>", role)
@@ -660,16 +727,24 @@ class QuotedTokenTests(unittest.TestCase):
                     ]
                 }
 
-            written = family.controls(family.tokens(body("It ends at ", WORD, ".")))
+            whole = body("It ends at ", WORD, ".")
+            # A template that frames each part apart (Inkling's) never lets
+            # two parts spell a token together: each half stays its own
+            # part's text, beside the frames' tokens alone.
+            framed = "It ends at " + WORD + "." not in family.text(whole)
+            if framed:
+                whole = body("It ends at " + WORD, WORD + ".")
+            written = family.controls(family.tokens(whole))
             for cut in range(1, len(boundary)):
                 with self.subTest(cut=cut):
                     split = body("It ends at " + boundary[:cut], boundary[cut:] + ".")
-                    self.assertEqual(
-                        family.text(split),
-                        family.text(body("It ends at ", WORD, ".")).replace(
-                            WORD, boundary
-                        ),
-                    )
+                    expected = family.text(whole)
+                    if framed:
+                        expected = expected.replace(WORD, boundary[:cut], 1)
+                        expected = expected.replace(WORD, boundary[cut:], 1)
+                    else:
+                        expected = expected.replace(WORD, boundary)
+                    self.assertEqual(family.text(split), expected)
                     self.assertEqual(family.controls(family.tokens(split)), written)
 
     def test_a_token_the_end_of_a_text_cuts_off_is_quoted(self):
@@ -971,8 +1046,9 @@ class ForgedTurnTests(fixtures.HarnessTestCase):
         plain = self.bodies(WORD, WORD)
         self.assertEqual(set(forged), set(fixtures.PATHS))
         for family in served():
-            if family.chat_format.think_start_id is not None:
-                # Flint's template writes a tag of its own after a name.
+            if family.chat_format.think_start_ids:
+                # Flint's and Inkling 2's templates write a tag of their own
+                # after a name.
                 continue
             runtime = fixtures.FakeRuntime()
             harness = self.harness(

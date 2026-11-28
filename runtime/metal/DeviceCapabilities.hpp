@@ -42,11 +42,36 @@ struct DeviceCapabilities {
     // the total thread count for every dispatch.
     uint64_t maxThreadgroupWidth = 0;
     bool hasUnifiedMemory = false;
+    // The memory rate the laws read (ops::KernelCalibration::memoryBytesPerSecond), in bytes a second: a plain
+    // read of a 256 MiB private buffer on a GPU left alone, as a constant of the device's class, its GPU class
+    // and core count (classMemoryBytesPerSecond), which the reading of a device sets. It is not measured at a
+    // start: a probe took another process's share of the GPU for the device's rate (a 16-core M5 Pro read 147
+    // to 251 GB/s beside a second process's steps against 291 alone, and a 32-core M5 Max left alone 429.5 or
+    // 450.9), the plans followed it, and one build's greedy output then differed from start to start. 0 for a
+    // class the table does not hold: the matrix tile then takes no split (ops matrixSplits) and a decode
+    // attention's page model no share of DRAM (ops::decodePassNanoseconds).
+    uint64_t memoryBytesPerSecond = 0;
 
     [[nodiscard]] constexpr GpuClass gpuClass() const noexcept {
         return appleGpuFamily >= 11   ? GpuClass::Apple11
                : appleGpuFamily == 10 ? GpuClass::Apple10
                                       : GpuClass::Apple9;
+    }
+    // A class's memory rate: what five starts of its Mac read on a GPU held alone, at the nearest 1.05^n (the
+    // higher of the M5 Max's two): a 10-core M4 109.6 GB/s, a 12-core M6 161.9, a 16- and a 20-core M5 Pro 290.7,
+    // a 32-core M5 Max 450.9. A class not listed, or a device that reports no core count, has none (0).
+    [[nodiscard]] static constexpr uint64_t classMemoryBytesPerSecond(GpuClass gpu, uint32_t gpuCores) noexcept {
+        struct Class {
+            GpuClass gpu;
+            uint32_t cores;
+            uint64_t bytesPerSecond;
+        };
+        constexpr Class kClasses[] = {{GpuClass::Apple9, 10, 109'553'136'383},  {GpuClass::Apple10, 16, 290'677'085'356},
+                                      {GpuClass::Apple10, 20, 290'677'085'356}, {GpuClass::Apple10, 32, 450'935'564'252},
+                                      {GpuClass::Apple11, 12, 161'859'877'733}};
+        for (const Class &entry : kClasses)
+            if (entry.gpu == gpu && entry.cores == gpuCores) return entry.bytesPerSecond;
+        return 0;
     }
     // The GPU core count kernel policy plans for: the reported one, or
     // kAssumedGpuCores when the device does not report it.

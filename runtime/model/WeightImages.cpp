@@ -25,7 +25,7 @@ WeightFile WeightImages::load(ImagePlan image) {
   if (!released_) image.write(contentsOf(buffer), buffer);
   WeightFile file(*backend_, buffer, image.component, image.magic, image.layer, image.type,
                   image.declaredBytes ? image.declaredBytes : buffer.sizeBytes(), contentIdentity_,
-                  std::move(image.planned));
+                  std::move(image.planned), std::move(image.formats));
   images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write)});
   return file;
 }

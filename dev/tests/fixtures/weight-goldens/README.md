@@ -11,8 +11,7 @@
 - `gguf_quantization`: the reference GGUF implementation's
   `quantize_row_q8_0_ref` of the reference's Q8_0 fixture values (`q8_0`,
   `gguf-reference`), which pins the reference's Q8_0 quantization, the
-  loader's of Qwen3.8-Flash-Next's BF16 and F16 hyper-connection projections,
-  to its commit 7ab4ee7 alike.
+  loader's of 16-bit values into Q8_0, to its commit 7ab4ee7 alike.
 - `gguf_images`: every image `gguf-preparation` writes from its dense and MoE
   GGUF fixtures.
 - `draft_images`: every image `draft-preparation` writes from the DFlash2

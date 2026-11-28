@@ -43,6 +43,7 @@ tokenizer's.
 import json
 import re
 import sys
+import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -188,8 +189,9 @@ class ChatTemplate:
     # RENDERS, REJECTS, DROPS or MISPLACES.
     original: str
     # The generation prompt's text and tokens by the options that shape it
-    # (_generation_key), for each reasoning effort; absent where it is empty
-    # or the probes disagree.
+    # (_generation_key), for each reasoning effort; absent where the probes
+    # disagree, or where it is empty and the model does not open its own
+    # message.
     generation_prompts: dict
     # The same for other options, probed on first use.
     probe: Callable
@@ -220,14 +222,53 @@ class ChatTemplate:
         return found if found is not None else self.probe(key)
 
 
+# What /v1/models reports of reasoning where a request's effort decides
+# nothing: no efforts, so that a client offers none.
+NO_REASONING = {"thinks": None, "efforts": [], "default": None}
+
+
+def tokenizer_reasoning(directory, chat_format):
+    """What /v1/models reports of reasoning for a model no server has started
+    (Frontend.reasoning, under no server default): its tokenizer's default
+    template's (ChatTemplate.reasoning). The tokenizer is loaded from
+    directory as a start loads it, but for its vocabulary, which no template
+    reads and which takes the load's time (0.3 to 0.8 s of it, against
+    0.05): an empty tokenizer.json stands in for its own. The installer
+    records the report for the desktop app."""
+    if not chat_format.reasoning_switch:
+        return dict(NO_REASONING)
+    from tokenizers import Tokenizer, models
+    from transformers import AutoTokenizer
+
+    directory = Path(directory)
+    with tempfile.TemporaryDirectory(prefix="splash-template-") as scratch:
+        if (directory / "tokenizer.json").exists():
+            for file in directory.iterdir():
+                if file.name != "tokenizer.json":
+                    (Path(scratch) / file.name).symlink_to(file.resolve())
+            (Path(scratch) / "tokenizer.json").write_text(
+                Tokenizer(models.BPE()).to_str()
+            )
+            directory = Path(scratch)
+        tokenizer = AutoTokenizer.from_pretrained(
+            directory, local_files_only=True, trust_remote_code=False
+        )
+    templates = ChatTemplates(
+        tokenizer, opens_own_message=chat_format.opens_own_message
+    )
+    return dict(templates.select(None).reasoning)
+
+
 class ChatTemplates:
     """The tokenizer's templates, or a custom one in their place, probed and
     chosen once at startup."""
 
-    def __init__(self, tokenizer, *, override=None):
+    def __init__(self, tokenizer, *, override=None, opens_own_message=False):
         """override, a custom template's source (read_template_file), is the
         one template every request renders with, in place of all the
-        tokenizer defines."""
+        tokenizer defines. opens_own_message: the model opens its own
+        message (ChatFormat.opens_own_message), so its templates' generation
+        prompt is empty."""
         if override is not None:
             named = {None: override}
         else:
@@ -243,7 +284,7 @@ class ChatTemplates:
         prepared = {}
         for source in named.values():
             if source not in prepared:
-                prepared[source] = _prepare(render, encode, source)
+                prepared[source] = _prepare(render, encode, source, opens_own_message)
         self.templates = {name: prepared[source] for name, source in named.items()}
         if override is not None:
             _require_generation_prompt(render, self.templates[None])
@@ -347,7 +388,7 @@ def _require_generation_prompt(render, template):
     raise ChatTemplateError(f"the custom chat template serves no request: {reason}")
 
 
-def _prepare(render, encode, source):
+def _prepare(render, encode, source, opens_own_message):
     original = _original(render, source)
     later_system = UNSUPPORTED
     if original == RENDERS:
@@ -363,7 +404,9 @@ def _prepare(render, encode, source):
     def probe(key):
         def generation_prompt():
             options = {**json.loads(key), "add_generation_prompt": True}
-            found = _generation_prompt(render, encode, source, options) or ("", ())
+            found = _generation_prompt(
+                render, encode, source, options, opens_own_message
+            ) or ("", ())
             return found, _probed_bytes(key, found)
 
         return memoized(probed, lock, key, generation_prompt)
@@ -372,7 +415,7 @@ def _prepare(render, encode, source):
         source,
         later_system,
         original,
-        _generation_prompts(render, encode, source),
+        _generation_prompts(render, encode, source, opens_own_message),
         probe,
         *_reasoning(render, source),
         _thinking_end(render, source),
@@ -556,20 +599,23 @@ def _reasoning(render, source):
     }, names
 
 
-def _generation_prompts(render, encode, source):
+def _generation_prompts(render, encode, source, opens_own_message):
     """The generation prompt for each reasoning effort a request can pass."""
     prompts = {}
     for effort in (None, *REASONING_EFFORTS):
         options = _effort_options(effort)
-        if found := _generation_prompt(render, encode, source, options):
+        if found := _generation_prompt(
+            render, encode, source, options, opens_own_message
+        ):
             prompts[_generation_key(options)] = found
     return prompts
 
 
-def _generation_prompt(render, encode, source, options):
+def _generation_prompt(render, encode, source, options, opens_own_message):
     """What add_generation_prompt appends under these options, with its
     tokens: kept where every probe conversation renders as a prefix of its
-    prompt and gains the same non-empty text."""
+    prompt and gains the same text, non-empty unless the model opens its own
+    message."""
     texts = set()
     for messages in _FOLLOWED.values():
         prompt = _outcome(render, source, messages, options)
@@ -583,7 +629,7 @@ def _generation_prompt(render, encode, source, options):
         ):
             return None
         texts.add(prompt[len(history) :])
-    if len(texts) == 1 and (text := texts.pop()):
+    if len(texts) == 1 and ((text := texts.pop()) or opens_own_message):
         return text, tuple(encode(text))
     return None
 

@@ -150,8 +150,10 @@ class SmokeRealTests(unittest.TestCase):
                         ple_memory=None,
                         expert_memory=None,
                         verify_rows=None,
+                        max_concurrent_requests=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
+                        cached_states="exact" if absolute else None,
                     )
                     with (
                         mock.patch.object(
@@ -166,6 +168,12 @@ class SmokeRealTests(unittest.TestCase):
                             self.assertEqual(
                                 command[command.index("--kv-format") + 1],
                                 arguments.kv_format,
+                            )
+                            self.assertEqual(
+                                command[command.index("--cached-states") + 1]
+                                if "--cached-states" in command
+                                else None,
+                                arguments.cached_states,
                             )
                             self.assertEqual(
                                 popen.call_args.kwargs["cwd"], smoke_real.ROOT
@@ -193,8 +201,10 @@ class SmokeRealTests(unittest.TestCase):
             ple_memory=None,
             expert_memory=None,
             verify_rows=None,
+            max_concurrent_requests=None,
             max_image_pixels=None,
             kv_format="int8",
+            cached_states=None,
         )
 
     @contextlib.contextmanager
@@ -304,6 +314,30 @@ class SmokeRealTests(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_lanes_reach_the_server(self):
+        model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
+        self.assertIsNone(smoke_real.parse_args(model).max_concurrent_requests)
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--max-concurrent-requests", command)
+        arguments = self.server_arguments()
+        arguments.max_concurrent_requests = smoke_real.parse_args(
+            [*model, "--max-concurrent-requests", "3"]
+        ).max_concurrent_requests
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(
+                    command[command.index("--max-concurrent-requests") + 1], "3"
+                )
+            finally:
+                server.close()
+
     def test_persistent_cache_scenario_needs_the_ssd_cache(self):
         model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -369,7 +403,7 @@ class SmokeRealTests(unittest.TestCase):
                 with self.assertRaisesRegex(smoke_real.SmokeFailure, "lock"):
                     smoke_real.require_closed_cache(Path(temporary))
 
-    def run_persistent_cache(self, changes=(), switch=True):
+    def run_persistent_cache(self, changes=(), switch=True, source="disk"):
         """Runs the scenario against scripted servers of a model whose
         reasoning a request's effort switches or not, each change (read,
         section, key, value) setting a key of one status read. Returns the
@@ -400,7 +434,15 @@ class SmokeRealTests(unittest.TestCase):
                 "choices": [{"message": {"content": "Done"}}],
                 "usage": {"prompt_tokens": 5980},
             },
-            {"choices": [{"message": {"content": "Again"}}]},
+            {
+                "choices": [{"message": {"content": "Again"}}],
+                "usage": {
+                    "prompt_tokens_details": {
+                        "state_source": source,
+                        "lost_state": False,
+                    }
+                },
+            },
         ]
         turns, starts = [], []
         server = mock.Mock(port=8000)
@@ -474,6 +516,13 @@ class SmokeRealTests(unittest.TestCase):
         }.items():
             with self.subTest(name=name), self.assertRaises(smoke_real.SmokeFailure):
                 self.run_persistent_cache([change])
+        # Usage that does not say the state came from the SSD cache.
+        for source in ("memory", None):
+            with (
+                self.subTest(source=source),
+                self.assertRaises(smoke_real.SmokeFailure),
+            ):
+                self.run_persistent_cache(source=source)
 
     @staticmethod
     def timeout_status(**changes):
@@ -486,6 +535,7 @@ class SmokeRealTests(unittest.TestCase):
                 "submitted": 7,
                 "completed": 5,
                 "cancelled": 1,
+                "timed_out": 1,
                 "failed": 1,
             },
         }
@@ -496,38 +546,37 @@ class SmokeRealTests(unittest.TestCase):
                 status[key] = value
         return status
 
-    def test_scoring_timeout_accepts_either_terminal_path_after_cleanup(self):
-        for outcome in ("cancelled", "failed"):
-            with self.subTest(outcome=outcome):
-                before = self.timeout_status()
-                active = self.timeout_status(
-                    requests={"submitted": 8}, transport={"pending": 1}
-                )
-                finishing = self.timeout_status(
-                    requests={"submitted": 8, outcome: 2}, transport={"pending": 1}
-                )
-                idle = self.timeout_status(requests={"submitted": 8, outcome: 2})
-                with (
-                    mock.patch.object(
-                        smoke_real,
-                        "request",
-                        side_effect=[
-                            (200, status) for status in (active, finishing, idle)
-                        ],
-                    ) as request,
-                    mock.patch.object(smoke_real.time, "sleep") as sleep,
-                ):
-                    smoke_real.wait_for_timeout_cleanup(8000, before)
-                self.assertEqual(request.call_count, 3)
-                self.assertEqual(sleep.call_count, 2)
+    def test_scoring_timeout_ends_timed_out_after_cleanup(self):
+        # The engine counts a request its deadline ended, by its own deadline
+        # or the frontend's cancel at it, in timed_out alone.
+        before = self.timeout_status()
+        active = self.timeout_status(
+            requests={"submitted": 8}, transport={"pending": 1}
+        )
+        finishing = self.timeout_status(
+            requests={"submitted": 8, "timed_out": 2}, transport={"pending": 1}
+        )
+        idle = self.timeout_status(requests={"submitted": 8, "timed_out": 2})
+        with (
+            mock.patch.object(
+                smoke_real,
+                "request",
+                side_effect=[(200, status) for status in (active, finishing, idle)],
+            ) as request,
+            mock.patch.object(smoke_real.time, "sleep") as sleep,
+        ):
+            smoke_real.wait_for_timeout_cleanup(8000, before)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_scoring_timeout_rejects_invalid_outcomes_and_unhealthy_runtime(self):
         cases = {
             "not_admitted": {"requests": {"submitted": 7}},
             "extra_request": {"requests": {"submitted": 9}},
             "completed": {"requests": {"completed": 6}},
-            "double_terminal": {"requests": {"failed": 2}},
-            "double_cancel": {"requests": {"cancelled": 3}},
+            "failed": {"requests": {"failed": 2}},
+            "cancelled": {"requests": {"cancelled": 2}},
+            "double_timeout": {"requests": {"timed_out": 3}},
             "new_instance": {"instance": "replacement"},
             "native_restart": {"transport": {"restarts": 1}},
             "not_ready": {"ready": False},
@@ -535,7 +584,7 @@ class SmokeRealTests(unittest.TestCase):
         }
         for name, changes in cases.items():
             with self.subTest(name=name):
-                after = self.timeout_status(requests={"submitted": 8, "cancelled": 2})
+                after = self.timeout_status(requests={"submitted": 8, "timed_out": 2})
                 for key, value in changes.items():
                     if isinstance(value, dict):
                         after[key].update(value)
@@ -548,10 +597,10 @@ class SmokeRealTests(unittest.TestCase):
                     smoke_real.wait_for_timeout_cleanup(8000, self.timeout_status())
 
     def test_scoring_timeout_cleanup_has_a_deadline(self):
-        for cancelled, pending in ((1, 0), (1, 1), (2, 1)):
-            with self.subTest(terminal=cancelled == 2, pending=pending):
+        for timed_out, pending in ((1, 0), (1, 1), (2, 1)):
+            with self.subTest(terminal=timed_out == 2, pending=pending):
                 stuck = self.timeout_status(
-                    requests={"submitted": 8, "cancelled": cancelled},
+                    requests={"submitted": 8, "timed_out": timed_out},
                     transport={"pending": pending},
                 )
                 with (
@@ -573,10 +622,12 @@ class SmokeRealTests(unittest.TestCase):
             "content": [{"type": "output_text", "text": text}],
         }
 
-    def run_images(self, output, reused=None):
+    def run_images(self, output, reused=None, switch=True):
         """run_images over canned answers: the red image encoded once, its
         repeat a prefix hit and, behind another system prompt, its cached rows
-        reused, or the image telemetry `reused` after that request."""
+        reused, or the image telemetry `reused` after that request. Returns
+        each request's output limit, for a model whose effort switches its
+        reasoning off or not (`switch`)."""
         red = {"choices": [{"message": {"content": "red"}}]}
         repeat = {
             **red,
@@ -602,13 +653,30 @@ class SmokeRealTests(unittest.TestCase):
         with (
             mock.patch.object(
                 smoke_real, "request", side_effect=[(200, item) for item in documents]
-            ),
+            ) as request,
             mock.patch.object(
                 smoke_real, "image_data_url", return_value="data:image/png;base64,AA=="
             ),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            smoke_real.run_images(8000, "test-model", "test-request")
+            smoke_real.run_images(8000, "test-model", "test-request", switch)
+        limits = ("max_completion_tokens", "max_tokens", "max_output_tokens")
+        return [
+            body[key]
+            for call in request.call_args_list
+            for body in call.args[3:]
+            for key in limits
+            if key in body
+        ]
+
+    def test_image_requests_leave_room_for_reasoning_the_model_does_anyway(self):
+        for switch in (True, False):
+            with self.subTest(switch=switch):
+                limits = self.run_images(
+                    [self.assistant_message("Blue.")], switch=switch
+                )
+                room = 0 if switch else smoke_real.REASONING_ROOM
+                self.assertEqual(limits, [32 + room] * 5 + [1024 + room])
 
     def test_image_rows_the_cache_let_go_are_encoded_again(self):
         self.run_images(

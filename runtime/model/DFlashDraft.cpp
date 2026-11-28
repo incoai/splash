@@ -131,13 +131,17 @@ DFlashContextWindow::~DFlashContextWindow() {
 DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators,
-                         const ops::Projection &head, ops::DraftVocabulary subset)
+                         const ops::Projection &head, ops::DraftVocabulary subset,
+                         ops::LogitFinishValues finish, ops::StopTokens stopTokens)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize), head_(head), subset_(subset),
+      selector_(finish.tokens, stopTokens), head_(head), subset_(subset), finish_(finish),
       subsetHead_(subsetRows(backend, head, subset)),
       contextKvProjections_(contextKvRows(backend, weights)) {
   if (head.outputSize != weights.layout.vocabularySize)
     throw std::invalid_argument("a draft's head is its vocabulary's");
+  if (!finish.tokens || finish.tokens > head.outputSize || !(finish.softcap >= 0.0F) ||
+      (finish.tokens != head.outputSize && subset != ops::DraftVocabulary{}))
+    throw std::invalid_argument("a draft's head finish holds its tokens, a padded head's over its whole vocabulary");
 }
 
 ops::DraftVocabulary DFlashDraft::vocabulary(ops::DraftVocabulary subset,
@@ -174,7 +178,8 @@ const ops::Projection &DFlashDraft::head(ops::DraftVocabulary vocabulary) const 
 void DFlashDraft::addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
                                const DFlashDraftStep &step) const {
   selector_.add(graph, buffers, {weights_.predecessorCodebook, weights_.successorCodebook}, step.vocabulary,
-                step.lanes);
+                head(step.vocabulary).outputSize, step.lanes,
+                operators_.draftSelectorShards(static_cast<uint32_t>(step.lanes.size())), finish_.softcap);
 }
 
 void DFlashDraft::addContextPrefill(
@@ -249,26 +254,6 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
           span.startPosition, layout.attentionShape());
     }
   }
-}
-
-uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
-  const ops::Linear &linear = operators_.draftLinear();
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
-  uint32_t storageRows = rows;
-  const auto include = [&](const ops::Projection &p) {
-    storageRows = std::max(storageRows, linear.storageRows(rows, p.shape()));
-  };
-  for (const DFlashDraftLayerWeights &layer : weights_.layers)
-    for (const ops::Projection *p : {&layer.attentionDynamic, &layer.qkvProjection, &layer.outputProjection,
-                                     &layer.mlpDynamic, &layer.gateProjection, &layer.upProjection,
-                                     &layer.downProjection})
-      include(*p);
-  include(weights_.contextProjection);
-  include(weights_.selectorProjection);
-  for (const ops::Projection &p : contextKvProjections_) include(p);
-  // Its view of the head's rows, on the target's plans as the head (addDecode).
-  storageRows = std::max(storageRows, operators_.linear().storageRows(rows, subsetHead_.shape()));
-  return storageRows / ExecutionLimits::draftQueryRows;
 }
 
 void DFlashDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
@@ -355,10 +340,11 @@ void DFlashDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buff
 
   // The final norm feeds the shared vocabulary head and then the selector;
   // the selector reuses whatever table the head leaves when the layouts match.
-  // The head is the target's weights, so it runs on the target's plans, as
-  // its scratch is sized (DecodeArena::linearScratchSize): only the draft's
-  // own projections keep bf16 activations.
-  const ops::Linear &target = operators_.linear();
+  // The head is the target's weights, so it runs on the target's plans of a
+  // decode step, as its storage and scratch are sized (draftStepLanes,
+  // DecodeArena::linearScratchSize): only the draft's own projections keep
+  // bf16 activations.
+  const ops::Linear &target = operators_.decodeLinear();
   const ops::Projection &vocabularyProjection = head(step.vocabulary);
   const ops::LinearPlan headPlan = target.plan(vocabularyProjection, rows);
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
@@ -367,6 +353,11 @@ void DFlashDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buff
   const ops::PreparedInput afterHead = target.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
+  // The logits are left as the head writes them: the selector reads only its
+  // tokens' columns of a padded head's rows (the constructor holds such a
+  // head to its whole vocabulary: a view of the head holds whole tiles of its
+  // rows, QUANT_TILE_ROWS, which need not end at its tokens), and the softcap
+  // waits for the selector's edges (addSelection).
   linear.add(graph,
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},
@@ -390,9 +381,10 @@ void DFlashDraft::addContextCommit(
   }
   ops::requireStepRows(step);
   const DFlashDraftLayout &layout = weights_.layout;
-  // The context projections run over the step's rows.
+  // The context projections run over the step's rows, on the draft's plans
+  // of a decode step.
   const uint32_t rows = step.rows;
-  const ops::Linear &linear = operators_.draftLinear();
+  const ops::Linear &linear = operators_.draftDecodeLinear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
              weights_.contextProjection, linear.plan(weights_.contextProjection, rows));

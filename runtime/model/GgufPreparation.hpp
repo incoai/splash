@@ -5,6 +5,7 @@
 #include "model/WeightImages.hpp"
 #include "model/WeightSource.hpp"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -14,8 +15,35 @@
 namespace splash::model {
 
 // The Metal staging of the rows of one repack step, whatever the tensor,
-// layer or expert count.
+// layer or expert count. An image's writer holds two (pipelineChunks).
 inline constexpr uint64_t kGgufRepackStagingBytes = 32 << 20;
+
+// Runs `count` chunks through two staging buffers: chunk i is staged into
+// buffer i % 2 while the GPU command of chunk i - 1 runs, then that command
+// is waited for and chunk i's submitted, so the reads and the GPU's writes
+// overlap and one command is in flight at a time, as the backend requires.
+// Buffer i % 2 is free when chunk i is staged: its last command, chunk
+// i - 2's, ended before chunk i - 1's was submitted. stage(i, buffer)
+// stages; submit(i, buffer) submits and returns the command's ticket, whose
+// wait() ends it. A stage that throws leaves the command in flight to its
+// ticket's destruction, which waits for it, so nothing writes the image
+// after the writer failed. (Waiting for each command before staging the
+// next kept the loading thread waiting on the GPU for 15% of a load; staged
+// this way it waits 1-2%, and the 27B MLX's cold load takes 4.5 s instead
+// of 5.2, the 27B and 35B UD-Q4_K_M GGUFs' 4.8 instead of 5.6 and 5.7
+// instead of 6.7, M5 Max 32-core. The rows are still read at 4.1-4.4 GB/s
+// against the SSD's 6.5-7, which this does not explain.)
+template <class Stage, class Submit>
+void pipelineChunks(size_t count, Stage &&stage, Submit &&submit) {
+  std::optional<decltype(submit(size_t{0}, 0U))> pending;
+  for (size_t chunk = 0; chunk < count; ++chunk) {
+    const unsigned buffer = chunk % 2;
+    stage(chunk, buffer);
+    if (pending) static_cast<void>(pending->wait());
+    pending.emplace(submit(chunk, buffer));
+  }
+  if (pending) static_cast<void>(pending->wait());
+}
 
 // Writes every byte of a planned image into its buffer: the header and
 // descriptors, the copied rows and the planes the GPU repacks into it, each
@@ -27,12 +55,30 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
 // writeGgufImage writes it, then `checkUnchanged` finds the sources it was
 // planned from unwritten since. The image holds both, to write it again on a
 // restore. Its record declares the image's resident bytes
-// (gguf::Image::residentBytes).
+// (gguf::Image::residentBytes) and its formats (gguf::imageFormats).
 [[nodiscard]] WeightFile loadImage(metal::MetalBackend &backend, WeightImages &images, std::string_view prefix,
                                    std::shared_ptr<const gguf::Image> plan, std::function<void()> checkUnchanged);
 // The record loadImage gives `plan`, for an image whose rows stream instead.
 [[nodiscard]] WeightFileRecord imageRecord(const WeightImages &images, std::string_view prefix,
                                            const gguf::Image &plan);
+
+// Whether every 32 values of a tensor of `values` BF16 or F16 values (ggml
+// type `type`) at data offset `offset` of `file`, a GGUF's or a checkpoint's,
+// are exactly an MXFP8 block's (gguf::mxfp8Block), read on a thread per core
+// the first time a process asks: a start's gguf::PlanOptions::exactlyMxfp8.
+[[nodiscard]] bool exactlyMxfp8(const WeightSource &file, uint64_t offset, uint64_t values, uint32_t type);
+// Whether every one of `values` F32 values at data offset `offset` of `file`
+// is a BF16 value (exactBfloat16), read as exactlyMxfp8 reads: a start's
+// gguf::PlanOptions::exactlyBfloat16.
+[[nodiscard]] bool exactlyBfloat16(const WeightSource &file, uint64_t offset, uint64_t values);
+// `options` with the readers of the values a start's plan holds exactly in
+// fewer bytes (exactlyMxfp8, exactlyBfloat16), which its sizing and its load
+// plan with alike.
+[[nodiscard]] inline gguf::PlanOptions readingValues(gguf::PlanOptions options) {
+  options.exactlyMxfp8 = exactlyMxfp8;
+  options.exactlyBfloat16 = exactlyBfloat16;
+  return options;
+}
 
 // Rows [first, first + count) of a repack (its sources' rows in order), whole
 // and back to back into `to`, count * ggufRowBytes(format, columns) bytes:
@@ -50,5 +96,20 @@ struct FileRows final {
   uint64_t offset = 0;
 };
 [[nodiscard]] std::optional<FileRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count);
+
+// A plane of a repack's rows as its file stores them: where its row 0 is,
+// from the file's start, and its bytes a row; none (rowBytes 0) for a
+// format without that plane.
+struct PlaneRows final {
+  const WeightSource *file = nullptr;
+  uint64_t offset = 0;
+  uint64_t rowBytes = 0;
+};
+// The planes of a repack whose one source is an MLX affine, mxfp4 or mxfp8
+// tensor of all its rows in order, from which the GPU builds the native
+// blocks it repacks (moe_expert_load): an affine tensor's codes, scales and
+// biases, an mxfp4 or mxfp8 tensor's codes and scales. None for any other
+// repack, whose native rows readRepackRows builds.
+[[nodiscard]] std::optional<std::array<PlaneRows, 3>> storedPlanes(const gguf::Repack &repack);
 
 } // namespace splash::model

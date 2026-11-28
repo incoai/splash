@@ -11,7 +11,7 @@
 // CacheElement and ValuesTokenMajor: the layer's pages' (int8_t for q8_, and
 // token-major values for the selected blocks' readers); HeadDim, RotaryPairs
 // and Gated: full_qkv_storage_phase's. A sequence's page table is its binding
-// among the four (SPLASH_LANE_BINDING).
+// among the eight (SPLASH_LANE_BINDING).
 #define ATTENTION_QKV(Name, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, CacheElement, ValuesTokenMajor)     \
   kernel void Name(                                                                                          \
       device const bfloat *qkv [[buffer(0)]],                                                                \
@@ -23,9 +23,9 @@
       device const SplashKvPage *page_table0 [[buffer(6)]],                                                  \
       device const SplashKvPage *page_table1 [[buffer(7)]],                                                  \
       device const SplashKvPage *page_table2 [[buffer(8)]],                                                  \
-      device const SplashKvPage *page_table3 [[buffer(9)]],                                                  \
-      device const SplashLaneRows *layout [[buffer(10)]],                                                    \
-      constant SplashAttentionParams &params [[buffer(11)]],                                                 \
+      device const SplashKvPage *page_table3 [[buffer(9)]], device const SplashKvPage *page_table4 [[buffer(10)]], device const SplashKvPage *page_table5 [[buffer(11)]], device const SplashKvPage *page_table6 [[buffer(12)]], device const SplashKvPage *page_table7 [[buffer(13)]],                                                  \
+      device const SplashLaneRows *layout [[buffer(14)]],                                                    \
+      constant SplashAttentionParams &params [[buffer(15)]],                                                 \
       uint3 group [[threadgroup_position_in_grid]],                                                          \
       uint thread_index [[thread_index_in_threadgroup]],                                                     \
       uint lane [[thread_index_in_simdgroup]],                                                               \
@@ -35,7 +35,7 @@
     SPLASH_STORE_MAXIMA_##CacheElement(HeadDim)                                                              \
     full_qkv_storage_phase<QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, CacheElement, ValuesTokenMajor>(  \
         qkv, q_norm, k_norm, rope_cos, rope_sin, queries,                                                    \
-        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3), layout, params,     \
+        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7), layout, params,     \
         reductions, normalized, maxima, group, thread_index, lane, simd_group);                              \
   }
 
@@ -49,9 +49,9 @@
       device const SplashKvPage *page_table0 [[buffer(4)]],                                                  \
       device const SplashKvPage *page_table1 [[buffer(5)]],                                                  \
       device const SplashKvPage *page_table2 [[buffer(6)]],                                                  \
-      device const SplashKvPage *page_table3 [[buffer(7)]],                                                  \
-      device const SplashLaneRows *layout [[buffer(8)]],                                                     \
-      constant SplashAttentionParams &params [[buffer(9)]],                                                  \
+      device const SplashKvPage *page_table3 [[buffer(7)]], device const SplashKvPage *page_table4 [[buffer(8)]], device const SplashKvPage *page_table5 [[buffer(9)]], device const SplashKvPage *page_table6 [[buffer(10)]], device const SplashKvPage *page_table7 [[buffer(11)]],                                                  \
+      device const SplashLaneRows *layout [[buffer(12)]],                                                     \
+      constant SplashAttentionParams &params [[buffer(13)]],                                                  \
       uint3 group [[threadgroup_position_in_grid]],                                                          \
       uint thread_index [[thread_index_in_threadgroup]],                                                     \
       uint lane [[thread_index_in_simdgroup]],                                                               \
@@ -61,13 +61,14 @@
     SPLASH_STORE_MAXIMA_##CacheElement(HeadDim)                                                              \
     full_qkv_storage_phase<QHeads, KHeads, HeadDim, 0, Gated, W, CacheElement, ValuesTokenMajor>(            \
         qkv, q_norm, k_norm, nullptr, nullptr, queries,                                                      \
-        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3), layout, params,     \
+        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7), layout, params,     \
         reductions, normalized, maxima, group, thread_index, lane, simd_group);                              \
   }
 // Each geometry's instances for its pages' formats and the norm types its
-// families store: bf16 (an MLX target's) and F32, or F32 alone for
+// families load: bf16 (an MLX target's) and F32, or F32 alone for
 // Qwen3.8-Flash-Next's (_kv2_g12, whose pages hold token-major values) and
-// Flint's (_kv4_g8_d128), which load from GGUFs only.
+// Flint's (_kv4_g8_d128), whose MLX images widen their norms to the F32 their
+// GGUFs hold (model/SafetensorsImage.hpp float32Norms).
 #define ATTENTION_QKV_FORMATS(Suffix, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, ValuesTokenMajor)         \
   ATTENTION_QKV(attention_q8_qkv##Suffix, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, int8_t,               \
                 ValuesTokenMajor)                                                                            \

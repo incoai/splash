@@ -85,10 +85,6 @@ PARSES = {
         "</parameter>\n</function>\n</tool_call>",
         [("roll_cut", {"item": "s1"})],
     ),
-    "a tool not offered": (
-        call("search", ("limit", "5"), ("query", "a b")),
-        [("search", {"limit": "5", "query": "a b"})],
-    ),
     "a parameter the tool does not declare": (
         call("roll_cut", ("item", "s1"), ("count", "2")),
         [("roll_cut", {"item": "s1", "count": "2"})],
@@ -247,6 +243,10 @@ class ToolCallReadingTests(unittest.TestCase):
         # A </think> in text is dropped.
         content, calls = self.read("Sure.</think> Here" + call("roll_cut"))
         self.assertEqual((content, calls), ("Sure. Here", [("roll_cut", {})]))
+        # A call of a tool the request does not declare is the text the
+        # model wrote.
+        text = call("search", ("limit", "5"), ("query", "a b"))
+        self.assertEqual(self.read(text), (text, []))
 
     def test_values_convert_by_their_declared_types(self):
         for schema, text, value in CONVERSIONS:
@@ -553,10 +553,9 @@ class ToolCallReadingTests(unittest.TestCase):
         ):
             with self.subTest(closed=closed):
                 self.assertEqual(self.read(closed + "\nDone.")[0].strip(), "Done.")
-        # A call the token limit cuts keeps the arguments it streamed. A value
-        # that is its text streams as it is written: one typed a string, and
-        # one its schema gives no type, as a parameter a tool does not
-        # declare, closed or not.
+        # A call the token limit cuts is no call, and has streamed nothing,
+        # whatever its values: one typed a string, and one its schema gives
+        # no type, as a parameter a tool does not declare, closed or not.
         for function, name in (
             ("roll_cut", "cut_at"),
             ("roll_cut", "count"),
@@ -567,16 +566,11 @@ class ToolCallReadingTests(unittest.TestCase):
                     f"<tool_call>\n<function={function}>\n<parameter=item>\ns1\n"
                     f"</parameter>\n<parameter={name}>\n12:"
                 )
-                _, calls, events = project(cut, tool_policy(SCHEMAS), incomplete=True)
-                arguments = f'{{"item":"s1","{name}":"12:'
-                self.assertEqual(
-                    [
-                        (c["function"]["name"], c["function"]["arguments"])
-                        for c in calls
-                    ],
-                    [(function, arguments)],
+                content, calls, events = project(
+                    cut, tool_policy(SCHEMAS), incomplete=True
                 )
-                self.assertEqual(streamed_arguments(events), arguments)
+                self.assertEqual((content, calls), ("", []))
+                self.assertEqual(streamed_arguments(events), "")
         # Types are read through local references, a parameter's own and the
         # one a model such as pydantic's recursive one puts at the top.
         point = {
@@ -613,6 +607,100 @@ class ToolCallReadingTests(unittest.TestCase):
                     self.read(call("f", *arguments), {"f": schema})[1],
                     [("f", expected)],
                 )
+
+    def test_every_call_one_piece_of_output_holds_is_read(self):
+        # A speculative step can bring several whole calls at once.
+        text = "\n".join(
+            call("roll_cut", ("item", f"s{index}"), ("shift", str(index)))
+            for index in range(4)
+        )
+        self.assertEqual(
+            self.read(text)[1],
+            [("roll_cut", {"item": f"s{index}", "shift": index}) for index in range(4)],
+        )
+
+    def test_text_before_between_and_after_calls_is_kept(self):
+        first, second = call("note", ("text", "a")), call("note", ("text", "b"))
+        for text, content in (
+            ("Let me check. " + first, "Let me check. "),
+            ("before" + first + "between" + second + "after", "beforebetweenafter"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text)[0], content)
+
+    def test_a_call_tag_in_prose_keeps_the_text_after_it(self):
+        text = "The literal marker is <tool_call> and it starts a tool call. END"
+        self.assertEqual(self.read(text), (text, []))
+
+    def test_a_call_in_another_layout_stays_text(self):
+        # A JSON body inside the call tags, or a function without them, is
+        # not this format's call: its text reaches the client whole.
+        for text in (
+            '<tool_call>\n{"name": "note", "arguments": {"text": "a"}}\n</tool_call>',
+            "<function=note>\n<parameter=text>\na\n</parameter>\n</function>",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text), (text, []))
+
+    def test_closing_tags_repeated_after_a_call_leave_its_arguments(self):
+        self.assertEqual(
+            self.read(call("note", ("text", "p9")) + "</function></tool_call>"),
+            ("</function></tool_call>", [("note", {"text": "p9"})]),
+        )
+
+    def test_a_repeated_parameter_keeps_its_first_value(self):
+        self.assertEqual(
+            self.read(call("note", ("text", "first"), ("text", "second")))[1],
+            [("note", {"text": "first"})],
+        )
+
+    def test_values_that_spell_no_json_of_their_type_stay_text(self):
+        # Every call's arguments stay valid JSON, and a value that is not
+        # one drops no other call.
+        schema = {
+            "type": "object",
+            "properties": {
+                "values": {"type": "array", "items": {"type": "number"}},
+                "ids": {"type": "array"},
+                "label": {"type": "string"},
+                "flag": {"type": "boolean"},
+                "place": {"anyOf": [{"type": "string"}, {"type": "object"}]},
+            },
+        }
+        for argument, expected in (
+            (("values", "[1.5, NaN, 3.0]"), "[1.5, NaN, 3.0]"),
+            (("ids", "{1, 2, 3}"), "{1, 2, 3}"),
+            (("label", "null"), "null"),
+            (("flag", "yes"), "yes"),
+            (("flag", "True"), True),
+            (("place", '{"city": "Paris"}'), {"city": "Paris"}),
+            (("place", "Paris"), "Paris"),
+        ):
+            with self.subTest(argument=argument):
+                self.assertEqual(
+                    self.read(call("f", argument), {"f": schema})[1],
+                    [("f", {argument[0]: expected})],
+                )
+        self.assertEqual(
+            len(
+                self.read(
+                    call("f", ("ids", "{1, 2, 3}")) + call("f", ("label", "next")),
+                    {"f": schema},
+                )[1]
+            ),
+            2,
+        )
+
+    def test_a_call_the_token_limit_cuts_is_no_call(self):
+        # No client can run a cut command as if it were whole: the call is
+        # dropped, and the text before it stays.
+        content, calls, events = project(
+            "Deleting.\n<tool_call>\n<function=note>\n<parameter=text>\nrm -rf /",
+            tool_policy(SCHEMAS),
+            incomplete=True,
+        )
+        self.assertEqual((content, calls), ("Deleting.\n", []))
+        self.assertNotIn("tool", [kind for kind, _ in events])
 
 
 if __name__ == "__main__":

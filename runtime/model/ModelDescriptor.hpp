@@ -2,6 +2,7 @@
 
 #include "DFlashDraft.hpp"
 #include "Flint.hpp"
+#include "Inkling2Loop.hpp"
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -20,14 +21,17 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout, Inkling2LoopLayout>;
 
 // The families Splash serves, values of the layout types TargetLayout holds,
 // one type for each architecture's code. A family of an architecture is one
 // more value here. Refusals name them in this order, and a config's model type
 // finds its family among those of its type in it (describeSourceModel).
 inline constexpr std::tuple kFamilies{Qwen3_8Layout{}, Qwen3_6MoeLayout{}, kQwen3_5_122BLayout, Qwen4ExpLayout{},
-                                      FlintLayout{}};
+                                      FlintLayout{}, Inkling2LoopLayout{}};
+static_assert(std::apply([](const auto &...family) { return ((family.attentionNormMean > 0.0F) && ...); },
+                         kFamilies),
+              "every family states its attentionNormMean, by which its safetensors checkpoints' norm storage is told");
 
 // Calls `use` with each family's layout, in kFamilies' order.
 template <class Use> constexpr void forEachFamily(Use use) {
@@ -72,6 +76,11 @@ struct ModelDescriptor final {
   [[nodiscard]] std::string_view family() const noexcept {
     return std::visit([](const auto &layout) { return layout.family; }, target);
   }
+  // The activations its plans take where a start gives no --activations: its family's default
+  // (QwenTargetDimensions::activations).
+  [[nodiscard]] ops::Int8Activations activations() const noexcept {
+    return std::visit([](const auto &layout) { return layout.activations; }, target);
+  }
   [[nodiscard]] bool valid() const noexcept;
 };
 
@@ -110,6 +119,8 @@ struct FamilyFacts final {
   bool denseFfn = false;
   uint32_t contextTokens = 0;
   uint32_t maximumContextTokens = 0;
+  // Its default --activations (QwenTargetDimensions::activations), as the option spells it.
+  std::string_view activations = "auto";
 };
 
 // Each family's facts, in kFamilies' order.
@@ -124,11 +135,28 @@ struct FamilyFacts final {
 // under the part's name), from which it plans the target as every start
 // plans the GGUF (gguf::planImages); and draft, once chosen, the DFlash2
 // draft's config.json. The installer runs it before any weight download
-// (the engine's model-check command).
+// (the engine's model-check command). targetHeaders is the directory of the
+// target's files or their headers: a GGUF's, which it needs, or a
+// checkpoint's shards, which the installer gives it once it has them. With them it sets
+// *quantizableWeights to whether --weights auto loads any of the target's
+// tensors in another format than --weights original does (gguf::imageFormats
+// of its two plans), which the app offers the option by; it leaves it unset
+// for a checkpoint without them, or one whose headers do not plan.
 [[nodiscard]] std::string_view
 inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                            const std::filesystem::path &config,
-                           const std::optional<std::filesystem::path> &ggufHeaders,
-                           const std::optional<std::filesystem::path> &draft);
+                           const std::optional<std::filesystem::path> &targetHeaders,
+                           const std::optional<std::filesystem::path> &draft,
+                           std::optional<bool> *quantizableWeights = nullptr);
+
+// Prepares once the image of the vision tower that an upstream model's
+// configuration describes (inspectSourceConfiguration's arguments but the
+// headers and draft): written from its source in root's vision/ as every
+// start writes it, then freed. A tower whose files preparation refuses, one
+// quantized or of a weight not exactly a BF16, is so refused at installation,
+// which runs it once the tower downloaded (the engine's vision-check
+// command), instead of at every start.
+void checkVisionSource(std::string_view targetFormat, std::string_view visionFormat,
+                       const std::filesystem::path &config, const std::filesystem::path &root);
 
 } // namespace splash::model

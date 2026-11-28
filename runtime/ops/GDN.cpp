@@ -16,7 +16,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 namespace splash::ops {
 namespace {
@@ -38,8 +37,9 @@ static_assert(SPLASH_TARGET_VERIFY_ROWS == 16 && SPLASH_GDN_NARROW_ROWS < SPLASH
 // of either gate, and their kernels' name suffix. The scan reads no packed
 // rows, so shapes of one head layout share its kernel (scanSuffix). The
 // kernels that read the norm take the norm types the shape's families store
-// (normKernel): F32 and bf16, or F32 alone for Qwen3.8-Flash-Next's, which
-// loads from GGUFs only.
+// (normKernel): F32 and bf16, or F32 alone for Qwen3.8-Flash-Next's, whose
+// norms load as F32 from its GGUFs and its MLX images
+// (model/SafetensorsImage.hpp float32Norms).
 struct CompiledGdn final {
   GdnShape shape;
   std::string_view suffix;
@@ -276,12 +276,14 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
         throw std::invalid_argument("invalid GDN decode tape");
     requireBytes(buffers.tape, std::max(params.pending_tape[lane], params.step_tape[lane]) + tapeBytes, "GDN tape");
   }
-  std::vector<metal::MetalBuffer> bindings{buffers.packed,
-                                           buffers.convolutionWeights};
+  // The widest production dispatch: two inputs, two states per lane, seven
+  // tensors and two scratch buffers.
+  static_assert(2 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH + 7 + 2 <= metal::kInlineBufferBindings,
+                "GDN decode bindings outgrow the inline binding capacity");
+  metal::BufferList bindings{buffers.packed, buffers.convolutionWeights};
   const bool prepare = input != LinearInput::Plain;
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension, rows);
-  bindings.reserve(prepare ? 19 : 17);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(), {buffers.tape, buffers.decayWeights, buffers.timeBias, buffers.mixerNorm.buffer,

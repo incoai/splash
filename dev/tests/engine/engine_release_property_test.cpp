@@ -140,7 +140,7 @@ struct Wall final {
   // The extent ids no form holds.
   [[nodiscard]] uint32_t freeIds() const {
     uint32_t held = 0;
-    for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Index, kv::PageForm::Slim})
+    for (const kv::PageForm form : kv::kAllPageForms)
       held += spill.pool.allocatedExtents(form);
     return spill.pool.pageCount() / spill.pool.extentPages() - held;
   }

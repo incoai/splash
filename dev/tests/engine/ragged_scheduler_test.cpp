@@ -35,16 +35,19 @@ using test::require;
 constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
 constexpr uint32_t kPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
 // The prefill commands in a row that may serve later arrivals of a request's
-// priority and not it before it is overdue (Scheduler.cpp).
-constexpr uint32_t kOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
+// priority and not it before it is overdue (Scheduler.cpp): a full batch's
+// other lanes, of a runtime of the default's lanes.
+constexpr uint32_t kOvertakes = model::ExecutionLimits::defaultLanes - 1;
 constexpr double kGap = 500.0;
 
 model::CommandLimits limits(uint32_t commandRows = kChunk, uint32_t passes = 1, uint32_t indexPageLanes = 1,
-                            uint64_t attentionPairs = std::numeric_limits<uint64_t>::max()) {
+                            uint64_t attentionPairs = std::numeric_limits<uint64_t>::max(),
+                            uint32_t lanes = model::ExecutionLimits::defaultLanes) {
   return {.commandRows = commandRows,
           .layers = passes,
           .maximumPasses = passes,
           .lanesPastChunk = 1,
+          .lanes = lanes,
           .indexPageLanes = indexPageLanes,
           .attentionPairs = attentionPairs};
 }
@@ -184,7 +187,8 @@ public:
 // A dense 27B target of one chunk a command.
 class DenseSim final : public Sim {
 public:
-  explicit DenseSim(double decodeShare = 0.0) : Sim(test::kDense27B, limits(), decodeShare) {}
+  explicit DenseSim(double decodeShare = 0.0, uint32_t lanes = model::ExecutionLimits::defaultLanes)
+      : Sim(test::kDense27B, limits(kChunk, 1, 1, std::numeric_limits<uint64_t>::max(), lanes), decodeShare) {}
 };
 
 uint32_t rowsOf(const BatchPlan &plan) {
@@ -300,16 +304,22 @@ void testRejectedCommitCountsNothing() {
   require(sim.scheduler.snapshot().decodeBatches == 1, "the remaining request's decode was not counted");
 }
 
+// A decode takes the runtime's lanes, two, the default's four or eight, and
+// the next takes the requests the last left out first.
 void testDecodeLanesRotate() {
-  DenseSim sim;
-  for (uint64_t id = 1; id <= 6; ++id)
-    sim.decoder(id);
-  const BatchPlan first = sim.plan();
-  require(first.kind == WorkKind::Decode && first.width() == 4, "the first decode did not use the real B4 graph");
-  sim.run(first);
-  const BatchPlan second = sim.plan();
-  require(second.width() == 4 && second.items[0].requestId == 5 && second.items[1].requestId == 6,
-          "decode did not prioritize lanes omitted by the previous batch");
+  for (const uint32_t lanes : {2U, model::ExecutionLimits::defaultLanes, model::ExecutionLimits::maximumBatchWidth}) {
+    DenseSim sim(0.0, lanes);
+    for (uint64_t id = 1; id <= lanes + 2; ++id)
+      sim.decoder(id);
+    const BatchPlan first = sim.plan();
+    require(first.kind == WorkKind::Decode && first.width() == lanes,
+            "the first decode did not take the runtime's " + std::to_string(lanes) + " lanes");
+    sim.run(first);
+    const BatchPlan second = sim.plan();
+    require(second.width() == lanes && second.items[0].requestId == lanes + 1 &&
+                second.items[1].requestId == lanes + 2,
+            "decode did not prioritize lanes omitted by the previous batch");
+  }
 }
 
 void testMaskStagesNeverMix() {
@@ -1597,30 +1607,34 @@ void testAgingBoundsALongLaneUnderArrivals() {
 // that end later arrivals' short prompts, a few hundred rows each, the 30K
 // prompt, whose rows past its whole chunks do not fit beside them, is overdue
 // and starts, ahead of the next short arrival, and leads the next command;
-// served, it counts again, and the short arrival leads.
+// served, it counts again, and the short arrival leads. K is a full batch's
+// other lanes: one of two, three of the default's four, seven of eight.
 void testAWaitingPromptIsOverdueAfterKOvertakes() {
-  DenseSim sim;
-  sim.scheduler.submit(request(1, 14 * kChunk + 1900));
-  const std::array waiting{PrefillAdmission{1, 0}};
-  for (uint64_t id = 10; id < 10 + kOvertakes; ++id) {
-    sim.lane(id, 0, 300);
-    require(sim.scheduler.prefillAdmissionOrder(waiting, sim.in()).empty(),
-            "the waiting prompt started after " + std::to_string(id - 10) + " commands of later arrivals");
-    sim.step();
-    require(sim.scheduler.phase(id) == Phase::Decode, "a short arrival did not end its prompt in one command");
-    sim.scheduler.cancel(id);
-    sim.scheduler.remove(id);
+  for (const uint32_t lanes : {2U, model::ExecutionLimits::defaultLanes, model::ExecutionLimits::maximumBatchWidth}) {
+    const uint32_t overtakes = lanes - 1;
+    DenseSim sim(0.0, lanes);
+    sim.scheduler.submit(request(1, 14 * kChunk + 1900));
+    const std::array waiting{PrefillAdmission{1, 0}};
+    for (uint64_t id = 10; id < 10 + overtakes; ++id) {
+      sim.lane(id, 0, 300);
+      require(sim.scheduler.prefillAdmissionOrder(waiting, sim.in()).empty(),
+              "the waiting prompt started after " + std::to_string(id - 10) + " commands of later arrivals");
+      sim.step();
+      require(sim.scheduler.phase(id) == Phase::Decode, "a short arrival did not end its prompt in one command");
+      sim.scheduler.cancel(id);
+      sim.scheduler.remove(id);
+    }
+    sim.scheduler.submit(request(20, 300));
+    const std::array both{PrefillAdmission{1, 0}, PrefillAdmission{20, 0}};
+    require(sim.scheduler.prefillAdmissionOrder(both, sim.in()).front() == 1,
+            "the waiting prompt did not start ahead of a short arrival after K overtakes");
+    sim.scheduler.resourcesReady(1, 0);
+    sim.scheduler.resourcesReady(20, 0);
+    const BatchPlan first = sim.plan();
+    require(first.items == std::vector<BatchItem>{{1, kChunk, 0}}, "the overdue prompt did not lead the next command");
+    sim.run(first);
+    require(sim.plan().items[0].requestId == 20, "served, the prompt stayed overdue");
   }
-  sim.scheduler.submit(request(20, 300));
-  const std::array both{PrefillAdmission{1, 0}, PrefillAdmission{20, 0}};
-  require(sim.scheduler.prefillAdmissionOrder(both, sim.in()).front() == 1,
-          "the waiting prompt did not start ahead of a short arrival after K overtakes");
-  sim.scheduler.resourcesReady(1, 0);
-  sim.scheduler.resourcesReady(20, 0);
-  const BatchPlan first = sim.plan();
-  require(first.items == std::vector<BatchItem>{{1, kChunk, 0}}, "the overdue prompt did not lead the next command");
-  sim.run(first);
-  require(sim.plan().items[0].requestId == 20, "served, the prompt stayed overdue");
 }
 
 // Equal prompts are served oldest first, the oldest leading to its prompt's

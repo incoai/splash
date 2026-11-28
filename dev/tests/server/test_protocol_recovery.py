@@ -473,7 +473,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
                         json.loads(calls[0]["function"]["arguments"]), {"value": value}
                     )
 
-    def test_anthropic_overflow_has_actual_counts_for_text_and_image_precheck(self):
+    def test_overflow_has_actual_counts_in_both_apis_for_text_and_image_precheck(self):
         harness = self.harness(FakeRuntime(), max_context=2)
         status, _, raw = harness.request("POST", "/v1/messages", request_body())
         self.assertEqual(status, 400)
@@ -495,8 +495,10 @@ class ProtocolRecoveryTests(unittest.TestCase):
         self.assertEqual(caught.exception.input_tokens, 100)
         status, _, raw = harness.request("POST", "/v1/chat/completions", request_body())
         self.assertEqual(status, 400)
+        # The OpenAI shape names both counts too, as the Anthropic one does.
         self.assertEqual(
-            json.loads(raw)["error"]["message"], "prompt exceeds the context window"
+            json.loads(raw)["error"]["message"],
+            "prompt exceeds the context window: 2 tokens > 1 maximum input tokens",
         )
 
 

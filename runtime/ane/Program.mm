@@ -95,7 +95,12 @@ constexpr Signature kSignatures[] = {
     {"_ANESharedEvents", '+', "sharedEventsWithSignalEvents:waitEvents:", "@@:@@"},
 };
 
-constexpr unsigned kQos = QOS_CLASS_DEFAULT;
+// The QoS of every request to the service, which orders the ANE's queue:
+// user-initiated, the class of work a user waits for, goes ahead of the
+// default, utility and background clients' queued work (media analysis,
+// indexing), which a default request shares the ANE's fifth priority with
+// or waits behind. It does not cut short an inference already running.
+constexpr unsigned kQos = QOS_CLASS_USER_INITIATED;
 // How often a caller waiting for the service asks whether to stop.
 constexpr auto kWaitSlice = std::chrono::milliseconds(50);
 

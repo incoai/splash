@@ -7,6 +7,7 @@
 #include "ops/DraftSelector.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
+#include "ops/LogitFinish.hpp"
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
@@ -85,8 +86,10 @@ struct DFlashDraftLayout final {
   float rotaryTheta = 0.0F;
   uint32_t selectorRank = 0;
   uint32_t kvHeads = 0;
-  // The target layers whose output rows the draft reads, ascending: the
-  // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
+  // The target layer ids whose rows the draft reads, ascending, as its
+  // target's family names them (QwenTargetDimensions::draftReadsLayerInputs):
+  // the first targetLayerCount of targetLayers, targetHiddenSize() values a
+  // row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
 
@@ -257,12 +260,17 @@ struct DFlashDraftStep final {
 // target's sampling and acceptance policy remain outside the model. Its
 // logits are its target's vocabulary head's, `head`, over the whole
 // vocabulary or over `subset` (QwenTargetDimensions::draftVocabulary), a view
-// of the head's rows that reads that share of its weights.
+// of the head's rows that reads that share of its weights, with the head's
+// finish, `finish` (QwenTargetDimensions::logitFinish): no candidate of the
+// rows past its tokens, which a head padded past them drafts over its whole
+// vocabulary to leave out, and its softcap on each candidate's score after
+// the selector's edge, as DFlash2 trains a draft of a softcapped head. Its
+// trees end at its target's stop tokens, `stopTokens` (ops::DraftSelector).
 class DFlashDraft final {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
                const ops::ExecutionPlans &operators, const ops::Projection &head,
-               ops::DraftVocabulary subset);
+               ops::DraftVocabulary subset, ops::LogitFinishValues finish, ops::StopTokens stopTokens);
 
   // A lane's tokens that choose the vocabulary of its steps: the last of the
   // tokens it read and its anchor (vocabulary).
@@ -302,14 +310,6 @@ public:
                          std::span<const DFlashDraftRingLayer> ring,
                          uint32_t rows, uint32_t startPosition) const;
 
-  // Lanes of storage the draft's own projections, and its view of the head's
-  // rows of its subset, bind in a decode step of `lanes` lanes
-  // (ops::Linear::storageRows of a draft's block a lane; the whole head's are
-  // QwenTarget::headStorageLanes). A context commit of a step's rows, up to a
-  // verify block's a lane, binds as many lanes of its row tensors, which hold
-  // a verify block's rows a lane: at least the staged tile's rows of any step
-  // of `lanes` lanes (ops::stagedTileRows(T) <= 16 x lanes).
-  [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
   // A step's draft layers and its logits over its vocabulary, then its
   // proposals from them.
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers, const DFlashDraftStep &step) const;
@@ -346,6 +346,7 @@ private:
   ops::DraftSelector selector_;
   const ops::Projection &head_;
   ops::DraftVocabulary subset_;
+  ops::LogitFinishValues finish_;
   // The head's rows of the subset's tokens.
   ops::Projection subsetHead_;
   // Each layer's key and value rows of its QKV projection, views of its

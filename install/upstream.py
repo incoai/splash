@@ -15,12 +15,14 @@ new commit cannot be installed. local.py does the same from local files.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
 import tempfile
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import assembly, families, gguf, hub, models
@@ -36,8 +38,10 @@ TOKENIZER_FILES = (
     "special_tokens_map.json",
 )
 # The name prefixes of a safetensors checkpoint's vision tower tensors: MLX's,
-# and transformers' (as NVIDIA's Model Optimizer keeps them).
-VISION_TOWER = ("vision_tower.", "model.visual.")
+# transformers' (as NVIDIA's Model Optimizer keeps them, and Inkling 2's
+# release its own), and transformers' Inkling 2 (as its MLX conversions keep
+# them).
+VISION_TOWER = ("vision_tower.", "model.visual.", "model.vision_tower.")
 # Where an MLX repository keeps its image processor's configuration: a file of
 # its own, or the image_processor object of processor_config.json, where newer
 # Transformers releases save it.
@@ -75,6 +79,9 @@ class Target:
     # serves (the layout in assembly.py). A GGUF's configuration and tokenizer
     # are derived from it at installation instead.
     files: dict[str, str]
+    # Why a text target serves no images: the refusal of its tower, for a
+    # family that serves text instead (ModelFamily.text_fallback).
+    vision_note: str | None = None
 
 
 def root_ggufs(files):
@@ -288,17 +295,23 @@ def split_order(names, split):
     return [parts[number][1] for number in sorted(parts)]
 
 
-def select_vision(repo):
-    """The name and header of the GGUF repository's vision projector, chosen
-    by content among its root GGUF files named mmproj, whatever the publisher
-    calls them: a projector Splash loads (read_projector) of BF16, F32 or F16
-    weights, preferred in that order. Each header costs a few range
-    requests."""
-    usable, found = {"BF16": [], "F32": [], "F16": []}, []
+def select_vision(repo, family):
+    """The name and header of the GGUF repository's vision projector for
+    family's tower, chosen by content among its root GGUF files named
+    mmproj, whatever the publisher calls them: a projector Splash loads
+    (read_projector) of a weight type the family's tower takes, preferred in
+    its order (ModelFamily.projectors: BF16, F32, then F16 for Qwen's; Q8_0
+    last for Inkling's). Each header costs a few range requests."""
+    usable, found = {precision: [] for precision in family.projectors}, []
     for name in filter(projector_named, root_ggufs(repo.files)):
-        header, precision, kind = read_projector(repo, name)
+        try:
+            header, precision, kind = read_projector(repo, name)
+        except models.ModelError as error:
+            # A header Splash cannot read is no projector it loads.
+            found.append(f"{name} ({error})")
+            continue
         found.append(f"{name} ({kind})")
-        if precision:
+        if precision in usable:
             usable[precision].append((name, header))
     for precision, projectors in usable.items():
         if len(projectors) == 1:
@@ -310,20 +323,27 @@ def select_vision(repo):
                 + ", describe no single tower"
             )
     raise models.VisionError(
-        "the GGUF repository has no BF16, F32 or F16 vision projector ("
-        + ("; ".join(found) or "no GGUF named mmproj")
-        + ")"
+        f"the GGUF repository has no {either(family.projectors)} vision "
+        "projector (" + ("; ".join(found) or "no GGUF named mmproj") + ")"
     )
+
+
+def either(names):
+    """names as a choice of them: A, B or C."""
+    *others, last = names
+    return f"{', '.join(others)} or {last}" if others else last
 
 
 def read_projector(repo, name):
     """The header of the GGUF name in repo; the precision of a vision
-    projector Splash loads (a clip model of BF16, F32 or F16 weights), else
-    None; and how a refusal describes it, ARCHITECTURE: TYPES. The tower runs
-    in BF16 and preparation never rounds a weight: it converts F32 and F16
-    only where every value is exact, as in an F16 projector made from a BF16
-    tower, where F16 rounds the smallest BF16 weights onto its subnormal grid
-    and what that keeps is still a BF16."""
+    projector Splash loads (a clip model of BF16, F32 or F16 weights, or of
+    Q8_0 matrices beside them), else None; and how a refusal describes it,
+    ARCHITECTURE: TYPES. The tower runs in BF16 and preparation rounds no
+    float weight: it converts F32 and F16 only where every value is exact,
+    as in an F16 projector made from a BF16 tower, where F16 rounds the
+    smallest BF16 weights onto its subnormal grid and what that keeps is
+    still a BF16. Q8_0 projections it keeps in Q8_0, for the towers whose
+    family takes Q8_0 projectors (ModelFamily.projectors)."""
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
     architecture = header.values.get("general.architecture")
@@ -331,8 +351,8 @@ def read_projector(repo, name):
         gguf.TENSOR_TYPES.get(kind, f"type {kind}") for kind in header.tensors.values()
     }
     precision = None
-    if architecture == "clip" and types and types <= {"BF16", "F32", "F16"}:
-        precision = next(p for p in ("F16", "BF16", "F32") if p in types)
+    if architecture == "clip" and types and types <= {"BF16", "F32", "F16", "Q8_0"}:
+        precision = next(p for p in ("Q8_0", "F16", "BF16", "F32") if p in types)
     return header, precision, f"{architecture}: {', '.join(sorted(types))}"
 
 
@@ -363,17 +383,83 @@ def inspect_target(repo, variant, language_only, scratch):
     configuration and headers are written into scratch. The target's text
     configuration is checked first, then its vision tower and the tower's
     configuration, so a model Splash cannot serve is refused for that,
-    whatever its tower; a refusal of the tower alone names --language-only."""
-    try:
+    whatever its tower; a refusal of the tower alone names --language-only,
+    but for a family that serves text instead (with_text_fallback)."""
+
+    def inspect(text_only):
+        # Each inspection writes into a scratch directory of its own.
+        into = Path(tempfile.mkdtemp(dir=scratch))
         if variant is not None or not any(
             n.endswith(".safetensors") for n in repo.files
         ):
-            return _gguf_target(repo, variant, language_only, scratch)
-        return mlx_target(repo, language_only)
+            return _gguf_target(repo, variant, text_only, into)
+        return mlx_target(repo, text_only)
+
+    try:
+        return with_text_fallback(inspect, language_only)
     except models.VisionError as error:
         raise models.VisionError(
             f"{error}; use --language-only to serve text only"
         ) from None
+
+
+def with_text_fallback(inspect, language_only):
+    """inspect(language_only)'s target, but where its tower is refused, for a
+    family that serves text instead (ModelFamily.text_fallback), its text
+    target, the refusal its vision_note; another family's refusal stands."""
+    try:
+        return inspect(language_only)
+    except models.VisionError as error:
+        if language_only:
+            raise
+        refusal = error
+    # Its text configuration passed before its tower was refused.
+    with contextlib.redirect_stdout(io.StringIO()):
+        text = inspect(True)
+    if not text.family.text_fallback:
+        raise refusal
+    return replace(text, vision_note=str(refusal))
+
+
+def check_vision(target, paths, scratch):
+    """Refuse target's tower, as a VisionError, where the engine cannot
+    prepare it from its files as every start does (the engine's
+    vision-check): quantized, of names it does not bind, or of a weight not
+    exactly a BF16, which headers do not show. An engine that cannot run the
+    check gives a ModelError instead. paths maps the target's file names to
+    their local files, linked into scratch as an installation links them."""
+    root = Path(tempfile.mkdtemp(dir=scratch))
+    for path, name in target.files.items():
+        if path.startswith("vision/"):
+            (root / path).parent.mkdir(exist_ok=True)
+            (root / path).symlink_to(paths[name])
+    arguments = [target.format, target.vision_format, str(target.config), str(root)]
+    try:
+        models.run_engine(["vision-check", *arguments], "vision check")
+    except models.EngineRefusal as error:
+        # The engine names the link it read: the refusal, which a record
+        # keeps (vision_unavailable), names the target's file.
+        refusal = str(error)
+        for path, name in target.files.items():
+            refusal = refusal.replace(str(root / path), name)
+        raise models.VisionError(f"its vision tower: {refusal}") from None
+
+
+def prepared_tower(target, paths, scratch, text):
+    """target once the engine prepared its tower from paths (check_vision);
+    where it refuses, for a family that serves text instead
+    (ModelFamily.text_fallback), text(), its text target, the refusal its
+    vision_note; another family's refusal stands."""
+    if target.vision_format == "none":
+        return target
+    try:
+        check_vision(target, paths, scratch)
+    except models.VisionError as refusal:
+        if not target.family.text_fallback:
+            raise
+        with contextlib.redirect_stdout(io.StringIO()):
+            return replace(text(), vision_note=str(refusal))
+    return target
 
 
 def _gguf_target(repo, variant, language_only, scratch):
@@ -396,9 +482,9 @@ def gguf_target(repo, names, scratch, *, projector=None):
     """The GGUF target whose files in repo are names, one or a split GGUF's
     parts in split order, its configuration and headers written into
     scratch. projector, for a model that serves images, gives the name and
-    header of its vision projector in repo (select_vision): called once the
-    text configuration passed, for a family whose models have a vision
-    tower; the others serve text only."""
+    header of its vision projector in repo for the family's tower
+    (select_vision): called once the text configuration passed, for a family
+    whose models have a vision tower; the others serve text only."""
     # A split GGUF's parts lie side by side in target/, where the native
     # loader finds them by their -0000K-of-0000N names, and their headers in
     # scratch's target/, where the engine's model check finds them.
@@ -417,14 +503,18 @@ def gguf_target(repo, names, scratch, *, projector=None):
     family = check_model("gguf", "none", config, gguf_headers=target)
     vision_format = "none"
     if projector is not None and family.vision:
-        name, vision_header = projector(repo)
+        name, vision_header = projector(repo, family)
         try:
-            _validate_processor(gguf.processor_config(vision_header))
-            config.write_bytes(
-                models.json_bytes(gguf.model_config(headers[0], vision_header))
-            )
-            check_model("gguf", "gguf", config, gguf_headers=target)
+            _validate_processor(gguf.processor_config(vision_header), family)
+            vision_config = gguf.model_config(headers[0], vision_header)
         except models.ModelError as error:
+            raise models.VisionError(f"vision projector {name}: {error}") from None
+        config.write_bytes(models.json_bytes(vision_config))
+        # The engine's refusal refuses the projector; an engine that cannot
+        # run the check fails the inspection, as check_vision's does.
+        try:
+            check_model("gguf", "gguf", config, gguf_headers=target)
+        except models.EngineRefusal as error:
             raise models.VisionError(f"vision projector {name}: {error}") from None
         files[assembly.GGUF_VISION] = name
         vision_format = "gguf"
@@ -432,23 +522,32 @@ def gguf_target(repo, names, scratch, *, projector=None):
 
 
 def mlx_target(repo, language_only):
-    """The MLX target in repo, which serves images unless language_only."""
+    """The MLX target in repo, which serves images unless language_only or
+    its family has no vision tower (family.vision), as _gguf_target's."""
     required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
     missing = sorted(required - repo.files)
-    # Serving text only drops the processor requirement and no other.
-    processor = language_only or any(n in repo.files for n in PROCESSOR_FILES)
-    if missing or not processor:
-        # A checkpoint that lacks only the processor can serve text.
-        refusal = models.ModelError if missing else models.VisionError
-        if not processor:
-            missing.append(" or ".join(PROCESSOR_FILES))
+    processor = any(n in repo.files for n in PROCESSOR_FILES)
+
+    def refuse(refusal, missing):
         raise refusal(
             f"target repository {repo.name} is missing: {', '.join(missing)}. "
             "Configuration, tokenizer and processor must come from the target "
             "repository"
         )
+
+    if missing:
+        # Before the family is known, a processor is asked for unless text only.
+        if not (language_only or processor):
+            missing.append(" or ".join(PROCESSOR_FILES))
+        refuse(models.ModelError, missing)
     config = repo.file("config.json")
     family = check_model("mlx-affine", "none", config)
+    # Serving text only drops the processor requirement and no other; so does
+    # a family without a vision tower, which serves text only.
+    vision = not language_only and family.vision
+    if vision and not processor and not family.image_format.defaulted:
+        # A checkpoint that lacks only the processor can serve text.
+        refuse(models.VisionError, [" or ".join(PROCESSOR_FILES)])
     files = {path: "config.json" for path in ("config.json", "tokenizer/config.json")}
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     # The target's shards: those holding a tensor other than the tower's. A
@@ -456,11 +555,11 @@ def mlx_target(repo, language_only):
     # keeps it in a subdirectory).
     files |= {"target/" + n: n for n in _weight_files(repo, exclude=VISION_TOWER)}
     vision_format = "none"
-    if not language_only:
+    if vision:
         # The text passed, so a refusal of the tower's processor, shards or
         # configuration refuses the vision alone.
         try:
-            _validate_processor(_image_processor(repo))
+            _validate_processor(_image_processor(repo, family), family)
             shards = _weight_files(repo, VISION_TOWER)
         except models.ModelError as error:
             raise models.VisionError(str(error)) from None
@@ -469,18 +568,23 @@ def mlx_target(repo, language_only):
         vision_format = "safetensors"
         try:
             check_model("mlx-affine", vision_format, config)
-        except models.ModelError as error:
+        except models.EngineRefusal as error:
             raise models.VisionError(str(error)) from None
         files |= {"vision/" + n: n for n in shards}
     return Target("mlx-affine", vision_format, config, None, family, files)
 
 
-def _image_processor(repo):
+def _image_processor(repo, family):
     """An MLX target's image processor configuration, from the first of
-    PROCESSOR_FILES the repository has."""
+    PROCESSOR_FILES the repository has, or its processor class's defaults
+    where the family's has no other (ImageFormat.defaulted)."""
+    if not any(name in repo.files for name in PROCESSOR_FILES):
+        return {}
     if "preprocessor_config.json" in repo.files:
         return models.read_json(repo.file("preprocessor_config.json"))
     config = models.read_json(repo.file("processor_config.json")).get("image_processor")
+    if config is None and family.image_format.defaulted:
+        return {}
     if not isinstance(config, dict):
         raise models.VisionError(
             f"{repo.name}'s processor_config.json has no image_processor"
@@ -543,18 +647,45 @@ def _safetensors_tensors(repo, name):
     return set(header) - {"__metadata__"}
 
 
-def _validate_processor(config):
-    """Splash prepares images one way (server/images.py): 16-pixel patches in
-    two temporal slices, merged 2x2 and normalized to [-1, 1]. A processor
-    configuration asking for another is rejected before any download; it is
-    not installed, since nothing reads it."""
+def _validate_processor(config, family):
+    """Splash prepares images one way for each family's tower
+    (server/images.py, ModelFamily.image_format): patches of its side (Qwen's
+    16 pixels in two temporal slices, Inkling's 20 in one), merged 2x2 and
+    normalized to [-1, 1]. A processor configuration asking for another is
+    rejected before any download; it is not installed, since nothing reads
+    it. Inkling's processor (transformers' Inkling2ImageProcessor) states a
+    token's side instead, its patches' merged 2x2, and a value it leaves out
+    is its class's default, which a checkpoint without one keeps throughout
+    (ImageFormat.defaulted)."""
+    if family.image_format.name == "inkling":
+        # Its class's values, and a GGUF projector's patch and merge (as
+        # gguf.processor_config states them); a value left out is the
+        # default, and temporal_patch_size, which the class ignores, any.
+        token = 2 * family.image_format.patch
+        expected = {
+            "size": {"height": token, "width": token},
+            "patch_size": family.image_format.patch,
+            "merge_size": 2,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "rescale_factor": 1 / 255,
+            "do_rescale": True,
+            "do_normalize": True,
+            "do_convert_rgb": True,
+        }
+        if any(config.get(key, value) != value for key, value in expected.items()):
+            raise models.ModelError("unsupported vision preprocessing configuration")
+        return
     expected = {
-        "patch_size": 16,
-        "temporal_patch_size": 2,
+        "patch_size": family.image_format.patch,
         "merge_size": 2,
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
     }
+    if family.image_format.name == "qwen":
+        expected["temporal_patch_size"] = 2
+    elif "temporal_patch_size" in config:
+        raise models.ModelError("unsupported vision preprocessing configuration")
     if any(config.get(key) != value for key, value in expected.items()):
         raise models.ModelError("unsupported vision preprocessing configuration")
 
@@ -585,6 +716,8 @@ def prepare(selection):
         installation=selection.link,
         installed=installed_commit,
     )
+    if installed_commit is None:
+        target = _cached_holding(selection, target)
     if installed is None and "manifest.json" in target.files:
         with hub.as_model_errors(f"cannot install {selection.model}"):
             manifest = models.read_json(target.file("manifest.json"))
@@ -592,6 +725,78 @@ def prepare(selection):
     if installed is not None and target.revision == installed_commit:
         return _start_installed(selection, target, installed)
     return _install_commit(selection, target, installed)
+
+
+def _cached_holding(selection, target):
+    """target, or, where it stands in from the Hub cache for the default
+    branch and lacks the GGUF selection's :VARIANT names, the newest cached
+    snapshot that holds that model whole, named in the log. The cache's
+    record of the branch can name a snapshot that holds only what an
+    interrupted download of the branch's new commit fetched (a projector of
+    1 GB of 17), while an older snapshot holds every file; offline, that one
+    installs. A snapshot holds the model when the target inspects from it,
+    its tower too unless the selection is text only, and it has each of the
+    target's files. A selection that names no variant never stands in on
+    another snapshot: whatever single GGUF that one holds is not what the
+    Hub would select. None holding the model: target stands where a
+    snapshot held its text, for the install to word what it lacks, and
+    otherwise the selection is refused, naming the commits looked at."""
+    if (
+        not target.unreachable_reason
+        or target.paths is None
+        or selection.revision is not None
+        or selection.variant is None
+    ):
+        return target
+    commits = list(dict.fromkeys([target.revision, *hub.cached_snapshots(target.name)]))
+    text_held = False
+    for commit in commits:
+        cached = (
+            target
+            if commit == target.revision
+            else hub.Repository.cached(
+                target.name,
+                commit,
+                unreachable_reason=target.unreachable_reason,
+                unreachable_kind=target.unreachable_kind,
+            )
+        )
+        with (
+            tempfile.TemporaryDirectory(prefix="splash-target-") as scratch,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            try:
+                inspected = inspect_target(
+                    cached, selection.variant, selection.language_only, Path(scratch)
+                )
+            except models.VisionError:
+                text_held = True
+                continue
+            except models.ModelError:
+                continue
+        if not set(inspected.files.values()) <= cached.files:
+            continue
+        if inspected.vision_note is not None and not selection.language_only:
+            # Its text, without the tower another snapshot may hold.
+            text_held = True
+            continue
+        if cached is not target:
+            print(
+                f"The Hub cache's {target.name}@{target.revision[:12]}, its "
+                f"record of the default branch, lacks {selection.model}; "
+                f"taking {commit}, the newest cached snapshot that holds it.",
+                flush=True,
+            )
+        return cached
+    if text_held:
+        return target
+    raise models.ModelError(
+        f"cannot install {selection.model}: could not reach the Hub "
+        f"({target.unreachable_reason}), and no cached commit of {target.name} "
+        f"holds :{selection.variant} whole (looked at "
+        f"{', '.join(commit[:12] for commit in commits)})",
+        kind=target.unreachable_kind,
+    )
 
 
 def remove(selection):
@@ -633,7 +838,12 @@ def _selections_of(selection):
     whose files nothing could delete once the model's row is gone. Its own
     comes last, so that a removal cut short can be asked for again."""
     links = []
-    if not (selection.revision or selection.language_only or selection.draft_model):
+    if not (
+        selection.revision
+        or selection.language_only
+        or selection.draft_model
+        or selection.draft_revision
+    ):
         links = [
             link
             for link in models.selection_links(selection.models_root)
@@ -648,8 +858,10 @@ def _start_installed(selection, target, installed):
     """Start the verified installation of the target's commit, assembled again
     first when its draft moved or this release changes it (_changes). The
     draft's repository is asked only when the Hub answered for the target, so
-    a commit revision holds its draft too. Only assembling it again reads the
-    Hub cache: the snapshots the installation links (assembly.source)."""
+    a commit revision holds its draft too. Assembling it again reads the Hub
+    cache alone: the snapshots the installation links (assembly.source). One
+    that lacks its family's tower asks the Hub for its commit's listing, and
+    downloads the tower it names (_lacks_tower)."""
     if target.unreachable_reason:
         print(
             f"Could not reach the Hub ({target.unreachable_reason}); "
@@ -665,15 +877,53 @@ def _start_installed(selection, target, installed):
             flush=True,
         )
     answered = _answered(target) and not (draft and draft.unreachable_reason)
-    if changes := _changes(installed, family, draft):
+    changes = _changes(installed, family, draft)
+    # An installation that lacks the tower its family serves (_lacks_tower)
+    # takes it in once the Hub answers for its commit: the Hub's listing names
+    # a GGUF's projector, which downloads, where the snapshots the
+    # installation links hold none. Until then, and for a repository whose
+    # tower Splash cannot serve, it serves text only.
+    tower = _lacks_tower(selection, installed)
+    if tower:
+        # The Hub's listing of the commit, which a commit revision resolves
+        # without: one request, which a listing without a tower Splash serves
+        # is not asked again for (vision_unavailable).
+        listed = target
+        if not _answered(listed) and not target.unreachable_reason:
+            with suppress(models.ModelError, OSError):
+                listed = hub.Repository.resolve(selection.repo_id, target.revision)
+        if _answered(listed) and listed.paths is None:
+            print(
+                f"Updating {selection.model}: its family serves images now.",
+                flush=True,
+            )
+            try:
+                _install(selection, listed, installed, draft)
+                return UPDATED if answered else UNREACHABLE
+            except (models.ModelError, OSError) as error:
+                # A projector that cannot download, say: it serves text, and
+                # what else changed is assembled from the snapshots it links.
+                # The update it was started for did not happen: kept.
+                models.warn(
+                    f"{selection.model} serves text only for now; cannot take in "
+                    f"its vision tower: {error}"
+                )
+                _start_as_installed(selection, installed, draft, changes, answered)
+                return KEPT
+    return _start_as_installed(selection, installed, draft, changes, answered)
+
+
+def _start_as_installed(selection, installed, draft, changes, answered):
+    """Start installed serving what it serves, assembled again first for
+    changes (_changes) or where it no longer verifies, and return what that
+    did."""
+    if changes:
         print(f"Updating {selection.model}: {'; '.join(changes)}.", flush=True)
         if not _keeping_installation(
             selection,
             installed,
             f"update it ({'; '.join(changes)})",
-            lambda: _install(
-                selection, assembly.source(installed, "target"), installed, draft
-            ),
+            lambda: _reassemble(selection, installed, draft),
         ):
             return KEPT
         return UPDATED if answered else UNREACHABLE
@@ -686,8 +936,41 @@ def _start_installed(selection, target, installed):
     # A concurrent installation replaced or damaged the assembly after it was
     # verified: no verified installation is left to keep.
     print(f"Reinstalling {selection.model}: {replaced}", flush=True)
-    _install(selection, assembly.source(installed, "target"), installed, draft)
+    _reassemble(selection, installed, draft)
     return UPDATED if answered else UNREACHABLE
+
+
+def _reassemble(selection, installed, draft):
+    """Assemble installed again from the snapshots it links (assembly.source),
+    to serve what it serves: one that serves text only stays so, whatever its
+    snapshots hold, its record keeping what the Hub's listing said of its
+    tower (assembly_record), and it replaces no assembly of its commit that
+    another start gave its tower since (publish)."""
+    text_only = installed["vision_format"] == "none"
+    _install(
+        selection,
+        assembly.source(installed, "target"),
+        installed,
+        draft,
+        language_only=text_only,
+        keep_tower=text_only,
+    )
+
+
+def _lacks_tower(selection, installed):
+    """Whether installed, a verified assembly of selection, serves text only
+    though its family serves images and the selection asks for them, and the
+    Hub's listing of its commit was not found without a tower Splash serves
+    (vision_unavailable): one assembled while its family served text only
+    (Inkling-2-Mini's before 1.7.3), or from the Hub cache."""
+    family = families.named(installed["family"])
+    return bool(
+        family
+        and family.vision
+        and not selection.language_only
+        and installed["vision_format"] == "none"
+        and "vision_unavailable" not in installed
+    )
 
 
 def _install_commit(selection, target, installed):
@@ -749,42 +1032,74 @@ def _retain_installed(selection):
     return None
 
 
-def _install(selection, repo, installed, draft=None):
+def _install(
+    selection, repo, installed, draft=None, *, language_only=None, keep_tower=False
+):
     """Assemble repo's target and its draft, and publish the assembly at the
     selection link. draft is the draft's repository as this start resolved
     it, or None to resolve it here, asking the Hub only when it answered for
-    repo."""
+    repo. language_only, when given, takes the selection's place, and
+    keep_tower publishes nothing over an assembly another start gave its
+    tower since (_reassemble, publish)."""
     # Every Hub request (header reads, downloads) happens here.
     with (
         hub.as_model_errors(f"cannot install {selection.model}"),
         tempfile.TemporaryDirectory(prefix="splash-target-") as scratch,
     ):
-        target = inspect_target(
-            repo, selection.variant, selection.language_only, Path(scratch)
-        )
+        if language_only is None:
+            language_only = selection.language_only
+        target = inspect_target(repo, selection.variant, language_only, Path(scratch))
         if draft is None:
             draft = _resolve_draft(target.family, selection, installed, repo)
-        draft, files = _draft(target, installed, draft)
+        # The target's files download after the draft's, which makes room for
+        # both first. A file the assembly links at two paths, such as a shard
+        # holding the tower and text tensors, downloads once.
+        names = set(target.files.values())
+        following = sum(size for size, _ in repo.missing(names))
+        draft, files = _draft(target, installed, draft, following)
         vision = "disabled" if target.vision_format == "none" else "enabled"
+        if target.vision_note:
+            vision += f" ({target.vision_note})"
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
             f"draft {draft.name}; vision {vision}.",
             flush=True,
         )
-        downloaded = repo.download(set(target.files.values()))
+        downloaded = repo.download(names)
+        try:
+            checked = prepared_tower(
+                target,
+                downloaded,
+                Path(scratch),
+                lambda: inspect_target(repo, selection.variant, True, Path(scratch)),
+            )
+        except models.VisionError as error:
+            raise models.VisionError(
+                f"{error}; use --language-only to serve text only"
+            ) from None
+        if checked is not target:
+            print(
+                f"{selection.model} serves text only: {checked.vision_note}.",
+                flush=True,
+            )
+            target = checked
     files |= {path: downloaded[name] for path, name in target.files.items()}
     publish(
         selection.models_root,
         selection.link,
-        assembly_record(selection.model, target, repo, draft),
+        assembly_record(selection.model, target, repo, draft, installed),
         files,
+        keep_tower=keep_tower,
     )
 
 
-def assembly_record(model, target, repo, draft):
+def assembly_record(model, target, repo, draft, installed=None):
     """The record of model's assembly of target, inspected in repo, and the
-    draft repository draft, but for the files it links (publish)."""
-    return {
+    draft repository draft, but for the files it links (publish). A text
+    target records why it serves no images where the Hub's listing of its
+    commit said so: now (paths None: not the Hub cache's), or as installed,
+    the assembly of the same commit it replaces, records it."""
+    record = {
         "version": 1,
         "model": model,
         "family": target.family.name,
@@ -792,15 +1107,123 @@ def assembly_record(model, target, repo, draft):
         "vision_format": target.vision_format,
         "sources": {"target": repo.identity(), "draft": draft.identity()},
     }
+    if target.vision_note and repo.paths is None:
+        record["vision_unavailable"] = target.vision_note
+    elif (
+        installed
+        and "vision_unavailable" in installed
+        and target.vision_format == "none"
+        and installed["sources"]["target"] == record["sources"]["target"]
+    ):
+        record["vision_unavailable"] = installed["vision_unavailable"]
+    return record
 
 
-def publish(models_root, link, record, files):
+def _weights_auto_changes(target_format, files):
+    """Whether --weights auto loads any weight of an assembly's target in
+    another format than the default does, as the engine plans the target's
+    files under each (its model check, given them): what the app offers the
+    option by. files maps each assembly path to its file. None where the
+    engine does not say, of a target it refuses when it loads it."""
+    with tempfile.TemporaryDirectory(prefix="splash-weights-") as scratch:
+        try:
+            for name, path in files.items():
+                if name.startswith("target/"):
+                    link = Path(scratch) / name
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(Path(path).absolute())
+            arguments = ["model-check", target_format, "none"]
+            arguments += [str(Path(files["config.json"]).absolute())]
+            arguments += [str(Path(scratch) / "target")]
+            checked = json.loads(models.run_engine(arguments, "model check"))
+        except (models.ModelError, OSError, KeyError):
+            return None
+    return checked.get("quantizable_weights")
+
+
+def _reasoning(family, files):
+    """What the model's own chat template makes of the reasoning efforts, as
+    its server reports it at /v1/models before any option changes it
+    (chat_templates.tokenizer_reasoning): whether it thinks unasked, the
+    efforts it renders differently, and the one it renders unasked. The app
+    offers Thinking's choices by it. files maps each assembly path to its
+    file; family names the model's. None where its tokenizer does not load
+    or its template does not render, which a start refuses."""
+    # Imported here: it takes Jinja, and transformers once it is asked, whose
+    # warnings a start silences too (launcher.py).
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    from server import chat_templates
+
+    with tempfile.TemporaryDirectory(prefix="splash-tokenizer-") as scratch:
+        try:
+            for name, path in files.items():
+                if name.startswith("tokenizer/"):
+                    link = Path(scratch) / name
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(Path(path).absolute())
+            return chat_templates.tokenizer_reasoning(
+                Path(scratch) / "tokenizer", families.named(family).chat_format
+            )
+        except Exception:  # a tokenizer's parsers raise what they like
+            return None
+
+
+# What the app offers a model's options by, which publish records.
+OPTION_KEYS = {"quantizable_weights", "reasoning"}
+
+
+def bring_records_current(models_root, first=None):
+    """Give each installation under models_root whose record lacks what the
+    app offers its options by (OPTION_KEYS: one made before 1.7.4) that
+    record, without the Hub or a start: its assembly published again as it
+    is, its record saying besides what the engine and the tokenizer say
+    (_weights_auto_changes, _reasoning). The installations of the model
+    first, if any, come first; each answer is asked for outside the
+    installation lock, and its record is written under it. One whose
+    record has them, or whose files are gone or changed, is left as it is,
+    and so is one another installation replaced meanwhile. The desktop app
+    runs it as it launches (cached.py); a start does as much for the model
+    it starts (_changes)."""
+    models_root = Path(models_root).resolve()
+    stale = []
+    for link in models.selection_links(models_root):
+        with suppress(models.ModelError, OSError):
+            installed = assembly.verify(link)
+            if not OPTION_KEYS <= installed.keys():
+                stale.append((link, installed))
+    stale.sort(key=lambda found: found[1]["model"] != first)
+
+    def options(installed):
+        files = {name: Path(e["path"]) for name, e in installed["files"].items()}
+        return {
+            "quantizable_weights": _weights_auto_changes(
+                installed["target_format"], files
+            ),
+            "reasoning": _reasoning(installed["family"], files),
+        }
+
+    for link, installed in stale:
+        with suppress(models.ModelError, OSError):
+            said = options(installed)
+            with models.installation_lock(models_root):
+                # Read again under the lock: another installation may have
+                # replaced it, and its files are checked as it is built.
+                if assembly.verify(link) != installed:
+                    continue
+                files = {n: Path(e["path"]) for n, e in installed["files"].items()}
+                published = assembly.build(models_root, installed | said, files)
+                models.link_selection(link, published)
+                assembly.collect_garbage(models_root, updating=True)
+
+
+def publish(models_root, link, record, files, *, keep_tower=False):
     """Publish the assembly of record and files (assembly path -> source
-    file) at link, a selection link under models_root, and return it. A file
-    the assembly it replaces records, unchanged since, is not read again for
-    its digest (assembly.file_record); any other is read before the
-    installation lock is taken, which other installations and starting
-    servers wait for, and its record is taken again under the lock."""
+    file) at link, a selection link under models_root, and return it, or
+    with keep_tower the assembly link names where that has the commit's
+    tower. A file the assembly it replaces records, unchanged since, is not
+    read again for its digest (assembly.file_record); any other is read
+    before the installation lock is taken, which other installations and
+    starting servers wait for, and its record is taken again under the lock."""
     models_root.mkdir(parents=True, exist_ok=True)
     # One record per linked file, however many assembly paths link it.
     records = _file_records(assembly.recorded(link), set(files.values()))
@@ -808,6 +1231,15 @@ def publish(models_root, link, record, files):
     with models.installation_lock(models_root):
         # The record of the assembly the link names, which this one replaces.
         previous = assembly.recorded(link)
+        # A text-only assembly of the commit another start gave its tower
+        # since this one read it replaces nothing (keep_tower).
+        if (
+            keep_tower
+            and previous
+            and previous["vision_format"] != "none"
+            and previous["sources"]["target"] == record["sources"]["target"]
+        ):
+            return link.resolve()
         # A file changed since its record was taken is read again.
         records = {
             path: assembly.file_record(path, entry) for path, entry in records.items()
@@ -818,6 +1250,10 @@ def publish(models_root, link, record, files):
             )
             files = files | derived
             records |= _file_records(previous, derived.values())
+        record["quantizable_weights"] = _weights_auto_changes(
+            record["target_format"], files
+        )
+        record["reasoning"] = _reasoning(record["family"], files)
         record["files"] = {name: records[path] for name, path in sorted(files.items())}
         # A new installation requires its pins before it is published; its
         # older pins are retired once it is, in the repositories the
@@ -858,7 +1294,8 @@ def _changes(installed, family, draft):
     """What a start changes in a verified assembly of the target's installed
     commit: the draft, when draft, as this start resolved it, is another
     repository or commit, or the GGUF metadata, when this release derives it
-    otherwise."""
+    otherwise, or what the app offers its options by (quantizable_weights,
+    reasoning), when its record lacks either."""
     if family is None:
         return [f"no supported family is named {installed['family']}"]
     changes = []
@@ -873,15 +1310,21 @@ def _changes(installed, family, draft):
         "metadata"
     ] != assembly.metadata_key(installed["files"]):
         changes.append("the GGUF metadata adapter changed")
+    if not OPTION_KEYS <= installed.keys():
+        # An assembly made before 1.7.4: assembled again from its snapshots,
+        # its record says what the app offers of --weights and of Thinking.
+        changes.append("its record gains what the app offers its options by")
     return changes
 
 
 def _resolve_draft(family, selection, installed, target):
     """The draft's repository, --draft-model or else the family's DFlash2
-    release, at its default branch's commit: one Hub request, made only when
-    the Hub answered for the target. Otherwise, or when it cannot be
-    resolved, the installed draft stands in; without one, a commit the Hub
-    cache holds, else it fails with the target's reason and class."""
+    release, at the commit of --draft-revision or else of its default
+    branch: one Hub request, made only when the Hub answered for the target,
+    and none for a commit an installation of it records (Repository.resolve).
+    Otherwise, or when it cannot be resolved, the installed draft stands in;
+    without one, a commit the Hub cache holds, else it fails with the
+    target's reason and class."""
     name = selection.draft_model or family.draft_repo
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
@@ -891,6 +1334,7 @@ def _resolve_draft(family, selection, installed, target):
     try:
         return hub.Repository.resolve(
             name,
+            selection.draft_revision,
             installation=selection.link,
             installed=commit,
             unreachable=None
@@ -909,17 +1353,18 @@ def _resolve_draft(family, selection, installed, target):
         )
 
 
-def _draft(target, installed, draft):
+def _draft(target, installed, draft, following=0):
     """The draft repository and its downloaded files, by assembly path: draft,
     as this start resolved it, when it is not the installed draft, or else
     the installed one, which is kept too when draft cannot be fetched
-    (downloaded and checked for the target)."""
+    (downloaded and checked for the target). following is the bytes of the
+    downloads after it (Repository.download's reserve)."""
     family = target.family
     recorded = installed and installed["sources"]["draft"]
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):
-                return draft, draft_files(draft, target)
+                return draft, draft_files(draft, target, following)
         except models.ModelError as error:
             if not recorded:
                 raise
@@ -928,7 +1373,7 @@ def _draft(target, installed, draft):
                 f"keeping the installed one: {error}"
             )
     repo = assembly.source(installed, "draft")
-    return repo, draft_files(repo, target)
+    return repo, draft_files(repo, target, following)
 
 
 def _answered(repo):
@@ -942,12 +1387,13 @@ def _at(repo):
     return f"{repo.name}@{repo.revision[:12]}" if repo.revision else repo.name
 
 
-def draft_files(repo, target):
+def draft_files(repo, target, following=0):
     """The DFlash2 draft in repo for target's family, downloaded, by assembly
     path: config.json, the safetensors weights and the mask embedding when
     shipped (DRAFT_MASK_EMBEDDING), at the repository's root. The weights
     download only once the engine accepts its configuration with the
-    target's (check_model)."""
+    target's (check_model); following is the bytes of the downloads after
+    them (Repository.download's reserve)."""
     family = target.family
     try:
         if "config.json" not in repo.files:
@@ -973,5 +1419,5 @@ def draft_files(repo, target):
             f"{error}"
         ) from error
     mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
-    downloaded = repo.download({"config.json", *weights, *mask})
+    downloaded = repo.download({"config.json", *weights, *mask}, reserve=following)
     return {"draft/" + name: path for name, path in downloaded.items()}

@@ -14,6 +14,7 @@ from unittest import mock
 from dev.tests.server_fixtures import (
     FakeRuntime,
     HarnessTestCase,
+    Plan,
     StalledConsole,
     TemplateTokenizer,
     chat_body,
@@ -96,9 +97,44 @@ class DiagnosticsTests(HarnessTestCase):
                     console_written()
                 self.assertEqual(stderr.getvalue(), written)
 
+    def test_a_probe_for_a_missing_path_is_answered_without_an_error_line(self):
+        # Claude Code sends HEAD /api/hello at each start, Hermes GETs five
+        # paths: each a client looking for an API, in a healthy session.
+        harness = self.harness(FakeRuntime())
+        for method, path in (
+            ("HEAD", "/api/hello"),
+            ("GET", "/api/tags"),
+            ("GET", "/v1/props"),
+        ):
+            with (
+                self.subTest(method=method, path=path),
+                mock.patch.object(api, "print_status") as output,
+            ):
+                status, _, _ = harness.request(method, path)
+                self.assertEqual(status, 404)
+                output.assert_not_called()
+
+    def test_a_path_served_under_another_method_is_logged(self):
+        harness = self.harness(FakeRuntime())
+        for method, path in (
+            ("GET", "/v1/chat/completions"),
+            ("GET", "/v1/messages"),
+            ("HEAD", "/v1/responses"),
+            ("GET", "/tokenize"),
+        ):
+            with (
+                self.subTest(method=method, path=path),
+                mock.patch.object(api, "print_status") as output,
+            ):
+                status, _, _ = harness.request(method, path)
+                self.assertEqual(status, 404)
+                output.assert_called_once_with(
+                    f"Error · not_found · {method} {path}", error=True
+                )
+
     def test_http_error_logs_method_and_path_without_query_or_body(self):
         harness = self.harness(FakeRuntime())
-        for method in ("GET", "POST", "DELETE"):
+        for method in ("POST", "DELETE"):
             with (
                 self.subTest(method=method),
                 mock.patch.object(api, "print_status") as output,
@@ -116,6 +152,44 @@ class DiagnosticsTests(HarnessTestCase):
             output.assert_called_once_with(
                 "Error · invalid_request_error · POST /v1/messages", error=True
             )
+
+    def test_a_request_that_runs_out_of_time_is_one_error_line(self):
+        # The server meets the deadline of a request the engine still runs,
+        # plain and streamed: the request ends once, with one line, not an
+        # Error line of the handler's and the backend's Cancelled after it.
+        for stream in (False, True):
+            runtime = FakeRuntime(Plan(block=True))
+            harness = self.harness(runtime, request_logger=diagnostics.print_request)
+            with (
+                self.subTest(stream=stream),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            ):
+                status, _, _ = harness.request(
+                    "POST",
+                    "/v1/messages",
+                    {
+                        "model": "test-model",
+                        "max_tokens": 8,
+                        "timeout": 0.2,
+                        "stream": stream,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                deadline = time.monotonic() + 5
+                while not runtime.calls or not runtime.calls[-1].done:
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                time.sleep(0.2)
+                console_written()
+                ends = [
+                    line
+                    for line in (stdout.getvalue() + stderr.getvalue()).splitlines()
+                    if " Started · " not in line
+                ]
+                self.assertEqual(status, 200 if stream else 504)
+                self.assertEqual(len(ends), 1, ends)
+                self.assertRegex(ends[0], r"Error · request \d+ · request_timeout$")
 
     def test_request_record_contains_metrics_but_console_omits_the_prompt(self):
         records = []
@@ -135,6 +209,7 @@ class DiagnosticsTests(HarnessTestCase):
             (
                 started,
                 r"^\d{2}:\d{2}:\d{2} Started · request (\d+) · input \d+ · cached \d+"
+                r" · reuse ended: prompt parts from the cache at \d+"
                 r" · effort none · thinking off\n$",
             ),
             (record, r"^\d{2}:\d{2}:\d{2} Done · request (\d+) · input [^\n]*\n$"),
@@ -232,6 +307,37 @@ class DiagnosticsTests(HarnessTestCase):
             output.getvalue(), "19:03:32 Started · input 153,545 · cached 23,456\n"
         )
 
+    def test_console_start_says_why_its_reuse_stopped(self):
+        def line(end, tokens):
+            with (
+                mock.patch.object(api.time, "strftime", return_value="19:03:32"),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                printed(
+                    {
+                        "outcome": "started",
+                        "prompt_tokens": 9_000,
+                        "cached_tokens": 4_096,
+                        "reuse_end": end,
+                        "reuse_end_tokens": tokens,
+                    }
+                )
+            return output.getvalue().removeprefix(
+                "19:03:32 Started · input 9,000 · cached 4,096 · reuse ended: "
+            )
+
+        self.assertEqual(line("nothing_matched", 0), "nothing matched\n")
+        self.assertEqual(
+            line("prefix_end", 4_096), "prompt parts from the cache at 4,096\n"
+        )
+        self.assertEqual(
+            line("kv_without_state", 2_048),
+            "KV matched 2,048 tokens past the last state\n",
+        )
+        self.assertEqual(
+            line("disk_read_failed", 8_192), "an SSD read to 8,192 failed\n"
+        )
+
     def test_console_start_shows_how_a_chat_request_reasons(self):
         def line(**reasoning):
             with (
@@ -262,6 +368,11 @@ class DiagnosticsTests(HarnessTestCase):
         self.assertEqual(
             line(sent_effort="none", effort="none", thinking=False),
             " · effort none · thinking off\n",
+        )
+        # A model that opens its own reasoning decides whether it thinks.
+        self.assertEqual(
+            line(sent_effort="none", effort="none", thinking=None),
+            " · effort none\n",
         )
         self.assertEqual(
             line(
@@ -467,6 +578,25 @@ class DiagnosticsTests(HarnessTestCase):
         self.assertRegex(
             errors.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · capacity_exhausted · " + reason + "\n$",
+        )
+
+    def test_console_error_gives_a_capacity_failure_its_clients_advice(self):
+        reason = "could not allocate KV target: engine memory budget exceeded"
+        remedy = (
+            "shorten the conversation, or restart the server with a larger --max-memory"
+        )
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
+            printed(
+                {
+                    "outcome": "error",
+                    "error_code": "capacity_exhausted",
+                    "engine_reason": reason,
+                    "remedy": remedy,
+                }
+            )
+        self.assertRegex(
+            errors.getvalue(),
+            rf"^\d{{2}}:\d{{2}}:\d{{2}} Error · capacity_exhausted · {reason} · {remedy}\n$",
         )
 
     def test_concurrent_console_lines_stay_whole(self):

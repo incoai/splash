@@ -1350,10 +1350,10 @@ void narrowCells(Fixture &fixture, const Cell &narrow) {
   }
 }
 
-// Lanes 0 to 3 take blocks of 16, 5, 9 and 12 rows at rows 0, 16, 21 and 30
-// of a step's 42, each block a random tree whose rows 1 and 2 are the
+// Lanes 0 to 7 take blocks of 16, 5, 9, 12, 5, 6, 5 and 6 rows packed from
+// row 0, a step's 64, each block a random tree whose rows 1 and 2 are the
 // anchor's children, so that a path past row 2 skips a row; the next step's
-// blocks of 12, 9, 5 and 16 rows fold each lane's path to its deepest leaf of
+// blocks of 6, 5, 7, 5, 12, 9, 5 and 15 rows fold each lane's path to its deepest leaf of
 // the first step's tree, which reaches past row 2 (row 4 hangs off row 1 or
 // later). Over both steps of every layer,
 // each lane's state cells, tape and hidden rows are its blocks' run alone
@@ -1363,7 +1363,7 @@ void narrowCells(Fixture &fixture, const Cell &narrow) {
 // that took its tree rows at another row than its first (lanes 2 and 3 of
 // the first step, at lane x 16) runs another lane's tree or a chain.
 void raggedTrees(MetalBackend &backend, const GdnShape &shape, bool float32, GdnStateFormat format) {
-  constexpr std::array<std::array<uint32_t, kMaxLanes>, 2> kBlockRows{{{16, 5, 9, 12}, {12, 9, 5, 16}}};
+  constexpr std::array<std::array<uint32_t, kMaxLanes>, 2> kBlockRows{{{16, 5, 9, 12, 5, 6, 5, 6}, {6, 5, 7, 5, 12, 9, 5, 15}}};
   const std::string what = std::string("ragged trees vh") + std::to_string(shape.valueHeads) +
                            (float32 ? " f32 norm " : " bf16 norm ") + std::string(formatName(format));
   const GdnHeadOrder order = float32 ? GdnHeadOrder::Tiled : GdnHeadOrder::Grouped;
@@ -1489,9 +1489,13 @@ void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnSta
   // Narrow and wide trees, and a chain whose last row is its second last's
   // sibling; the last lane holds only its first rows.
   std::array<BlockTree, kMaxLanes> trees{randomTree(random, blockRows, 3), randomTree(random, blockRows, blockRows),
-                                         randomTree(random, blockRows, 1), randomTree(random, blockRows, 4)};
+                                         randomTree(random, blockRows, 1), randomTree(random, blockRows, 4),
+                                         randomTree(random, blockRows, 2), randomTree(random, blockRows, blockRows),
+                                         randomTree(random, blockRows, 3), randomTree(random, blockRows, 4)};
   trees[2].parent.back() = blockRows - 3;
-  const std::array<uint32_t, kMaxLanes> held{blockRows, blockRows, blockRows, blockRows - 3};
+  std::array<uint32_t, kMaxLanes> held;
+  held.fill(blockRows);
+  held.back() = blockRows - 3;
   auto *rows = static_cast<TreeRow *>(tree.tree.contents());
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
     tree.blocks[lane].rows = held[lane];

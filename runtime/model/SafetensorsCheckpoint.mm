@@ -97,15 +97,21 @@ void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataByte
     if (ranges[i].first < ranges[i - 1].second) throw WeightStoreError("overlapping source tensors");
 }
 
-// The .safetensors shards of directory, in name order.
+// The .safetensors shards of directory, in name order. A directory that is
+// absent or holds none is a part of the model that is not installed, which
+// the weight error names by its path.
 std::vector<std::filesystem::path> shardPaths(const std::filesystem::path &directory) {
+  const std::string missing = "no safetensors weights in " + directory.string();
+  std::error_code unreadable;
+  std::filesystem::directory_iterator entries(directory, unreadable);
+  if (unreadable) throw WeightStoreError(missing + ": " + unreadable.message());
   std::vector<std::filesystem::path> paths;
-  for (const auto &entry : std::filesystem::directory_iterator(directory))
+  for (const auto &entry : entries)
     if (entry.path().extension() == ".safetensors") {
       if (paths.size() == 1024) throw WeightStoreError("too many source shards");
       paths.push_back(entry.path());
     }
-  if (paths.empty()) throw WeightStoreError("source contains no safetensors weights");
+  if (paths.empty()) throw WeightStoreError(missing);
   std::sort(paths.begin(), paths.end());
   return paths;
 }
@@ -140,6 +146,12 @@ const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const 
   const SourceTensor *tensor = find(name);
   if (!tensor) throw WeightStoreError("missing source tensor: " + std::string(name));
   return *tensor;
+}
+std::vector<std::string> SafetensorsCheckpoint::names(std::string_view prefix) const {
+  std::vector<std::string> result;
+  for (auto it = impl_->tensors.lower_bound(prefix); it != impl_->tensors.end() && it->first.starts_with(prefix); ++it)
+    result.push_back(it->first);
+  return result;
 }
 void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
 

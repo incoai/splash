@@ -28,7 +28,7 @@ struct ServerScreenTests {
             "kind": "memory_budget", "bound": "max_memory", "message": "x", "required_bytes": 1 << 30, "budget_bytes": 1}}))
         sys.exit(1)
         """.write(to: fake.root.appending(path: "install/launcher.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.options["--port"] = String(fake.port)
@@ -64,7 +64,7 @@ extension ServerScreenTests {
         while pathlib.Path("\(hold.path)").exists():
             time.sleep(0.02)
         """.write(to: fake.root.appending(path: "install/models.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.options["--port"] = String(fake.port)
@@ -109,7 +109,7 @@ extension ServerScreenTests {
     @Test func aRequestsRowFollowsTheEngineBackAndEndsWithItsStatus() async throws {
         let fake = try FakeRuntime("splash-request-rows", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         func signal(_ name: String, _ text: String = "") throws {
             try text.write(to: fake.root.appending(path: name), atomically: true, encoding: .utf8)
@@ -200,7 +200,7 @@ extension ServerScreenTests {
         record.write_text(json.dumps({"pid": os.getpid(), "phase": "failed", "failure": {"kind": "model", "message": "x"}}))
         sys.exit(1)
         """.write(to: fake.root.appending(path: "install/launcher.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.options["--port"] = String(fake.port)
@@ -265,7 +265,7 @@ extension ServerScreenTests {
         for (model, family, gigabytes) in models {
             try fake.install(model, family: family, bytes: Format.gigabytes(gigabytes))
         }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         await state.launch()
         return state
     }
@@ -384,25 +384,31 @@ extension ServerScreenTests {
 }
 
 extension ServerScreenTests {
-    /// The page of `window` drawn through `change`: as drawn before it, every 30 ms or so for 0.3 s
-    /// after it, each with how long after, and once it has stopped changing, which a slow Mac
-    /// reaches long after the animations' length.
-    static func pictures(of window: NSWindow, through change: () -> Void) async throws
+    /// The page of `window` drawn through `change`: as drawn before it, ten times after it, each
+    /// after `every` seconds of the run loop (30 ms: 0.3 s in all), with how long after, and once it
+    /// has stopped changing, which a slow Mac reaches long after the animations' length: the whole
+    /// picture, or what `same` compares of two, where the rest of the window never stops changing.
+    /// Each wait for it holds the main thread, at most 10 s.
+    static func pictures(of window: NSWindow, every interval: TimeInterval = 0.03,
+                         same: ((NSBitmapImageRep, NSBitmapImageRep) -> Bool)? = nil,
+                         through change: () -> Void) async throws
         -> (before: NSBitmapImageRep, drawn: [(at: Duration, picture: NSBitmapImageRep)], after: NSBitmapImageRep) {
         let before = try #require(await Snapshot.picture(of: window))
         let start = ContinuousClock.now
         change()
         var drawn: [(at: Duration, picture: NSBitmapImageRep)] = []
         for _ in 0..<10 {
-            pump(0.03)
+            pump(interval)
             drawn.append((ContinuousClock.now - start, try #require(await Snapshot.picture(of: window))))
         }
         var after = try #require(await Snapshot.picture(of: window))
         for _ in 0..<40 {
             pump(0.25)
             let next = try #require(await Snapshot.picture(of: window))
-            if next.bitmapData.map({ Data(bytes: $0, count: next.bytesPerRow * next.pixelsHigh) })
-                == after.bitmapData.map({ Data(bytes: $0, count: after.bytesPerRow * after.pixelsHigh) }) { break }
+            func bytes(_ picture: NSBitmapImageRep) -> Data? {
+                picture.bitmapData.map { Data(bytes: $0, count: picture.bytesPerRow * picture.pixelsHigh) }
+            }
+            if same?(next, after) ?? (bytes(next) == bytes(after)) { break }
             after = next
         }
         return (before, drawn, after)
@@ -446,7 +452,7 @@ extension ServerScreenTests {
         let flint = ServeSettingsTests.flint.unusable.sorted().map { "\"\($0)\"" }.joined(separator: ", ")
         let moe = ServeSettingsTests.moe.unusable.sorted().map { "\"\($0)\"" }.joined(separator: ", ")
         let qwen = #""context_tokens": 262144, "max_context_tokens": 1010000"#
-        return #"{"Qwen3.8-27B": {"unusable": ["--disable-ane", "--expert-memory", "--ple-memory", "--sparse-kv-memory"], \#(qwen)}, "#
+        return #"{"Qwen3.8-27B": {"unusable": ["--disable-ane", "--expert-memory", "--ple-memory", "--recalibrate-ane", "--sparse-kv-memory"], \#(qwen)}, "#
             + #""Qwen3.6-35B-A3B": {"unusable": [\#(moe)], \#(qwen)}, "#
             + #""Flint": {"unusable": [\#(flint)], "context_tokens": 262144, "max_context_tokens": 262144}}"#
     }()
@@ -463,7 +469,11 @@ extension ServerScreenTests {
         state.options["--port"] = String(fake.port)
         let window = await Self.serverWindow(state, picked: qwen)
         defer { window.orderOut(nil) }
-        let start = try await Self.pictures(of: window) { state.start(qwen) }
+        // Still once the page shows Starting…: the control bar under it goes on moving while the
+        // server starts.
+        let start = try await Self.pictures(of: window, same: { Self.page($0, of: window) == Self.page($1, of: window) }) {
+            state.start(qwen)
+        }
         let before = Self.page(start.before, of: window), after = Self.page(start.after, of: window)
         #expect(state.server.phase == .starting && before != after)
         let between = start.drawn.filter { Self.page($0.picture, of: window) != before && Self.page($0.picture, of: window) != after }.count
@@ -512,6 +522,71 @@ extension ServerScreenTests {
         let going = try await Self.pictures(of: window) { state.options["--max-context"] = nil }
         let shown = going.drawn.filter { Self.showsWarning($0.picture, of: window) }.count
         #expect(shown == 0, "the caution showed in \(shown) of \(going.drawn.count) frames after it went")
+    }
+
+    /// The SSD cache the options asked for, off for want of room on the disk, says why under SSD
+    /// Cache while the model runs, and the note goes as it stops. Only serve.log said it, while the
+    /// options went on showing Auto. The page is searched whole, drawn apart from the window, for
+    /// the note's sign; with SPLASH_APP_SNAPSHOTS set, the frames of the note going are kept, light
+    /// and dark, for the sweep.
+    @Test(arguments: [NSAppearance.Name.aqua, .darkAqua]) func theSSDCacheOffSaysWhyWhileTheModelRuns(_ appearance: NSAppearance.Name) async throws {
+        let fake = try FakeRuntime("splash-cache-off", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.launchedWithModels(fake, families: Self.realisticFamilies)
+        defer { state.quit() }
+        state.options["--port"] = String(fake.port)
+        state.selection = "mlx-community/Qwen3.8-27B-4bit"
+        state.start("mlx-community/Qwen3.8-27B-4bit")
+        for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        try await waitFor(state.server.phase == .ready, "ready")
+        // The launch options, Advanced open.
+        let window = await Snapshot.window(GroupedPage(column: 640) { LaunchOptions(advanced: true) }.environment(state),
+                                           size: ServerPictures.size, appearance: appearance)
+        defer { window.orderOut(nil) }
+        pump(0.5)
+        let scroll = try #require(window.contentView?.pageScroll)
+        let document = try #require(scroll.documentView)
+        /// The top, in points from the document's top, of the first row of the whole page, drawn
+        /// apart from the window, that shows the warning sign's yellow; nil where none does.
+        func warning() throws -> CGFloat? {
+            let picture = try #require(document.bitmapImageRepForCachingDisplay(in: document.bounds))
+            document.cacheDisplay(in: document.bounds, to: picture)
+            let scale = CGFloat(picture.pixelsHigh) / document.bounds.height
+            let row = (0..<picture.pixelsHigh).first { y in
+                (0..<picture.pixelsWide).contains { x in
+                    guard let color = picture.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return false }
+                    let (r, g, b) = (color.redComponent * 255, color.greenComponent * 255, color.blueComponent * 255)
+                    return r > 180 && g > 130 && b < r - 100
+                }
+            }
+            return row.map { CGFloat($0) / scale }
+        }
+        let name = appearance == .aqua ? "light" : "dark"
+        func keep(_ step: String, _ change: (before: NSBitmapImageRep, drawn: [(at: Duration, picture: NSBitmapImageRep)], after: NSBitmapImageRep)) {
+            guard let directory = Snapshot.directory else { return }
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let frames = [("0-before", change.before)] + change.drawn.enumerated().map { ("1-\($0.offset)-\(Int($0.element.at / .milliseconds(1)))ms", $0.element.picture) }
+                + [("2-after", change.after)]
+            for (frame, picture) in frames {
+                try? picture.representation(using: .png, properties: [:])?.write(to: directory.appending(path: "cache-off-\(step)-\(frame)-\(name).png"))
+            }
+        }
+        let none = try warning()
+        #expect(none == nil, "a note showed with the cache on")
+        try "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free"
+            .write(to: fake.root.appending(path: "cache-off"), atomically: true, encoding: .utf8)
+        // The next status the app asks for, within 2 s, says it.
+        try await waitFor(state.server.cacheOff != nil, "the status's off_reason")
+        pump(0.5)
+        let note = try #require(try warning(), "the cache off said nothing")
+        // The note in the window's middle, for the pictures of its going as the model stops.
+        scroll.scroll(by: note - 250 - scroll.contentView.bounds.minY)
+        pump(0.3)
+        let stop = try await Self.pictures(of: window) { state.stop() }
+        keep("stop", stop)
+        #expect(Self.showsWarning(stop.before, of: window), "the note was not in the window")
+        let left = try warning()
+        #expect(!Self.showsWarning(stop.after, of: window) && left == nil, "the note stayed after the model stopped")
     }
 
     /// Restore Defaults coming and going moves nothing on the page: the launch options' header
@@ -651,7 +726,7 @@ extension ServerScreenTests {
         try "print('\(Self.realisticFamilies)')".write(to: fake.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
         // An installer that downloads until the test ends.
         try "import time\nwhile True:\n    time.sleep(0.05)\n".write(to: fake.root.appending(path: "install/models.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         try await waitFor(!state.findingCachedModels, "the look through the cache")
@@ -689,10 +764,12 @@ extension ServerScreenTests {
 
 /// A grouped page of the launch options between sections, the one under them with a red row.
 private struct LaunchOptionsSample: View {
+    var row = ScrollTarget()
+
     var body: some View {
         Group {
             GroupedSection { ForEach(0..<8, id: \.self) { Text("Row \($0)") } }
-            LaunchOptions()
+            LaunchOptions(row: row)
             GroupedSection { Color.red.frame(height: 40) } header: { Text("Below") }
             GroupedSection { ForEach(0..<4, id: \.self) { Text("Last \($0)") } }
         }
@@ -717,7 +794,10 @@ extension ServerScreenTests {
     /// Opening Advanced with the page at its end moves nothing under the launch options up: the
     /// options it opens push the section under them down. The frame after the click drew the
     /// card without Advanced's row, the section under it moved up by the row's height, as the
-    /// switches among the options came in.
+    /// switches among the options came in. The pictures start at the first frame after the
+    /// click's update and come every 5 ms: the scroll to Advanced's first step drew the section
+    /// 14.5 points up in that frame (+25.5 points of scroll, +11 of push), which pictures 30 ms
+    /// apart missed unless other tests' work on the main thread shifted them.
     @Test func openingAdvancedAtThePagesEndMovesNothingUp() async throws {
         let (state, folder) = AppState.forTests()
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -738,16 +818,51 @@ extension ServerScreenTests {
         let frame = row.convert(row.bounds, to: nil)
         let point = NSPoint(x: frame.minX + 40, y: frame.midY)
         let closed = scroll.documentView!.frame.height
-        let change = try await Self.pictures(of: window) {
-            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-                window.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
-                                                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!)
-            }
+        let change = try await Self.pictures(of: window, every: 0.005) {
+            Self.click(point, in: window)
+            // The click's update.
+            pump(0)
         }
         let before = try #require(Self.redTop(change.before, of: window))
         let tops = change.drawn.map { Self.redTop($0.picture, of: window) }
         #expect(scroll.documentView!.frame.height > closed + 300, "Advanced opened")
         #expect(tops.allSatisfy { ($0 ?? .infinity) >= before - 1 }, "the section under the disclosure, at \(before), was drawn at \(tops)")
+    }
+
+    /// Closing Advanced before its options have unfolded ends the scroll to them within the time
+    /// an unfolding takes, though the scroll never reaches the options' laid-out place: a display
+    /// link left running would call it each frame for as long as the page showed. With Reduce
+    /// Motion the options open at once, and the link ends within that time too.
+    @Test func closingAdvancedWhileItUnfoldsEndsTheScroll() async throws {
+        let (state, folder) = AppState.forTests()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let row = ScrollTarget()
+        let window = await Snapshot.window(GroupedPage(column: 640) { LaunchOptionsSample(row: row) }.environment(state),
+                                           size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.3)
+        // The page at its end, where the Advanced row shows however many options are above it.
+        let scroll = try #require(window.contentView?.pageScroll)
+        let end = try #require(scroll.documentView).frame.height - scroll.contentView.bounds.height + scroll.contentInsets.bottom
+        scroll.scroll(by: end - scroll.contentView.bounds.minY)
+        pump(0.3)
+        let anchor = try #require(row.view)
+        let frame = anchor.convert(anchor.bounds, to: nil)
+        let point = NSPoint(x: frame.minX + 40, y: frame.midY)
+        Self.click(point, in: window)
+        pump(0.05)
+        #expect(row.link != nil || Motion.reduced, "opening Advanced started no scroll")
+        Self.click(point, in: window)
+        pump(Motion.settleSpring.settlingDuration)
+        #expect(row.link == nil, "the scroll still ran after Advanced closed")
+    }
+
+    /// A click at `point`, in `window`'s coordinates.
+    static func click(_ point: NSPoint, in window: NSWindow) {
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            window.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!)
+        }
     }
 }
 

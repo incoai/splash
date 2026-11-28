@@ -21,6 +21,7 @@ from dev.tests.server_fixtures import (
     response_events,
     responses_body,
 )
+from server import protocol as wire
 from server import server as api
 from server.dialects import responses as responses_dialect
 from server.dialects import scoring
@@ -197,6 +198,45 @@ class RequestFailureTests(HarnessTestCase):
             "plain answer\n",
         )
 
+    def test_a_disconnect_while_a_stream_writes_nothing_cancels(self):
+        # The output projector holds an integer argument until its close, so
+        # the stream has nothing to write that could fail; the request still
+        # finds the client gone and cancels.
+        plan = Plan([[13]] + [[14]] * 400, delay=0.01)
+        runtime = FakeRuntime(plan)
+        harness = self.harness(runtime, timeout=30)
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "integer"}},
+                    },
+                },
+            }
+        ]
+        connection = http.client.HTTPConnection(
+            *harness.server.server_address, timeout=5
+        )
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            json.dumps(chat_body(stream=True, reasoning_effort="none", tools=tools)),
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        response.readline()
+        self.assertTrue(plan.started.wait(2))
+        closed_at = time.monotonic()
+        response.close()
+        connection.close()
+        while runtime.cancel_count == 0 and time.monotonic() < closed_at + 3:
+            time.sleep(0.01)
+        self.assertEqual(runtime.cancel_count, 1)
+
     def test_stream_disconnect_before_headers_cancels(self):
         waiting = Plan([[4]], block=True, before_start=True)
         runtime = FakeRuntime(waiting)
@@ -235,19 +275,30 @@ class RequestFailureTests(HarnessTestCase):
         status, _, _ = harness.request("POST", "/v1/chat/completions", chat_body())
         self.assertEqual(status, 200)
 
-    def test_capacity_failure_is_a_bad_request_naming_the_limits(self):
+    def test_capacity_failure_is_a_context_overflow_in_each_api(self):
+        # A request that does not fit even alone is answered as each API
+        # answers a prompt over the context, so that agents compact and
+        # retry: its tokens, the prompt tokens memory holds it now where the
+        # engine says so, and what helps; never --max-context, which sizes no
+        # memory a lone request lacks. The console keeps the engine's
+        # sentence, beside the same advice.
         native = (
             "could not allocate KV target: engine memory budget exceeded "
-            "(additional_pages=12, free_pages=0); the request does not fit in the "
-            "memory this server may use, even after every cached prefix was "
-            "evicted: restart the server with a smaller --max-context, or with a "
-            "larger --max-memory where one lowered it"
+            "(additional_pages=12, free_pages=0); the request, a Resident lane "
+            "of 2 tokens in prefill, does not fit in the memory this server may "
+            "use beside device_untracked_bytes=0 of Metal memory outside the "
+            "server's buffers, even after every cached prefix was evicted and "
+            "any store of streamed experts shrank to its floor"
         )
         records = []
         capacity = [
             Plan(
                 exception=api.engine_runtime.RequestFailed(
-                    1, b"capacity_exhausted", native.encode(), retryable=False
+                    1,
+                    b"capacity_exhausted",
+                    native.encode(),
+                    capacity_limit=wire.CapacityLimit.MEMORY,
+                    fits_tokens=1,
                 )
             )
             for _ in range(2)
@@ -255,7 +306,7 @@ class RequestFailureTests(HarnessTestCase):
         harness = self.harness(
             FakeRuntime(*capacity, Plan([[4]])), request_logger=records.append
         )
-        # Retrying fails the same way, so no response invites a retry.
+        bodies = {}
         for path, body in (
             ("/v1/chat/completions", chat_body()),
             ("/v1/messages", anthropic_body()),
@@ -268,20 +319,90 @@ class RequestFailureTests(HarnessTestCase):
                 "POST", path, json.dumps(body), {"Content-Type": "application/json"}
             )
             response = connection.getresponse()
-            error = json.loads(response.read())["error"]
+            # Retrying the same request fails the same way: no Retry-After.
             self.assertEqual(response.status, 400)
             self.assertIsNone(response.getheader("Retry-After"))
-            self.assertEqual(error["type"], "invalid_request_error")
-            self.assertEqual(error["message"], native)
-            if path == "/v1/chat/completions":
-                self.assertEqual(error["code"], "capacity_exhausted")
+            bodies[path] = json.loads(response.read())
+        tokens = [r["prompt_tokens"] for r in records if r["outcome"] == "error"]
+        remedy = (
+            "shorten the conversation, or restart the server with a larger "
+            "--max-memory if one was set below this Mac's memory"
+        )
+        chat = bodies["/v1/chat/completions"]["error"]
+        self.assertEqual(chat["type"], "invalid_request_error")
+        self.assertEqual(chat["code"], "context_length_exceeded")
+        self.assertEqual(
+            chat["message"],
+            f"prompt does not fit in this server's memory: {tokens[0]} tokens > "
+            f"1 tokens it holds for this request now; {remedy}",
+        )
+        messages = bodies["/v1/messages"]
+        self.assertEqual(messages["type"], "error")
+        self.assertEqual(messages["error"]["type"], "invalid_request_error")
+        self.assertEqual(
+            messages["error"]["message"],
+            f"prompt is too long: {tokens[1]} tokens > 1 maximum input tokens "
+            f"this server's memory holds for it now; {remedy}",
+        )
+        for body in (chat["message"], messages["error"]["message"]):
+            self.assertNotIn("--max-context", body)
+            self.assertNotIn("additional_pages", body)
         status, _, _ = harness.request("POST", "/v1/chat/completions", chat_body())
         self.assertEqual(status, 200)
-        # The console line names the engine's reason.
+        # The console line names the engine's code, its reason and the advice
+        # its client got.
         failed = [record for record in records if record["outcome"] == "error"]
+        self.assertEqual(
+            [record["error_code"] for record in failed], ["capacity_exhausted"] * 2
+        )
         self.assertEqual([record["engine_reason"] for record in failed], [native] * 2)
+        self.assertEqual([record["remedy"] for record in failed], [remedy] * 2)
 
-    def test_disk_quota_failure_is_a_bad_request_naming_the_ssd_cache(self):
+    def test_capacity_failure_names_counts_only_where_they_say_why(self):
+        # Where the engine cannot say what memory holds the request, or its
+        # prompt fit and its output outgrew what it holds, the message names
+        # its tokens alone: each limit with what helps it.
+        cases = (
+            (wire.CapacityLimit.MEMORY, 0, "this server's memory", "--max-memory"),
+            (wire.CapacityLimit.MEMORY, 4080, "this server's memory", "--max-memory"),
+            (
+                wire.CapacityLimit.CLOSED_DISK,
+                0,
+                "this server's memory",
+                "reopens the SSD cache that stopped taking writes",
+            ),
+        )
+        for limit, fits, where, remedy in cases:
+            with self.subTest(limit=limit.name, fits=fits):
+                failure = api.engine_runtime.RequestFailed(
+                    1,
+                    b"capacity_exhausted",
+                    b"does not fit",
+                    capacity_limit=limit,
+                    fits_tokens=fits,
+                )
+                harness = self.harness(
+                    FakeRuntime(Plan(exception=failure), Plan(exception=failure))
+                )
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", chat_body()
+                )
+                self.assertEqual(status, 400)
+                self.assertRegex(
+                    json.loads(payload)["error"]["message"],
+                    rf"^prompt does not fit in {where}: 2 tokens; .*{remedy}",
+                )
+                status, _, payload = harness.request(
+                    "POST", "/v1/messages", anthropic_body()
+                )
+                self.assertEqual(status, 400)
+                self.assertRegex(
+                    json.loads(payload)["error"]["message"],
+                    rf"^prompt is too long: 2 tokens do not fit in {where} now; "
+                    rf".*{remedy}",
+                )
+
+    def test_disk_quota_failure_is_a_context_overflow_naming_the_ssd_cache(self):
         native = (
             "this request's KV needs needed_bytes=1703936 of the SSD cache, which may "
             "hold active_limit_bytes=425984 of active KV now (--max-cache-disk and the "
@@ -290,7 +411,11 @@ class RequestFailureTests(HarnessTestCase):
         runtime = FakeRuntime(
             Plan(
                 exception=api.engine_runtime.RequestFailed(
-                    1, b"kv_disk_quota", native.encode(), retryable=False
+                    1,
+                    b"kv_disk_quota",
+                    native.encode(),
+                    capacity_limit=wire.CapacityLimit.DISK_QUOTA,
+                    fits_tokens=1,
                 )
             ),
             Plan([[4]]),
@@ -302,8 +427,13 @@ class RequestFailureTests(HarnessTestCase):
         error = json.loads(payload)["error"]
         # Retrying fails the same way while memory and the quota stay as they are.
         self.assertEqual(status, 400)
-        self.assertEqual(error["code"], "kv_disk_quota")
-        self.assertEqual(error["message"], native)
+        self.assertEqual(error["code"], "context_length_exceeded")
+        self.assertEqual(
+            error["message"],
+            "prompt does not fit in the SSD cache: 2 tokens > 1 tokens it holds "
+            "for this request now; shorten the conversation, or restart the "
+            "server with a larger --max-cache-disk",
+        )
         status, _, _ = harness.request("POST", "/v1/chat/completions", chat_body())
         self.assertEqual(status, 200)
 
@@ -386,21 +516,31 @@ class RequestFailureTests(HarnessTestCase):
                 )
                 console.assert_not_called()
 
-    def test_a_failure_after_the_engine_took_the_request_names_it(self):
-        """The handler's own failure of a request the engine took, as its
-        deadline, names the engine's id, as the backend's lines do."""
+    def test_a_deadline_after_the_engine_took_the_request_ends_its_record(self):
+        """The handler's deadline of a request the engine took ends the
+        request's record, the one line that names it by the engine's id;
+        the handler prints none of its own."""
+        records = []
         blocking = Plan([[4]], block=True)
-        harness = self.harness(FakeRuntime(blocking))
+        harness = self.harness(FakeRuntime(blocking), request_logger=records.append)
         with mock.patch.object(api, "print_status") as console:
             status, _, _ = harness.request(
                 "POST", "/v1/chat/completions", chat_body(timeout=0.03)
             )
         blocking.release.set()
         self.assertEqual(status, 504)
-        console.assert_called_once()
+        console.assert_not_called()
+        deadline = time.monotonic() + 5
+        while not records or records[-1]["outcome"] == "started":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
         self.assertEqual(
-            console.call_args.args[0],
-            "Error · request 1 · request_timeout · POST /v1/chat/completions",
+            (
+                records[-1]["outcome"],
+                records[-1]["error_code"],
+                records[-1]["request_id"],
+            ),
+            ("error", "request_timeout", 1),
         )
 
     def test_unexpected_handler_error_cancels_and_is_structured(self):

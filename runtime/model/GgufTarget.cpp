@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <regex>
 #include <set>
-#include <span>
 #include <string>
 
 namespace splash::model {
@@ -48,38 +47,24 @@ std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &
 }
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
-                                   const std::vector<std::filesystem::path> &paths, std::string_view architecture,
-                                   const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
-                                   ExpertStoreOptions experts)
-    : backend_(backend), images_(images), planned_(std::make_shared<Planned>(paths)) {
-  planned_->images =
-      gguf::planImages(planned_->source.file(), architecture, geometry,
-                       {.streamExperts = experts.memoryBytes != 0, .streamTable = table.cacheBytes != 0});
-  planned_->layers = geometry.layers;
-  planned_->firstMoeLayer = geometry.leadingDenseLayers;
-  planned_->table = table;
-  planned_->experts = experts;
+                                   const std::vector<std::filesystem::path> &paths, const GgufTargetPlan &plan,
+                                   SparseRowStoreOptions table, ExpertStoreOptions experts,
+                                   gguf::Float16Weights weights)
+    : GgufTargetLoader(backend, images, std::make_shared<Planned>(paths), plan, std::move(table), experts, weights) {}
+
+GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
+                                   std::shared_ptr<Planned> planned, const GgufTargetPlan &plan,
+                                   SparseRowStoreOptions table, ExpertStoreOptions experts,
+                                   gguf::Float16Weights weights)
+    : TargetImages(backend, images, std::shared_ptr<std::vector<gguf::Image>>(planned, &planned->images),
+                   [planned] { planned->source.checkUnchanged(); }, plan.layerImages, plan.firstMoeLayer,
+                   std::move(table), experts, weights),
+      planned_(std::move(planned)) {
+  const gguf::PlanOptions options = readingValues(planOptions());
+  planned_->images = plan.images(planned_->source.file(), options);
 }
 
-StreamedBlocks GgufTargetLoader::streamedExperts() const {
-  const std::span layers = std::span(planned_->images).first(planned_->layers);
-  return {gguf::streamedExperts(layers.subspan(planned_->firstMoeLayer)), planned_,
-          {[planned = planned_] { planned->source.checkUnchanged(); }}};
-}
-
-const gguf::Image *GgufTargetLoader::tablePlan() const noexcept {
-  const size_t index = planned_->layers + 2;
-  return index < planned_->images.size() ? &planned_->images[index] : nullptr;
-}
-
-WeightFile GgufTargetLoader::table() {
-  const gguf::Image *plan = tablePlan();
-  if (!plan) throw GgufError("the target has no table");
-  if (plan->streamedRows) throw GgufError("the target's table streams");
-  return open(planned_->layers + 2);
-}
-
-std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() const {
+std::optional<TargetImages::StreamedTable> GgufTargetLoader::streamTable() const {
   const gguf::Image *plan = tablePlan();
   if (!plan || !plan->streamedRows) return std::nullopt;
   const gguf::StreamedRows &rows = *plan->streamedRows;
@@ -89,22 +74,8 @@ std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() c
   return StreamedTable{
       std::make_shared<SparseRowStore>(SparseRowTable{rows.tensor, rows.rows, rows.rowBytes, rows.offset},
                                        openRowReader(std::shared_ptr<const WeightSource>(planned_, &source)),
-                                       planned_->table),
-      rows.format, imageRecord(images_, "target/", *plan)};
+                                       tableOptions()),
+      rows.format, tableRecord(*plan)};
 }
-
-WeightFile GgufTargetLoader::open(size_t index) {
-  return loadImage(backend_, images_, "target/", {planned_, &planned_->images[index]},
-                   [planned = planned_] { planned->source.checkUnchanged(); });
-}
-
-WeightFile GgufTargetLoader::layer(uint32_t index) {
-  if (index >= planned_->layers) throw GgufError("target layer is out of range");
-  return open(index);
-}
-
-WeightFile GgufTargetLoader::head() { return open(planned_->layers); }
-
-WeightFile GgufTargetLoader::embedding() { return open(planned_->layers + 1); }
 
 } // namespace splash::model

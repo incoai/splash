@@ -14,7 +14,9 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
@@ -29,8 +31,11 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
+
+extern char **environ;
 
 using namespace splash;
 using namespace splash::engine;
@@ -751,9 +756,194 @@ void testFlushEndsOrStopsAtItsDeadline() {
           "a flush whose writes never land did not stop at its deadline");
 }
 
+// The roles this binary plays for the stop-signal test, spawned as their
+// own processes: an engine that installs the stop signals and says when one
+// asks it to stop, and a server that starts one and exits when told.
+constexpr std::string_view kEngineRole = "stop-signals-engine";
+constexpr std::string_view kServerRole = "stop-signals-server";
+
+void writeLine(int fd, const std::string &line) {
+  const std::string text = line + "\n";
+  if (write(fd, text.data(), text.size()) != static_cast<ssize_t>(text.size()))
+    _exit(3);
+}
+
+// Installs the stop signals over a transport whose input never ends, says
+// "ready", and "stopped" once a signal asked the transport to stop; it gives
+// up after 10 s.
+int runStopSignalsEngine() {
+  std::array<int, 2> input{};
+  if (pipe(input.data()))
+    return 2;
+  const int output = open("/dev/null", O_WRONLY);
+  FdTransport transport(input[0], output);
+  StopSignals signals(transport);
+  writeLine(STDOUT_FILENO, "ready");
+  for (int waited = 0; waited < 5'000; ++waited) {
+    if (transport.shutdownRequested()) {
+      writeLine(STDOUT_FILENO, "stopped");
+      _exit(0);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  _exit(1);
+}
+
+// Spawns `self` in `role` with stdin and stdout on the fds given, stderr,
+// and no other fd: a pipe's end it inherited would keep the pipe open. Its
+// stop signals are at their defaults and none blocked, and it has the
+// variable by which a server tells its engine to stop on its signal alone
+// when `underServer`.
+pid_t spawnRole(const char *self, std::string_view role, int in, int out, bool underServer) {
+  posix_spawn_file_actions_t files;
+  posix_spawn_file_actions_init(&files);
+  posix_spawn_file_actions_adddup2(&files, in, STDIN_FILENO);
+  posix_spawn_file_actions_adddup2(&files, out, STDOUT_FILENO);
+  posix_spawn_file_actions_addinherit_np(&files, STDERR_FILENO);
+  posix_spawnattr_t attributes;
+  posix_spawnattr_init(&attributes);
+  sigset_t defaults, none;
+  sigemptyset(&defaults);
+  for (const int number : {SIGTERM, SIGINT, SIGHUP})
+    sigaddset(&defaults, number);
+  sigemptyset(&none);
+  posix_spawnattr_setsigdefault(&attributes, &defaults);
+  posix_spawnattr_setsigmask(&attributes, &none);
+  posix_spawnattr_setflags(&attributes,
+                           POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_CLOEXEC_DEFAULT);
+  std::vector<std::string> environment;
+  for (char **variable = environ; *variable; ++variable)
+    if (!std::string_view(*variable).starts_with("SPLASH_ENGINE_STOPPED_BY_PARENT="))
+      environment.emplace_back(*variable);
+  if (underServer)
+    environment.emplace_back("SPLASH_ENGINE_STOPPED_BY_PARENT=1");
+  std::vector<char *> envp;
+  for (std::string &variable : environment)
+    envp.push_back(variable.data());
+  envp.push_back(nullptr);
+  std::string program(self), name(role);
+  char *argv[] = {program.data(), name.data(), nullptr};
+  pid_t pid = 0;
+  const int error = posix_spawn(&pid, self, &files, &attributes, argv, envp.data());
+  posix_spawn_file_actions_destroy(&files);
+  posix_spawnattr_destroy(&attributes);
+  if (error || pid <= 0)
+    throw std::runtime_error("cannot spawn " + std::string(role) + ": " + std::strerror(error));
+  return pid;
+}
+
+// Starts an engine as a server does and exits once its input ends, leaving
+// the engine to run without it; says the engine's pid first.
+int runStopSignalsServer(const char *self) {
+  const pid_t engine = spawnRole(self, kEngineRole, STDIN_FILENO, STDOUT_FILENO, true);
+  writeLine(STDOUT_FILENO, "engine " + std::to_string(engine));
+  char byte = 0;
+  while (read(STDIN_FILENO, &byte, 1) > 0) {
+  }
+  _exit(0);
+}
+
+// The next line a role writes on `fd` within `timeout`; empty at its end or
+// when none arrived.
+std::string readLine(int fd, std::chrono::milliseconds timeout) {
+  std::string line;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  char byte = 0;
+  while (true) {
+    const auto left =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+    pollfd ready{fd, POLLIN, 0};
+    if (left <= 0 || poll(&ready, 1, static_cast<int>(left)) <= 0 || read(fd, &byte, 1) != 1)
+      return {};
+    if (byte == '\n')
+      return line;
+    line += byte;
+  }
+}
+
+// Sends `number` to `pid` from another process, as a stop of the whole
+// process group comes from one.
+void signalFromAnotherProcess(pid_t pid, const char *number) {
+  // A pid of 0 or less names a process group, or every process.
+  if (pid <= 1)
+    throw std::logic_error("no engine to signal");
+  std::string program("/bin/kill"), flag("-s"), name(number), target = std::to_string(pid);
+  char *argv[] = {program.data(), flag.data(), name.data(), target.data(), nullptr};
+  pid_t sender = 0;
+  if (posix_spawn(&sender, "/bin/kill", nullptr, nullptr, argv, environ))
+    throw std::runtime_error("cannot run /bin/kill");
+  int status = 0;
+  waitpid(sender, &status, 0);
+  require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "/bin/kill did not signal the engine");
+}
+
+// An engine a server started stops on that server's own SIGTERM or SIGINT,
+// not on one another process sends while the server lives, as a stop of the
+// process group reaches it beside the server, which drains first; SIGHUP,
+// any once the server is gone, and any to an engine no server started stop
+// it whoever sends them. Each stop is said within 5 s; each that is not, in
+// 300 ms.
+void testAnEngineUnderAServerStopsOnItsServersSignalAlone(const char *self) {
+  using namespace std::chrono_literals;
+  struct Spawned final {
+    Pipes pipes;
+    pid_t pid = 0;
+    Spawned(const char *self, bool underServer) {
+      pid = spawnRole(self, kEngineRole, pipes.input[0], pipes.output[1], underServer);
+      close(pipes.output[1]);
+      pipes.output[1] = -1;
+      require(readLine(pipes.output[0], 5s) == "ready", "the engine did not install its stop signals");
+    }
+    [[nodiscard]] bool stops(std::chrono::milliseconds within) const {
+      return readLine(pipes.output[0], within) == "stopped";
+    }
+    ~Spawned() {
+      kill(pid, SIGKILL);
+      waitpid(pid, nullptr, 0);
+    }
+  };
+  for (const char *number : {"TERM", "INT"}) {
+    Spawned engine(self, true);
+    signalFromAnotherProcess(engine.pid, number);
+    require(!engine.stops(300ms), std::string("SIG") + number + " from another process stopped an engine its server runs");
+    kill(engine.pid, std::string_view(number) == "TERM" ? SIGTERM : SIGINT);
+    require(engine.stops(5s), std::string("the server's own SIG") + number + " did not stop its engine");
+  }
+  {
+    Spawned engine(self, true);
+    signalFromAnotherProcess(engine.pid, "HUP");
+    require(engine.stops(5s), "SIGHUP from another process did not stop an engine its server runs");
+  }
+  {
+    Spawned engine(self, false);
+    signalFromAnotherProcess(engine.pid, "TERM");
+    require(engine.stops(5s), "SIGTERM from another process did not stop an engine no server started");
+  }
+  // The server goes, the engine stays, and then any SIGTERM stops it.
+  Pipes pipes;
+  const pid_t server = spawnRole(self, kServerRole, pipes.input[0], pipes.output[1], false);
+  close(pipes.output[1]);
+  pipes.output[1] = -1;
+  const std::string started = readLine(pipes.output[0], 5s);
+  require(started.starts_with("engine ") && readLine(pipes.output[0], 5s) == "ready",
+          "the server role did not start its engine");
+  const pid_t engine = static_cast<pid_t>(std::stol(started.substr(7)));
+  pipes.closeInputWriter();
+  waitpid(server, nullptr, 0);
+  signalFromAnotherProcess(engine, "TERM");
+  const bool stopped = readLine(pipes.output[0], 5s) == "stopped";
+  if (!stopped)
+    kill(engine, SIGKILL);
+  require(stopped, "SIGTERM from another process did not stop an engine whose server is gone");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc > 1 && argv[1] == kEngineRole)
+    return runStopSignalsEngine();
+  if (argc > 1 && argv[1] == kServerRole)
+    return runStopSignalsServer(argv[0]);
   try {
     testTransportNeedsRoomForInput();
     testCleanEofAndProtocolFailure();
@@ -771,6 +961,7 @@ int main() {
     testNoOutputWriteStartsAfterAShutdown();
     testFailedOutputEndsTheLoop();
     testFlushEndsOrStopsAtItsDeadline();
+    testAnEngineUnderAServerStopsOnItsServersSignalAlone(argv[0]);
     std::cout << "native fd transport tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

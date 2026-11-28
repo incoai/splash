@@ -1,6 +1,7 @@
 #include "Checked.hpp"
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
+#include "TestStderr.hpp"
 #include "model/Crc32c.hpp"
 #include "model/SlotFile.hpp"
 #include "model/SsdReaders.hpp"
@@ -75,6 +76,7 @@ using splash::kHostPageBytes;
 using splash::model::DiskBudget;
 using splash::model::SlotFile;
 using splash::model::SlotRecord;
+using splash::model::slotFileDamage;
 using splash::model::SsdReaders;
 
 // A slot is its payload rounded up to whole host pages, as uncached IO wants.
@@ -82,6 +84,7 @@ static_assert(SlotFile::slotBytesFor(1) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes + 1) == 2 * kHostPageBytes);
 
+using splash::test::capturedStderr;
 using splash::test::dataBytes;
 using splash::test::rejects;
 using splash::test::require;
@@ -453,7 +456,8 @@ static void testShortPayloadEndsTheFile() {
   require(file.read(slot, {output}, {})->wait() && output == payload, "a short adopted payload did not read back");
 }
 
-// An adopted slot's first read checks its payload against the record; damage fails only that slot.
+// An adopted slot's first read checks its payload against the record; damage fails only that slot, which the log
+// says once, naming the file, and /status counts.
 static void testAdoptedSlotsCheckTheirFirstRead() {
   constexpr size_t size = kHostPageBytes;
   Directory directory;
@@ -480,7 +484,17 @@ static void testAdoptedSlotsCheckTheirFirstRead() {
   auto intact = file.adopt(records[1]);
   auto partial = file.adopt(records[2]);
   file.finishAdoption();
-  require(!file.read(damaged, {output}, {})->wait(), "a damaged slot read back");
+  const uint64_t failures = slotFileDamage().checksumFailures;
+  const std::string log = capturedStderr([&] {
+    require(!file.read(damaged, {output}, {})->wait(), "a damaged slot read back");
+    require(!file.read(damaged, {output}, {})->wait(), "a damaged slot read back the second time");
+  });
+  require(log.find("Persistent cache file " + directory.slots().string() +
+                   ": the copy in slot 0 fails its checksum; the server gives it up, and the request that needed it "
+                   "recomputes what it held.") != std::string::npos &&
+              log.find("fails its checksum", log.find("fails its checksum") + 1) == std::string::npos &&
+              slotFileDamage().checksumFailures == failures + 1,
+          "a damaged copy was not said once in the log, naming its file, and counted: " + log);
   require(file.read(intact, {output}, {})->wait() && output == five &&
               file.read(intact, {output}, {})->wait(),
           "an intact adopted slot did not read back");
@@ -490,6 +504,72 @@ static void testAdoptedSlotsCheckTheirFirstRead() {
   auto fresh = file.acquire(size);
   require(file.write(fresh, {four}, {})->wait() && file.read(fresh, {half}, {})->wait(),
           "a slot this process wrote was checked against a record");
+}
+
+// A persistent file cut short leaves behind the records past its end, keeps those within it, and says how short it is
+// and how many it left behind (SlotFile::cutShort), which /status counts.
+static void testAFileCutShortSaysWhatItLeftBehind() {
+  constexpr size_t size = kHostPageBytes;
+  Directory directory;
+  const std::vector<std::byte> payload(size, std::byte{7});
+  {
+    SlotFile file(size, std::make_shared<DiskBudget>(3 * size), directory.persistence());
+    require(!file.cutShort(), "a new file was cut short");
+    file.finishAdoption();
+    std::vector<std::shared_ptr<SlotFile::Slot>> kept;
+    for (uint64_t label = 1; label <= 3; ++label) {
+      kept.push_back(file.acquire(size));
+      require(file.write(kept.back(), {payload}, {})->wait(), "persistent write failed");
+      file.label(kept.back(), labelOf(label));
+    }
+    require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+    file.seal();
+  }
+  require(::truncate(directory.slots().c_str(), static_cast<off_t>(size + size / 2)) == 0,
+          "the slot file could not be cut short");
+  const uint64_t cutCopies = slotFileDamage().cutCopies;
+  SlotFile file(size, std::make_shared<DiskBudget>(3 * size), directory.persistence());
+  const std::optional<SlotFile::CutShort> &cut = file.cutShort();
+  require(file.records().size() == 1 && cut && cut->path == directory.slots().string() &&
+              cut->fileBytes == size + size / 2 && cut->reachBytes == 3 * size && cut->records == 3 &&
+              cut->cut == 2 && slotFileDamage().cutCopies == cutCopies + 2,
+          "a file cut short did not say what it left behind: records " + std::to_string(file.records().size()) +
+              (cut ? ", file " + std::to_string(cut->fileBytes) + ", reach " + std::to_string(cut->reachBytes) +
+                         ", records " + std::to_string(cut->records) + ", cut " + std::to_string(cut->cut)
+                   : std::string(", none cut")));
+}
+
+// A slot an earlier process wrote checks the whole segment a read touches, so its first bytes need a buffer that
+// holds the segment: one of their own size reads them in the process that wrote the slot and not in the next, and
+// one of the slot's size reads them in both.
+static void testAnAdoptedSlotsFirstBytesNeedTheSegmentsRoom() {
+  constexpr size_t size = 4 * kHostPageBytes, prefix = kHostPageBytes;
+  Directory directory;
+  const std::vector<std::byte> payload(size, std::byte{7});
+  const auto firstBytes = [&](SlotFile &file, const SlotFile::Slot &slot, size_t room) {
+    auto *bytes = static_cast<std::byte *>(::operator new(room, std::align_val_t{splash::kSlotReadAlignmentBytes}));
+    const auto read = file.readAt(slot, 0, prefix, {bytes, room});
+    const bool whole = read && read->size() == prefix && (*read)[prefix - 1] == std::byte{7};
+    ::operator delete(bytes, std::align_val_t{splash::kSlotReadAlignmentBytes});
+    return whole;
+  };
+  {
+    SlotFile file(size, std::make_shared<DiskBudget>(2 * size), directory.persistence());
+    file.finishAdoption();
+    auto slot = file.acquire(size);
+    require(file.write(slot, {payload}, {})->wait(), "persistent write failed");
+    file.label(slot, labelOf(1));
+    require(firstBytes(file, *slot, prefix + splash::kSlotReadAlignmentBytes),
+            "the process that wrote the slot did not read its first bytes into a buffer of their size");
+    require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+    file.seal();
+  }
+  SlotFile file(size, std::make_shared<DiskBudget>(2 * size), directory.persistence());
+  require(file.records().size() == 1, "the written slot's record did not come back");
+  auto slot = file.adopt(file.records()[0]);
+  file.finishAdoption();
+  require(!firstBytes(file, *slot, prefix + splash::kSlotReadAlignmentBytes) && firstBytes(file, *slot, size),
+          "an adopted slot's first bytes were read without its segment's room, or not with it");
 }
 
 // A file written for another tag empties when it opens; so does a record
@@ -944,10 +1024,9 @@ static void testTheLimitBoundsLiveSlots() {
   auto first = file.acquire(size), second = file.acquire(size);
   require(first && second && !file.acquire(size), "the limit did not bound live slots");
   budget->setLimitBytes(size - 1);
-  require(!file.takesWrite(false) && !file.takesWrite(true),
-          "a file took a write under a limit that holds no slot");
+  require(!file.takesWrite(), "a file took a write under a limit that holds no slot");
   budget->setLimitBytes(size);
-  require(file.takesWrite(true), "a file took no write under a limit that holds a slot");
+  require(file.takesWrite(), "a file took no write under a limit that holds a slot");
   first.reset();
   require(!file.acquire(size), "a slot was granted while more than the limit was live");
   second.reset();
@@ -958,7 +1037,7 @@ static void testTheLimitBoundsLiveSlots() {
           "a written file did not measure its blocks");
 }
 
-// Writes draw their host pages from the write budget; overdrawn, it holds back writes not in use
+// Writes draw their host pages from the write budget; overdrawn, it holds back every cache write
 // until it refills.
 static void testWritesDrawOnTheWriteBudget() {
   constexpr size_t size = kHostPageBytes;
@@ -966,11 +1045,11 @@ static void testWritesDrawOnTheWriteBudget() {
   double now = 0.0;
   auto budget = std::make_shared<DiskBudget>(16 * size, [&now] { return now; });
   SlotFile file(2 * size, budget);
-  require(file.takesWrite(false) && !budget->admitsAgainAt() && !budget->writeBudgetBytes(),
+  require(file.takesWrite() && !budget->admitsAgainAt() && !budget->writeBudgetBytes(),
           "a budget without a write budget held a write back");
   // Four pages a day, one at once.
   budget->setWriteBudget(4 * size);
-  require(budget->writeBudgetBytes() == static_cast<int64_t>(size) && file.takesWrite(false),
+  require(budget->writeBudgetBytes() == static_cast<int64_t>(size) && file.takesWrite(),
           "a new write budget did not start full");
   const std::vector<std::byte> half(size / 2, std::byte{1});
   std::vector<std::shared_ptr<SlotFile::Slot>> slots;
@@ -979,26 +1058,88 @@ static void testWritesDrawOnTheWriteBudget() {
     require(file.write(slots.back(), {half}, {})->wait(), "a slot write failed");
   };
   write();
-  require(!budget->writeBudgetBytes() && file.takesWrite(false),
+  require(!budget->writeBudgetBytes() && file.takesWrite(),
           "half a page's payload did not take its page");
   write();
+  // Overdrawn by a page, it reopens once it holds an eighth of its burst again: 9/32 of a day.
   const auto again = budget->admitsAgainAt();
-  require(!file.takesWrite(false) && file.takesWrite(true) && again &&
-              std::abs(*again - kDay / 4) < 1.0,
-          "an overdrawn budget did not hold back what is not in use alone, or say until when");
-  write();
-  require(std::abs(*budget->admitsAgainAt() - kDay / 2) < 1.0,
-          "a copy in use was not counted");
-  now = kDay / 2 + 1.0;
-  require(file.takesWrite(false) && !budget->admitsAgainAt(),
-          "the budget did not refill at its rate");
+  require(!file.takesWrite() && again && std::abs(*again - 9 * kDay / 32) < 1.0 &&
+              budget->writeBudgetBytes() == -static_cast<int64_t>(size + size / 8),
+          "an overdrawn budget took a write, or did not say until when");
+  now = 9 * kDay / 32 + 1.0;
+  require(file.takesWrite() && !budget->admitsAgainAt(), "the budget did not refill at its rate");
   now = 10 * kDay;
   require(budget->writeBudgetBytes() == static_cast<int64_t>(size),
           "the budget refilled past a quarter of a day's");
-  write();
-  write();
-  budget->lift();
-  require(file.takesWrite(false) && !budget->admitsAgainAt(), "a lifted budget held a write back");
+}
+
+// A spent budget is a read-only spell: back at a balance of zero it takes no write, one write at a time, but stays
+// closed until it holds an eighth of its burst, and then takes writes until it is overdrawn again.
+static void testASpentBudgetStaysClosedUntilItHasRefilled() {
+  constexpr size_t size = kHostPageBytes;
+  constexpr double kDay = 86'400'000.0;
+  double now = 0.0;
+  auto budget = std::make_shared<DiskBudget>(1024 * size, [&now] { return now; });
+  SlotFile file(size, budget);
+  // 256 pages a day, 64 at once; it reopens at 8.
+  budget->setWriteBudget(256 * size);
+  const std::vector<std::byte> page(size, std::byte{2});
+  std::vector<std::shared_ptr<SlotFile::Slot>> slots;
+  const auto writes = [&] {
+    uint32_t count = 0;
+    for (; file.takesWrite(); ++count) {
+      slots.push_back(file.acquire(size));
+      require(file.write(slots.back(), {page}, {})->wait(), "a slot write failed");
+    }
+    slots.clear();
+    return count;
+  };
+  require(writes() == 65, "a full budget did not take its burst and one write");
+  // A page's refill brings the balance back to zero: the old gate took one write there.
+  now += kDay / 256 + 1.0;
+  require(budget->writeBudgetBytes() < -7 * static_cast<int64_t>(size) && !writes(),
+          "a spent budget took a write at a balance of zero");
+  now += 8 * kDay / 256 - 2.0;
+  require(!writes(), "a spent budget took a write short of its reopen level");
+  now += 2.0;
+  const uint32_t reopened = writes();
+  require(reopened == 9, "a refilled budget did not take what it reopened with and one write: " + std::to_string(reopened));
+  now += kDay / 256 + 1.0;
+  require(!writes(), "a budget overdrawn again took a write before it refilled");
+}
+
+// Over days of a writer that writes whenever it may, the cache never writes more than the burst, the refill and one
+// write, and each spell reopens with at least an eighth of the burst.
+static void testTheCapHoldsAcrossSpells() {
+  constexpr size_t size = kHostPageBytes;
+  constexpr double kDay = 86'400'000.0;
+  double now = 0.0;
+  auto budget = std::make_shared<DiskBudget>(1024 * size, [&now] { return now; });
+  SlotFile file(size, budget);
+  budget->setWriteBudget(256 * size);
+  const std::vector<std::byte> page(size, std::byte{3});
+  uint64_t written = 0;
+  uint32_t spells = 0, spellWrites = 0, fewest = UINT32_MAX;
+  bool open = true;
+  for (; now < 3 * kDay; now += kDay / 2048) {
+    const bool takes = file.takesWrite();
+    if (takes && !open) {
+      ++spells;
+      spellWrites = 0;
+    }
+    if (!takes && open && spells)
+      fewest = std::min(fewest, spellWrites);
+    open = takes;
+    while (file.takesWrite()) {
+      require(file.write(file.acquire(size), {page}, {})->wait(), "a slot write failed");
+      written += size;
+      ++spellWrites;
+    }
+    const double cap = 64.0 * size + 256.0 * size * now / kDay + size;
+    require(static_cast<double>(written) <= cap, "the cache wrote past its write budget");
+  }
+  require(spells >= 20 && fewest >= 8, "the budget did not reopen in spells of an eighth of its burst: " +
+                                           std::to_string(spells) + " spells, fewest writes " + std::to_string(fewest));
 }
 
 // The write rate counts what every write took, with a write budget or without, over the last hour
@@ -1394,8 +1535,6 @@ static void testSpillsWithinTheWriteBudget() {
           "the write budget did not say when it covers committed writes again");
   now = 86'400'000.0 / 8;
   require(budget->admitsSpill(size / 2) && !budget->admitsSpill(size), "the write budget did not refill");
-  budget->lift();
-  require(budget->admitsSpill(uint64_t{1} << 50), "a lifted write budget refused a spill");
 }
 
 // While reads a step waits for run, write chunks defer to them; without such reads, or with a read
@@ -1483,6 +1622,7 @@ int main() {
     testPersistentSlotsComeBack();
     testShortPayloadEndsTheFile();
     testAdoptedSlotsCheckTheirFirstRead();
+    testAFileCutShortSaysWhatItLeftBehind();
     testForeignFilesAndDamagedRecordsAreDropped();
     testAdoptionCountsPastTheQuota();
     testSlotsCountTheirPayloads();
@@ -1494,6 +1634,8 @@ int main() {
     testAdoptionReturnsTheHolesAnEarlierProcessKept();
     testTheLimitBoundsLiveSlots();
     testWritesDrawOnTheWriteBudget();
+    testASpentBudgetStaysClosedUntilItHasRefilled();
+    testTheCapHoldsAcrossSpells();
     testWritesCountOverTheLastHourAndDay();
     testFullVolumeIsReported();
     testReadAtReadsAlignedUnits();
@@ -1501,6 +1643,7 @@ int main() {
     testOneSegmentKeepsVersionOneRecords();
     testSegmentedRecords();
     testAdoptedReadsCheckTheirSegments();
+    testAnAdoptedSlotsFirstBytesNeedTheSegmentsRoom();
     testCommitmentsDrawWithinTheActiveLimit();
     testSpillsWithinTheWriteBudget();
     testWritesDeferToReads();

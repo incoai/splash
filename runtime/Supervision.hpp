@@ -10,20 +10,26 @@
 // by which the server fails, stops or relaunches an engine from them.
 //
 // Stopping, from the outside in:
-// 1. The engine, on SIGTERM or the end of its input, stops taking work,
+// 1. The engine, on SIGTERM or the end of its input, stops taking work
+//    (under a server, on the server's own SIGTERM: one sent to the process
+//    group waits for the server's drain, 3),
 //    gives the newest restore points of a persistent cache up to kFlush to
 //    reach the disk and the copies no state needs up to kDrain to go, and
 //    exits.
 // 2. The server stops its engine with SIGTERM, sends SIGKILL to one still
 //    running after kStop, then waits up to kStop more for it to exit.
-// 3. The server, on SIGTERM or a first SIGINT, stops as in 2; later SIGTERMs
-//    are ignored, and a second SIGINT while it stops (the user's double
-//    Ctrl+C) kills the engine at once.
+// 3. The server, on SIGTERM or a first SIGINT, lets the requests its engine
+//    runs finish for up to its --shutdown-timeout (at most kStop, 5 s by
+//    default; a second signal cuts it short), then stops as in 2; later
+//    SIGTERMs are ignored, and a second SIGINT while it stops (the user's
+//    double Ctrl+C) kills the engine at once.
 // 4. The app stops a server with one signal, SIGINT for its own and SIGTERM
 //    for a leftover one (which may already be stopping), and kills the
-//    process group only after 2 * kStop, the longest 2 takes. A second
-//    signal before kStop could cut a flush 1 allows; one after it adds
-//    nothing the server does not do itself.
+//    process group only after 2 * kStop: the longest drain of 3 and the
+//    engine's own stop of 1 fit in it; only 2's wait for an engine that
+//    outlives its SIGKILL, up to kStop more, runs past it, and the group's
+//    kill ends that. A second signal before kStop could cut a flush 1
+//    allows; one after it adds nothing the server does not do itself.
 namespace splash::supervision {
 
 using std::chrono::milliseconds;

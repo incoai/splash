@@ -1,8 +1,10 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/Normalization.h"
 #include "ops/Linear.hpp"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -27,8 +29,52 @@ struct NormWeights final {
 [[nodiscard]] std::string normKernel(std::string_view name, const NormWeights &weights,
                                      uint32_t width);
 
+// A producer's RMS norm epilogue (kernels/common/rms_norm_epilogue.h): the
+// weighted RMS norm, with `weights`, of the bf16 rows a projection or combine
+// writes, which the last of its output tiles to finish writes into `output`
+// (bf16 rows, as addRms writes them): the norm's dispatch fewer. `partials`
+// and `counter` are its scratch, which a step's dispatches share one after
+// another: a float a tile and row, and a counter at zero before and after.
+struct RmsNormEpilogue final {
+  NormWeights weights;
+  metal::MetalBuffer output;
+  metal::MetalBuffer partials;
+  metal::MetalBuffer counter;
+
+  // The bytes of the partials of `tiles` tiles of `rows` rows, and of the
+  // counter.
+  [[nodiscard]] static constexpr uint64_t partialsBytes(uint32_t tiles, uint32_t rows) noexcept {
+    return uint64_t{tiles} * rows * sizeof(float);
+  }
+  static constexpr uint64_t kCounterBytes = sizeof(uint32_t);
+  // The parameters of a producer of `tiles` output tiles of `rows` rows of
+  // `width` values, each buffer checked to hold them; throws otherwise.
+  [[nodiscard]] RmsNormEpilogueParams params(uint32_t rows, uint32_t width, uint32_t tiles) const;
+  // Its bindings, in the kernels' order: partials, counter, weights, output.
+  [[nodiscard]] std::array<metal::MetalBuffer, 4> bindings() const { return {partials, counter, weights.buffer, output}; }
+};
+
+// A LayerNorm's bf16 weight and bias of every column.
+struct LayerNormWeights final {
+  metal::MetalBuffer weight;
+  metal::MetalBuffer bias;
+};
+
 class Normalization final {
 public:
+  // A LayerNorm's contract, which its owner checks once, where it takes the
+  // weights: a bf16 weight and bias of each of `width` columns. Throws,
+  // naming `name`, otherwise.
+  static void requireLayer(const LayerNormWeights &weights, uint32_t width, const std::string &name);
+  // LayerNorm with bias of `rows` fp32 rows of `width`, a tower's residual
+  // stream, into bf16 rows: (x - mean) / sqrt(variance + epsilon) * weight +
+  // bias, the mean and variance fp32 over the row, of weights requireLayer
+  // took. Into fp32 rows instead with outputElement Float32, which may be the
+  // input's own (the LayerNorm that starts Inkling 2's tower's residual
+  // stream).
+  static void addLayer(metal::CommandGraph &graph, const metal::MetalBuffer &input,
+                       const LayerNormWeights &weights, const metal::MetalBuffer &output, uint32_t width,
+                       uint32_t rows, float epsilon, FloatOutput outputElement = FloatOutput::BFloat16);
   // Also writes the consumer's `layout` table into `scratch` when it is not
   // Plain, and throws when `scratch` cannot hold it; returns what the
   // scratch then describes.

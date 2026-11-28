@@ -16,10 +16,15 @@ this machine, which must be otherwise idle:
   EXPECT_OUTPUT_CHANGE=1) each build must still repeat itself, and the
   candidate's acceptance rate per width may be at most 0.02 below the
   baseline's.
-- the prefill FFN's Neural Engine split: with --ane-ffn-share every round
-  runs that share and must report it. Without it startup calibrates the split
-  from timings, so the first share and least chunk rows a round reports are
-  those every later round runs.
+- the prefill FFN's Neural Engine split: every round runs the same one and
+  the result names the split each round reported. With --ane-ffn-share every
+  round runs that share (0: the GPU alone), which the split rounds to whole
+  channel units. Without it a start of the candidate's benchmark before the
+  rounds calibrates the split, or recalls this Mac's record of it, and every
+  round runs the share and least chunk rows it reports; a calibrated split of
+  two shares, one in one step and one in two, runs at the larger in both, as
+  --ane-ffn-share gives a split. Every round must report the first round's
+  share and least chunk rows.
 - speed (abba.compare): decode GPU milliseconds per step and wall
   milliseconds per output token for B1-B4, the GPU time and the wall time of
   the 14,096-token cold prefill (partial_4k_cold), the TTFT of its partial
@@ -41,6 +46,12 @@ this machine, which must be otherwise idle:
   EXPECT_IMAGE_CHANGE=1), for a change of the image layout, the images that
   differ are reported and fail nothing.
 
+Every load sends the benchmark's chat requests (its decode throughput prompt
+and its transcripts' requests) in the model's own tokens, rendered by its
+tokenizer and chat template (chat_prompts): with --prompts, a file beside the
+result, where they are not the benchmark's built-in Qwen tokens, so that a
+Qwen model's loads run as they did and any other family's run at all.
+
 The candidate's own benchmark invariants must hold too, and the baseline must
 be another build: one with the candidate's build_id compares nothing. The
 result is <output dir>/backend-regression.json with each round's benchmark
@@ -52,11 +63,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-from dev.benchmarks import abba, weights
+from dev.benchmarks import abba, chat_prompts, weights
 from dev.tests import smoke_real as smoke
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,6 +92,15 @@ MEMORY_PLAN = (
 )
 
 
+# The line a start logs of its split (engine::logOutcome), after its time and
+# any warning's mark.
+SPLIT_LINE = re.compile(
+    r"^(?:\d\d:\d\d:\d\d )?(?:Warning · )?"
+    r"((?:Neural Engine FFN split (?:at|off|unavailable)|The GPU runs the prefill "
+    r"FFN alone).*)"
+)
+
+
 class RegressionError(RuntimeError):
     pass
 
@@ -92,27 +113,54 @@ def ane_ffn_share(value: str) -> float:
     return share
 
 
-def pin_ane_ffn(args, document: dict) -> None:
-    """Holds every round to one Neural Engine split, the given share or else
-    the first share and least chunk rows a round reports, and fails a round
-    that reported another."""
-    share = document["ane_ffn_share"]
-    if args.ane_ffn_share_given:
-        if share != args.ane_ffn_share:
-            raise RegressionError(
-                f"ran the Neural Engine split at share {share}, "
-                f"not the given {args.ane_ffn_share}"
-            )
-        return
-    rows = document["ane_ffn_minimum_rows"]
+def split_options(args) -> list[str]:
+    """The benchmark options of the split every round runs: the given or the
+    calibrated share and least chunk rows. None where the calibration ran no
+    split: --ane-ffn-share 0 would plan another context, so every round runs
+    as it starts and must report no split."""
     if args.ane_ffn_share is None:
-        args.ane_ffn_share, args.ane_ffn_minimum_rows = share, rows
-    elif (share, rows) != (args.ane_ffn_share, args.ane_ffn_minimum_rows):
+        return []
+    options = ["--ane-ffn-share", repr(args.ane_ffn_share)]
+    if args.ane_ffn_share and args.ane_ffn_minimum_rows:
+        options += ["--ane-ffn-minimum-rows", str(args.ane_ffn_minimum_rows)]
+    return options
+
+
+def pin_ane_ffn(args, document: dict) -> None:
+    """Holds every round to one Neural Engine split: the first round's share
+    and least chunk rows, which a given share's split rounds to whole channel
+    units. Fails a round that ran no split for a given share, a split for a
+    given share of 0, or another split than the first round's."""
+    share, rows = document["ane_ffn_share"], document["ane_ffn_minimum_rows"]
+    given = args.ane_ffn_share
+    if given == 0 and share:
+        raise RegressionError(
+            f"ran the Neural Engine split at share {share}, not the given {given} "
+            "(the GPU alone)"
+        )
+    if given and not share:
+        raise RegressionError(
+            f"ran no Neural Engine split, not the share {given} it was given"
+        )
+    if args.ane_ffn_split is None:
+        args.ane_ffn_split = (share, rows)
+    elif (share, rows) != args.ane_ffn_split:
         raise RegressionError(
             f"ran the Neural Engine split at share {share} from {rows} rows, "
-            f"not the first round's {args.ane_ffn_share} from "
-            f"{args.ane_ffn_minimum_rows}"
+            f"not the first round's {args.ane_ffn_split[0]} from "
+            f"{args.ane_ffn_split[1]}"
         )
+
+
+def split_line(log: Path) -> str | None:
+    """The line a start logged of its Neural Engine split, which names the
+    share of each kind of command, without its time, or None."""
+    lines = [
+        found.group(1)
+        for line in log.read_text(errors="replace").splitlines()
+        if (found := SPLIT_LINE.match(line.strip()))
+    ]
+    return lines[-1] if lines else None
 
 
 def parse_document(stdout: str, returncode: int) -> dict:
@@ -131,39 +179,81 @@ def parse_document(stdout: str, returncode: int) -> dict:
     return document
 
 
-def run_round(tree: Path, model_root: Path, round_index: int, version: str, args):
-    """The benchmark's document of one round, every scenario in one load."""
-    stem = args.output_dir / f"round-{round_index + 1}-{version}-{'-'.join(SCENARIOS)}"
+def run_benchmark(
+    tree: Path, model_root: Path, stem: Path, scenarios, samples: int, args
+) -> dict:
+    """The document of one load of tree's benchmark, which runs samples of
+    scenarios with the split's options, its log and stdout beside stem."""
     command = [
         str(tree / BENCHMARK),
         str(tree / METALLIB),
         str(model_root),
         "--samples",
-        str(args.samples),
+        str(samples),
         "--scenario",
-        ",".join(SCENARIOS),
+        ",".join(scenarios),
         "--progress",
         str(stem.with_suffix(".progress.jsonl")),
+        *split_options(args),
+        *args.prompt_options,
     ]
-    # A first round that ran no split pins none: later rounds take the
-    # outcome the build remembered, and the check holds them to it.
-    if args.ane_ffn_share_given or args.ane_ffn_share:
-        command += ["--ane-ffn-share", repr(args.ane_ffn_share)]
-        if args.ane_ffn_minimum_rows:
-            command += ["--ane-ffn-minimum-rows", str(args.ane_ffn_minimum_rows)]
-    print(f"round {round_index + 1} {version}", file=sys.stderr)
     with stem.with_suffix(".log").open("w") as log:
         finished = subprocess.run(
             command, stdout=subprocess.PIPE, stderr=log, text=True
         )
     stem.with_suffix(".json").write_text(finished.stdout)
+    return parse_document(finished.stdout, finished.returncode)
+
+
+def failed(stem: Path, error: Exception) -> RegressionError:
+    log = stem.with_suffix(".log")
+    tail = "".join(log.read_text(errors="replace").splitlines(True)[-3:])
+    return RegressionError(f"{stem.name}: {error} ({log}):\n{tail}")
+
+
+def prompt_options(model_root: Path, output_dir: Path) -> list[str]:
+    """The benchmark options of the model's chat requests: none where its
+    tokenizer and chat template give the built-in ones, else --prompts and
+    the file of its own written in output_dir."""
+    prompts = chat_prompts.model_prompts(model_root)
+    if prompts == chat_prompts.builtin():
+        return []
+    path = output_dir / "prompts.txt"
+    chat_prompts.write(prompts, path)
+    return ["--prompts", str(path)]
+
+
+def calibrate_split(tree: Path, model_root: Path, args) -> dict:
+    """Without a given share: the split the candidate's start calibrates, or
+    recalls, in a load of the short scenario's one sample, which every round
+    then runs (split_options)."""
+    stem = args.output_dir / "split-candidate-short"
+    print("Neural Engine split: the candidate's start", file=sys.stderr)
     try:
-        document = parse_document(finished.stdout, finished.returncode)
+        document = run_benchmark(tree, model_root, stem, ("short",), 1, args)
+    except RegressionError as error:
+        raise failed(stem, error) from error
+    share, rows = document["ane_ffn_share"], document["ane_ffn_minimum_rows"]
+    if share:
+        args.ane_ffn_share, args.ane_ffn_minimum_rows = share, rows
+    return {
+        "share": share,
+        "minimum_rows": rows,
+        "log": split_line(stem.with_suffix(".log")),
+    }
+
+
+def run_round(tree: Path, model_root: Path, round_index: int, version: str, args):
+    """The benchmark's document of one round, every scenario in one load,
+    with the split it logged."""
+    stem = args.output_dir / f"round-{round_index + 1}-{version}-{'-'.join(SCENARIOS)}"
+    print(f"round {round_index + 1} {version}", file=sys.stderr)
+    try:
+        document = run_benchmark(tree, model_root, stem, SCENARIOS, args.samples, args)
         pin_ane_ffn(args, document)
     except RegressionError as error:
-        log = stem.with_suffix(".log")
-        tail = "".join(log.read_text(errors="replace").splitlines(True)[-3:])
-        raise RegressionError(f"{stem.name}: {error} ({log}):\n{tail}") from error
+        raise failed(stem, error) from error
+    document["ane_ffn_log"] = split_line(stem.with_suffix(".log"))
     return document
 
 
@@ -218,6 +308,11 @@ def round_record(version: str, document: dict) -> dict:
         "version": version,
         "identity": {**document["identity"], "build_id": document["build_id"]},
         "memory_plan": {key: document[key] for key in MEMORY_PLAN},
+        "ane_ffn": {
+            "share": document["ane_ffn_share"],
+            "minimum_rows": document["ane_ffn_minimum_rows"],
+            "log": document.get("ane_ffn_log"),
+        },
         "performance_failures": document["performance_failures"],
         **measured,
     }
@@ -340,6 +435,15 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
     if builds["baseline"] == builds["candidate"]:
         failures.append(
             f"the baseline has the candidate's build_id {builds['baseline']}"
+        )
+    splits = {
+        (record["ane_ffn"]["share"], record["ane_ffn"]["minimum_rows"])
+        for record in rounds
+    }
+    if len(splits) != 1:
+        failures.append(
+            f"rounds ran different Neural Engine splits (share, least rows): "
+            f"{sorted(splits)}"
         )
     places = {
         (record["identity"].get("model_root"), record["identity"].get("device"))
@@ -487,8 +591,9 @@ def main(argv=None) -> int:
     smoke.hold_model_root(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trees = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
-    args.ane_ffn_share_given = args.ane_ffn_share is not None
     args.ane_ffn_minimum_rows = None
+    args.ane_ffn_split = None
+    args.prompt_options = []
     document = {
         "schema_version": 2,
         "timing": "native GPU time and TTFT; ABBA rule of dev/benchmarks/abba.py",
@@ -500,6 +605,15 @@ def main(argv=None) -> int:
         "pass": False,
     }
     try:
+        args.prompt_options = prompt_options(args.model_root, args.output_dir)
+        document["prompts"] = (
+            args.prompt_options[-1] if args.prompt_options else "built-in"
+        )
+        document["ane_ffn_given"] = args.ane_ffn_share
+        if args.ane_ffn_share is None:
+            document["ane_ffn_calibration"] = calibrate_split(
+                trees["candidate"], args.model_root, args
+            )
         rounds = [
             round_record(
                 version,
@@ -508,8 +622,7 @@ def main(argv=None) -> int:
             for index, version in enumerate(ROUNDS)
         ]
         document["rounds"] = rounds
-        document["ane_ffn_share"] = args.ane_ffn_share
-        document["ane_ffn_minimum_rows"] = args.ane_ffn_minimum_rows
+        document["ane_ffn_share"], document["ane_ffn_minimum_rows"] = args.ane_ffn_split
         document["comparison"] = summarize(rounds, args.expect_output_change)
         options = args.weight_digest_options
         document["weights"] = weights.compare(
@@ -531,8 +644,29 @@ def main(argv=None) -> int:
     return 0 if document["pass"] else 1
 
 
+def describe_split(split: dict) -> str:
+    """A round's split: the line its start logged, else its share and least
+    chunk rows."""
+    if split.get("log"):
+        return split["log"]
+    if not split["share"]:
+        return "no Neural Engine split"
+    return f"Neural Engine split at share {split['share']} from {split['minimum_rows']} rows"
+
+
 def report(document: dict) -> None:
     comparison = document["comparison"]
+    if calibration := document.get("ane_ffn_calibration"):
+        print(
+            f"Neural Engine split calibrated by the candidate: {describe_split(calibration)}"
+        )
+    given = document.get("ane_ffn_given")
+    for index, record in enumerate(document["rounds"]):
+        print(
+            f"round {index + 1} {record['version']}"
+            + (f" (given share {given})" if given is not None else "")
+            + f": {describe_split(record['ane_ffn'])}"
+        )
     for name, result in comparison["speed"].items():
         rounds = " ".join(f"{value:.2f}" for value in result["rounds"])
         print(f"{name}: {abba.describe(result)} (ABBA {rounds})")

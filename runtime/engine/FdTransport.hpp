@@ -101,4 +101,25 @@ private:
   int outputError_ = 0;
 };
 
+// The process's stop signals while it lives: SIGTERM, SIGINT and SIGHUP ask
+// the transport to shut down (requestShutdown) instead of killing the
+// process, so the normal destructors run. An inherited ignored SIGHUP
+// (nohup) stays ignored, as it does for the server. SIGPIPE is ignored: a
+// closed parent pipe surfaces as EPIPE, which ends the transport as a
+// shutdown. An engine a Splash server started (SPLASH_ENGINE_STOPPED_BY_PARENT
+// =1) stops on that server's own SIGTERM or SIGINT alone while it lives: one
+// sent to the whole process group, Ctrl+C at a terminal or the app's stop,
+// reaches the server too, which first lets the requests in flight finish
+// (--shutdown-timeout) and then stops the engine itself. SIGHUP, and once
+// the server is gone any of them, stops it whoever sends it.
+class StopSignals final {
+public:
+  explicit StopSignals(FdTransport &transport);
+  // Detaches the transport before it is destroyed; later stop signals stay
+  // harmless until the process exits.
+  ~StopSignals();
+  StopSignals(const StopSignals &) = delete;
+  StopSignals &operator=(const StopSignals &) = delete;
+};
+
 } // namespace splash::engine

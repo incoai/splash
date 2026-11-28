@@ -10,6 +10,7 @@
 #include "metal/abi/QuantFormat.h"
 #include "model/DFlashDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
+#include "model/Flint.hpp"
 #include "model/SafetensorsImage.hpp"
 #include "model/SafetensorsTarget.hpp"
 #include "model/VisionLoader.hpp"
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <type_traits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,7 +41,8 @@ inline void writeSyntheticShard(const std::filesystem::path &path,
   uint64_t offset = 0;
   std::vector<uint64_t> offsets;
   for (const SyntheticTensor &tensor : tensors) {
-    uint64_t bytes = tensor.dtype == "U32" || tensor.dtype == "F32"     ? 4
+    uint64_t bytes = tensor.dtype == "I64"                              ? 8
+                     : tensor.dtype == "U32" || tensor.dtype == "F32"     ? 4
                      : tensor.dtype == "U8" || tensor.dtype == "F8_E4M3" ? 1
                                                                          : 2;
     std::string shape;
@@ -114,12 +117,24 @@ inline std::vector<SyntheticTensor> draftTensors(const model::DFlashDraftLayout 
 // The tensors of an MLX target of layout as mlx-lm saves it, which
 // model/SafetensorsImage.cpp reads: bf16 norms, convolution, A_log and
 // dt_bias, and each quantized module's codes, scales and biases in the bits
-// and group size quantization(module) gives, as MLX packs them.
+// and group size quantization(module) gives, as MLX packs them. A Qwen
+// hybrid's names are mlx-vlm's (language_model.*); Flint's mlx-lm's (model.*,
+// lm_head), with its bf16 sinks and router, its leading dense layers and a
+// shared expert of its slices without a gate, as mlx-community's Flint holds
+// them. Its norms are stored as their multipliers, as mlx-community's
+// checkpoints of both store them: the attention q and k norms, by which the
+// loader tells (safetensors::normStorage), hold 1.5, nearer every family's
+// mean (1.414 to 1.707) than that mean less 1.
 template <class Layout, class Quantization>
 std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization quantization) {
   std::vector<SyntheticTensor> result;
   const auto bfloat16 = [&](const std::string &name, std::vector<uint64_t> shape) {
     result.push_back({name, "BF16", std::move(shape)});
+  };
+  const auto multipliers = [&](const std::string &name, uint64_t elements) {
+    std::vector<uint8_t> data(elements * 2);
+    for (uint64_t at = 0; at < elements; ++at) data[2 * at + 1] = 0x3F, data[2 * at] = 0xC0; // bf16 1.5
+    result.push_back({name, "BF16", {elements}, std::move(data)});
   };
   const auto quantized = [&](const std::string &module, uint64_t rows, uint64_t columns, uint64_t experts = 1) {
     const auto [bits, group] = quantization(module);
@@ -130,19 +145,22 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
     bfloat16(module + ".scales", shape(columns / group));
     bfloat16(module + ".biases", shape(columns / group));
   };
+  constexpr bool flint = std::is_same_v<Layout, model::FlintLayout>;
+  const std::string language = flint ? "model." : "language_model.model.";
   const uint64_t hidden = layout.hiddenSize;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    const std::string prefix = "language_model.model.layers." + std::to_string(layer) + ".";
+    const std::string prefix = language + "layers." + std::to_string(layer) + ".";
     bfloat16(prefix + "input_layernorm.weight", {hidden});
     if (layout.isFullAttentionLayer(layer)) {
       const std::string attention = prefix + "self_attn.";
       const uint64_t kv = uint64_t{layout.attentionKvHeads} * layout.attentionHeadDimension;
-      quantized(attention + "q_proj", 2ull * layout.attentionWidth, hidden);
+      quantized(attention + "q_proj", (layout.attentionGate ? 2ull : 1ull) * layout.attentionWidth, hidden);
       quantized(attention + "k_proj", kv, hidden);
       quantized(attention + "v_proj", kv, hidden);
-      bfloat16(attention + "q_norm.weight", {layout.attentionHeadDimension});
-      bfloat16(attention + "k_norm.weight", {layout.attentionHeadDimension});
+      multipliers(attention + "q_norm.weight", layout.attentionHeadDimension);
+      multipliers(attention + "k_norm.weight", layout.attentionHeadDimension);
       quantized(attention + "o_proj", hidden, layout.attentionWidth);
+      if (flint) bfloat16(attention + "softmax_offset", {layout.attentionQueryHeads});
     } else {
       const std::string gdn = prefix + "linear_attn.";
       quantized(gdn + "in_proj_qkv", layout.convolutionDimension, hidden);
@@ -162,18 +180,19 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
       quantized(projections + "up_proj", width, hidden, experts);
       quantized(projections + "down_proj", hidden, width, experts);
     };
-    if (layout.ffnKind == model::QwenFfnKind::SparseMoe) {
-      quantized(mlp + "gate", layout.experts, hidden);
+    if (layout.isMoeLayer(layer)) {
+      if (flint) bfloat16(mlp + "gate.weight", {layout.experts, hidden});
+      else quantized(mlp + "gate", layout.experts, hidden);
       ffn(mlp + "switch_mlp.", layout.expertIntermediateSize, layout.experts);
-      ffn(mlp + "shared_expert.", layout.expertIntermediateSize, 1);
-      quantized(mlp + "shared_expert_gate", 1, hidden);
+      ffn(mlp + "shared_expert.", uint64_t{layout.sharedExpertSlices} * layout.expertIntermediateSize, 1);
+      if (layout.sharedExpertGate) quantized(mlp + "shared_expert_gate", 1, hidden);
     } else {
       ffn(mlp, layout.intermediateSize, 1);
     }
   }
-  bfloat16("language_model.model.norm.weight", {hidden});
-  quantized("language_model.lm_head", layout.vocabularySize, hidden);
-  quantized("language_model.model.embed_tokens", layout.vocabularySize, hidden);
+  bfloat16(language + "norm.weight", {hidden});
+  quantized(flint ? "lm_head" : "language_model.lm_head", layout.vocabularySize, hidden);
+  quantized(language + "embed_tokens", layout.vocabularySize, hidden);
   return result;
 }
 
@@ -186,7 +205,9 @@ enum class FloatCheckpoint { ModelOptimizer, CompressedTensors };
 
 // The tensors of a target of layout in NVFP4 and FP8, as `checkpoint` saves
 // them, which model/SafetensorsImage.cpp reads by transformers names: bf16
-// norms (each stored 1 below the weight the norm multiplies by), convolution
+// norms (each stored 1 below the weight the norm multiplies by: 0, but the
+// attention q and k norms 0.5, by which the loader tells the storage,
+// nearer the hybrids' 0.49 than their 1.49), convolution
 // [channels, 1, taps], GDN alpha and beta, router, shared-expert gate and
 // token table, each routed expert a module of its own, and each quantized
 // module in the format format(module) gives, its codes and E4M3 scales beside
@@ -225,8 +246,11 @@ std::vector<SyntheticTensor> floatTargetTensors(const Layout &layout, Format for
       quantized(attention + "q_proj", 2ull * layout.attentionWidth, hidden);
       quantized(attention + "k_proj", kv, hidden);
       quantized(attention + "v_proj", kv, hidden);
-      bfloat16(attention + "q_norm.weight", {layout.attentionHeadDimension});
-      bfloat16(attention + "k_norm.weight", {layout.attentionHeadDimension});
+      for (const char *norm : {"q_norm.weight", "k_norm.weight"}) {
+        std::vector<uint8_t> half;
+        for (uint32_t at = 0; at < layout.attentionHeadDimension; ++at) half.insert(half.end(), {0x00, 0x3F});
+        result.push_back({attention + norm, "BF16", {layout.attentionHeadDimension}, std::move(half)});
+      }
       quantized(attention + "o_proj", hidden, layout.attentionWidth);
     } else {
       const std::string gdn = prefix + "linear_attn.";
@@ -331,9 +355,12 @@ SyntheticAccounting writeSyntheticModel(const std::filesystem::path &root, const
   writeSyntheticShard(root / "vision" / "model.safetensors", visionTensors(vision));
   uint64_t targetBytes = 0;
   for (const model::gguf::Image &image :
-       model::safetensors::planImages(model::SafetensorsCheckpoint(root / "target"), target))
+       [&] {
+         const model::SafetensorsCheckpoint checkpoint(root / "target");
+         return model::safetensors::planImages(checkpoint, target, model::safetensors::normStorage(checkpoint, target));
+       }())
     targetBytes += image.bytes;
-  return {targetBytes, model::draftImageBytes(root / "draft", draft), model::visionImageBytes(vision)};
+  return {targetBytes, model::draftImageBytes(root / "draft", draft), model::VisionLoader(root / "vision", model::VisionSource::Safetensors, vision).image().bytes};
 }
 
 } // namespace splash::test

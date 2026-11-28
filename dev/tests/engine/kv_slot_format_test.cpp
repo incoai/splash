@@ -15,6 +15,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <numeric>
 #include <iostream>
 #include <ranges>
 #include <span>
@@ -39,10 +40,18 @@ constexpr uint32_t kBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 constexpr kv::Layout kFlashNext{12, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks};
 constexpr kv::Layout kFlashNextBf16{12, 2, 256, kv::Format::BFloat16, 128, true, 0, 0, kv::Reads::SelectedBlocks};
 
-// The bytes a write of the page stores, in slot order.
-std::vector<std::byte> gather(const SlotFormat &format, const test::HostKvPages &pages, uint32_t page) {
+// Block b's pages, base page first: from b x kv::Layout::blockPages on.
+std::vector<uint32_t> blockOf(const kv::Layout &layout, uint32_t block) {
+  std::vector<uint32_t> pages(layout.blockPages());
+  std::iota(pages.begin(), pages.end(), block * layout.blockPages());
+  return pages;
+}
+
+// The bytes a write of block b's part stores, in slot order.
+std::vector<std::byte> gather(const SlotFormat &format, const test::HostKvPages &pages, uint32_t block,
+                              kv::Component part = kv::Component::Base) {
   std::vector<std::byte> payload;
-  for (const std::span<const std::byte> span : format.transferSpans(pages, page))
+  for (const std::span<const std::byte> span : format.transferSpans(pages, blockOf(pages.layout(), block), part))
     payload.insert(payload.end(), span.begin(), span.end());
   return payload;
 }
@@ -158,28 +167,60 @@ void testPitchRule() {
 }
 
 // A layout without block records, one whose attention reads every page,
-// keeps its spans' order as one segment, a windowed layout's region by region
-// (kv::Layout::region), has no records, and a whole restore puts the payload
-// back in that order. A block index under the page loop is no layout.
+// keeps its block's spans' order as one segment a part: a page's own without
+// a window; a windowed block's region by region (kv::Layout::region), its
+// base part the layers no window bounds from its base page and its window
+// part the windowed ones from its window unit's pages, without the slots
+// that pad it, so that the two hold what one page of every layer held. It
+// has no records, and a whole restore of a part puts its payload back in
+// that order, a window unit's padding untouched. A block index under the
+// page loop is no layout.
 void testUnspillableLayouts() {
   for (const kv::Layout &layout : {kv::Layout{16, 4, 256}, kv::Layout{10, 2, 256, kv::Format::BFloat16},
                                    kv::Layout{12, 2, 256, kv::Format::Int8, 0, true},
-                                   kv::Layout{6, 4, 128, kv::Format::Int8, 0, false, 512, 0b011010}}) {
+                                   kv::Layout{6, 4, 128, kv::Format::Int8, 0, false, 512, 0b011010},
+                                   kv::Layout{7, 4, 128, kv::Format::BFloat16, 0, false, 512, 0b1110110}}) {
     const SlotFormat format(layout);
-    require(format.version() == 0 && format.payloadBytes() == layout.bytesPerModelPage() &&
-                format.segments() == std::vector<uint64_t>{layout.bytesPerModelPage()},
-            "a layout that cannot spill is not one segment of its page");
-    test::HostKvPages pages(layout, 2);
-    pages.fill(0, 7);
-    const std::vector<std::span<const std::byte>> spans = format.transferSpans(pages, 0);
-    const std::vector<std::span<std::byte>> expected = pages.spans(0);
+    const uint64_t block = uint64_t{layout.attentionLayers} * layout.bytesPerLayerPage();
+    const bool windowed = layout.components() != kv::componentBit(kv::Component::Base);
+    const uint64_t base = windowed ? uint64_t{layout.pageSlots()} * layout.bytesPerLayerPage() : block;
+    require(format.version() == 0 && format.payloadBytes() == base &&
+                format.segments() == std::vector<uint64_t>{base} &&
+                (!windowed || (format.payloadBytes(kv::Component::Window) == block - base &&
+                               format.segments(kv::Component::Window) == std::vector<uint64_t>{block - base})),
+            "a layout that cannot spill is not one segment of each part of its block's K/V");
+    test::HostKvPages pages(layout, 2 * layout.blockPages());
+    for (const uint32_t page : blockOf(layout, 0))
+      pages.fill(page, 7 + page);
+    // The base's spans, then the window's: the block's in its regions' order.
+    std::vector<std::span<const std::byte>> spans = format.transferSpans(pages, blockOf(layout, 0));
+    if (windowed) {
+      const auto window = format.transferSpans(pages, blockOf(layout, 0), kv::Component::Window);
+      spans.insert(spans.end(), window.begin(), window.end());
+    }
+    std::vector<std::span<std::byte>> expected;
+    for (uint32_t region = 0; region < layout.attentionLayers; ++region)
+      for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer)
+        if (layout.region(layer) == region)
+          for (const std::span<std::byte> tensor : pages.layerSpans(blockOf(layout, 0)[layout.blockPage(layer)], layer))
+            if (!tensor.empty())
+              expected.push_back(tensor);
     require(std::ranges::equal(spans, expected,
                                [](auto left, auto right) {
                                  return left.data() == right.data() && left.size() == right.size();
                                }),
-            "a layout that cannot spill does not write its spans in order");
-    format.scatterPage(gather(format, pages, 0), pages, 1);
-    require(std::ranges::equal(pages.page(0), pages.page(1)), "a whole restore did not put the spans back in order");
+            "a layout that cannot spill does not write its block's parts' spans in its layers' regions' order");
+    for (const kv::Component part : kv::kAllComponents) {
+      if (!(layout.components() & kv::componentBit(part)))
+        continue;
+      format.scatterPage(gather(format, pages, 0, part), pages, blockOf(layout, 1), part);
+      require(gather(format, pages, 1, part) == gather(format, pages, 0, part),
+              "a whole restore did not put a part's spans back in order");
+    }
+    for (const uint32_t page : blockOf(layout, 1))
+      for (uint32_t slot = layout.usedSlots(page - layout.blockPages()); slot < layout.pageSlots(); ++slot)
+        for (const std::span<std::byte> tensor : pages.slotSpans(page, slot))
+          require(zero(tensor), "a whole restore wrote a window unit's padding");
     rejects([&] { static_cast<void>(format.indexRange()); }, "has no block records",
             "a layout that cannot spill has an index range");
     rejects([&] { static_cast<void>(format.recordRange(0, 0)); }, "has no block records",
@@ -189,38 +230,6 @@ void testUnspillableLayouts() {
   }
   for (const kv::Layout &layout : {kv::Layout{}, kv::Layout{12, 2, 256, kv::Format::Int8, 128, false}})
     rejects([&] { static_cast<void>(SlotFormat(layout)); }, "layout is invalid", "an invalid layout has a slot format");
-}
-
-// A Slim page of a windowed layout, which holds the regions of the layers
-// no window bounds (kv::Layout::regions), stores those spans in order: the
-// first bytes of a Full page's payload, which a Slim page restores into as
-// a Full page restores, leaving the rest of its memory alone. A spillable
-// layout's records hold Full pages alone.
-void testSlimPayloads() {
-  for (const kv::Layout &layout : {kv::Layout{6, 4, 128, kv::Format::Int8, 0, false, 512, 0b011010},
-                                   kv::Layout{6, 4, 128, kv::Format::BFloat16, 0, false, 512, 0b111000}}) {
-    const SlotFormat format(layout);
-    const uint64_t slim = layout.bytesPerModelPage(kv::PageForm::Slim);
-    require(layout.slimmable() && format.payloadBytes(kv::PageForm::Slim) == slim &&
-                slim == 3 * layout.bytesPerLayerPage() && format.payloadBytes() == layout.bytesPerModelPage(),
-            "a Slim page's payload is not the regions of its layers no window bounds");
-    test::HostKvPages pages(layout, 2);
-    pages.fill(0, 11);
-    const std::vector<std::byte> full = gather(format, pages, 0);
-    pages.setForm(0, kv::PageForm::Slim);
-    const std::vector<std::byte> payload = gather(format, pages, 0);
-    require(payload.size() == slim && std::ranges::equal(payload, std::span(full).first(slim)),
-            "a Slim page's payload is not the first bytes of its Full payload");
-    pages.setForm(1, kv::PageForm::Slim);
-    format.scatterPage(payload, pages, 1);
-    require(std::ranges::equal(pages.page(1).first(slim), pages.page(0).first(slim)) &&
-                zero(pages.page(1).subspan(slim)),
-            "a Slim restore did not put its regions back, or wrote past them");
-    rejects([&] { format.scatterPage(full, pages, 1); }, "another size", "a Full payload was restored as Slim");
-  }
-  const SlotFormat records(kFlashNext);
-  rejects([&] { static_cast<void>(records.payloadBytes(kv::PageForm::Slim)); }, "holds a Full page",
-          "a slot of block records held a Slim page");
 }
 
 // A write stores the page's bytes as the format says, zeros in between: its
@@ -257,7 +266,7 @@ void testTransfersAndScatters() {
     }
     require(pageBytes == layout.bytesPerModelPage(), "a slot holds other than every byte of its page once");
 
-    format.scatterPage(payload, pages, 1);
+    format.scatterPage(payload, pages, blockOf(layout, 1));
     require(std::ranges::equal(pages.page(0), pages.page(1)), "a whole restore did not put every byte back");
 
     // One record at a time into a page of storage without an index, as the
@@ -317,8 +326,8 @@ void testRejections() {
           "one record was scattered as a layer's");
   rejects([&] { format.scatterIndex(record, pages.indexSpans(0)); }, "another size",
           "a short index was scattered");
-  rejects([&] { format.scatterPage(record, pages, 0); }, "another size", "a short payload was restored");
-  rejects([&] { static_cast<void>(format.transferSpans(other, 0)); }, "do not hold its layout",
+  rejects([&] { format.scatterPage(record, pages, std::array<uint32_t, 1>{0}); }, "another size", "a short payload was restored");
+  rejects([&] { static_cast<void>(format.transferSpans(other, std::array<uint32_t, 1>{0})); }, "do not hold its layout",
           "another layout's page was written");
   require(zero(pages.page(0)), "a refused scatter wrote into the page");
 }
@@ -330,7 +339,6 @@ int main() {
     testFlashNextSlots();
     testPitchRule();
     testUnspillableLayouts();
-    testSlimPayloads();
     testTransfersAndScatters();
     testRejections();
   } catch (const std::exception &error) {

@@ -29,6 +29,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -237,7 +238,7 @@ void testSupersedingClaimTakesThePassCommand() {
     require(passes.prefills.back().second == 0 && passes.model.heldStateBytes == 128,
             "the Background prompts' command did not hold its states between passes");
     if (ended)
-      passes.engine.cancel(2);
+      passes.engine.cancel(2, 0.0);
     passes.submit(3, 129, RequestPriority::Foreground);
     passes.runUntil([&] { return passes.events.usage.contains(3); }, "the Foreground prompt did not finish");
     passes.runUntil([&] { return idle(passes.engine); }, "the requests did not end");
@@ -264,7 +265,7 @@ void testALaneOfACommandTakenOutsidePreparationEndsAtTheNextTick() {
                   "the Background prompts did not run a pass");
   require(passes.prefills.back().second == 0 && passes.model.heldStateBytes == 128,
           "the Background prompts' command is not between its passes");
-  passes.engine.cancel(2);
+  passes.engine.cancel(2, 0.0);
   require(!passes.events.usage.contains(2), "the lane cancelled between passes ended before its command did");
   const uint64_t abandoned = passes.engine.snapshot().scheduler.abandonedPassCommands;
   const size_t lanePages = passes.cache.pageTable(2).pages.size();
@@ -323,7 +324,7 @@ void testACancelBetweenPassesEndsBesideAHigherPrioritysDecode() {
         passes.engine.provideMask(3, mask, {});
   };
   answer();
-  passes.engine.cancel(2);
+  passes.engine.cancel(2, 0.0);
   for (uint32_t step = 0; step < 50 && !passes.events.usage.contains(2); ++step) {
     answer();
     static_cast<void>(passes.engine.tick(passes.now++));
@@ -378,7 +379,7 @@ void testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses() {
   require(ran.back().pass == 0 && ran.back().passes > 1 && holds(ran.back(), 1) && holds(ran.back(), 2),
           "the Normal prompts do not share a command between its passes");
   const uint32_t commandPasses = ran.back().passes;
-  passes.engine.cancel(2);
+  passes.engine.cancel(2, 0.0);
   for (uint32_t step = 0; step < 200 && !passes.events.usage.contains(2); ++step)
     static_cast<void>(passes.engine.tick(passes.now++));
   const Pass ending = ran.back();
@@ -435,9 +436,9 @@ void testAHostRefusedStartIsFreedForByThePass() {
               std::to_string(harness.governor->ledger().hostRefusedWaitingBytes()));
 }
 
-// A start the pool's limit leaves no page beside a lane in service takes a queued request's chain, as vLLM and
-// SGLang evict any block no running request holds: written to the SSD cache first, from which that request later
-// restores it without its prefill, or, with no tier, dropped and prefilled again. The lane in service keeps its KV.
+// A start the pool's limit leaves no page beside a lane in service takes a queued request's chain: written to the
+// SSD cache first, from which that request later restores it without its prefill, or, with no tier, dropped and
+// prefilled again. The lane in service keeps its KV.
 void testAStartTakesAQueuedChainItsRequestRestoresLater() {
   for (const bool tiered : {true, false}) {
     test::TestKvStorage storage(64, 4096, 4);
@@ -501,7 +502,7 @@ void testAStartTakesAQueuedChainItsRequestRestoresLater() {
     require(!tiered || !tier.writes.empty(), "the chain was not written to the SSD cache before it went");
     // The lane ends and the limit lifts: the queued request starts.
     storage.budgetPages = std::numeric_limits<uint32_t>::max();
-    engine.cancel(1);
+    engine.cancel(1, 0.0);
     run([&] { return idle(engine); }, "the requests did not finish");
     const auto at = std::ranges::find(events.startIds, 2);
     require(at != events.startIds.end() &&
@@ -583,7 +584,7 @@ void testAHostRefusedStartBesideALaneTakesAQueuedChain() {
     const uint32_t restores = harness.tier ? harness.tier->restores : 0;
     // The lane ends and the host's other memory leaves: the queued request starts.
     memory.setHost(other - 4 * kHostMarginBytes, MemoryPressure::Normal);
-    harness.engine.cancel(1);
+    harness.engine.cancel(1, 0.0);
     for (int each = 0; each < 20'000 && !idle(harness.engine); ++each)
       step();
     require(idle(harness.engine), "the requests did not finish");
@@ -649,7 +650,7 @@ void testAHostPassForItsMarginAloneKeepsCertainReuse() {
     require(!refused, "the host refused a start");
     // The lane ends and the host's other memory leaves: the queued request starts.
     memory.setHost(other - 4 * kHostMarginBytes, MemoryPressure::Normal);
-    harness.engine.cancel(1);
+    harness.engine.cancel(1, 0.0);
     for (int each = 0; each < 20'000 && !idle(harness.engine); ++each)
       step();
     require(idle(harness.engine), "the requests did not finish");
@@ -1188,6 +1189,412 @@ void testRequestsNearTheWholeContextOnASharedPrefixAllComplete() {
   }
 }
 
+// A unit at no cost, offered once armed to one request's claims alone, whose take reports bytes it does not free: a
+// count that finds room the attempt then does not, as the 48g's go-back met its 202.1 MiB with nothing taken and was
+// refused again.
+class PhantomRoom final : public VictimSource {
+public:
+  PhantomRoom(uint64_t target, uint64_t bytes) : target(target), bytes_(bytes) {}
+  [[nodiscard]] std::string_view name() const noexcept override { return "phantom"; }
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &query, const Victim *after) const override {
+    if (!armed || after || query.requestId != target)
+      return std::nullopt;
+    return Victim{.key = 1, .bytes = bytes_, .sized = false};
+  }
+  FreeResult take(const VictimQuery &, const Victim &) override {
+    armed = false;
+    ++taken;
+    return {FreeOutcome::Met, bytes_};
+  }
+  uint64_t target;
+  bool armed = false;
+  uint32_t taken = 0;
+
+private:
+  uint64_t bytes_;
+};
+
+// The limit of the wait tests: 512 pages of 4 KiB and a page for the states, 16,384 tokens of KV.
+constexpr uint64_t kWaitLimitBytes = 513 * 4096;
+
+// A harness of 1,024 pages under kWaitLimitBytes whose decodes go on to their output limit, its commands taking an
+// M6's times if `timed`.
+std::unique_ptr<test::EngineHarness> waitHarness(bool timed = false) {
+  auto harness = std::make_unique<test::EngineHarness>(HarnessOptions{.pages = 1024,
+                                                                      .memory = test::FakeMemory::Config{},
+                                                                      .limits = {.limitBytes = kWaitLimitBytes},
+                                                                      .timing = timed ? &test::kM6FlashNextQ2 : nullptr});
+  harness->model.decodeFinishes = false;
+  return harness;
+}
+
+// A request of `tokens` tokens of `value`, then `suffix` tokens of value + 1000, for `output` tokens, with no deadline
+// of its own.
+EngineRequest waitRequest(uint64_t id, uint32_t tokens, uint32_t value, uint32_t output, uint32_t suffix = 0) {
+  std::vector<uint32_t> prompt(tokens, value);
+  for (uint32_t index = 0; index < suffix; ++index)
+    prompt.push_back(value + 1000 + index);
+  EngineRequest result = request(id, prompt);
+  result.maxNewTokens = output;
+  result.deadlineMilliseconds = 1e12;
+  return result;
+}
+
+bool live(const Engine &engine, uint64_t id) {
+  return std::ranges::any_of(engine.snapshot().activeRequests,
+                             [&](const ActiveRequestSnapshot &active) { return active.id == id; });
+}
+
+// The times each request's running lane yielded its memory to others: suspended in prefill or decode, not a resume
+// whose attempt was refused and gave its lane back.
+class Yields final {
+public:
+  explicit Yields(test::EngineHarness &harness) {
+    harness.model.laneReleased = [this, &harness] {
+      if (harness.model.suspendedIds.size() == seen_)
+        return;
+      seen_ = harness.model.suspendedIds.size();
+      const uint64_t id = harness.model.suspendedIds.back();
+      for (const ActiveRequestSnapshot &active : harness.engine.snapshot().activeRequests)
+        if (active.id == id && (active.phase == Phase::Prefill || active.phase == Phase::Decode ||
+                                active.phase == Phase::WaitingMask))
+          ++counts_[id];
+    };
+  }
+  [[nodiscard]] uint32_t of(uint64_t id) const {
+    const auto found = counts_.find(id);
+    return found == counts_.end() ? 0 : found->second;
+  }
+
+private:
+  size_t seen_ = 0;
+  std::map<uint64_t, uint32_t> counts_;
+};
+
+// The 48g's go-back (request 237): a cold request is admitted while another conversation sits between its turns,
+// whose turns then arrive back to back, each nearly all cached. Short beside one of them, the go-back yields; it
+// resumes alone, and its count meets its need with nothing taken while its attempt is refused again. It waits and
+// counts again, takes the other conversation's cached prefix it needs, and is served; the turns after it wait
+// behind it, and it yields to none of them. Failed at that count, it ended with capacity_exhausted, its message saying
+// every cached prefix was evicted while the other conversation's was still in memory.
+void testAGoBackShortBesideAConversationWaitsAndIsServed() {
+  auto owned = waitHarness();
+  test::EngineHarness &harness = *owned;
+  const Yields yields(harness);
+  constexpr uint64_t kGoBack = 100;
+  PhantomRoom phantom(kGoBack, 64 * 4096);
+  harness.governor->ledger().addSource(phantom);
+  // Conversation 0's first turn: 8,000 tokens, cached once it ends.
+  harness.engine.submit(waitRequest(1, 8000, 5, 8));
+  harness.runUntilIdle();
+  harness.engine.submit(waitRequest(kGoBack, 10000, 9, 4));
+  // Its turns 2 to 9, each sent once the one before has ended, each 40 tokens past the one before.
+  uint64_t turn = 1;
+  bool armedOnce = false;
+  const auto feed = [&] {
+    if (turn < 9 && !live(harness.engine, turn) && std::ranges::count(harness.events.startIds, kGoBack)) {
+      ++turn;
+      harness.engine.submit(waitRequest(turn, 8000, 5, 8, static_cast<uint32_t>(turn) * 40));
+    }
+    if (!armedOnce && yields.of(kGoBack)) {
+      armedOnce = true;
+      phantom.armed = true;
+    }
+  };
+  harness.runUntil(
+      [&] {
+        feed();
+        return turn == 9 && idle(harness.engine);
+      },
+      "the requests did not end");
+  const std::string message = harness.events.failureDetails.empty() ? "" : harness.events.failureDetails.front().first;
+  require(armedOnce && phantom.taken == 1,
+          "the go-back never yielded and resumed alone with a count met in error: suspensions " +
+              std::to_string(yields.of(kGoBack)) + ", phantom taken " +
+              std::to_string(phantom.taken) + ", failed " + std::to_string(harness.events.failedCount) + " (" +
+              message + ")");
+  require(harness.events.failedCount == 0 && harness.events.usage.contains(kGoBack) &&
+              harness.events.completedCount == 10,
+          "a go-back that fits alone was failed after its count met in error: " +
+              std::to_string(harness.events.failedCount) + " failed (" + message + ")");
+  require(yields.of(kGoBack) == 1,
+          "the go-back yielded " + std::to_string(yields.of(kGoBack)) +
+              " times: after it waited it yielded to turns sent after it");
+}
+
+// A request that has waited for memory yields to none sent after it. Beside a long reply the cold prompt yields once,
+// as the rank chooses (decoding first); it resumes alone, and the reply's conversation's next turn, sent after it,
+// starts beside it on its cached prefix: once the two do not fit, the turn yields, not the prompt that waited. Ranked
+// by its completed work alone, the prompt yielded again, to every decode sent after it.
+void testARequestThatWaitedYieldsToNoneSentAfterIt() {
+  auto owned = waitHarness();
+  test::EngineHarness &harness = *owned;
+  const Yields yields(harness);
+  harness.engine.submit(waitRequest(1, 8000, 5, 600));
+  harness.runUntil([&] { return harness.events.outputs[1].size() >= 8; }, "the reply did not decode");
+  harness.engine.submit(waitRequest(2, 12000, 9, 64));
+  bool later = false;
+  harness.runUntil(
+      [&] {
+        const auto prompt = harness.model.requests.find(2);
+        if (!later && !live(harness.engine, 1) && yields.of(2) == 1 &&
+            prompt != harness.model.requests.end() && prompt->second.resident) {
+          later = true;
+          harness.engine.submit(waitRequest(3, 8000, 5, 600, 100));
+        }
+        return later && idle(harness.engine);
+      },
+      "the requests did not end");
+  require(harness.events.failedCount == 0 && harness.events.completedCount == 3,
+          std::to_string(harness.events.failedCount) + " of three requests that each fit alone failed");
+  require(yields.of(2) == 1 && yields.of(3) >= 1,
+          "the prompt that waited yielded " + std::to_string(yields.of(2)) +
+              " times, the turn sent after it " + std::to_string(yields.of(3)));
+}
+
+// Runs the requests submitted to their ends, arming `phantom` for the one left alone once another has ended: its
+// next count meets its need in error once. True when it was armed.
+bool runArmingTheOneLeftAlone(test::EngineHarness &harness, PhantomRoom &phantom) {
+  bool armed = false;
+  harness.runUntil(
+      [&] {
+        const std::vector<ActiveRequestSnapshot> active = harness.engine.snapshot().activeRequests;
+        if (!armed && harness.events.completedCount && active.size() == 1) {
+          armed = true;
+          phantom.target = active.front().id;
+          phantom.armed = true;
+        }
+        return idle(harness.engine);
+      },
+      "the requests did not end");
+  return armed;
+}
+
+// Two requests that each fit alone and not together, in each order of arrival: the one short beside the other waits,
+// and once the other has ended it is served alone though its count meets its need in error once; neither yields
+// twice. Failed at that count, the one that waited ended with capacity_exhausted.
+void testTwoRequestsThatDoNotFitTogetherBothComplete() {
+  for (const bool longFirst : {true, false}) {
+    auto owned = waitHarness();
+    test::EngineHarness &harness = *owned;
+    const Yields yields(harness);
+    PhantomRoom phantom(0, 64 * 4096);
+    harness.governor->ledger().addSource(phantom);
+    harness.engine.submit(waitRequest(1, longFirst ? 10000 : 7000, 5, 16));
+    harness.engine.submit(waitRequest(2, longFirst ? 7000 : 10000, 9, 16));
+    const bool armed = runArmingTheOneLeftAlone(harness, phantom);
+    const std::string order = longFirst ? "the longer first" : "the shorter first";
+    require(armed && phantom.taken == 1, order + ": the request left alone counted no need");
+    require(harness.events.failedCount == 0 && harness.events.completedCount == 2,
+            order + ": " + std::to_string(harness.events.failedCount) + " of two requests that each fit alone failed" +
+                (harness.events.failureDetails.empty() ? "" : " (" + harness.events.failureDetails.front().first + ")"));
+    require(yields.of(1) <= 1 && yields.of(2) <= 1,
+            order + ": a request yielded more than once");
+  }
+}
+
+// Three requests of which no two fit together: all are served, the last left alone though its count meets its need
+// in error once, and none yields twice.
+void testThreeRequestsOfWhichNoTwoFitAllComplete() {
+  auto owned = waitHarness();
+  test::EngineHarness &harness = *owned;
+  const Yields yields(harness);
+  PhantomRoom phantom(0, 64 * 4096);
+  harness.governor->ledger().addSource(phantom);
+  for (uint64_t id = 1; id <= 3; ++id)
+    harness.engine.submit(waitRequest(id, 9000, static_cast<uint32_t>(id * 10), 64));
+  const bool armed = runArmingTheOneLeftAlone(harness, phantom);
+  require(armed && phantom.taken == 1, "the request left alone counted no need");
+  require(harness.events.failedCount == 0 && harness.events.completedCount == 3,
+          std::to_string(harness.events.failedCount) + " of three requests that each fit alone failed" +
+              (harness.events.failureDetails.empty() ? "" : " (" + harness.events.failureDetails.front().first + ")"));
+  for (uint64_t id = 1; id <= 3; ++id)
+    require(yields.of(id) <= 1,
+            "request " + std::to_string(id) + " yielded " + std::to_string(yields.of(id)) +
+                " times");
+}
+
+// A request that cannot fit even alone, with every cached unit it may take taken, fails at once with
+// capacity_exhausted, the only one of these requests that fails. Its message says every cached prefix was evicted
+// where the cache holds none, the conversation's next turn finding none of its prefix; where a lookup holds that
+// prefix, the message names the cached pages that stay and why it could not take them. It lacked memory, and
+// says the prompt tokens memory holds it: fewer than its own, within the 512 pages of the limit.
+void testARequestThatCannotFitAloneFailsAtOnceWithATrueMessage() {
+  for (const bool held : {false, true}) {
+    auto owned = waitHarness();
+    test::EngineHarness &harness = *owned;
+    harness.engine.submit(waitRequest(1, 8000, 5, 8));
+    harness.runUntilIdle();
+    std::vector<CacheLookup> lease;
+    if (held)
+      lease.push_back(harness.cache.lookup(std::vector<uint32_t>(8000, 5), {}));
+    const double submitted = harness.now();
+    harness.engine.submit(waitRequest(2, 17000, 9, 8));
+    harness.runUntilIdle();
+    const std::string what = held ? "with the prefix held: " : "with nothing held: ";
+    require(harness.events.failures == std::vector<std::string>{"capacity_exhausted"},
+            what + "a request of 532 pages under a limit of 512 did not fail with capacity_exhausted");
+    require(harness.now() - submitted < kResourceWaitTimeoutMilliseconds,
+            what + "a request that cannot fit alone waited " + std::to_string(harness.now() - submitted) +
+                " ms to fail");
+    const std::string &message = harness.events.failureDetails.front().first;
+    const CapacityShortfall capacity = harness.events.capacities.front();
+    require(capacity.limit == CapacityLimit::Memory && capacity.fitsTokens > 0 &&
+                capacity.fitsTokens < std::min(17000U, 512U * KvCache::pageTokens),
+            what + "the failure does not say the prompt tokens memory holds it: " +
+                std::to_string(capacity.fitsTokens));
+    if (held) {
+      // The pages that stay are the held prefix's 250, or as many as its chain keeps of them.
+      const std::string before = ", even after every cached prefix its claim may take was evicted and any store of "
+                                 "streamed experts shrank to its floor (cached_prefix_pages=";
+      const std::string after = " stay in memory, which it could not take: its own restored prefix, or prefixes "
+                                "held for a lookup or not offered to it)";
+      const size_t at = message.find(before);
+      const size_t end = message.rfind(after);
+      const uint64_t stay = at == std::string::npos || end == std::string::npos || end <= at + before.size()
+                                ? 0
+                                : std::stoull(message.substr(at + before.size(), end - at - before.size()));
+      require(stay > 0 && stay <= 250 && message.ends_with(after),
+              what + "the failure's message does not name the cached pages that stay: " + message);
+    } else {
+      require(message.ends_with(", even after every cached prefix was evicted and any store of streamed experts "
+                                "shrank to its floor"),
+              what + "the failure's message does not say every cached prefix was evicted: " + message);
+    }
+    lease.clear();
+    // The first turn's conversation again: what it finds of its prefix is what the failed request left of it.
+    harness.engine.submit(waitRequest(3, 8000, 5, 8, 40));
+    harness.runUntilIdle();
+    require((harness.events.starts.back() == 0) == !held,
+            what + "the conversation's next turn found " + std::to_string(harness.events.starts.back()) +
+                " tokens of its prefix");
+  }
+}
+
+// An image whose vision memory and prompt's KV cannot fit together in what a lone request may take is refused at
+// once, before its start takes anything: no lane, no claim, no cached prefix evicted. It lacked memory beside its
+// images, and says the tokens of KV that fit beside them and the 99 prompt tokens they hold with a token of output; a
+// smaller image is served.
+void testAnImageThatCannotFitIsRefusedBeforeItTakesAnything() {
+  HarnessOptions options{.pages = 64};
+  // The plan's lone request holds 1,000 tokens beside 4 KiB of images, 100 beside more.
+  options.engine.residentTokensBeside = [](uint64_t bytes) { return bytes > 4096 ? uint64_t{100} : 1000; };
+  test::EngineHarness harness(std::move(options));
+  harness.engine.submit(waitRequest(1, 300, 5, 8));
+  harness.runUntilIdle();
+  const auto withImage = [&](uint64_t id, uint32_t tokens) {
+    EngineRequest value = waitRequest(id, tokens, 7, 8);
+    value.images = {{0, 16, 8, 8, id, id}};
+    value.imagePixels.assign(value.images.front().pixelBytes(splash::ops::kImagePatchPixels), 1);
+    return value;
+  };
+  harness.model.imageBytes = 600 * 1024;
+  const double submitted = harness.now();
+  harness.engine.submit(withImage(2, 300));
+  harness.runUntilIdle();
+  require(harness.events.failures == std::vector<std::string>{"capacity_exhausted"},
+          "an image whose vision memory and prompt do not fit alone did not fail with capacity_exhausted");
+  require(harness.now() == submitted && !harness.model.requests.contains(2),
+          "the image that cannot fit began a lane before it was refused");
+  const std::string &message = harness.events.failureDetails.front().first;
+  require(message.find("holds the KV of 100 tokens, fewer than its 300") != std::string::npos &&
+              harness.events.capacities.front() == CapacityShortfall{CapacityLimit::ImageMemory, 99},
+          "the image's refusal does not name what fits beside its images: " + message);
+  // The conversation cached before it lost nothing.
+  harness.engine.submit(waitRequest(3, 300, 5, 8, 40));
+  harness.runUntilIdle();
+  require(harness.events.starts.back() > 0, "the image's refusal evicted the cached conversation");
+  harness.model.imageBytes = 1024;
+  harness.engine.submit(withImage(4, 300));
+  harness.runUntilIdle();
+  require(harness.events.failedCount == 1 && harness.events.completedCount == 3,
+          "an image that fits beside its prompt was not served");
+}
+
+// A lone request whose every count meets its need in error, so that its attempts are refused again at each try,
+// retries once a backoff until the resource wait's limit and ends there with resource_timeout, its text true:
+// memory did not become available. Failed at its first refusal, it ended with capacity_exhausted at once.
+void testALoneRetryOnACountThatNeverHoldsEndsAtTheResourceWait() {
+  auto owned = waitHarness();
+  test::EngineHarness &harness = *owned;
+  PhantomRoom phantom(2, 64 * 4096);
+  harness.governor->ledger().addSource(phantom);
+  harness.engine.submit(waitRequest(1, 8000, 5, 8));
+  harness.runUntilIdle();
+  harness.engine.submit(waitRequest(2, 10000, 9, 8));
+  const double submitted = harness.now();
+  // Armed again before every tick: each count meets the need in error.
+  harness.runUntil(
+      [&] {
+        phantom.armed = true;
+        return idle(harness.engine);
+      },
+      "the lone request did not end");
+  require(harness.events.failures == std::vector<std::string>{"resource_timeout"} &&
+              harness.events.failureDetails.front().first.starts_with(
+                  "memory did not become available within the resource wait limit") &&
+              phantom.taken > 2,
+          "a lone request refused at each try after a met count did not retry until the resource wait: " +
+              std::to_string(phantom.taken) + " counts, " +
+              (harness.events.failures.empty() ? std::string("no failure") : harness.events.failures.front()));
+  // Its tries are paced by the resource backoff, not run back to back: one count a backoff, 300 in the 30 s.
+  require(phantom.taken <= kResourceWaitTimeoutMilliseconds / kResourceRetryBackoffMilliseconds + 2,
+          "a lone request refused at each try counted " + std::to_string(phantom.taken) +
+              " times in the resource wait: its tries were not paced by the backoff");
+  const double waited = harness.now() - submitted;
+  require(waited >= kResourceWaitTimeoutMilliseconds &&
+              waited <= kResourceWaitTimeoutMilliseconds + 2 * kResourceRetryBackoffMilliseconds,
+          "the retries ended after " + std::to_string(waited) + " ms, not at the resource wait's limit");
+}
+
+// A request waiting behind another for memory ends at its client's deadline, as deadline_exceeded, and the request
+// ahead of it is served.
+void testAWaitEndsAtTheClientsDeadline() {
+  auto owned = waitHarness(true);
+  test::EngineHarness &harness = *owned;
+  harness.engine.submit(waitRequest(1, 10000, 5, 600));
+  harness.runUntil([&] { return harness.events.outputs[1].size() >= 8; }, "the first request did not decode");
+  EngineRequest waiting = waitRequest(2, 10000, 9, 16);
+  waiting.deadlineMilliseconds = harness.now() + 2000.0;
+  harness.engine.submit(std::move(waiting));
+  harness.runUntilIdle();
+  require(harness.events.failures == std::vector<std::string>{"deadline_exceeded"} &&
+              harness.events.usage.contains(1) && harness.events.outputs[1].size() == 600,
+          "a request waiting for memory did not end at its deadline beside the request ahead of it");
+}
+
+// One conversation whose turns grow toward the limit runs under it as with memory to spare: the same commands at
+// the same times, nothing suspended, nothing waited for.
+void testALoneConversationRunsAsWithMemoryToSpare() {
+  const auto run = [](bool limited) {
+    auto harness = std::make_unique<test::EngineHarness>(
+        HarnessOptions{.pages = 1024,
+                       .memory = test::FakeMemory::Config{},
+                       .limits = {.limitBytes = limited ? kWaitLimitBytes : test::GovernorLimits{}.limitBytes},
+                       .timing = &test::kM6FlashNextQ2});
+    harness->model.decodeFinishes = false;
+    for (uint32_t turn = 1; turn <= 4; ++turn) {
+      harness->engine.submit(waitRequest(turn, 4000 * turn - 200, 5, 64));
+      harness->runUntilIdle();
+    }
+    return harness;
+  };
+  const auto limited = run(true);
+  const auto spare = run(false);
+  const auto shape = [](const test::EngineHarness &harness) {
+    std::vector<std::tuple<WorkKind, std::vector<uint32_t>, double>> commands;
+    for (const test::EngineHarness::Command &command : harness.commands())
+      commands.emplace_back(command.kind, command.rows, command.startMilliseconds);
+    return commands;
+  };
+  require(limited->events.failedCount == 0 && limited->events.completedCount == 4 && limited->model.suspensions == 0,
+          "a lone conversation under the limit failed or yielded");
+  require(shape(*limited) == shape(*spare),
+          "a lone conversation under the limit ran other commands, or at other times, than with memory to spare: " +
+              std::to_string(limited->commands().size()) + " commands against " +
+              std::to_string(spare->commands().size()));
+}
+
 // A start refused memory that lands later holds no room on its claim from the pass in which the scheduler declines
 // it, while a prompt that leads it prefills. Wanted and refused again, its claim waits again, its wait's age kept from
 // its first refusal, within the resource wait limit from its first wait only.
@@ -1227,7 +1634,7 @@ void testADeclinedRefusalHoldsNoClaimRoom() {
     harness.model.maximumLanes = 0;
     submit(1, 8193);
     static_cast<void>(harness.tick());
-    harness.model.maximumLanes = model::ExecutionLimits::maximumBatchWidth;
+    harness.model.maximumLanes = model::ExecutionLimits::defaultLanes;
     submit(2, 16385);
     static_cast<void>(harness.tick());
     require(waiting() && harness.engine.resourceWaitSnapshot(harness.now()).memory == 1,
@@ -1556,6 +1963,18 @@ std::span<const test::TestCase> rulesTests() {
        testTheRequestAfterAWholeContextLaneTakesItsCachedPages},
       {"testRequestsNearTheWholeContextOnASharedPrefixAllComplete",
        testRequestsNearTheWholeContextOnASharedPrefixAllComplete},
+      {"testAGoBackShortBesideAConversationWaitsAndIsServed", testAGoBackShortBesideAConversationWaitsAndIsServed},
+      {"testARequestThatWaitedYieldsToNoneSentAfterIt", testARequestThatWaitedYieldsToNoneSentAfterIt},
+      {"testTwoRequestsThatDoNotFitTogetherBothComplete", testTwoRequestsThatDoNotFitTogetherBothComplete},
+      {"testThreeRequestsOfWhichNoTwoFitAllComplete", testThreeRequestsOfWhichNoTwoFitAllComplete},
+      {"testARequestThatCannotFitAloneFailsAtOnceWithATrueMessage",
+       testARequestThatCannotFitAloneFailsAtOnceWithATrueMessage},
+      {"testAnImageThatCannotFitIsRefusedBeforeItTakesAnything",
+       testAnImageThatCannotFitIsRefusedBeforeItTakesAnything},
+      {"testALoneRetryOnACountThatNeverHoldsEndsAtTheResourceWait",
+       testALoneRetryOnACountThatNeverHoldsEndsAtTheResourceWait},
+      {"testAWaitEndsAtTheClientsDeadline", testAWaitEndsAtTheClientsDeadline},
+      {"testALoneConversationRunsAsWithMemoryToSpare", testALoneConversationRunsAsWithMemoryToSpare},
   };
   return kTests;
 }

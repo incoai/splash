@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace splash::ops::ane_ffn {
 namespace {
@@ -23,7 +24,7 @@ constexpr double kMinimumGain = 0.05;
 constexpr double kChunkNoise = 0.02;
 // The first word of a Calibration's text, which a change to its fields
 // renumbers.
-constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-2";
+constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-4";
 
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
@@ -33,7 +34,41 @@ Line gpuAlone(const std::array<ChunkTimings::Gpu, 2> &gpu) {
   return {low.milliseconds - slope * low.rows, slope};
 }
 
+// The split layer of the function that holds a step of `rows` rows; infinite
+// where none does.
+double functionLayer(const ChunkTimings &timings, uint32_t rows) {
+  const auto function = std::ranges::find_if(timings.functions, [&](const ChunkTimings::Function &timed) {
+    return timed.least <= rows && rows <= timed.rows;
+  });
+  return function == timings.functions.end() ? std::numeric_limits<double>::infinity() : function->split;
+}
+
+// The shares calibration times the split at.
+constexpr std::array<double, 2> kTimedShares{0.4, 0.8};
+
+// A share's timing: its split's GPU part, and its layer less the GPU alone
+// read right before it. The high share's program also holds a function of
+// half the rows.
+Timing share(uint32_t aneUnits, uint32_t units, uint32_t rows, bool half, const Readers &read) {
+  read.load(aneUnits, half);
+  const double gpu = read.gpuPart(), alone = read.alone(rows);
+  return {static_cast<double>(aneUnits) / units, gpu, read.split(rows, alone), alone};
+}
+
 } // namespace
+
+Timings time(uint32_t units, uint32_t rows, const Readers &read) {
+  Timings timings;
+  timings.low = share(nearestUnits(kTimedShares[0], units), units, rows, false, read);
+  timings.high = share(nearestUnits(kTimedShares[1], units), units, rows, true, read);
+  timings.gpuAlone = timings.high.alone;
+  timings.highHalf = read.split(rows / 2, read.alone(rows / 2));
+  return timings;
+}
+
+Timing time(uint32_t aneUnits, uint32_t units, uint32_t rows, const Readers &read) {
+  return share(aneUnits, units, rows, false, read);
+}
 
 double usable(double milliseconds) {
   if (!(milliseconds > 0.0 && std::isfinite(milliseconds)))
@@ -47,9 +82,10 @@ uint32_t nearestUnits(double share, uint32_t units) {
   return static_cast<uint32_t>(std::clamp<long>(std::lround(share * units), 1, units - 1));
 }
 
-// Not a number where either part is not.
+// Not a number where either part is not. A model of two steps has its
+// halves' line, whatever its mixer.
 double Model::operator()(double share) const noexcept {
-  const double a = ane(share), g = gpu(share) + u * a;
+  const double a = halves.slope ? halves(share) : ane(share), g = mixer + gpu(share) + u * a;
   return a > g ? a : g;
 }
 
@@ -64,7 +100,19 @@ double Model::operator()(double share) const noexcept {
 Model fit(const Timing &low, const Timing &high) {
   if (!(low.share < high.share)) throw std::invalid_argument("ANE FFN calibration needs a low and a high share");
   const double slope = (high.gpu - low.gpu) / (high.share - low.share);
-  return refit({{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}}, low.share, low.split);
+  return refit({{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}, {}}, low.share, low.split);
+}
+
+// The high share's step of half the rows gives H as its full chunk gives A:
+// a half costs the ANE more than half a full chunk (its 0.97 share of
+// Qwen3.8-27B's FFN 29.7 ms at 1,024 rows against 54.5 at 2,048 on a 20-core
+// M5 Pro).
+Model twoSteps(Model oneStep, const Timings &timings) {
+  if (!(timings.mixer >= 0.0 && std::isfinite(timings.mixer)))
+    throw std::invalid_argument("ANE FFN calibration's mixer is not usable");
+  oneStep.halves = {0.0, 2.0 * usable(timings.highHalf) / timings.high.share};
+  oneStep.mixer = timings.mixer;
+  return oneStep;
 }
 
 // Where the GPU's part takes the longer at `share`, the split layer there
@@ -144,14 +192,8 @@ bool slowerNowhere(const ChunkTimings &candidate, const ChunkTimings &incumbent)
   const std::optional<uint32_t> candidateLeast = minimumRows(candidate), incumbentLeast = minimumRows(incumbent);
   if (!incumbentLeast) return true;
   if (!candidateLeast || *candidateLeast > *incumbentLeast) return false;
-  const auto split = [](const ChunkTimings &timings, uint32_t rows) {
-    const auto function = std::ranges::find_if(timings.functions, [&](const ChunkTimings::Function &timed) {
-      return timed.least <= rows && rows <= timed.rows;
-    });
-    return function == timings.functions.end() ? std::numeric_limits<double>::infinity() : function->split;
-  };
   for (uint32_t rows = *incumbentLeast; rows <= incumbent.functions.front().rows; ++rows)
-    if (!(split(candidate, rows) <= (1.0 + kChunkNoise) * split(incumbent, rows))) return false;
+    if (!(functionLayer(candidate, rows) <= (1.0 + kChunkNoise) * functionLayer(incumbent, rows))) return false;
   return true;
 }
 
@@ -168,77 +210,116 @@ std::string Calibration::nextStart(const std::optional<Calibration> &record) {
 }
 
 std::string Calibration::withoutSplit() const {
-  return refusals ? "the Neural Engine refused its split twice; " + nextStart(*this)
-                  : "no Neural Engine split beat it by enough when this Mac calibrated it";
+  return "the Neural Engine refused its split twice; " + nextStart(*this);
 }
 
 std::string Calibration::text() const {
   std::ostringstream text;
   text << std::setprecision(9) << kCalibrationTag << ' ' << aneUnits << ' ' << minimumRows;
   for (const ChunkTimings::Gpu &point : gpu) text << ' ' << point.rows << ' ' << point.milliseconds;
-  text << ' ' << refusals;
+  text << ' ' << refusals << ' ' << twoStepUnits << ' ' << mixer;
   return text.str();
 }
 
-// A record of units holds least rows and the GPU alone at ascending rows of
-// usable milliseconds, and fewer than kRefusals refusals; one of none holds
-// neither, and at most kRefusals.
+// A record of units holds least rows of one step or units of two steps, or
+// both, the GPU alone at ascending rows of usable milliseconds, and fewer
+// than kRefusals refusals; one of none holds neither, and one refusal or
+// kRefusals.
 std::optional<Calibration> Calibration::parse(std::string_view text) {
   std::istringstream in{std::string(text)};
   std::string tag;
   Calibration calibration;
   in >> tag >> calibration.aneUnits >> calibration.minimumRows;
   for (ChunkTimings::Gpu &point : calibration.gpu) in >> point.rows >> point.milliseconds;
-  in >> calibration.refusals;
+  in >> calibration.refusals >> calibration.twoStepUnits >> calibration.mixer;
   std::string rest;
   if (!in || tag != kCalibrationTag || (in >> rest) || calibration.refusals > kRefusals) return std::nullopt;
   const auto &[low, high] = calibration.gpu;
   const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
   if (!calibration.aneUnits)
-    return calibration.minimumRows ? std::nullopt : std::optional(Calibration{.refusals = calibration.refusals});
+    return calibration.minimumRows || calibration.twoStepUnits || !calibration.refusals
+               ? std::nullopt
+               : std::optional(Calibration{.refusals = calibration.refusals});
   if (calibration.refusals == kRefusals) return std::nullopt;
-  if (!calibration.minimumRows || !(low.rows < high.rows) || !usableMilliseconds(low.milliseconds) ||
-      !usableMilliseconds(high.milliseconds))
+  if ((!calibration.minimumRows && !calibration.twoStepUnits) || !(low.rows < high.rows) ||
+      !usableMilliseconds(low.milliseconds) || !usableMilliseconds(high.milliseconds) ||
+      !(calibration.mixer >= 0.0 && std::isfinite(calibration.mixer)))
     return std::nullopt;
   return calibration;
 }
 
-// Each layer the GPU waits for the Neural Engine's evaluation before it joins
-// the ANE's part to its own, so evaluations that take as long as the GPU's
-// whole layers alone make the split slower than the GPU alone, whatever the
-// rest of the layer takes: the breaker trips there, and never short of it. An
+// Each layer the GPU waits for the Neural Engine's evaluations before it joins
+// the ANE's part to its own: one step's evaluations that take as long as the
+// GPU alone's FFN layers, or two pipelined steps' as long as its whole layers,
+// beside which they run, make the split slower than the GPU alone, whatever
+// the rest of the layer takes: the breaker trips there, and never short of it. An
 // evaluation counts against the GPU alone's layer of its function's rows,
 // which the chunk pads up to, so the GPU alone would take no longer over the
-// chunk; the reason scales the window's ratio to a layer of the most rows.
+// chunk; the reason scales the command's ratio to a layer of the most rows.
 // At the units calibration chooses, at or just below where the parts meet
 // (choose), an evaluation takes at most about as long as the GPU's part
-// (Qwen3.8-27B on an M5 Max: 13.2 ms against the GPU alone's 19.0), and
-// another process keeping the ANE busy costs the split 2-8%: far short of
-// the trip point. Judging kWindow commands at once, it weighs one slow
-// evaluation, as a function's first after its program loads again, among all
-// of theirs.
-Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu) {
+// (Qwen3.8-27B on an M5 Max: 13.2 ms against the GPU alone's 19.0). An M5
+// Pro's commands of two steps took 0.66-0.67 of the GPU alone's layers
+// through seven minutes of prefill; beside another client of the ANE at their
+// priority, 1.77; behind one at a higher priority, 12.7. Each command is
+// judged on its own: one slow evaluation, as a function's first after its
+// program loads again, weighs little among a command's.
+Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu, double mixer) {
   const auto &[low, high] = gpu;
   if (!(low.rows < high.rows)) throw std::invalid_argument("ANE FFN breaker needs the GPU alone at two row counts");
+  if (!(mixer >= 0.0 && std::isfinite(mixer))) throw std::invalid_argument("ANE FFN breaker's mixer is not usable");
   static_cast<void>(usable(low.milliseconds));
   static_cast<void>(usable(high.milliseconds));
   gpu_ = gpuAlone(gpu);
+  mixer_ = mixer;
   mostRows_ = high.rows;
 }
 
-std::string Breaker::add(uint32_t rows, uint32_t evaluations, double milliseconds) {
+std::optional<double> Breaker::alone(uint32_t rows, uint32_t layers, bool pipelined) const {
+  if (!gpu_) return std::nullopt;
+  return layers * ((*gpu_)(rows) + (pipelined ? mixer_ * rows / mostRows_ : 0.0));
+}
+
+std::string Breaker::judge(uint32_t rows, uint32_t layers, bool pipelined, double milliseconds) const {
   if (!gpu_) return {};
-  ane_ += milliseconds;
-  alone_ += evaluations * (*gpu_)(rows);
-  if (++commands_ < kWindow) return {};
-  const double ratio = ane_ / alone_, most = (*gpu_)(mostRows_);
-  commands_ = 0;
-  ane_ = alone_ = 0.0;
+  const double ratio = milliseconds / *alone(rows, layers, pipelined), most = (*gpu_)(mostRows_);
   if (!(ratio >= 1.0)) return {};
   std::ostringstream reason;
   reason << std::fixed << std::setprecision(1) << "losing to the GPU alone (" << ratio * most
          << " ms on the Neural Engine per " << mostRows_ << "-row layer against " << most << " ms on the GPU alone)";
   return reason.str();
+}
+
+Pause::Verdict Pause::finished(AwakeClock::time_point now, bool split, bool losing) {
+  if (until_ && now >= *until_) {
+    until_.reset();
+    probing_ = true;
+  }
+  if (!split) return Verdict::Kept;
+  if (!losing) {
+    probing_ = false;
+    return Verdict::Kept;
+  }
+  if (std::exchange(probing_, false)) return Verdict::Stopped;
+  until_ = now + length_;
+  return Verdict::Paused;
+}
+
+std::optional<Late> late(double longestBuffer, double medianBuffer, double longestEvaluation) noexcept {
+  if (!(longestBuffer > 1.0 && longestBuffer > 10.0 * medianBuffer)) return std::nullopt;
+  return longestEvaluation >= (longestBuffer - medianBuffer) / 2 ? Late::NeuralEngine : Late::Gpu;
+}
+
+// Split commands of Qwen3.8-27B MLX 4-bit on a 20-core M5 Pro took the GPU
+// 0.80-1.33 of the GPU alone's time over their layers through 1,179 commands
+// of cold prompts beside display sleep and wake, the screen saver, every core
+// busy and memory at the system's warning, the most a 640-row command in one
+// step, whose GPU alone counts no mixer; beside another process keeping the
+// GPU busy with compute buffers of 1 s, 10.6-21.1. Three times sits over
+// twice the first and under a third of the second. The image encodes ahead of
+// a command are no work of its layers.
+bool shared(double gpuMilliseconds, double encodeMilliseconds, double aloneMilliseconds) noexcept {
+  return gpuMilliseconds - encodeMilliseconds >= 3.0 * aloneMilliseconds;
 }
 
 } // namespace splash::ops::ane_ffn

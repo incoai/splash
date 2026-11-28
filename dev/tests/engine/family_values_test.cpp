@@ -43,6 +43,8 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flashNextDraft();
   if (family == model::FlintLayout{}.family)
     return test::flintDraft();
+  if (family == model::Inkling2LoopLayout{}.family)
+    return test::inkling2Draft();
   throw std::logic_error(std::string(family) + " has no draft to take its values with");
 }
 
@@ -63,7 +65,7 @@ std::string familyValues() {
     if (target.draftChoosesMaskToken()) target.maskToken = target.firstDraftMaskToken;
     const model::ModelDescriptor model =
         model::makeModelDescriptor(std::string(family.family), target, draft,
-                                   {.outputHiddenSize = draft.hiddenSize}, model::TargetSource::Gguf,
+                                   ops::visionLayout(family.visionTower, draft.hiddenSize), model::TargetSource::Gguf,
                                    model::VisionSource::None);
     require(model.valid(), std::string(family.family) + "'s descriptor is not valid");
     const kv::Layout &kv = model.targetKvLayout;
@@ -72,7 +74,7 @@ std::string familyValues() {
     out << "family " << family.family << '\n'
         << "facts experts " << own.experts << " recurrent-state " << own.recurrentState << " ple-table "
         << own.pleTable << " sparse-kv " << own.sparseKv << " dense-ffn " << own.denseFfn << " context "
-        << own.contextTokens << ".." << own.maximumContextTokens << '\n'
+        << own.contextTokens << ".." << own.maximumContextTokens << " activations " << own.activations << '\n'
         << "kv layers " << kv.attentionLayers << " heads " << kv.kvHeads << " dimension " << kv.headDimension
         << " index " << kv.indexDimension << (kv.valuesTokenMajor ? " values-token-major" : "");
     if (kv.windowedLayers)
@@ -83,7 +85,6 @@ std::string familyValues() {
       layout.format = format;
       out << "kv " << kv::formatName(format) << " page " << layout.bytesPerModelPage(kv::PageForm::Full)
           << " index-page " << layout.bytesPerModelPage(kv::PageForm::Index)
-          << (layout.slimmable() ? " slim-page " + std::to_string(layout.bytesPerModelPage(kv::PageForm::Slim)) : "")
           << " alignment " << layout.extentAlignmentPages() << " extents " << layout.minimumExtentPages() << ".."
           << layout.maximumExtentPages() << '\n'
           << "kv " << kv::formatName(format) << " extent-pages";
@@ -105,6 +106,13 @@ std::string familyValues() {
         out << "namespace " << kv::formatName(kvFormat) << ' '
             << (format == ops::GdnStateFormat::Float32 ? "fp32" : "bf16") << ' '
             << engine::persistentCacheNamespace(identity, states) << '\n';
+        // bf16 activations (--activations bf16) compute other pages and
+        // states than auto's: a namespace of their own, while auto's, the
+        // golden's, stays the one 1.7.3 wrote.
+        engine::RuntimeCacheIdentity bf16 = identity;
+        bf16.activations = ops::Int8Activations::Off;
+        require(engine::persistentCacheNamespace(bf16, states) != engine::persistentCacheNamespace(identity, states),
+                "bf16 activations shared auto's persistent cache namespace");
       }
     }
   });

@@ -102,7 +102,7 @@ public:
   }
   uint64_t bytes() const noexcept override { return 64; }
   bool writable() const noexcept override { return true; }
-  bool canOffload(bool) const noexcept override { return true; }
+  bool canOffload() const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
@@ -123,7 +123,7 @@ public:
   explicit KeptState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
   uint64_t bytes() const noexcept override { return 64; }
   bool writable() const noexcept override { return true; }
-  bool canOffload(bool) const noexcept override { return true; }
+  bool canOffload() const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
@@ -217,7 +217,7 @@ private:
 class Executor final : public model::Model {
 public:
   explicit Executor(
-      uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth)
+      uint32_t maximumLanes = model::ExecutionLimits::defaultLanes)
       : maximumLanes(maximumLanes) {}
 
   void checkHealth() override {
@@ -337,8 +337,12 @@ public:
         for (uint64_t row = (item.logicalPosition + engine::KvCache::pageTokens - 1) /
                             engine::KvCache::pageTokens * engine::KvCache::pageTokens;
              row < end; row += engine::KvCache::pageTokens) {
-          kv->content.at(item.pageTable[row / engine::KvCache::pageTokens]) =
-              rows(row / engine::KvCache::pageTokens, item.inputTokens[row - item.logicalPosition]);
+          const uint64_t page = row / engine::KvCache::pageTokens;
+          kv->content.at(item.pageTable[page]) = rows(page, item.inputTokens[row - item.logicalPosition]);
+          // The windowed layers' rows go to the block's window unit's pages.
+          for (uint32_t table = 0; table < item.windowTables.size(); ++table)
+            kv->content.at(item.windowTables[table][page]) = rows(page, item.inputTokens[row - item.logicalPosition]) ^
+                                                             (uint64_t{table + 1} << 60);
         }
       }
       Request &state = requests.at(item.requestId);
@@ -568,12 +572,13 @@ public:
   }
   // A command holds groupRows rows in up to `passes` passes over as many
   // layers, the rows of one lane at most past a chunk, and streams the
-  // history of one lane at most.
+  // history of one lane at most; it runs `lanes` lanes.
   model::CommandLimits commandLimits() const noexcept override {
     return {.commandRows = groupRows,
             .layers = passes,
             .maximumPasses = passes,
             .lanesPastChunk = 1,
+            .lanes = lanes,
             .indexPageLanes = 1,
             .streamsWeights = streamedExperts};
   }
@@ -663,7 +668,7 @@ public:
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
   // every state.
-  bool canSnapshotToDisk(bool) const noexcept override { return stateTier != nullptr; }
+  bool canSnapshotToDisk() const noexcept override { return stateTier != nullptr; }
   std::unique_ptr<StateOffload> snapshotToDisk(uint64_t, std::function<void()>) override {
     ++diskSnapshots;
     return std::make_unique<OffloadTicket>(stateTier);
@@ -673,6 +678,11 @@ public:
   }
   // What a lane's start allocates (takeLaneState). Nothing without `memory`.
   uint64_t startStateBytes() const noexcept override { return memory ? laneTake().allocated : 0; }
+  // What a start with images builds for them (Model::imageStartBytes).
+  uint64_t imageBytes = 0;
+  uint64_t imageStartBytes(const ModelRequest &request) const override {
+    return request.images.empty() ? 0 : imageBytes;
+  }
   // The production model's pool releases the buffers beyond a lane's with
   // keepLane, else all of them (QwenStateStorage::idleBytes); the fake's are
   // those of the states the cache let go of and of `evictedStates` more (none
@@ -763,16 +773,26 @@ public:
   static uint64_t rows(uint32_t block, uint32_t firstToken) {
     return (uint64_t{block} << 32) | firstToken;
   }
-  // With `kv`, a step's page table names allocated extents only and finds
-  // every prompt block before `position`; with windowPages, the window's
-  // pages hold every layer (kv::PageForm::Full), and windowDigest folds in
-  // what the step read there.
+  // With `kv`, a step's page tables name allocated extents only and find
+  // every prompt block before `position`, its base page and each page of its
+  // window unit (unitPages of them) where its window table holds one (absent,
+  // kv::kAbsentPage, before the window); with windowPages, the window's
+  // pages hold every layer (kv::PageForm::Full) and their units, and
+  // windowDigest folds in what the step read there, of the base page and the
+  // window unit's.
   void requireRows(const ModelBatchItem &item, uint64_t position) {
     if (!kv)
       return;
+    if (item.windowTables.size() != unitPages)
+      throw std::logic_error("a step's window tables are not its blocks' window units");
     for (uint32_t page : item.pageTable)
       if (!kv->allocated(page / kv->extentPages()))
         throw std::logic_error("a page table names a page of a released extent");
+    for (const std::vector<uint32_t> &table : item.windowTables)
+      for (uint32_t page : table)
+        if (table.size() != item.pageTable.size() ||
+            (page != kv::kAbsentPage && !kv->allocated(page / kv->extentPages())))
+          throw std::logic_error("a window table names a page of a released extent, or other blocks");
     const std::vector<uint32_t> &prompt = prompts.at(item.requestId);
     const uint64_t blocks =
         std::min<uint64_t>(position, prompt.size()) / engine::KvCache::pageTokens;
@@ -780,6 +800,11 @@ public:
       if (kv->content.at(item.pageTable[block]) !=
           rows(block, prompt[block * engine::KvCache::pageTokens]))
         throw std::logic_error("a page does not hold its block's rows");
+      for (uint32_t table = 0; table < item.windowTables.size(); ++table)
+        if (item.windowTables[table][block] != kv::kAbsentPage &&
+            kv->content.at(item.windowTables[table][block]) !=
+                (rows(block, prompt[block * engine::KvCache::pageTokens]) ^ (uint64_t{table + 1} << 60)))
+          throw std::logic_error("a window unit's page does not hold its block's rows");
     }
     if (!windowPages)
       return;
@@ -791,10 +816,15 @@ public:
     const uint64_t marked = (std::min<uint64_t>(position, prompt.size()) + engine::KvCache::pageTokens - 1) /
                             engine::KvCache::pageTokens;
     for (uint64_t page = first - std::min<uint64_t>(first, windowPages); page < item.pageTable.size(); ++page) {
-      if (kv->form(item.pageTable[page]) != kv::PageForm::Full)
-        throw std::logic_error("a page a step's window reads does not hold every layer");
-      if (page < marked)
+      if (kv->form(item.pageTable[page]) != kv::PageForm::Full ||
+          std::ranges::any_of(item.windowTables,
+                              [&](const std::vector<uint32_t> &table) { return table[page] == kv::kAbsentPage; }))
+        throw std::logic_error("a page a step's window reads does not hold every layer, or its unit");
+      if (page < marked) {
         fold(kv->content.at(item.pageTable[page]));
+        for (const std::vector<uint32_t> &table : item.windowTables)
+          fold(kv->content.at(table[page]));
+      }
     }
   }
 
@@ -827,6 +857,7 @@ public:
   // A windowed target's window, in pages, and the digest of what each step
   // read in its windows (requireRows).
   uint32_t windowPages = 0;
+  uint32_t unitPages = 0;
   uint64_t windowDigest = 0xcbf29ce484222325ULL;
   std::unordered_map<uint64_t, std::vector<uint32_t>> prompts;
   std::unordered_map<uint64_t, DraftContextPlan> plans;
@@ -857,7 +888,8 @@ public:
   // them leave RAM, their copies landing when it says so.
   std::shared_ptr<OffloadControl> offloadTier;
   // Its decode cycles capture states (Model::capturesInDecode), as every
-  // target but one with auxiliary state bytes does.
+  // target that folds its state does (QwenTarget::foldsState): all but one
+  // whose commit alone writes its auxiliary state.
   bool decodeStateCaptures = true;
   uint32_t deniedReservations = 0;
   std::optional<uint32_t> denyReservationAt;
@@ -876,7 +908,10 @@ public:
   // Requests the engine ended (end()).
   uint32_t ends = 0;
   bool resumeDenied = false;
-  uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth;
+  uint32_t maximumLanes = model::ExecutionLimits::defaultLanes;
+  // The lanes the model runs (CommandLimits::lanes), which bound the engine's
+  // admission; maximumLanes, the states it can begin, may refuse sooner.
+  uint32_t lanes = model::ExecutionLimits::defaultLanes;
   std::function<void()> beginObserver;
   std::function<void()> reservationObserver;
   std::function<bool()> reservationRoom;

@@ -67,8 +67,9 @@ void testByteAccounting() {
 // A sliding window: windowedLayers names the layers whose rows read only the
 // windowTokens keys before their own, and either is zero without the other.
 // A page's regions hold the layers no window bounds first, then the windowed
-// ones, each in layer order; without a window a layer's region is the layer,
-// and a window changes no byte count.
+// ones, each in layer order; without a window a layer's region is the layer.
+// A page holds a region of each layer no window bounds, and a block's window
+// unit the windowed ones on pages of that size.
 void testWindows() {
   // Flint's 49 layers: all but 0, 1, 48 and every fourth from 5 windowed.
   constexpr uint64_t windowed = [] {
@@ -79,8 +80,22 @@ void testWindows() {
   }();
   constexpr Layout flint{49, 4, 128, Format::Int8, 0, false, 512, windowed};
   static_assert(flint.valid() && std::popcount(windowed) == 35);
-  static_assert(flint.bytesPerModelPage() == 1'655'808 &&
-                flint.bytesPerModelPage() == Layout{49, 4, 128}.bytesPerModelPage());
+  // A page holds the 14 layers no window bounds, a block's base unit; its
+  // window unit is 3 pages of the 35 windowed ones, the last holding 7 and 7
+  // slots unused; a block's K/V counts what one page of every layer held.
+  static_assert(flint.pageSlots() == 14 && flint.windowUnitPages() == 3 && flint.blockPages() == 4 &&
+                flint.bytesPerModelPage() == 14 * flint.bytesPerLayerPage() && flint.bytesPerModelPage() == 473'088 &&
+                flint.kvBytesPerModelPage() == Layout{49, 4, 128}.bytesPerModelPage() &&
+                flint.bytesPerBlock() == 4 * 473'088);
+  static_assert(flint.usedSlots(0) == 14 && flint.usedSlots(2) == 14 && flint.usedSlots(3) == 7 &&
+                flint.usedSlots(4) == 0);
+  static_assert(flint.blockPage(5) == 0 && flint.slot(5) == 2 && flint.blockPage(48) == 0 && flint.slot(48) == 13 &&
+                flint.blockPage(2) == 1 && flint.slot(2) == 0 && flint.blockPage(47) == 3 && flint.slot(47) == 6);
+  static_assert(Layout{49, 4, 128}.pageSlots() == 49 && Layout{49, 4, 128}.blockPages() == 1);
+  // A window bounds some layers but not all, and a windowed layout has no
+  // block index.
+  static_assert(!Layout{2, 4, 128, Format::Int8, 0, false, 512, 0b11}.valid() &&
+                !Layout{2, 4, 128, Format::Int8, 128, true, 512, 0b10, Reads::SelectedBlocks}.valid());
   static_assert(flint.region(0) == 0 && flint.region(1) == 1 && flint.region(5) == 2 &&
                 flint.region(45) == 12 && flint.region(48) == 13);
   static_assert(flint.region(2) == 14 && flint.region(3) == 15 && flint.region(6) == 17 &&
@@ -94,6 +109,15 @@ void testWindows() {
       if (flint.windowed(later) == flint.windowed(layer))
         require(flint.region(later) > region, "a class of layers is out of layer order");
   }
+  // A looped target's 48 layers (one per layer application) over 8 KV heads of 128, each sixth from layer 5
+  // attending every key and the other 40 windowed over the 1023 keys before a row's: its 8 full layers' regions
+  // first, in layer order, then the windowed ones', on a page of 8 slots and a
+  // window unit of 5 pages, exactly filled.
+  constexpr Layout looped{48, 8, 128, Format::Int8, 0, false, 1023, 0x7DF7DF7DF7DFull};
+  static_assert(looped.valid() && looped.regions(PageForm::Full) == 8 && looped.windowUnitPages() == 5 &&
+                looped.usedSlots(5) == 8 && looped.blockPage(0) == 1 && looped.slot(46) == 7);
+  static_assert(looped.region(5) == 0 && looped.region(11) == 1 && looped.region(47) == 7 && looped.region(0) == 8 &&
+                looped.region(4) == 12 && looped.region(6) == 13 && looped.region(46) == 47);
   for (const Layout layout :
        {Layout{16, 4, 256}, Layout{12, 2, 256, Format::Int8, 128, true, 0, 0, Reads::SelectedBlocks}})
     for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer)

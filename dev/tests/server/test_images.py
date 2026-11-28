@@ -180,10 +180,25 @@ class DataUrlTest(unittest.TestCase):
         payload = png_bytes(64, 64)
         url = "data:image/png;base64," + base64.b64encode(payload).decode()
         self.assertEqual(images.decode_data_url(url), payload)
+        # Wrapped at 76 columns as `base64` on Linux writes it, unpadded or
+        # URL-safe, the same bytes.
+        encoded = base64.b64encode(payload).decode()
+        wrapped = "\n".join(encoded[i : i + 76] for i in range(0, len(encoded), 76))
+        for variant in (
+            wrapped + "\n",
+            wrapped.replace("\n", "\r\n"),
+            encoded.rstrip("="),
+            base64.urlsafe_b64encode(payload).decode(),
+        ):
+            with self.subTest(variant=variant[-8:]):
+                self.assertEqual(
+                    images.decode_data_url("data:image/png;base64," + variant), payload
+                )
         for invalid in (
             "https://example.com/x.png",
             "data:image/png,rawbytes",
             "data:image/png;base64,not*base64",
+            "data:image/png;base64,abcde",
             None,
         ):
             with self.subTest(url=invalid):
@@ -285,6 +300,71 @@ def image_message(url=None):
 
 
 class ImageRequestTest(HarnessTestCase):
+    def test_an_image_that_cannot_fit_names_the_image_options(self):
+        # The vision scratch of a large image and its prompt's KV beside it
+        # do not fit what a lone request may take: the client is told to
+        # compact or send a smaller image, and of --max-memory and
+        # --max-image-pixels, never of --max-context, which changes neither.
+        native = (
+            "the request's images need 551 MiB of vision scratch and image "
+            "buffers, beside which the memory a lone request may take holds the "
+            "KV of 41 tokens, fewer than its 66; refused before it took any memory"
+        )
+        failure = api.engine_runtime.RequestFailed(
+            1,
+            b"capacity_exhausted",
+            native.encode(),
+            capacity_limit=native_wire.CapacityLimit.IMAGE_MEMORY,
+            fits_tokens=40,
+        )
+        runtime = FakeRuntime(Plan(exception=failure), Plan(exception=failure))
+        harness = self.harness(runtime, tokenizer=ImagePadTokenizer())
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", chat_body(messages=[image_message()])
+        )
+        self.assertEqual(status, 400)
+        error = json.loads(payload)["error"]
+        self.assertEqual(error["code"], "context_length_exceeded")
+        tokens = len(runtime.requests[0].frame.prompt_tokens)
+        self.assertEqual(
+            error["message"],
+            f"prompt does not fit in this server's memory: {tokens} tokens > 40 "
+            "tokens it holds for this request now; send a smaller image, or "
+            "restart the server with a larger --max-memory or a smaller "
+            "--max-image-pixels",
+        )
+        body = anthropic_body()
+        body["messages"] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": png_data_url().split(",", 1)[1],
+                        },
+                    },
+                ],
+            }
+        ]
+        status, _, payload = harness.request("POST", "/v1/messages", body)
+        self.assertEqual(status, 400)
+        message = json.loads(payload)["error"]["message"]
+        self.assertTrue(
+            message.startswith(
+                "prompt is too long: "
+                f"{len(runtime.requests[1].frame.prompt_tokens)} tokens > 40 "
+                "maximum input tokens"
+            ),
+            message,
+        )
+        for text in (error["message"], message):
+            self.assertIn("--max-image-pixels", text)
+            self.assertNotIn("--max-context", text)
+
     def test_image_parts_expand_placeholders_and_carry_spans_and_pixels(self):
         runtime = FakeRuntime(Plan([[4]]))
         harness = self.harness(runtime, tokenizer=ImagePadTokenizer())
@@ -653,6 +733,48 @@ class ImageRequestTest(HarnessTestCase):
         del job
         self.assertEqual(app.images.stats()["request_bytes"], 0)
 
+    def test_an_image_that_cannot_be_decoded_is_refused_in_anthropic_s_words(self):
+        # Half of a PNG, as a file cut short on its way: each tower's
+        # preparation refuses it in the words Claude Code acts on, and a
+        # Messages request that holds it gets them in a 400.
+        payload = png_bytes(64, 64)
+        cut = payload[: len(payload) // 2]
+        for prepare in (images.prepare, images.prepare_inkling):
+            with self.subTest(prepare=prepare.__name__):
+                with self.assertRaises(images.ImageError) as refused:
+                    prepare(cut)
+                self.assertEqual(str(refused.exception), "Could not process image")
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, tokenizer=ImagePadTokenizer())
+        source = {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": base64.b64encode(cut).decode(),
+        }
+        status, _, body = harness.request(
+            "POST",
+            "/v1/messages",
+            anthropic_body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {"type": "image", "source": source},
+                        ],
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(status, 400, body)
+        error = json.loads(body)
+        self.assertEqual(error["type"], "error")
+        self.assertEqual(
+            (error["error"]["type"], error["error"]["message"]),
+            ("invalid_request_error", "Could not process image"),
+        )
+        self.assertEqual(runtime.requests, [])
+
     def test_anthropic_and_responses_images_reach_the_same_pipeline(self):
         runtime = FakeRuntime(Plan([[4]]), Plan([[4]]))
         harness = self.harness(runtime, tokenizer=ImagePadTokenizer())
@@ -709,6 +831,84 @@ class ImageRequestTest(HarnessTestCase):
         self.assertEqual(len(runtime.requests[1].frame.image_spans), 1)
         self.assertEqual(
             runtime.requests[1].frame.image_spans, runtime.requests[0].frame.image_spans
+        )
+
+    def test_a_messages_request_of_too_many_images_names_its_oldest(self):
+        # 65 images, the oldest in a tool result as Claude Code's Read sends
+        # one: the refusal names that block, which Claude Code then replaces
+        # with a note. 64 are taken, as before.
+        runtime = FakeRuntime(Plan([[4]]))
+        harness = self.harness(
+            runtime, tokenizer=ImagePadTokenizer(), max_context=65536
+        )
+        media_type, _, data = png_data_url((30, 200, 30)).partition(";base64,")
+        image = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type.removeprefix("data:"),
+                "data": data,
+            },
+        }
+
+        def body(images):
+            return anthropic_body(
+                messages=[
+                    {"role": "user", "content": "screenshot it"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "screenshot",
+                                "input": {},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": [{"type": "text", "text": "ok"}, image],
+                            },
+                            {"type": "text", "text": "and these"},
+                            *[image] * (images - 1),
+                        ],
+                    },
+                ]
+            )
+
+        for path in ("/v1/messages", "/v1/messages/count_tokens"):
+            with self.subTest(path=path):
+                status, _, refused = harness.request("POST", path, body(65))
+                self.assertEqual(status, 400, refused)
+                self.assertEqual(
+                    json.loads(refused)["error"]["message"],
+                    "messages.2.content.0.tool_result.content.1.image: "
+                    "requests support at most 64 images",
+                )
+        self.assertEqual(runtime.requests, [])
+        status, _, taken = harness.request("POST", "/v1/messages", body(64))
+        self.assertEqual(status, 200, taken)
+        self.assertEqual(len(runtime.requests[0].frame.image_spans), 64)
+        # The oldest in a user's own content.
+        plain = anthropic_body(
+            messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "yes"},
+                {"role": "user", "content": [{"type": "text", "text": "these"}, image]},
+                {"role": "assistant", "content": "seen"},
+                {"role": "user", "content": [image] * 64},
+            ]
+        )
+        status, _, refused = harness.request("POST", "/v1/messages", plain)
+        self.assertEqual(status, 400, refused)
+        self.assertEqual(
+            json.loads(refused)["error"]["message"],
+            "messages.2.content.1.image: requests support at most 64 images",
         )
 
     def test_tool_results_carry_images_like_user_content(self):

@@ -13,6 +13,9 @@
 
 namespace splash::ops {
 
+// The kernels bind each lane's buffers, eight (metal/kernels/common/lane_bindings.h).
+static_assert(SPLASH_MAXIMUM_BATCH_WIDTH == 8, "the lane bindings name eight lanes");
+
 namespace {
 
 constexpr uint64_t kKeyBytes = BLOCK_INDEXER_DIMENSION * sizeof(uint16_t);
@@ -152,7 +155,8 @@ void BlockIndexer::addTreePool(metal::CommandGraph &graph, const IndexerBlocks &
   const auto pending = laneBindings(blocks.pending);
   graph.add("block_indexer_pool_tree",
             {blocks.records, blocks.keys, rows.tree, rows.laneRows, pending[0], pending[1], pending[2], pending[3],
-             keyNorm.buffer, std::move(inverseFrequencies), std::move(blockKeys)},
+             pending[4], pending[5], pending[6], pending[7], keyNorm.buffer, std::move(inverseFrequencies),
+             std::move(blockKeys)},
             params, {rows.laneCap, params.lanes, 1}, {BLOCK_INDEXER_DIMENSION, 1, 1});
 }
 
@@ -180,8 +184,8 @@ void BlockIndexer::addTreeSelect(metal::CommandGraph &graph, metal::MetalBuffer 
   const auto tables = laneBindings(rows.index.tables);
   // The history's tiles, then each row of tiles' last, the step's own blocks.
   graph.add("block_indexer_score_tree",
-            {std::move(queries), std::move(blockKeys), rows.tree, rows.laneRows, tables[0], tables[1], tables[2],
-             tables[3], scores},
+            {std::move(queries), std::move(blockKeys), rows.tree, rows.laneRows,
+             tables[0], tables[1], tables[2], tables[3], tables[4], tables[5], tables[6], tables[7], scores},
             params,
             {(history + BLOCK_INDEXER_SCORE_BLOCKS - 1) / BLOCK_INDEXER_SCORE_BLOCKS + 1,
              (rows.laneCap + BLOCK_INDEXER_SCORE_ROWS - 1) / BLOCK_INDEXER_SCORE_ROWS, params.lanes},
@@ -219,9 +223,13 @@ void BlockIndexer::addCommit(metal::CommandGraph &graph, const IndexerCommit &co
   std::ranges::copy(commit.anchors, std::begin(params.first_position));
   const auto in = laneBindings(commit.pendingIn), out = laneBindings(commit.pendingOut);
   const auto tables = laneBindings(commit.indexTables);
+  static_assert(4 + 3 * SPLASH_MAXIMUM_BATCH_WIDTH <= metal::kInlineBufferBindings,
+                "block indexer commit bindings outgrow the inline binding capacity");
   graph.add("block_indexer_commit",
-            {commit.keys, commit.blockKeys, commit.paths, commit.laneRows, in[0], in[1], in[2], in[3], out[0], out[1],
-             out[2], out[3], tables[0], tables[1], tables[2], tables[3]},
+            {commit.keys, commit.blockKeys, commit.paths, commit.laneRows,
+             in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7],
+             out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7],
+             tables[0], tables[1], tables[2], tables[3], tables[4], tables[5], tables[6], tables[7]},
             params, {commit.layers, lanes, 1}, {BLOCK_INDEXER_DIMENSION, 1, 1});
 }
 

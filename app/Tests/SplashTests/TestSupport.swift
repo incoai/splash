@@ -136,6 +136,16 @@ extension Shell {
     static let bare = Shell(path: "/bin/zsh", arguments: ["-f"], name: "zsh")
 }
 
+extension Keychain {
+    /// A service of one test app's own in the login Keychain, which no other test and not the
+    /// user's app reads: empty, so that the app reads no API key unless the test writes one. A
+    /// service the tests shared held whatever an earlier run or test left in it, and gave it to
+    /// every test's app as its key.
+    static func forTests() -> Keychain {
+        Keychain(service: "Splash Tests \(UUID().uuidString)")
+    }
+}
+
 extension AppState.Folders {
     /// The chats in `folder`, the logs in its Logs: a test's own, apart from the user's.
     init(in folder: URL) {
@@ -145,12 +155,12 @@ extension AppState.Folders {
 
 extension AppState {
     /// An app whose chats are in `folder`, its logs in its Logs and its defaults `defaults`, else
-    /// there too, on `runtime`, else on an empty one in the folder; its API key is not the user's
-    /// either, and its terminals run `Shell.bare`. Apps made with one folder's defaults are
-    /// launches of one app.
+    /// there too, on `runtime`, else on an empty one in the folder; its API key in a Keychain
+    /// service of its own (`Keychain.forTests`), and its terminals run `Shell.bare`. Apps made with
+    /// one folder's defaults are launches of one app.
     static func forTests(in folder: URL, runtime: Runtime? = nil, defaults: UserDefaults? = nil) -> AppState {
         AppState(runtime: runtime ?? Runtime(root: folder.appending(path: "Runtime")), folders: Folders(in: folder),
-                 keychain: Keychain(service: "Splash Tests"), defaults: defaults ?? .kept(in: folder), shell: { .bare })
+                 keychain: .forTests(), defaults: defaults ?? .kept(in: folder), shell: { .bare })
     }
 
     /// The same in a new temporary folder, with that folder, for the test to remove.

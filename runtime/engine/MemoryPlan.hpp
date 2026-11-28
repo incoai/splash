@@ -21,40 +21,45 @@ namespace splash::engine {
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
 inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 
-// The pages of the KV runway in extents of extentPages pages: the whole
-// extents that hold the pages startup warmup runs on, which the KV pool
-// allocates when it is built.
-[[nodiscard]] constexpr uint64_t kvRunwayPages(uint32_t extentPages) noexcept {
-  return (uint64_t{model::ExecutionLimits::warmupKvPages} + extentPages - 1) /
-         extentPages * extentPages;
-}
-
 // What one request needs at the least: the fixed bytes, one lane's state and
-// the KV runway (smallest extents, lookup index too); nullopt on overflow.
+// the KV runway of `lanes` lanes (smallest extents, lookup index too);
+// nullopt on overflow.
 [[nodiscard]] std::optional<uint64_t>
 minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
-                     const kv::Layout &layout) noexcept;
+                     const kv::Layout &layout, uint32_t lanes) noexcept;
 
 // One request's KV capacity, in pages, of a budget of `pages` pages: the
 // whole extents of the size a pool of them takes (kv::Layout::extentPagesFor).
 [[nodiscard]] uint64_t kvCapacityPagesFor(const kv::Layout &layout, uint64_t pages) noexcept;
 
-// The pages a lane of a layout whose pages give up a window's layers
-// (kv::Layout::slimmable) keeps Full at the most: its window's, the pages
-// its command's rows write (`commandPages`, zero for a prefill chunk's) and
-// one more, where its window starts inside a page. Zero for another layout,
-// whose pages are all Full.
-[[nodiscard]] uint32_t kvWindowFloorPages(const kv::Layout &layout, uint32_t commandPages) noexcept;
-// The bytes of the extents of `extentPages` pages that one request's `pages`
-// KV pages take: Full ones, but for a layout whose pages give up a window's
-// layers, the `floorPages` its lane keeps Full (kvWindowFloorPages) and Slim
-// ones past them, each form in whole extents of its own. kvPagesWithin is
-// the inverse: the most pages whose extents `bytes` hold. Extents of one
-// page price the pages one by one.
-[[nodiscard]] uint64_t kvPagesBytes(const kv::Layout &layout, uint64_t pages, uint32_t floorPages,
-                                    uint32_t extentPages) noexcept;
-[[nodiscard]] uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorPages,
+// The blocks a lane of a windowed layout holds whole at the most, each its
+// base page and its window unit: its window's, those its command's rows
+// write (`commandPages`, zero for a prefill chunk's) and one more, where its
+// window starts inside a page; past them a lane holds a block's base page
+// alone, its window having passed it. Zero without a window.
+[[nodiscard]] uint32_t kvWindowFloorBlocks(const kv::Layout &layout, uint32_t commandPages) noexcept;
+// The pages one request's `blocks` blocks take, of which `floorBlocks`
+// (kvWindowFloorBlocks) whole; kvPageBlocks is the inverse.
+[[nodiscard]] uint64_t kvBlockPages(const kv::Layout &layout, uint64_t blocks, uint32_t floorBlocks) noexcept;
+[[nodiscard]] uint64_t kvPageBlocks(const kv::Layout &layout, uint64_t pages, uint32_t floorBlocks) noexcept;
+// The cached states a plan whose experts stream holds room for beside one
+// request's K/V capacity of `capacityPages` pages, so that the pool's last
+// extent lands with them held: as many as the capacity holds the tails of, a
+// tail being the window units of a state's windowPages blocks; none without
+// a window, whose states pin no K/V (StreamedMemoryPlan::cachedStatesBytes).
+[[nodiscard]] uint64_t kvCachedStates(const kv::Layout &layout, uint64_t capacityPages) noexcept;
+// The bytes of the whole extents of `extentPages` pages that one request's
+// `pages` KV pages take. kvPagesWithin is the inverse: the most pages whose
+// extents `bytes` hold, with their blocks' tokens' lookup index (kvPageBlocks).
+// Extents of one page price the pages one by one.
+[[nodiscard]] uint64_t kvPagesBytes(const kv::Layout &layout, uint64_t pages, uint32_t extentPages) noexcept;
+[[nodiscard]] uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorBlocks,
                                      uint32_t extentPages) noexcept;
+// The fewest bytes in which kvPagesWithin, pricing pages one by one, finds
+// `pages` pages with their lookup index: the pages one request's capacity
+// serves, its index counted as kvPagesWithin counts it, a block's in a page
+// past the floor and a share of one within it.
+[[nodiscard]] uint64_t kvPagesCost(const kv::Layout &layout, uint64_t pages, uint32_t floorBlocks) noexcept;
 
 // How a part of the weights that can stream from the SSD is held
 // (--expert-memory, --ple-memory): as the planner decides (Auto), loaded
@@ -108,6 +113,10 @@ struct ModelMemoryFootprint final {
   // at the start, but fixed in the plan, so that the context and the KV it
   // holds rest on the engine's limit alone.
   uint64_t hostHeldBackBytes = 0;
+  // The room a plan whose experts stream sets aside for cached states beside
+  // one request's K/V (StreamedMemoryPlan::cachedStatesBytes), which the K/V
+  // capacity does not take; zero otherwise.
+  uint64_t cachedStatesBytes = 0;
 };
 
 // What a spill-capable target plans for long requests' K/V on the SSD cache
@@ -176,7 +185,7 @@ struct ModelMemoryProfile final {
   KvSpillPlan spill{};
   // The pages one lane's prefill command writes at most: a group's where
   // its routed experts stream (model::kPrefillGroupChunks chunks), zero for
-  // a chunk's. A windowed layout's lane keeps them Full (kvWindowFloorPages).
+  // a chunk's (kvWindowFloorBlocks).
   uint32_t commandPages = 0;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
@@ -200,16 +209,28 @@ struct EngineMemoryPolicy {
                : minimumWorkingSetMarginBytes;
   }
 
+  // The automatic budget leaves this share of the Mac's memory unwired. At
+  // their default wired limit, the 16, 24, 36, 48 and 64 GB Macs measured
+  // leave 32, 30, 25, 24 and 21%, a 128 GB Mac about 12%; larger Macs were
+  // not measured. A 128 GB M5 Max whose `iogpu.wired_limit_mb` was raised,
+  // the engine and two other GPU processes wiring 96% of its memory,
+  // stalled 91 s in the kernel and panicked (#735).
+  static constexpr uint32_t unwiredFloorPercent = 10;
+
+  // The recommendation less the margin; automatically also no more than the
+  // Mac's memory less the unwired floor. An explicit `maximumMemoryBytes`
+  // is the user's, capped by the recommendation alone.
   [[nodiscard]] static constexpr uint64_t
   hardBudgetBytes(uint64_t recommendedWorkingSetBytes,
-                  uint64_t maximumMemoryBytes) noexcept {
+                  uint64_t maximumMemoryBytes, uint64_t physicalMemoryBytes) noexcept {
     const uint64_t margin = workingSetMarginBytes(recommendedWorkingSetBytes);
-    const uint64_t automatic = recommendedWorkingSetBytes > margin
-                                   ? recommendedWorkingSetBytes - margin
-                                   : 0;
-    return maximumMemoryBytes && maximumMemoryBytes < automatic
-               ? maximumMemoryBytes
-               : automatic;
+    const uint64_t recommended = recommendedWorkingSetBytes > margin
+                                     ? recommendedWorkingSetBytes - margin
+                                     : 0;
+    if (maximumMemoryBytes)
+      return maximumMemoryBytes < recommended ? maximumMemoryBytes : recommended;
+    const uint64_t floored = physicalMemoryBytes - physicalMemoryBytes / 100 * unwiredFloorPercent;
+    return floored < recommended ? floored : recommended;
   }
 
   // A bounded host cushion, independent of the engine's Metal capacity.
@@ -264,7 +285,9 @@ struct EngineMemoryBreakdown {
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
   uint64_t visionWeightsBytes = 0;
-  uint32_t maximumBatchWidth = model::ExecutionLimits::maximumBatchWidth;
+  // The lanes and the default's context (EngineMemoryPlan::compareDefaultLanes).
+  uint32_t maximumBatchWidth = model::ExecutionLimits::defaultLanes;
+  uint32_t defaultLanesContextTokens = 0;
   uint64_t laneStateBytes = 0;
   uint64_t sharedPrefillBytes = 0;
   uint64_t sharedDecodeBytes = 0;
@@ -279,6 +302,9 @@ struct EngineMemoryBreakdown {
   // All lanes' state, cached composite states, and KV extents grow from this
   // one governor-controlled byte budget; none is preallocated.
   uint64_t dynamicBudgetBytes = 0;
+  // Of it, the room for cached states that one request's K/V capacity
+  // leaves (ModelMemoryFootprint::cachedStatesBytes).
+  uint64_t cachedStatesBytes = 0;
 
   uint32_t kvPageTokens = 0;
   uint64_t kvPageBytes = 0;
@@ -286,24 +312,23 @@ struct EngineMemoryBreakdown {
   // chosen for this pool (kv::Layout::extentPagesFor). This is allocation
   // geometry, never the cache block size.
   uint32_t kvExtentPages = 0;
+  // The layout's smallest extent, which the startup runway rounds up to.
+  uint32_t kvSmallestExtentPages = 0;
   uint64_t kvExtentBytes = 0;
   // One request's KV capacity: the whole extents of the budget's pages left
-  // after one lane's state. The pool's page ids cover more (RuntimeResources
-  // sizes them by the hard budget). Request context and four-lane execution
-  // are independent policy limits.
+  // after one lane's state, and the tokens of the blocks they hold: with a
+  // window, its lane's floor of blocks whole, its base unit and its window
+  // unit, and past them their base units alone (kvWindowFloorBlocks), the
+  // floor's window pages kvWindowFloorPages. The tails of the points the
+  // cache keeps on a request's chain are cache, not counted here. The pool's
+  // page ids cover more (RuntimeResources sizes them by the hard budget).
+  // Request context and four-lane execution are independent policy limits.
+  uint32_t kvWindowFloorPages = 0;
   uint32_t kvCapacityPages = 0;
   uint64_t kvCapacityBytes = 0;
   uint64_t kvCapacityTokens = 0;
   // An Index page's bytes (kv::PageForm::Index): its blocks' index alone.
   uint64_t kvIndexPageBytes = 0;
-  // A Slim page's bytes and the Full pages a lane keeps beside them
-  // (kvWindowFloorPages), of a layout whose pages give up a window's layers
-  // past every window; zero for another layout. One request's capacity is
-  // then those Full pages, in whole Full extents, and the pages of as many
-  // whole Slim extents as the rest holds. The tails of states the SSD keeps
-  // on a request's chain stay Full beside these and are not counted.
-  uint64_t kvSlimPageBytes = 0;
-  uint32_t kvWindowFloorPages = 0;
   // A spill-capable target's plan.
   KvSpillPlan kvSpill;
   ContextBounds contextBounds;
@@ -311,6 +336,16 @@ struct EngineMemoryBreakdown {
   uint64_t minimumDynamicBytes = 0;
   uint64_t minimumRequiredBytes = 0;
   uint64_t deficitBytes = 0;
+
+  // The requests the budget runs at once beside one of the context the start
+  // serves (EngineMemoryPlan::noteConcurrentRequests): the lanes, up to
+  // maximumBatchWidth, whose states fit beside its KV. Short of them all,
+  // what holds one more: the most context that leaves room for its state,
+  // and the bytes the state and KV budget lacks for it beside the served
+  // context; zero where every lane fits.
+  uint32_t concurrentRequests = 0;
+  uint32_t moreRequestsContextTokens = 0;
+  uint64_t moreRequestsBytes = 0;
 
   [[nodiscard]] std::string describe() const;
 };
@@ -381,6 +416,7 @@ public:
   [[nodiscard]] const EngineMemoryBreakdown &breakdown() const noexcept {
     return breakdown_;
   }
+  [[nodiscard]] const ModelMemoryProfile &model() const noexcept { return model_; }
   // Stable per-request ceiling advertised by the runtime: never more than the
   // model supports, and no more than one request's KV capacity holds (less
   // the speculative scratch) unless spilling serves more
@@ -388,6 +424,22 @@ public:
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
   // What admission decides which requests spill by (EngineSpillConfig).
   [[nodiscard]] SpillGeometry spillGeometry() const noexcept;
+  // The tokens of context the budget holds one request with `besideBytes`
+  // more beside its lane's state, priced as its KV capacity is, less the
+  // speculative scratch: ContextBounds::resident, uncapped by the window,
+  // beside nothing.
+  [[nodiscard]] uint64_t residentTokensBeside(uint64_t besideBytes) const noexcept;
+  // Takes the context a first start of `defaultLanes`, the plan of the
+  // default's lanes, would serve, its most capped by `askedTokens`
+  // (--max-context, none uncapped), where it is more than `servedTokens`,
+  // this start's (EngineMemoryBreakdown::defaultLanesContextTokens), and
+  // returns it.
+  uint32_t compareDefaultLanes(const EngineMemoryPlan &defaultLanes, uint32_t servedTokens,
+                               uint32_t askedTokens) noexcept;
+  // Takes the requests the budget runs at once beside one of `servedTokens`
+  // and, short of every lane, what one more needs
+  // (EngineMemoryBreakdown::concurrentRequests), and returns them.
+  uint32_t noteConcurrentRequests(uint32_t servedTokens) noexcept;
 
   // The plan as /status reports it (memory_plan): the device, the model and
   // the budget.

@@ -114,6 +114,9 @@ bool NativeRuntime::flushRestorePoints() {
   if (!engineHealthy_)
     return false;
   try {
+    if (const uint32_t held = core_.restorePointsHeldByBudget())
+      logLine("Persistent cache: ", held, " restore points not written at the stop, as the write budget "
+              "(--max-cache-disk-writes) is spent; the next start takes back what reached the disk before.");
     return core_.flushRestorePoints();
   } catch (...) {
     executionFailed(std::current_exception());
@@ -198,8 +201,10 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
                         protocol::IssueCode::InvalidRequestId,
                         request.requestId, "request id is already active"});
   }
-  const uint64_t nowUnix = config_.unixMicros();
+  // The awake clock first: the deadline then never follows the server's,
+  // which reads its wall clock first (a cancel at it is a timeout).
   const double nowMonotonic = config_.monotonicMilliseconds();
+  const uint64_t nowUnix = config_.unixMicros();
   const uint64_t remaining =
       request.absoluteDeadlineUnixMicros > nowUnix
           ? std::min(request.absoluteDeadlineUnixMicros - nowUnix,
@@ -222,6 +227,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.priority = request.priority;
     engineRequest.prompt = std::move(request.promptTokens);
     engineRequest.generationPromptTokens = request.generationPromptTokens;
+    engineRequest.headTokens = request.headTokens;
     engineRequest.images = std::move(request.imageSpans);
     engineRequest.imagePixels = std::move(request.imagePixels);
     engineRequest.maxNewTokens = request.logicalMaxOutputTokens;
@@ -250,7 +256,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
 bool NativeRuntime::handleCancel(const protocol::CancelFrame &cancel) {
   // Cancel can arrive after the terminal event; it is then a no-op.
   if (telemetry_.contains(cancel.requestId))
-    core_.cancel(cancel.requestId);
+    core_.cancel(cancel.requestId, config_.monotonicMilliseconds());
   return true;
 }
 
@@ -333,10 +339,11 @@ bool NativeRuntime::handleIssue(protocol::ProtocolIssue issue) {
 
 void NativeRuntime::requestError(uint64_t requestId, std::string code,
                                  std::string message, bool retryable,
-                                 uint32_t retryAfterSeconds) {
+                                 uint32_t retryAfterSeconds,
+                                 CapacityShortfall capacity) {
   send(protocol::ErrorEvent{protocol::FailureClass::RequestError, requestId,
                             retryable, std::move(code), std::move(message),
-                            retryAfterSeconds});
+                            retryAfterSeconds, capacity});
 }
 
 void NativeRuntime::engineError(std::string code, std::string message) {
@@ -397,11 +404,12 @@ void NativeRuntime::batchCompleted(WorkKind kind, uint32_t width,
                                   wallMilliseconds, cycleMilliseconds);
 }
 
-void NativeRuntime::started(uint64_t requestId, uint32_t matchedTokens,
+void NativeRuntime::started(uint64_t requestId, const engine::StartFound &found,
                             uint32_t lane) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   telemetry.startedMilliseconds = config_.monotonicMilliseconds();
-  send(protocol::StartEvent{requestId, lane, matchedTokens});
+  send(protocol::StartEvent{requestId, lane, found.matchedPromptTokens, found.prefixTokens,
+                            found.stateSource, found.lostState, found.reuseEnd, found.reuseEndTokens});
 }
 
 void NativeRuntime::promptProgress(uint64_t requestId,
@@ -501,12 +509,13 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason, boo
 }
 
 void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
-                           std::string message, uint32_t retryAfterSeconds) {
+                           std::string message, uint32_t retryAfterSeconds,
+                           CapacityShortfall capacity) {
   const LaneOutcomeWire wire = laneOutcomeWire(outcome);
   if (outcome == LaneOutcome::CapacityExhausted)
     metrics_.capacityFailed();
   requestError(requestId, std::string(wire.code), std::move(message),
-               wire.retryable, retryAfterSeconds);
+               wire.retryable, retryAfterSeconds, capacity);
   ended(requestId);
 }
 

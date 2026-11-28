@@ -11,6 +11,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import transformers
+
 from dev.tests import native_peer
 from dev.tests.server_fixtures import (
     READY,
@@ -1318,7 +1320,9 @@ class ServerRecoveryTests(HarnessTestCase):
                     unprepared_hold(),
                     mock.patch.object(api, "load_thinking_key", return_value=None),
                     mock.patch.object(
-                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                        transformers.AutoTokenizer,
+                        "from_pretrained",
+                        return_value=object(),
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
                     mock.patch.object(api, "thinking_end_tokens", return_value=None),
@@ -1330,6 +1334,7 @@ class ServerRecoveryTests(HarnessTestCase):
                             process_factory=factory, **options
                         ),
                     ),
+                    mock.patch.object(api, "ConstraintFactory"),
                     mock.patch.object(api, "FrontendServer"),
                     mock.patch.object(api.signal, "signal"),
                     mock.patch("sys.stdout", new_callable=io.StringIO),

@@ -92,6 +92,8 @@ public:
     return closeConnection_;
   }
   [[nodiscard]] bool engineHealthy() const noexcept { return engineHealthy_; }
+  // Before Ready: the model's command limits changed (Engine::refreshCommandLimits).
+  void refreshCommandLimits() noexcept { core_.refreshCommandLimits(); }
   // Code and message of the failure that stopped the engine, for the log.
   [[nodiscard]] const std::string &engineFailure() const noexcept {
     return engineFailure_;
@@ -149,14 +151,15 @@ private:
   bool handleMaskIssue(protocol::ProtocolIssue issue);
   bool handleIssue(protocol::ProtocolIssue issue);
   void requestError(uint64_t requestId, std::string code, std::string message,
-                    bool retryable = false, uint32_t retryAfterSeconds = 0);
+                    bool retryable = false, uint32_t retryAfterSeconds = 0,
+                    CapacityShortfall capacity = {});
   void engineError(std::string code, std::string message);
   void executionFailed(std::exception_ptr error);
   bool send(const protocol::EngineEvent &event);
   // After a request's terminal event: the engine no longer holds it.
   void ended(uint64_t requestId);
 
-  void started(uint64_t requestId, uint32_t matchedTokens,
+  void started(uint64_t requestId, const engine::StartFound &found,
                uint32_t lane) override;
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens, uint32_t draftedTokens,
@@ -173,7 +176,8 @@ private:
                  const SpeculativeCounts &speculation,
                  const ScoreReadout &score) override;
   void failed(uint64_t requestId, LaneOutcome outcome,
-              std::string message, uint32_t retryAfterSeconds) override;
+              std::string message, uint32_t retryAfterSeconds,
+              CapacityShortfall capacity) override;
 
   static uint64_t durationMicros(double startMilliseconds,
                                  double endMilliseconds);

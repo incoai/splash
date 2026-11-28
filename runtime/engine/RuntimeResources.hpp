@@ -61,31 +61,37 @@ struct RuntimeCacheIdentity {
   model::RopeScaling ropeScaling;
   // The target model's manifest.
   std::string targetModelSha256;
+  // --cached-states (none without GDN layers) and --activations, which
+  // every cached page and state was computed at.
+  std::string_view cachedStates = "int8";
+  ops::Int8Activations activations = ops::Int8Activations::On;
 };
 
-[[nodiscard]] RuntimeCacheIdentity
-makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
-                         std::string_view targetManifestSha256,
-                         std::string_view buildId,
-                         kv::Layout targetKvLayout,
-                         model::RopeScaling ropeScaling);
+[[nodiscard]] RuntimeCacheIdentity makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
+                                                            std::string_view targetManifestSha256,
+                                                            std::string_view buildId, kv::Layout targetKvLayout,
+                                                            model::RopeScaling ropeScaling);
 
 // The name of the directory a persistent cache tier keeps its files in:
 // what its copies hold, from the models that computed them, the KV and
-// state layouts, the target's RoPE scaling and the format of the cache's
-// files. The build is not part of it; a change to what a copy holds bumps
+// state layouts, the target's RoPE scaling, bf16 activations and the format
+// of the cache's files. The build is not part of it; a change to what a copy holds bumps
 // the cache's format instead.
-[[nodiscard]] std::string
-persistentCacheNamespace(const RuntimeCacheIdentity &identity,
-                         const model::CompositeStateLayout &states);
+[[nodiscard]] std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
+                                                   const model::CompositeStateLayout &states);
 
-// A persistent cache tier's directory, and the files of its KV pages and
+// A persistent cache tier's directory, and the files of its KV copies, one
+// for each component of a block (kv::Component), base first, and of its
 // states there.
 struct PersistentCacheFiles final {
   std::unique_ptr<CacheDirectory> directory;
-  std::shared_ptr<model::SlotFile> kv;
+  std::vector<std::shared_ptr<model::SlotFile>> kv;
   std::shared_ptr<model::SlotFile> states;
 };
+
+// A start refused for want of memory, by the host's reserve or a command out of
+// GPU memory (RuntimeBootstrapReport::commandOutOfMemory): why, and what to do.
+[[nodiscard]] std::string startMemoryRefusal(std::string_view why);
 
 // The memory plan counts each weight category from the loaded model, so
 // every category the model has must report its allocation and identity.
@@ -159,17 +165,21 @@ struct RuntimeResourcesConfig {
   // --kv-spill always: every request of a spill-capable target spills, for
   // validation (EngineSpillConfig::always).
   bool kvSpillAlways = false;
-  // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
-  // for validation that trimming changes no output (CacheWindowPolicy::trim).
-  bool kvWindowTrim = true;
   // --verify-rows: the rows a decode cycle verifies (reportVerifyRows); a
   // benchmark round verifies every row of a draft's block a lane (all) so
   // that rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
-  // --activations: whether the plans may round activations to int8
-  // where an int8-activation path takes them, or keep every activation bf16
-  // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
-  ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  // --max-concurrent-requests: the lanes the runtime runs and plans for.
+  uint32_t lanes = model::ExecutionLimits::defaultLanes;
+  // --activations: whether the plans may round activations to int8 where
+  // an int8-activation path takes them (ops::Int8Activations), for the
+  // engine's life; none, not given, is ModelDescriptor::activations.
+  std::optional<ops::Int8Activations> int8Activations;
+  // --weights: whether the target's 16-bit projections load as Q8_0 or as
+  // their files store them (model::gguf::float16Planes), which the sizing,
+  // the planned geometry and the load all take, and so the weights' manifest
+  // and the persistent cache's namespace.
+  model::gguf::Float16Weights weights = model::gguf::Float16Weights::Published;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -324,12 +334,22 @@ public:
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }
-  // The share the prefill FFN's Neural Engine split runs at and the least
-  // rows of a chunk it takes; 0 for none.
-  [[nodiscard]] double aneFfnShare() const noexcept { return aneFfn_ ? aneFfn_->share() : 0.0; }
+  // The larger share the prefill FFN's Neural Engine split runs at, of one
+  // step or two, and the least rows of a command it takes; 0 for none.
+  [[nodiscard]] double aneFfnShare() const noexcept {
+    using Steps = ops::AneFfn::Steps;
+    return aneFfn_ ? std::max(aneFfn_->share(Steps::One), aneFfn_->share(Steps::Two)) : 0.0;
+  }
   [[nodiscard]] uint32_t aneFfnMinimumRows() const noexcept { return aneFfn_ ? aneFfn_->minimumRows() : 0; }
   // How the start's split came out, and the automatic context.
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
+  // Whether the start left the split to set up once `runtime`, the engine's,
+  // has prefilled a full chunk on the GPU alone; and setting it up then, on
+  // `runtime`'s prefill buffers, with that prefill's `prefillMilliseconds`
+  // of GPU time (engine::finishAneFfn), which `runtime` takes from its next
+  // command on (model::RuntimeModel::setAneFfn).
+  [[nodiscard]] bool aneFfnPending() const noexcept { return aneFfnPending_.has_value(); }
+  void finishAneFfn(double prefillMilliseconds, model::RuntimeModel &runtime);
   // The split as it stands now, for /status.
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
   // The streamed PLE table's store (--ple-memory), if the model has one.
@@ -369,7 +389,7 @@ private:
                    std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+                   AneFfnStart aneFfn, kv::Format kvFormat, std::string buildId, std::function<bool()> cancelled,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
                    model::VerifyRows verifyRows);
@@ -406,6 +426,12 @@ private:
   // Over model_'s images, its expert store if it has one, and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
+  // The start's split left to set up (aneFfnPending), and what its model
+  // needs then: the KV format, the build and the start's cancellation.
+  std::optional<AneFfnStart> aneFfnPending_;
+  kv::Format kvFormat_;
+  std::string buildId_;
+  std::function<bool()> cancelled_;
   // --kv-spill always.
   bool spillAlways_ = false;
   // --verify-rows, which modelContext() passes on.
@@ -417,16 +443,26 @@ private:
   bool probationStopped_ = false;
 };
 
+// Where the model's side of the split (aneFfnModel) times and prepares it:
+// with `buffers`, on the prefill buffers of a dense FFN and the hidden rows
+// its layers alternate between that `buffers` hands its use, the engine's
+// own; without, on a prefill arena allocated for each call. Its programs wait
+// for the ANE's service until `cancelled` returns true.
+struct AneFfnTiming final {
+  using Use = std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)>;
+  std::function<bool()> cancelled;
+  std::function<void(const Use &)> buffers;
+};
+
 // The model's side of the split of `loaded`'s target on `backend`, valid
-// while `backend`, `loaded` and `operators` are: its timing and prepared split
-// run on a prefill arena of their own, its programs wait for the ANE's
-// service until `cancelled` returns true, and its calibrations are
-// remembered beside the programs (ane::recall) under its layers' shapes and
-// formats and the Int8Activations its GPU part plans with
-// (ops::AneFfn::calibrationKey), the device, the macOS version, the engine's
-// `buildId` and the most units the plan holds.
+// while `backend`, `loaded` and `operators` are: it times and prepares the
+// split as `timing` says, and its calibrations are remembered beside the
+// programs (ane::recall) under its layers' shapes and formats and the
+// Int8Activations its GPU part plans with (ops::AneFfn::calibrationKey), the
+// device, the macOS version, the engine's `buildId` and the most units the
+// plan holds.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
-                                      std::string_view buildId, std::function<bool()> cancelled);
+                                      std::string_view buildId, AneFfnTiming timing);
 
 } // namespace splash::engine

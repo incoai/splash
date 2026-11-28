@@ -18,7 +18,7 @@
 //    chooses one of its reserved special tokens.
 // Its target is the Qwen3.5 architecture's (model/QwenTarget.cpp) over its
 // layers: every layer attends and none keeps GDN state. Its weights load from
-// a GGUF only.
+// a GGUF or an MLX checkpoint (model/SafetensorsImage.hpp).
 
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
@@ -47,11 +47,10 @@ inline constexpr uint64_t kFlintSlidingLayers = [] {
 
 struct FlintLayout final : QwenHybridLayout {
   // Its config's model type, whose keys its config.json holds at its top
-  // level, and its GGUFs' architecture; no safetensors checkpoint of it loads.
+  // level, and its GGUFs' architecture; an MLX checkpoint of it loads too.
   static constexpr std::string_view modelType = "flint";
   static constexpr bool flatConfig = true;
   static constexpr std::string_view ggufArchitecture = "flint";
-  static constexpr bool loadsSafetensors = false;
 
   // Flint's, its first family (kFamilies). Its context is the native one:
   // its full layers have no RoPE to stretch.
@@ -66,6 +65,9 @@ struct FlintLayout final : QwenHybridLayout {
                           .attentionKvHeads = 4,
                           .attentionHeadDimension = 128,
                           .attentionGate = false,
+                          .attentionSinks = true,
+                          .float32NormsOnly = true,
+                          .attentionNormMean = 1.707F,
                           .rotaryPairs = 64,
                           .rotaryTheta = 10'000.0F,
                           .slidingWindow = 513,

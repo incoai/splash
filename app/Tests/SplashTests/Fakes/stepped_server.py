@@ -88,6 +88,9 @@ class Handler(BaseHTTPRequestHandler):
                     "status_age_ms": age or 0.0,
                 },
             }
+            # An SSD cache the disk left off, with the engine's reason the test writes.
+            if (root / "cache-off").exists():
+                body["disk"] = {"capacity_bytes": 0, "off_reason": (root / "cache-off").read_text()}
         data = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

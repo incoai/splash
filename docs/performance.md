@@ -77,6 +77,12 @@ Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:
 | --- | ---: | ---: |
 | `Qwen3.8-27B-GGUF:UD-IQ3_XXS` | 43.5 tok/s | 53,241 tokens (81,913 with `--language-only`) |
 | `Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL` | 145 tok/s | 256K tokens |
+| `Inkling-2-Mini-GGUF:UD-IQ3_XXS` | 68–79 tok/s | 160,785 tokens (197,649 with `--language-only`) |
+
+Inkling-2-Mini's row is four 256-token answers to a code prompt over two
+starts, with its vision tower loaded and its experts, 10.2 GiB, all in memory;
+prose answers decoded at 53 to 59 tokens a second, and a 2,890-token prompt
+prefilled in 2.6 s.
 
 The context column reports capacity, not the prompt length of the decode
 measurement. The SSD cache, on by default, sets its state staging aside within
@@ -109,8 +115,8 @@ cached prefixes, and writes whenever memory runs short: serving
 Ternary-Bonsai-2-27B PQ2_0 to six clients' mixed traffic for 30 minutes, a
 16 GiB SSD cache on the M6 wrote 26 GB, about 50 GB an hour, and read 36 GB.
 `--max-cache-disk-writes` sets a write budget to spare the drive, such as
-`25G` a day on a 256 GB Mac: once it is spent, states other than the ones
-conversations resume from are dropped instead of written.
+`25G` a day on a 256 GB Mac: once it is spent, the cache writes nothing and
+keeps to memory until the budget refills.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and

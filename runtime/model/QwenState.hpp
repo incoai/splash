@@ -31,6 +31,12 @@ struct GdnParityBuffers final {
 // convolution state, then every layer's recurrent state, then the auxiliary.
 [[nodiscard]] GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
                                               const GdnStateLayout &layout);
+// A prefill group's scratch cell of `layout` in `base`
+// (groupCellBytes(layout)): every layer's views are one layer's convolution
+// and recurrent state, then the auxiliary (PrefillArena::groupCell).
+[[nodiscard]] uint64_t groupCellBytes(const GdnStateLayout &layout) noexcept;
+[[nodiscard]] GdnParityBuffers groupCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
+                                                const GdnStateLayout &layout);
 // A cached state's cell of `layout` in `base` (layout.cachedCellBytes()):
 // every layer's convolution state, then every layer's recurrent codes
 // (ops::StateCodec), then the auxiliary, each recurrentLayers view a layer's
@@ -145,10 +151,15 @@ struct QwenBufferPool final {
 // One copy of a state on its way to disk, in a buffer of the backend's like
 // every other: resident, and set aside by the memory plan. The write reads
 // this copy, so the state's own buffers return to the pool as soon as it is
-// taken.
+// taken. It is held only while the tier takes cache writes
+// (QwenStateStorage::releaseStaging): empty otherwise, its memory the
+// states' and KV's as with no tier.
 struct StateStaging final {
   metal::MetalBuffer buffer;
+  // Writes that read it and have not drained, on the engine thread.
+  uint32_t writes = 0;
 
+  [[nodiscard]] bool held() const noexcept { return static_cast<bool>(buffer); }
   [[nodiscard]] std::span<std::byte> bytes() const {
     return {static_cast<std::byte *>(buffer.contents()), buffer.sizeBytes()};
   }
@@ -196,7 +207,8 @@ public:
     return disk_ ? 0 : bytes();
   }
   [[nodiscard]] bool writable() const noexcept override { return !disk_ && file_; }
-  [[nodiscard]] bool canOffload(bool inUse) const noexcept override { return writable() && file_->takesWrite(inUse); }
+  [[nodiscard]] bool canPersist() const noexcept override { return writable() && file_->takesWrite(); }
+  [[nodiscard]] bool canOffload() const noexcept override { return canPersist() && staging_->held(); }
   [[nodiscard]] std::unique_ptr<StateOffload>
   offload(std::function<void()> completion) const override;
   [[nodiscard]] std::unique_ptr<StateOffload>
@@ -356,13 +368,13 @@ public:
   // state's: page-aligned, with a whole draft window and its context window.
   void validateLengths(const QwenLogicalLengths &lengths,
                        bool cacheSnapshot) const;
-  [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept {
-    return file_ && file_->takesWrite(inUse);
+  [[nodiscard]] bool canSnapshotToDisk() const noexcept {
+    return file_ && file_->takesWrite() && staging_->held();
   }
   // Writes the lane's committed state to the disk tier from its own cells,
   // taking no cache slot, its codes made in the staging buffer by a command
   // of the codec; the ticket carries the disk copy. Null without a tier that
-  // takes it (canSnapshotToDisk(true)), or when the quota cannot admit
+  // takes it (canSnapshotToDisk), or when the quota cannot admit
   // another state. The caller asked the write budget first.
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint32_t lane, std::function<void()> completion);
@@ -387,11 +399,24 @@ public:
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
     return allocations_->bytes.load(std::memory_order_relaxed);
   }
-  // The buffer a state's write to the disk tier stages through; zero without
-  // a tier.
+  // The buffer a state's write to the disk tier stages through, as held
+  // now; zero without a tier, or while it is released.
   [[nodiscard]] uint64_t stagingBytes() const noexcept {
     return staging_ ? staging_->buffer.sizeBytes() : 0;
   }
+  // The staging is held while the tier's state file takes cache writes
+  // (SlotFile::takesWrite) and a write reads it: a spent write budget, or a
+  // file that stopped taking writes, costs state memory nothing. As an
+  // elastic pool (StateStagingPool): a unit of a state's slot, its floor
+  // while the file takes writes or a write reads it, its cap while the file
+  // takes writes; given back above its floor, and taken back under
+  // `admit` while the file takes writes, before any staged write
+  // (canOffload, canSnapshotToDisk) can start. A write that stages nothing
+  // (CompositeState::persist) needs none. Engine thread, with no command
+  // in flight; none of it without a tier.
+  [[nodiscard]] PoolState stagingState() const noexcept;
+  [[nodiscard]] uint64_t releaseStaging() noexcept;
+  [[nodiscard]] metal::AllocationResult growStaging(const metal::AllocationAdmission &admit);
   [[nodiscard]] CompositeStateLayout layout() const noexcept { return layout_; }
 
 private:

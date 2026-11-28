@@ -3,9 +3,11 @@
 # --title TITLE, it then answers the request for a title, which streams nothing, with TITLE.
 import itertools
 import json
+import runpy
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -39,6 +41,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 title = sys.argv[sys.argv.index("--title") + 1] if "--title" in sys.argv else None
+runpy.run_path(str(Path(__file__).with_name("app_bound.py")))["end_with_app"]()
 server = HTTPServer(("127.0.0.1", 0), Handler)
 print(server.server_port, flush=True)
 server.handle_request()

@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 17
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -55,8 +55,8 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIIII")
+_IMAGE_SPAN = struct.Struct("<IIIIIIQQ")
 # Cancel and Stop: one request id.
 _REQUEST_END = struct.Struct("<Q")
 # Request id, mask request id, mask words, forced token words.
@@ -65,12 +65,16 @@ _STATUS_REQUEST = struct.Struct("<Q")
 _RELEASE_REQUEST = struct.Struct("<Q")
 # Concurrent requests, context, vision, vocabulary, mask rows, stop count.
 _READY = struct.Struct("<IIBIII")
-_START = struct.Struct("<QII")
+# Request, lane, matched prompt tokens, prefix tokens, state source, lost
+# state, reuse end, reuse end tokens.
+_START = struct.Struct("<QIIIBBBI")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
 _DONE = struct.Struct("<QBBIIQQQIIIII")
-_ERROR = struct.Struct("<BBIQII")
+# Failure class, retryable, retry after, request, capacity limit, fits tokens,
+# code bytes, message bytes.
+_ERROR = struct.Struct("<BBIQBIII")
 _STATUS_JSON = struct.Struct("<Q")
 # Kind, bound, required bytes, budget bytes, plan context, message bytes.
 _START_FAILED = struct.Struct("<BBQQII")
@@ -83,12 +87,12 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 114
-assert _IMAGE_SPAN.size == 32
+assert _REQUEST.size == 118
+assert _IMAGE_SPAN.size == 40
 assert _READY.size == 21
-assert _START.size == 16
+assert _START.size == 27
 assert _DONE.size == 62
-assert _ERROR.size == 22
+assert _ERROR.size == 27
 assert _STATUS_JSON.size == 8
 assert _START_FAILED.size == 26
 assert _WARMING.size == 8
@@ -247,8 +251,11 @@ SAMPLING_FIELDS: tuple[str, ...] = tuple(
 @dataclass(slots=True, frozen=True)
 class ImageSpan:
     """One image in the prompt: its placeholder token run, the patch grid of
-    the resized pixels, and a 128-bit digest of that content. Placeholder
-    token ids are identical for every image, so cache identity keys on spans.
+    the prepared pixels, the image's own pixels at its top left before the
+    padding to that grid (zero: the whole grid), and a 128-bit digest of that
+    content. Placeholder token ids are identical for every image, so cache
+    identity keys on spans. patch, the side of a grid patch in pixels, is the
+    served tower's, which the engine knows: it is not part of the frame.
     """
 
     offset: int
@@ -257,10 +264,13 @@ class ImageSpan:
     grid_width: int
     digest_lo: int
     digest_hi: int
+    content_height: int = 0
+    content_width: int = 0
+    patch: int = 16
 
     @property
     def pixel_bytes(self) -> int:
-        return self.grid_height * 16 * self.grid_width * 16 * 3
+        return self.grid_height * self.patch * self.grid_width * self.patch * 3
 
 
 @dataclass(slots=True, frozen=True)
@@ -309,6 +319,9 @@ class RequestFrame:
     # Only a request that generates inside a thinking block has one; a score
     # request never does.
     thinking_budget: ThinkingBudget | None = None
+    # Where the prompt's head (its system prompt and tools) ends; zero
+    # without one. It must leave at least one prompt token.
+    head_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -380,12 +393,41 @@ class ReadyEvent:
     stop_token_ids: tuple[int, ...]
 
 
+# Where the state a request resumes from was: none for a cold start, a RAM
+# copy, or the SSD cache's copy alone; the values are runtime/engine/
+# Types.hpp's.
+class StateSource(IntEnum):
+    NONE = 0
+    MEMORY = 1
+    DISK = 2
+
+
+class ReuseEnd(IntEnum):
+    """Why a start's reuse stopped (engine::ReuseEnd): nothing matched; the
+    prompt parts from the cache where the matched KV ends; KV matched past the
+    state it resumed from; or a read from the SSD cache failed."""
+
+    NOTHING_MATCHED = 0
+    PREFIX_END = 1
+    KV_WITHOUT_STATE = 2
+    DISK_READ_FAILED = 3
+
+
 @dataclass(slots=True, frozen=True)
 class StartEvent:
     request_id: int
     lane: int
-    # The cached prefix the request starts from; zero for a cold start.
+    # What the request found in the cache: the tokens of the state it resumes
+    # from, zero for a cold start; the prompt's tokens whose KV the cache
+    # matched, the state's included; where that state was; and whether a
+    # matched block past the state once held a state that is gone from both
+    # tiers; why its reuse stopped, and that end's tokens (engine::StartFound).
     matched_prompt_tokens: int
+    prefix_tokens: int = 0
+    state_source: StateSource = StateSource.NONE
+    lost_state: bool = False
+    reuse_end: ReuseEnd = ReuseEnd.NOTHING_MATCHED
+    reuse_end_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -460,6 +502,19 @@ class DoneEvent:
     top_logits: tuple[float, ...] = ()
 
 
+class CapacityLimit(IntEnum):
+    """What a request that cannot fit even alone lacked (engine::
+    CapacityLimit): memory, memory beside its images, an SSD cache that takes
+    no writes, or the SSD cache's quota of active KV; none for any other
+    failure."""
+
+    NONE = 0
+    MEMORY = 1
+    IMAGE_MEMORY = 2
+    CLOSED_DISK = 3
+    DISK_QUOTA = 4
+
+
 @dataclass(slots=True, frozen=True)
 class ErrorEvent:
     failure_class: FailureClass
@@ -470,6 +525,10 @@ class ErrorEvent:
     # For a retryable request error, the seconds after which a retry may
     # succeed, as when the SSD cache's write budget refills; 0 for at once.
     retry_after_seconds: int = 0
+    # For a request that cannot fit even alone, what it lacked and the most
+    # prompt tokens that holds it now, 0 where the engine cannot say.
+    capacity_limit: CapacityLimit = CapacityLimit.NONE
+    fits_tokens: int = 0
 
 
 # The JSON is opaque to the transport: the document carries its own
@@ -765,6 +824,8 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
         grid_width = _u32(span.grid_width, "image grid width")
         _u64(span.digest_lo, "image digest")
         _u64(span.digest_hi, "image digest")
+        content_height = _u32(span.content_height, "image content height")
+        content_width = _u32(span.content_width, "image content width")
         if (
             grid_height < 2
             or grid_width < 2
@@ -775,6 +836,11 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
             raise ValueError("image grid must be even-sided and within the patch limit")
         if tokens != (grid_height // 2) * (grid_width // 2):
             raise ValueError("image span tokens must equal the merged grid size")
+        if (
+            content_height > grid_height * span.patch
+            or content_width > grid_width * span.patch
+        ):
+            raise ValueError("image content must lie inside its grid")
         if offset < previous_end or offset + tokens > prompt_tokens:
             raise ValueError(
                 "image spans must be sorted, non-overlapping runs inside the prompt"
@@ -841,6 +907,8 @@ def _validated_request(
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
+        if _u32(request.head_tokens, "head tokens") >= len(prompt):
+            raise ValueError("head must leave a prompt token")
         if scores and (
             len(scores) < MIN_SCORE_TOKENS
             or len(scores) > MAX_SCORE_TOKENS
@@ -977,6 +1045,7 @@ def _request_frame(request: RequestFrame) -> bytearray:
                 request.thinking_budget.also_ends,
             )
         ),
+        request.head_tokens,
     )
     for index, span in enumerate(request.image_spans):
         _IMAGE_SPAN.pack_into(
@@ -986,6 +1055,8 @@ def _request_frame(request: RequestFrame) -> bytearray:
             span.tokens,
             span.grid_height,
             span.grid_width,
+            span.content_height,
+            span.content_width,
             span.digest_lo,
             span.digest_hi,
         )
@@ -1248,12 +1319,29 @@ def _decode_event(frame: Frame) -> EngineEvent:
             kind, bound, required, budget, plan_context, payload[_START_FAILED.size :]
         )
     if frame_type is FrameType.START:
-        request_id, lane, matched = _START.unpack(payload)
+        request_id, lane, matched, prefix, source, lost, end, end_tokens = (
+            _START.unpack(payload)
+        )
         if not request_id:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "start event request id must be non-zero"
             )
-        return StartEvent(request_id, lane, matched)
+        if source > max(StateSource) or lost > 1 or end > max(ReuseEnd):
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "start state source, lost state or reuse end is invalid",
+                request_id,
+            )
+        return StartEvent(
+            request_id,
+            lane,
+            matched,
+            prefix,
+            StateSource(source),
+            bool(lost),
+            ReuseEnd(end),
+            end_tokens,
+        )
     if frame_type is FrameType.PROMPT_PROGRESS:
         request_id, processed, elapsed = _PROMPT_PROGRESS.unpack(payload)
         if not request_id or processed > MAX_PROMPT_TOKENS:
@@ -1441,9 +1529,16 @@ def _decode_event(frame: Frame) -> EngineEvent:
             )
         return event
     if frame_type is FrameType.ERROR:
-        failure, retryable, retry_after, request_id, code_bytes, message_bytes = (
-            _ERROR.unpack_from(payload)
-        )
+        (
+            failure,
+            retryable,
+            retry_after,
+            request_id,
+            limit,
+            fits_tokens,
+            code_bytes,
+            message_bytes,
+        ) = _ERROR.unpack_from(payload)
         if retryable > 1 or code_bytes + message_bytes != len(payload) - _ERROR.size:
             _fatal(
                 IssueCode.INVALID_PAYLOAD_LENGTH,
@@ -1479,6 +1574,20 @@ def _decode_event(frame: Frame) -> EngineEvent:
                 "only a retryable error says when to retry",
                 request_id,
             )
+        if limit > max(CapacityLimit):
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "error event capacity limit is invalid",
+                request_id,
+            )
+        if (limit and classification is not FailureClass.REQUEST_ERROR) or (
+            fits_tokens and not limit
+        ):
+            _fatal(
+                IssueCode.INVALID_ERROR_CLASSIFICATION,
+                "only a request's capacity failure says what fits",
+                request_id,
+            )
         message_start = _ERROR.size + code_bytes
         return ErrorEvent(
             classification,
@@ -1487,6 +1596,8 @@ def _decode_event(frame: Frame) -> EngineEvent:
             payload[_ERROR.size : message_start],
             payload[message_start:],
             retry_after,
+            CapacityLimit(limit),
+            fits_tokens,
         )
     if frame_type is FrameType.STATUS_JSON:
         (correlation_id,) = _STATUS_JSON.unpack_from(payload)

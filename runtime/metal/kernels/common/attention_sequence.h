@@ -10,7 +10,7 @@ using namespace metal;
 // that holds the dispatch's tile `tile` is the last whose first tile is at
 // most it. A sequence's place among them names its page table among the
 // dispatch's bindings (SPLASH_LANE_BINDING) and its entry of the command's
-// layout. The lookup is three selects over every entry, not a loop to
+// layout. The lookup is seven selects over every entry, not a loop to
 // params.sequences: a tile whose sequence such a loop found ran its page loop
 // up to a quarter slower (the 64-fused-row tiles of two KV heads).
 inline uint splash_attention_sequence_of_tile(constant SplashAttentionParams &params, uint tile) {

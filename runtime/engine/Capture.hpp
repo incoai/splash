@@ -4,9 +4,9 @@
 
 namespace splash::engine {
 
-// A state boundary a prefill command captures
-// (ModelBatchItem::stateCaptures), or the one it ends at whose state apply
-// takes from the lane after it (fromLane).
+// A state boundary a command captures (ModelBatchItem::stateCaptures), or
+// the one a prefill command ends at whose state apply takes from the lane
+// after it (fromLane).
 struct LaneCapture final {
   uint32_t tokens = 0;
   // Room for the state's buffers came from reclaiming cached memory; its

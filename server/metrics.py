@@ -33,6 +33,7 @@ PROMETHEUS_SERIES = {
     "splash_requests_submitted_total": ("requests", "submitted"),
     "splash_requests_completed_total": ("requests", "completed"),
     "splash_requests_cancelled_total": ("requests", "cancelled"),
+    "splash_requests_timed_out_total": ("requests", "timed_out"),
     "splash_requests_failed_total": ("requests", "failed"),
     "splash_scheduler_queued": ("scheduler", "queued"),
     "splash_scheduler_waiting_resources": ("scheduler", "waiting_resources"),
@@ -108,12 +109,19 @@ PROMETHEUS_SERIES = {
     "splash_disk_volume_available_bytes": ("disk", "volume_available_bytes"),
     "splash_disk_write_budget_bytes": ("disk", "write_budget_bytes"),
     "splash_disk_read_bytes_total": ("disk", "read_bytes"),
+    "splash_disk_spilled_kv_read_bytes_total": ("disk", "spilled_kv_read_bytes"),
+    "splash_disk_weights_read_bytes_total": ("disk", "weights_read_bytes"),
     "splash_disk_written_bytes_total": ("disk", "written_bytes"),
     "splash_disk_written_last_hour_bytes": ("disk", "written_last_hour_bytes"),
     "splash_disk_written_last_day_bytes": ("disk", "written_last_day_bytes"),
     "splash_cache_hits_total": ("cache", "hits"),
     "splash_cache_cold_misses_total": ("cache", "cold_misses"),
     "splash_cache_reused_tokens_total": ("cache", "reused_tokens"),
+    # The started requests' prompt tokens, and of the reused tokens those the
+    # SSD cache restored: reused over prompt tokens is the token hit rate.
+    "splash_cache_prompt_tokens_total": ("cache", "prompt_tokens"),
+    "splash_cache_reused_disk_tokens_total": ("cache", "reused_disk_tokens"),
+    "splash_cache_token_hit_ratio": ("cache", "token_hit_rate"),
     "splash_cache_deduplicated_kv_tokens_total": ("cache", "deduplicated_kv_tokens"),
     "splash_cache_lazy_junctions_total": ("cache", "lazy_junctions"),
     "splash_target_prefill_rows_total": (
@@ -229,47 +237,112 @@ def prometheus_metrics(status):
             return current
         return None
 
-    lines = [
-        "# HELP splash_info Splash runtime metrics.",
-        "# TYPE splash_info gauge",
-        'splash_info{runtime="native"} 1',
-    ]
+    lines = ["# HELP splash_info Splash runtime metrics."]
+
+    def family(name, samples):
+        """`samples` of the metric `name`, under its type: a counter where
+        the name ends in `_total`, as Prometheus names counters, else a
+        gauge."""
+        if samples:
+            kind = "counter" if name.endswith("_total") else "gauge"
+            lines.append(f"# TYPE {name} {kind}")
+            lines.extend(samples)
+
+    family("splash_info", ['splash_info{runtime="native"} 1'])
     pressure = status.get("memory_pressure")
-    for state in ("normal", "warning", "critical"):
-        lines.append(
+    family(
+        "splash_memory_pressure",
+        [
             f'splash_memory_pressure{{state="{state}"}} {1 if pressure == state else 0}'
-        )
+            for state in ("normal", "warning", "critical")
+        ],
+    )
     thermal = status.get("thermal_state")
-    for state in ("nominal", "fair", "serious", "critical"):
-        lines.append(
+    family(
+        "splash_thermal_state",
+        [
             f'splash_thermal_state{{state="{state}"}} {1 if thermal == state else 0}'
-        )
+            for state in ("nominal", "fair", "serious", "critical")
+        ],
+    )
     gated = status.get("disk", {}).get("writes_gated")
-    for state in ("no", "budget", "closed"):
-        lines.append(
+    family(
+        "splash_disk_writes_gated",
+        [
             f'splash_disk_writes_gated{{state="{state}"}} {1 if gated == state else 0}'
+            for state in ("no", "budget", "closed")
+        ],
+    )
+    accounts = status.get("memory_governor", {}).get("accounts", ())
+    labels = [f'account="{label_value(account["name"])}"' for account in accounts]
+    family(
+        "splash_memory_account_bytes",
+        [
+            f'splash_memory_account_bytes{{{label},measure="{measure}"}} '
+            f"{account[measure + '_bytes']}"
+            for label, account in zip(labels, accounts)
+            for measure in ("floor", "current", "cap")
+        ],
+    )
+    for measure in ("grows", "shrinks"):
+        name = f"splash_memory_account_{measure}_total"
+        family(
+            name,
+            [
+                f"{name}{{{label}}} {account[measure]}"
+                for label, account in zip(labels, accounts)
+            ],
         )
-    for account in status.get("memory_governor", {}).get("accounts", ()):
-        label = f'account="{label_value(account["name"])}"'
-        for measure in ("floor", "current", "cap"):
-            lines.append(
-                f'splash_memory_account_bytes{{{label},measure="{measure}"}} '
-                f"{account[measure + '_bytes']}"
-            )
-        lines.append(f"splash_memory_account_grows_total{{{label}}} {account['grows']}")
-        lines.append(
-            f"splash_memory_account_shrinks_total{{{label}}} {account['shrinks']}"
+    # Starts by why their reuse stopped, and copies the SSD quota gave up by
+    # kind: one labelled counter each.
+    for name, path, label in (
+        ("splash_cache_reuse_ends_total", ("cache", "reuse_ends"), "reason"),
+        ("splash_disk_quota_given_up_total", ("disk", "quota_given_up"), "kind"),
+    ):
+        counts = status
+        for key in path:
+            counts = counts.get(key, {}) if isinstance(counts, dict) else {}
+        family(
+            name,
+            [
+                f'{name}{{{label}="{label_value(key)}"}} {count}'
+                for key, count in counts.items()
+                if is_finite_number(count)
+            ],
         )
+    # The calls the model wrote that were not returned as calls, by reason
+    # (output.REJECTED_CALL_REASONS).
+    rejected = status.get("tool_calls", {}).get("rejected", {})
+    family(
+        "splash_tool_calls_rejected_total",
+        [
+            f'splash_tool_calls_rejected_total{{reason="{label_value(reason)}"}} {count}'
+            for reason, count in rejected.items()
+            if is_finite_number(count)
+        ],
+    )
+    # The schema keywords best-effort answers were generated without.
+    unenforced = status.get("structured_output", {}).get("keywords_not_enforced", {})
+    family(
+        "splash_schema_keywords_not_enforced_total",
+        [
+            "splash_schema_keywords_not_enforced_total"
+            f'{{keyword="{label_value(keyword)}"}} {count}'
+            for keyword, count in unenforced.items()
+            if is_finite_number(count)
+        ],
+    )
     # One counter per decode width the engine reports, b1 to its maximum
     # batch width.
     widths = status.get("scheduler", {}).get("decode_batches_by_width", {})
     for width, count in widths.items():
         if is_finite_number(count):
-            lines.append(f"splash_scheduler_decode_{width}_total {count}")
+            name = f"splash_scheduler_decode_{width}_total"
+            family(name, [f"{name} {count}"])
     for name, path in PROMETHEUS_SERIES.items():
         metric_value = value(path)
         if metric_value is not None:
-            lines.append(f"{name} {metric_value}")
+            family(name, [f"{name} {metric_value}"])
     lines.extend(prometheus_latency(status.get("latency", {})))
     return "\n".join(lines) + "\n"
 
@@ -279,7 +352,10 @@ def usage_dict(result, job):
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
         "total_tokens": result.prompt_tokens + result.completion_tokens,
-        "prompt_tokens_details": {"cached_tokens": result.cache.matched_tokens},
+        "prompt_tokens_details": {
+            "cached_tokens": result.cache.matched_tokens,
+            **result.cache.reuse(),
+        },
         "completion_tokens_details": {"reasoning_tokens": job.reasoning_tokens},
     }
 

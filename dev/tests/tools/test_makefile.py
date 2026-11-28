@@ -57,6 +57,7 @@ INHERITED = (
     "MODEL",
     "REVISION",
     "DRAFT_MODEL",
+    "DRAFT_REVISION",
     "LANGUAGE_ONLY",
     "PYTHON_CANDIDATES",
 )
@@ -265,6 +266,7 @@ class MakefileTests(unittest.TestCase):
                 "MODEL=owner/repo",
                 "REVISION=main",
                 "DRAFT_MODEL=owner/draft",
+                "DRAFT_REVISION=main",
                 "LANGUAGE_ONLY=1",
                 f"MODEL_ROOT={model_root}",
                 f"BASELINE={baseline}",
@@ -306,6 +308,30 @@ class MakefileTests(unittest.TestCase):
                         if script == "dev.benchmarks.backend_regression":
                             self.assertEqual(arguments.ane_ffn_share, 0.0)
                             self.assertEqual(arguments.weight_digest_options, streamed)
+            # One family's release-check also runs the persistent cache's
+            # smoke with exact cached states (EXACT_STATES_MODEL), the others
+            # none.
+            for exact, count in (("owner/repo", 1), ("other/repo", 0)):
+                with mock.patch.object(backend_regression, "ROOT", candidate):
+                    result = self.make(
+                        "-n", "release-check", *variables, f"EXACT_STATES_MODEL={exact}"
+                    )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                script = "dev/tests/smoke_real.py"
+                smokes = [
+                    smoke_real.parse_args(command[command.index(script) + 1 :])
+                    for command in (
+                        shlex.split(line)
+                        for line in result.stdout.replace("\\\n", "").splitlines()
+                        if script in line
+                    )
+                ]
+                exact_smokes = [
+                    smoke
+                    for smoke in smokes
+                    if smoke.cached_states == "exact" and smoke.persistent_cache
+                ]
+                self.assertEqual(len(exact_smokes), count, exact)
             result = self.make("-n", "verify-models", *variables)
             self.assertEqual(result.returncode, 0, result.stderr)
             tool = str("build" / weights.WEIGHT_DIGESTS)

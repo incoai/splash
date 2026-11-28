@@ -7,6 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 using namespace splash;
@@ -58,6 +59,20 @@ void testImageIdentityKeysBlocks() {
   require(blockImageIdentity(32, 32, threeSpans) == blockImageIdentity(32, 32, laterSpans) &&
               blockImageIdentity(0, 8, threeSpans) == blockImageIdentity(0, 8, firstSpan),
           "a span outside the block changed its identity");
+
+  // A span of the whole grid (no own size: Qwen's) keeps the identity 1.7.2
+  // gave it, which persistent caches key their blocks by; an image's own
+  // size, where its grid pads past it (Inkling 2's), keys its blocks too, as
+  // the image cache keys it: its height and its width each, here inside the
+  // 160 pixels of the grid's eight 20-pixel patches.
+  require(redIdentity == BlockIdentity{0xc60913e5f84283c3ULL, 0x56e7824f2a3d7489ULL},
+          "a span of the whole grid changed its identity");
+  const auto ofSize = [](uint32_t height, uint32_t width) {
+    return blockImageIdentity(0, 32, std::array<ImageSpan, 1>{ImageSpan{8, 16, 8, 8, 0x1111, 0x2222, height, width}});
+  };
+  require(ofSize(150, 140) != redIdentity, "image identity ignores the image's own size");
+  require(ofSize(150, 140) != ofSize(150, 130), "image identity ignores the image's own width");
+  require(ofSize(150, 140) != ofSize(145, 140), "image identity ignores the image's own height");
 
   const auto tokens = page(248056);
   auto redBlock = cache.insert(0, tokens, acquired.pages[0], redIdentity);
@@ -407,9 +422,13 @@ void testSubtreeThroughChurn() {
           "subtree churn leaked a block or a page reference");
 }
 
-// A copy that takes 100 of the quota.
+// A copy of a base part alone that takes 100 of the quota, landed.
 struct FakeSlot final : engine::KvDiskSlot {
   uint64_t bytes() const noexcept override { return 100; }
+  uint64_t bytes(kv::Component part) const noexcept override { return part == kv::Component::Base ? 100 : 0; }
+  Presence presence(kv::Component part) const noexcept override {
+    return part == kv::Component::Base ? Presence::Landed : Presence::None;
+  }
 };
 
 // On random trees, as blocks, states, holders, transfers, waiting chains and the resume point change, the counts the
@@ -659,9 +678,9 @@ void testPageReachFollowsItsRule() {
       expectedCandidates += now && blocks[block].candidate;
     }
     const KvCache::PageReach reach = cache.pageReach(mask, keptStates, unwaited, stateWritten);
-    require(reach.now == std::array<uint32_t, 3>{expectedNow, 0, 0} &&
-                reach.written == std::array<uint32_t, 3>{expectedWritten, 0, 0} &&
-                reach.reachable == std::array<uint32_t, 3>{expectedReachable, 0, 0} &&
+    require(reach.now == std::array<uint32_t, kv::kPageForms>{expectedNow, 0} &&
+                reach.written == std::array<uint32_t, kv::kPageForms>{expectedWritten, 0} &&
+                reach.reachable == std::array<uint32_t, kv::kPageForms>{expectedReachable, 0} &&
                 reach.candidates == expectedCandidates,
             "pageReach counted " + std::to_string(reach.now[0]) + " now, " + std::to_string(reach.written[0]) +
                 " written and " + std::to_string(reach.reachable[0]) + " reachable pages and " +
@@ -945,119 +964,118 @@ void testSpilledBlocksTakeTheirPagesForm() {
   cache.checkInvariants();
 }
 
-// A block on a Slim page keeps its K/V there, and its copy holds what its page held when written;
-// a writer's Full page drops a copy of the Slim page, which holds less.
-void testSlimBlocksKeepWhatTheirCopiesHold() {
-  test::TestKvStorage storage(16, 100, 4, 0, 30);
-  KvPool pool(storage, 4);
-  CacheRecency recency;
-  KvCache cache(pool, recency);
-  auto acquired = pool.acquirePages(3);
-  require(acquired.granted(), "test pages were not acquired");
-  auto root = cache.insert(0, page(91), acquired.pages[0], {});
-  auto middle = cache.insert(root.id, page(92), acquired.pages[1], {});
-  auto leaf = cache.insert(middle.id, page(93), acquired.pages[2], {});
-  cache.setSlot(middle.id, std::make_shared<FakeSlot>());
-  const KvPageMoveResult trimmed =
-      pool.movePages(std::array{acquired.pages[1], acquired.pages[2]}, kv::PageForm::Slim);
-  require(trimmed.granted(), "the pages did not move to the Slim form");
-  cache.followPages(trimmed.moves);
-  require(pool.form(cache.page(middle.id)) == kv::PageForm::Slim &&
-              pool.form(cache.page(leaf.id)) == kv::PageForm::Slim && cache.indexBlocks() == 0 &&
-              cache.blockOn(cache.page(leaf.id)) == leaf.id && cache.kvCopied(middle.id) &&
-              cache.copyForm(middle.id) == kv::PageForm::Full,
-          "a block did not follow its page to the Slim form, or its Full copy stopped holding its K/V");
-  cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
-  require(cache.kvCopied(leaf.id) && cache.copyForm(leaf.id) == kv::PageForm::Slim,
-          "a copy of a Slim page did not hold what the page holds");
-  cache.unholdPage(acquired.pages[0]);
-  cache.unholdPage(cache.page(middle.id));
-  cache.unholdPage(cache.page(leaf.id));
-  require(cache.diskCandidate(true).value().id == middle.id && !cache.diskCandidate(false) &&
-              cache.evictionCandidate(0).value().id == leaf.id,
-          "the copy of a Slim page was not redundant, or a Slim leaf not a RAM leaf");
-  cache.dropPage(leaf.id);
-  require(cache.page(leaf.id) == KvCache::noPage && cache.copyForm(leaf.id) == kv::PageForm::Slim &&
-              cache.kvCopied(leaf.id),
-          "a disk-only block lost the form its copy holds");
-  cache.checkInvariants();
-  const auto writer = pool.acquirePages(1);
-  require(writer.granted() && pool.form(writer.pages[0]) == kv::PageForm::Full, "a writer's page was not acquired");
-  require(cache.insert(middle.id, page(93), writer.pages[0], {}).physicalPage == writer.pages[0] &&
-              cache.page(leaf.id) == writer.pages[0] && !cache.slot(leaf.id) &&
-              cache.copyForm(leaf.id) == kv::PageForm::Full && cache.diskBlocks() == 1,
-          "a block a writer computed again kept a copy of its Slim page beside the writer's Full one");
-  cache.unholdPage(writer.pages[0]);
-  cache.checkInvariants();
-
-  // Taken back after a restart, into a pool of its own.
-  test::TestKvStorage nextStorage(16, 100, 4, 0, 30);
-  KvPool nextPool(nextStorage, 4);
-  CacheRecency later;
-  KvCache next(nextPool, later);
-  require(next.adoptDiskBlock(40, 0, page(94), {}, std::make_shared<FakeSlot>(), 1, kv::PageForm::Slim) &&
-              next.copyForm(40) == kv::PageForm::Slim,
-          "a block taken back lost the form its copy holds");
-  rejects([&] {
-    static_cast<void>(next.adoptDiskBlock(41, 0, page(95), {}, std::make_shared<FakeSlot>(), 1,
-                                          kv::PageForm::Index));
-  }, "invalid adopted KV cache block", "a copy of an index alone was taken back");
-  next.checkInvariants();
+// A state with a RAM copy at the block, counted in or out as StateCache
+// counts it: its entry, its RAM copy's tail, and its marks.
+void countRamState(KvCache &cache, uint64_t block, bool added, const KvCache::TailUnits &units = {}) {
+  if (added) {
+    cache.countState(block, true, false);
+    cache.countRamState(block, true, units);
+    cache.setStateMarks(block, {.needed = true}, true);
+  } else {
+    cache.setStateMarks(block, {}, false);
+    cache.countRamState(block, false);
+    cache.countState(block, false, false);
+  }
 }
 
-// With a window of three pages a state pins only the three blocks ending at it; a Slim block takes
-// a writer's Full page, making its tail Full again, unless a write is reading it.
-void testStateTailsPinBoundedWindows() {
-  test::TestKvStorage storage(32, 100, 4, 0, 30);
+// With a window of three pages a state's tail counts on the three blocks that end at its block, and a state's
+// removal takes its count off what its tail alone held; a block takes the page of a writer that computed it
+// again, its copy then one of another command's K/V, unless a write is reading its own.
+void testStateTailsCountOnBoundedWindows() {
+  test::TestKvStorage storage(32, 100, 4);
   KvPool pool(storage, 4);
   CacheRecency recency;
   KvCache cache(pool, recency, false, false, 3);
-  auto acquired = pool.acquirePages(13);
+  auto acquired = pool.acquirePages(12);
   require(acquired.granted(), "test pages were not acquired");
   std::vector<uint64_t> chain;
   for (uint32_t index = 0; index < 10; ++index)
     chain.push_back(cache.insert(index ? chain.back() : 0, page(100 + index), acquired.pages[index], {}).id);
-  const auto candidates = [&] {
-    std::vector<uint64_t> blocks;
-    for (auto candidate = cache.trimCandidate(0); candidate; candidate = cache.trimCandidate(candidate->id))
-      blocks.push_back(candidate->id);
-    std::ranges::sort(blocks);
-    return blocks;
-  };
-  cache.countState(chain[9], true, false);
-  cache.countState(chain[7], true, false);
-  require(cache.pinnedBlocks() == 5 &&
-              candidates() == std::vector<uint64_t>(chain.begin(), chain.begin() + 5),
-          "two states two blocks apart did not pin five blocks, or the rest were no trim candidates");
-  cache.countState(chain[9], false, false);
-  require(cache.pinnedBlocks() == 3 &&
-              candidates() == std::vector<uint64_t>{chain[0], chain[1], chain[2], chain[3],
-                                                    chain[4], chain[8], chain[9]} &&
-              cache.tailFull(chain[7]),
-          "a state's removal did not unpin what its tail alone held");
+  countRamState(cache, chain[9], true);
+  countRamState(cache, chain[7], true);
+  require(cache.pinnedBlocks() == 5 && cache.tailHeld(chain[5]) && !cache.tailHeld(chain[4]),
+          "two states two blocks apart did not count on five blocks");
+  countRamState(cache, chain[9], false);
+  require(cache.pinnedBlocks() == 3 && !cache.tailHeld(chain[8]) && cache.tailHeld(chain[7]) &&
+              cache.tailHeld(chain[5]),
+          "a state's removal did not take its count off what its tail alone held");
   cache.checkInvariants();
 
-  // Blocks 2 and 3 give up their windowed layers, 2 with a copy of its Slim
-  // page and 3 with one of its Full page; block 4 too, being written.
+  // Block 3 has a copy; block 4 is being written.
   cache.setSlot(chain[3], std::make_shared<FakeSlot>());
-  const KvPageMoveResult trimmed = pool.movePages(
-      std::array{acquired.pages[2], acquired.pages[3], acquired.pages[4]}, kv::PageForm::Slim);
-  require(trimmed.granted(), "the pages did not move to the Slim form");
-  cache.followPages(trimmed.moves);
-  cache.setSlot(chain[2], std::make_shared<FakeSlot>());
   cache.setSlot(chain[4], std::make_shared<FakeSlot>());
   cache.setTransfer(chain[4], KvCache::Transfer::Draining);
-  require(!cache.tailFull(chain[3]) && candidates().size() == 4, "a Slim tail was taken for Full");
-  const uint32_t slim = cache.page(chain[2]);
-  require(cache.insert(chain[1], page(102), acquired.pages[10], {}).physicalPage == acquired.pages[10] &&
-              cache.page(chain[2]) == acquired.pages[10] && !cache.slot(chain[2]) && cache.blockOn(slim) == 0 &&
-              cache.insert(chain[2], page(103), acquired.pages[11], {}).physicalPage == acquired.pages[11] &&
-              cache.slot(chain[3]) && !cache.kvCopied(chain[3]) && cache.upgrades() == 2 && cache.tailFull(chain[3]),
-          "a Slim block did not take the writer's Full page, or kept a copy of what it held");
-  require(cache.insert(chain[3], page(104), acquired.pages[12], {}).physicalPage == acquired.pages[12] &&
-              pool.form(cache.page(chain[4])) == kv::PageForm::Slim && cache.upgrades() == 2,
-          "a Slim block being written took the writer's page");
+  const uint32_t before = cache.page(chain[3]);
+  require(cache.insert(chain[2], page(103), acquired.pages[10], {}).physicalPage == acquired.pages[10] &&
+              cache.page(chain[3]) == acquired.pages[10] && cache.blockOn(before) == 0 && cache.slot(chain[3]) &&
+              !cache.kvCopied(chain[3]) && cache.upgrades() == 1,
+          "a block did not take the writer's page, or took its copy for one of that page");
+  require(cache.insert(chain[3], page(104), acquired.pages[11], {}).physicalPage == acquired.pages[11] &&
+              cache.page(chain[4]) != acquired.pages[11] && cache.upgrades() == 1,
+          "a block being written took the writer's page");
   cache.setTransfer(chain[4], KvCache::Transfer::None);
+  cache.checkInvariants();
+}
+
+// A block holds its window unit while a state's tail holds it: with a window of two blocks and units of two pages,
+// a new block takes its base page alone; the first pin takes its lane's unit and the last gives it up,
+// its pages free once no request holds them; a transfer keeps a unit past its last pin until it ends; a writer
+// that computes a block again gives it its unit only where a tail holds it; and freedBy names, release by
+// release, the units each frees, a unit two tails share at the second.
+void testWindowUnitsLiveWhileATailHoldsThem() {
+  test::TestKvStorage storage(64, 100, 4);
+  KvPool pool(storage, 4);
+  CacheRecency recency;
+  KvCache cache(pool, recency, false, false, 2, 2);
+  auto acquired = pool.acquirePages(24);
+  require(acquired.granted(), "test pages were not acquired");
+  const auto unit = [&](uint32_t index) {
+    return std::vector<uint32_t>{acquired.pages[8 + 2 * index], acquired.pages[9 + 2 * index]};
+  };
+  std::vector<uint64_t> chain;
+  for (uint32_t index = 0; index < 4; ++index) {
+    const std::vector<uint32_t> window = unit(index);
+    chain.push_back(cache.insert(index ? chain.back() : 0, page(200 + index), acquired.pages[index], {}, window).id);
+  }
+  require(cache.windowUnits() == 0 && !cache.holdsUnit(chain[3]), "a new block took its writer's unit");
+  // The requests let go of every page; the blocks own their base pages.
+  for (const uint32_t each : acquired.pages)
+    pool.releasePage(each, false);
+  countRamState(cache, chain[3], true, {{chain[2], unit(2)}, {chain[3], unit(3)}});
+  require(cache.windowUnits() == 2 && cache.holdsUnit(chain[2]) && cache.holdsUnit(chain[3]) &&
+              cache.window(chain[3])[0] == unit(3)[0] && cache.blockOn(unit(2)[1]) == chain[2],
+          "a state's tail did not take its lane's units");
+  countRamState(cache, chain[2], true, {{chain[1], unit(1)}});
+  cache.checkInvariants();
+  // Releases in turn: the state at 3 frees block 3's unit; block 2's two
+  // tails share, so the second release frees it, with block 1's.
+  KvCache::Gone gone;
+  require(cache.freedBy(chain[3], gone, {.ram = true}).now == std::vector<uint64_t>{chain[3]} &&
+              cache.freedBy(chain[2], gone, {.ram = true}).now == std::vector<uint64_t>{chain[2], chain[1]},
+          "freedBy did not name each release's units, the shared one at the second");
+  const uint32_t free = pool.freePageCount();
+  cache.setSlot(chain[3], std::make_shared<FakeSlot>());
+  cache.setTransfer(chain[3], KvCache::Transfer::Draining);
+  countRamState(cache, chain[3], false);
+  require(cache.holdsUnit(chain[3]) && pool.freePageCount() == free,
+          "a unit a transfer moves went with its last pin");
+  cache.setTransfer(chain[3], KvCache::Transfer::None);
+  require(!cache.holdsUnit(chain[3]) && pool.freePageCount() == free + 2 && cache.unitsFreed() == 1,
+          "the unit did not go free as its transfer ended");
+  cache.checkInvariants();
+  // A writer computes blocks 2 and 3 again: block 2, which a tail holds,
+  // takes its unit; block 3 its base page alone.
+  auto writer = pool.acquirePages(6);
+  require(writer.granted(), "writer pages were not acquired");
+  const std::vector<uint32_t> writerUnit2{writer.pages[2], writer.pages[3]}, writerUnit3{writer.pages[4], writer.pages[5]};
+  static_cast<void>(cache.insert(chain[1], page(202), writer.pages[0], {}, writerUnit2));
+  static_cast<void>(cache.insert(chain[2], page(203), writer.pages[1], {}, writerUnit3));
+  require(cache.window(chain[2])[0] == writerUnit2[0] && !cache.holdsUnit(chain[3]) && cache.upgrades() == 2,
+          "a writer gave its unit to a block no tail holds, or kept it from one a tail holds");
+  countRamState(cache, chain[2], false);
+  require(cache.windowUnits() == 0, "the last state's release kept a unit");
+  for (const uint32_t each : writer.pages)
+    pool.releasePage(each, false);
   cache.checkInvariants();
 }
 
@@ -1164,8 +1182,8 @@ int main() {
     testMatchableExcludesPoisonedBlocks();
     testRequestsHoldTheirBlocks();
     testSpilledBlocksTakeTheirPagesForm();
-    testSlimBlocksKeepWhatTheirCopiesHold();
-    testStateTailsPinBoundedWindows();
+    testStateTailsCountOnBoundedWindows();
+    testWindowUnitsLiveWhileATailHoldsThem();
     testWritersAndTheContentOfABlock();
     testCopiesLeaveWithTheirBlocks();
     std::cout << "KV page cache tests passed\n";

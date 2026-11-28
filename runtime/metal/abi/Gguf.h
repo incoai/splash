@@ -12,12 +12,16 @@
 // column tile the GGUF_TILE_COLUMNS output columns of one threadgroup (grid.x
 // counts column tiles), and an expert tile the grouped rows of one MoE expert.
 // The int8 prefill tile's activation group is the MLX weight group of 64
-// inputs (GGUF_PREFILL_INT8_GROUP).
+// inputs, two Q8_0 groups (GGUF_PREFILL_INT8_GROUP).
 #define GGUF_TILE_COLUMNS 64u
-// Decode tile of the staged kernels, which runs plans of up to 64 rows, a
-// decode step's or a prompt chunk's alike: two simdgroups, each staging its
-// own GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8,
-// 16, 32, 48 or 64 rows.
+// Decode tile of the staged kernels, which runs plans of up to
+// GGUF_STAGED_ROWS rows, a decode step's or a prompt chunk's alike: two
+// simdgroups, each staging its own GGUF_STAGED_COLUMNS columns
+// GGUF_STAGED_STEP inputs at a time over 8, 16, 32, 48 or 64 rows
+// (GGUF_ROW_GROUP_ROWS); a plan of more rows runs two row groups of the tile of
+// half its rows in one dispatch, grid.z (ops::stagedRowGroups).
+#define GGUF_ROW_GROUP_ROWS 64u
+#define GGUF_STAGED_ROWS (2u * GGUF_ROW_GROUP_ROWS)
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)
@@ -40,9 +44,10 @@
 // GGUF_COLUMN_ROWS live rows in registers, which the MoE expert tiles run for
 // an expert's only tile of that many rows and ops::Linear for a decode step of
 // that many live rows (kernels/decode/linear_gguf_column.metal):
-// GGUF_COLUMN_SPLITS simdgroups of 32 columns, one a lane, each summing its
-// part of K.
+// GGUF_COLUMN_SPLITS simdgroups of GGUF_COLUMN_COLUMNS columns, one a lane,
+// each summing its part of K.
 #define GGUF_COLUMN_ROWS 2u
+#define GGUF_COLUMN_COLUMNS 32u
 #define GGUF_COLUMN_SPLITS 8u
 #define GGUF_COLUMN_THREADS (GGUF_COLUMN_SPLITS * 32u)
 struct GgufColumnParams {
@@ -51,8 +56,21 @@ struct GgufColumnParams {
   uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of the tensor
   uint32_t format;      // the tensor's GGUF_FMT_*, a one-pass gate/up's both tensors'
+  uint32_t splits;      // K partitions (grid.y); 1 = no cross-threadgroup reduction
 };
-static_assert(sizeof(GgufColumnParams) == 20, "GGUF column parameters are 20 bytes on both sides");
+static_assert(sizeof(GgufColumnParams) == 24, "GGUF column parameters are 24 bytes on both sides");
+// A fused projection's segments on the column tile (gguf_column_fused), as
+// GgufDecodeFusedParams's on the staged tile.
+struct GgufColumnFusedParams {
+  uint32_t rows;        // live rows, 1 to GGUF_COLUMN_ROWS
+  uint32_t input_size;  // K
+  uint32_t out_stride;  // columns of a destination row
+  uint32_t cols[3];     // columns per segment; 0 past the last
+  uint32_t fmt[3];      // GGUF_FMT_* per segment
+  uint32_t offset[3];   // first destination column per segment
+  uint32_t splits;      // K partitions of every segment
+};
+static_assert(sizeof(GgufColumnFusedParams) == 52, "GGUF column fused parameters are 52 bytes on both sides");
 
 // The register tile's activations, Table16 (kernels/common/gguf_sgmatrix.h):
 // per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,
@@ -101,12 +119,13 @@ struct GgufPrefillSegmentsParams {
 static_assert(sizeof(GgufPrefillSegmentsParams) == 36, "GGUF segmented prefill parameters are 36 bytes on both sides");
 
 // Int8 prefill tile (kernels/prefill/gguf_prefill_int8.metal), MLX affine
-// weights in groups of 64: gguf_prefill_int8_quantize writes each 64-input
-// group of each chunk row as int8 codes and a float2 (scale, scale * sum of
-// the codes); gguf_prefill_int8_<format>_<a|r|g> multiplies them by the weight
-// codes in int8 and folds each group's affine correction in fp32. A tile is a
-// column tile of GGUF_PREFILL_INT8_SIMDGROUPS simdgroups of 32 columns by
-// GGUF_PREFILL_INT8_ROWS rows, for both formats: af5g64 on 64-row tiles lost
+// weights in groups of 64 and Q8_0: gguf_prefill_int8_quantize writes each
+// 64-input group of each chunk row as int8 codes and a float2 (scale, scale *
+// sum of the codes); gguf_prefill_int8_<format>_<a|r|g> multiplies them by the
+// weight codes in int8 and folds each group's affine correction (each Q8_0
+// 32-group's d) in fp32. A tile is a column tile of
+// GGUF_PREFILL_INT8_SIMDGROUPS simdgroups of 32 columns by
+// GGUF_PREFILL_INT8_ROWS rows, for every format: af5g64 on 64-row tiles lost
 // to the bf16 tile at 65-96 rows (0.95x, 16-core M5 Pro, measured).
 #define GGUF_PREFILL_INT8_GROUP 64u
 #define GGUF_PREFILL_INT8_SIMDGROUPS (GGUF_TILE_COLUMNS / 32u)
@@ -152,8 +171,9 @@ inline constexpr uint64_t gguf_prefill_int8_scale_bytes(uint32_t k, uint64_t sto
 // Decode tiles: the register tile, of plans of up to 32 rows where the
 // device's calibration takes it (RegisterBoundary, ops/KernelCalibration.hpp),
 // and the staged tile, of the other plans of up to 64 rows, a decode step's
-// or a prompt chunk's. One tensor per dispatch, over the dispatch's tiles
-// (grid.x) and K partitions (grid.y).
+// or a prompt chunk's, and of a decode step's of 65 to 128 rows in two row
+// groups (ops::stagedRowGroups). One tensor per dispatch, over the dispatch's
+// tiles (grid.x), K partitions (grid.y) and row groups (grid.z).
 struct GgufDecodeParams {
   uint32_t input_size;  // K
   uint32_t splits;      // K partitions; 1 = no cross-threadgroup reduction

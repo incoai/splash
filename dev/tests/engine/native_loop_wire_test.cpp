@@ -849,7 +849,7 @@ void testImageRequestBeyondVisionStaysRequestScoped() {
     loop.announceReady(protocol::peer::kTestReady);
     auto image = request(9);
     image.imageSpans = {{8, 16, 8, 8, 1, 2}};
-    image.imagePixels.assign(image.imageSpans[0].pixelBytes(), 1);
+    image.imagePixels.assign(image.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels), 1);
     for (const protocol::RequestFrame &frame : {image, request(1)}) {
       require(loop.receive(protocol::peer::serialize(frame)),
               "image request closed the native connection");
@@ -986,6 +986,88 @@ void testCancelledScoreReturnsEmptyLogits() {
     }
   }
   require(doneCount == 1, "cancelled score did not emit Done");
+}
+
+// A request its deadline ends is counted timed out, not failed or cancelled:
+// whether the engine meets the deadline, or the server meets it first and
+// cancels at or after it. A cancel before the deadline is a cancel. Each
+// request has 1000 ms from its arrival; the server sees a cancel as a cancel.
+void testADeadlineEndIsCountedTimedOut() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  fixture.executor.decodeFinishes = false;
+  loop.announceReady(protocol::peer::kTestReady);
+  const auto counted = [&](uint64_t timedOut, uint64_t cancelled) {
+    const engine::EngineSnapshot counts = loop.statusSnapshot();
+    return counts.timedOut == timedOut && counts.cancelled == cancelled && counts.failed == 0;
+  };
+  // The engine's own deadline.
+  require(loop.receive(protocol::peer::serialize(request(1, 64))), "request failed");
+  require(loop.tick(), "the request did not start");
+  fixture.monotonic += 1000.0;
+  runUntilIdle(loop);
+  require(counted(1, 0), "the engine's deadline end was not counted timed out");
+  // The server's cancel at the deadline, while the request's command runs.
+  for (const double late : {1000.0, 1500.0}) {
+    fixture.output.clear();
+    const auto commandsReady = fixture.executor.holdCommands();
+    require(loop.receive(protocol::peer::serialize(request(2, 64))) && loop.tick() && loop.commandInFlight(),
+            "the request's command was not held");
+    fixture.monotonic += late;
+    require(loop.receive(protocol::peer::serialize(protocol::CancelFrame{2})), "cancel failed");
+    *commandsReady = true;
+    runUntilIdle(loop);
+    bool cancelled = false;
+    for (const protocol::EngineEvent &message : fixture.events())
+      if (const auto *done = std::get_if<protocol::DoneEvent>(&message))
+        cancelled = done->reason == EngineFinishReason::Cancelled;
+    require(cancelled, "a cancel at the deadline did not end the request as cancelled");
+  }
+  require(counted(3, 0), "a cancel at or after the deadline was not counted timed out");
+  // A cancel before it.
+  require(loop.receive(protocol::peer::serialize(request(3, 64))) && loop.tick(), "request failed");
+  fixture.monotonic += 999.0;
+  require(loop.receive(protocol::peer::serialize(protocol::CancelFrame{3})), "cancel failed");
+  runUntilIdle(loop);
+  require(counted(3, 1), "a cancel before the deadline was not counted cancelled");
+}
+
+// The engine's deadline for a request is never later than the server's, so
+// that the server's cancel at its own deadline counts timed out whatever time
+// passes between the two clock reads on each side: the server reads the wall
+// clock before the monotonic one (server/runtime.py _wire_deadline), the
+// engine its monotonic clock before the wall clock. Every clock read takes
+// `server` or `engine` ms of one true time; the cancel is read at the server's
+// deadline exactly.
+void testACancelAtTheServersDeadlineIsATimeout() {
+  for (const auto &[server, engine] : {std::pair{0.0, 0.0}, {0.5, 7.0}, {7.0, 0.5}}) {
+    auto now = std::make_shared<double>(100.0);
+    engine::NativeLoopConfig config;
+    config.engine.maxContext = 1024;
+    LoopFixture fixture(config);
+    fixture.clocks.emplace([now, step = engine] { return uint64_t(1e12 + (*now += step) * 1000.0); },
+                           [now, step = engine] { return *now += step; });
+    engine::NativeRuntime &loop = fixture.loop;
+    fixture.executor.decodeFinishes = false;
+    loop.announceReady(protocol::peer::kTestReady);
+    // The server's stamp: its wall clock, then its monotonic clock, against a
+    // deadline 1000 ms on.
+    const double serverDeadline = *now + 1000.0;
+    protocol::RequestFrame frame = request(1, 64);
+    const uint64_t wall = uint64_t(1e12 + (*now += server) * 1000.0);
+    frame.remainingDeadlineMicros = uint64_t((serverDeadline - (*now += server)) * 1000.0);
+    frame.absoluteDeadlineUnixMicros = wall + frame.remainingDeadlineMicros;
+    require(loop.receive(protocol::peer::serialize(frame)) && loop.tick(), "the request did not start");
+    *now = serverDeadline - engine;
+    require(loop.receive(protocol::peer::serialize(protocol::CancelFrame{1})), "cancel failed");
+    runUntilIdle(loop);
+    const engine::EngineSnapshot counts = loop.statusSnapshot();
+    require(counts.timedOut == 1 && counts.cancelled == 0,
+            "a cancel at the server's deadline, the clocks read " + std::to_string(server) + " and " +
+                std::to_string(engine) + " ms apart, was counted cancelled");
+  }
 }
 
 // A Stop frame ends a request that still has output budget left with one
@@ -1325,6 +1407,8 @@ std::span<const test::TestCase> wireTests() {
       {"testScoreRequestCompletesAfterFullPrompt", testScoreRequestCompletesAfterFullPrompt},
       {"testCancelledScoreReturnsEmptyLogits", testCancelledScoreReturnsEmptyLogits},
       {"testStopFrameEndsTheRequestAsStopped", testStopFrameEndsTheRequestAsStopped},
+      {"testADeadlineEndIsCountedTimedOut", testADeadlineEndIsCountedTimedOut},
+      {"testACancelAtTheServersDeadlineIsATimeout", testACancelAtTheServersDeadlineIsATimeout},
       {"testPrefillTimeCountsFromTheStart", testPrefillTimeCountsFromTheStart},
       {"testInvalidScoreFailsOneRequestAndKeepsTheBatch", testInvalidScoreFailsOneRequestAndKeepsTheBatch},
       {"testConstrainedMaskExchange", testConstrainedMaskExchange},

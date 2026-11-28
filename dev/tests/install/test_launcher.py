@@ -671,6 +671,7 @@ class LauncherTests(unittest.TestCase):
             "--offline",
             "--revision",
             "--draft-model",
+            "--draft-revision",
             "--mmproj",
             "--chat-template-file",
             "--reasoning-effort",
@@ -1342,6 +1343,7 @@ class LauncherTests(unittest.TestCase):
                 "revision": "v2",
                 "language_only": True,
                 "draft_model": str(draft.resolve()),
+                "draft_revision": None,
             }
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
@@ -1399,6 +1401,54 @@ class LauncherTests(unittest.TestCase):
                 ),
                 ("prepare", MODEL_ID, "v2", True, options["draft_model"]),
             )
+
+    def test_a_draft_revision_reaches_the_installer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            with (
+                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch.object(launcher.os, "execve"),
+            ):
+                launcher.main(
+                    ["serve", "--model", MODEL_ID, "--draft-model", "owner/draft"]
+                    + ["--draft-revision", "e" * 40]
+                )
+            (chosen,) = install.call_args.args
+            self.assertEqual(
+                chosen.link,
+                launcher.model_artifacts.selection_link(
+                    chosen.models_root,
+                    MODEL_ID,
+                    draft_model="owner/draft",
+                    draft_revision="e" * 40,
+                ),
+            )
+            with (
+                mock.patch.object(launcher, "_ensure_runtime"),
+                mock.patch.object(launcher, "_run_held", return_value=0) as run,
+            ):
+                launcher._ensure_installed(chosen)
+            parsed = launcher.model_artifacts.parse_args(run.call_args.args[0][2:])
+            self.assertEqual(
+                (parsed.draft_model, parsed.draft_revision), ("owner/draft", "e" * 40)
+            )
+
+    def test_a_draft_revision_of_a_local_draft_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                mock.patch("sys.stderr", io.StringIO()) as error,
+                self.assertRaises(SystemExit) as refused,
+            ):
+                launcher.parse_args(
+                    ["serve", "--model", MODEL_ID, "--draft-model", temporary]
+                    + ["--draft-revision", "main"]
+                )
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn(
+            launcher.model_artifacts.DRAFT_REVISION_OF_A_DIRECTORY, error.getvalue()
+        )
 
     def test_offline_serve_forbids_the_hub_to_installer_and_server(self):
         for offline in (False, True):
@@ -1480,7 +1530,10 @@ class LauncherTests(unittest.TestCase):
         ):
             launcher.main(["serve", "--model", MODEL_ID])
         self.assertEqual(
-            held["handlers"], dict.fromkeys(launcher.STOP_SIGNALS, launcher._interrupt)
+            held["handlers"],
+            dict.fromkeys(
+                launcher.STOP_SIGNALS, launcher.model_artifacts.raise_stopped
+            ),
         )
         self.assertLessEqual(set(launcher.STOP_SIGNALS), held["mask"])
 
@@ -1521,8 +1574,8 @@ class LauncherTests(unittest.TestCase):
             (
                 "import os, signal, subprocess, sys, threading, time",
                 "from unittest import mock",
-                "from install import launcher",
-                "signal.signal(signal.SIGINT, launcher._interrupt)",
+                "from install import launcher, models",
+                "models.take_stop_signals()",
                 "popen = subprocess.Popen",
                 "programs = []",
                 "stop = (os.getpid(), signal.SIGINT)",
@@ -1534,7 +1587,7 @@ class LauncherTests(unittest.TestCase):
                 "    else:",
                 "        threading.Timer(0.2, os.kill, stop).start()",
                 "    return programs[-1]",
-                "held = [sys.executable, '-c', 'import time; time.sleep(10)']",
+                "held = [sys.executable, '-c', sys.argv[2]]",
                 "with mock.patch.object(subprocess, 'Popen', side_effect=spawn):",
                 "    try:",
                 "        launcher._run_held(held)",
@@ -1547,16 +1600,31 @@ class LauncherTests(unittest.TestCase):
                 "    print('still running')",
             )
         )
+        # A program that takes the stop, as the installer does, ends by it,
+        # unwinding what it holds; one that leaves it blocked is killed.
+        taking = (
+            "import sys, time\n"
+            "from install import models\n"
+            "try:\n"
+            "    models.take_stop_signals()\n"
+            "    time.sleep(10)\n"
+            "except models.Stopped as stop:\n"
+            "    sys.exit(128 + stop.number)\n"
+        )
         for moment in ("spawn", "run"):
-            with self.subTest(moment=moment):
-                result = subprocess.run(
-                    [sys.executable, "-c", program, moment],
-                    cwd=launcher.ROOT,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                self.assertEqual(result.stdout, f"{-signal.SIGKILL}\n", result.stderr)
+            for held, status in (
+                ("import time; time.sleep(10)", -signal.SIGKILL),
+                (taking, 128 + signal.SIGTERM),
+            ):
+                with self.subTest(moment=moment, status=status):
+                    result = subprocess.run(
+                        [sys.executable, "-c", program, moment, held],
+                        cwd=launcher.ROOT,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    self.assertEqual(result.stdout, f"{status}\n", result.stderr)
 
     def test_programs_take_a_stop_held_from_their_start(self):
         home = self.enterContext(tempfile.TemporaryDirectory())

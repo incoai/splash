@@ -137,7 +137,7 @@ void testImagePromptsRunPrefillGroups() {
     auto value = request(1, std::vector<uint32_t>(8193, 7));
     if (images) {
       value.images = {{4000, 16, 8, 8, 1, 1}};
-      value.imagePixels.assign(value.images.front().pixelBytes(), 1);
+      value.imagePixels.assign(value.images.front().pixelBytes(splash::ops::kImagePatchPixels), 1);
     }
     engine.submit(std::move(value));
     runUntilIdle(engine);
@@ -216,7 +216,7 @@ void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
     if (cancel) {
       tickUntil(engine, now, [&] { return passes() == 3 && !engine.commandInFlight(); },
                 "the long prompt did not run three passes");
-      engine.cancel(2);
+      engine.cancel(2, 0.0);
       require(engine.snapshot().cancelled == 1, "a cancel between passes did not end the request at once");
       const size_t ran = commands.size();
       for (uint32_t step = 0; step < 8; ++step) static_cast<void>(engine.tick(now++));
@@ -243,8 +243,8 @@ void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
       require(!command.pass || (commands[index - 1].kind == WorkKind::Decode && commands[index - 1].requestId == 1),
               "the decoding lane did not step between two passes");
     }
-    engine.cancel(1);
-    if (!cancel) engine.cancel(2);
+    engine.cancel(1, 0.0);
+    if (!cancel) engine.cancel(2, 0.0);
     runUntilIdle(engine);
   }
 }
@@ -330,7 +330,7 @@ void testShortPromptsShareACommandInPasses() {
       passing.tickUntil([&] { return passing.prefills() == 2 && passing.engine.commandInFlight() == inFlight; },
                         "the short prompts did not run two passes");
       for (uint64_t id = 1; id <= cancelled; ++id)
-        passing.engine.cancel(id);
+        passing.engine.cancel(id, 0.0);
       require(passing.engine.snapshot().cancelled == (cancelled == 3 && !inFlight ? 3u : 0u),
               cancelled == 3 && !inFlight ? "a command whose lanes were all cancelled went on"
                                           : "a lane cancelled during its command's passes left the command");
@@ -392,7 +392,7 @@ void testLanesCancelledBetweenPassesHoldNoArrivalBack() {
   passing.tickUntil([&] { return passing.prefills() == first.passes / 2 && !passing.engine.commandInFlight(); },
                     "the Background prompts did not run half their passes");
   for (uint64_t id = 2; id <= 3; ++id)
-    passing.engine.cancel(id);
+    passing.engine.cancel(id, 0.0);
   passing.submit(4, 100, RequestPriority::Foreground);
   const size_t arrived = passing.commands.size();
   passing.tickUntil([&] { return passing.events.usage.contains(4); }, "the Foreground request did not end");
@@ -430,7 +430,7 @@ void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
         },
         "the Background prompts did not run a pass of their command");
     if (cancelled) {
-      passing.engine.cancel(4);
+      passing.engine.cancel(4, 0.0);
       require(passing.engine.snapshot().cancelled == 0, "a lane cancelled between its command's passes left it");
     }
     passing.submit(5, 100, RequestPriority::Foreground);
@@ -493,7 +493,7 @@ void testAStopBetweenPassesFinishesAsStop() {
   passing.engine.stop(1);
   passing.tickUntil([&] { return passing.events.reasons.contains(1); }, "the stopped lane did not end");
   for (uint64_t id = 2; id <= 4; ++id)
-    passing.engine.cancel(id);
+    passing.engine.cancel(id, 0.0);
   passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
   const EngineSnapshot counts = passing.engine.snapshot();
   require(passing.events.reasons.at(1) == EngineFinishReason::Stop && passing.events.outputs.at(1).size() == emitted &&
@@ -530,7 +530,7 @@ void testAStartThatTakesALaneRunsTheNextCommand() {
           "the command after a Foreground arrival under four Background lanes was not its prompt's");
   passing.tickUntil([&] { return passing.events.usage.contains(5); }, "the Foreground request did not end");
   for (uint64_t id = 1; id <= 4; ++id)
-    passing.engine.cancel(id);
+    passing.engine.cancel(id, 0.0);
   passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
   const EngineSnapshot counts = passing.engine.snapshot();
   require(counts.completed == 1 && counts.cancelled == 4 && passing.events.failedCount == 0,
@@ -683,7 +683,7 @@ void testTheLaneThatYieldsIsChosenAfterTheLadder() {
     passing.submit(id, 300, RequestPriority::Background);
   passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
                     "the Background prompts did not run a pass");
-  passing.engine.cancel(2);
+  passing.engine.cancel(2, 0.0);
   passing.storage.growthBlocked = true;
   passing.submit(3, 3000, RequestPriority::Foreground);
   passing.tickUntil([&] { return passing.engine.snapshot().resourceSuspensions == 1; },
@@ -727,19 +727,20 @@ void testALaneThatEndedBetweenPassesIsNotSuspended() {
       require(pass->lanes == std::vector<uint64_t>{2, 3} && pass->passes > 1,
               "the prompts did not share a command in passes");
       if (cancelled) {
-        passing.engine.cancel(ending);
+        passing.engine.cancel(ending, 0.0);
       } else {
         passing.now = 5000;
         static_cast<void>(passing.engine.tick(passing.now++));
       }
       const EngineSnapshot before = passing.engine.snapshot();
-      require(before.cancelled + before.failed == 0, "a lane that ended between its command's passes left it");
+      require(before.cancelled + before.timedOut + before.failed == 0,
+              "a lane that ended between its command's passes left it");
       passing.storage.growthBlocked = true;
       const size_t ended = passing.commands.size();
       passing.tickUntil(
           [&] {
             const EngineSnapshot counts = passing.engine.snapshot();
-            return counts.cancelled + counts.failed == 1 || counts.resourceSuspensions;
+            return counts.cancelled + counts.timedOut == 1 || counts.resourceSuspensions;
           },
           "the lane that ended did not end");
       passing.storage.growthBlocked = false;
@@ -756,7 +757,8 @@ void testALaneThatEndedBetweenPassesIsNotSuspended() {
       const auto rerun = lanes({ending == 3 ? uint64_t{2} : uint64_t{3}});
       const EngineSnapshot counts = passing.engine.snapshot();
       require(counts.resourceSuspensions == 0 && counts.prioritySuspensions == 0 &&
-                  counts.cancelled == cancelled && counts.failed == !cancelled && counts.completed == 2 &&
+                  counts.cancelled == cancelled && counts.timedOut == !cancelled && counts.failed == 0 &&
+                  counts.completed == 2 &&
                   lanes({2, 3}) == passing.commands.end() && rerun != passing.commands.end() && rerun->pass == 0,
               "a lane that ended between its command's passes was suspended, or the command not given up");
     }
@@ -798,7 +800,7 @@ void testADeadlineEndsALaneOfACommandInPasses() {
     require(passing.events.failedCount == 1 && (!wakeup || *wakeup >= passing.now),
             "a lane whose deadline passed during its command's passes did not end there");
     if (when == When::BetweenPasses)
-      passing.engine.cancel(1);
+      passing.engine.cancel(1, 0.0);
     passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
     require(expiringPasses() == 1 + (when == When::InAPass) && passing.events.failedCount == 1,
             "a lane whose deadline passed during its command's passes was run again");
@@ -838,7 +840,7 @@ void testRecoveryAdmitsBetweenPasses() {
   passing.tickUntil([&] { return replay().second != passing.commands.end(); }, "the suspended request did not replay");
   const auto [first, replayed] = replay();
   require(std::count_if(first, replayed, normal) == 6, "a lower priority's replay ran between a command's passes");
-  passing.engine.cancel(1);
+  passing.engine.cancel(1, 0.0);
   passing.tickUntil([&] { return idle(passing.engine); }, "engine did not reach idle");
   require(passing.events.failedCount == 0, "a request failed");
 }
@@ -877,7 +879,7 @@ void testAResidentLaneHoldingSpilledBlocksRunsPrefillGroups() {
               spill.events.starts.back() == 8 * KvCache::pageTokens &&
               spill.model.prefillChunks.at(2) == 1,
           "a Resident request holding spilled blocks ran its prompt a chunk a command");
-  spill.engine.cancel(1);
+  spill.engine.cancel(1, 0.0);
   spill.runUntilIdle();
 }
 
@@ -922,13 +924,13 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
     spill.engine.submit(Spilling::prompt(2, 2, 9, 1));
     spill.engine.submit(Spilling::prompt(3, 3, 9, 1));
     spill.runUntil([&] { return sharing(spill, prefills); }, "the two prompts did not share a command in passes");
-    spill.engine.cancel(3);
+    spill.engine.cancel(3, 0.0);
     require(spill.engine.snapshot().cancelled == 0, "the cancelled lane left its command");
     spill.model.refusedSpilledReads = {1};
     spill.runUntil([&] { return spill.engine.snapshot().cancelled == 1; }, "the cancelled lane did not end");
     spill.model.refusedSpilledReads.clear();
     require(spill.engine.snapshot().resourceSuspensions == 0, "a lane yielded beside one that gave its command up");
-    spill.engine.cancel(1);
+    spill.engine.cancel(1, 0.0);
     spill.runUntilIdle();
     require(spill.events.completedCount == 3 && spill.events.failedCount == 0, "the requests did not end");
   }
@@ -945,7 +947,7 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
       spill.engine.submit(std::move(background));
     }
     spill.runUntil([&] { return sharing(spill, prefills); }, "the Background prompts did not share a command in passes");
-    spill.engine.cancel(3);
+    spill.engine.cancel(3, 0.0);
     spill.model.refusedStaging = {4};
     std::vector<uint32_t> prompt = earlier;
     prompt.insert(prompt.end(), 300, 9);
@@ -1030,7 +1032,7 @@ void testAnEndedLaneLeavesAStartResident() {
                  "the prompts did not run a pass of their command");
   require(spill.engine.snapshot().spill.spill == 0 && prefills.back() == std::pair{2UL, 0U},
           "the prompts did not share a command");
-  spill.engine.cancel(1);
+  spill.engine.cancel(1, 0.0);
   spill.engine.submit(Spilling::prompt(3, 3, 6, 1));
   spill.runUntilIdle();
   require(spill.engine.snapshot().spill.spill == 0 && spill.events.failedCount == 0 &&

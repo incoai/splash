@@ -56,8 +56,10 @@ private struct ServerSections: View {
             if state.server.phase == .ready {
                 ActivitySection(advanced: advanced)
             }
+            // A model its check for updates is giving its tower says so in the download's row.
+            let awaitingVision = state.awaitingVision.filter { $0.id != state.installer.model }
             if first || failed || warming || state.installer.failure != nil || state.installer.finished != nil
-                || state.installer.running || state.keyProblem != nil {
+                || state.installer.running || state.keyProblem != nil || !awaitingVision.isEmpty {
                 GroupedSection {
                     if let problem = state.keyProblem {
                         NoticeRow(title: "Splash can’t use its API key",
@@ -91,6 +93,14 @@ private struct ServerSections: View {
                     }
                     if let finished = state.installer.finished {
                         FinishedRow(model: finished.model, result: finished.result)
+                    }
+                    ForEach(awaitingVision) { model in
+                        // One download at a time, and the model that runs is updated once stopped.
+                        let serving = state.serving(model.id)
+                        NoticeRow(quietSymbol: "photo", title: "\(state.displayName(of: model.id)) is installed text only",
+                                  message: "Splash serves its images now. \(serving ? "Stop it, then update" : "Update") it to add its vision tower.",
+                                  action: serving || !state.ready || state.installer.running
+                                      ? nil : ("Update", { state.checkForUpdates(model.id) }))
                     }
                     if state.installer.running { DownloadRow() }
                 } header: {
@@ -209,9 +219,10 @@ private struct ControlBar: View {
         HStack(spacing: 12) {
             StatusMark(look: look, since: server.since)
             VStack(alignment: .leading, spacing: 2) {
+                // At its end, as the Server button cuts the model's name.
                 Text(model.map(state.displayName(of:)) ?? "")
                     .font(.headline)
-                    .truncationMode(.middle)
+                    .truncationMode(.tail)
                 detail
                     .font(.callout)
                     .foregroundStyle(.secondary)

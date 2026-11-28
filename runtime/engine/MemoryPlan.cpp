@@ -102,6 +102,8 @@ void writeModel(json::Writer &w, const ModelMemoryProfile &model) {
           .field("lane_state_bytes", footprint.runtime.laneStatePlannedAllocatedBytes)
           .field("shared_prefill_bytes", footprint.runtime.sharedPrefillPlannedAllocatedBytes)
           .field("shared_decode_bytes", footprint.runtime.sharedDecodePlannedAllocatedBytes)
+          .field("page_table_bytes", footprint.runtime.pageTableBytes)
+          .field("window_table_bytes", footprint.runtime.windowTableBytes)
           .field("pipeline_reserve_bytes", model::kPipelineReserveBytes)
           .field("runtime_overhead_reserve_bytes", model::kRuntimeOverheadReserveBytes)
           .field("streamed_table_bytes", footprint.streamedTableBytes)
@@ -122,6 +124,7 @@ void writeBudget(json::Writer &w, const EngineMemoryBreakdown &budget) {
         .field("draft_weights_bytes", budget.draftWeightsBytes)
         .field("vision_weights_bytes", budget.visionWeightsBytes)
         .field("maximum_batch_width", budget.maximumBatchWidth)
+        .field("default_lanes_context_tokens", budget.defaultLanesContextTokens)
         .field("lane_state_bytes", budget.laneStateBytes)
         .field("shared_prefill_bytes", budget.sharedPrefillBytes)
         .field("shared_decode_bytes", budget.sharedDecodeBytes)
@@ -133,20 +136,22 @@ void writeBudget(json::Writer &w, const EngineMemoryBreakdown &budget) {
         .field("host_held_back_bytes", budget.hostHeldBackBytes)
         .field("fixed_runtime_bytes", budget.fixedRuntimeBytes)
         .field("dynamic_budget_bytes", budget.dynamicBudgetBytes)
+        .field("cached_states_bytes", budget.cachedStatesBytes)
         .field("kv_page_tokens", budget.kvPageTokens)
         .field("kv_page_bytes", budget.kvPageBytes)
         .field("kv_extent_pages", budget.kvExtentPages)
+        .field("kv_smallest_extent_pages", budget.kvSmallestExtentPages)
         .field("kv_extent_bytes", budget.kvExtentBytes)
         .field("kv_capacity_pages", budget.kvCapacityPages)
         .field("kv_capacity_bytes", budget.kvCapacityBytes)
         .field("kv_capacity_tokens", budget.kvCapacityTokens)
-        .field("kv_index_page_bytes", budget.kvIndexPageBytes);
-    // A windowed layout's Slim pages; nothing for another layout.
-    if (budget.kvSlimPageBytes) {
-      w.object("kv_window", [&] {
-        w.field("slim_page_bytes", budget.kvSlimPageBytes).field("floor_pages", budget.kvWindowFloorPages);
-      });
-    }
+        .field("kv_index_page_bytes", budget.kvIndexPageBytes)
+        .field("concurrent_requests", budget.concurrentRequests)
+        .field("more_requests_context_tokens", budget.moreRequestsContextTokens)
+        .field("more_requests_bytes", budget.moreRequestsBytes);
+    // A windowed layout's lane floor, in window pages; nothing for another.
+    if (budget.kvWindowFloorPages)
+      w.object("kv_window", [&] { w.field("floor_pages", budget.kvWindowFloorPages); });
     w.key("kv_spill");
     writeSpillPlan(w, budget.kvSpill);
     w.object("context_bounds", [&] {
@@ -167,12 +172,13 @@ void writeBudget(json::Writer &w, const EngineMemoryBreakdown &budget) {
 
 std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
                                              uint64_t laneStateBytes,
-                                             const kv::Layout &layout) noexcept {
-  uint64_t runwayBytes = 0;
-  uint64_t dynamicBytes = 0;
-  uint64_t result = 0;
-  if (!checkedMultiply(layout.bytesPerModelPage() + kv::kPageTokens * model::kLookupIndexTokenBytes,
-                       kvRunwayPages(layout.minimumExtentPages()), runwayBytes) ||
+                                             const kv::Layout &layout, uint32_t lanes) noexcept {
+  // The runway's pages, and its blocks' lookup index: a window unit's pages take none.
+  const uint32_t blockPages = layout.blockPages();
+  const uint64_t pages = model::ExecutionLimits::runwayPages(layout.minimumExtentPages(), lanes, blockPages);
+  uint64_t runwayBytes = 0, dynamicBytes = 0, result = 0;
+  if (!checkedMultiply(layout.bytesPerModelPage(), pages, runwayBytes) ||
+      !checkedAdd(runwayBytes, pages / blockPages * kv::kPageTokens * model::kLookupIndexTokenBytes, runwayBytes) ||
       !checkedAdd(laneStateBytes, runwayBytes, dynamicBytes) ||
       !checkedAdd(fixedBytes, dynamicBytes, result))
     return std::nullopt;
@@ -184,28 +190,50 @@ uint64_t kvCapacityPagesFor(const kv::Layout &layout, uint64_t pages) noexcept {
   return extentPages ? pages - pages % extentPages : 0;
 }
 
-uint32_t kvWindowFloorPages(const kv::Layout &layout, uint32_t commandPages) noexcept {
-  if (!layout.slimmable()) return 0;
+uint32_t kvWindowFloorBlocks(const kv::Layout &layout, uint32_t commandPages) noexcept {
+  if (!layout.windowUnitPages())
+    return 0;
   const uint32_t command =
       commandPages ? commandPages : model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens;
   return layout.windowPages() + command + 1;
 }
 
-uint64_t kvPagesBytes(const kv::Layout &layout, uint64_t pages, uint32_t floorPages, uint32_t extentPages) noexcept {
-  const uint64_t full = layout.slimmable() ? std::min<uint64_t>(pages, floorPages) : pages;
-  const auto extents = [&](uint64_t count) { return count ? (count - 1) / extentPages + 1 : 0; };
-  return extentPages * (extents(full) * layout.bytesPerModelPage() +
-                        extents(pages - full) * layout.bytesPerModelPage(kv::PageForm::Slim));
+uint64_t kvBlockPages(const kv::Layout &layout, uint64_t blocks, uint32_t floorBlocks) noexcept {
+  return blocks + uint64_t{layout.windowUnitPages()} * std::min<uint64_t>(blocks, floorBlocks);
 }
 
-uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorPages, uint32_t extentPages) noexcept {
+uint64_t kvPageBlocks(const kv::Layout &layout, uint64_t pages, uint32_t floorBlocks) noexcept {
+  const uint64_t unit = layout.windowUnitPages();
+  const uint64_t floor = uint64_t{floorBlocks} * (1 + unit);
+  return pages >= floor ? pages - unit * floorBlocks : pages / (1 + unit);
+}
+
+uint64_t kvCachedStates(const kv::Layout &layout, uint64_t capacityPages) noexcept {
+  const uint64_t tailPages = uint64_t{layout.windowPages()} * layout.windowUnitPages();
+  return tailPages ? capacityPages / tailPages : 0;
+}
+
+uint64_t kvPagesBytes(const kv::Layout &layout, uint64_t pages, uint32_t extentPages) noexcept {
+  return pages ? ((pages - 1) / extentPages + 1) * extentPages * layout.bytesPerModelPage() : 0;
+}
+
+uint64_t kvPagesCost(const kv::Layout &layout, uint64_t pages, uint32_t floorBlocks) noexcept {
   const uint64_t index = uint64_t{kv::kPageTokens} * model::kLookupIndexTokenBytes;
-  const auto whole = [&](uint64_t room, kv::PageForm form) {
-    return room / (extentPages * (layout.bytesPerModelPage(form) + index)) * extentPages;
-  };
-  const uint64_t floorBytes = kvPagesBytes(layout, floorPages, floorPages, extentPages) + floorPages * index;
-  if (!layout.slimmable() || bytes < floorBytes) return whole(bytes, kv::PageForm::Full);
-  return floorPages + whole(bytes - floorBytes, kv::PageForm::Slim);
+  const uint64_t page = layout.bytesPerModelPage(), unit = layout.windowUnitPages();
+  if (pages >= floorBlocks * (1 + unit))
+    return pages * (page + index) - unit * floorBlocks * index;
+  return (pages * (page * (1 + unit) + index) + unit) / (1 + unit);
+}
+
+uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorBlocks, uint32_t extentPages) noexcept {
+  const uint64_t index = uint64_t{kv::kPageTokens} * model::kLookupIndexTokenBytes;
+  const uint64_t page = layout.bytesPerModelPage(), unit = layout.windowUnitPages();
+  // Past the floor a page is a block and its index; within it a block is
+  // its base page, its unit and its index.
+  const uint64_t past = (bytes + unit * floorBlocks * index) / (page + index);
+  const uint64_t pages =
+      past >= floorBlocks * (1 + unit) ? past : bytes * (1 + unit) / (page * (1 + unit) + index);
+  return pages / extentPages * extentPages;
 }
 
 uint32_t ContextBounds::maximum() const noexcept {
@@ -291,15 +319,16 @@ std::string EngineMemoryBreakdown::describe() const {
       << "expert store above its floor at the start: " << bytesAndMiB(hostHeldBackBytes) << '\n'
       << "fixed runtime: " << bytesAndMiB(fixedRuntimeBytes) << '\n'
       << "elastic state/KV budget: " << bytesAndMiB(dynamicBudgetBytes) << '\n'
+      << "of it, cached states beside the KV: " << bytesAndMiB(cachedStatesBytes) << '\n'
       << "KV page: " << kvPageTokens << " tokens, "
       << bytesAndMiB(kvPageBytes) << '\n'
       << "KV extent: " << kvExtentPages << " pages, "
       << bytesAndMiB(kvExtentBytes) << '\n'
       << "KV capacity of one request: " << kvCapacityPages << " pages / "
       << kvCapacityTokens << " tokens\n";
-  if (kvSlimPageBytes)
-    out << "KV past the windows: Slim pages of " << bytesAndMiB(kvSlimPageBytes) << ", a lane keeping "
-        << kvWindowFloorPages << " pages Full\n";
+  if (kvWindowFloorPages)
+    out << "KV past the windows: base pages, a lane keeping the window units of " << kvWindowFloorPages
+        << " pages\n";
   if (kvSpill.enabled)
     out << "KV on the SSD cache: Index pages of " << bytesAndMiB(kvIndexPageBytes) << "; a Spill request keeps "
         << kvSpill.densePages << " dense, " << kvSpill.windowPages << " window and 2 x " << kvSpill.groupPages
@@ -345,6 +374,53 @@ SpillGeometry EngineMemoryPlan::spillGeometry() const noexcept {
           .groupPages = spill.groupPages};
 }
 
+uint64_t EngineMemoryPlan::residentTokensBeside(uint64_t besideBytes) const noexcept {
+  const kv::Layout &layout = model_.targetKvLayout;
+  const uint64_t beside = breakdown_.laneStateBytes + (model_.spill.enabled ? model_.spill.heldBytes() : 0);
+  const uint32_t floorBlocks = kvWindowFloorBlocks(layout, model_.commandPages);
+  const uint64_t pages = std::min<uint64_t>(
+      kvPagesWithin(layout, saturatingSubtract(breakdown_.dynamicBudgetBytes, beside + besideBytes), floorBlocks, 1),
+      std::numeric_limits<uint32_t>::max());
+  return saturatingSubtract(uint64_t{kv::kPageTokens} * kvPageBlocks(layout, kvCapacityPagesFor(layout, pages), floorBlocks),
+                            model::ExecutionLimits::speculativeScratchTokens);
+}
+
+uint32_t EngineMemoryPlan::noteConcurrentRequests(uint32_t servedTokens) noexcept {
+  EngineMemoryBreakdown &budget = breakdown_;
+  const auto holds = [&](uint64_t besideBytes) { return residentTokensBeside(besideBytes) >= servedTokens; };
+  uint32_t requests = 1;
+  while (requests < budget.maximumBatchWidth && holds(uint64_t{requests} * budget.laneStateBytes))
+    ++requests;
+  budget.concurrentRequests = requests;
+  budget.moreRequestsContextTokens = 0;
+  budget.moreRequestsBytes = 0;
+  if (requests < budget.maximumBatchWidth) {
+    const uint64_t beside = uint64_t{requests} * budget.laneStateBytes;
+    budget.moreRequestsContextTokens = static_cast<uint32_t>(
+        std::min<uint64_t>(residentTokensBeside(beside), std::numeric_limits<uint32_t>::max()));
+    // The fewest bytes more that hold one more lane's state beside the
+    // served context: beside its whole state, nothing more holds that
+    // context, as the plan does.
+    uint64_t low = 0, high = beside;
+    while (low < high) {
+      const uint64_t middle = low + (high - low) / 2;
+      if (holds(beside - middle))
+        high = middle;
+      else
+        low = middle + 1;
+    }
+    budget.moreRequestsBytes = low;
+  }
+  return requests;
+}
+
+uint32_t EngineMemoryPlan::compareDefaultLanes(const EngineMemoryPlan &defaultLanes, uint32_t servedTokens,
+                                               uint32_t askedTokens) noexcept {
+  const uint32_t most = defaultLanes.maximumContextTokens();
+  const uint32_t tokens = askedTokens ? std::min(askedTokens, most) : most;
+  return breakdown_.defaultLanesContextTokens = tokens > servedTokens ? tokens : 0;
+}
+
 void writeJson(json::Writer &w, const EngineMemoryPlan &plan) {
   w.object([&] {
     w.field("valid", true).field("maximum_context_tokens", plan.maximumContextTokens()).key("device");
@@ -373,12 +449,14 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       model.footprint.runtime.sharedPrefillPlannedAllocatedBytes;
   breakdown.sharedDecodeBytes =
       model.footprint.runtime.sharedDecodePlannedAllocatedBytes;
+  breakdown.maximumBatchWidth = model.footprint.runtime.lanes;
   breakdown.pipelineReserveBytes = model::kPipelineReserveBytes;
   breakdown.runtimeOverheadReserveBytes = model::kRuntimeOverheadReserveBytes;
   breakdown.stateStagingBytes = model.footprint.stateStagingBytes;
   breakdown.aneFfnBytes = model.footprint.aneFfnBytes;
   breakdown.streamedTableBytes = model.footprint.streamedTableBytes;
   breakdown.hostHeldBackBytes = model.footprint.hostHeldBackBytes;
+  breakdown.cachedStatesBytes = model.footprint.cachedStatesBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
 
   if (auto error = device.validationError()) {
@@ -401,7 +479,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                     std::move(breakdown))};
   }
   breakdown.hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
-      breakdown.recommendedWorkingSetBytes, maximumMemoryBytes);
+      breakdown.recommendedWorkingSetBytes, maximumMemoryBytes, breakdown.physicalMemoryBytes);
 
   breakdown.kvPageBytes = model.targetKvLayout.bytesPerModelPage();
   breakdown.fixedRuntimeBytes = model.fixedRuntimeBytes();
@@ -410,8 +488,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
           ? breakdown.hardBudgetBytes - breakdown.fixedRuntimeBytes
           : 0;
   const std::optional<uint64_t> required =
-      minimumRequiredBytes(breakdown.fixedRuntimeBytes,
-                           breakdown.laneStateBytes, model.targetKvLayout);
+      minimumRequiredBytes(breakdown.fixedRuntimeBytes, breakdown.laneStateBytes, model.targetKvLayout,
+                           breakdown.maximumBatchWidth);
   if (!required) {
     return {std::nullopt,
             failure(BudgetErrorCode::ArithmeticOverflow,
@@ -422,43 +500,35 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.minimumDynamicBytes = *required - breakdown.fixedRuntimeBytes;
   breakdown.kvIndexPageBytes = model.targetKvLayout.indexBytesPerModelPage();
   breakdown.kvSpill = model.spill;
-  // A windowed layout's request keeps Full only its lane's window and the
-  // pages its command writes; the rest of its KV is Slim.
   const kv::Layout &kvLayout = model.targetKvLayout;
-  breakdown.kvWindowFloorPages = kvWindowFloorPages(kvLayout, model.commandPages);
-  if (kvLayout.slimmable())
-    breakdown.kvSlimPageBytes = kvLayout.bytesPerModelPage(kv::PageForm::Slim);
   // Page ids stay 32-bit. One request's KV capacity is the whole extents of
   // the size that leaves the fewest of the budget's pages, priced one by one,
-  // unused; a windowed layout's Full and Slim pages take extents of their
-  // own (kvPagesWithin). They are what the budget leaves beside its lane's
+  // unused (kvPagesWithin). They are what the budget leaves beside its lane's
   // state and what a spill-capable target holds from its start
   // (KvSpillPlan::heldBytes), as a lone start's claim counts them
   // (Engine::residentRoom), so that the context advertised is one a lone
   // start takes. Beside the state alone, a Qwen3.8-Flash-Next start that can
   // spill advertised an extent more than a lone start could take wherever
   // the room past its last extent was less than its 6,881,280 bytes of Index
-  // runway and tables.
+  // runway and tables. The room a streamed plan sets aside for cached states
+  // stays theirs: the K/V reaches its capacity with them held.
   const uint64_t availableForOneRequestKv =
-      saturatingSubtract(breakdown.dynamicBudgetBytes,
-                         breakdown.laneStateBytes + (model.spill.enabled ? model.spill.heldBytes() : 0));
-  const auto pagesWithin = [&](uint32_t extentPages) {
-    return std::min<uint64_t>(
-        kvPagesWithin(kvLayout, availableForOneRequestKv, breakdown.kvWindowFloorPages, extentPages),
-        std::numeric_limits<uint32_t>::max());
-  };
-  const uint64_t budgetPages = pagesWithin(1);
-  breakdown.kvExtentPages = model.targetKvLayout.extentPagesFor(budgetPages);
-  breakdown.kvCapacityPages =
-      static_cast<uint32_t>(kvLayout.slimmable() && breakdown.kvExtentPages
-                                ? pagesWithin(breakdown.kvExtentPages)
-                                : kvCapacityPagesFor(model.targetKvLayout, budgetPages));
-  breakdown.kvCapacityBytes =
-      kvPagesBytes(kvLayout, breakdown.kvCapacityPages, breakdown.kvWindowFloorPages, breakdown.kvExtentPages);
+      saturatingSubtract(breakdown.dynamicBudgetBytes, breakdown.laneStateBytes + breakdown.cachedStatesBytes +
+                                                           (model.spill.enabled ? model.spill.heldBytes() : 0));
+  // A windowed layout's request holds whole only its lane's window and the
+  // blocks its command writes; past them its blocks' base pages.
+  const uint32_t floorBlocks = kvWindowFloorBlocks(kvLayout, model.commandPages);
+  breakdown.kvWindowFloorPages = floorBlocks * kvLayout.windowUnitPages();
+  const uint64_t budgetPages = std::min<uint64_t>(kvPagesWithin(kvLayout, availableForOneRequestKv, floorBlocks, 1),
+                                                  std::numeric_limits<uint32_t>::max());
+  breakdown.kvExtentPages = kvLayout.extentPagesFor(budgetPages);
+  breakdown.kvSmallestExtentPages = kvLayout.minimumExtentPages();
+  breakdown.kvCapacityPages = static_cast<uint32_t>(kvCapacityPagesFor(kvLayout, budgetPages));
+  breakdown.kvCapacityBytes = kvPagesBytes(kvLayout, breakdown.kvCapacityPages, breakdown.kvExtentPages);
 
   if (!checkedMultiply(breakdown.kvPageBytes, breakdown.kvExtentPages,
                        breakdown.kvExtentBytes) ||
-      !checkedMultiply(breakdown.kvPageTokens, breakdown.kvCapacityPages,
+      !checkedMultiply(breakdown.kvPageTokens, kvPageBlocks(kvLayout, breakdown.kvCapacityPages, floorBlocks),
                        breakdown.kvCapacityTokens)) {
     return {std::nullopt, failure(BudgetErrorCode::ArithmeticOverflow,
                                   "KV capacity overflows uint64",

@@ -21,10 +21,19 @@
 
 namespace {
 
+// The devices stream 13.5 GB/s a core, the plain read the backend measures on the 12-core M6 (161.9 GB/s), which
+// the matrix tile's split law reads (KernelCalibration::memoryBytesPerSecond).
+constexpr uint64_t kBytesPerSecondPerCore = 13'500'000'000;
+
 using namespace splash;
 
 using splash::test::rejects;
 using splash::test::require;
+
+// A family's layout check: its architecture's own where it has one, else the
+// Qwen hybrid's.
+template <class Layout> void requireLayout(const Layout &layout) { model::requireQwenLayout(layout); }
+void requireLayout(const model::Inkling2LoopLayout &layout) { model::requireInkling2Layout(layout); }
 
 template <class Weights>
 model::DFlashDraftLayout draftOf() {
@@ -102,7 +111,8 @@ model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
 
 // A layer's gate and up projections run as one gate/up plan, so their shapes
 // must match, though not their formats: a pair with an F16 tensor, which the
-// Apple9 register tile does not take, stages. The vocabulary head reserves
+// Apple9 register tile does not take, stages on Apple9 and runs the matrix
+// tile on Apple10 and Apple11, as every pair does there. The vocabulary head reserves
 // workspace only in decode, and the arenas hold a gate/up layer's decode and
 // short-prefill plans and a mixed pair's decode plans at the rows they store.
 void checkGateUpLayers() {
@@ -128,49 +138,92 @@ void checkGateUpLayers() {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
     ops::ExecutionPlans plans(device, ops::Int8Activations::On);
-    const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8, ops::GdnStateFormat::Float32);
-    const auto head = target.logitsProjection.shape();
-    const auto containsHead = [&](const auto &shapes) {
-      return std::find(shapes.begin(), shapes.end(), head) != shapes.end();
-    };
-    require(!containsHead(geometry.target.prefillProjections) &&
-                containsHead(geometry.target.decodeProjections),
-            "vocabulary head must reserve workspace only in decode");
-    const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
-    for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
-      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, lanes * model::kDecodeRows,
-          ops::LinearEpilogue::GateUp}, up);
-      const auto required = plan.scratchSize();
-      require(scratch.input >= required.input && scratch.sums >= required.sums &&
-                  scratch.partials >= required.partials && scratch.counters >= required.counters,
-              "the decode arena is below a gate/up layer's scratch");
-      require(model::DecodeArena::gateScratchBytes(geometry, plans) >= plan.gateScratchBytes(),
-              "the gate/up workspace is too small");
-      // The F16 and Q8_0 pair stages, at rows the storage of the target's
-      // projections over a step's rows holds (ops::Linear::storageRows).
-      const auto pair = plans.linear().plan(mixed.upProjection, lanes * model::kDecodeRows,
-                                            ops::LinearEpilogue::GateUp, &mixed.gateProjection);
-      const auto paired = pair.scratchSize();
-      uint32_t storage = 0;
-      for (const auto &shape : geometry.target.decodeProjections)
-        storage = std::max(storage, plans.linear().storageRows(lanes * model::kDecodeRows, shape));
-      require(pair.configuration().tile == ops::LinearTile::GgufStaged && pair.storageRows() <= storage,
-              "a gate/up pair with an F16 gate did not stage within the decode storage");
-      require(scratch.input >= paired.input && scratch.sums >= paired.sums && scratch.partials >= paired.partials &&
-                  scratch.counters >= paired.counters &&
-                  model::DecodeArena::gateScratchBytes(geometry, plans) >= pair.gateScratchBytes(),
-              "the arenas are below a gate/up pair in two formats");
-    }
-    const auto sizes = model::prefillTensorBytes(geometry, plans);
-    for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 48U, 64U}) {
-      const auto required = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
-          ops::LinearEpilogue::None}, up).scratchSize();
-      require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
-                  sizes[uint32_t(model::PrefillTensor::LinearCounters)] >= required.counters,
-              "the short-prefill split scratch is too small");
+    for (const uint32_t runtimeLanes : {model::ExecutionLimits::defaultLanes, model::kLaneCount}) {
+      const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                         model::StreamedParts::loaded(dense), runtimeLanes);
+      const auto head = target.logitsProjection.shape();
+      const auto containsHead = [&](const auto &shapes) {
+        return std::find(shapes.begin(), shapes.end(), head) != shapes.end();
+      };
+      require(!containsHead(geometry.target.prefillProjections) &&
+                  containsHead(geometry.target.decodeProjections),
+              "vocabulary head must reserve workspace only in decode");
+      const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
+      for (uint32_t lanes = 1; lanes <= runtimeLanes; ++lanes) {
+        // A step's rows, a verify block a lane: a gate/up pair on the decode
+        // tiles, past them the up-with-gate pass after the gate's
+        // (Linear::addSwiGlu), each the plan it runs.
+        const uint32_t rows = model::ExecutionLimits::stepRows(lanes);
+        const auto plan = plans.decodeLinear().plan({{up.outputSize, up.inputSize}, rows,
+            rows <= ops::kMaximumDecodeTileRows ? ops::LinearEpilogue::GateUp : ops::LinearEpilogue::UpWithGate}, up);
+        const uint64_t gate = plan.gateScratchBytes();
+        const auto required = plan.scratchSize();
+        require(scratch.input >= required.input && scratch.sums >= required.sums &&
+                    scratch.partials >= required.partials && scratch.counters >= required.counters,
+                "the decode arena is below a gate/up layer's scratch");
+        require(model::DecodeArena::gateScratchBytes(geometry, plans) >= gate, "the gate/up workspace is too small");
+        // The F16 and Q8_0 pair stages on Apple9 and runs the matrix tile on
+        // Apple10 and Apple11, at rows the storage of the target's projections
+        // over a step's rows holds (ops::Linear::storageRows).
+        if (rows > ops::kMaximumDecodeTileRows) continue;
+        const auto pair = plans.decodeLinear().plan(mixed.upProjection, rows,
+                                                    ops::LinearEpilogue::GateUp, &mixed.gateProjection);
+        const auto paired = pair.scratchSize();
+        uint32_t storage = 0;
+        for (const auto &shape : geometry.target.decodeProjections)
+          storage = std::max(storage, plans.decodeLinear().storageRows(rows, shape));
+        require(pair.configuration().tile ==
+                        (family == 9 ? ops::LinearTile::GgufStaged : ops::LinearTile::GgufMatrix) &&
+                    pair.storageRows() <= storage,
+                "a gate/up pair with an F16 gate did not run its device's tile within the decode storage");
+        require(scratch.input >= paired.input && scratch.sums >= paired.sums && scratch.partials >= paired.partials &&
+                    scratch.counters >= paired.counters &&
+                    model::DecodeArena::gateScratchBytes(geometry, plans) >= pair.gateScratchBytes(),
+                "the arenas are below a gate/up pair in two formats");
+      }
+      const auto sizes = model::prefillTensorBytes(geometry, plans);
+      for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 48U, 64U}) {
+        const auto required = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
+            ops::LinearEpilogue::None}, up).scratchSize();
+        require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
+                    sizes[uint32_t(model::PrefillTensor::LinearCounters)] >= required.counters,
+                "the short-prefill split scratch is too small");
+      }
     }
   }
+}
+
+// A decode arena's gate scratch holds its draft's gate/up pair, af4g64 planes
+// (DraftCheckpoint) of 8 rows a lane, on the tile their format takes, at every
+// lane count of every runtime: a MoE target adds no bound of its own, and one
+// lane's pair stores 16 rows where it runs two passes on the 16-row tile.
+void checkDraftGateScratch(const model::LoadedModel &loaded) {
+  const auto &d = loaded.draft.layout;
+  const ops::Projection up(d.intermediateSize, d.hiddenSize,
+                           ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_AF4G64, d.intermediateSize,
+                                                                            d.hiddenSize, {}, {}, {})}});
+  const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
+  for (uint32_t family : {9U, 10U, 11U})
+    for (uint32_t cores : {8U, 10U, 12U, 14U, 16U, 18U, 20U, 30U, 32U, 40U, 60U, 80U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = cores;
+      device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
+      const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+      for (uint32_t runtimeLanes = 1; runtimeLanes <= model::kLaneCount; ++runtimeLanes) {
+        const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts,
+                                                           runtimeLanes);
+        const uint64_t held = model::DecodeArena::gateScratchBytes(geometry, plans);
+        for (uint32_t lanes = 1; lanes <= runtimeLanes; ++lanes)
+          require(held >= plans.draftLinear()
+                              .plan(up, lanes * model::kDraftRows, ops::LinearEpilogue::GateUp, &up)
+                              .gateScratchBytes(),
+                  "the decode arena's gate scratch is below its draft's pair of " + std::to_string(lanes) +
+                      " lanes on Apple" + std::to_string(family) + " of " + std::to_string(cores) + " cores");
+      }
+    }
 }
 
 // The prefill arena holds the int8 prefill tile's codes and scales of a full
@@ -186,6 +239,7 @@ void checkPrefillInt8Scratch() {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = 20;
+      device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
       const ops::ExecutionPlans plans(device, setting);
       // The arena's codes and scales for `loaded`, and the tables of its plans
       // on the decode tiles.
@@ -220,8 +274,56 @@ void checkPrefillInt8Scratch() {
     }
 }
 
-// One decode arena serves every lane count, and a staged plan's partials
-// grow with its rows. The arena must hold every lane's plan of every target
+// Where a start gives no --activations its model's family gives the default (ModelDescriptor::activations):
+// bf16 for Inkling-2, auto's int8 paths for every other family. So on a GPU with int8-activation paths (Apple10,
+// Apple11) Inkling-2's plans by default run an af4g64 projection's 2048-row chunk on the bf16 prefill tile and score
+// no INT8 queries after 32K tokens, --activations auto gives it both as it gives every family, and a Qwen
+// target's default takes both as it did.
+void checkFamilyActivations() {
+  uint32_t families = 0;
+  model::forEachFamily([&](const auto &layout) {
+    model::ModelDescriptor descriptor;
+    descriptor.target = layout;
+    const bool inkling = std::is_same_v<std::decay_t<decltype(layout)>, model::Inkling2LoopLayout>;
+    require(descriptor.activations() == (inkling ? ops::Int8Activations::Off : ops::Int8Activations::On),
+            std::string(layout.family) + " has another default of --activations than its family's");
+    ++families;
+  });
+  require(families == std::tuple_size_v<decltype(model::kFamilies)>, "a family's activations were not read");
+  model::ModelDescriptor inkling, qwen;
+  inkling.target = model::Inkling2LoopLayout{};
+  qwen.target = model::Qwen3_8Layout{};
+  const ops::Projection af4(5120, 17408,
+                            ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_AF4G64, 5120, 17408, {}, {}, {})}});
+  const kv::Layout layout{1, 2, 256};
+  const std::array sequence{ops::PagedAttention::chunkParams(32768, 64, 64, (32768 + 64 + 31) / 32)};
+  for (uint32_t family : {9U, 10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    // Whether the plans of a start that gave `given`, or nothing, take the int8 paths.
+    const auto int8Paths = [&](std::optional<ops::Int8Activations> given, const model::ModelDescriptor &model) {
+      const ops::ExecutionPlans plans(device, given.value_or(model.activations()));
+      const bool tile = plans.linear().plan(af4, 2048, ops::LinearEpilogue::Residual).configuration().tile ==
+                        ops::LinearTile::GgufPrefillInt8;
+      const bool queries = plans.attention(sequence, 16, layout, plans.sequenceAttentionWorkspace(16, layout))
+                               .splitPipeline()
+                               .find("q8q") != std::string::npos;
+      require(tile == queries && tile == (plans.linear().int8Activations() == ops::Int8Activations::On && family >= 10),
+              "the int8 prefill tile and INT8 queries do not follow the plans' activations");
+      return tile;
+    };
+    const bool int8 = family >= 10;
+    require(!int8Paths({}, inkling) && int8Paths(ops::Int8Activations::On, inkling) == int8 &&
+                !int8Paths(ops::Int8Activations::Off, inkling),
+            "Inkling-2 took int8 activations by default, or --activations auto did not give it them");
+    require(int8Paths({}, qwen) == int8 && int8Paths(ops::Int8Activations::On, qwen) == int8 &&
+                !int8Paths(ops::Int8Activations::Off, qwen),
+            "a Qwen target's default left the int8 activations it took, or bf16 did not turn them off");
+  }
+}
+
+// A decode arena, of four lanes or eight, serves every lane count up to its
+// own, and a staged plan's partials grow with its rows. It must hold every lane's plan of every target
 // projection and the draft's context projections, over a lane's most rows,
 // and of the draft's own and of its head over its subset of the vocabulary
 // (DFlashDraft), over its block's, at the measured core counts and an M3
@@ -229,7 +331,9 @@ void checkPrefillInt8Scratch() {
 // column tiles and not for the whole head's 3,880, whose plan takes no
 // partials.
 void checkLaneScratch(const model::LoadedModel &loaded) {
-  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  for (const uint32_t runtimeLanes : {model::ExecutionLimits::defaultLanes, model::kLaneCount}) {
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                     model::StreamedParts::loaded(loaded), runtimeLanes);
   const auto &d = geometry.draft;
   const auto &target = geometry.target;
   // Each matrix with the rows a lane gives it.
@@ -246,41 +350,133 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
+      device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
       const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
       for (const auto &[matrix, laneRows] : matrices)
-        for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
+        for (uint32_t lanes = 1; lanes <= runtimeLanes; ++lanes)
           for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                                 ops::LinearEpilogue::GateUp}) {
-            const auto need = plans.linear().plan({matrix, lanes * laneRows, epilogue}).scratchSize();
+            const uint32_t rows = std::min(lanes * laneRows, geometry.target.stepRows());
+            if (epilogue == ops::LinearEpilogue::GateUp && rows > ops::kMaximumDecodeTileRows) continue;
+            const auto need = plans.decodeLinear().plan({matrix, rows, epilogue}).scratchSize();
             require(scratch.input >= need.input && scratch.sums >= need.sums && scratch.partials >= need.partials &&
                         scratch.counters >= need.counters,
                     "decode arena scratch below a lane's plan");
           }
     }
+  }
 }
 
-// A decode step of any rows its lanes may give it, up to four lanes of a
-// verify block's 16, finds its MoE plan's workspace in the decode arena: past
-// 32 rows the 35B's and the 122B's plans take 32-row expert tiles, whose 274
-// tiles at 64 rows a bound of four lanes of 8 rows did not hold.
+// A decode step of any rows its lanes may give it, up to 128 at eight lanes,
+// finds its MoE plan's workspace in the decode arena: past 32 rows the 35B's
+// and the 122B's plans take 32-row expert tiles, whose 274 tiles at 64 rows a
+// bound of four lanes of 8 rows did not hold.
 void checkDecodeStepMoe(const model::LoadedModel &loaded) {
-  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  for (const auto &[lanes, stepRows] : {std::pair{4U, 64U}, {8U, 128U}})
   for (uint32_t family : {9U, 10U, 11U}) {
+    const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                       model::StreamedParts::loaded(loaded), lanes);
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 20;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
     const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     const model::TargetRows step = model::decodeTargetRows(geometry, plans);
-    require(step.rows == model::kLaneCount * model::ExecutionLimits::targetVerifyRows,
-            "the decode arena does not hold four lanes of a verify block's rows");
+    require(step.rows == stepRows, "the decode arena does not hold a step's rows");
     for (uint32_t rows = 1; rows <= step.rows; ++rows) {
       const ops::MoeWorkspace need =
-          plans.moe(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat, rows).workspace();
+          plans.moe(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat, rows, ops::StepKind::Decode).workspace();
       for (const auto field : ops::kMoeWorkspaceFields)
         require(step.moe.*field >= need.*field,
                 "the decode arena does not hold the MoE plan of a step of " + std::to_string(rows) + " rows");
     }
+  }
+}
+
+// A decode step holds a verify block a lane (ExecutionLimits::stepRows), 64 rows
+// at four lanes; past one decode tile's 64 its projections run the staged
+// tile's two row groups, which store 96 rows at five and six lanes and 128 at
+// seven and eight, so the decode arena's row tensors and its target tensors
+// hold the storage of every plan over the step's rows on a decode step's
+// plans: the target's projections, the vocabulary head and the draft's context
+// projections, on every device family.
+void checkDecodeStepRows(const model::LoadedModel &loaded) {
+  const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
+  for (uint32_t family : {9U, 10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 20;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
+    const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+    for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
+      const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts,
+                                                         lanes);
+      const uint32_t rows = model::ExecutionLimits::stepRows(lanes);
+      const uint32_t held = model::decodeTargetRows(geometry, plans).rows;
+      require(held == model::decodeTensorLanes(model::DecodeTensor::CapturedTargetHidden, lanes) * model::kDecodeRows &&
+                  (lanes > 4 || held == rows),
+              "a decode step of " + std::to_string(lanes) + " lanes holds other rows than its verify blocks'");
+      uint32_t storage = 0;
+      for (const auto &p : geometry.target.decodeProjections)
+        storage = std::max(storage, plans.decodeLinear().storageRows(rows, p));
+      const auto &d = geometry.draft;
+      for (const ops::ProjectionShape p : {ops::ProjectionShape{d.hiddenSize, d.targetHiddenSize()},
+                                           ops::ProjectionShape{d.contextKvSize(), d.hiddenSize}})
+        storage = std::max(storage, plans.draftDecodeLinear().storageRows(rows, p));
+      require(storage <= held, "the decode arena does not hold the storage of a step of " + std::to_string(lanes) +
+                                   " lanes' plans on Apple" + std::to_string(family));
+    }
+  }
+}
+
+// A MoE plan runs its experts' int8 passes only where the block's experts
+// take them (MoeShape::int8Experts), int8 activations are on, the device's
+// dense prefill runs the int8 tile and the chunk has more rows than the
+// decode tiles' 64. The kernel-selection golden pins the plan lines of each
+// device, format set and row count with them on; this checks what it does
+// not hold: experts streamed take no int8 passes, and `--activations bf16`
+// keeps a chunk the passes would take on its staged experts' exact
+// activations, with no int8 scratch.
+void checkMoeInt8Passes(const model::LoadedModel &loaded) {
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  // Experts in the int8 tile's formats take the passes as the start keeps
+  // them resident and not as it streams them, whether the geometry comes
+  // from the files or from the model as it loaded: both go through
+  // RuntimeGeometry::from with the start's streamed parts.
+  for (const bool streamed : {false, true}) {
+    model::QwenTargetGeometry target = geometry.target;
+    target.moeInt8Experts = true;
+    const auto planned = model::RuntimeGeometry::from(loaded.descriptor, loaded.draft.layout, target,
+                                                      kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                      {.experts = streamed});
+    require(planned.target.moeShape().int8Experts == !streamed,
+            streamed ? "a start that streams its experts plans their int8 passes"
+                     : "a start that keeps its experts resident plans no int8 passes");
+  }
+  for (uint32_t family : {10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 20;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
+    const ops::ExecutionPlans plans(device, ops::Int8Activations::Off), int8(device, ops::Int8Activations::On);
+    ops::MoeShape shape = geometry.target.moeBlockShape();
+    shape.int8Experts = true;
+    // Every chunk the passes take with int8 activations on, the largest
+    // among them.
+    uint32_t taken = 0;
+    for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
+      if (!int8.moe(shape, geometry.target.moeRouterFormat, rows, ops::StepKind::Prefill).configuration().int8Passes) continue;
+      ++taken;
+      const ops::MoePlan plan = plans.moe(shape, geometry.target.moeRouterFormat, rows, ops::StepKind::Prefill);
+      require(!plan.configuration().int8Passes && plan.workspace().groupedCodesBytes == 0,
+              "a MoE plan of Apple" + std::to_string(family) + " with bf16 activations of " +
+                  std::to_string(rows) + " rows runs int8 passes");
+    }
+    require(taken && int8.moe(shape, geometry.target.moeRouterFormat, SPLASH_PREFILL_TOKEN_BUDGET, ops::StepKind::Prefill)
+                         .configuration()
+                         .int8Passes,
+            "no chunk of Apple" + std::to_string(family) + " takes the int8 passes with int8 activations on");
   }
 }
 
@@ -295,6 +491,7 @@ void checkDecodeArenaPages(const model::LoadedModel &loaded) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 20;
+    device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
     const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     const ops::LinearScratchSize linear = model::DecodeArena::linearScratchSize(geometry, plans);
     uint64_t pages = model::decodeArenaBaseBytes(geometry, plans);
@@ -303,6 +500,68 @@ void checkDecodeArenaPages(const model::LoadedModel &loaded) {
       pages += alignUp(scratch);
     require(model::decodeArenaBytes(geometry, plans) == pages,
             "the decode arena's plan does not count each of its buffers in whole host pages");
+  }
+}
+
+// A runtime's arenas hold its lanes: eight lanes' more than the default's
+// four, each lane's tensors, its GDN tape and its logits most, and a step's
+// rows to a verify block a lane (ExecutionLimits::stepRows); a runtime of more
+// lanes than a step holds is refused.
+//
+// A default runtime's arenas are pinned to the byte: `decode`, Apple9's and
+// Apple10's (Apple11 plans as Apple10), and `prefill`, Apple9's, Apple10's
+// and Apple11's, are what model::plannedDecodeBytes and plannedPrefillBytes
+// give a runtime of four lanes on 20 cores, which the planning of more lanes
+// leaves as they are. A dense target's prefill arena holds its two half
+// chunks' group cell, one GDN layer's state (3.26 MB on Qwen3.8-27B). The
+// 20-core Apple10 (an M5 Pro) runs a MoE target's chunks whose routes average
+// 64 an expert on 64-row expert tiles (the 35B's 2048 rows), whose scratch
+// holds 32 grouped rows more past the routes than the 32-row tiles' (160 KiB).
+void checkArenasHoldTheirLanes(const char *name, const model::LoadedModel &loaded, std::array<uint64_t, 2> decode,
+                               std::array<uint64_t, 3> prefill) {
+  const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
+  const auto four = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts);
+  const auto eight = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts, 8);
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+  require(four.target.lanes == model::ExecutionLimits::defaultLanes &&
+              model::plannedDecodeBytes(eight, plans) > model::plannedDecodeBytes(four, plans) &&
+              model::plannedPrefillBytes(eight, plans) >= model::plannedPrefillBytes(four, plans),
+          std::string(name) + "'s eight lanes' arenas hold no more than four's");
+  rejects([&] { static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                               parts, model::ExecutionLimits::maximumBatchWidth + 1)); },
+          "invalid model runtime lanes", "a runtime of more lanes than a step holds was planned");
+  for (uint32_t family : {9U, 10U, 11U}) {
+    device.appleGpuFamily = family;
+    const ops::ExecutionPlans familyPlans(device, ops::Int8Activations::On);
+    require(model::plannedDecodeBytes(four, familyPlans) == decode[family == 9 ? 0 : 1] &&
+                model::plannedPrefillBytes(four, familyPlans) == prefill[family - 9],
+            std::string(name) + "'s default arenas are not the base's on Apple" + std::to_string(family) + " (" +
+                std::to_string(model::plannedDecodeBytes(four, familyPlans)) + " and " +
+                std::to_string(model::plannedPrefillBytes(four, familyPlans)) + " bytes)");
+  }
+  // One to eight lanes on every device family: arenas that grow with the
+  // lanes, decode tensors of at least the lanes (the default's four at four),
+  // and a step of a verify block a lane.
+  for (uint32_t family : {9U, 10U, 11U}) {
+    device.appleGpuFamily = family;
+    const ops::ExecutionPlans familyPlans(device, ops::Int8Activations::On);
+    uint64_t fewer = 0;
+    for (uint32_t lanes = 1; lanes <= model::ExecutionLimits::maximumBatchWidth; ++lanes) {
+      const auto geometry =
+          model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts, lanes);
+      const uint64_t decode = model::plannedDecodeBytes(geometry, familyPlans);
+      const uint32_t held = model::decodeArenaLanes(geometry, familyPlans);
+      require(decode >= fewer && held >= lanes && held <= model::ExecutionLimits::maximumBatchWidth &&
+                  (lanes != model::ExecutionLimits::defaultLanes || held == lanes) &&
+                  model::decodeTargetRows(geometry, familyPlans).rows >= geometry.target.stepRows(),
+              std::string(name) + "'s arenas of " + std::to_string(lanes) + " lanes on Apple" +
+                  std::to_string(family) + " do not hold their lanes");
+      fewer = decode;
+    }
   }
 }
 
@@ -328,6 +587,7 @@ uint64_t decodeBytes(const model::RuntimeGeometry &geometry, model::DecodeTensor
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
   return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device, ops::Int8Activations::On))[static_cast<uint32_t>(tensor)];
 }
 
@@ -389,6 +649,7 @@ void checkArenasWithoutGdnLayers() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
   const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   // Whether `bytes` are the hybrid's but for the GDN tensors, which only the
   // hybrid's arena holds.
@@ -418,6 +679,39 @@ void checkArenasWithoutGdnLayers() {
   require(withoutGdn(model::decodeTensorBytes(hybrid, plans), model::decodeTensorBytes(attentionOnly, plans),
                      gdnDecode),
           "the decode arena without GDN layers is not a hybrid's without its GDN scratch");
+}
+
+// A dense target's prefill commands run in two chunks of half the rows, the steps its Neural Engine split pipelines
+// (ops::AneFfn::firstStepRows): a command still holds kPrefillRows rows, its group tensors hold no more than one chunk
+// of them would, and its group cell holds one GDN layer's state and the auxiliary, which the second chunk reads within
+// the layer the first wrote it (PrefillArena::groupCell). A MoE target's commands stay one chunk.
+void checkDenseHalves() {
+  const auto dense = model::RuntimeGeometry::from(loadedModel<model::Qwen3_8Weights>(), kv::Format::Int8,
+                                                  ops::GdnStateFormat::Float32);
+  const auto moe = model::RuntimeGeometry::from(loadedModel<model::Qwen3_6MoeWeights>(), kv::Format::Int8,
+                                                ops::GdnStateFormat::Float32);
+  require(dense.prefillChunks == 2 && dense.prefillChunkRows == model::kPrefillRows / 2 &&
+              model::commandLimits(dense, 0).commandRows == model::kPrefillRows && moe.prefillChunks == 1 &&
+              model::commandLimits(moe, 0).commandRows == model::kPrefillRows,
+          "a dense target's commands are not two chunks of half the rows, or a MoE target's not one");
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+  auto single = dense;
+  single.prefillChunks = 1;
+  single.prefillChunkRows = model::kPrefillRows;
+  const auto halves = model::targetTensorBytes(dense.target, model::prefillTargetRows(dense, plans)),
+             whole = model::targetTensorBytes(single.target, model::prefillTargetRows(single, plans));
+  for (uint32_t index = 0; index < halves.size(); ++index)
+    require(halves[index] >= whole[index] && halves[index] - whole[index] < 2 * kHostPageBytes,
+            "a dense target's tensor " + std::to_string(index) + " holds more than a chunk of its command's rows");
+  const auto prefill = model::prefillTensorBytes(dense, plans);
+  const model::GdnStateLayout &state = dense.target.stateLayout;
+  require(prefill[static_cast<uint32_t>(model::PrefillTensor::GroupCell)] ==
+              state.convolutionLayerBytes() + state.recurrentLayerBytes() + alignUp(state.auxiliaryBytes),
+          "a dense target's group cell does not hold one GDN layer's state");
 }
 
 // Arenas are sized from the projections the weights hold, so each must have
@@ -468,8 +762,9 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
-  // Every family's layout, the 122B's among them, passes the layout check.
-  model::forEachFamily([](const auto &family) { model::requireQwenLayout(family); });
+  // Every family's layout, the 122B's among them, passes its architecture's
+  // layout check.
+  model::forEachFamily([](const auto &family) { requireLayout(family); });
   // A layout without GDN layers sets none of the GDN dimensions.
   auto strayGdn = model::FlintLayout{};
   strayGdn.gdnKeyHeads = 16;
@@ -519,6 +814,7 @@ void checkPrefillAttentionHistory() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
+  device.memoryBytesPerSecond = kBytesPerSecondPerCore * device.gpuCoreCount;
   const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   const uint32_t heads = geometry.target.attentionQueryHeads;
   const kv::Layout &layout = geometry.target.kvLayout;
@@ -539,17 +835,34 @@ int main() {
     checkGdnWidths();
     checkDraftVocabulary();
     checkGateUpLayers();
+    checkDraftGateScratch(loadedModel<model::Qwen3_8Weights>());
+    checkDraftGateScratch(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDraftGateScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    checkDraftGateScratch(loadedModel<model::Qwen4ExpWeights>());
     checkYarnGeometry();
     checkIndexTables();
     checkSpilledKvGeometry();
     checkArenasWithoutGdnLayers();
+    checkDenseHalves();
     checkPrefillInt8Scratch();
+    checkFamilyActivations();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    // Decode arenas: 98,304 bytes over 1.7.4's on every model and family, the draft selector's partial ids and
+    // values sized for its most shards (32, where 1.7.4 held 8), two buffers of four lanes' 28 positions.
+    checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {450'674'688, 431'947'776},
+                              {749'715'456, 730'988'544, 730'988'544});
+    checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {279'379'968, 272'760'832},
+                              {539'017'216, 532'561'920, 532'398'080});
+    checkArenasHoldTheirLanes("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>(),
+                              {409'894'912, 401'965'056}, {1'124'614'144, 1'116'684'288, 1'116'684'288});
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDecodeStepRows(loadedModel<model::Qwen3_8Weights>());
+    checkDecodeStepRows(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>());
+    checkMoeInt8Passes(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkDecodeStepMoe(loadedModel<model::Qwen4ExpWeights>());
     std::cout << "model execution plans: PASS (three paired geometries)\n";

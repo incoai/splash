@@ -1,43 +1,60 @@
 #include "engine/WriteBehind.hpp"
 
+#include <algorithm>
+
 namespace splash::engine {
 
 WriteBehind::WriteBehind(Cache &cache) : cache_(cache), copying_(cache.persistent()) {}
 
-void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
-  if (!cache_.kvTierWritable() || tokens < kMinimumTokens || queued_.contains(block))
+void WriteBehind::published(uint64_t block, uint32_t tokens, double now, bool head) {
+  head = head && cache_.persistent();
+  if (!cache_.kvTierWritable() || (tokens < kMinimumTokens && !head) || queued_.contains(block))
     return;
-  // While copies wait for demand, the queue keeps only the points their
-  // conversations still resume from.
+  Point point{.block = block, .due = now + kDelayMilliseconds, .head = head};
+  if (cache_.persistent())
+    point.due = head || fallsDue(point) ? now : kNever;
+  // While copies wait for demand, and of the points not due, the queue keeps
+  // only those their conversations still resume from.
   copying_ = copying();
-  if (!copying_)
-    std::erase_if(waiting_, [&](const Point &point) {
-      if (cache_.newestPoint(point.block))
-        return false;
-      queued_.erase(point.block);
-      ++counters_.unneeded;
-      return true;
-    });
-  queued_.insert(block);
-  waiting_.push_back({block, now + kDelayMilliseconds});
-}
-
-bool WriteBehind::settle(PersistStatus status) {
-  switch (status) {
-  case PersistStatus::Durable:
-    ++counters_.durable;
-    return true;
-  case PersistStatus::Unneeded:
+  std::erase_if(waiting_, [&](const Point &point) {
+    if ((copying_ && point.due != kNever) || cache_.newestPoint(point.block))
+      return false;
+    queued_.erase(point.block);
     ++counters_.unneeded;
     return true;
-  case PersistStatus::Refused:
-    ++counters_.refused;
+  });
+  queued_.insert(block);
+  waiting_.push_back(point);
+}
+
+bool WriteBehind::fallsDue(Point &point) const {
+  // A gone point settles at once and one being copied goes on. Its base is
+  // found by a walk of its chain only when the last one is no longer taken
+  // back, a point landed (settle) or a copy its chain holds went (step), and
+  // checked in O(1) a step.
+  if (!cache_.chainLength(point.block) || cache_.stillTakenBack(point.block))
     return true;
-  case PersistStatus::Started:
-  case PersistStatus::Busy:
-    return false;
+  if (!point.base || !cache_.stillTakenBack(point.base)) {
+    if (point.chain.empty())
+      point.chain = cache_.chainBlocks(point.block);
+    point.base = cache_.deepestTakenBack(point.block);
   }
-  return false;
+  const uint32_t pages = cache_.chainLength(point.block) - (point.base ? cache_.chainLength(point.base) : 0);
+  return pages * KvCache::pageTokens >= kMinimumTokens;
+}
+
+bool WriteBehind::settle(uint64_t block, PersistStatus status) {
+  if (status == PersistStatus::Started || status == PersistStatus::Busy)
+    return false;
+  queued_.erase(block);
+  // A point that landed may be a deeper base for those waiting.
+  if (status == PersistStatus::Durable)
+    for (Point &point : waiting_)
+      point.base = 0;
+  ++(status == PersistStatus::Durable    ? counters_.durable
+     : status == PersistStatus::Unneeded ? counters_.unneeded
+                                         : counters_.refused);
+  return true;
 }
 
 bool WriteBehind::copying() const noexcept { return cache_.persistent() || demandBytes_ != 0; }
@@ -81,9 +98,20 @@ bool WriteBehind::step(double now, bool claimWaiting, const std::function<bool()
     stopped_ = Stop::ClaimWaiting;
     return false;
   }
+  // A copy given up or lost under a state breaks the bases whose chains
+  // hold it, and those alone are found again (fallsDue): at a full quota
+  // nearly every copy given up lies under a state.
+  for (const uint64_t block : cache_.takeBrokenCopies())
+    if (const uint32_t depth = cache_.chainLength(block))
+      for (Point &point : waiting_)
+        if (point.base && depth <= cache_.chainLength(point.base) && point.chain[depth - 1] == block)
+          point.base = 0;
   bool settled = false;
-  for (auto point = waiting_.begin(); point != waiting_.end() && point->due <= now;) {
-    if (inUse(point->block)) {
+  for (auto point = waiting_.begin(); point != waiting_.end();) {
+    // Measured again: its base may have gone, or a point before it started.
+    if (cache_.persistent() && !point->head)
+      point->due = fallsDue(*point) ? std::min(point->due, now) : kNever;
+    if (point->due > now || inUse(point->block)) {
       ++point;
       continue;
     }
@@ -91,11 +119,10 @@ bool WriteBehind::step(double now, bool claimWaiting, const std::function<bool()
       stopped_ = Stop::Covered;
       break;
     }
-    if (!settle(cache_.persist(point->block))) {
+    if (!settle(point->block, cache_.persist(point->block))) {
       stopped_ = Stop::Stalled;
       break;
     }
-    queued_.erase(point->block);
     point = waiting_.erase(point);
     settled = true;
   }
@@ -105,12 +132,15 @@ bool WriteBehind::step(double now, bool claimWaiting, const std::function<bool()
 bool WriteBehind::flush() {
   if (!cache_.persistent())
     return true;
-  cache_.liftDiskWriteBudget();
   while (!waiting_.empty()) {
-    const uint64_t block = waiting_.back().block;
-    if (!settle(cache_.persist(block)))
+    if (!cache_.takesCacheWrites()) {
+      counters_.refused += waiting_.size();
+      waiting_.clear();
+      queued_.clear();
+      break;
+    }
+    if (!settle(waiting_.back().block, cache_.persist(waiting_.back().block)))
       return false;
-    queued_.erase(block);
     waiting_.pop_back();
   }
   return true;
@@ -125,7 +155,7 @@ std::optional<double> WriteBehind::nextWakeup() const {
   if (!copying_ || stopped_ == Stop::ClaimWaiting || stopped_ == Stop::Covered)
     return std::nullopt;
   for (const Point &point : waiting_)
-    if (!inUse(point.block))
+    if (point.due != kNever && !inUse(point.block))
       return stopped_ == Stop::Stalled ? cache_.diskWritesAdmittedAt() : point.due;
   return std::nullopt;
 }

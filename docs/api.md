@@ -22,13 +22,13 @@ Messages requires it.
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | A Messages request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
 | `POST /v1/chat/completions/count_tokens` | A Chat request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
-| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit, the input it takes (`input_modalities`), what a request may carry (`limits`: `request_bytes`, `images`, `image_bytes`, `pdf_bytes`, `pdf_pages`, as [images and PDFs](#images-and-pdfs) has them) and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
+| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit, the input it takes (`input_modalities`), what a request may carry (`limits`: `request_bytes`, `images`, `image_bytes`, `image_aspect`, `pdf_bytes`, `pdf_pages`, as [images and PDFs](#images-and-pdfs) has them) and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](internals.md#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops, and `500 engine_failed` once the engine has stopped for good, before the server exits |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
-| `GET /ready` | 200 while the engine is ready, else 503; public |
+| `GET /ready` | 200 while the engine is ready and the server admits requests, else 503; public |
 | `GET /` | The chat page; public, and gone with `--no-webui` |
 
 ## Request fields
@@ -45,7 +45,12 @@ Completions, text completions, Responses and Messages share these fields:
 - `priority`: `foreground`, `normal` (the default) or `background`. A request
   waits while one of a higher priority runs, and when lanes or memory run short
   a higher priority suspends a running request of a lower one
-  ([admission and eviction](internals.md#admission-and-eviction)).
+  ([admission and eviction](internals.md#admission-and-eviction)). A
+  `background` request still waiting or running 10 s after its arrival runs as
+  `normal`, so attended work cannot hold it back for long, but it still yields
+  memory and its lane as `background`: a `normal` start that the lanes or
+  memory cannot hold beside it suspends it, and it then waits as `background`
+  for another 10 s.
 - `timeout`: the seconds a request may take from its arrival; it can only
   shorten `--request-timeout`. A request that runs out returns 504
   `request_timeout`.
@@ -57,14 +62,14 @@ Completions, text completions, Responses and Messages share these fields:
   up to four, which bound the memory and time of its stop search. A stop is at
   most 16,384 characters (a longer one returns 400). A stop string ends the
   output where the model writes it, inside a tool call or structured output too,
-  which it cuts as the token limit does: a call it cuts keeps the arguments it
-  has, and no call of the output counts as made; a cut structured answer is not
-  validated.
+  which it cuts as the token limit does ([tool calls](#tool-calls)): no call of
+  the output counts as made, and the finish reason is the stop; a cut
+  structured answer is not validated.
 - `return_progress`, with `stream` true: prompt progress before the output
   ([output limits and streaming](#output-limits-and-streaming)).
 - `cache_salt`: a nonempty string. A request shares cached prompts, their KV and
   states, only with requests of the same salt, and a request without one only
-  with others without one, as vLLM's field does. A salt no other request uses
+  with others without one. A salt no other request uses
   makes it compute its whole prompt itself, except its images' encoded rows,
   which it may take from one cache the runtime keeps for every request, keyed
   by the image and not the salt.
@@ -73,6 +78,8 @@ Chat Completions also takes `messages`, `tools`, `tool_choice` and
 `parallel_tool_calls` ([tool calls](#tool-calls)), `response_format`
 ([structured output](#structured-output)), `reasoning_effort` and
 `chat_template_kwargs` ([default reasoning effort](server.md#default-reasoning-effort)),
+`enable_thinking`, which is `chat_template_kwargs`' `enable_thinking` sent at
+the top level (the two may not differ),
 `thinking_token_budget` ([thinking token budget](server.md#thinking-token-budget)),
 `preserve_thinking`, which reaches the template (the Qwen templates keep earlier
 turns' reasoning with it), `max_completion_tokens` or `max_tokens`,
@@ -91,7 +98,7 @@ U+0000 in any of them reaches the model as U+FFFD, as a lone surrogate does: a
 template may delete the character, and with it what kept a tag apart. A
 history tool call whose `arguments` are not a JSON object,
 such as one the output limit cut, is kept as text, so the conversation
-continues. `n` other than 1 and `logprobs: true` return 400.
+continues. `n` other than 1, `logprobs: true` and a `top_logprobs` return 400.
 
 `POST /v1/completions` serves OpenAI's legacy text completions. `prompt` is one
 string, which the loaded tokenizer encodes as a raw prompt, adding its own
@@ -134,11 +141,14 @@ and a removed tool is left out until a later block adds it again),
 `disable_parallel_tool_use`), `stop_sequences`, the [sampling](#sampling)
 fields, of which Anthropic defines `temperature`, `top_p` and `top_k`, Chat's
 `ignore_eos`, `thinking`, `output_config` and Chat's `chat_template_kwargs`,
-whose `enable_thinking` outranks `thinking`. Otherwise a request reasons only
-when `thinking` sets it: `{"type": "enabled", "budget_tokens": N}` and
+whose `enable_thinking` outranks `thinking`. Otherwise `thinking` sets the
+effort: `{"type": "enabled", "budget_tokens": N}` and
 `{"type": "adaptive"}` reason at `output_config.effort`, one of `low`, `medium`,
 `high` (the default), `xhigh` and `max`, while `{"type": "disabled"}` and an
-omitted `thinking` do not. Enabled thinking requires `budget_tokens`, an integer
+omitted `thinking` ask for none, under which the Qwen families do not reason;
+Flint, whose model decides each turn, and Inkling 2, which still reasons
+briefly at `none`, may ([default reasoning
+effort](server.md#default-reasoning-effort)). Enabled thinking requires `budget_tokens`, an integer
 of at least 1024, which caps it ([thinking token
 budget](server.md#thinking-token-budget)). Reasoning comes back in `thinking` blocks.
 With `thinking.display` `omitted` (or `updates`) a block carries no text, and its
@@ -230,14 +240,16 @@ the connections it holds cannot exhaust it.
 ## Sampling
 
 Chat, text completions, Responses and Messages sample with `temperature`
-(default 1.0, in [0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or
+(in [0, 2]), `top_p` (in (0, 1]), `top_k` (a positive integer, 0 or
 -1), `min_p` (0, in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in
 [-2, 2]) and `repetition_penalty` (1, positive). The defaults of `temperature`,
-`top_p` and `top_k` are the ones the served model's family publishes (Qwen's,
-and the same numbers in Flint's GGUF release); the publishers set no
+`top_p` and `top_k` are the ones the served model's family publishes: 1.0, 0.95
+and 20 for the Qwen families and Flint (Qwen's, and the same numbers in Flint's
+GGUF release), 1.0, 1.0 and 0 for Inkling-2-Mini, which samples over every
+token; the publishers set no
 penalties, so Qwen's recommended `presence_penalty` of 1.5 for non-thinking use
 must be sent explicitly. Each field that is out of range returns 400 naming it,
-on every route. As in vLLM, a
+on every route. A
 nonzero temperature below 0.01 samples at 0.01, and the penalties rewrite the
 raw logits before temperature, for greedy requests too: repetition divides a
 positive logit and multiplies a negative one for every token of the prompt or of
@@ -246,7 +258,7 @@ token by `presence_penalty` plus `frequency_penalty` times its count.
 Speculative decoding stays exact: each verified draft position counts the draft
 tokens before it, so a penalized request samples as it would without a draft.
 Splash does not implement `logit_bias`: a non-empty one returns 400; `null` and
-`{}` are accepted. Like vLLM and HF, repetition counts every prompt token: with
+`{}` are accepted. Like HF, repetition counts every prompt token: with
 the Qwen templates that includes the tool-call syntax every tool-enabled system
 prompt carries, earlier tool calls and reasoning, and the `<think>` markers of
 the generation prompt, so a `repetition_penalty` above 1 can delay tool calls
@@ -255,7 +267,17 @@ defines no penalties and no `min_p` for Messages; Splash's Messages takes
 them and `logit_bias` as Chat does, with the same 400 for a bad value, so that
 a client whose requests go only to Messages can set them too.
 
-In vLLM's order, after temperature `min_p` first drops every token less
+`--sampling-default NAME=VALUE` (repeatable) sets the value a sampling field
+takes when a request leaves it out, in place of the default above. A value
+the request sends still wins, and of two pairs for one name the last wins.
+`splash serve` refuses a value a request may not set before it downloads
+anything, with the words of the request's 400.
+
+```sh
+splash serve --model mlx-community/Qwen3.8-27B-4bit --sampling-default temperature=0.6 --sampling-default presence_penalty=1.5
+```
+
+After temperature, `min_p` first drops every token less
 likely than `min_p` times the most likely one, `top_k` then keeps the most
 likely of the rest, every one when it is 0 or -1 or past the vocabulary, and
 `top_p` then the fewest of those whose probabilities, renormalized over them,
@@ -270,8 +292,8 @@ ones before it (the target's residual after each rejection), and draws from
 the last residual where it keeps none ([Drafts](models.md#drafts)); a decode
 cycle keeps a draft token only where the row before it selected that token,
 and then the selection of the last row it keeps, so every token it emits is a
-draw from the target. vLLM itself refuses a nonzero
-`min_p` with speculative decoding; here it is one more cut of the target
+draw from the target. With speculative decoding a nonzero
+`min_p` is one more cut of the target
 distribution, which the draws read as they read the others, so sampling stays
 exact. A request
 that keeps only its most likely token, at a `min_p` of 1 or a `top_k` of 1,
@@ -282,20 +304,21 @@ A lane's arithmetic can depend on the batch it decodes in and on how its prompt
 is chunked. On a GGUF MoE target, an expert that a step routes at most two rows
 to runs them on the column tile, which sums in another order than the staged
 matmul, so a row's result also depends on the rows decoded or prefilled beside
-it. On M5 and later Macs with `--activations auto`, the default, attention
+it. On M5 and later Macs with `--activations auto`, the default of every
+model but Inkling-2, whose default is `bf16`, attention
 over INT8 KV scores INT8 queries where its splits read 8 pages or more, which
 follows the chunk's rows and history and, in verify, the batch's longest lane;
-a target's MLX 4- or 5-bit projection rounds its prefill rows to int8 when their
-chunk, with the rows prefilled beside them, has more than 64 rows; and a rotated
-PQ2_0 projection decodes in int8 activations on plans of 16 rows or more, though
-not on a lone lane's split plans of 8 rows, which keep bf16. Concurrent requests
-change the batch and the chunking, and chunk boundaries also come from the
-cached boundary a request resumes from, from a boundary another request waits to
-resume from, and from one whose state, or the KV past it, memory could not hold.
-With `--state-format bf16` the state is also rounded at each state a chunk
-captures (a replay point, junction or checkpoint). So under `--verify-rows
-all` a greedy or seeded request repeats its output when it runs alone with the
-same cached prefixes; alongside other
+a target's MLX 4-, 5- or 8-bit or Q8_0 projection rounds its prefill rows to int8
+when their chunk, with the rows prefilled beside them, has more than 64 rows;
+and a rotated PQ2_0 projection decodes in int8 activations on plans of 16 rows
+or more, though not on a lone lane's split plans of 8 rows, which keep bf16.
+Concurrent requests change the batch and the chunking, and chunk boundaries also
+come from the cached boundary a request resumes from, from a boundary another
+request waits to resume from, and from one whose state, or the KV past it,
+memory could not hold. With `--state-format bf16` the state is also rounded at
+each state a chunk captures (a replay point, junction or checkpoint). So under
+`--verify-rows all` a greedy or seeded request repeats its output when it runs
+alone with the same cached prefixes; alongside other
 requests, or with other prefixes cached, it can differ. A request's own repeat
 is such a case: served from the prefix cache, it computes only the rows past the
 state its first run cached, so its output can differ from that run's, which
@@ -348,7 +371,7 @@ invalid value returns 400 naming the field the request sent. Messages refuses
 a final assistant message (prefill) with 400; `count_tokens` still counts it.
 
 Chat, text completions, Responses and Messages accept `"ignore_eos":true`
-(default false), as vLLM and llama.cpp do: the model never selects its own
+(default false), as llama.cpp does: the model never selects its own
 stop tokens, and a draft proposal of one is rejected, so generation runs to its
 output budget and finishes with `length` (Messages' `max_tokens`) unless a stop
 string ends it first. Benchmarks use it
@@ -376,6 +399,23 @@ rest of the uncached input, and the prefix cache keeps a prompt as prefill
 computes it, at no cost of its own. So uncached input is `input_tokens` less
 `cached_tokens`, as in Messages, which reports no `cache_creation_input_tokens`.
 
+Beside the cached tokens, the same object (Messages: `usage` itself) says what
+the request reused: `prefix_tokens`, how far the cache matched its prompt's KV;
+`state_source`, where the state it resumed from was (`"memory"`, `"disk"` for
+the SSD cache's copy, or null for none); and `lost_state`, true when a matched
+block past that state once held a state that is gone, or when the request
+matched a state whose prefix memory could not hold and started without it.
+`cached_tokens` is what
+the request resumed from and did not read again; `prefix_tokens` can go past it
+where no state was kept, the matched KV past the state then read again.
+`reuse_end` says why the reuse stopped where it did, and `reuse_end_tokens` that
+end's tokens: `"nothing_matched"` (0), `"prefix_end"`, the prompt parting from
+what is cached where the matched KV ends (that token), `"kv_without_state"`, KV
+matched past the state it resumed from (the tokens of that KV, read again), or
+`"disk_read_failed"`, a read from the SSD cache that failed, the request then
+resuming from less (the tokens the read would have restored). The server's
+`Started` line gives the same reason.
+
 Every API keeps a response's state where its generation ended: at the last
 32-token page boundary, counted from the start of the prompt, that the prompt
 and its generated tokens reach, beside the state before its generation prompt.
@@ -398,12 +438,14 @@ state ([internals](internals.md#replay-points-and-checkpoints)).
 Such a state is opportunistic: memory that runs short drops it first, and the
 SSD cache never writes it, so a client that never sends a reply back as it came
 costs the cache nothing. A request whose prompt renders an earlier reply back,
-as far as a page that reply's state was kept at, whether memory still holds that
-state or not, shows that its conversation renders replies back: its own reply's
-state is kept when the reply holds at least 2048 tokens past its prompt's state
-(fewer prefill again faster than their state writes), and memory that runs short
-writes it to the SSD cache as any checkpoint, so the next turn resumes after the
-reply under memory pressure too, and so is the state of each later such turn.
+as far as a page of that reply, whether a state was kept there or not, shows
+that its conversation renders replies back: its own reply's state is kept as an
+ordinary state where it lies past the page the reply shares with its prompt, and
+memory that runs short writes it to the SSD cache as any, so the next turn
+resumes after the reply under memory pressure too, and so is the state of each
+later such turn. A reply that ends within that shared page, a short tool call,
+keeps the opportunistic state: its next turn computes under 32 tokens again
+where memory ran short.
 
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
@@ -492,6 +534,36 @@ not give: `["integer", "any"]` constrains no type, and
 Calls are not validated against their schemas; a client reports what its tool
 rejects. A `stop` string may cut a call ([request fields](#request-fields)).
 
+Which calls are returned, in every dialect:
+
+- a call is returned under the name of the tool in `tools` it names: that
+  tool's, or that of the one declared tool its name matches whatever its case,
+  as a model may write a name (Flint writes `Bash` as `bash`); a call whose
+  name matches no declared tool, or several, is the text the model wrote,
+  from its opening tag to its close, streamed or not;
+- streaming, a call of a declared tool streams as the model writes it, as
+  OpenAI and Anthropic stream one, once its arguments begin as an
+  object: at once in Qwen's and Flint's tags, whose arguments the server
+  writes, and at the first non-space character, `{`, where the model writes its
+  arguments as JSON (Inkling); arguments that begin otherwise make the call its
+  text;
+- not streaming, a call is returned once it closes, if its arguments read as a
+  JSON object; otherwise it is the text the model wrote.
+
+When a call does not end as a call:
+
+| case | Chat, streamed | Chat, complete | Messages, streamed | Messages, complete | Responses, streamed | Responses, complete |
+|---|---|---|---|---|---|---|
+| name of no declared tool or of several, or JSON arguments not beginning with `{` | text | text | text block | text block | message item | message item |
+| cut by the token limit | call ends with the arguments it sent; `finish_reason` `length` | call left out; `length` | `tool_use` block closed with the input it sent; `stop_reason` `max_tokens` | block left out; `max_tokens` | `function_call` item `incomplete`; response `incomplete` | item left out; response `incomplete` |
+| cut by a stop sequence | as above; `stop` | call left out; `stop` | as above; `stop_sequence` | block left out; `stop_sequence` | `function_call` item `incomplete`; response `completed` | item left out; `completed` |
+| arguments not JSON at the close (model-written JSON) | call as sent; `tool_calls` | text; `stop` | `tool_use` as sent; `tool_use` | text block; `end_turn` | item as sent; `completed` | message item; `completed` |
+
+Text before such a call, and calls closed before it, stay. Each such call is
+counted in `/status` `tool_calls.rejected` (`undeclared`, `invalid_arguments`,
+`cut`) and `splash_tool_calls_rejected_total{reason}`, and its request logs one
+line, `Tool calls · request N · ...`. No model output answers with a 500.
+
 The output is read as the chat template lays calls out, in the family's
 syntax ([chat formats](models.md#chat-formats)). In Qwen's XML a call opens at
 `<tool_call>` and the newline before `<function=`, and a value ends at
@@ -505,12 +577,13 @@ Besides:
 - names lose the space around them; an opening that names no function, or a
   name too long to be one, opens no call and reads as the text the model
   wrote, and a call after it still reads; a `</think>` in text is dropped;
+- where the model writes a call's arguments as JSON (Inkling), a call whose
+  header names no function, `<|message_model|><|content_invoke_tool_json|>`,
+  is named by its object's `name` as a header would name it, and is held until
+  it closes; one whose object names no declared tool is its text;
 - a repeated parameter keeps its first value, which has streamed;
 - text after a call stays content, with or without its `</tool_call>`;
-- a call the token limit or a stop sequence cuts keeps the unfinished
-  arguments it has, which Chat and Responses (with status `incomplete`) return
-  and a Messages stream has streamed, while a complete Messages response leaves
-  the call out;
+- a call the token limit or a stop sequence cuts ends as the table above says;
 - JSON that would decode to a lone surrogate or nest past 122 levels keeps its
   text, which writes back as valid JSON, so that the call's arguments read back
   within the 128 levels the server reads where a request carries them deepest,
@@ -575,6 +648,32 @@ reference a remote document, and cannot combine `unevaluatedProperties` with
 final output; it does not inject formatting instructions into the prompt.
 Clients should describe their output requirements in their own messages.
 
+Some keywords the output grammar does not enforce: `not`, `if`/`then`/`else`,
+`dependentSchemas`, `dependentRequired`, `dependencies`, `propertyNames`,
+`unevaluatedProperties`, `unevaluatedItems`, `contains`, `uniqueItems`,
+`$dynamicRef`, `$recursiveRef`, draft 3's `extends`, `disallow` and
+`divisibleBy`, a `pattern` with look-around, word boundaries or
+backreferences, `minItems`, `maxItems` or `multipleOf` above 256, and `oneOf`,
+which it enforces as `anyOf`. What happens to a schema holding one follows the
+strictness the request asks for, as in the API it speaks:
+
+- strict (`json_schema.strict: true` in Chat, `text.format.strict: true` in
+  Responses; both default to false, as OpenAI's; Messages is always strict, as
+  Anthropic's structured outputs are): refused with 400 before generation,
+  naming the keyword and its JSON pointer, for example `unsupported output
+  schema: uniqueItems at #/properties/tags is not enforced by the output
+  grammar`;
+- not strict: best effort, as OpenAI's `strict: false`. The grammar enforces
+  everything else, and the answer is checked only against what it enforced: a
+  reply that breaks only a keyword it did not enforce is returned as written,
+  never a 500. The request logs one line naming the keywords, `Schema keywords
+  not enforced · request N · uniqueItems`, counted in `/status`
+  `structured_output.keywords_not_enforced` and
+  `splash_schema_keywords_not_enforced_total{keyword}`.
+
+A strict tool's schema is never refused for such a keyword: its grammar leaves
+the keyword out, and calls are not validated.
+
 The JSON is the answer's first token where no reasoning comes before it, so a
 small output limit is spent on the value; after reasoning, up to 64 whitespace
 characters may set it apart, as the template's blank line after `</think>`
@@ -587,10 +686,24 @@ call starts the same way.
 
 Images arrive inline as base64 `data:` URLs: Chat `image_url` parts, Responses
 `input_image` items and Messages `image` blocks with a `base64` source; an image
-URL to fetch returns 400. JPEG, PNG, WebP and GIF decode. An image file may
-hold up to 32 MiB and 33,554,432 pixels, with an aspect ratio up to 200:1, and
-is resized to at most `--max-image-pixels` (4,194,304 by default). A request
-carries at most 64 images, PDF pages included.
+URL to fetch returns 400. JPEG, PNG, WebP and GIF decode; any other image, or
+one cut short, returns 400 `Could not process image`, the words of Anthropic's
+API, on which Claude Code takes the image out of the conversation and goes on.
+An image file may hold up to 32 MiB and 33,554,432 pixels, with an aspect ratio
+up to 200:1, and is resized to at most `--max-image-pixels` (4,194,304 by
+default). Inkling 2
+takes an image of any aspect ratio at its own size, padded to whole 40-pixel
+tokens, and resizes only an image of more patches than the cap gives
+(`--max-image-pixels` / 256: 16,384 patches at the default, which make 4,096
+tokens) ([Vision](models.md#vision)); `/v1/models` reports
+`limits.image_aspect` 200 for every model, Inkling 2 included. A request
+carries at most 64 images, PDF pages included. A Messages request of more
+image blocks is refused naming the oldest, as Anthropic's API names a block
+(`messages.2.content.0.image: requests support at most 64 images`): Claude
+Code, which keeps up to 100 images in a conversation, takes an image out and
+sends the request again, at one refused request for each round that brings an
+image past the 64th. It answers from the new image, then keeps the first 64
+and a note in place of the later one.
 
 PDFs arrive inline too: Chat `file` parts with `file_data`, Responses
 `input_file` items and Messages `document` blocks with a base64
@@ -606,8 +719,10 @@ system's libraries and fonts and Splash's runtime, and to write nothing, reach
 no network and start no program.
 
 A model serving without vision refuses both with 400: one served with
-`--language-only`, one of a family without a vision tower such as Flint, or a
-GGUF served without a projector ([vision](models.md#vision)).
+`--language-only`, one of a family without a vision tower such as Flint, a
+GGUF served without a projector, or an Inkling 2 installation that serves text
+because its source has no tower Splash serves or it has not taken its tower in
+yet ([vision](models.md#vision)).
 
 ## Responses state
 
@@ -731,21 +846,32 @@ fields; additional fields may be added:
 
 | Field | Meaning |
 | --- | --- |
-| `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start; a request a stop sequence ended counts as `completed`, not `cancelled` |
+| `requests.submitted`, `completed`, `cancelled`, `timed_out`, `failed` | Native request counters since engine start; a request a stop sequence ended counts as `completed`, not `cancelled`, and one that reached its deadline (the request's `timeout` or `--request-timeout`) as `timed_out`, not `failed`, which counts the engine's own failures |
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, where a block-sparse target keeps its KV (`kv_mode`: `resident` or `spill`, only while its KV can go to the SSD), and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
 | `identity.cache.rope_scaling` | With a `--max-context` past 256K, the target's RoPE scaling, which every cached key went through: `type` `yarn`, its `factor` and `original_context_tokens`; `null` otherwise |
+| `identity.cache.cached_states`, `activations` | The precision options every cached page and state was computed at besides the KV format (`identity.kv.format`): how cached states keep their recurrent layers (`--cached-states`: `int8` codes, `exact`, or `none` for a target without recurrent layers) and `--activations` (`auto` or `bf16`), as the start's `Runtime precision` line names them ([KV cache precision](server.md#kv-cache-precision)). `--weights` (`auto` or `16bit`), which the line names first, is in the weights' manifest that `identity.cache.loaded_model_layout_sha256` and `identity.kv.target_model_sha256` digest, which name the format each tensor loads in: the two modes of a model with 16-bit projections differ there ([16-bit weights](models.md#16-bit-weights)) |
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](server.md#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
-| `streamed_experts` | While routed experts stream, the [streamed experts](server.md#streamed-experts)' store: its bytes at its cap and floor, its live chunks and those at the cap, the chunks it gave back and took back, its live chunks' bytes and slots and its resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
+| `streamed_experts` | While routed experts stream, the [streamed experts](server.md#streamed-experts)' store: its bytes at its cap and floor, its live chunks and those at the cap, the chunks it gave back and took back, its live chunks' bytes and slots and its resident experts, each streamed expert size's bytes a slot (`slot_bytes`: the store holds one share of each size's experts, its chunks' regions whole), per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](server.md#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded (once per request, at its start or a resume) or ended at that bound (and of those, the converted ones: `converted_bounded`, `converted_length_ends`), and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves (`spill_moves`), and of those the releases that gave a spilling request's pages' memory back for a claim and their pages (`releases`, `released_pages`); rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
+| `disk.read_bytes`, `spilled_kv_read_bytes`, `weights_read_bytes` | Bytes read from the SSD since engine start: by the [SSD cache](server.md#ssd-cache) (`read_bytes`: restored KV pages and states, and spilled K/V), of which spilled K/V a decode's block reads and a prefill's history stream took (`spilled_kv_read_bytes`); and from the model's own files by the weights that stay there, streamed experts and a streamed table (`weights_read_bytes`), which `read_bytes` does not count. A long prompt of a streamed model reads tens of GB of weights: 29 GB for 50,842 tokens of Qwen3.6-35B-A3B on a 16 GB Mac |
 | `disk.written_last_hour_bytes`, `written_last_day_bytes` | The [SSD cache](server.md#ssd-cache)'s write rate: the bytes its writes took over the last hour and the last day the Mac was awake, in the host pages each write stores, as `--max-cache-disk-writes` counts them, with a write budget or without. Each window ends now and is exact to a minute; an engine that started less than an hour or a day ago has written all of its count |
-| `disk.write_behind.waiting`, `durable`, `unneeded`, `refused` | The restore points the [SSD cache](server.md#ssd-cache) copies ahead: those queued for their copies, the one being copied among them (`waiting`), and since engine start those copied (`durable`), gone on from first (`unneeded`) and not copied for want of room or a file that takes writes (`refused`). An idle engine can report points waiting. Without `--persistent-cache` a point is copied only while a reclaim has reached cached KV or a state with no copy on the SSD within the last minute, 10 s after its publication once its request has ended; otherwise it waits for memory to run short, which may never happen, and is not work the engine owes. With it each point is written once it falls due, 10 s after its publication at the earliest, and at a clean stop (up to 6 s), so there `waiting` is SSD work still to come and drains by itself |
-| `kv.window` | For a target with sliding-window layers, its [windows](internals.md#sliding-windows): the `window_pages` a row's window and a state's tail keep Full, whether pages past every window give up their windowed layers' K/V (`trim`, off with the native `--kv-window-trim off`), the pool's `full_pages` and `slim_pages` in use and the Slim extents' `slim_bytes`, the `pinned_blocks` states' tails hold, the `trimmed_pages` since engine start, the `upgrades` of blocks that took the page of a writer that computed them again, and the `refused_states` whose tail was not Full; absent for other targets |
-| `memory_plan.budget.kv_window` | For a target whose pages give up a window's layers, a Slim page's `slim_page_bytes` and the `floor_pages` a lane keeps Full, by which one request's KV capacity is counted; absent for other targets |
+| `cache.prompt_tokens`, `reused_tokens`, `reused_disk_tokens`, `token_hit_rate`; `cache.hit_rate` | Since engine start, the prompt tokens of the requests that started and the tokens they resumed from the cache, of which `reused_disk_tokens` came back from the [SSD cache](server.md#ssd-cache); `token_hit_rate` is `reused_tokens / prompt_tokens`. `hit_rate` counts requests: those that resumed from any cached prefix over all that started |
+| `cache.reuse_ends.nothing_matched`, `prefix_end`, `kv_without_state`, `disk_read_failed` | The requests that started, by why their reuse stopped (each request's `reuse_end` in its usage) |
+| `disk.quota_given_up.window_parts`, `kv_copies`, `state_copies`, `states`, `states_in_use` | The copies the [SSD cache](server.md#ssd-cache)'s quota gave up to make room since engine start, by kind: window parts no point needs, KV copies, copies of states RAM still holds, a state's only copy (the KV on the SSD its point alone needed goes after it as KV copies), and the only copy of a state in use |
+| `disk.written_by.states`, `kv_demotions`, `kv_copies`, `kv_window_parts`; `disk.kv_rewrites`, `kv_rewritten_bytes` | What the [SSD cache](server.md#ssd-cache) wrote since engine start by class: states (evicted ones and restore points' alike), KV pages demoted as they left memory, and KV pages copied ahead, each the parts of a block's copy it wrote, and of those two the window parts of a model with a sliding window; a spilling request's writes through are under `kv_spill`. States count as each write starts, at the state's size, failed writes too; the KV classes as each write lands, at what each part's slot counts; so the classes do not sum to `written_bytes`, which counts each write's host pages as it is submitted. `kv_rewrites` counts the KV pages written again after a full cache gave their copy up while memory still held them, and `kv_rewritten_bytes` their bytes |
+| `disk.damage.checksum_failures`, `cut_copies` | Damage the persistent cache's files showed since the engine started: copies taken back whose first read failed their checksums, each given up and recomputed by the request that needed it, and records that lay past the end of a file found cut short at the start, left behind. The log says each: a damaged copy once with its file and slot, a file cut short once with how short it is and how many of the restore points its records describe the start took back |
+| `disk.write_behind.waiting`, `durable`, `unneeded`, `refused` | The restore points the [SSD cache](server.md#ssd-cache) copies ahead: those queued for their copies, the one being copied among them (`waiting`), and since engine start those copied (`durable`), gone on from first (`unneeded`) and not copied for want of room or a file that takes writes, or left at a clean stop while the write budget is spent (`refused`). An idle engine can report points waiting. Without `--persistent-cache` a point is copied only while a reclaim has reached cached KV or a state with no copy on the SSD within the last minute, 10 s after its publication once its request has ended; otherwise it waits for memory to run short, which may never happen, and is not work the engine owes. With it a point is written once it falls due, 2,048 tokens past its conversation's last point written or being written, and the newest at a clean stop (up to 6 s), so there `waiting` is SSD work still to come and the newest point of each conversation short of that |
+| `kv.window` | For a target with sliding-window layers, its [windows](internals.md#sliding-windows): the `window_pages` a row's window and a state's tail read, the `pinned_blocks` states' tails hold, the `window_units` blocks hold (a block holds its window unit while a state's tail holds it), the `upgrades` of blocks that took the page of a writer that computed them again, and the `refused_states` not published because a block of their tail held no window unit; absent for other targets |
+| `memory_plan.budget.kv_window` | For a target with sliding-window layers, the `floor_pages` of window units a lane holds whole beside its blocks' base pages (its window, its command and one block more), by which one request's KV capacity is counted; absent for other targets |
+| `memory_plan.budget.concurrent_requests` | The requests the planned memory runs at once beside one request of the served context: the lanes, up to `maximum_batch_width` (`--max-concurrent-requests`), whose states fit beside its KV in `dynamic_budget_bytes`. Where it is less, further requests wait for a lane's memory although lanes are free, and the start logs it; `more_requests_context_tokens` is then the most context that leaves room for one more lane's state (`--max-context`), and `more_requests_bytes` what the state and KV budget lacks for one more beside the served context (a larger `--max-memory`, or a smaller `--expert-memory` where the routed experts stream); both 0 where every lane fits |
+| `memory_plan.budget.kv_smallest_extent_pages` | The KV layout's smallest extent, in pages, to which the startup runway (`minimum_dynamic_bytes`) rounds its warmup blocks' pages up |
+| `memory_plan.model.memory.page_table_bytes`, `window_table_bytes` | The decode arena's page tables of one page a lane, in whole host pages, as a target without a window holds them, and what a windowed target's tables of its window unit's pages add to them; `shared_decode_bytes` counts both |
 | `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](server.md#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `memory_plan.budget.host_held_back_bytes` | The expert store's chunks above its floor, which it started without and the memory ledger grows into as the host allows ([memory and context](server.md#memory-and-context)): no memory at the start, but among the fixed bytes, so that the context and the KV the plan holds are the limit's |
-| `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](internals.md#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
+| `memory_plan.budget.cached_states_bytes` | Of the dynamic budget, the room kept for cached states beside one request's K/V where the routed experts stream: as many states as the K/V capacity holds the tails of (a windowed layout's), taken from the experts, so that the K/V reaches its capacity with them held; 0 where the experts load whole or the layout has no window |
+| `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](internals.md#neural-engine-prefill): `split` while it serves, over commands of `minimum_rows` rows or more, at most `share` of the FFN's channels (where commands of two steps take a larger share than those of one, `reason` gives both); `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `verify_rows` | The rows decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where each cycle's step is the one of the most expected accepted tokens per measured cost, with what its cycles show a long history adds to it, every row of which its lanes' trees fill is verified, or, where the target's experts stream, each cycle verifies the rows whose chance of a token is worth their time by its cycles' cost line (the default), `all` where each verifies every row of a draft's block a lane, whatever output the lane has left (`--verify-rows all`) |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
@@ -768,16 +894,17 @@ fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
-| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn, and under `--reasoning-effort`, where the server sets every request's effort |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families; `false` for Flint, whose model decides each turn, for Inkling 2, whose model is told the effort but opens its reasoning itself and still reasons at `none`, and under `--reasoning-effort`, where the server sets every request's effort |
 | `reasoning_effort` | The effort `--reasoning-effort` gives every request, whatever it asks; `null` without the option |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row, and the server is exiting ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |
 | `capabilities.max_context_tokens` | The context the server serves now: the latest engine's, which a restart whose plan holds less may lower until a later one regains it |
 | `console.dropped_lines` | The console lines, the server's and its engine's, dropped since the server started because stdout or stderr stopped draining with 1024 lines waiting; the log marks each gap with a `Warning · N console lines dropped …` line ([console](server.md#console)) |
 
-`GET /ready` is 200 while the engine's own `ready` is true. While the engine
-loop is busy, `/ready` keeps its last answer until the loop has left status
-requests unanswered for 30 s; a loop that leaves a status refresh unanswered
+`GET /ready` is 200 while the engine's own `ready` is true and the server
+admits requests: from a stop's first signal, as it drains, it is 503. While
+the engine loop is busy, `/ready` keeps its last answer until the loop has left
+status requests unanswered for 30 s; a loop that leaves a status refresh unanswered
 that long fails the engine, which then restarts. `/ready` stays healthy under
 warning pressure, and reports 503 while macOS reports critical pressure;
 requests already running continue, and one that needs more memory is suspended
@@ -795,7 +922,8 @@ conflicts and replans, the memory ledger's owed and claimed bytes and per accoun
 with its grows and shrinks, the streamed experts' chunks, shrinks
 and regrows, the requests that converted to `spill`, the loop's longest tick,
 and the p99 and longest of its steps' host time to a submitted command; the
-table's other fields are in `/status` alone.
+table's other fields are in `/status` alone. Each metric comes under its
+`# TYPE` line: a counter for a name that ends in `_total`, a gauge otherwise.
 `splash_kv_free_allocated_pages` counts free pages of allocated extents, not
 remaining capacity; memory headroom is `splash_memory_headroom_bytes`. Consumers
 should tolerate missing native fields while the engine is unavailable, and
@@ -866,10 +994,8 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | Status | `code` | Meaning |
 | --- | --- | --- |
 | 400 | `invalid_request_error` | A malformed request, or a field Splash cannot honor; the message names it. |
-| 400 | `context_length_exceeded` | The prompt exceeds the context limit, or leaves no room in it for output. |
-| 400 | `capacity_exhausted` | The request cannot fit in memory even alone; retrying fails the same way. |
+| 400 | `context_length_exceeded` | The prompt exceeds the context limit, or leaves no room in it for output; the message names both counts (`prompt exceeds the context window: N tokens > M maximum input tokens`, in Messages Anthropic's `prompt is too long: ...`). Also a request that cannot fit even alone, in memory or in the SSD cache's quota (`--max-cache-disk`): its message names its tokens and, where the engine can say it and its prompt is what does not fit, the prompt tokens memory or the quota holds it now (`prompt does not fit in this server's memory: N tokens > M tokens it holds for this request now`, in Messages `prompt is too long: N tokens > M maximum input tokens ...`), and what helps (a shorter conversation or a larger `--max-memory`, `--max-cache-disk` for the quota, for a request with images a smaller image, `--max-memory` or `--max-image-pixels`); retrying it unchanged fails the same way, so agents compact as for an overlong prompt. The console line keeps the engine's code (`capacity_exhausted`, `kv_disk_quota`) and its sentence, with the same advice. |
 | 400 | `request_quarantined` | The engine had started this request at each of two engine failures in a row; Splash refuses it for an hour after the second failure, or until the server restarts, and retrying within that hour fails the same way ([engine restarts](server.md#engine-restarts-and-sleep)). |
-| 400 | `kv_disk_quota` | The request's KV does not fit in memory now, and the SSD cache may not hold even its prompt's (`--max-cache-disk`, and the volume's free space); retrying fails the same way while memory and the quota stay as they are. |
 | 401 | `authentication_error` | The API key is missing or wrong. |
 | 403 | `forbidden` | A Host or Origin the server does not serve; the message names the flag that admits it. |
 | 404 | `model_not_found` | `model` is neither the served ID nor an alias. |

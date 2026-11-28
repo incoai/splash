@@ -16,9 +16,19 @@ ROOT = Path(__file__).resolve().parents[3]
 # engine's facts of its layout and the family's release give them.
 UNUSABLE = {
     "Qwen3.8-27B": {"--expert-memory", "--ple-memory", "--sparse-kv-memory"},
-    "Qwen3.6-35B-A3B": {"--ple-memory", "--sparse-kv-memory", "--disable-ane"},
-    "Qwen3.5-122B-A10B": {"--ple-memory", "--sparse-kv-memory", "--disable-ane"},
-    "Qwen3.8-Flash-Next": {"--disable-ane"},
+    "Qwen3.6-35B-A3B": {
+        "--ple-memory",
+        "--sparse-kv-memory",
+        "--disable-ane",
+        "--recalibrate-ane",
+    },
+    "Qwen3.5-122B-A10B": {
+        "--ple-memory",
+        "--sparse-kv-memory",
+        "--disable-ane",
+        "--recalibrate-ane",
+    },
+    "Qwen3.8-Flash-Next": {"--disable-ane", "--recalibrate-ane"},
     "Flint": {
         "--language-only",
         "--state-format",
@@ -26,12 +36,33 @@ UNUSABLE = {
         "--ple-memory",
         "--sparse-kv-memory",
         "--disable-ane",
+        "--recalibrate-ane",
         "--max-image-pixels",
         "--reasoning-effort",
         "--default-reasoning-effort",
         "--thinking-token-budget",
         "--thinking-end-text",
     },
+    # Its effort reaches its template, which tells the model, but the model
+    # opens its reasoning itself, which no thinking budget caps; it has no
+    # recurrent state.
+    "Inkling-2-Mini": {
+        "--state-format",
+        "--cached-states",
+        "--ple-memory",
+        "--sparse-kv-memory",
+        "--disable-ane",
+        "--recalibrate-ane",
+        "--thinking-token-budget",
+        "--thinking-end-text",
+    },
+}
+# The context each family's models serve: their native window, and the most
+# past it, with YaRN, which stretches only the Qwen families'. Inkling 2's own
+# window, 1048576 tokens, is served up to the most --max-context takes.
+CONTEXT = {
+    "Flint": (262144, 262144),
+    "Inkling-2-Mini": (1010000, 1010000),
 }
 
 
@@ -45,16 +76,27 @@ class OptionReportTests(unittest.TestCase):
             {name: set(family["unusable"]) for name, family in report.items()},
             UNUSABLE,
         )
-        # Flint serves its native window alone; YaRN stretches the others'.
         self.assertEqual(
             {
                 name: (family["context_tokens"], family["max_context_tokens"])
                 for name, family in report.items()
             },
-            {
-                name: (262144, 262144 if name == "Flint" else 1010000)
-                for name in UNUSABLE
-            },
+            {name: CONTEXT.get(name, (262144, 1010000)) for name in UNUSABLE},
+        )
+        # Each family's default --activations, which the app's menu names.
+        self.assertEqual(
+            {name: family["activations"] for name, family in report.items()},
+            {name: "bf16" if name == "Inkling-2-Mini" else "auto" for name in UNUSABLE},
+        )
+        # The sampling a request gets unless it names its own, which the
+        # app's sampling fields show.
+        self.assertEqual(
+            report["Inkling-2-Mini"]["sampling"],
+            {"temperature": 1.0, "top_p": 1.0, "top_k": 0},
+        )
+        self.assertEqual(
+            report["Qwen3.6-35B-A3B"]["sampling"],
+            {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
         )
         # --max-context takes at most the most context any family serves.
         self.assertEqual(

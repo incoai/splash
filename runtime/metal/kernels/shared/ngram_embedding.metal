@@ -100,17 +100,17 @@ kernel void ngram_embedding_conv(device const bfloat *input [[buffer(0)]],
                                  device const bfloat *history_in0 [[buffer(1)]],
                                  device const bfloat *history_in1 [[buffer(2)]],
                                  device const bfloat *history_in2 [[buffer(3)]],
-                                 device const bfloat *history_in3 [[buffer(4)]],
-                                 device bfloat *history_out0 [[buffer(5)]],
-                                 device bfloat *history_out1 [[buffer(6)]],
-                                 device bfloat *history_out2 [[buffer(7)]],
-                                 device bfloat *history_out3 [[buffer(8)]],
-                                 device const float *taps [[buffer(9)]],
-                                 device const float *gated [[buffer(10)]],
-                                 device float *streams [[buffer(11)]],
-                                 device const SplashLaneRows *layout [[buffer(12)]],
-                                 device const SplashTreeRow *tree [[buffer(13)]],
-                                 constant NgramEmbeddingParams &p [[buffer(14)]],
+                                 device const bfloat *history_in3 [[buffer(4)]], device const bfloat *history_in4 [[buffer(5)]], device const bfloat *history_in5 [[buffer(6)]], device const bfloat *history_in6 [[buffer(7)]], device const bfloat *history_in7 [[buffer(8)]],
+                                 device bfloat *history_out0 [[buffer(9)]],
+                                 device bfloat *history_out1 [[buffer(10)]],
+                                 device bfloat *history_out2 [[buffer(11)]],
+                                 device bfloat *history_out3 [[buffer(12)]], device bfloat *history_out4 [[buffer(13)]], device bfloat *history_out5 [[buffer(14)]], device bfloat *history_out6 [[buffer(15)]], device bfloat *history_out7 [[buffer(16)]],
+                                 device const float *taps [[buffer(17)]],
+                                 device const float *gated [[buffer(18)]],
+                                 device float *streams [[buffer(19)]],
+                                 device const SplashLaneRows *layout [[buffer(20)]],
+                                 device const SplashTreeRow *tree [[buffer(21)]],
+                                 constant NgramEmbeddingParams &p [[buffer(22)]],
                                  uint3 group [[threadgroup_position_in_grid]],
                                  uint tid [[thread_index_in_threadgroup]]) {
   const uint width = p.streams * p.hidden;
@@ -119,7 +119,7 @@ kernel void ngram_embedding_conv(device const bfloat *input [[buffer(0)]],
   const SplashLaneRows rows = layout[s];
   if (ulong(rows.first) + rows.rows > p.rows) return;
   device const bfloat *sequence = input + ulong(rows.first) * width;
-  device const bfloat *history_in = SPLASH_LANE_BINDING(s, history_in0, history_in1, history_in2, history_in3);
+  device const bfloat *history_in = SPLASH_LANE_BINDING(s, history_in0, history_in1, history_in2, history_in3, history_in4, history_in5, history_in6, history_in7);
   const int history = int((p.taps - 1) * p.dilation);
   const auto at = [&](int t) -> float {
     return t >= 0 ? float(sequence[ulong(t) * width + c]) : float(history_in[ulong(history + t) * width + c]);
@@ -140,7 +140,7 @@ kernel void ngram_embedding_conv(device const bfloat *input [[buffer(0)]],
     // Rows past the sequence's write its history: row rows + j holds row
     // rows - history + j.
     const int j = int(row - rows.rows);
-    device bfloat *history_out = SPLASH_LANE_BINDING(s, history_out0, history_out1, history_out2, history_out3);
+    device bfloat *history_out = SPLASH_LANE_BINDING(s, history_out0, history_out1, history_out2, history_out3, history_out4, history_out5, history_out6, history_out7);
     history_out[ulong(j) * width + c] = bfloat(at(int(rows.rows) - history + j));
   }
 }
@@ -185,14 +185,14 @@ kernel void ngram_embedding_commit(device const bfloat *input [[buffer(0)]],
                                    device const bfloat *history_in0 [[buffer(1)]],
                                    device const bfloat *history_in1 [[buffer(2)]],
                                    device const bfloat *history_in2 [[buffer(3)]],
-                                   device const bfloat *history_in3 [[buffer(4)]],
-                                   device bfloat *history_out0 [[buffer(5)]],
-                                   device bfloat *history_out1 [[buffer(6)]],
-                                   device bfloat *history_out2 [[buffer(7)]],
-                                   device bfloat *history_out3 [[buffer(8)]],
-                                   device const uint *paths [[buffer(9)]],
-                                   device const SplashLaneRows *layout [[buffer(10)]],
-                                   constant NgramEmbeddingParams &p [[buffer(11)]],
+                                   device const bfloat *history_in3 [[buffer(4)]], device const bfloat *history_in4 [[buffer(5)]], device const bfloat *history_in5 [[buffer(6)]], device const bfloat *history_in6 [[buffer(7)]], device const bfloat *history_in7 [[buffer(8)]],
+                                   device bfloat *history_out0 [[buffer(9)]],
+                                   device bfloat *history_out1 [[buffer(10)]],
+                                   device bfloat *history_out2 [[buffer(11)]],
+                                   device bfloat *history_out3 [[buffer(12)]], device bfloat *history_out4 [[buffer(13)]], device bfloat *history_out5 [[buffer(14)]], device bfloat *history_out6 [[buffer(15)]], device bfloat *history_out7 [[buffer(16)]],
+                                   device const uint *paths [[buffer(17)]],
+                                   device const SplashLaneRows *layout [[buffer(18)]],
+                                   constant NgramEmbeddingParams &p [[buffer(19)]],
                                    uint3 group [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]]) {
   const uint lane = group.z;
@@ -201,8 +201,8 @@ kernel void ngram_embedding_commit(device const bfloat *input [[buffer(0)]],
   if (ulong(rows.first) + rows.rows > p.rows) return;
   const uint path = paths[lane];
   ngram_history_rows(input + ulong(rows.first) * p.streams * p.hidden,
-                     SPLASH_LANE_BINDING(lane, history_in0, history_in1, history_in2, history_in3),
-                     SPLASH_LANE_BINDING(lane, history_out0, history_out1, history_out2, history_out3), p,
+                     SPLASH_LANE_BINDING(lane, history_in0, history_in1, history_in2, history_in3, history_in4, history_in5, history_in6, history_in7),
+                     SPLASH_LANE_BINDING(lane, history_out0, history_out1, history_out2, history_out3, history_out4, history_out5, history_out6, history_out7), p,
                      popcount(path), path, group.xy, tid);
 }
 

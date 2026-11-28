@@ -7,6 +7,8 @@
 #include "PrefillWork.hpp"
 #include "TranscriptPrompts.hpp"
 
+#include <CommonCrypto/CommonDigest.h>
+
 #include <algorithm>
 #include <iterator>
 #include <array>
@@ -24,6 +26,8 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -79,8 +83,9 @@ public:
     ++batchSequence_;
   }
 
-  void started(uint64_t requestId, uint32_t matchedTokens,
+  void started(uint64_t requestId, const engine::StartFound &found,
                uint32_t) override {
+    const uint32_t matchedTokens = found.matchedPromptTokens;
     Observation &value = observations_[requestId];
     value.cacheStatus = matchedTokens ? "prefix_hit" : "miss";
     value.matchedTokens = matchedTokens;
@@ -108,7 +113,7 @@ public:
   }
 
   void failed(uint64_t requestId, LaneOutcome outcome, std::string message,
-              uint32_t) override {
+              uint32_t, CapacityShortfall) override {
     observations_[requestId].failure =
         std::string(laneOutcomeWire(outcome).code) + ":" + message;
   }
@@ -374,7 +379,7 @@ private:
   [[nodiscard]] bool drained() const {
     const engine::EngineSnapshot counts = engine_.snapshot();
     return counts.submitted ==
-               counts.completed + counts.cancelled + counts.failed &&
+               counts.completed + counts.cancelled + counts.timedOut + counts.failed &&
            !engine_.commandInFlight();
   }
 
@@ -383,14 +388,97 @@ private:
   std::shared_ptr<WakeState> wake_ = std::make_shared<WakeState>();
 };
 
+// The ids random prompts draw from, from 100: 200,000 of them, or the
+// model's vocabulary past 100 where it holds fewer (main sets it), so that
+// a vocabulary of 200,100 or more draws the same tokens whatever its size.
+uint32_t randomTokenIds = 200000;
+
 std::vector<uint32_t> prompt(uint32_t length, uint64_t salt) {
   std::vector<uint32_t> result(length);
   uint64_t state = salt ^ 0x9e3779b97f4a7c15ULL;
   for (uint32_t &token : result) {
     state = state * 6364136223846793005ULL + 1442695040888963407ULL;
-    token = 100 + static_cast<uint32_t>((state >> 17) % 200000);
+    token = 100 + static_cast<uint32_t>((state >> 17) % randomTokenIds);
   }
   return result;
+}
+
+// The chat requests the decode, context, transcripts and logits scenarios
+// send: the decode throughput prompt, which asks for counting, and the
+// transcripts' requests (TranscriptPrompts.hpp), each one user message with
+// thinking off in the model's chat template. The built-in ones are Qwen's
+// tokens; --prompts gives a model's own, which backend_regression renders
+// with its tokenizer and chat template (dev/benchmarks/chat_prompts.py).
+struct BenchmarkPrompts final {
+  std::vector<uint32_t> decode;
+  std::vector<std::vector<uint32_t>> transcripts;
+  // built-in, file, or random: random tokens of the built-in ones' lengths,
+  // for a model whose vocabulary lacks Qwen's tokens and no --prompts.
+  std::string_view source;
+};
+
+// The digest of the built-in decode throughput prompt's tokens as
+// little-endian uint32s, as the report gives a prompt's.
+constexpr std::string_view kDecodeThroughputPromptSha256 =
+    "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982";
+
+std::string tokensSha256(std::span<const uint32_t> tokens) {
+  std::vector<uint8_t> bytes;
+  bytes.reserve(tokens.size() * 4);
+  for (const uint32_t token : tokens)
+    for (uint32_t shift = 0; shift != 32; shift += 8)
+      bytes.push_back(static_cast<uint8_t>(token >> shift));
+  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256(bytes.data(), static_cast<CC_LONG>(bytes.size()), digest);
+  std::ostringstream hex;
+  for (const unsigned char byte : digest)
+    hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(byte);
+  return hex.str();
+}
+
+std::vector<std::vector<uint32_t>> readNumberLines(const std::filesystem::path &path);
+
+// The prompts of a run on a model of `vocabularySize` tokens: those of
+// --prompts, a file of the decode prompt's tokens on its first line and
+// each transcript request's on the next six; else the built-in ones, which
+// a model without Qwen's tokens replaces by random ones of their lengths.
+BenchmarkPrompts benchmarkPrompts(const std::optional<std::filesystem::path> &path, uint32_t vocabularySize) {
+  BenchmarkPrompts prompts;
+  if (path) {
+    std::vector<std::vector<uint32_t>> lines = readNumberLines(*path);
+    if (lines.size() != 1 + benchmark::kTranscriptPrompts.size() ||
+        std::any_of(lines.begin(), lines.end(), [](const auto &line) { return line.empty(); }))
+      throw std::invalid_argument("--prompts takes 7 lines of tokens: the decode prompt and the 6 transcript requests");
+    for (const std::vector<uint32_t> &line : lines)
+      for (const uint32_t token : line)
+        if (token >= vocabularySize)
+          throw std::invalid_argument("--prompts token " + std::to_string(token) +
+                                      " lies outside the model's vocabulary of " +
+                                      std::to_string(vocabularySize) + " tokens");
+    prompts.decode = std::move(lines.front());
+    prompts.transcripts.assign(std::make_move_iterator(lines.begin() + 1), std::make_move_iterator(lines.end()));
+    prompts.source = "file";
+    return prompts;
+  }
+  prompts.decode.assign(std::begin(benchmark::kDecodeThroughputPrompt), std::end(benchmark::kDecodeThroughputPrompt));
+  for (const std::span<const uint32_t> request : benchmark::kTranscriptPrompts)
+    prompts.transcripts.emplace_back(request.begin(), request.end());
+  prompts.source = "built-in";
+  const auto inVocabulary = [&](std::span<const uint32_t> tokens) {
+    return std::all_of(tokens.begin(), tokens.end(), [&](uint32_t token) { return token < vocabularySize; });
+  };
+  if (inVocabulary(prompts.decode) && std::all_of(prompts.transcripts.begin(), prompts.transcripts.end(),
+                                                  [&](const auto &request) { return inVocabulary(request); }))
+    return prompts;
+  std::cerr << "backend-benchmark: the built-in chat prompts are Qwen's tokens, outside this model's vocabulary of "
+            << vocabularySize << " tokens; the decode, context, transcripts and logits scenarios send random tokens "
+               "of their lengths instead (--prompts, as backend_regression passes, sends the model's own)\n";
+  prompts.decode = prompt(static_cast<uint32_t>(prompts.decode.size()), 0x4445434f4445ULL);
+  for (uint32_t index = 0; index < prompts.transcripts.size(); ++index)
+    prompts.transcripts[index] =
+        prompt(static_cast<uint32_t>(prompts.transcripts[index].size()), uint64_t{index} << 32 | 0x43484154ULL);
+  prompts.source = "random";
+  return prompts;
 }
 
 // What each lookup of a cache check found, for its failure: under host
@@ -760,6 +848,13 @@ ops::Int8Activations parseInt8Activations(std::string_view value) {
   return value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
 }
 
+// --weights, as serve's: whether the target's 16-bit projections load as
+// Q8_0 or as their files store them.
+model::gguf::Float16Weights parseWeights(std::string_view value) {
+  if (value != "auto" && value != "original") throw std::invalid_argument("--weights requires original or auto");
+  return value == "auto" ? model::gguf::Float16Weights::Q8_0 : model::gguf::Float16Weights::Published;
+}
+
 // --ane-ffn-minimum-rows: the least rows of a chunk the prefill FFN's Neural
 // Engine split takes, a positive count.
 uint32_t parseAneFfnMinimumRows(std::string_view value) {
@@ -768,6 +863,34 @@ uint32_t parseAneFfnMinimumRows(std::string_view value) {
   if (error != std::errc{} || end != value.data() + value.size() || !rows)
     throw std::invalid_argument("--ane-ffn-minimum-rows takes a positive row count");
   return rows;
+}
+
+// --context-lengths: the context and exact scenarios' lengths, ascending
+// token counts separated by commas.
+std::vector<uint32_t> parseContextLengths(std::string_view value) {
+  std::vector<uint32_t> lengths;
+  for (;;) {
+    const size_t comma = value.find(',');
+    const std::string_view length = value.substr(0, comma);
+    uint32_t parsed = 0;
+    const auto [end, error] = std::from_chars(length.data(), length.data() + length.size(), parsed);
+    if (error != std::errc{} || end != length.data() + length.size() || !parsed ||
+        (!lengths.empty() && parsed <= lengths.back()))
+      throw std::invalid_argument("--context-lengths takes ascending token counts");
+    lengths.push_back(parsed);
+    if (comma == std::string_view::npos) return lengths;
+    value.remove_prefix(comma + 1);
+  }
+}
+
+// --short-idle: the seconds the short scenario leaves the engine idle before
+// each prompt, at most an hour.
+double parseShortIdle(std::string_view value) {
+  double seconds = 0.0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), seconds);
+  if (error != std::errc{} || end != value.data() + value.size() || !(seconds >= 0.0 && seconds <= 3600.0))
+    throw std::invalid_argument("--short-idle takes seconds from 0 to 3600");
+  return seconds;
 }
 
 // --ane-ffn-share: the prefill FFN's Neural Engine share, in [0, 1).
@@ -914,38 +1037,58 @@ int main(int argc, char **argv) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
-                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
-                   "[--activations auto|bf16] [--verify-rows all|auto] "
-                   "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
+                   "[--ane-ffn-minimum-rows ROWS]] [--ane-calibration again] [--max-context TOKENS] "
+                   "[--activations auto|bf16] [--weights original|auto] [--verify-rows all|auto] "
+                   "[--logits DIR [--logits-from DIR] [--logits-width LANES] [--logits-cache evict|keep]] "
+                   "[--context-lengths TOKENS[,TOKENS...]] [--short-idle SECONDS] [--prompts PATH]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
+                   "  --ane-calibration again: calibrate the split again instead of taking "
+                   "this Mac's record, as serve's --recalibrate-ane\n"
                    "  ROWS: the least rows of a chunk that share takes "
                    "(default: 512)\n"
                    "  TOKENS: the context the engine serves, as serve's "
                    "--max-context, with YaRN past the model's native window "
                    "(default: what memory holds)\n"
-                   "  --activations: as serve's (default: auto)\n"
+                   "  --activations: as serve's (default: the model's)\n"
+                   "  --weights: as serve's (default: auto)\n"
                    "  --verify-rows: as serve's (default: all, so that the times measure the "
                    "backend and outputs repeat, where the verify budget's rows follow the "
                    "cycles before them)\n"
                    "  DIR: the logits scenario's dump, and the earlier dump whose "
                    "prefixes it scores (default: its own greedy transcripts')\n"
                    "  LANES: the score requests the logits scenario runs at once "
-                   "(default: 1)\n";
+                   "(default: 1)\n"
+                   "  --logits-cache: keep leaves the cache between score requests, so that "
+                   "a prefix that extends an earlier one resumes from its KV as a "
+                   "conversation's next turn does (default: evict, each cold)\n"
+                   "  TOKENS: the context and exact scenarios' lengths, ascending "
+                   "(default: 2048,10000,50000,128000)\n"
+                   "  SECONDS: how long the short scenario leaves the engine idle before each "
+                   "prompt (default: 0)\n"
+                   "  PATH: the chat requests' tokens in the model's chat template, the decode prompt's "
+                   "on the first line and the 6 transcript requests' on the next, as backend_regression "
+                   "writes them (default: the built-in Qwen ones, or random tokens of their lengths for "
+                   "a model without Qwen's tokens)\n";
       return 2;
     }
     uint32_t samples = 1;
+    double shortIdleSeconds = 0.0;
     BenchmarkScenarios selected;
     std::optional<std::filesystem::path> progressPath;
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
+    bool recalibrateAne = false;
+    std::vector<uint32_t> contextLengths{2048, 10000, 50000, 128000};
     uint32_t maxContext = 0;
-    ops::Int8Activations int8Activations = ops::Int8Activations::On;
+    std::optional<ops::Int8Activations> int8Activations;
+    model::gguf::Float16Weights weights = model::gguf::Float16Weights::Q8_0;
     model::VerifyRows verifyRows = model::VerifyRows::All;
-    std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
+    std::optional<std::filesystem::path> logitsDirectory, logitsFrom, promptsPath;
     uint32_t logitsWidth = 1;
+    bool logitsKeepCache = false;
     bool logitsOptions = false;
     for (int index = 3; index < argc; index += 2) {
       if (index + 1 >= argc)
@@ -959,17 +1102,29 @@ int main(int argc, char **argv) {
         selected = parseScenarios(argv[index + 1]);
       } else if (option == "--ane-ffn-share") {
         aneFfnShare = parseAneFfnShare(argv[index + 1]);
+      } else if (option == "--ane-calibration") {
+        if (std::string_view(argv[index + 1]) != "again")
+          throw std::invalid_argument("--ane-calibration takes again");
+        recalibrateAne = true;
       } else if (option == "--ane-ffn-minimum-rows") {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
         maxContext = parseMaxContext(argv[index + 1]);
       } else if (option == "--activations") {
         int8Activations = parseInt8Activations(argv[index + 1]);
+      } else if (option == "--weights") {
+        weights = parseWeights(argv[index + 1]);
       } else if (option == "--verify-rows") {
         const std::string_view value(argv[index + 1]);
         if (value != "all" && value != "auto")
           throw std::invalid_argument("--verify-rows takes all or auto");
         verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+      } else if (option == "--context-lengths") {
+        contextLengths = parseContextLengths(argv[index + 1]);
+      } else if (option == "--short-idle") {
+        shortIdleSeconds = parseShortIdle(argv[index + 1]);
+      } else if (option == "--prompts") {
+        promptsPath = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits") {
         logitsDirectory = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits-from") {
@@ -980,6 +1135,12 @@ int main(int argc, char **argv) {
         logitsOptions = true;
         if (logitsWidth > model::ExecutionLimits::maximumBatchWidth)
           throw std::invalid_argument("--logits-width exceeds the batch width");
+      } else if (option == "--logits-cache") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "evict" && value != "keep")
+          throw std::invalid_argument("--logits-cache takes evict or keep");
+        logitsKeepCache = value == "keep";
+        logitsOptions = true;
       } else {
         throw std::invalid_argument("unknown benchmark option");
       }
@@ -987,7 +1148,7 @@ int main(int argc, char **argv) {
     if (selected.logits != logitsDirectory.has_value())
       throw std::invalid_argument("the logits scenario and --logits go together");
     if (logitsOptions && !logitsDirectory)
-      throw std::invalid_argument("--logits-from and --logits-width need --logits");
+      throw std::invalid_argument("--logits-from, --logits-width and --logits-cache need --logits");
     if (progressPath)
       progress = std::make_unique<ProgressJournal>(*progressPath, samples);
 
@@ -998,11 +1159,18 @@ int main(int argc, char **argv) {
     config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    config.aneFfn.recalibrate = recalibrateAne;
     config.int8Activations = int8Activations;
+    config.weights = weights;
     config.verifyRows = verifyRows;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
+    randomTokenIds = std::min<uint32_t>(randomTokenIds, capabilities.vocabularySize - 100);
+    const BenchmarkPrompts prompts = benchmarkPrompts(promptsPath, capabilities.vocabularySize);
+    if (prompts.source == "built-in" && tokensSha256(prompts.decode) != kDecodeThroughputPromptSha256)
+      throw std::logic_error("the built-in decode throughput prompt changed");
+    const std::span<const uint32_t> decodeThroughputPrompt = prompts.decode;
     // Complete production warmup and memory audit before measuring. A start
     // refused memory the host or Metal may give back, as while the previous
     // engine's memory settles, retries as serve's does (main.mm): within the
@@ -1056,17 +1224,28 @@ int main(int argc, char **argv) {
     if (progress)
       progress->identity(identity);
 
-    // These warmups run after serving began, and widths 2-4 each add a lane.
+    // The lanes this start runs (RuntimeResourcesConfig::lanes): every width
+    // below warms, decodes and is reported.
+    const uint32_t lanes = resources->memoryPlan().breakdown().maximumBatchWidth;
+    if (logitsWidth > lanes)
+      throw std::invalid_argument("--logits-width exceeds the lanes this start runs");
+
+    // These warmups run after serving began, and widths past one each add a lane.
     // They are lanes alone in service, which the engine passes through the
     // host's margins allocation by allocation once nothing in place meets
     // one; a warmup retries none, so like a start's warmup they run inside a
     // Floor claim: only the engine's limit and macOS's critical pressure
     // refuse what they allocate. Like a start's warmup too, they hold the KV
-    // runway they run on.
+    // runway they run on: all its pages, named, so that the hold allocates
+    // again the extents of it the start's audit released, as the Neural
+    // Engine split's set-up after that audit does (requireWarmup). The audit
+    // keeps one empty extent, and a windowed layout's runway, a block's
+    // pages times the warmup's blocks, takes more than one.
     MemoryGovernor &governor = resources->memoryGovernor();
     const ClaimId warmups = governor.ledger().open({.cls = ClaimClass::Floor});
     std::optional<MemoryGovernor::Scope> warmupScope(std::in_place, governor, warmups);
-    std::optional<engine::KvPool::RunwayHold> runway(std::in_place, resources->kvPool());
+    std::optional<engine::KvPool::RunwayHold> runway(std::in_place, resources->kvPool(),
+                                                     resources->kvPool().runwayPages());
     if (progress)
       progress->begin("warmup", "prefill_2048", 0,
                       model::ExecutionLimits::prefillTokenBudget);
@@ -1080,10 +1259,8 @@ int main(int argc, char **argv) {
                          prefillWarmup.wallSeconds * 1000.0,
                          prefillWarmupGpuMilliseconds, 0.0);
     }
-    std::array<double, model::ExecutionLimits::maximumBatchWidth>
-        decodeWarmupWall{};
-    std::array<double, model::ExecutionLimits::maximumBatchWidth>
-        decodeWarmupGpu{};
+    std::vector<double> decodeWarmupWall(lanes);
+    std::vector<double> decodeWarmupGpu(lanes);
     std::vector<std::string> performanceFailures;
     for (uint32_t width = 1; width <= decodeWarmupWall.size(); ++width) {
       decodeWarmupWall[width - 1] =
@@ -1112,23 +1289,13 @@ int main(int argc, char **argv) {
     // This executable characterizes one source identity and checks internal
     // invariants; a source-regression claim requires a separately captured
     // baseline report and an explicit comparison outside this process.
-    constexpr std::array<uint32_t, 39> decodeThroughputPrompt{
-        248045, 846,   198,   2427, 38453, 494,   220,   16,
-        11,     4237,  1754,  1324, 321,   1141,  6163,  803,
-        383,    264,   491,   1500, 13,    14569, 2980,  488,
-        5372,   220,   17,    15,   15,    13,    248046, 198,
-        248045, 74455, 198,   248068, 271,  248069, 271};
-    constexpr std::string_view decodeThroughputPromptSha256 =
-        "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982";
     std::vector<DecodeThroughputMeasurement> decodeThroughput;
-    decodeThroughput.reserve(model::ExecutionLimits::maximumBatchWidth * samples);
+    decodeThroughput.reserve(size_t{lanes} * samples);
     uint64_t requestId = 1;
     if (selected.decode) {
       for (uint32_t sample = 0; sample < samples; ++sample) {
-        for (uint32_t offset = 0;
-             offset < model::ExecutionLimits::maximumBatchWidth; ++offset) {
-          const uint32_t width =
-              1 + (sample + offset) % model::ExecutionLimits::maximumBatchWidth;
+        for (uint32_t offset = 0; offset < lanes; ++offset) {
+          const uint32_t width = 1 + (sample + offset) % lanes;
           evictAllCache(resources->cache());
           decodeThroughput.push_back(runDecodeThroughput(
               engine, driver, *executor, events, progress.get(), requestId,
@@ -1168,7 +1335,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    constexpr std::array<uint32_t, 4> lengths{2048, 10000, 50000, 128000};
+    const std::vector<uint32_t> &lengths = contextLengths;
     // The rolling request, a length's longest, appends this many tokens.
     constexpr uint32_t rollingSuffixTokens = 256;
     std::vector<Measurement> measurements;
@@ -1418,6 +1585,7 @@ int main(int argc, char **argv) {
       for (uint32_t sample = 0; sample < samples; ++sample) {
         for (uint32_t rows : shortRows) {
           evictAllCache(resources->cache());
+          std::this_thread::sleep_for(std::chrono::duration<double>(shortIdleSeconds));
           Measurement result = runRequest(
               engine, driver, *executor, events, progress.get(), requestId++, "short", sample,
               prompt(rows, (uint64_t{rows} << 32 | sample) ^ 0x53484f5254ULL));
@@ -1442,7 +1610,7 @@ int main(int argc, char **argv) {
         for (uint32_t index = 0; index < transcriptCases.size(); ++index) {
           const auto [request, context] = transcriptCases[index];
           std::vector<uint32_t> tokens = prompt(context, uint64_t{index} << 32 | 0x5452414e53ULL);
-          const std::span<const uint32_t> question = benchmark::kTranscriptPrompts[request];
+          const std::span<const uint32_t> question = prompts.transcripts[request];
           tokens.insert(tokens.end(), question.begin(), question.end());
           evictAllCache(resources->cache());
           Measurement result =
@@ -1460,14 +1628,15 @@ int main(int argc, char **argv) {
     // real requests (TranscriptPrompts.hpp), 256 answer tokens each, 16
     // prefixes into each answer, or after the prefixes an earlier dump
     // scored: score-only requests whose score tokens are the vocabulary, each
-    // cold, logitsWidth at once so that they prefill beside each other.
+    // cold (or after the earlier ones' KV, --logits-cache keep), logitsWidth
+    // at once so that they prefill beside each other.
     if (selected.logits) {
       constexpr uint32_t kAnswerTokens = 256, kPrefixes = 16;
       LogitDump dump;
       if (logitsFrom) {
         dump = readLogitDump(*logitsFrom);
       } else {
-        for (const std::span<const uint32_t> question : benchmark::kTranscriptPrompts) {
+        for (const std::span<const uint32_t> question : prompts.transcripts) {
           evictAllCache(resources->cache());
           const Measurement answer =
               runRequest(engine, driver, *executor, events, progress.get(), requestId++, "logits_answer", 0,
@@ -1479,7 +1648,7 @@ int main(int argc, char **argv) {
         // holds as many sequences.
         for (uint32_t prefix = 0; prefix < kPrefixes; ++prefix)
           for (uint32_t sequence = 0; sequence < dump.sequences.size(); ++sequence) {
-            const uint32_t question = static_cast<uint32_t>(benchmark::kTranscriptPrompts[sequence].size());
+            const uint32_t question = static_cast<uint32_t>(prompts.transcripts[sequence].size());
             const uint32_t answered = static_cast<uint32_t>(dump.sequences[sequence].size()) - question;
             if (answered)
               dump.records.emplace_back(sequence, question + prefix * answered / kPrefixes);
@@ -1492,7 +1661,8 @@ int main(int argc, char **argv) {
       std::ofstream logits(*logitsDirectory / "logits.f32", std::ios::binary | std::ios::trunc);
       for (size_t first = 0; first < dump.records.size(); first += logitsWidth) {
         const size_t count = std::min<size_t>(logitsWidth, dump.records.size() - first);
-        evictAllCache(resources->cache());
+        if (!first || !logitsKeepCache)
+          evictAllCache(resources->cache());
         for (size_t offset = 0; offset < count; ++offset) {
           const auto [sequence, prefix] = dump.records[first + offset];
           EngineRequest request;
@@ -1505,6 +1675,9 @@ int main(int argc, char **argv) {
         }
         driver.untilIdle();
         for (size_t offset = 0; offset < count; ++offset) {
+          if (logitsKeepCache)
+            std::cerr << "backend-benchmark: logits record " << first + offset << " resumed from "
+                      << events.get(requestId + offset).matchedTokens << " cached tokens\n";
           const std::vector<float> row = events.takeOptionLogits(requestId + offset);
           if (row.size() != vocabulary.size())
             throw std::runtime_error("a score request returned no row of the vocabulary");
@@ -1599,7 +1772,7 @@ int main(int argc, char **argv) {
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
               << ",\"verify_rows\":" << model::ExecutionLimits::draftQueryRows
-              << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
+              << ",\"batch_width\":" << lanes
               << ",\"kv_block_tokens\":"
               << kv::kPageTokens
               << "},\"start_wait_ms\":" << startWaitMilliseconds
@@ -1621,7 +1794,8 @@ int main(int argc, char **argv) {
     }
     std::cout << "]},\"decode_throughput\":{\"prompt_tokens\":"
               << decodeThroughputPrompt.size()
-              << ",\"prompt_sha256\":\"" << decodeThroughputPromptSha256
+              << ",\"prompt_sha256\":\"" << tokensSha256(decodeThroughputPrompt)
+              << "\",\"prompt_source\":\"" << prompts.source
               << "\",\"output_tokens_per_lane\":64,\"samples\":[";
     for (size_t index = 0; index < decodeThroughput.size(); ++index) {
       if (index)

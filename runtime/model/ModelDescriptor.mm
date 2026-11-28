@@ -2,10 +2,13 @@
 #include "GgufImage.hpp"
 #include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
+#include "SafetensorsTarget.hpp"
+#include "VisionLoader.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
+#include "metal/abi/Vision.h"
 #include "ops/MoE.hpp"
 
 #import <Foundation/Foundation.h>
@@ -13,18 +16,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <fnmatch.h>
 #include <initializer_list>
-#include <iterator>
 #include <numeric>
 #include <optional>
-#include <regex>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <unordered_set>
 #include <utility>
 
 namespace splash::model {
@@ -101,13 +100,6 @@ std::string requireString(NSDictionary *object, NSString *key,
   return text;
 }
 
-// The text of a JSON string, which a lone surrogate escape leaves without one.
-std::string requireText(id value, std::string_view label) {
-  const char *text = [value isKindOfClass:[NSString class]] ? static_cast<NSString *>(value).UTF8String : nullptr;
-  if (!text) throw std::invalid_argument(std::string(label) + " must be a string");
-  return text;
-}
-
 // A value that is not the runtime's is refused naming its source, what the
 // model was installed from or the assembly's own record, beside the runtime:
 // "mismatch: safetensors 47, runtime 48".
@@ -179,24 +171,35 @@ void requireBooleans(NSDictionary *object, std::string_view where,
   }
 }
 
-// Each layer's type in a layer_types array: linear_attention for a GDN
-// layer; for an attention layer, sliding_attention where a window bounds it
-// (kv::Layout::windowed), else full_attention.
+// Each of `layers` layers' type in a layer_types array, the one
+// `expected(layer)` names, asked in layer order.
+template <class Expected>
+void requireLayerTypes(NSArray *types, uint32_t layers, Expected expected, std::string_view source,
+                       std::string_view label) {
+  if (types.count != layers)
+    throw std::invalid_argument(std::string(label) + " count mismatch: " + std::string(source) + " " +
+                                std::to_string(types.count) + ", runtime " + std::to_string(layers));
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+    NSString *type = expected(layer);
+    if (![types[layer] isEqual:type])
+      throw std::invalid_argument(std::string(label) + " " + std::to_string(layer) + " must be " + type.UTF8String);
+  }
+}
+
+// A target's: linear_attention for a GDN layer; for an attention layer,
+// sliding_attention where a window bounds it (kv::Layout::windowed), else
+// full_attention.
 void requireLayerTypes(NSArray *types, const QwenHybridLayout &target,
                        std::string_view source, std::string_view label) {
-  if (types.count != target.layers)
-    throw std::invalid_argument(std::string(label) + " count mismatch: " + std::string(source) +
-                                " " + std::to_string(types.count) + ", runtime " +
-                                std::to_string(target.layers));
-  for (uint32_t layer = 0, attention = 0; layer < target.layers; ++layer) {
-    NSString *expected = !target.isFullAttentionLayer(layer)       ? @"linear_attention"
-                         : target.kvLayout().windowed(attention++) ? @"sliding_attention"
-                                                                   : @"full_attention";
-    if (![types[layer] isEqual:expected])
-      throw std::invalid_argument(std::string(label) + " " +
-                                  std::to_string(layer) + " must be " +
-                                  expected.UTF8String);
-  }
+  uint32_t attention = 0;
+  requireLayerTypes(
+      types, target.layers,
+      [&](uint32_t layer) {
+        return !target.isFullAttentionLayer(layer)       ? @"linear_attention"
+               : target.kvLayout().windowed(attention++) ? @"sliding_attention"
+                                                         : @"full_attention";
+      },
+      source, label);
 }
 
 // Each family's native window, which its config's max_position_embeddings
@@ -217,12 +220,22 @@ std::string_view sourceName(TargetSource source) {
   return source == TargetSource::Safetensors ? "safetensors" : "GGUF";
 }
 
+// The model README.md's Models table lists for a family whose name is not
+// the family's, its fine-tune of the family's architecture.
+constexpr std::pair<std::string_view, std::string_view> kListedModels[]{
+    {"Qwen3.5-122B-A10B", "Ornith-1.5-122B"},
+};
+
 // The refusal of a model of none of the families Splash serves: what tells it
-// from the family its config's model type names, or that it names none.
+// from the family its config's model type names, or that it names none. Each
+// family is named, and after it the model the README lists for it where that
+// is another name, so a user finds the model they read of.
 std::invalid_argument unsupportedModel(const std::string &difference) {
   std::string supported;
   forEachFamily([&](const auto &layout) {
     supported += (supported.empty() ? "" : ", ") + std::string(layout.family);
+    for (const auto &[family, listed] : kListedModels)
+      if (family == layout.family) supported += " (" + std::string(listed) + ")";
   });
   return std::invalid_argument("no supported model has this architecture (" + difference + "); supported: " +
                                supported);
@@ -235,27 +248,45 @@ struct SizeDifference final {
   size_t matched;
   std::string difference;
 };
-std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
-                                             TargetSource source) {
-  const std::initializer_list<ExpectedNumber> sizes{
-      {"hidden_size", target.hiddenSize},
-      {"num_hidden_layers", target.layers},
-      {"vocab_size", target.vocabularySize},
-      {"max_position_embeddings", target.nativeContextTokens},
-      {"num_attention_heads", target.attentionQueryHeads},
-      {"num_key_value_heads", target.attentionKvHeads},
-      {"head_dim", target.attentionHeadDimension}};
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, std::string_view family, TargetSource source,
+                                             std::initializer_list<ExpectedNumber> sizes) {
   size_t matched = 0;
   for (const ExpectedNumber &size : sizes) {
     const std::string label = std::string("text config ") + size.key;
     NSNumber *value = requireNumber(text[@(size.key)], label);
     if (value.doubleValue != size.value)
       return SizeDifference{matched, label + ": " + std::string(sourceName(source)) + " " +
-                                         value.description.UTF8String + ", " + std::string(target.family) +
-                                         " " + @(size.value).description.UTF8String};
+                                         value.description.UTF8String + ", " + std::string(family) + " " +
+                                         @(size.value).description.UTF8String};
     ++matched;
   }
   return std::nullopt;
+}
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
+                                             TargetSource source) {
+  return sizeDifference(text, target.family, source,
+                        {{"hidden_size", target.hiddenSize},
+                         {"num_hidden_layers", target.layers},
+                         {"vocab_size", target.vocabularySize},
+                         {"max_position_embeddings", target.nativeContextTokens},
+                         {"num_attention_heads", target.attentionQueryHeads},
+                         {"num_key_value_heads", target.attentionKvHeads},
+                         {"head_dim", target.attentionHeadDimension}});
+}
+// Inkling-2-Mini's sizes: its weight layers, which its steps run more
+// applications of, and its own window (modelContextTokens, above the context
+// it is served at) at model_max_length, its release config's key, which the
+// config the installer derives states too.
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const Inkling2LoopLayout &target,
+                                             TargetSource source) {
+  return sizeDifference(text, target.family, source,
+                        {{"hidden_size", target.hiddenSize},
+                         {"num_hidden_layers", target.weightLayers},
+                         {"vocab_size", target.vocabularySize},
+                         {"model_max_length", target.modelContextTokens},
+                         {"num_attention_heads", target.attentionQueryHeads},
+                         {"num_key_value_heads", target.attentionKvHeads},
+                         {"head_dim", target.attentionHeadDimension}});
 }
 
 // The target's text configuration, of its family (describeSourceModel), whose
@@ -263,7 +294,8 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybri
 // holds the rest of what the kernels compute; a GGUF's is what the installer
 // derived from the GGUF's metadata, which the GGUF planner checks
 // (gguf::planImages).
-void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source) {
+void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source,
+                        bool statesAttentionGate = true) {
   const std::string_view name = sourceName(source);
   if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
   if (source != TargetSource::Safetensors) return;
@@ -287,8 +319,12 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
                    {{"intermediate_size", target.intermediateSize}});
   requireBooleans(text, "text config",
                   {{"attention_bias", false},
-                   {"attn_output_gate", true},
                    {"tie_word_embeddings", false}});
+  if (statesAttentionGate) requireBooleans(text, "text config", {{"attn_output_gate", true}});
+  // The gate of the GDN's gated norm, where a config names it.
+  if (text[@"output_gate_type"])
+    requireEqual(requireString(text, @"output_gate_type", "text config output_gate_type"),
+                 target.gdnSigmoidGate ? "sigmoid" : "swish", name, "text config output_gate_type");
   requireEqual(requireString(text, @"hidden_act", "text config hidden_act"),
                "silu", name, "text config hidden_act");
   requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"),
@@ -320,6 +356,36 @@ void requireWholes(NSArray *values, std::span<const uint32_t> expected, std::str
   };
   throw std::invalid_argument(label + " mismatch: " + std::string(source) + " " + text(found) + ", runtime " +
                               text(expected));
+}
+
+// Qwen3.8-Flash-Next's text configuration: the hybrid's (validateTextConfig
+// above) but attn_output_gate, which it leaves unstated (its attention is
+// gated: Qwen4ExpLayout's packedFullWidth), then, where a safetensors config
+// states them (a GGUF's metadata
+// does, which its planner checks), its hyper-connections, its QSA indexer
+// (its heads, head width, one key head, the tokens of a block and the tokens
+// its blocks select), its PLE n-gram embedding (n-grams, heads, convolution,
+// width, its layer by its 1-based id), and the end-of-sequence token its
+// hash reads (Qwen4ExpLayout::pleEosToken).
+void validateTextConfig(NSDictionary *text, const Qwen4ExpLayout &target, TargetSource source) {
+  validateTextConfig(text, static_cast<const QwenHybridLayout &>(target), source, false);
+  if (source != TargetSource::Safetensors) return;
+  requireNumbers(text, sourceName(source), "text config",
+                 {{"hc_count", target.hyperConnections},
+                  {"hc_lowrank", target.hyperRank},
+                  {"indexer_n_heads", target.indexerHeads},
+                  {"indexer_head_dim", target.indexerHeadDimension},
+                  {"indexer_kv_heads", 1},
+                  {"indexer_compress_ratio", target.indexerBlockTokens},
+                  {"indexer_budget", target.indexerTokens()},
+                  {"ngram_size", target.pleNgram},
+                  {"heads_per_ngram", target.pleHeadsPerNgram},
+                  {"ple_conv_kernel_size", target.pleConvolutionTaps},
+                  {"ple_embed_dim", target.pleWidth()},
+                  {"eos_token_id", target.pleEosToken}});
+  const std::array<uint32_t, 1> pleLayers{target.pleLayer + 1};
+  requireWholes(requireArray(text, @"ple_layer_ids", "text config ple_layer_ids"), pleLayers, sourceName(source),
+                "text config ple_layer_ids");
 }
 
 // The layers of `mask` among `layers`, a bit each, in order.
@@ -374,6 +440,72 @@ void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSou
     if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
 }
 
+// Inkling-2-Mini's text configuration, in its config.json's text_config (its
+// release's or an MLX conversion's, or the one the installer derives from its
+// GGUF, whose metadata its plan checks, ggufTargetPlan): the sizes
+// (sizeDifference), then the rest as the layout's values make them: its
+// tokens (unpadded_vocab_size), its window and sliding layers
+// (local_layer_ids), its loop (loop_config: its layers, passes and gate
+// rank, the same passes for every token), and the experts a token takes and
+// their width (intermediate_size). Where a config states them (the release's
+// states most, the derived one those its header holds), its sliding heads,
+// relative bias, clips, log scaling, value norm, convolutions, block
+// residual, softcaps, router bias and scale, shared experts (none), stop
+// token, RMS epsilon and bias-free attention; its clip and log-scaling alpha
+// are held as the layout's F32 values, the nearest F32 of the config's.
+void validateTextConfig(NSDictionary *text, const Inkling2LoopLayout &target, TargetSource source) {
+  const std::string_view name = sourceName(source);
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  requireNumbers(text, name, "text config",
+                 {{"unpadded_vocab_size", target.vocabularyTokens},
+                  {"sliding_window_size", target.slidingWindow},
+                  {"num_experts_per_tok", target.expertsPerToken},
+                  {"intermediate_size", target.expertIntermediateSize}});
+  std::vector<uint32_t> sliding;
+  for (uint32_t layer = 0; layer < target.weightLayers; ++layer)
+    if (target.slides(layer)) sliding.push_back(layer);
+  requireWholes(requireArray(text, @"local_layer_ids", "text config local_layer_ids"), sliding, name,
+                "text config local_layer_ids");
+  NSDictionary *loop = requireObject(text, @"loop_config", "text config loop_config");
+  requireNumbers(loop, name, "text config loop_config",
+                 {{"core_start", target.loopFirstLayer},
+                  {"core_end", target.loopEndLayer},
+                  {"num_passes", target.loopPasses},
+                  {"gate_rank", target.loopGateRank}});
+  if (loop[@"is_varloop"]) requireBooleans(loop, "text config loop_config", {{"is_varloop", false}});
+  for (const ExpectedNumber &stated : {ExpectedNumber{"swa_head_dim", target.attentionHeadDimension},
+                                       ExpectedNumber{"swa_num_attention_heads", target.attentionQueryHeads},
+                                       ExpectedNumber{"swa_num_key_value_heads", target.attentionKvHeads},
+                                       ExpectedNumber{"d_rel", target.relativeRank},
+                                       ExpectedNumber{"rel_extent", target.relativeExtent},
+                                       ExpectedNumber{"rel_l2_clip_threshold", target.relativeClip},
+                                       ExpectedNumber{"log_scaling_n_floor", target.logScalingFloor},
+                                       ExpectedNumber{"sconv_kernel_size", target.convolutionTaps},
+                                       ExpectedNumber{"n_layers_per_attn_res_block", target.blockResidualPeriod},
+                                       ExpectedNumber{"mlp_gate_softcap", target.expertGateSoftcap},
+                                       ExpectedNumber{"mlp_up_softcap", target.expertUpSoftcap},
+                                       ExpectedNumber{"final_logit_softcapping", target.logitSoftcap},
+                                       ExpectedNumber{"route_scale", target.expertRoutedScale},
+                                       ExpectedNumber{"n_shared_experts", target.sharedExpertSlices},
+                                       ExpectedNumber{"eos_token_id", target.stopTokens.ids[0]},
+                                       ExpectedNumber{"rms_norm_eps", SPLASH_RMS_EPSILON}})
+    if (text[@(stated.key)]) requireNumbers(text, name, "text config", {stated});
+  for (const auto &[key, expected] : {std::pair{"qk_l2_clip_threshold", target.queryClip},
+                                      std::pair{"log_scaling_alpha", target.logScalingAlpha}}) {
+    if (!text[@(key)]) continue;
+    const std::string label = std::string("text config ") + key;
+    NSNumber *number = requireNumber(text[@(key)], label);
+    if (number.floatValue != expected)
+      throw std::invalid_argument(label + " mismatch: " + std::string(name) + " " + number.description.UTF8String +
+                                  ", runtime " + @(expected).description.UTF8String);
+  }
+  for (const auto &[key, expected] : {std::pair{"use_value_norm_no_gamma", true},
+                                      std::pair{"attn_res_normalize_values", true},
+                                      std::pair{"use_gate_bias", true}, std::pair{"q_bias", false},
+                                      std::pair{"o_bias", false}})
+    if (text[@(key)]) requireBooleans(text, "text config", {{key, expected}});
+}
+
 // The mask token a DFlash2 draft of a family whose drafts choose theirs
 // names (dflash_config.mask_token_id), which must be one of the target's
 // reserved tokens; readDraftLayout then holds the draft to it.
@@ -420,16 +552,14 @@ uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
 // (metal/abi/QuantFormat.h), as MLX loads it: an entry's mode is MLX's default,
 // affine, unless it names another. The object states its bits and group size; a
 // module's entry that omits either takes its mode's default, as MLX's
-// to_quantized does: affine 4 bits in groups of 64, mxfp4 4 bits in groups of
-// 32, nvfp4 4 bits in groups of 16. The images read each module's format from
-// its tensors, as MLX does (model/SafetensorsImage.hpp). An entry that is not
-// an object, false as MLX writes for a module it leaves unquantized, is refused
-// for a module the images read only quantized (safetensors::quantizedModules:
-// each projection and the head), so before any weight download; any other
-// module's, such as the router's, the shared-expert gate's, GDN alpha's and
-// beta's or the token table's, which the images read unquantized too, is
-// accepted.
-void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry) {
+// to_quantized does: affine 4 bits in groups of 64, mxfp4 4 bits and mxfp8 8
+// bits in groups of 32, nvfp4 4 bits in groups of 16. The images read each
+// module's format from its tensors, as MLX does (model/SafetensorsImage.hpp).
+// An entry that is not an object, false as MLX writes for a module it leaves
+// unquantized, names nothing to check: the images load such a projection as
+// Q8_0 (as stored under --weights original, gguf::float16Planes) and any
+// other module as they read it unquantized.
+void requireMlxQuantization(NSDictionary *quantization) {
   const auto require = [](NSDictionary *entry, const std::string &label, bool module) {
     NSString *mode = entry[@"mode"] ?: @"affine";
     if (![mode isKindOfClass:[NSString class]]) throw std::invalid_argument(label + " mode must be a string");
@@ -437,7 +567,8 @@ void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensio
     const auto number = [&](NSString *key, uint32_t modeDefault) {
       return module && !entry[key] ? modeDefault : requireWhole(entry[key], label + " " + key.UTF8String);
     };
-    const uint32_t bits = number(@"bits", 4), group = number(@"group_size", affine ? 64 : nvfp4 ? 16 : 32);
+    const uint32_t bits = number(@"bits", [mode isEqual:@"mxfp8"] ? 8 : 4),
+                   group = number(@"group_size", affine ? 64 : nvfp4 ? 16 : 32);
     if (safetensors::mlxFormat(mode.UTF8String ?: "", bits, group) == GGUF_FMT_COUNT)
       throw std::invalid_argument(label + " is " + mode.UTF8String + " " + std::to_string(bits) +
                                   "-bit in groups of " + std::to_string(group) + "; MLX weights load as " +
@@ -449,40 +580,17 @@ void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensio
   for (NSString *module in quantization)
     if ([quantization[module] isKindOfClass:[NSDictionary class]])
       require(quantization[module], "quantization " + std::string(module.UTF8String ?: ""), true);
-  for (const std::string &module : safetensors::quantizedModules(geometry, safetensors::ModuleNames::Mlx)) {
-    id entry = quantization[@(module.c_str())];
-    if (entry && ![entry isKindOfClass:[NSDictionary class]])
-      throw std::invalid_argument("quantization " + module +
-                                  " is unquantized; Splash loads quantized MLX projections");
-  }
-}
-
-// The projections a configuration names for a layer's routed experts
-// (safetensors::quantizedModules' mlp.experts by transformers names) as each
-// expert's own modules: the first and the last expert's stand for every
-// expert's, as matching all names of 256 experts in 40 layers takes half a
-// second, and the images refuse any other expert left unquantized when they
-// read its tensors.
-std::vector<std::string> expertProjections(const std::string &experts, const QwenTargetDimensions &geometry) {
-  std::vector<std::string> names;
-  for (const uint32_t expert : {0u, geometry.experts - 1})
-    for (const char *projection : {"gate_proj", "up_proj", "down_proj"})
-      names.push_back(experts + "." + std::to_string(expert) + "." + projection);
-  return names;
 }
 
 // A Model Optimizer target's quantization, its config.json's
 // quantization_config of quant_method "modelopt": each layer it quantizes, by
-// its quantized_layers or else by its quant_algo for every layer its ignore
-// patterns leave, holds NVFP4 in groups of 16 (NVFP4, W4A16_NVFP4) or FP8 with
-// a scale per tensor (FP8), which the block kernels read weights-only, and each
-// module the images read only quantized (safetensors::quantizedModules by
-// transformers names, a layer's routed experts as the one layer mlp.experts, as
-// quantized_layers keys them) is such a layer: a key of quantized_layers, or
-// else a module no ignore pattern names, nor its experts' projections
-// (expertProjections). Its activation and KV cache quantization play no part:
-// the kernels read activations in bf16 and keep Splash's own KV formats.
-void requireModelOptimizerQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry) {
+// its quantized_layers or else by its quant_algo, holds NVFP4 in groups of 16
+// (NVFP4, W4A16_NVFP4) or FP8 with a scale per tensor (FP8), which the block
+// kernels read weights-only; a projection it leaves unquantized loads as Q8_0
+// or as stored, as --weights says (model/SafetensorsImage.hpp). Its activation and KV cache quantization play
+// no part: the kernels read activations in bf16 and keep Splash's own KV
+// formats.
+void requireModelOptimizerQuantization(NSDictionary *quantization) {
   const auto requireAlgorithm = [](NSDictionary *entry, const std::string &label) {
     const std::string algorithm = requireString(entry, @"quant_algo", label + " quant_algo");
     if (algorithm == "FP8") return;
@@ -494,103 +602,29 @@ void requireModelOptimizerQuantization(NSDictionary *quantization, const QwenTar
                                   std::to_string(requireWhole(entry[@"group_size"], label + " group_size")) +
                                   "; Model Optimizer NVFP4 loads in groups of 16");
   };
-  const std::vector<std::string> required =
-      safetensors::quantizedModules(geometry, safetensors::ModuleNames::Transformers);
   NSDictionary *layers = quantization[@"quantized_layers"];
-  if ([layers isKindOfClass:[NSDictionary class]]) {
-    for (NSString *module in layers) {
-      const std::string label = "quantization_config quantized_layers " + std::string(module.UTF8String ?: "");
-      if (![layers[module] isKindOfClass:[NSDictionary class]])
-        throw std::invalid_argument(label + " must be an object");
-      requireAlgorithm(layers[module], label);
-    }
-    for (const std::string &module : required)
-      if (!layers[@(module.c_str())])
-        throw std::invalid_argument("quantization_config leaves " + module +
-                                    " unquantized; Splash loads quantized projections");
-    return;
-  }
-  requireAlgorithm(quantization, "quantization_config");
-  NSArray *ignore = quantization[@"ignore"] ?: quantization[@"exclude_modules"];
-  if (ignore && ![ignore isKindOfClass:[NSArray class]])
-    throw std::invalid_argument("quantization_config ignore must be an array");
-  for (id entry in ignore) {
-    const std::string pattern = requireText(entry, "quantization_config ignore entry");
-    for (const std::string &module : required) {
-      std::vector<std::string> names{module};
-      if (module.ends_with(".experts"))
-        std::ranges::copy(expertProjections(module, geometry), std::back_inserter(names));
-      for (const std::string &name : names)
-        if (!fnmatch(pattern.c_str(), name.c_str(), 0))
-          throw std::invalid_argument("quantization_config leaves " + name +
-                                      " unquantized; Splash loads quantized projections");
-    }
+  if (![layers isKindOfClass:[NSDictionary class]]) return requireAlgorithm(quantization, "quantization_config");
+  for (NSString *module in layers) {
+    const std::string label = "quantization_config quantized_layers " + std::string(module.UTF8String ?: "");
+    if (![layers[module] isKindOfClass:[NSDictionary class]]) throw std::invalid_argument(label + " must be an object");
+    requireAlgorithm(layers[module], label);
   }
 }
-
-// The modules compressed-tensors names by a configuration's targets and
-// ignore entries: a module's own name, a regular expression after "re:"
-// matched from the start of a name (as Python's re.match), or a class, of
-// which Linear is every projection's. A pattern is bounded, as parsing it
-// recurses on its nesting, and so is a match (libc++ throws error_complexity
-// past its step bound), so no configuration exhausts the check.
-class ModuleMatcher {
-public:
-  static constexpr size_t kMaxPatternBytes = 512;
-
-  ModuleMatcher(NSArray *entries, std::string label) : label_(std::move(label)) {
-    for (id entry in entries) {
-      const std::string text = requireText(entry, label_ + " entry");
-      if (text == "Linear") {
-        linear_ = true;
-      } else if (text.starts_with("re:")) {
-        if (text.size() > kMaxPatternBytes)
-          throw std::invalid_argument(label_ + " entry exceeds " + std::to_string(kMaxPatternBytes) + " bytes");
-        try {
-          patterns_.emplace_back(text.substr(3));
-        } catch (const std::regex_error &) {
-          throw std::invalid_argument(label_ + " entry " + text + " is not a regular expression Splash reads");
-        }
-      } else {
-        names_.insert(text);
-      }
-    }
-  }
-  [[nodiscard]] bool matches(const std::string &module) const {
-    if (linear_ || names_.contains(module)) return true;
-    try {
-      return std::ranges::any_of(patterns_, [&](const std::regex &pattern) {
-        return std::regex_search(module, pattern, std::regex_constants::match_continuous);
-      });
-    } catch (const std::regex_error &) {
-      throw std::invalid_argument(label_ + " holds a regular expression too complex to match " + module);
-    }
-  }
-
-private:
-  std::string label_;
-  bool linear_ = false;
-  std::unordered_set<std::string> names_;
-  std::vector<std::regex> patterns_;
-};
 
 // A compressed-tensors target's quantization, its config.json's
 // quantization_config of quant_method "compressed-tensors" (llm-compressor's,
 // as unsloth's NVFP4 releases are): each config group's weights are NVFP4
 // (nvfp4-pack-quantized: float 4-bit by tensor_group in groups of 16) or FP8
 // (float-quantized: float 8-bit by channel or tensor), symmetric and in their
-// stored column order, and each module the images read only quantized
-// (safetensors::quantizedModules by transformers names, the routed experts by
-// their projections, expertProjections) is a group's target that no ignore
-// entry names (ModuleMatcher). Its activation and KV cache schemes play no
+// stored column order; a projection no group quantizes loads as Q8_0 or as
+// stored, as --weights says (model/SafetensorsImage.hpp). Its activation and KV cache schemes play no
 // part.
-void requireCompressedTensorsQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry) {
+void requireCompressedTensorsQuantization(NSDictionary *quantization) {
   NSDictionary *groups = quantization[@"config_groups"];
   if (![groups isKindOfClass:[NSDictionary class]] || !groups.count)
     throw std::invalid_argument("quantization_config config_groups must be a non-empty object");
   const std::string format =
       quantization[@"format"] ? requireString(quantization, @"format", "quantization_config format") : "";
-  std::vector<ModuleMatcher> targets;
   for (NSString *name in groups) {
     const std::string label = "quantization_config config_groups " + std::string(name.UTF8String ?: "");
     NSDictionary *group = groups[name], *weights = nil;
@@ -618,20 +652,6 @@ void requireCompressedTensorsQuantization(NSDictionary *quantization, const Qwen
         [weights[@"actorder"] isEqual:@YES])
       throw std::invalid_argument(label + " is asymmetric or ordered by activation groups; Splash loads symmetric "
                                   "compressed-tensors weights in their stored column order");
-    targets.emplace_back(requireArray(group, @"targets", label + " targets"), label + " targets");
-  }
-  NSArray *ignoreEntries = quantization[@"ignore"] ?: @[];
-  if (![ignoreEntries isKindOfClass:[NSArray class]])
-    throw std::invalid_argument("quantization_config ignore must be an array");
-  const ModuleMatcher ignore(ignoreEntries, "quantization_config ignore");
-  for (const std::string &module : safetensors::quantizedModules(geometry, safetensors::ModuleNames::Transformers)) {
-    const std::vector<std::string> names =
-        module.ends_with(".experts") ? expertProjections(module, geometry) : std::vector<std::string>{module};
-    for (const std::string &name : names)
-      if (ignore.matches(name) ||
-          std::ranges::none_of(targets, [&](const ModuleMatcher &target) { return target.matches(name); }))
-        throw std::invalid_argument("quantization_config leaves " + name +
-                                    " unquantized; Splash loads quantized projections");
   }
 }
 
@@ -639,15 +659,14 @@ void requireCompressedTensorsQuantization(NSDictionary *quantization, const Qwen
 // quantization_config of Model Optimizer or compressed-tensors. A checkpoint
 // with none of them holds BF16 weights, or another method's that a
 // transformers quantization_config states (GPTQ, AWQ, ...).
-void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geometry) {
+void requireQuantization(NSDictionary *config) {
   NSDictionary *mlxQuantization = config[@"quantization"];
-  if ([mlxQuantization isKindOfClass:[NSDictionary class]]) return requireMlxQuantization(mlxQuantization, geometry);
+  if ([mlxQuantization isKindOfClass:[NSDictionary class]]) return requireMlxQuantization(mlxQuantization);
   NSDictionary *quantization = config[@"quantization_config"];
   if ([quantization isKindOfClass:[NSDictionary class]]) {
-    if ([quantization[@"quant_method"] isEqual:@"modelopt"])
-      return requireModelOptimizerQuantization(quantization, geometry);
+    if ([quantization[@"quant_method"] isEqual:@"modelopt"]) return requireModelOptimizerQuantization(quantization);
     if ([quantization[@"quant_method"] isEqual:@"compressed-tensors"])
-      return requireCompressedTensorsQuantization(quantization, geometry);
+      return requireCompressedTensorsQuantization(quantization);
   }
   throw std::invalid_argument("this model requires an MLX checkpoint (" + std::string(safetensors::kMlxAffineFormats) +
                               ", " + std::string(safetensors::kMlxFloatFormats) +
@@ -657,10 +676,16 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
 
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
 // window, convolutions and selector must be those the draft kernels are built
-// for, and its block at least their rows; its hidden size, vocabulary and
-// mask token the target's; and the target layers it reads (target_layer_ids)
-// some of the target's, ascending. Its layers, intermediate size and rotary
-// base are its own.
+// for, and its block at least their rows; its hidden size, vocabulary, mask
+// token, the finish of its logits and how it reads its target the target's;
+// and the target layers it reads (target_layer_ids) some of the target's,
+// ascending. Its layers, intermediate size and rotary base are its own. The
+// target's values that say how it reads its target (num_target_layers,
+// target_hidden_reduction, embedding_normalization, capture_final_norm) and
+// the target's tokens (valid_vocab_size) it states or leaves to its target,
+// as Inkling-2-Mini-DFlash2's release leaves three of them to its serving
+// adapter: a config without one takes its target's, and one that states
+// another is refused.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
@@ -679,6 +704,12 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {{"is_causal", false},
                    {"attention_bias", false},
                    {"tie_word_embeddings", false}});
+  // The count of target layers its ids number, where its config states it
+  // (num_target_layers): its target's, so that its ids name the target's
+  // layers (a draft numbered by another count, such as Inkling 2's weight
+  // layers beside its 48 applications, would read other rows).
+  if (draft[@"num_target_layers"])
+    requireNumbers(draft, "checkpoint", "draft config", {{"num_target_layers", target.layers}});
   requireEqual(requireString(draft, @"hidden_act", "draft config hidden_act"),
                "silu", "checkpoint", "draft config hidden_act");
   NSDictionary *rope =
@@ -694,6 +725,11 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", target.maskToken}});
+  // Scales the draft kernels do not take, 1 where a config states them: its
+  // logits' multiplier before any softcap (output_multiplier) and its token
+  // rows' scale (input_embedding_scale).
+  for (const char *scale : {"output_multiplier", "input_embedding_scale"})
+    if (flash[@(scale)]) requireNumbers(flash, "checkpoint", "draft config dflash_config", {{scale, 1.0}});
   // The block it was trained to fill: the kernels' rows or more, of which a
   // cycle drafts the first (Ornith-1.5-122B's fills 16). Its weights have no
   // part of the block's length.
@@ -710,28 +746,114 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   if (flash[@"target_hidden_reduction"])
     requireEqual(requireString(flash, @"target_hidden_reduction", "draft config target_hidden_reduction"),
                  reduction, "checkpoint", "draft config dflash_config target_hidden_reduction");
+  // Its rows of its own tokens as they were made (embedding_normalization):
+  // the token table's rows through their norm where its target's first layer
+  // reads them so (QwenTargetDimensions::draftEmbeddingNorm), else as stored.
+  if (flash[@"embedding_normalization"])
+    requireEqual(requireString(flash, @"embedding_normalization", "draft config embedding_normalization"),
+                 target.draftEmbeddingNorm ? "folded_rmsnorm" : "none", "checkpoint",
+                 "draft config dflash_config embedding_normalization");
+  // Its head's finish, its target's (QwenTargetDimensions::logitSoftcap and
+  // vocabularyTokens): the softcap, which its selector's scores take after
+  // their edges (selector_softcap_mode after_correction, the one placement
+  // the selector runs), stated where its target has one; and its tokens
+  // (valid_vocab_size).
+  if (target.logitSoftcap != 0.0F || flash[@"final_logit_softcapping"]) {
+    requireNumbers(flash, "checkpoint", "draft config dflash_config",
+                   {{"final_logit_softcapping", target.logitSoftcap}});
+    requireEqual(requireString(flash, @"selector_softcap_mode", "draft config selector_softcap_mode"),
+                 "after_correction", "checkpoint", "draft config dflash_config selector_softcap_mode");
+  }
+  if (flash[@"valid_vocab_size"])
+    requireNumbers(flash, "checkpoint", "draft config dflash_config", {{"valid_vocab_size", target.tokens()}});
+  // The ids of the rows it reads (QwenTargetDimensions::draftReadsLayerInputs):
+  // a target layer's output rows, or the rows passed into a layer, the id
+  // past the target's layers its final norm's rows, whether it reads them
+  // (capture_final_norm).
   NSArray *ids = requireArray(flash, @"target_layer_ids", "draft config target_layer_ids");
   std::vector<uint32_t> targetLayers;
   for (id value : ids) {
     targetLayers.push_back(
         requireWhole(value, "draft config target_layer_ids " + std::to_string(targetLayers.size())));
-    if (targetLayers.back() >= target.layers)
+    if (targetLayers.back() >= target.draftReadableLayers())
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
+  const bool finalNorm = !targetLayers.empty() && targetLayers.back() == target.layers;
+  if (flash[@"capture_final_norm"])
+    requireBooleans(flash, "draft config dflash_config", {{"capture_final_norm", finalNorm}});
   const DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
                   targetLayers);
+  // Every layer slides (layer_types), as the draft kernels attend each
+  // layer's window (sliding_window) alone: a full layer read as sliding
+  // drafts from keys it was not trained on, and decodes slower.
+  requireLayerTypes(requireArray(draft, @"layer_types", "draft config layer_types"), layout.layers,
+                    [](uint32_t) { return @"sliding_attention"; }, "checkpoint", "draft config layer_types");
   return layout;
 }
 
 // The vision tower's config, config.json's vision_config, which the
 // installer derives from a GGUF's mmproj too: the tower the layout describes,
-// over RGB patches of two frames, without deepstack layers.
+// a Qwen tower over RGB patches of two frames, without deepstack layers; or
+// Inkling's (inkling2_vision, in transformers' names as its config.json
+// states them: its patches' side and merge as native_patch_size and
+// adapter_merge_size or patch_size and spatial_merge_size, its MLP as a
+// ratio of its width), over RGB patches of one frame into a projector
+// without biases, of the exact GELU transformers' default activation is.
 void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                           TargetSource source) {
+  if (layout.tower == ops::VisionTower::Inkling) {
+    // Its model type and the width it projects into, its text model's, where
+    // it states them: a vision config that names neither is its checkpoint's
+    // tower, as a text_config that names no model type is its checkpoint's
+    // text model (describeSourceModel; ddalcu/Inkling-2-Mini-MLX-8bit's).
+    if (vision[@"model_type"])
+      requireEqual(requireString(vision, @"model_type", "vision config model_type"), "inkling2_vision",
+                   sourceName(source), "vision config model_type");
+    if (vision[@"text_hidden_size"])
+      requireNumbers(vision, sourceName(source), "vision config", {{"text_hidden_size", layout.outputHiddenSize}});
+    requireNumbers(vision, sourceName(source), "vision config",
+                   {{"num_hidden_layers", layout.depth},
+                    {"hidden_size", layout.hiddenSize},
+                    {"num_attention_heads", layout.heads},
+                    {"mlp_ratio", double(layout.intermediateSize) / layout.hiddenSize},
+                    {"projection_hidden_dim", layout.mergedHiddenSize},
+                    {"posemb_grid_size", layout.positionGridSide},
+                    {"layer_norm_eps", SPLASH_INKLING_VISION_NORM_EPSILON}});
+    // Its patches' side and merge, which transformers stores as patch_size
+    // and spatial_merge_size, the release's names its aliases: either, or
+    // both alike.
+    struct Spelling final {
+      const char *release, *stored;
+      uint32_t value;
+    };
+    for (const Spelling &size : {Spelling{"native_patch_size", "patch_size", layout.patchSize},
+                                 Spelling{"adapter_merge_size", "spatial_merge_size", layout.spatialMerge}}) {
+      if (vision[@(size.stored)])
+        requireNumbers(vision, sourceName(source), "vision config", {{size.stored, size.value}});
+      if (vision[@(size.release)] || !vision[@(size.stored)])
+        requireNumbers(vision, sourceName(source), "vision config", {{size.release, size.value}});
+    }
+    requireBooleans(vision, "vision config", {{"projector_bias", false}});
+    if (vision[@"hidden_act"])
+      requireEqual(requireString(vision, @"hidden_act", "vision config hidden_act"), "gelu", sourceName(source),
+                   "vision config hidden_act");
+    // Its RoPE, axial over the encoder's base, which a config states only to
+    // set transformers' defaults.
+    if (vision[@"rope_parameters"]) {
+      NSDictionary *rope = requireObject(vision, @"rope_parameters", "vision config rope_parameters");
+      if (rope[@"rope_type"])
+        requireEqual(requireString(rope, @"rope_type", "vision config rope_type"), "axial", sourceName(source),
+                     "vision config rope_type");
+      if (rope[@"rope_theta"])
+        requireNumbers(rope, sourceName(source), "vision config rope_parameters",
+                       {{"rope_theta", SPLASH_INKLING_VISION_ROPE_THETA}});
+    }
+    return;
+  }
   requireNumbers(vision, sourceName(source), "vision config",
                  {{"depth", layout.depth},
                   {"hidden_size", layout.hiddenSize},
@@ -766,7 +888,13 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   });
   NSDictionary *text = flat ? config : config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
-  const auto type = requireString(text, @"model_type", "text model type");
+  // A text_config that names no model type is its checkpoint's text model,
+  // whose type is the one its config names with _text after it, as every
+  // family's checkpoints name theirs (inkling2_loop_text of inkling2_loop;
+  // ddalcu/Inkling-2-Mini-MLX-8bit's text_config names none, and
+  // install/gguf.py names a GGUF's checkpoint by the same rule).
+  const std::string type = text[@"model_type"] ? requireString(text, @"model_type", "text model type")
+                                               : requireString(config, @"model_type", "model type") + "_text";
   TargetSource targetSource;
   // "mlx-affine" names every safetensors target, as installations record it.
   if (targetFormat == "mlx-affine") targetSource = TargetSource::Safetensors;
@@ -794,19 +922,18 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   // holds its draft's.
   DFlashDraftLayout dflashLayout;
   std::visit([&](auto &layout) {
-    if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
-      throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
     validateTextConfig(text, layout, targetSource);
-    if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
+    if (targetSource == TargetSource::Safetensors) requireQuantization(config);
     if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)
       layout.experts = ggufRoutedExperts(text, layout);
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
-  ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
-                                               {.outputHiddenSize = std::visit(
-                                                    [](const auto &layout) { return layout.hiddenSize; }, *target)},
-                                               targetSource, visionSource);
+  // The family's tower, projecting into its text model's width.
+  const ops::VisionLayout vision = std::visit(
+      [](const auto &layout) { return ops::visionLayout(layout.visionTower, layout.hiddenSize); }, *target);
+  ModelDescriptor result =
+      makeModelDescriptor(std::move(name), *target, dflashLayout, vision, targetSource, visionSource);
   if (result.hasVision())
     validateVisionConfig(requireObject(config, @"vision_config", "vision config"), result.vision,
                          result.targetSource);
@@ -842,7 +969,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   std::visit(
       [&](const auto &layout) {
         result.capabilities = {layout.vocabularySize,
-                               layout.nativeContextTokens, sparseKvShape(layout)};
+                               layout.nativeContextTokens, sparseKvShape(layout), vision.patchSize};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -871,9 +998,11 @@ bool ModelDescriptor::valid() const noexcept {
                  capabilities.maximumContextTokens <= layout.yarnContextTokens)) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
+               vision.tower == layout.visionTower && vision.outputHiddenSize == layout.hiddenSize &&
+               capabilities.imagePatchPixels == vision.patchSize &&
                layout.hiddenSize == draft.hiddenSize &&
                draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+               draft.targetLayers[draft.targetLayerCount - 1] < layout.draftReadableLayers() &&
                // A family whose drafts choose the mask token holds its draft's.
                (!layout.draftChoosesMaskToken() ||
                 (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
@@ -912,7 +1041,8 @@ std::vector<FamilyFacts> familyFacts() {
                      .sparseKv = sparseKvShape(layout).has_value(),
                      .denseFfn = layout.ffnKind == QwenFfnKind::Dense,
                      .contextTokens = layout.nativeContextTokens,
-                     .maximumContextTokens = layout.maximumContextTokens()});
+                     .maximumContextTokens = layout.maximumContextTokens(),
+                     .activations = layout.activations == ops::Int8Activations::On ? "auto" : "bf16"});
   });
   return facts;
 }
@@ -939,23 +1069,53 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
 
 std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                                             const std::filesystem::path &config,
-                                            const std::optional<std::filesystem::path> &ggufHeaders,
-                                            const std::optional<std::filesystem::path> &draft) {
+                                            const std::optional<std::filesystem::path> &targetHeaders,
+                                            const std::optional<std::filesystem::path> &draft,
+                                            std::optional<bool> *quantizableWeights) {
   @autoreleasepool {
     NSDictionary *target = readObject(config, "upstream model config");
     NSDictionary *checkpoint = draft ? readObject(*draft, "draft config") : nil;
     // Unnamed: the record names an installation, which this precedes.
     const ModelDescriptor descriptor = describeSourceModel({}, targetFormat, visionFormat, target, checkpoint);
     if (descriptor.targetSource == TargetSource::Gguf) {
-      if (!ggufHeaders) throw std::invalid_argument("a GGUF target is checked with its headers");
-      const OpenGguf headers(findTargetGgufs(*ggufHeaders), GgufContents::Headers);
+      if (!targetHeaders) throw std::invalid_argument("a GGUF target is checked with its headers");
+      const OpenGguf headers(findTargetGgufs(*targetHeaders), GgufContents::Headers);
       std::visit(
           [&](const auto &layout) {
-            static_cast<void>(gguf::planImages(headers.file(), layout.ggufArchitecture, layout));
+            const auto formats = [&](gguf::Float16Weights weights) {
+              std::vector<std::string> result;
+              for (const gguf::Image &image : ggufTargetPlan(layout).images(headers.file(), {.weights = weights}))
+                result.push_back(gguf::imageFormats(image));
+              return result;
+            };
+            const bool differ = formats(gguf::Float16Weights::Q8_0) != formats(gguf::Float16Weights::Published);
+            if (quantizableWeights) *quantizableWeights = differ;
           },
           descriptor.target);
+    } else if (targetHeaders && quantizableWeights) {
+      // A checkpoint whose headers do not plan is refused when it loads, not
+      // here: what --weights auto does to it stays unsaid.
+      try {
+        const SafetensorsCheckpoint checkpoint(*targetHeaders);
+        *quantizableWeights = std::visit(
+            [&](const auto &layout) { return weightsAutoChanges(safetensorsTargetPlan(layout), checkpoint); },
+            descriptor.target);
+      } catch (const std::exception &) {
+        quantizableWeights->reset();
+      }
     }
     return descriptor.family();
+  }
+}
+
+void checkVisionSource(std::string_view targetFormat, std::string_view visionFormat,
+                       const std::filesystem::path &config, const std::filesystem::path &root) {
+  @autoreleasepool {
+    const ModelDescriptor descriptor =
+        describeSourceModel({}, targetFormat, visionFormat, readObject(config, "upstream model config"), nil);
+    if (descriptor.visionSource != VisionSource::Safetensors && descriptor.visionSource != VisionSource::Gguf)
+      throw std::invalid_argument("a vision check needs a vision source");
+    VisionLoader(root / "vision", descriptor.visionSource, descriptor.vision).check();
   }
 }
 

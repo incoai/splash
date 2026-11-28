@@ -67,7 +67,7 @@ WeightFile::WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
                        std::string relativePath, std::string_view expectedMagic,
                        uint32_t expectedLayer, uint32_t expectedType,
                        uint64_t declaredBytes, std::string contentIdentity,
-                       std::shared_ptr<const std::vector<gguf::Fill>> planned)
+                       std::shared_ptr<const std::vector<gguf::Fill>> planned, std::string formats)
     : impl_(std::make_unique<Impl>()) {
     impl_->base = std::move(image);
     impl_->planned = std::move(planned);
@@ -76,7 +76,7 @@ WeightFile::WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
     checkWeightHeader(header, impl_->base.sizeBytes(), expectedMagic, expectedLayer, expectedType, relativePath);
     impl_->backend = &backend;
     impl_->record = {std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
-                     declaredBytes, std::move(contentIdentity)};
+                     declaredBytes, std::move(contentIdentity), std::move(formats)};
 }
 
 WeightFile::WeightFile(WeightFile &&) noexcept = default;
@@ -217,11 +217,14 @@ std::string weightManifestFingerprint(
                   return left.relativePath < right.relativePath;
               });
     std::ostringstream canonical;
-    canonical << "splash-packed-manifest-v1\n";
+    // v2 names each image's loaded formats, so a build that loads a source in
+    // other formats than another never shares its persistent cache.
+    canonical << "splash-packed-manifest-v2\n";
     for (const WeightFileRecord &record : sorted) {
         canonical << record.relativePath << '\t' << record.declaredBytes
                   << '\t' << record.magic << '\t' << record.layer << '\t'
-                  << record.type << '\t' << record.contentIdentity << '\n';
+                  << record.type << '\t' << record.contentIdentity << '\t'
+                  << weightDigest(record.formats) << '\n';
     }
     return weightDigest(canonical.str());
 }

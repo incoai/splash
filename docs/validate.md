@@ -8,12 +8,17 @@ make install test-real test-http-real MODEL=mlx-community/Qwen3.8-27B-4bit
 `make check` needs no model weights, but it runs the Metal tests, so it needs a
 Mac that Splash supports: it runs the source checks, `check-native-cpu`,
 `check-native-metal`, `check-native-build`, the Python checks and `check-app`,
-the desktop app's tests (`swift test --package-path app`). `make
+the desktop app's tests (`swift test --package-path app --no-parallel`), one
+at a time, as a test that pumps the main thread holds every other main-actor
+test and the app's own tasks until it returns. `make
 check-native-cpu` builds production and runs native CPU tests without a GPU;
 `make check-native-metal` requires a supported Metal device and runs the kernel
 tests under shader validation, and the Linear pipeline resource check without
 it, then `test-sanitizers-metal`. They include loading small synthetic MLX,
-GGUF and vision sources and the GGUF kernels on synthetic tensors. `make
+GGUF and vision sources and the GGUF kernels on synthetic tensors. On macOS
+27.2.1 run `gguf-projection` under shader validation alone, or with
+`MTL_SHADER_VALIDATION_GLOBAL_MEMORY=0`: validation with several GPU processes
+at once corrupts the int8 prefill tile's registers there. `make
 check-native-build` builds every native test, benchmark and tool and runs
 none. Hosted CI runs the CPU checks, `check-native-build` and `check-app` in
 one job and `test-sanitizers` in another beside it. `make test-sanitizers`
@@ -45,14 +50,14 @@ Makefiles and the real-model harnesses).
 The real-model targets run against an installation in this checkout's
 `install/models`: run `make install` with the same options first, or in the
 same command, as above. They take `MODEL` exactly as `splash serve --model`
-does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
-`--draft-model` and `--language-only`:
+does, and `REVISION`, `DRAFT_MODEL`, `DRAFT_REVISION` and `LANGUAGE_ONLY=1` as
+its `--revision`, `--draft-model`, `--draft-revision` and `--language-only`:
 
 | Target | Runs |
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
-| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window, sizes that a `--spill-tokens` in `ORACLE_ARGS` replaces in all three (on a 24 GB Mac, `ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M"`; below) |
-| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](server.md#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
+| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, twice: under shader validation, which compares no embedding digests, and without it, which compares the fixture's pinned digests too; and the native model runtime oracle, its three runs, a fourth on a runtime of eight lanes (`--lanes 8`) and its sibling check on eight lanes (`--siblings-only`: a branched lane's path against the same step with its tree's other rows replaced, every expert tile on the staged tile), each with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target the spill checks of all but the sibling check take the default prompts, two staging buffers, and 32K tokens with the default window, sizes that a `--spill-tokens` in `ORACLE_ARGS` replaces in each (on a 24 GB Mac, `ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M"`; below) |
+| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint, Inkling 2), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](server.md#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
@@ -74,6 +79,18 @@ phases are exempt: the cancellation phase (`cancel`), and the reference wave
 that compacts the conversation, whose summary request and the request after it
 share only the system prompt and tools. Replay points of unfinished requests
 evicted during a phase only print a warning.
+
+In both scenarios each client also fixes a seeded bug, in a project and
+session of its own (`bugfix`): the shop package of
+`dev/tests/fixtures/agent_bugfix/project`, whose `money.to_cents` reads "8.5"
+as 805 cents, so that three cart tests fail and the cause is found only by
+running the tests and following the cart into `shop/money.py`. It passes when
+the client ran the test command, changed `shop/money.py` alone by at most 6
+lines, and the project's tests pass, as do amounts the tests do not use. Each
+client tries once; a failure prints what the engine's `/status` says changed
+over the fix (requests completed and failed, restarts, cached prompt tokens
+reused, replay points lost), from which the reader tells an engine fault from
+the model's answer.
 
 `benchmark-backend` and `benchmark-decode-profile` take `MODEL` the same way.
 The models they are run with, one per family and source format:
@@ -113,13 +130,14 @@ limit and charge. A block-sparse target's spill check counts what it allocates
 at most before its first prompt, and where the budget leaves less room, stops
 there, naming both, an `--expert-memory` that fits where that store still
 loads, and a `--spill-tokens` that fits for the oracle's command run by hand:
-`ORACLE_ARGS` reaches all three runs of `test-real`, and a `--spill-tokens`
-there replaces the first two runs' default prompts and the third's 32K.
+`ORACLE_ARGS` reaches every run of `test-real`, and a `--spill-tokens`
+there replaces the first, second and fourth runs' default prompts and the
+third's 32K.
 Beside the weights, Qwen3.8-Flash-Next's default checks hold up to 4.3 GB and
 its 32K check about 5.9 GB. On the 24 GB M6 (11-02) a check's need as the
 oracle names it (up to 1866 MiB by default, 3382 MiB at 32K) and the expert
 store together fit in about 10440 MiB on a text installation and 9580 MiB on
-one that serves vision, so all three runs take
+one that serves vision, so every run takes
 `ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M"`, or
 `"--expert-memory 5632M --ple-memory 237M"` where the installation serves
 vision, whose default checks alone fit only up to about `7700M` of experts.
@@ -184,9 +202,13 @@ the other. Per model, `release-check`:
   and requires the conversation's next turn to restore its prompt from disk
   (`test-http-real` with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`);
 - compares this build with `BASELINE`, which must have another build
-  identity, in ABBA order (`test-performance-real`), every round after the
-  first to report a [Neural Engine share](internals.md#neural-engine-prefill) running that
-  share: output tokens and acceptance must be
+  identity, in ABBA order (`test-performance-real`), every round at one
+  [Neural Engine split](internals.md#neural-engine-prefill): a start of this
+  build before the rounds calibrates it (or recalls this Mac's record), every
+  round runs its share from its least chunk rows (a calibrated split of two
+  shares, one in one step and one in two, at the larger in both), each must
+  report the same share and rows, and the result names the split each round's
+  start logged; output tokens and acceptance must be
   identical (`EXPECT_OUTPUT_CHANGE=1` allows changed outputs with acceptance
   within 0.02; the benchmark verifies every row of a draft's block a lane
   (`--verify-rows all`), so outputs repeat and its times measure the
@@ -200,7 +222,8 @@ the other. Per model, `release-check`:
   and this build's
   memory plan must hold, without the Neural Engine split, at least the
   context the baseline's holds without it. `ANE_FFN_SHARE=SHARE` runs
-  every round at that share instead (0: the GPU alone).
+  every round at that share instead, which the split rounds to whole channel
+  units (0.44 of the 27B's 34 runs as 15 of them, 0.441; 0: the GPU alone).
 
 Where the Mac's memory cannot hold a model's weight images, or its largest
 Metal buffer cannot hold one of them, as for Qwen3.8-Flash-Next,
@@ -271,7 +294,10 @@ partial-prefix request and the cold prefills of short prompts, three samples
 each, in
 `build/release/<owner>--<repo>[--VARIANT]/backend-benchmark.json`;
 `make benchmark-backend MODEL=...` adds the 2K to 128K contexts the memory
-plan holds. The second compares this build with a retained checkout's in ABBA
+plan holds; `backend-benchmark --context-lengths` sets those contexts, and
+`--short-idle SECONDS` leaves the engine idle before each short prompt, so that
+its first tokens are those of a next turn after that pause. The second
+compares this build with a retained checkout's in ABBA
 order, as the release check does ([Release check](#release-check)), and writes
 `backend-regression.json` there. Neither is a comparison with another engine
 or a test of agent task quality.
@@ -315,15 +341,46 @@ a file of uint32 token ids (`dev/benchmarks/teacher_logits.mm`): for each
 window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
-also takes `--kv-format`, `--state-format`, `--activations`,
+also takes `--kv-format`, `--state-format`, `--activations`, `--weights`,
 `--expert-memory` and `--ple-memory`, and, with `--captures yes`, writes the
-output rows of the target layers the model's draft reads (its
-`target_layer_ids`) at the positions a window's prefill computed, in one
-command, to `OUTPUT-END.captures.f32` (fp32, a row per position of each
-layer's hidden values in the draft's layer order), which a reference's
-residuals after those layers compare with (`dev/tools/flint_reference.py`
-writes Flint's, `residuals.npy`): a draft of the layers to compare, such as a
-test draft whose `fc` reads them, makes them its captures.
+rows of the target layers the model's draft reads (its `target_layer_ids`: each
+layer's output rows, or, for Inkling 2, the rows passed into each application
+and at id 48 the final norm's, [Drafts](models.md#drafts)) at the positions a
+window's prefill computed, in one command, to `OUTPUT-END.captures.f32` (fp32,
+a row per position of each layer's hidden values in the draft's layer order),
+which a reference's residuals after those layers compare with, or Inkling 2's
+after the application before each id
+(`dev/tools/flint_reference.py` writes Flint's and
+`dev/tools/inkling2_reference.py` Inkling 2's, `residuals.npy`): a draft of
+the layers to compare, such as a test draft whose `fc` reads them, makes them
+its captures. With `--draft yes` it writes the draft's lattice of each
+window's first decode cycle to `OUTPUT-END.draft.json`: the cycle's anchor
+(the first forced id) and its position, each of the seven proposal
+positions' sixteen candidates and their unary scores (the draft's logits of
+them, finished as the target's head but for its softcap), the edges to them
+from each candidate of the position before (from the anchor for the first),
+and the first position's probabilities after the anchor, softcapped where
+the draft takes the head's softcap (`RuntimeInstrumentation::
+lastDraftLattice`), which a reference forward of the draft fed the same
+captured rows and ids compares with. `--captured-rows FILE` has the draft
+read FILE's rows (laid out as `--captures yes` writes them, each value a
+bf16) in place of those the target captured at those positions
+(`RuntimeInstrumentation::replaceCapturedRows`), so that the draft and a
+reference's read the same rows.
+
+`python -m dev.tools.draft_golden METALLIB MODEL_ROOT GOLDEN_DIR WORK_DIR`
+grades the installed model's draft against a reference's golden vectors,
+opt-in like `test-real` as it needs the model and the vectors: for each
+golden block, `teacher-logits` runs the block's anchor after the golden
+captured rows (`--captured-rows`, bf16 activations and KV), and the draft's
+candidates, unary scores, softcapped selector scores and greedy proposals
+are held to the golden set's tolerances, by default its `af4g64` outputs,
+the draft as Splash quantizes its projections (the README of the
+Inkling-2-Mini oracle's golden vectors states the layout and the rules). On
+an M5 Pro, the Inkling-2-Mini draft's preview revision (499fbb70) passes all
+33 blocks of the oracle's five prompts: unary scores within 0.84 of the
+reference's (tolerance 1.5), softcapped scores within 0.43 (1.0), and its 168
+graded proposals equal.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that
@@ -362,11 +419,10 @@ stops.
 reuse; run them with the cache options to measure, such as
 `--server-args '--persistent-cache --cache-dir DIR'`, and a `--max-memory`
 under which the cache gives states up, or its reclaims write nothing. A
-restore point is copied 10 s after its publication unless its conversation
-went on from it first, so `--gap` decides which writes a run measures: at
-`agent`'s default most points are gone on from in time and the states written
-are the reclaims', and at a gap past the delay, such as 15, every point is
-copied, as at `edit`'s. Each
+persistent cache copies a restore point every 2,048 tokens of a
+conversation whatever the gap between turns; a temporary cache copies one 10 s
+after its publication unless its conversation went on from it first, so there
+`--gap` decides which writes a run measures. Each
 request records its time to first token, to its first output of any kind (a
 turn may answer with reasoning and a tool call alone), and the server's count
 of its prompt: its tokens, those the cache held (`cached`), those whose KV it
@@ -385,9 +441,7 @@ per 1,000 prompt tokens, by cause as far as the counters tell: KV pages
 demoted by reclaims, copied ahead for restore points and written through by
 `spill` requests, each at the plan's page size, and the rest, the states,
 which no counter splits between the reclaims that wrote them and the restore
-points' copies (a model with sliding-window layers writes its Slim pages
-shorter than that, so its KV is overstated and its states understated, which
-the readouts say); the share of the prompts' tokens the cache held; and each
+points' copies; the share of the prompts' tokens the cache held; and each
 kind of turn's median and longest time to first token (`first` and `loop` in
 `agent`). The tool results and user messages are slices of the client
 interpreter's standard library sources, the same for every tree, whose digest
@@ -451,13 +505,15 @@ these do not excuse, notes them.
 | --- | --- |
 | G4 | the client gaps between token events (chunks less than half the shortest decode command apart are one event's; an unanswered request counts its open gap, up to when the client stopped waiting): the largest at most 10 s, the p99 at most 5 s; every gap past 2.5 s is listed |
 | G8 | no engine restart, failed request (an HTTP error but `context_length_exceeded`, an error event in a stream the server had begun, a request of a failed TTFT round, or one `/status` counts in `requests.failed`), unanswered request, Metal failure or loop tick of 5 s or more, no exit, late start or failed request that ended the run, and every server stopped by SIGINT alone with exit 0, the engine it started gone within SIGINT's grace too |
-| G9 | the memory accounts sum to `charged_bytes` in every sample, no claim waits 30 s, nothing is owed at the end |
+| G9 | the memory accounts sum to `charged_bytes` in every sample, no request waits 30 s for memory while nothing ahead of it makes progress (`admission.stalled_wait_ms`: how far into the engine's resource wait limit, which restarts while a lane ahead of the request works, the request furthest into it is), nothing is owed at the end; the longest wait for memory, whatever refused it and behind progress or not (`memory_governor.claims.oldest_ms`), is reported, and fails only a server that does not report `stalled_wait_ms`: a request that has waited is served in arrival order behind the work sent before it ([memory claims](internals.md#memory-claims)), as long as that work runs |
+| Conversation | each request of a turn that grows its conversation (an `agent` turn after the first, an `edit` build turn after a conversation's first) finds at least 90 % of the conversation's previous prompt cached, and each such turn's first tokens come within 3 times its new tokens' prefill at the run's median time per new token of such a turn, or within 10 s; a request answered without usage, and its conversation's next, is not judged |
 | Store | a regrown expert unit taken back within 60 s of its regrow is counted; a second such take back within 60 s of the one before is an oscillation and fails |
 | Churn | the run lasted its load window (`--minutes`) and every client completed a request |
 | First token | no answered request (G8 judges unanswered ones) waited for its first token more than twice the prefill time, at the run's own rate (the tokens its answered requests prefilled over the time from the first send to the last answer), of the work the scheduler may put ahead of it: the requests in flight at its send, 24,576 rows of later arrivals (three prefill commands of at most 8,192 rows, the most that may pass over it in a row) and its own prompt, each less its cached tokens; a starvation guard, not a speed check |
 
-G8 applies to every scenario, the others to churn runs, and the check of an
-`agent` or `edit` run notes what it measured. The check also counts
+G8 applies to every scenario, the conversation gate to `agent` and `edit`
+runs, the others to churn runs, and the check of an `agent` or `edit` run
+notes what it measured. The check also counts
 the client gaps past the decode gap target of 500 ms by cause, each taking the
 first of these that the `/status` samples from 2 s before it to 2 s after it
 show: a claim waiting for memory, the experts' size changing, a compaction, a

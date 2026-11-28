@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -24,23 +25,26 @@
 
 namespace splash::engine {
 
-// Moves KV pages between their extents and a slot file, each page laid out
-// in its slot as kv::SlotFormat says, so the tier holds no memory of its own
-// beyond what reads land in. The file's IO worker writes a page straight from
-// its extent (SlotFormat::transferSpans), a bounded number at once: reclaim
-// may use all of them, copies ahead of need a quarter and write-through half,
-// so that one kind never starves another and reclaim always keeps a quarter.
-// A page's slot holds what the page holds as it is written: a Full page
-// whole, a Slim page its first regions and its index
+// Moves KV blocks between their pages' extents and slot files, each part of
+// a block (kv::Component) in a file of its own, laid out in its slot as
+// kv::SlotFormat says, so the tier holds no memory of its own beyond what
+// reads land in. Each file's IO worker writes a part straight from its
+// extent (SlotFormat::transferSpans). The tier bounds the writes in flight,
+// counted by block: a block's write of its parts is one write, whatever
+// parts it writes, its parts' IO on their files' workers at once. Reclaim
+// may use all of them, copies ahead of need a quarter and write-through
+// half, so that one kind never starves another and reclaim always keeps a
+// quarter. A part's slot holds its K/V and, for the base, its index
 // (kv::SlotFormat::payloadBytes), and takes that much of the quota
 // (model::SlotFile::quotaBytesFor). Reads go to the SSD readers beside the
-// worker (model::readKvCopy): a restore is a task of a background batch that
-// reads what its page's form holds, the index alone, a Slim page's payload
-// or all of it, into memory of its own and scatters it into the page. The
-// restores asked for since the last submitRestores() go out together, the
-// index restores as one batch on every reader and the whole restores as
-// another on at most kWholeRestoreReaders, whose reads are a slot each.
-// Copies of slots are read the same way by whoever holds them (copy()).
+// workers (model::readKvCopy): a restore is a task of a background batch
+// that reads what its parts hold, of the base what its page's form holds,
+// the index alone or all of it, into memory of its own and scatters it into
+// the pages. The restores asked for since the last submitRestores() go out
+// together, the index restores as one batch on every reader and the whole
+// restores as another on at most kWholeRestoreReaders, whose reads are a
+// part's slot each. A base part's slot is read the same way by whoever holds
+// it (copy()).
 //
 // The tier reaches its pages as SlotFormat's page functions do, with their
 // layout() and each page's form(page): Pages is kv::PageStorage for the
@@ -48,20 +52,35 @@ namespace splash::engine {
 // under the sanitizers.
 template <class Pages> class BasicKvPageTier final : public KvTier {
 public:
-  // A slot of the tier, which is also the copy reads of spilled K/V reach
+  // A part's slot, which is also the copy reads of spilled K/V reach
   // (model::KvCopy).
-  struct DiskSlot final : KvDiskSlot, model::KvCopy {
-    DiskSlot(std::shared_ptr<model::SlotFile::Slot> held,
-             std::shared_ptr<const model::SlotFile> owner)
+  struct PartSlot final : model::KvCopy {
+    PartSlot(std::shared_ptr<model::SlotFile::Slot> held, std::shared_ptr<const model::SlotFile> owner)
         : slot(std::move(held)), file(std::move(owner)) {}
     [[nodiscard]] uint64_t id() const noexcept override { return slot->id(); }
-    [[nodiscard]] uint64_t bytes() const noexcept override { return slot->bytes(); }
     [[nodiscard]] std::optional<std::span<const std::byte>>
     readAt(uint64_t offset, uint64_t bytes, std::span<std::byte> buffer) const noexcept override {
       return file->readAt(*slot, offset, bytes, buffer);
     }
     std::shared_ptr<model::SlotFile::Slot> slot;
     std::shared_ptr<const model::SlotFile> file;
+  };
+  // A block's copy: a part's slot by component, and its presence.
+  struct DiskSlot final : KvDiskSlot {
+    [[nodiscard]] uint64_t bytes() const noexcept override {
+      uint64_t total = 0;
+      for (const kv::Component part : kv::kAllComponents) total += bytes(part);
+      return total;
+    }
+    [[nodiscard]] uint64_t bytes(kv::Component part) const noexcept override {
+      const std::shared_ptr<PartSlot> &held = slots[static_cast<size_t>(part)];
+      return held ? held->slot->bytes() : 0;
+    }
+    [[nodiscard]] Presence presence(kv::Component part) const noexcept override {
+      return slots[static_cast<size_t>(part)] ? presences[static_cast<size_t>(part)] : Presence::None;
+    }
+    std::array<std::shared_ptr<PartSlot>, kv::kComponents> slots;
+    std::array<Presence, kv::kComponents> presences{};
   };
   // Writes in flight at once, by default, and restores at most; the readers
   // whole restores take at once (four threads read 460 KiB pieces at
@@ -70,42 +89,46 @@ public:
   static constexpr uint32_t kRestores = 4096;
   static constexpr unsigned kWholeRestoreReaders = 8;
 
-  BasicKvPageTier(Pages &pages, kv::SlotFormat format, std::shared_ptr<model::SlotFile> file,
+  // `files` holds a file for each of the layout's components
+  // (kv::Layout::components), base first.
+  BasicKvPageTier(Pages &pages, kv::SlotFormat format, std::vector<std::shared_ptr<model::SlotFile>> files,
                   std::shared_ptr<model::SsdReaders> readers, uint32_t writes = kWrites);
-  // How the tier lays a page of the layout out in its slot, as a persistent
-  // cache's namespace names it (persistentCacheNamespace's kv line): empty
-  // for the order of the page's spans (kv::SlotFormat version 0), so that a
-  // layout without block records keeps its namespace, and the block records'
-  // version for a spillable layout. Whatever changes what the tier writes
+  // How the tier lays a block out in its slots, as a persistent cache's
+  // namespace names it (persistentCacheNamespace's kv line): empty for a
+  // layout with one component whose slots hold the order of its spans
+  // (kv::SlotFormat version 0), so that it keeps its namespace; the block
+  // records' version for a spillable layout; and the parts of a windowed
+  // layout, each in its own file. Whatever changes what the tier writes
   // changes this with it, so that no process adopts a slot of another layout.
   [[nodiscard]] static std::string_view slotFormatToken(const kv::Layout &layout) noexcept;
   ~BasicKvPageTier() override;
   BasicKvPageTier(const BasicKvPageTier &) = delete;
   BasicKvPageTier &operator=(const BasicKvPageTier &) = delete;
 
-  [[nodiscard]] uint64_t slotBytes(kv::PageForm form) const override {
-    return file_->quotaBytesFor(format_.payloadBytes(form));
-  }
-  [[nodiscard]] bool writable() const noexcept override { return file_->writable(); }
-  [[nodiscard]] bool persistent() const noexcept override { return file_->persistent(); }
-  void label(const std::shared_ptr<KvDiskSlot> &slot, std::vector<std::byte> label) override;
-  // Takes back a slot an earlier process recorded in a persistent tier's
-  // file (model::SlotFile::adopt).
-  [[nodiscard]] std::shared_ptr<KvDiskSlot> adopt(const model::SlotRecord &record);
+  [[nodiscard]] kv::Components components() const noexcept override { return format_.layout().components(); }
+  [[nodiscard]] uint64_t slotBytes(kv::Components parts) const override;
+  [[nodiscard]] bool writable() const noexcept override;
+  [[nodiscard]] bool persistent() const noexcept override { return files_.front()->persistent(); }
+  void label(const std::shared_ptr<KvDiskSlot> &copy, kv::Components parts, std::vector<std::byte> label) override;
+  // Takes back as the copy's part a slot an earlier process recorded in
+  // that part's file (model::SlotFile::adopt), into `into` or a new copy.
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> adopt(const model::SlotRecord &record, kv::Component part,
+                                                  std::shared_ptr<KvDiskSlot> into);
   [[nodiscard]] bool canDemote(WriteClass write) const noexcept override;
   [[nodiscard]] bool canRestore() const noexcept override { return restores_ < kRestores; }
-  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireSlot(kv::PageForm form,
-                                                        model::DiskBudget::Draw draw) override;
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireSlot(kv::Components parts, model::DiskBudget::Draw draw,
+                                                        std::shared_ptr<KvDiskSlot> into) override;
   [[nodiscard]] std::unique_ptr<KvTransfer>
-  demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot, WriteClass write,
-         std::function<void()> completion) override;
+  demote(std::span<const uint32_t> pages, const std::shared_ptr<KvDiskSlot> &copy, kv::Components parts,
+         WriteClass write, std::function<void()> completion) override;
   [[nodiscard]] std::unique_ptr<KvTransfer>
-  restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
+  restore(const std::shared_ptr<KvDiskSlot> &copy, kv::Components parts, std::span<const uint32_t> pages,
           std::function<void()> completion) override;
+  void giveUp(const std::shared_ptr<KvDiskSlot> &copy, kv::Components parts) override;
   void submitRestores() override;
   [[nodiscard]] std::shared_ptr<const model::KvCopy>
   copy(const std::shared_ptr<KvDiskSlot> &slot) const override {
-    return diskSlot(slot);
+    return diskSlot(slot)->slots[static_cast<size_t>(kv::Component::Base)];
   }
   void poll() override;
 
@@ -124,17 +147,21 @@ private:
   private:
     std::shared_ptr<Outcome> outcome_;
   };
+  // A block's write: its copy, and the IO of each part it writes; a part
+  // whose file refused it has none, and fails the write.
   struct Write final {
     WriteClass write;
-    std::shared_ptr<model::SlotFile::Operation> io;
+    std::shared_ptr<DiskSlot> copy;
+    kv::Components parts = 0;
+    std::array<std::shared_ptr<model::SlotFile::Operation>, kv::kComponents> io;
     std::shared_ptr<Outcome> outcome;
   };
-  // A restore: its slot, its page and the page's form, which says what it
-  // reads: the page's index alone (an Index page) or the payload of what
-  // the page holds.
+  // A restore: the slots of the parts it reads, its block's pages and the
+  // base page's form, which says what it reads of the base: the page's
+  // index alone (an Index page) or the block's payload.
   struct Restore final {
-    std::shared_ptr<const DiskSlot> copy;
-    uint32_t page = 0;
+    std::array<std::shared_ptr<const PartSlot>, kv::kComponents> parts;
+    std::vector<uint32_t> pages;
     kv::PageForm form = kv::PageForm::Full;
     std::function<void()> completion;
     std::shared_ptr<Outcome> outcome;
@@ -147,17 +174,21 @@ private:
     size_t left = 0;
   };
   [[nodiscard]] static std::shared_ptr<DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot> &slot);
-  // A reader's task: reads one restore's range and scatters it.
+  // std::logic_error unless the parts are some of the layout's components
+  // and the copy's presence of each is `presence`.
+  void requireParts(const DiskSlot &copy, kv::Components parts, KvDiskSlot::Presence presence) const;
+  [[nodiscard]] model::SlotFile &file(kv::Component part) const { return *files_[static_cast<size_t>(part)]; }
+  // A reader's task: reads one restore's parts and scatters them.
   void read(const Restore &restore) const;
   [[nodiscard]] uint32_t share(WriteClass write) const noexcept;
 
   Pages &pages_;
   const kv::SlotFormat format_;
-  std::shared_ptr<model::SlotFile> file_;
+  std::vector<std::shared_ptr<model::SlotFile>> files_;
   std::shared_ptr<model::SsdReaders> readers_;
   uint32_t writeLimit_;
   std::array<uint32_t, 3> classWrites_{};
-  // Every write whose IO the worker may still run.
+  // Every write whose IO a worker may still run.
   std::vector<Write> writes_;
   // Restores asked for and not yet submitted, and those submitted.
   std::vector<Restore> queued_;
@@ -171,12 +202,13 @@ extern template class BasicKvPageTier<kv::PageStorage>;
 
 template <class Pages>
 BasicKvPageTier<Pages>::BasicKvPageTier(Pages &pages, kv::SlotFormat format,
-                                        std::shared_ptr<model::SlotFile> file,
+                                        std::vector<std::shared_ptr<model::SlotFile>> files,
                                         std::shared_ptr<model::SsdReaders> readers, uint32_t writes)
-    : pages_(pages), format_(std::move(format)), file_(std::move(file)), readers_(std::move(readers)),
+    : pages_(pages), format_(std::move(format)), files_(std::move(files)), readers_(std::move(readers)),
       writeLimit_(writes) {
-  if (!file_ || !readers_ || !writeLimit_)
-    throw std::invalid_argument("KV tier needs a slot file, readers and room for a write");
+  if (files_.size() != static_cast<size_t>(std::popcount(components())) ||
+      std::ranges::any_of(files_, [](const auto &file) { return !file; }) || !readers_ || !writeLimit_)
+    throw std::invalid_argument("KV tier needs a slot file for each component, readers and room for a write");
   if (format_.layout() != pages_.layout())
     throw std::invalid_argument("KV tier's slot format is another layout's");
   // Tracking a submitted IO must not allocate: the tier drains every IO it
@@ -184,22 +216,26 @@ BasicKvPageTier<Pages>::BasicKvPageTier(Pages &pages, kv::SlotFormat format,
   writes_.reserve(writeLimit_);
 }
 
-// A transfer in flight reads or writes its page in place, and the cache that
-// held the page for it is gone before the tier is: the worker and the
+// A transfer in flight reads or writes its pages in place, and the cache
+// that held the pages for it is gone before the tier is: the workers and the
 // readers must be done with every page first. Nothing will read the slots a
 // cancelled write leaves behind, nor the pages an unread restore leaves,
 // because the tier that maps pages to them is going away too.
 template <class Pages> BasicKvPageTier<Pages>::~BasicKvPageTier() {
   for (const Write &write : writes_)
-    write.io->drain();
+    for (const auto &io : write.io)
+      if (io) io->drain();
   for (RestoreBatch &batch : batches_)
     readers_->stop(*batch.batch);
 }
 
 template <class Pages>
 std::string_view BasicKvPageTier<Pages>::slotFormatToken(const kv::Layout &layout) noexcept {
-  // kv::SlotFormat's version 1, the block records of a spillable layout.
-  return layout.spillable() ? " slots block-records-v1" : "";
+  // kv::SlotFormat's version 1, the block records of a spillable layout; a
+  // windowed layout's base and window parts in two files.
+  if (layout.spillable())
+    return " slots block-records-v1";
+  return layout.components() != kv::componentBit(kv::Component::Base) ? " slots base-window-parts-v1" : "";
 }
 
 template <class Pages>
@@ -212,13 +248,46 @@ BasicKvPageTier<Pages>::diskSlot(const std::shared_ptr<KvDiskSlot> &slot) {
 }
 
 template <class Pages>
-void BasicKvPageTier<Pages>::label(const std::shared_ptr<KvDiskSlot> &slot, std::vector<std::byte> label) {
-  file_->label(diskSlot(slot)->slot, std::move(label));
+void BasicKvPageTier<Pages>::requireParts(const DiskSlot &copy, kv::Components parts,
+                                          KvDiskSlot::Presence presence) const {
+  bool held = parts && !(parts & ~components());
+  for (const kv::Component part : kv::kAllComponents)
+    held = held && (!(parts & kv::componentBit(part)) || copy.presence(part) == presence);
+  if (!held)
+    throw std::logic_error("a KV copy's parts are not as the tier's call needs them");
+}
+
+template <class Pages> uint64_t BasicKvPageTier<Pages>::slotBytes(kv::Components parts) const {
+  uint64_t bytes = 0;
+  for (const kv::Component part : kv::kAllComponents)
+    if (parts & components() & kv::componentBit(part))
+      bytes += file(part).quotaBytesFor(format_.payloadBytes(part));
+  return bytes;
+}
+
+template <class Pages> bool BasicKvPageTier<Pages>::writable() const noexcept {
+  return std::ranges::all_of(files_, [](const auto &file) { return file->writable(); });
 }
 
 template <class Pages>
-std::shared_ptr<KvDiskSlot> BasicKvPageTier<Pages>::adopt(const model::SlotRecord &record) {
-  return std::make_shared<DiskSlot>(file_->adopt(record), file_);
+void BasicKvPageTier<Pages>::label(const std::shared_ptr<KvDiskSlot> &copy, kv::Components parts,
+                                   std::vector<std::byte> label) {
+  const std::shared_ptr<DiskSlot> disk = diskSlot(copy);
+  requireParts(*disk, parts, KvDiskSlot::Presence::Writing);
+  for (const kv::Component part : kv::kAllComponents)
+    if (parts & kv::componentBit(part))
+      file(part).label(disk->slots[static_cast<size_t>(part)]->slot, label);
+}
+
+template <class Pages>
+std::shared_ptr<KvDiskSlot> BasicKvPageTier<Pages>::adopt(const model::SlotRecord &record, kv::Component part,
+                                                          std::shared_ptr<KvDiskSlot> into) {
+  std::shared_ptr<DiskSlot> copy = into ? diskSlot(into) : std::make_shared<DiskSlot>();
+  requireParts(*copy, kv::componentBit(part), KvDiskSlot::Presence::None);
+  const auto index = static_cast<size_t>(part);
+  copy->slots[index] = std::make_shared<PartSlot>(file(part).adopt(record), files_[index]);
+  copy->presences[index] = KvDiskSlot::Presence::Landed;
+  return copy;
 }
 
 template <class Pages> uint32_t BasicKvPageTier<Pages>::share(WriteClass write) const noexcept {
@@ -236,44 +305,101 @@ template <class Pages> bool BasicKvPageTier<Pages>::canDemote(WriteClass write) 
 }
 
 template <class Pages>
-std::shared_ptr<KvDiskSlot> BasicKvPageTier<Pages>::acquireSlot(kv::PageForm form,
-                                                                model::DiskBudget::Draw draw) {
-  auto slot = file_->acquire(format_.payloadBytes(form), draw);
-  if (!slot)
-    return {};
-  return std::make_shared<DiskSlot>(std::move(slot), file_);
+std::shared_ptr<KvDiskSlot> BasicKvPageTier<Pages>::acquireSlot(kv::Components parts, model::DiskBudget::Draw draw,
+                                                                std::shared_ptr<KvDiskSlot> into) {
+  const std::shared_ptr<DiskSlot> copy = into ? diskSlot(into) : std::make_shared<DiskSlot>();
+  requireParts(*copy, parts, KvDiskSlot::Presence::None);
+  // All or none: a part whose file has no room gives back those taken.
+  std::array<std::shared_ptr<PartSlot>, kv::kComponents> taken;
+  for (const kv::Component part : kv::kAllComponents) {
+    if (!(parts & kv::componentBit(part)))
+      continue;
+    auto slot = file(part).acquire(format_.payloadBytes(part), draw);
+    if (!slot)
+      return {};
+    taken[static_cast<size_t>(part)] = std::make_shared<PartSlot>(std::move(slot), files_[static_cast<size_t>(part)]);
+  }
+  for (size_t part = 0; part < kv::kComponents; ++part) {
+    if (!taken[part])
+      continue;
+    copy->slots[part] = std::move(taken[part]);
+    copy->presences[part] = KvDiskSlot::Presence::Writing;
+  }
+  return copy;
 }
 
 template <class Pages>
-std::unique_ptr<KvTransfer> BasicKvPageTier<Pages>::demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,
-                                                           WriteClass write, std::function<void()> completion) {
+std::unique_ptr<KvTransfer> BasicKvPageTier<Pages>::demote(std::span<const uint32_t> pages,
+                                                           const std::shared_ptr<KvDiskSlot> &copy,
+                                                           kv::Components parts, WriteClass write,
+                                                           std::function<void()> completion) {
   if (!canDemote(write))
     return {};
-  if (pages_.form(page) == kv::PageForm::Index)
+  if (pages_.form(pages.front()) == kv::PageForm::Index)
     throw std::logic_error("only a page that holds its K/V is written to the KV tier");
-  auto disk = diskSlot(slot);
-  auto outcome = std::make_shared<Outcome>();
-  auto ticket = std::make_unique<Ticket>(outcome);
-  auto io = file_->write(disk->slot, format_.transferSpans(pages_, page), std::move(completion));
-  // A file that stopped taking writes since canDemote() refuses this one as
-  // canDemote() does from now on.
-  if (!io)
-    return {};
+  const std::shared_ptr<DiskSlot> disk = diskSlot(copy);
+  requireParts(*disk, parts, KvDiskSlot::Presence::Writing);
+  if (std::ranges::any_of(writes_, [&](const Write &other) { return other.copy == disk && other.parts & parts; }))
+    throw std::logic_error("a KV copy's part is written twice at once");
+  // Whatever the write allocates comes before its first IO starts, so that
+  // an allocation that fails leaves no IO the tier does not track.
+  Write entry{write, disk, parts, {}, std::make_shared<Outcome>()};
+  auto ticket = std::make_unique<Ticket>(entry.outcome);
+  std::array<std::vector<std::span<const std::byte>>, kv::kComponents> spans;
+  for (const kv::Component part : kv::kAllComponents)
+    if (parts & kv::componentBit(part))
+      spans[static_cast<size_t>(part)] = format_.transferSpans(pages_, pages, part);
+  // A file that stopped taking writes since canDemote() refuses its part as
+  // canDemote() does from now on, and so does one whose submission threw
+  // once another part started: the write is refused while nothing of it
+  // started, and fails once a part did, which keeps its pages still until
+  // that part ends.
+  for (const kv::Component part : kv::kAllComponents) {
+    if (!(parts & kv::componentBit(part)))
+      continue;
+    const auto index = static_cast<size_t>(part);
+    const bool started = std::ranges::any_of(entry.io, [](const auto &io) { return io != nullptr; });
+    try {
+      entry.io[index] = file(part).write(disk->slots[index]->slot, std::move(spans[index]), completion);
+    } catch (...) {
+      if (!started) throw;
+    }
+    if (!entry.io[index] && !started)
+      return {};
+  }
   ++classWrites_[static_cast<size_t>(write)];
-  writes_.push_back({write, std::move(io), std::move(outcome)});
+  writes_.push_back(std::move(entry));
   return ticket;
 }
 
 template <class Pages>
-std::unique_ptr<KvTransfer> BasicKvPageTier<Pages>::restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
+std::unique_ptr<KvTransfer> BasicKvPageTier<Pages>::restore(const std::shared_ptr<KvDiskSlot> &copy,
+                                                            kv::Components parts, std::span<const uint32_t> pages,
                                                             std::function<void()> completion) {
   if (!canRestore())
     return {};
-  Restore restore{diskSlot(slot), page, pages_.form(page), std::move(completion), std::make_shared<Outcome>()};
+  const std::shared_ptr<DiskSlot> disk = diskSlot(copy);
+  requireParts(*disk, parts, KvDiskSlot::Presence::Landed);
+  Restore restore{{}, {pages.begin(), pages.end()}, pages_.form(pages.front()), std::move(completion),
+                  std::make_shared<Outcome>()};
+  for (const kv::Component part : kv::kAllComponents)
+    if (parts & kv::componentBit(part))
+      restore.parts[static_cast<size_t>(part)] = disk->slots[static_cast<size_t>(part)];
   auto ticket = std::make_unique<Ticket>(restore.outcome);
   queued_.push_back(std::move(restore));
   ++restores_;
   return ticket;
+}
+
+template <class Pages>
+void BasicKvPageTier<Pages>::giveUp(const std::shared_ptr<KvDiskSlot> &copy, kv::Components parts) {
+  const std::shared_ptr<DiskSlot> disk = diskSlot(copy);
+  if (!parts || parts & ~disk->parts() ||
+      std::ranges::any_of(writes_, [&](const Write &other) { return other.copy == disk && other.parts & parts; }))
+    throw std::logic_error("a KV copy gives up a part it lacks or writes");
+  for (const kv::Component part : kv::kAllComponents)
+    if (parts & kv::componentBit(part))
+      disk->slots[static_cast<size_t>(part)].reset();
 }
 
 template <class Pages> void BasicKvPageTier<Pages>::submitRestores() {
@@ -313,33 +439,58 @@ template <class Pages> void BasicKvPageTier<Pages>::submitRestores() {
 }
 
 template <class Pages> void BasicKvPageTier<Pages>::read(const Restore &restore) const {
-  // The page's extent stays while its restore is in flight, and its memory
-  // is found beside the engine thread's changes to other extents.
+  // The extents of the pages a restore fills stay while it is in flight,
+  // and their memory is found beside the engine thread's changes to other
+  // extents. A window part's read also finds the spans of its block's base
+  // page, which it leaves, and that page's extent may go meanwhile: the
+  // pages find them under the lock their extents' changes take
+  // (kv::PageStorage::blockSpans), and the read fails if it went.
   // An index, a few KiB that a restored spilled chain reads by the
-  // thousand, goes through the reader's own buffer; a whole page brings its
+  // thousand, goes through the reader's own buffer; a whole part brings its
   // own, so that no reader keeps a slot's worth of memory.
   const bool index = restore.form == kv::PageForm::Index;
   model::KvReadBuffer buffer;
-  const std::optional<std::span<const std::byte>> bytes =
-      index ? model::readKvCopy(*restore.copy, format_.indexRange())
-            : model::readKvCopy(*restore.copy, {0, format_.payloadBytes(restore.form)}, buffer);
-  if (!bytes)
-    throw std::runtime_error("a KV tier slot could not be read");
-  if (index)
-    format_.scatterIndex(*bytes, pages_.indexSpans(restore.page));
-  else
-    format_.scatterPage(*bytes, pages_, restore.page);
+  for (const kv::Component part : kv::kAllComponents) {
+    const std::shared_ptr<const PartSlot> &copy = restore.parts[static_cast<size_t>(part)];
+    if (!copy)
+      continue;
+    const uint64_t payload = format_.payloadBytes(part);
+    // A copy an earlier process wrote reads the whole segments its range
+    // touches (model::SlotFile::readAt): a slot's worth holds them.
+    if (!index && copy->file->persistent())
+      static_cast<void>(buffer.hold(model::SlotFile::slotBytesFor(payload)));
+    const std::optional<std::span<const std::byte>> bytes =
+        index ? model::readKvCopy(*copy, format_.indexRange()) : model::readKvCopy(*copy, {0, payload}, buffer);
+    if (!bytes)
+      throw std::runtime_error("a KV tier slot could not be read");
+    if (index)
+      format_.scatterIndex(*bytes, pages_.indexSpans(restore.pages.front()));
+    else
+      format_.scatterPage(*bytes, pages_, restore.pages, part);
+  }
 }
 
 template <class Pages> void BasicKvPageTier<Pages>::poll() {
+  // A block's write ends once each of its parts' IO has: each part that
+  // landed is present, and the write succeeds once every one did.
   for (size_t index = 0; index < writes_.size();) {
     Write &write = writes_[index];
-    if (!write.io->ready()) {
+    if (std::ranges::any_of(write.io, [](const auto &io) { return io && !io->ready(); })) {
       ++index;
       continue;
     }
     --classWrites_[static_cast<size_t>(write.write)];
-    write.outcome->success = write.io->wait();
+    bool success = true;
+    for (const kv::Component part : kv::kAllComponents) {
+      const auto at = static_cast<size_t>(part);
+      if (!(write.parts & kv::componentBit(part)))
+        continue;
+      const bool landed = write.io[at] && write.io[at]->wait();
+      if (landed && write.copy->slots[at])
+        write.copy->presences[at] = KvDiskSlot::Presence::Landed;
+      success = success && landed;
+    }
+    write.outcome->success = success;
     write.outcome->ready = true;
     writes_.erase(writes_.begin() + static_cast<std::ptrdiff_t>(index));
   }
@@ -352,7 +503,7 @@ template <class Pages> void BasicKvPageTier<Pages>::poll() {
       Restore &restore = (*batch->restores)[index];
       restore.outcome->success = !batch->batch->failed(index);
       restore.outcome->ready = true;
-      restore.copy.reset();
+      restore.parts = {};
       batch->retired[index] = true;
       --batch->left;
       --restores_;

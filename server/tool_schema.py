@@ -11,13 +11,15 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from urllib.parse import unquote
 
+from jsonschema import validators
 from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
-from .chat_format import THINK_END, TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from .errors import APIError
 from .lru import LRUCache, memoized
 from .schema_validation import (
+    SCHEMA_MAP_KEYWORDS,
+    SUBSCHEMA_KEYWORDS,
     build_validator,
     check_schema,
     json_objects,
@@ -80,6 +82,32 @@ class ToolPolicy:
     # tool_choice none, whose grammar lets no call start.
     constrained: bool
     namespaces: dict = field(default_factory=dict)
+    # The name of every tool the request declares, whatever its choice lets
+    # a call name: the output's calls of any other are its text. None for
+    # those of schemas.
+    declared: frozenset | None = None
+
+    @property
+    def names(self):
+        """The tools the request declares."""
+        return frozenset(self.schemas) if self.declared is None else self.declared
+
+    @cached_property
+    def _names_by_case(self):
+        names = {}
+        for name in self.names:
+            names.setdefault(name.casefold(), []).append(name)
+        return names
+
+    def declared_name(self, name):
+        """The declared tool a call's `name` names: that tool, or the one
+        declared tool it matches whatever its case, as a model may write a
+        name (Flint writes Bash as bash); None where it matches none, or
+        several."""
+        if name in self.names:
+            return name
+        matches = self._names_by_case.get(name.casefold(), ())
+        return matches[0] if len(matches) == 1 else None
 
     @cached_property
     def argument_schemas(self):
@@ -191,11 +219,14 @@ SCHEMA_ANNOTATIONS = {
 
 # The grammar compiler expands these keywords into work proportional to their
 # values: a rule per required or optional array item, a state per divisor
-# residue. A tiny schema with a huge bound would exhaust memory, so larger
-# bounds are left out of the grammar; a response format checks them on the
-# complete output.
+# residue. A tiny schema with a huge bound would exhaust memory (10^8 killed
+# the server, 0501ed66), so larger bounds are left out of the grammar. Measured
+# with llguidance 1.8.0 over Inkling's 200K vocabulary: one array bounded at
+# 10,000 compiles in 25 ms; multipleOf 1,000 costs up to 2 ms a mask and
+# 10,000 up to 5 ms; 200 arrays bounded at 256 compile in 158 ms, at 500 they
+# exceed llguidance's symbol limit. 256 keeps every one of those cheap.
 GRAMMAR_BOUND_KEYWORDS = ("minItems", "maxItems", "multipleOf")
-MAX_GRAMMAR_BOUND = 64
+MAX_GRAMMAR_BOUND = 256
 
 # Checking a pattern compiles a grammar, and a client sends the same tools and
 # output schema on every turn, so the answers for this many patterns are kept,
@@ -262,6 +293,189 @@ def _grammar_compatible_schema(schema):
     return output
 
 
+# Keywords the output grammar does not enforce, which jsonschema asserts in
+# the dialects that define them: llguidance 1.8 compiles a schema leniently
+# (x-guidance lenient) and drops those it reports as unimplemented (not,
+# if/then/else, dependentSchemas, dependentRequired, dependencies,
+# propertyNames, unevaluatedProperties, unevaluatedItems, contains with
+# minContains and maxContains, uniqueItems, $dynamicRef, $recursiveRef), and
+# ignores draft 3's extends, disallow and divisibleBy without a word. A
+# strict response format holding one is refused before generation; any other
+# is best effort, its answer checked only against what the grammar enforced
+# (normalize_response_format). Each keyword's value that asks nothing, where
+# it has one, is accepted. A strict tool's grammar leaves them out
+# (_check_tool_schema).
+UNENFORCED_KEYWORDS = {
+    "not": None,
+    "if": None,
+    "dependentSchemas": ({},),
+    "dependentRequired": ({},),
+    "dependencies": ({},),
+    "propertyNames": (True, {}),
+    "unevaluatedProperties": (True, {}),
+    "unevaluatedItems": (True, {}),
+    "contains": None,
+    "uniqueItems": (False,),
+    "$dynamicRef": None,
+    "$recursiveRef": None,
+    "extends": ({}, []),
+    "disallow": ([],),
+    "divisibleBy": None,
+}
+
+
+def _pointer(path):
+    """The JSON pointer of `path` in a schema, as a fragment."""
+    return "#" + "".join(
+        "/" + str(part).replace("~", "~0").replace("/", "~1") for part in path
+    )
+
+
+def _schema_nodes(schema, path=()):
+    """Each schema of `schema`, as subschemas() visits them, with its path."""
+    yield schema, path
+    if not isinstance(schema, dict):
+        return
+    for key, item in schema.items():
+        if key in SCHEMA_MAP_KEYWORDS and isinstance(item, dict):
+            children = [((key, name), child) for name, child in item.items()]
+        elif key == "dependencies" and isinstance(item, dict):
+            children = [
+                ((key, name), child)
+                for name, child in item.items()
+                if not isinstance(child, list)
+            ]
+        elif key in SUBSCHEMA_KEYWORDS or key in ("type", "disallow"):
+            if isinstance(item, list):
+                children = [
+                    ((key, index), child)
+                    for index, child in enumerate(item)
+                    if key in SUBSCHEMA_KEYWORDS or isinstance(child, dict)
+                ]
+            elif key in SUBSCHEMA_KEYWORDS:
+                children = [((key,), item)]
+            else:
+                continue
+        else:
+            continue
+        for steps, child in children:
+            yield from _schema_nodes(child, path + steps)
+
+
+def unenforced_keywords(schema):
+    """The keywords of `schema`, a valid schema, that the output grammar does
+    not enforce, each as (keyword, where, why): those of UNENFORCED_KEYWORDS
+    that the schema's dialect asserts, a pattern the grammar compiler refuses
+    (look-around, word boundaries, backreferences), a bound of
+    GRAMMAR_BOUND_KEYWORDS above MAX_GRAMMAR_BOUND, which
+    _grammar_compatible_schema leaves out, and oneOf, which the grammar
+    enforces as anyOf: one value may match several of its branches."""
+    asserted = validators.validator_for(schema).VALIDATORS
+    found = []
+    for node, path in _schema_nodes(schema):
+        if not isinstance(node, dict):
+            continue
+        where = _pointer(path)
+        for keyword, idle in UNENFORCED_KEYWORDS.items():
+            if keyword not in node or keyword not in asserted:
+                continue
+            if keyword == "if" and not {"then", "else"} & node.keys():
+                continue
+            if idle is not None and any(
+                node[keyword] == value and type(node[keyword]) is type(value)
+                for value in idle
+            ):
+                continue
+            found.append(
+                (
+                    keyword,
+                    where,
+                    f"{keyword} at {where} is not enforced by the output grammar",
+                )
+            )
+        if isinstance(node.get("oneOf"), list) and len(node["oneOf"]) > 1:
+            found.append(
+                (
+                    "oneOf",
+                    where,
+                    f"oneOf at {where} is enforced only as anyOf by the output grammar",
+                )
+            )
+        pattern = node.get("pattern")
+        if isinstance(pattern, str) and not _grammar_takes_pattern(pattern):
+            found.append(
+                (
+                    "pattern",
+                    where,
+                    f"pattern at {where} uses look-around, a word "
+                    "boundary or a backreference, which the output grammar does not "
+                    "enforce",
+                )
+            )
+        for keyword in GRAMMAR_BOUND_KEYWORDS:
+            bound = node.get(keyword)
+            if (
+                not isinstance(bound, bool)
+                and isinstance(bound, (int, float))
+                and bound > MAX_GRAMMAR_BOUND
+            ):
+                found.append(
+                    (
+                        keyword,
+                        where,
+                        f"{keyword} {bound} at {where} is above "
+                        f"{MAX_GRAMMAR_BOUND}, the largest the output grammar enforces",
+                    )
+                )
+    return found
+
+
+def _enforced_schema(schema, found):
+    """`schema` without the keywords `found` (unenforced_keywords) names, and
+    oneOf read as anyOf: what the grammar holds the answer to, which a
+    best-effort response format checks the complete answer against."""
+    output = copy.deepcopy(schema)
+    places = {where for _, where, _ in found}
+    keywords = {keyword for keyword, _, _ in found}
+    for node, path in list(_schema_nodes(output)):
+        if not isinstance(node, dict) or _pointer(path) not in places:
+            continue
+        for keyword in keywords & set(node):
+            if keyword == "oneOf":
+                node["anyOf"] = node.pop("oneOf")
+            elif keyword == "if":
+                for key in ("if", "then", "else"):
+                    node.pop(key, None)
+            elif keyword == "contains":
+                for key in ("contains", "minContains", "maxContains"):
+                    node.pop(key, None)
+            elif keyword == "pattern":
+                if not _grammar_takes_pattern(node["pattern"]):
+                    del node["pattern"]
+            elif keyword in GRAMMAR_BOUND_KEYWORDS:
+                bound = node[keyword]
+                if isinstance(bound, (int, float)) and bound > MAX_GRAMMAR_BOUND:
+                    del node[keyword]
+            else:
+                del node[keyword]
+    return output
+
+
+class BestEffortValidator:
+    """A response format's validator that checks an answer only against what
+    the grammar enforced (_enforced_schema): an answer that breaks only a
+    keyword the grammar did not enforce is returned as the model wrote it.
+    `unenforced` names those keywords and where they are, for the request's
+    log line and the server's count."""
+
+    def __init__(self, validator, found):
+        self._validator = validator
+        self.unenforced = tuple((keyword, where) for keyword, where, _ in found)
+
+    def validate(self, value):
+        self._validator.validate(value)
+
+
 # Keywords that apply further schemas to the instance a schema describes.
 IN_PLACE_APPLICATORS = {
     "allOf",
@@ -299,8 +513,8 @@ def _extended(node):
 
 
 def _strict_schema(schema):
-    """The schema a strict tool's arguments are generated to, as vLLM and
-    SGLang generate them with XGrammar's strict mode: an object that does not
+    """The schema a strict tool's arguments are generated to, as XGrammar's
+    strict mode generates them: an object that does not
     say which properties it takes beyond those it declares takes none, and
     an array that does not say which items it takes beyond its leading ones
     takes none.
@@ -836,7 +1050,7 @@ def _tags(syntax, *tags):
 
 
 def _function_opening(syntax, name):
-    """What follows TOOL_CALL_OPEN in a grammar's call of tool `name`, up to
+    """What follows the call's tag in a grammar's call of tool `name`, up to
     its arguments: the tags around the name, and the name as text."""
     if syntax.tags_are_tokens:
         return " ".join(
@@ -875,9 +1089,22 @@ def _value_terminals(syntax):
     return [f"RAW_VALUE: {_RAW_VALUE} & ~{spelled}"]
 
 
+def _json_arguments(schema):
+    """The arguments of a call of the "json" kind (ToolCallSyntax.arguments):
+    one JSON value of `schema`."""
+    return (
+        "%llguidance {}\nstart: %json "
+        + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":"))
+        + "\n"
+    )
+
+
 def _free_arguments(syntax):
     """The arguments of a tool that is not strict: parameters in the chat
-    template's tags, each with any name and raw text."""
+    template's tags, each with any name and raw text, or for a call of the
+    "json" kind any object."""
+    if syntax.arguments == "json":
+        return _json_arguments({"type": "object"})
     key_open, key_close = _key_tags(syntax)
     rules = [
         "%llguidance {}",
@@ -1015,28 +1242,67 @@ def _reasoning(thinking, chat_format):
     close = f"<[{chat_format.think_end_id}]>"
     if thinking:
         return "think ", f"think: TEXT {close} WS"
-    if chat_format.think_start_id is not None:
-        return "think? ", f"think: <[{chat_format.think_start_id}]> TEXT {close} WS"
+    if chat_format.think_start_ids:
+        opening = " ".join(f"<[{token}]>" for token in chat_format.think_start_ids)
+        return "think? ", f"think: {opening} TEXT {close} WS"
     return "", None
+
+
+def _written_tags(chat_format, text):
+    """`text`, a text frame or close of the chat format, as a grammar writes
+    it: its visible tags (special tokens, ChatFormat.frame_tags), each as its
+    token."""
+    return " ".join(chat_format.frame_tags(text))
+
+
+def _answer(schema, chat_format):
+    """A JSON answer of `schema`, in the frame of the answer's text where the
+    chat format frames it (text_frames, text_close)."""
+    answer = "%json " + json.dumps(
+        _grammar_compatible_schema(schema), separators=(",", ":")
+    )
+    if chat_format.text_frames:
+        opening = _written_tags(chat_format, chat_format.text_frames[0])
+        close = _written_tags(chat_format, chat_format.text_close)
+        answer = f"{opening} {answer} {close}"
+    return answer
+
+
+def _answer_text(chat_format):
+    """The answer's text as a grammar item, and its rule: TEXT, where the
+    answer is the text outside other blocks; blocks of it in their frame
+    where the chat format frames it."""
+    if not chat_format.text_frames:
+        return "TEXT", None
+    opening = _written_tags(chat_format, chat_format.text_frames[0])
+    close = _written_tags(chat_format, chat_format.text_close)
+    return "texts", f"texts: ({opening} TEXT {close})*"
 
 
 def json_grammar(schema, thinking, *, chat_format):
     """The output grammar of a request with a response schema and no tools:
-    the reasoning chat_format lets come first (_reasoning), then the JSON."""
+    the reasoning chat_format lets come first (_reasoning), then the JSON,
+    in the answer's frame where the format has one."""
     think, think_rule = _reasoning(thinking, chat_format)
     grammar = [
         "%llguidance {}",
-        f"start: {think}%json "
-        + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":")),
+        f"start: {think}{_answer(schema, chat_format)}",
     ]
     if think_rule is not None:
         grammar.append(think_rule)
-        grammar.append(_text_rule(THINK_END))
+        grammar.append(_text_rule(chat_format.think_close))
     grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
 
 
 def normalize_response_format(value):
+    """A request's response schema and the validator of its complete answer.
+    A schema whose json_schema.strict is true (OpenAI's default is false in
+    Chat and Responses; Messages, whose structured outputs are always strict,
+    sets it) is refused with a keyword the grammar does not enforce. Any
+    other is best effort, as OpenAI's strict false: the grammar enforces what
+    it can, and the answer is checked against that alone
+    (BestEffortValidator)."""
     if value in (None, {"type": "text"}):
         return None, None
     if not isinstance(value, dict):
@@ -1058,13 +1324,26 @@ def normalize_response_format(value):
         validator = build_validator(schema)
     except SchemaError as error:
         raise APIError(400, f"invalid response schema: {error.message}") from error
+    strict = kind == "json_schema" and value["json_schema"].get("strict")
+    if strict is not None and not isinstance(strict, bool):
+        raise APIError(400, "response_format.json_schema.strict must be a boolean")
+    if found := unenforced_keywords(schema):
+        if strict:
+            raise APIError(400, f"unsupported output schema: {found[0][2]}")
+        try:
+            enforced = build_validator(_enforced_schema(schema, found))
+        except SchemaError as error:
+            raise APIError(400, f"invalid response schema: {error.message}") from error
+        validator = BestEffortValidator(enforced, found)
     return schema, validator
 
 
 def _check_tool_schema(name, schema):
     """Refuse strict tool `name`'s schema, from which its grammar is built, if
     it nests too deep, refers to another document or breaks its dialect's
-    meta-schema."""
+    meta-schema. A keyword its grammar does not enforce is left out of the
+    grammar (_grammar_compatible_schema), as a call is not validated after
+    it: clients send strict tools with look-around patterns on every turn."""
     _check_depth(schema, f"invalid tool schema for {name}")
     if ref := _remote_ref(schema):
         raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
@@ -1146,7 +1425,9 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
             strict=frozenset(),
             constrained=True,
             namespaces=namespaces or {},
+            declared=frozenset(schemas),
         )
+    declared = frozenset(schemas)
     if isinstance(choice, dict):
         function = choice.get("function", {})
         name = function.get("name") if isinstance(function, dict) else None
@@ -1179,6 +1460,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         strict=strict,
         constrained=choice != "auto" or not parallel or bool(strict),
         namespaces=namespaces or {},
+        declared=declared,
     )
     return offered, policy
 
@@ -1195,10 +1477,18 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
     auto choice, a response schema admits its JSON answer instead of the
     calls."""
     syntax = chat_format.call_syntax
-    strict_arguments = {
-        name: _argument_grammar(policy.argument_schemas[name], syntax)
-        for name in policy.strict
-    }
+    if syntax.arguments == "json":
+        strict_arguments = {
+            name: _json_arguments(
+                _strict_schema(_json_type_names(policy.schemas[name]))
+            )
+            for name in policy.strict
+        }
+    else:
+        strict_arguments = {
+            name: _argument_grammar(policy.argument_schemas[name], syntax)
+            for name in policy.strict
+        }
     side_grammars = []
     if len(strict_arguments) < len(policy.schemas):
         side_grammars.append(
@@ -1207,6 +1497,9 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
     closing = (
         f" {_tags(syntax, syntax.arguments_close)}" if syntax.arguments_close else ""
     )
+    if syntax.arguments == "json":
+        # The call's object closes after its arguments.
+        closing = ' "}"'
     calls = []
     for index, name in enumerate(policy.schemas):
         arguments = "free_arguments"
@@ -1215,38 +1508,38 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
             side_grammars.append(
                 {"name": arguments, "lark_grammar": strict_arguments[name]}
             )
+        opening = _function_opening(syntax, name)
+        if syntax.arguments == "json":
+            opening += " " + json.dumps(syntax.json_prefix(name))
         calls.append(
-            f"call_{index}: {TOOL_CALL_OPEN} {_function_opening(syntax, name)} "
-            f"@{arguments}{closing} {TOOL_CALL_CLOSE}"
+            f"call_{index}: {syntax.call_tag} {opening} "
+            f"@{arguments}{closing} {syntax.call_close}"
         )
     call = "(" + " | ".join(f"call_{index}" for index in range(len(calls))) + ")"
+    text, text_rule = _answer_text(chat_format)
     if not calls:
         # tool_choice "none": neither the text nor a JSON answer starts a call.
-        body = "TEXT" if response_schema is None else "answer"
+        body = text if response_schema is None else "answer"
     elif policy.required or response_schema is not None:
         # A call comes first.
-        body = f"{call} " + (f"(TEXT {call})* TEXT" if policy.parallel else "WS")
+        body = f"{call} " + (f"({text} {call})* {text}" if policy.parallel else "WS")
         if not policy.required:
             body = f"(({body}) | answer)"
     else:
-        body = f"(TEXT {call})* TEXT" if policy.parallel else f"TEXT ({call} WS)?"
+        body = f"({text} {call})* {text}" if policy.parallel else f"{text} ({call} WS)?"
     think, think_rule = _reasoning(thinking, chat_format)
     main = ["%llguidance {}", f"start: {think}{body}"]
     if response_schema is not None and not policy.required:
-        main.append(
-            "answer: %json "
-            + json.dumps(
-                _grammar_compatible_schema(response_schema), separators=(",", ":")
-            )
-            + " WS"
-        )
+        main.append(f"answer: {_answer(response_schema, chat_format)} WS")
     if think_rule is not None:
         main.append(think_rule)
+    if text_rule is not None:
+        main.append(text_rule)
     main.extend(
         [
             *calls,
             WHITESPACE_RULE,
-            _text_rule(TOOL_CALL_OPEN, THINK_END),
+            _text_rule(syntax.call_tag, chat_format.think_close),
         ]
     )
     side_grammars.insert(

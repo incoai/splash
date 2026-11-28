@@ -153,17 +153,23 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"recalibrate_ane", [](NativeArguments &read) { read.recalibrateAne = true; }},
       {"activations_bf16", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // The defaults the server leaves out are the engine's: each meaning
       // names the value, so a change of the engine's default fails it.
       {"verify_rows_auto", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::Auto; }},
       {"activations_auto", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::On; }},
+      {"max_concurrent_requests", [](NativeArguments &read) { read.lanes = 8; }},
+      {"max_concurrent_requests_default", [](NativeArguments &read) { read.lanes = 4; }},
       {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
       {"state_format_default",
        [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
       {"cached_states_exact", [](NativeArguments &read) { read.exactCachedStates = true; }},
       {"cached_states_default", [](NativeArguments &read) { read.exactCachedStates = false; }},
+      {"weights_auto", [](NativeArguments &read) { read.weights = model::gguf::Float16Weights::Q8_0; }},
+      {"weights_default",
+       [](NativeArguments &read) { read.weights = model::gguf::Float16Weights::Published; }},
       // A relaunch asks for the first engine's context beside that engine's
       // MAX_CONTEXT: it is planned as that engine was, and serves what its
       // plan holds of the context.
@@ -211,10 +217,12 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
+           read.neuralEngine == meant.neuralEngine && read.recalibrateAne == meant.recalibrateAne &&
+           read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
-           read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations;
+           read.kvSpillAlways == meant.kvSpillAlways &&
+           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations &&
+           read.weights == meant.weights && read.lanes == meant.lanes;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -240,11 +248,12 @@ void testNeuralEngine() {
           "--ane did not reach the arguments as given");
 }
 
-// Activations may round to int8 unless --activations bf16 keeps them bf16;
-// --activations auto, which the server never writes, keeps the rule.
+// Activations may round to int8 under --activations auto and stay bf16 under
+// --activations bf16; without the option the arguments name neither, and the
+// model's family gives its default (ModelDescriptor::activations).
 void testInt8Activations() {
   const ModelDirectory model;
-  require(parse(model, {"auto", "auto"}).int8Activations == ops::Int8Activations::On &&
+  require(!parse(model, {"auto", "auto"}).int8Activations &&
               parse(model, {"auto", "auto", "--activations", "auto"}).int8Activations == ops::Int8Activations::On &&
               parse(model, {"auto", "auto", "--activations", "bf16"}).int8Activations == ops::Int8Activations::Off,
           "--activations did not reach the arguments as given");
@@ -269,16 +278,6 @@ void testStreamedMemoryAndSpill() {
               !automatic.sparseKvMemory && !automatic.kvSpillAlways,
           "auto did not leave the stores to the planner");
   require(parse(model, {"auto", "auto", "--kv-spill", "always"}).kvSpillAlways, "--kv-spill always was not read");
-}
-
-// A windowed target trims the pages every window has passed unless
-// --kv-window-trim off, which only validation passes, keeps them Full.
-void testWindowTrim() {
-  const ModelDirectory model;
-  require(parse(model, {"auto", "auto"}).kvWindowTrim &&
-              parse(model, {"auto", "auto", "--kv-window-trim", "on"}).kvWindowTrim &&
-              !parse(model, {"auto", "auto", "--kv-window-trim", "off"}).kvWindowTrim,
-          "--kv-window-trim did not reach the arguments as given");
 }
 
 // A command line the server never writes is refused with what is wrong.
@@ -310,8 +309,14 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  refuses({"auto", "auto", "--ane-calibration", "on"}, "--ane-calibration requires again");
   for (const char *value : {"on", "off", "BF16", ""})
     refuses({"auto", "auto", "--activations", value}, "--activations requires auto or bf16");
+  for (const char *value : {"q8", "published", "16", "AUTO", "bf16", ""})
+    refuses({"auto", "auto", "--weights", value}, "--weights requires original or auto");
+  for (const char *requests : {"0", "9", "-1", "eight", ""})
+    refuses({"auto", "auto", "--max-concurrent-requests", requests},
+            "--max-concurrent-requests requires an integer in [1, 8]");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
   // The server passes bytes, auto or off.
@@ -324,8 +329,7 @@ void testRefusals() {
     refuses({"auto", "auto", "--sparse-kv-memory", size}, "--sparse-kv-memory requires a positive byte count or auto");
   for (const char *spill : {"never", "auto", ""})
     refuses({"auto", "auto", "--kv-spill", spill}, "--kv-spill requires always");
-  for (const char *trim : {"never", "auto", ""})
-    refuses({"auto", "auto", "--kv-window-trim", trim}, "--kv-window-trim requires on or off");
+  refuses({"auto", "auto", "--kv-window-trim", "off"}, "unexpected argument --kv-window-trim");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
@@ -424,7 +428,6 @@ int main(int argc, char **argv) {
     testInt8Activations();
     testVerifyRows();
     testStreamedMemoryAndSpill();
-    testWindowTrim();
     testRefusals();
     testARelaunchKeepsItsFirstEnginesMaxContext();
     std::cout << "native arguments tests passed\n";

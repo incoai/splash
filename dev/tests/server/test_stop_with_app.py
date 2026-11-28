@@ -11,6 +11,8 @@ import time
 import unittest
 from unittest import mock
 
+import transformers
+
 from dev.tests.server_fixtures import (
     NO_THINKING_END,
     keep_stop_signals,
@@ -101,13 +103,14 @@ class StopWithAppTest(unittest.TestCase):
             mock.patch.object(api, "FrontendServer"),
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(transformers.AutoTokenizer, "from_pretrained"),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ),
             mock.patch.object(api, "NativeBackend", return_value=backend),
+            mock.patch.object(api, "ConstraintFactory"),
             mock.patch.object(api, "print_status"),
         ):
             api.main()

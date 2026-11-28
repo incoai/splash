@@ -32,7 +32,6 @@ from __future__ import annotations
 import functools
 import json
 import os
-import signal
 import sys
 import tempfile
 from contextlib import redirect_stdout
@@ -64,7 +63,8 @@ def prepare_local_model(
     serves images; a GGUF target serves text only without one, as one of a
     family without a vision tower (Flint) always does. An MLX target's
     vision tower is in its checkpoint, and it serves images unless
-    language_only.
+    language_only, or unless the engine refuses its tower and its family
+    serves text instead (Inkling-2-Mini), which a printed line says.
     language_only: serve text only.
     models_dir: where prepared models are kept, Splash's own models
     directory by default. Preparations there run one at a time, beside the
@@ -72,15 +72,16 @@ def prepare_local_model(
 
     The directory links the files and never changes. Preparing the same
     files again returns it again, reading only their metadata, sizes and
-    times; the first preparation reads each file outside the Hugging Face
-    cache once, for its digest. Once a file changes, or a download moves the
-    draft's default branch, preparing again returns another directory: serve
-    that one. The server holds the directory it serves until it exits, and
-    takes models_dir's installation lock to hold it when it starts, so it
-    needs write access there; a directory a later preparation no longer
-    returns is removed only once no server holds it, with the files of its
-    Hub snapshots no other installation links, unless another tool shares
-    the snapshot.
+    times, and a vision tower's weights, which the engine prepares each time
+    (under a second); the first preparation reads each file outside the
+    Hugging Face cache once, for its digest. Once a file changes, or a
+    download moves the draft's default branch, preparing again returns
+    another directory: serve that one. The server holds the directory it
+    serves until it exits, and takes models_dir's installation lock to hold
+    it when it starts, so it needs write access there; a directory a later
+    preparation no longer returns is removed only once no server holds it,
+    with the files of its Hub snapshots no other installation links, unless
+    another tool shares the snapshot.
 
     A ModelError, "cannot prepare TARGET: REASON", refuses the files Splash
     cannot serve without a download (a missing file, an unsupported format,
@@ -124,11 +125,35 @@ def _prepare(target, draft, mmproj, language_only, models_root):
     )
     with tempfile.TemporaryDirectory(prefix="splash-target-") as scratch:
         source, inspected = _inspect(target, mmproj, language_only, Path(scratch))
+        inspected = _prepared_tower(target, mmproj, source, inspected, Path(scratch))
         repo = _draft(inspected.family, draft)
         files = upstream.draft_files(repo, inspected)
     files |= {path: source.paths[name] for path, name in inspected.files.items()}
     record = upstream.assembly_record(str(target), inspected, source, repo)
     return upstream.publish(models_root, link, record, files)
+
+
+def _prepared_tower(target, mmproj, source, inspected, scratch):
+    """inspected once the engine prepared its tower from source's files: a
+    GGUF's mmproj, named, is refused where it cannot (upstream.check_vision);
+    an MLX target of a family that serves text instead serves text
+    (upstream.prepared_tower)."""
+    try:
+        if mmproj:
+            upstream.check_vision(inspected, source.paths, scratch)
+            return inspected
+        checked = upstream.prepared_tower(
+            inspected,
+            source.paths,
+            scratch,
+            lambda: upstream.mlx_target(source, True),
+        )
+    except models.VisionError as error:
+        fix = "omit mmproj" if mmproj else "pass language_only=True"
+        raise models.VisionError(f"{error}; {fix} to serve text only") from None
+    if checked is not inspected:
+        print(f"{target} serves text only: {checked.vision_note}.", flush=True)
+    return checked
 
 
 def _path(value) -> Path:
@@ -152,11 +177,19 @@ def _inspect(target, mmproj, language_only, scratch):
                     "target keeps its vision tower in its checkpoint"
                 )
             try:
-                return repo, upstream.mlx_target(repo, language_only)
+                inspected = upstream.with_text_fallback(
+                    lambda text_only: upstream.mlx_target(repo, text_only),
+                    language_only,
+                )
             except models.VisionError as error:
                 raise models.VisionError(
                     f"{error}; pass language_only=True to serve text only"
                 ) from None
+            if inspected.vision_note:
+                print(
+                    f"{target} serves text only: {inspected.vision_note}.", flush=True
+                )
+            return repo, inspected
         directory, names = target, _gguf_in(repo.files)
     elif target.is_file():
         if not target.name.endswith(".gguf"):
@@ -236,17 +269,19 @@ def _entry(target, names):
     )
 
 
-def _projector(mmproj, repo):
+def _projector(mmproj, repo, family):
     """mmproj's name and header in repo, if it is a vision projector Splash
-    loads (upstream.read_projector); a refusal names mmproj."""
+    loads for family's tower (upstream.read_projector,
+    ModelFamily.projectors); a refusal names mmproj."""
     try:
         header, precision, kind = upstream.read_projector(repo, mmproj.name)
     except ModelError as error:
         raise models.VisionError(f"{mmproj}: {error}") from None
-    if precision is None:
+    if precision not in family.projectors:
         raise models.VisionError(
-            f"{mmproj} ({kind}) is not a vision projector Splash loads, a clip "
-            "model of BF16, F32 or F16 weights"
+            f"{mmproj} ({kind}) is not a vision projector Splash loads for "
+            f"{family.name}, a clip model of {upstream.either(family.projectors)} "
+            "weights"
         )
     return mmproj.name, header
 
@@ -287,7 +322,7 @@ def _main(argv=None):
     parser.add_argument("--language-only", action="store_true")
     args = parser.parse_args(argv)
     try:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+        models.take_stop_signals()
         with redirect_stdout(sys.stderr):
             prepared = _prepare_paths(
                 _path(args.target),
@@ -303,8 +338,8 @@ def _main(argv=None):
     except OSError as error:
         print(json.dumps(serve_record.failure(serve_record.INTERNAL, str(error))))
         return 1
-    except KeyboardInterrupt:
-        return 130
+    except models.Stopped as stop:
+        return 128 + stop.number
     return 0
 
 

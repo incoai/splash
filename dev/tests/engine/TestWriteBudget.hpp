@@ -12,7 +12,7 @@
 namespace splash::test {
 
 // Writes one page through a file of `budget`, as another writer of the tier
-// would: a state in use, whose write passes a spent budget too.
+// would, overdrawing a budget that had less.
 inline void spendWriteBudget(const std::shared_ptr<model::DiskBudget> &budget) {
   model::SlotFile file(kHostPageBytes, budget);
   const std::vector<std::byte> payload(kHostPageBytes, std::byte{1});
@@ -21,10 +21,11 @@ inline void spendWriteBudget(const std::shared_ptr<model::DiskBudget> &budget) {
 
 // A disk budget whose write budget refills on a clock the test moves: two
 // host pages a day, half a page at once, so that spend() overdraws a full
-// budget for a quarter of a day. The test links model/SlotFile.cpp.
+// budget by half a page, and it takes writes again once it holds an eighth of
+// its half page, 9/32 of a day later. The test links model/SlotFile.cpp.
 class WriteBudget final {
 public:
-  static constexpr double kRefillMilliseconds = 21'600'000.0;
+  static constexpr double kRefillMilliseconds = 24'300'000.0;
   static constexpr double kDayMilliseconds = 86'400'000.0;
 
   explicit WriteBudget(uint64_t quotaBytes = uint64_t{1} << 30)

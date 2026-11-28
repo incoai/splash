@@ -44,7 +44,8 @@ struct ChatStoreTests {
     /// A message the server refuses goes back to the composer before what was typed there since,
     /// which stays; a reply asked again gives no text back.
     @Test func aRefusedMessageGoesBackBeforeWhatWasTypedSince() {
-        let draft = Draft(files: FileManager.default.temporaryDirectory.appending(path: "splash-draft-\(UUID().uuidString)"))
+        let files = FileManager.default.temporaryDirectory.appending(path: "splash-draft-\(UUID().uuidString)")
+        let draft = Draft(files: files, kept: files.appending(path: "Drafts.plist")) { nil }
         let refused = ChatStore.Refused(text: "Summarize this", attachments: [], reason: "Too large", conversation: nil)
         draft.text = "and then this"
         draft.restore(refused)

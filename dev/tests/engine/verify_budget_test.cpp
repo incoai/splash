@@ -20,6 +20,7 @@
 // is a draft's block a lane; a table's line recalls its costs, and a line of
 // another table's points none.
 #include "TestChecks.hpp"
+#include "model/Model.hpp"
 #include "model/StepCosts.hpp"
 #include "model/VerifyBudget.hpp"
 
@@ -36,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 using splash::model::CostLine;
@@ -290,8 +292,8 @@ void invalidInputs() {
   VerifyBudget budget;
   const VerifyBudget::Lane lane;
   rejects([&] { budget.observe({}); }, "invalid verify budget cycle", "an empty cycle was observed");
-  const std::vector<VerifyBudget::Lane> five(5, lane);
-  rejects([&] { budget.observe(five); }, "invalid verify budget cycle", "five lanes were observed");
+  const std::vector<VerifyBudget::Lane> tooMany(VerifyBudget::kLanes + 1, lane);
+  rejects([&] { budget.observe(tooMany); }, "invalid verify budget cycle", "more lanes than a step holds were observed");
   for (const VerifyBudget::Label &label : {VerifyBudget::Label{kPositions, 0.0F, true}, {0, NAN, true}}) {
     VerifyBudget::Lane bad = lane;
     bad.labels = {label};
@@ -404,11 +406,12 @@ void risingPoints() {
 }
 
 // A point's cost is the median of its replays: a replay five times as slow
-// moves no point and leaves the measurement's spread none; two replays of a
-// point a tenth past its third, as a MoE target's routing moves them, leave
-// it steady (StepCosts::kSteadySpread), and two 30% past it, as other work
-// slows them, do not; an even count's is the mean of its middle two; and a
-// lane count is measured once every point has a cost.
+// moves no point; an even count's is the mean of its middle two; and a lane
+// count is measured once every point has a cost. A measured table is stale
+// where its largest step costs more than StepCosts::kStale past the median
+// of that step's replays now (a table measured on a busy Mac), and stays
+// where it costs that or less (now slower: other work only slows a step);
+// forgetting leaves every lane count unmeasured.
 void replaysMedian() {
   StepCosts costs(kClasses, 64, false);
   for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes) {
@@ -418,24 +421,29 @@ void replaysMedian() {
     for (size_t point = 0; point < points; ++point)
       for (uint32_t replay = 0; replay < StepCosts::kReplays; ++replay)
         replays[replay][point] = (10.0 + double(point)) * (replay == point % StepCosts::kReplays ? 5.0 : 1.0);
-    const double spread = costs.measure(lanes, replays);
+    costs.measure(lanes, replays);
     require(costs.measured(lanes), "a measured lane count was not measured");
     for (size_t point = 0; point < points; ++point)
       require(costs.points(lanes)[point].milliseconds == 10.0 + double(point),
               "a slow replay moved the cost of a point of " + std::to_string(lanes) + " lanes");
-    require(spread == 0.0, "a slow replay spread a measurement of " + std::to_string(lanes) + " lanes");
-    for (const double slower : {1.1, 1.3}) {
-      std::vector<std::vector<double>> slowed(StepCosts::kReplays, std::vector<double>(points, 10.0));
-      slowed[1].back() = slowed[2].back() = 10.0 * slower;
-      const double apart = costs.measure(lanes, slowed);
-      require(std::abs(apart - (slower - 1.0)) < 1e-9 && (apart <= StepCosts::kSteadySpread) == (slower < 1.2),
-              "two replays " + std::to_string(slower) + " times their third's spread a measurement " +
-                  std::to_string(apart));
+    const double largest = 10.0 + double(points - 1);
+    for (const auto &[now, stale] : std::initializer_list<std::pair<double, bool>>{
+             {largest, false}, {largest / 1.19, false}, {largest / 1.21, true}, {largest * 3.0, false}}) {
+      // One fast replay and one five times as slow leave the median at `now`.
+      const std::array<double, StepCosts::kReplays> check{now * 5.0, now, now / 2.0};
+      require(StepCosts::stale(costs.level(lanes, check)) == stale, "a table " + std::to_string(largest / now) +
+                                                                       " times its largest step now was judged " +
+                                                                       (stale ? "current" : "stale"));
     }
     costs.measure(lanes,
                   std::vector<std::vector<double>>{std::vector<double>(points, 4.0), std::vector<double>(points, 6.0)});
     require(costs.points(lanes).front().milliseconds == 5.0, "two replays' median is not their mean");
   }
+  costs.forget();
+  for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes)
+    require(!costs.measured(lanes), "a forgotten table stayed measured");
+  rejects([&] { static_cast<void>(costs.level(1, std::array<double, 1>{1.0})); }, "invalid level check",
+          "an unmeasured table's level was checked");
 }
 
 // The step of a measured table, by brute force over every T the lanes'
@@ -477,7 +485,7 @@ void choiceOverTheTable() {
       return cost(laneCount, p.last, p.cap);
     });
     const StepCosts::Choice got = costs.choose(spansOf(curves));
-    const uint32_t most = std::min(lanes * kBlock, mostRows), narrow = lanes * kNarrow;
+    const uint32_t most = std::min(lanes * kBlock, mostRows), narrow = std::min(lanes * kNarrow, most);
     std::vector<uint32_t> starts(std::begin(kClasses), std::end(kClasses));
     starts.push_back(narrow + 1);
     std::ranges::sort(starts);
@@ -862,11 +870,12 @@ void costLineFitsTheSamples() {
   for (uint32_t lanes = 1; lanes <= CostLine::kLanes; ++lanes) {
     CostLine costs(kStreamedClasses);
     // The seed's floor: 0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15 and 0.6 / 2.8 at
-    // one to four lanes.
+    // one to four lanes, and four lanes' 0.6 / 2.8 past them (their seed).
     const double seedSlope = (1.0 - CostLine::seed(lanes, lanes)) / (7.0 * lanes);
     const double seedFloor = seedSlope * lanes / CostLine::seed(lanes, lanes);
     require(!costs.line(lanes, false) && std::fabs(costs.floor(lanes, false) - seedFloor) <= 1e-12 &&
-                std::fabs(seedFloor - std::array{0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15, 0.6 / 2.8}[lanes - 1]) <= 1e-12,
+                std::fabs(seedFloor - std::array{0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15, 0.6 / 2.8}[std::min(lanes, 4U) - 1]) <=
+                    1e-12,
             std::to_string(lanes) + " lanes: before a sample the cost line had a fit, or its floor is not the seed's");
     std::mt19937_64 random(0xc057 + lanes);
     std::uniform_int_distribution<uint32_t> rowsOf(lanes, lanes * CostLine::kBlockRows);
@@ -1100,16 +1109,21 @@ void invalidSteps() {
   // Four lanes of four rows hold their anchors alone.
   rejects([&] { StepCosts costs(kClasses, StepCosts::kLanes, false); }, "hold nothing past its lanes' anchors",
           "a table of the anchors alone was made");
-  // The startup runway's 64 pages from page 5 hold four lanes of 26 points,
-  // not of 27; a class every row makes 61 at four lanes, while a MoE
-  // target's table of kClasses fits.
-  require(5 + 4 * StepCosts::lanePages(26) <= 64 && 5 + 4 * StepCosts::lanePages(27) > 64,
-          "the runway holds other lanes than a measurement lays");
+  // The startup runway of a runtime's lanes holds each lane count's
+  // measurement from page 5 (ExecutionLimits::runwayPages): four lanes' 64
+  // pages hold four lanes of 14 points, a MoE target's most today, eight
+  // lanes' 128 eight lanes of 14 at 128 rows a step; a table of a class every
+  // row makes runs past eight lanes' and is refused.
+  using splash::model::ExecutionLimits;
+  static_assert(ExecutionLimits::runwayPages(32, 1, 1) == 64 && ExecutionLimits::runwayPages(32, 4, 1) == 64 &&
+                ExecutionLimits::runwayPages(32, 8, 1) == 128 && ExecutionLimits::runwayPages(128, 5, 1) == 128);
   std::vector<uint32_t> everyRow;
-  for (uint32_t row = 1; row <= 64; ++row) everyRow.push_back(row);
-  rejects([&] { StepCosts(everyRow, 64, false).requireRunway(5, 64); }, "more pages than the startup runway",
+  for (uint32_t row = 1; row <= 128; ++row) everyRow.push_back(row);
+  const StepCosts every(everyRow, 128, false), moe(kClasses, 128, true), four(kClasses, 64, true);
+  rejects([&] { every.requireRunway(5, ExecutionLimits::runwayPages(128, 8, 1), 8); }, "startup runway",
           "a table whose measurement runs past the startup runway was taken");
-  StepCosts(kClasses, 64, true).requireRunway(5, 64);
+  moe.requireRunway(5, ExecutionLimits::runwayPages(32, 8, 1), 8);
+  four.requireRunway(5, ExecutionLimits::runwayPages(32, 4, 1), 4);
   StepCosts costs(kClasses, 64, false);
   const size_t points = costs.points(2).size();
   for (const std::vector<std::vector<double>> &replays :
@@ -1118,7 +1132,7 @@ void invalidSteps() {
         {std::vector<double>(points, NAN)}})
     rejects([&] { costs.measure(2, replays); }, "invalid step replays", "impossible replays were measured");
   require(!costs.measured(2), "refused replays measured a lane count");
-  for (const uint32_t lanes : {0U, 5U}) {
+  for (const uint32_t lanes : {0U, StepCosts::kLanes + 1}) {
     rejects([&] { static_cast<void>(costs.points(lanes)); }, "invalid step lane count",
             "points of an impossible lane count were given");
     rejects([&] { costs.measure(lanes, std::vector<std::vector<double>>{std::vector<double>(points, 1.0)}); },
@@ -1145,7 +1159,7 @@ void invalidSteps() {
   const std::vector<std::vector<float>> two(2);
   rejects([&] { static_cast<void>(line.choose(spansOf(two), std::vector<uint32_t>{8}, false)); },
           "a step's lanes hold no rows of their own", "lanes that hold no rows of their own took a step");
-  for (const uint32_t lanes : {0U, 5U}) {
+  for (const uint32_t lanes : {0U, StepCosts::kLanes + 1}) {
     rejects([&] { static_cast<void>(line.floor(lanes, false)); }, "invalid cost line lane count",
             "an impossible lane count had a floor");
     rejects([&] { line.observe(lanes, false, 4, 4, 10.0); }, "invalid cost line lane count",

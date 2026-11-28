@@ -7,16 +7,21 @@ import SwiftUI
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
-    /// The Advanced row, which opening it scrolls to the top, the options under it in view.
-    @State private var row = ScrollTarget()
+    /// The Advanced row, which opening it scrolls to the top, the options under it in view, and
+    /// closing it leaves where it is.
+    @State var row = ScrollTarget()
 
     var body: some View {
         let family = state.family(of: state.selection)
         GroupedSection {
             ForEach(Self.options(.main, for: family)) { OptionRow(option: $0, family: family) }
+            // What the model running pays in context for answering more requests at once than four.
+            if state.server.phase == .ready, let cost = state.server.lanesCost {
+                LanesCostNote(cost: cost)
+            }
             DisclosureRow(title: "Advanced", open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
-                .onChange(of: advanced) { if advanced { row.scrollToTop() } }
+                .onChange(of: advanced) { if advanced { row.scrollToTop() } else { row.stop() } }
             if advanced {
                 ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
                     let options = Self.options(section, for: family)
@@ -30,7 +35,18 @@ struct LaunchOptions: View {
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
                             .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 6))
-                        ForEach(options) { OptionRow(option: $0, family: family) }
+                        ForEach(options) { option in
+                            if option.flag == "--sampling-default" {
+                                SamplingRows(family: family)
+                            } else {
+                                OptionRow(option: option, family: family)
+                            }
+                        }
+                        // The server running says when the cache its options asked for is off:
+                        // the options show what they ask for, whatever the server made of it.
+                        if section == .cache, state.server.phase == .ready, let off = state.server.cacheOff {
+                            CacheOffNote(reason: off)
+                        }
                     }
                 }
             }
@@ -54,6 +70,12 @@ struct LaunchOptions: View {
                     .accessibilityHidden(!changed)
             }
         }
+        // Two points SwiftUI moves frame by frame, at the card's top and its foot, which the options
+        // Advanced opens push down, and the card's height as laid out: the scroll to the options
+        // goes as far as the foot has gone toward where the layout puts it.
+        .background(alignment: .top) { ViewAnchor { row.top = $0 }.frame(width: 1, height: 1) }
+        .background(alignment: .bottom) { ViewAnchor { row.pushed = $0 }.frame(width: 1, height: 1) }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { row.height = $0 }
     }
 
     /// The options of `section` the models of `family` can use.
@@ -68,6 +90,35 @@ extension EnvironmentValues {
     /// What the launch option of the row the view is in lacks to apply, while it doesn't
     /// (`LaunchOption.lacks`).
     @Entry var optionRowNeeds: String?
+}
+
+/// What the server running pays in context for a concurrency limit past four.
+private struct LanesCostNote: View {
+    let cost: Server.LanesCost
+
+    var body: some View {
+        Label("The model running answers \(cost.lanes) requests at once, which leaves \(ContextLength.title(cost.context)) of context; 4 would leave \(ContextLength.title(cost.defaultContext)).",
+              systemImage: "info.circle")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Why the server running has the SSD cache off though its options asked for one, in the
+/// engine's words, as on a disk with too little room beyond the space it keeps free.
+private struct CacheOffNote: View {
+    let reason: String
+
+    var body: some View {
+        Label("The model running has the SSD cache off: \(reason).", systemImage: "exclamationmark.triangle.fill")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .symbolRenderingMode(.multicolor)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
 }
 
 /// An option's name, with an info button that shows what it does, and what it needs while it is
@@ -124,6 +175,29 @@ private struct OptionLabeled<Content: View>: View {
     }
 }
 
+/// The sampling settings, a field each for what requests that set none get: temperature, top P and
+/// top K, whose empty fields show what the model picked uses, and the others under More sampling.
+private struct SamplingRows: View {
+    let family: ModelFamily
+    @State private var more = false
+
+    var body: some View {
+        ForEach(Sampling.main) { row($0) }
+        DisclosureRow(title: "More sampling", open: $more)
+        if more {
+            ForEach(Sampling.more) { row($0) }
+        }
+    }
+
+    private func row(_ setting: Sampling.Setting) -> some View {
+        let field = LaunchOption.Value(prompt: Sampling.placeholder(setting, family), message: setting.message,
+                                       parse: { Sampling.parse(setting, $0) })
+        return OptionRow(option: LaunchOption(flag: "--sampling-default", title: setting.title, help: setting.help, section: .api,
+                                              kind: .text(field, list: false)),
+                         family: family, part: setting)
+    }
+}
+
 /// One launch option, with the control its kind takes; dimmed where the others leave it no effect,
 /// a switch then off, and with what to beware of under it: why the model picked doesn't take the
 /// value kept, too, or that YaRN stretches its window to the value.
@@ -132,11 +206,22 @@ private struct OptionRow: View {
     let option: LaunchOption
     /// The family of the model the options are for.
     let family: ModelFamily
+    /// The part of the option's value the row sets, where it sets a part (a sampling setting);
+    /// nil for the whole value.
+    var part: Sampling.Setting?
     @State private var hovered = false
 
     var body: some View {
         @Bindable var state = state
-        let value = Binding(get: { state.options[option.flag] }, set: { state.options[option.flag] = $0 })
+        let whole = Binding(get: { state.options[option.flag] }, set: { state.options[option.flag] = $0 })
+        let value = part.map { part in
+            Binding(get: { Sampling.values(whole.wrappedValue)[part.name] },
+                    set: { new in
+                        var values = Sampling.values(whole.wrappedValue)
+                        values[part.name] = new
+                        whole.wrappedValue = Sampling.stored(values)
+                    })
+        } ?? whole
         let applies = option.applies(state.options)
         let takes = { family.takes(option.flag, $0) }
         VStack(alignment: .leading, spacing: 6) {
@@ -147,9 +232,13 @@ private struct OptionRow: View {
                                          set: { value.wrappedValue = $0 == on ? "true" : nil })) {
                         OptionLabel(title: option.title, help: option.help)
                     }
-                case .choice(let standard, _, let custom):
-                    ChoicePicker(title: option.title, help: option.help, standard: standard, choices: option.choices(for: family),
-                                 custom: custom, family: family, takes: takes, value: value)
+                case .choice(_, _, let custom):
+                    // A value kept that is the family's default is the menu's default item.
+                    let chosen = Binding(get: { value.wrappedValue == family.standard(option.flag) ? nil : value.wrappedValue },
+                                         set: { value.wrappedValue = $0 })
+                    ChoicePicker(title: option.title, help: option.help, standard: option.standard(for: family),
+                                 standardAt: family.standardIndex(option.flag), choices: option.choices(for: family), custom: custom,
+                                 family: family, takes: takes, value: chosen)
                 case .text(let custom, _):
                     TextRow(title: option.title, help: option.help, custom: custom, takes: takes, value: value)
                 case .folder:
@@ -193,6 +282,9 @@ private struct ChoicePicker: View {
     let title: String
     let help: String
     let standard: String
+    /// Where the default stands among the choices: first, unless the choices have an order of
+    /// their own that it belongs in.
+    var standardAt = 0
     let choices: [(value: String, title: String)]
     let custom: LaunchOption.Value?
     let family: ModelFamily
@@ -208,8 +300,9 @@ private struct ChoicePicker: View {
         let typed = value.flatMap { value in
             choices.contains { $0.value == value } ? nil : custom.map { PopupItem(id: value, title: $0.title(value)) }
         }
-        let items = [PopupItem(id: Self.none, title: standard, badge: "Default")]
-            + choices.map { PopupItem(id: $0.value, title: $0.title) }
+        let offered = choices.map { PopupItem(id: $0.value, title: $0.title) }
+        let at = min(standardAt, offered.count)
+        let items = Array(offered[..<at]) + [PopupItem(id: Self.none, title: standard, badge: "Default")] + Array(offered[at...])
             + [typed].compactMap { $0 }
             + (custom == nil ? [] : [PopupItem(id: Self.other, title: "Custom…", separated: true)])
         OptionLabeled(title: title, help: help) {

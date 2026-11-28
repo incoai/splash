@@ -15,10 +15,11 @@ from . import images as image_input
 from . import protocol as wire
 from . import request_fields, scoring
 from .backend import Job, ReasoningRequest
-from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import REASONING_EFFORTS
 from .chat_messages import normalize_messages, template_messages
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
+    NO_REASONING,
     RESERVED_TEMPLATE_KWARGS,
     render_chat_template,
     template_options,
@@ -34,7 +35,7 @@ from .errors import (
 )
 from .latency import LatencyMetrics
 from .metrics import is_finite_number
-from .output import MAX_STOP_CHARACTERS
+from .output import MAX_STOP_CHARACTERS, KeywordCounts, RejectedCalls
 from .tokenization import PromptTokenizer, tokenizable, unquoted
 from .tool_schema import (
     ToolPolicy,
@@ -46,72 +47,29 @@ from .tool_schema import (
 
 PREPARATION_WAIT_SECONDS = 30.0
 
-MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
-FLOAT32_MAX = float.fromhex("0x1.fffffep127")
-# vLLM raises a nonzero temperature below this to it (_MAX_TEMP in
-# vllm/sampling_params.py); Splash does the same.
+# A nonzero temperature below this samples at it.
 MIN_SAMPLING_TEMPERATURE = 0.01
 
-# The sampling numbers a request may set: each with its default, the value
-# that leaves the logits unchanged, the values the engine accepts and how a
-# 400 names them. The served family's published defaults
-# (Frontend.sampling_defaults) take the place of these. A nonzero top_p or
-# repetition_penalty must not round to zero in the engine's float32, which
-# would make the value invalid.
-SAMPLING_NUMBERS = {
-    "temperature": (
-        1.0,
-        lambda value: 0 <= value <= 2,
-        "a number in [0, 2]",
-    ),
-    "top_p": (
-        1.0,
-        lambda value: MIN_FLOAT32_SUBNORMAL <= value <= 1,
-        "a number in (0, 1]",
-    ),
-    "presence_penalty": (0.0, lambda value: -2 <= value <= 2, "a number in [-2, 2]"),
-    "frequency_penalty": (0.0, lambda value: -2 <= value <= 2, "a number in [-2, 2]"),
-    "repetition_penalty": (
-        1.0,
-        lambda value: MIN_FLOAT32_SUBNORMAL <= value <= FLOAT32_MAX,
-        "a positive number",
-    ),
-    "min_p": (0.0, lambda value: 0 <= value <= 1, "a number in [0, 1]"),
-}
-# With top_k, whose default 0 keeps every token, the table covers every
-# sampling option the frame carries.
-assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
-
-
-def accepts_sampling(name, value):
-    """Whether a request may set the sampling option name to value. A top_k
-    of 0 or -1 keeps every token."""
-    if name == "top_k":
-        return isinstance(value, int) and not isinstance(value, bool) and value >= -1
-    return name in SAMPLING_NUMBERS and (
-        is_finite_number(value) and SAMPLING_NUMBERS[name][1](value)
-    )
-
-
 # Text completions' output budget when max_tokens is omitted: OpenAI's
-# default for the endpoint, which vLLM and SGLang also use.
+# default for the endpoint.
 COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 
-def _generation_prompt(probed, rendered, tokens):
-    """Whether the generation prompt opens a think block, and how many of the
-    prompt's last tokens it is (zero where they differ from its tokens).
-    `probed` is its text and tokens, as the startup probe found them for the
-    request's template options, and the rendered prompt must end with that
-    text."""
+def _generation_prompt(probed, rendered, tokens, chat_format):
+    """Whether the generation prompt opens the chat format's reasoning, and
+    how many of the prompt's last tokens it is (zero where they differ from
+    its tokens). `probed` is its text and tokens, as the startup probe found
+    them for the request's template options, and the rendered prompt must end
+    with that text, which is empty only where the model opens its own message
+    (chat_format.opens_own_message)."""
     text, ids = probed
-    if not text or not rendered.endswith(text):
+    if not (text or chat_format.opens_own_message) or not rendered.endswith(text):
         raise APIError(
             400, "chat template must end with an assistant generation prefix"
         )
     count = len(ids)
     return (
-        text.rfind(THINK_START) > text.rfind(THINK_END),
+        text.rfind(chat_format.think_open) > text.rfind(chat_format.think_close),
         count if count < len(tokens) and tuple(tokens[-count:]) == ids else 0,
     )
 
@@ -138,6 +96,36 @@ class Prompt:
     template_effort: str | None = None
 
 
+def _head_tokens(messages, tools, tokens, openings):
+    """Where the prompt's head ends: its system message and the tools the
+    template renders before any other message, which other conversations of
+    the same agent or app share, end where the first other message opens
+    (ChatFormat.turn_openings, as `openings`' tokens). The engine keeps a
+    state there on first use, so the next conversation resumes past the
+    head rather than prefill it again. Zero without a system message first
+    or tools, and where no turn opens the format's way, as a custom template
+    (--chat-template-file) may write them. A head holds no image: system
+    content is text, and images come in user and tool turns."""
+    system = bool(messages) and messages[0].get("role") == "system"
+    if not (system or tools):
+        return 0
+    end = len(tokens)
+    for ids in openings:
+        index = -1
+        # Its first token found by list.index, the rest checked there: on an
+        # M5 Max a 15,000-token head takes 0.09 ms, where comparing at every
+        # token took 3.1 ms.
+        while True:
+            try:
+                index = tokens.index(ids[0], index + 1, end)
+            except ValueError:
+                break
+            if tuple(tokens[index : index + len(ids)]) == ids:
+                end = index
+                break
+    return 0 if end >= len(tokens) else end
+
+
 @dataclass
 class RenderedPrompt:
     text: str
@@ -147,6 +135,8 @@ class RenderedPrompt:
     thinking: bool
     # Images precede the generation prompt; expanding them keeps this count.
     generation_prompt_tokens: int
+    # Where the head ends (_head_tokens); zero without one.
+    head_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -179,6 +169,7 @@ class Frontend:
         thinking_codec,
         response_store,
         max_image_pixels=image_input.MAX_PIXELS,
+        image_format=image_input.QWEN_IMAGES,
         served_model_names=(),
         announce_served_name=False,
         reasoning_effort=None,
@@ -187,8 +178,9 @@ class Frontend:
         sampling_defaults=None,
     ):
         # What the engine serves, from its Ready (backend.runtime.capabilities):
-        # the context follows the latest engine (max_context); its lanes and
-        # vision are the model's. Without vision, message normalization
+        # the context follows the latest engine (max_context); its lanes are
+        # the ones the start runs (--max-concurrent-requests) and its vision
+        # the model's. Without vision, message normalization
         # rejects image and PDF input before any decoding.
         served = backend.runtime.capabilities
         preparation_capacity = served.max_concurrent_requests
@@ -203,6 +195,11 @@ class Frontend:
         # Sized by the first engine's context, which every relaunch asks for.
         self.prompt_tokenizer = PromptTokenizer(
             tokenizer, chat_format.message_boundary, served.max_context_tokens
+        )
+        # The tokens of each of its turn openings, where a prompt's head ends.
+        self.turn_openings = tuple(
+            tuple(tokenizer(text, add_special_tokens=False)["input_ids"])
+            for text in chat_format.turn_openings
         )
         # /v1/score counters for /status; latency lives in status latency.
         self.score_lock = threading.Lock()
@@ -246,12 +243,13 @@ class Frontend:
         # send, so a request that leaves it out is never refused for it.
         self.sampling_defaults = dict(sampling_defaults or {})
         for name, value in self.sampling_defaults.items():
-            if not accepts_sampling(name, value):
+            if request_fields.sampling_refusal(name, value) is not None:
                 raise ValueError(f"invalid sampling default {name}={value!r}")
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
         self.max_image_pixels = max_image_pixels
-        self.images = image_input.ImageCache()
+        # The served family's: how its tower takes an image.
+        self.images = image_input.ImageCache(image_format.prepare)
         self.ids = count(1)
         self.preparation_capacity = preparation_capacity
         self.preparation_slots = threading.BoundedSemaphore(preparation_capacity)
@@ -261,6 +259,10 @@ class Frontend:
         # The Responses API's stored responses, which /status reports.
         self.response_store = response_store
         self.thinking_codec = thinking_codec
+        # The calls the model wrote that the server did not return as calls.
+        self.rejected_calls = RejectedCalls()
+        # The schema keywords best-effort answers were generated without.
+        self.unenforced_keywords = KeywordCounts()
 
     def accepts_model(self, model):
         """Whether a request may name `model`: a name the server answers to,
@@ -290,19 +292,22 @@ class Frontend:
     def reasoning_switch(self):
         """Whether a request's reasoning effort or enable_thinking turns the
         model's reasoning on and off, as /status reports: where the family's
-        model leaves that to its prompt (ChatFormat.reasoning_switch) and the
+        prompt switches it (ChatFormat.prompt_switches_reasoning) and the
         server has not set every request's effort itself."""
-        return self.chat_format.reasoning_switch and self.reasoning_effort is None
+        return (
+            self.chat_format.prompt_switches_reasoning and self.reasoning_effort is None
+        )
 
     @property
     def reasoning(self):
         """What /v1/models reports of reasoning: the default template's
         (ChatTemplate.reasoning), with the server's default effort in place of
         the template's own, named by the listed effort it renders like; no
-        efforts where a request's effort decides nothing (reasoning_switch),
-        so that a client offers none."""
-        if not self.reasoning_switch:
-            return {"thinks": None, "efforts": [], "default": None}
+        efforts where a request's effort decides nothing, reaching no model
+        (ChatFormat.reasoning_switch) or replaced by the server's, so that a
+        client offers none."""
+        if not self.chat_format.reasoning_switch or self.reasoning_effort is not None:
+            return dict(NO_REASONING)
         template = self.chat_templates.select(None)
         reasoning = dict(template.reasoning)
         if (effort := self.default_reasoning_effort) is not None:
@@ -327,6 +332,10 @@ class Frontend:
             }
         status["grammar_cache"] = self.constraint_factory.stats()
         status["response_store"] = self.response_store.stats()
+        status["tool_calls"] = {"rejected": self.rejected_calls.stats()}
+        status["structured_output"] = {
+            "keywords_not_enforced": self.unenforced_keywords.stats()
+        }
         status["image_cache"] = self.images.stats()
         status["tokenizer_cache"] = self.prompt_tokenizer.stats()
         with self.score_lock:
@@ -424,6 +433,9 @@ class Frontend:
                     image.grid_width,
                     image.digest_lo,
                     image.digest_hi,
+                    content_height=image.content_height,
+                    content_width=image.content_width,
+                    patch=image.patch,
                 )
             )
             expanded.extend([pad_id] * image.tokens)
@@ -577,10 +589,11 @@ class Frontend:
         """A /v1/score request: its messages rendered exactly as Chat renders
         them, the assistant prefix after the generation prompt, and its
         labels' single tokens in that position (scoring.py). A model that
-        opens its reasoning itself (chat_format.think_start_id), which a
+        opens its reasoning itself (chat_format.think_start_ids), which a
         request's effort leaves reasoning, would open it where the generation
-        prompt ends: there an empty think block comes first, after which it
-        answers, unless the prefix opens the think block itself."""
+        prompt ends: there an empty think block in its format's own marks
+        (think_open, think_close) comes first, after which it answers, unless
+        the prefix opens the think block itself."""
         try:
             options = scoring.validate_options(body, index=index)
         except scoring.ScoreRequestError as error:
@@ -600,10 +613,11 @@ class Frontend:
                     '"reasoning_effort": "none"',
                 )
             prefix = options.assistant_prefix
-            if self.chat_format.think_start_id is not None and not prefix.startswith(
-                THINK_START
+            chat_format = self.chat_format
+            if chat_format.think_start_ids and not prefix.startswith(
+                chat_format.think_open
             ):
-                prefix = THINK_START + THINK_END + prefix
+                prefix = chat_format.think_open + chat_format.think_close + prefix
             text = rendered.text + prefix
             ids = list(rendered.tokens)
             if prefix:
@@ -754,6 +768,18 @@ class Frontend:
             raise APIError(
                 400, "chat_template_kwargs enable_thinking must be a boolean"
             )
+        # A top-level enable_thinking is the template variable's switch sent
+        # outside it: one value, sent either way.
+        top_level = body.get("enable_thinking")
+        if top_level is not None:
+            if not isinstance(top_level, bool):
+                raise APIError(400, "enable_thinking must be a boolean")
+            if enable_thinking not in (None, top_level):
+                raise APIError(
+                    400,
+                    "enable_thinking and chat_template_kwargs enable_thinking differ",
+                )
+            enable_thinking = top_level
         if self.reasoning_effort is not None:
             # The server's effort is every request's, as though each had sent
             # it and nothing else of reasoning: it replaces the request's
@@ -884,10 +910,22 @@ class Frontend:
         thinking, generation_prompt_tokens = False, 0
         if add_generation_prompt:
             thinking, generation_prompt_tokens = _generation_prompt(
-                chat_template.generation_prompt(options), rendered, tokens
+                chat_template.generation_prompt(options),
+                rendered,
+                tokens,
+                self.chat_format,
             )
+        head_tokens = _head_tokens(
+            prompt.messages, prompt.tools, tokens, self.turn_openings
+        )
         return RenderedPrompt(
-            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+            rendered,
+            tokens,
+            images,
+            positions,
+            thinking,
+            generation_prompt_tokens,
+            head_tokens,
         )
 
     def chat_job(
@@ -916,8 +954,11 @@ class Frontend:
             or isinstance(n, bool)
             or n != 1
             or (logprobs is not None and (not isinstance(logprobs, bool) or logprobs))
+            or body.get("top_logprobs") is not None
         ):
-            raise APIError(400, "n and logprobs are not currently supported")
+            raise APIError(
+                400, "n, logprobs and top_logprobs are not currently supported"
+            )
         prompt = self._prepare_prompt(
             body, tool_namespaces, deadline=deadline, without_slot=without_slot
         )
@@ -1020,6 +1061,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            head_tokens=rendered.head_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
         )
 
@@ -1034,7 +1076,8 @@ class Frontend:
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + chat_format.call_syntax.function_opening(name),
+                    chat_format.call_syntax.call_tag
+                    + chat_format.call_syntax.function_opening(name),
                     add_special_tokens=False,
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",
@@ -1045,10 +1088,10 @@ class Frontend:
 
     def _generation_options(self, body, stop_field="stop"):
         numbers = {}
-        for name, (default, _, requirement) in SAMPLING_NUMBERS.items():
+        for name, (default, _, _) in request_fields.SAMPLING_NUMBERS.items():
             value = body.get(name, self.sampling_defaults.get(name, default))
-            if not accepts_sampling(name, value):
-                raise APIError(400, f"{name} must be {requirement}")
+            if (refusal := request_fields.sampling_refusal(name, value)) is not None:
+                raise APIError(400, refusal)
             numbers[name] = float(value)
         if 0 < numbers["temperature"] < MIN_SAMPLING_TEMPERATURE:
             numbers["temperature"] = MIN_SAMPLING_TEMPERATURE
@@ -1056,10 +1099,8 @@ class Frontend:
         # top_k past the vocabulary keeps every token too, so one past the
         # frame's u32 is sent as its largest value.
         top_k = body.get("top_k", self.sampling_defaults.get("top_k", 0))
-        if not accepts_sampling("top_k", top_k):
-            raise APIError(
-                400, "top_k must be 0 or -1 (disabled) or a positive integer"
-            )
+        if (refusal := request_fields.sampling_refusal("top_k", top_k)) is not None:
+            raise APIError(400, refusal)
         top_k = min(max(top_k, 0), 0xFFFFFFFF)
         # Chat's stop, which another API's dialect converts its own field to.
         stop = body.get("stop")

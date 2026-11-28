@@ -29,6 +29,9 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
       ++result.restoring;
       continue;
     }
+    if (const double deadline = resourceDeadline(active); deadline > 0.0 && !active.resourceWait.diskQuota)
+      result.stalledWaitMilliseconds =
+          std::max(result.stalledWaitMilliseconds, now + config_.resourceWaitTimeoutMilliseconds - deadline);
     const bool waiting = scheduler_.phase(id) == Phase::WaitingResources;
     // Requests the latest admission pass held back, in any phase, while the
     // request they wait behind is still refused.
@@ -103,7 +106,7 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
   // refused lone starts the plan's context held.
   RestoredChains own;
   uint32_t held = 0;
-  if (active.admissionProbe && !active.skipCache) {
+  if (active.admissionProbe) {
     const std::span<const uint64_t> chain = active.admissionProbe->restoredChain();
     own.add(chain);
     held = cache_.residentChainPages(chain);
@@ -126,7 +129,7 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
 
 uint64_t Engine::laneDemandBytes() const {
   const LaneDemand lanes = laneDemand();
-  return uint64_t{lanes.fullPages} * cache_.bytesPerPage(kv::PageForm::Full) + lanes.bytes;
+  return uint64_t{lanes.fullPages} * cache_.bytesPerBlock() + lanes.bytes;
 }
 
 Engine::LaneDemand Engine::laneDemand() const {
@@ -176,15 +179,15 @@ Engine::LaneDemand Engine::laneDemand() const {
 std::optional<RequestPriority> Engine::highestLanePriority() const {
   std::optional<RequestPriority> highest;
   for (const auto &[_, active] : requests_)
-    if (active.lane && !active.finalized && (!highest || active.request.priority < *highest))
-      highest = active.request.priority;
+    if (active.lane && !active.finalized && (!highest || yieldsAs(active) < *highest))
+      highest = yieldsAs(active);
   return highest;
 }
 
 MemoryGovernor &Engine::governor() const { return *config_.governor; }
 
-std::array<uint32_t, 3> Engine::heldPages(const Request &active) const {
-  return active.claim.id ? governor().heldPages(active.claim.id) : std::array<uint32_t, 3>{};
+std::array<uint32_t, kv::kPageForms> Engine::heldPages(const Request &active) const {
+  return active.claim.id ? governor().heldPages(active.claim.id) : std::array<uint32_t, kv::kPageForms>{};
 }
 
 void Engine::syncClaims(double now) {
@@ -209,6 +212,9 @@ void Engine::syncClaims(double now) {
                              wait.allocationFailure == metal::AllocationFailure::HostPressure && retried &&
                              (deadline <= 0.0 || now < deadline);
     ledger.setHostRefusedWaiting(active.claim.id, hostRefused);
+    // It waits for memory, retried now or not, held room or not (/status).
+    ledger.setWaitsForMemory(active.claim.id, !active.finalized && wait.startedMilliseconds && !wait.passedOver &&
+                                                  wait.reason != StateFailure::ConcurrencyLimit && !wait.diskQuota);
     // A lane that sent tokens waits in its next decode gap.
     active.gapSince.claimWaited =
         active.gapSince.claimWaited || ((waiting || hostRefused) && active.lastTokenMilliseconds);
@@ -254,7 +260,7 @@ uint64_t Engine::copyDemandBytes() const {
   // and the cache a burst left would hold the store at its floor. Waiting
   // claims add nothing: write-behind stops whenever one waits.
   const MemoryLedger &ledger = memory.ledger();
-  return std::max(2 * pages * cache_.bytesPerPage(kv::PageForm::Full),
+  return std::max(2 * pages * cache_.bytesPerBlock(),
                   std::min(ledger.growthLackBytes(), ledger.largestGrowthUnit()));
 }
 
@@ -336,10 +342,13 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
     }
     return *memory.admission;
   };
-  // A start refused names what memory does not hold of it, where memory was
-  // asked.
+  // A start refused names what memory does not hold of it, and the prompt
+  // tokens memory holds it, where memory was asked.
   const auto shortfall = [&](const InMemory &memory) {
     return memory.room ? "; " + memoryShortfall(active, memory.room) : std::string();
+  };
+  const auto memoryFits = [](const InMemory &memory) {
+    return memory.room ? promptTokensHeld(memory.room->heldTokens) : 0;
   };
   // A resume goes on spilling whatever the tier and the write budget: its
   // writes are in use, and pages a closed tier does not take stay Full.
@@ -360,7 +369,9 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
                         static_cast<uint32_t>(std::lround(std::max(0.0, admitted - now) / 1000.0))});
       } else {
         ++counters_.spill.refusedClosed;
-        settle(active, {LaneOutcome::CapacityExhausted, reason + "which takes no writes" + shortfall(memory)});
+        settle(active, {.outcome = LaneOutcome::CapacityExhausted,
+                        .message = reason + "which takes no writes" + shortfall(memory),
+                        .capacity = {CapacityLimit::ClosedDisk, memoryFits(memory)}});
       }
       return SpillAdmission::Settled;
     }
@@ -407,32 +418,39 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
     endAtLength(active);
   } else {
     ++counters_.spill.refusedQuota;
-    settle(active, {LaneOutcome::KvDiskQuota,
-                    "this request's KV needs needed_bytes=" +
-                        std::to_string(needed * geometry.slotBytes) +
-                        " of the SSD cache, which may hold active_limit_bytes=" +
-                        std::to_string(activeLimitBytes) +
-                        " of active KV now (--max-cache-disk and the volume's free space)" + shortfall(memory)});
+    // Alone, the quota holds a request of fewer tokens than its pages and
+    // the restored chain's it counts already hold: a token past them takes
+    // a page.
+    const uint64_t quotaTokens = (activeLimitBytes / geometry.slotBytes + counted) * KvCache::pageTokens;
+    settle(active, {.outcome = LaneOutcome::KvDiskQuota,
+                    .message = "this request's KV needs needed_bytes=" + std::to_string(needed * geometry.slotBytes) +
+                               " of the SSD cache, which may hold active_limit_bytes=" +
+                               std::to_string(activeLimitBytes) +
+                               " of active KV now (--max-cache-disk and the volume's free space)" + shortfall(memory),
+                    .capacity = {CapacityLimit::DiskQuota,
+                                 static_cast<uint32_t>(std::min<uint64_t>(quotaTokens ? quotaTokens - 1 : 0,
+                                                                          std::numeric_limits<uint32_t>::max()))}});
   }
   return SpillAdmission::Settled;
 }
 
 void Engine::waitForResources(Request &active, double now, const Denial &denial) {
   active.refusedResources = true;
+  if (!denial.diskQuota)
+    noteMemoryWait(active);
   scheduler_.waitForResources(active.request.id);
   deferResourceRetry(active, now, denial);
   const std::optional<RequestPriority> highest = highestLanePriority();
   if (!scheduler_.suspended(active.request.id) && !denial.pending && !denial.diskQuota &&
       (!denial.projection || (highest && *highest > active.request.priority)))
-    static_cast<void>(preemptBelow(active.request.priority, now));
+    static_cast<void>(preemptBelow(yieldsAs(active), now));
 }
 
 bool Engine::competesForQuota(const Request &active) const {
   if (active.lane)
     return cache_.holdsActiveKvQuota(active.request.id);
   return (active.placement && *active.placement == KvMode::Spill) ||
-         (active.admissionProbe && !active.skipCache &&
-          cache_.restoreTakesQuota(active.admissionProbe->restoredChain()));
+         (active.admissionProbe && cache_.restoreTakesQuota(active.admissionProbe->restoredChain()));
 }
 
 bool Engine::convertToSpill(Request &active) {
@@ -451,10 +469,6 @@ bool Engine::spillingPrompt() const {
     const auto &[id, active] = entry;
     return active.lane && active.kvMode == KvMode::Spill && scheduler_.phase(id) == Phase::Prefill;
   });
-}
-
-bool Engine::laneInService() const {
-  return std::any_of(requests_.begin(), requests_.end(), [](const auto &entry) { return entry.second.lane.has_value(); });
 }
 
 SpilledExtents Engine::landedExtents() const {
@@ -706,11 +720,12 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
   const auto reserve = [&](size_t index) {
     const uint32_t tokens = boundaries[index].tokens;
     const StateClass kind = stateClass(index);
-    if (kind == StateClass::InUse && !states.empty() && boundaries[index - 1].disposable) {
-      // The prompt's replay point keeps the checkpoint captured before it
-      // beside buffers of its own, in its claim. Refused the pool and the
-      // admission, it takes that checkpoint's buffers, as it takes its
-      // lane's after a command: nothing is freed for it.
+    if (keepsCheckpoint(active, boundaries[index]) && !states.empty() && boundaries[index - 1].disposable) {
+      // The prompt's replay point and the head's state keep the checkpoint
+      // captured before them beside buffers of their own, in their claim.
+      // Refused the pool and the admission, each takes that checkpoint's
+      // buffers, as it takes its lane's after a command: nothing is freed
+      // for it.
       std::shared_ptr<StateReservation> buffers;
       static_cast<void>(allocate(
           [&] {
@@ -741,13 +756,13 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
   for (size_t index = active.stateBoundaryCursor;
        index < boundaries.size() && boundaries[index].tokens <= end; ++index) {
     const uint32_t tokens = boundaries[index].tokens;
-    // Published, every state but the prompt's replay point retires the
-    // checkpoint before it (apply): a checkpoint the command passes on its
-    // way to such a state is not captured, and that state takes buffers of
-    // its own class.
+    // Published, every state but the prompt's replay point and the head's
+    // retires the checkpoint before it (apply, keepsCheckpoint): a
+    // checkpoint the command passes on its way to such a state is not
+    // captured, and that state takes buffers of its own class.
     const bool passed = boundaries[index].disposable && index + 1 < boundaries.size() &&
                         boundaries[index + 1].tokens <= end &&
-                        stateClass(index + 1) != StateClass::InUse;
+                        !keepsCheckpoint(active, boundaries[index + 1]);
     if (!passed && !reserve(index))
       return tokens - start;
     if (tokens == end)
@@ -798,6 +813,16 @@ void Engine::reserveReplyCapture(Request &active, std::vector<StateCapture> &sta
   const uint32_t output = active.outputLimit - (held - active.promptTokens);
   if (page - held > std::min(model::ExecutionLimits::targetVerifyRows, output))
     return;
+  // In one attempt a reply at the wall keeps no state. The claim spares the
+  // running lanes' recovery points (pinned), which the cache's order gives
+  // up before an idle conversation's lost state, so that an optional capture
+  // takes no lane's way back; and it walks once a page.
+  const bool claims = active.captureRefusedAt != page;
+  std::vector<CompositeStateLease> recoveryPoints;
+  for (const auto &[_, lane] : requests_)
+    if (claims && lane.lane && !lane.finalized && lane.latestCheckpoint)
+      if (std::optional<CompositeStateLease> pin = cache_.pinState(lane.latestCheckpoint.kvBlock))
+        recoveryPoints.push_back(std::move(*pin));
   std::shared_ptr<StateReservation> buffers;
   static_cast<void>(allocate(
       [&] {
@@ -805,7 +830,8 @@ void Engine::reserveReplyCapture(Request &active, std::vector<StateCapture> &sta
         buffers = model_.reserveState(active.request.id, page, refusal);
         return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
       },
-      stateClaim(active, StateClass::Checkpoint, supersedes), Refusal::SettledOnce));
+      stateClaim(active, StateClass::Checkpoint, supersedes), claims ? Refusal::Settled : Refusal::SettledOnce));
+  active.captureRefusedAt = claims && !buffers ? page : active.captureRefusedAt;
   if (buffers) {
     states.push_back({page, std::move(buffers)});
     captures.push_back({page});
@@ -872,15 +898,33 @@ void Engine::ClaimHandle::reset() noexcept {
   id = {};
 }
 
+RequestPriority Engine::yieldsAs(const Request &active) noexcept {
+  return active.backgroundSince ? RequestPriority::Background : active.request.priority;
+}
+
 ClaimRank Engine::rankOf(const Request &active) const {
   const Phase phase = scheduler_.phase(active.request.id);
+  const uint64_t order = scheduler_.submissionOrder(active.request.id);
+  const uint64_t earliness = std::numeric_limits<uint64_t>::max() - order;
   return {.priority = static_cast<uint8_t>(static_cast<uint8_t>(RequestPriority::Background) -
-                                           static_cast<uint8_t>(active.request.priority)),
-          // At equal priority, prefer uninterrupted streaming over less
-          // replay work.
+                                           static_cast<uint8_t>(yieldsAs(active))),
+          // Once a request has waited for memory, it and those submitted
+          // before it are served in arrival order, and none of them yields to
+          // one submitted later: a request yields only to work ahead of it,
+          // which ends, so none waits behind later ones for ever. Ranked by
+          // work alone, the 48g's go-back yielded to each of the other
+          // conversation's turns sent after it.
+          .queued = queuedThrough_ && order <= *queuedThrough_ ? earliness : 0,
+          // At equal priority otherwise, prefer uninterrupted streaming over
+          // less replay work: the first yield costs the least work.
           .decoding = phase == Phase::Decode || phase == Phase::WaitingMask,
           .completedTokens = completedTokens(active),
-          .earliness = std::numeric_limits<uint64_t>::max() - scheduler_.submissionOrder(active.request.id)};
+          .earliness = earliness};
+}
+
+void Engine::noteMemoryWait(Request &active) {
+  active.waitedForMemory = true;
+  queuedThrough_ = std::max(queuedThrough_.value_or(0), scheduler_.submissionOrder(active.request.id));
 }
 
 ClaimSpec Engine::claimFor(const Request &active, ClaimClass cls) const {
@@ -894,8 +938,8 @@ ClaimSpec Engine::claimFor(const Request &active, ClaimClass cls) const {
 bool Engine::yieldsBefore(const Request &a, const Request &b) const {
   const ClaimRank left = rankOf(a);
   const ClaimRank right = rankOf(b);
-  return std::tie(left.priority, left.decoding, left.completedTokens) <
-         std::tie(right.priority, right.decoding, right.completedTokens);
+  return std::tie(left.priority, left.queued, left.decoding, left.completedTokens) <
+         std::tie(right.priority, right.queued, right.decoding, right.completedTokens);
 }
 
 const Engine::Request *Engine::laneToYield() const {
@@ -920,7 +964,7 @@ uint64_t Engine::kvCapacity(uint64_t requestId) const {
 bool Engine::preemptBelow(RequestPriority priority, double now) {
   // The lane that yields first has the lowest priority of all residents.
   Request *const victim = laneToYield();
-  if (!victim || victim->request.priority <= priority)
+  if (!victim || yieldsAs(*victim) <= priority)
     return false;
   if (yieldsEndedLanes(*victim))
     return true;
@@ -929,6 +973,14 @@ bool Engine::preemptBelow(RequestPriority priority, double now) {
   // would (Scheduler::yieldsTo).
   suspendLane(*victim, kvCapacity(victim->request.id), metal::AllocationFailure::None,
               StateFailure::ConcurrencyLimit, now);
+  // An aged Background lane runs as Normal, so once suspended it would be
+  // admitted again at once and decode beside the start it gave way to. It
+  // goes back to Background and ages from now (age).
+  if (victim->backgroundSince && victim->request.priority != RequestPriority::Background) {
+    victim->request.priority = RequestPriority::Background;
+    victim->backgroundSince = now;
+    scheduler_.setPriority(victim->request.id, RequestPriority::Background);
+  }
   // What the lane held is free: an earlier failure may fit now.
   allocationFailed_ = false;
   ++counters_.prioritySuspensions;
@@ -947,12 +999,21 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
     return Verdict::Wait;
   // Pages held by resident lanes come back when they finish, and memory the
   // host refuses when its pressure lifts. Alone, its claim took what the
-  // order gives (ClaimSpec::lone): it fails only once no write is in flight
-  // either, nothing else holding memory it could get.
+  // order gives (ClaimSpec::lone): it fails only once no write and no
+  // restore is in flight either, nothing else holding memory it could get.
+  // A restore holds its chain's pages until it lands: those another start's
+  // refused attempt left in flight kept the cache out of this one's reach,
+  // and two starts at once each gave up the prefix the other's reads held.
   if (anotherResident(requestId) ||
       denial.allocationFailure == metal::AllocationFailure::HostPressure)
     return Verdict::Yield;
-  return cache_.writesInFlight() ? Verdict::Wait : Verdict::Fail;
+  // Refused after a count that met its need, it waits for its retry, whose
+  // free() counts afresh and takes what it finds: its failure is a count
+  // that falls short. Failed at once, the 48g's go-back of 50,924 tokens
+  // ended beside another conversation's 110,528 cached tokens it could have
+  // taken. The resource wait bounds the retries.
+  return denial.metRefused || cache_.writesInFlight() || cache_.transfersInFlight() ? Verdict::Wait
+                                                                                    : Verdict::Fail;
 }
 
 ReleaseRule Engine::EngineVictims::releaseRule(const VictimQuery &query) const {
@@ -973,7 +1034,7 @@ ReleaseRule Engine::EngineVictims::releaseRule(const VictimQuery &query) const {
   // chain its admission probe restores in place.
   ReleaseRule rule{.takesFrom = releasable};
   const auto claimant = engine.requests_.find(query.requestId);
-  if (claimant != engine.requests_.end() && claimant->second.admissionProbe && !claimant->second.skipCache &&
+  if (claimant != engine.requests_.end() && claimant->second.admissionProbe &&
       (query.kept || claimant->second.kvMode == KvMode::Resident))
     rule.kept = claimant->second.admissionProbe->restoredChain();
   return rule;
@@ -1249,14 +1310,20 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
   return {};
 }
 
-std::array<uint32_t, 3> Engine::EngineVictims::movesInto(const VictimQuery &query) const {
-  // Released for the claim's bytes first, those free Index pages left the
-  // release only the runway, and a lone lane's growth at the wall ended at
-  // its length.
-  std::array<uint32_t, 3> pages{};
-  if (query.need.pages && query.need.form == kv::PageForm::Full &&
-      std::ranges::any_of(releases(query), [](const Victim &unit) { return unit.pages != 0; }))
-    pages[static_cast<size_t>(kv::PageForm::Index)] = engine_.cache_.inPlaceIndexPages(query.need.pages);
+std::array<uint32_t, kv::kPageForms> Engine::EngineVictims::movesInto(const VictimQuery &query) const {
+  // The free Index pages that a release in place the claim counts, or the
+  // claimant's own next page, moves into: a Spill lane's next page moves its
+  // oldest pages into free Index pages, where a Resident lane's takes a Full
+  // page any extent gives. Taken for the claim's bytes first, they left the
+  // release only the runway, and a lone lane at the wall ended at its length
+  // (16 of 400 tokens where a reply's capture took them).
+  std::array<uint32_t, kv::kPageForms> pages{};
+  const auto claimant = engine_.requests_.find(query.requestId);
+  const bool spills = claimant != engine_.requests_.end() && claimant->second.lane &&
+                      claimant->second.kvMode == KvMode::Spill;
+  if (spills || (query.need.pages && query.need.form == kv::PageForm::Full &&
+                 std::ranges::any_of(releases(query), [](const Victim &unit) { return unit.pages != 0; })))
+    pages[static_cast<size_t>(kv::PageForm::Index)] = engine_.cache_.inPlaceIndexPages(std::max(query.need.pages, 1U));
   return pages;
 }
 
@@ -1280,6 +1347,7 @@ void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFai
 void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
                               metal::AllocationFailure failure, double now) {
   suspendLane(active, workEnd, failure, StateFailure::MemoryPressure, now);
+  noteMemoryWait(active);
   // Resident lanes drain before admission resumes. Growth the host refused
   // resumes when its pressure lifts; any other limit only once memory is
   // freed, so it counts as a failure the drain waits out.
@@ -1305,7 +1373,7 @@ void Engine::collectLandings(double now) {
   std::vector<CacheProbe> probes;
   std::vector<std::span<const uint64_t>> chains;
   for (auto &[_, active] : requests_) {
-    if (active.lane || active.finalized || active.skipCache)
+    if (active.lane || active.finalized)
       continue;
     if (active.admissionProbe) {
       cache_.refresh(*active.admissionProbe, active.exactTokens, promptIdentity(active.request));

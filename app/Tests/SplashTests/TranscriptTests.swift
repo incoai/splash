@@ -769,7 +769,7 @@ struct TranscriptTests {
 
     /// The transcript's page, loaded in a window off the screen, drawn as on screen, as WebKit
     /// holds back the animation frames of a page it can't see.
-    private func shownPage() async throws -> (Transcript, WKWebView, NSWindow) {
+    func shownPage() async throws -> (Transcript, WKWebView, NSWindow) {
         try Showcase.requireScripts()
         let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         transcript.page.load()

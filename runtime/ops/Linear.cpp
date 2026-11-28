@@ -9,6 +9,7 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -51,7 +52,43 @@ void requirePlaneViews(const Projection &p) {
   throw std::invalid_argument("a view of leading inputs takes one unrotated quantized tensor, not a view");
 }
 
+// The workload a plan of `w` is selected for: that of one of the tensors of a
+// projection side by side (ProjectionShape::planOutputs), else its own.
+LinearWorkload selectedWorkload(LinearWorkload w, uint32_t planOutputs) noexcept {
+  if (planOutputs) w.matrix.outputSize = planOutputs;
+  return w;
+}
+
 } // namespace
+
+std::optional<Projection> Projection::sideBySide(std::span<const Projection *const> projections) {
+  // The fused dispatches run up to three segments (GgufDecodeFusedParams).
+  constexpr size_t kMostTensors = std::extent_v<decltype(GgufDecodeFusedParams::cols)>;
+  if (projections.size() < 2 || projections.size() > kMostTensors)
+    throw std::invalid_argument("projections side by side are two or three");
+  if (std::any_of(projections.begin(), projections.end(),
+                  [](const Projection *p) { return p->blocks().segments.size() != 1; }))
+    return std::nullopt;
+  const Projection &first = *projections.front();
+  const QuantizedSegment &lead = first.blocks().segments.front();
+  BlockWeights weights;
+  uint32_t columns = 0;
+  for (const Projection *p : projections) {
+    const QuantizedSegment &tensor = p->blocks().segments.front();
+    if (p->outputSize != first.outputSize || p->inputSize != first.inputSize || tensor.outputSize != p->outputSize ||
+        tensor.formatId != lead.formatId || tensor.layout != lead.layout || p->destination != first.destination ||
+        p->rotation || p->planeInputs_ || p->planOutputs_)
+      return std::nullopt;
+    QuantizedSegment segment = tensor;
+    segment.columnOffset = columns;
+    columns += segment.outputSize;
+    weights.segments.push_back(std::move(segment));
+  }
+  Projection result(columns, first.inputSize, std::move(weights));
+  result.destination = first.destination;
+  result.planOutputs_ = first.outputSize;
+  return result;
+}
 
 bool Projection::takesPlaneViews() const noexcept {
   const std::vector<QuantizedSegment> &segments = weights_.segments;
@@ -146,14 +183,17 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   validate(w);
   // Only the decode tiles have fp32 instances, of their plain projection.
   if (destination == FloatOutput::Float32 &&
-      (w.rows > kMaximumDecodeTileRows || w.epilogue != LinearEpilogue::None))
+      (config.tile == LinearTile::GgufPrefill || config.tile == LinearTile::GgufPrefillInt8 ||
+       w.epilogue != LinearEpilogue::None))
     throw std::invalid_argument("an fp32 destination takes a plain projection on the decode tiles");
   // Kernel names follow the segment formats (LinearGguf.cpp).
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations, bool splitFree) noexcept
-    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations), splitFree_(splitFree) {}
+Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations, StepKind step,
+               std::shared_ptr<Int8PathsTaken> taken, bool splitFree) noexcept
+    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations), step_(step),
+      taken_(std::move(taken)), splitFree_(splitFree) {}
 
 uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -166,7 +206,9 @@ uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
     const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, epilogue};
     validate(w);
     unit.oneFormat = epilogue == LinearEpilogue::GateUp;
-    storage = std::max(storage, LinearPlan(w, selectProjection(calibration_, int8Activations_, w, unit)).storageRows());
+    const LinearWorkload selected = selectedWorkload(w, shape.planOutputs);
+    storage = std::max(storage,
+                       LinearPlan(w, selectProjection(calibration_, int8Activations_, step_, selected, unit)).storageRows());
   }
   return storage;
 }
@@ -174,7 +216,7 @@ uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
 LinearPlan Linear::plan(LinearWorkload workload) const {
   workload.splitFree = workload.splitFree || splitFree_;
   validate(workload);
-  return LinearPlan(workload, selectProjection(calibration_, int8Activations_, workload, {}));
+  return LinearPlan(workload, selectProjection(calibration_, int8Activations_, step_, workload, {}));
 }
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutput destination) {
   return LinearPlan(workload, config, destination);
@@ -182,16 +224,22 @@ LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutpu
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
   w.splitFree = w.splitFree || splitFree_;
   validate(w);
+  const LinearWorkload selected = selectedWorkload(w, p.planOutputs());
+  validate(selected);
   const std::array<const Projection *, 2> projections{&p, gate};
   // A gate/up pair's 16-row tile follows its tensors' own formats.
   std::array<UnitFormats, 2> tensors{};
   const bool pair = w.epilogue == LinearEpilogue::GateUp && gate;
   if (pair) tensors = {unitFormats(std::span(&projections[0], 1)), unitFormats(std::span(&projections[1], 1))};
   LinearPlan plan(w,
-                  selectProjection(calibration_, int8Activations_, w, unitFormats(projections),
+                  selectProjection(calibration_, int8Activations_, step_, selected, unitFormats(projections),
                                    pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
                   p.destination);
   plan.rotated_ = static_cast<bool>(p.rotation);
+  if (const LinearConfig &config = plan.configuration(); taken_ && config.tile == LinearTile::GgufPrefillInt8)
+    Int8PathsTaken::mark(taken_->prefillTile);
+  else if (taken_ && config.decodeInt8)
+    Int8PathsTaken::mark(step_ == StepKind::Decode ? taken_->decodeTiles : taken_->prefillDecodeTiles);
   return plan;
 }
 
@@ -213,22 +261,26 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
   // count of rows any tile the device may run it on; the prefill tiles never
   // split (LinearGguf.cpp).
   const LinearMatrix matrix{shape.outputSize, shape.inputSize};
-  for (uint32_t count = 1; count <= std::min(rows, kMaximumDecodeTileRows); ++count)
+  for (uint32_t count = 1; count <= std::min(rows, kMaximumStagedRows); ++count)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-      bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, shape.registerFormats));
-  // A plan stores at most its rows' tiles: the decode tiles' up to
-  // kMaximumDecodeTileRows, the prefill tiles' whole 128-row tiles.
+      if (epilogue != LinearEpilogue::GateUp || count <= kMaximumDecodeTileRows)
+        bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, unitFormats(shape), shape.planOutputs));
+  // A plan stores at most its rows' tiles: the decode tiles' up to their rows
+  // (a decode step's kMaximumStagedRows, a chunk's kMaximumDecodeTileRows),
+  // the staged tile's or the matrix tile's fragments, the prefill tiles'
+  // whole 128-row tiles.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
-  const uint32_t storage = rows <= kMaximumDecodeTileRows
-                               ? std::max(rows, stagedStorageRows(rows, true))
+  const uint32_t storage = rows <= (step_ == StepKind::Decode ? kMaximumStagedRows : kMaximumDecodeTileRows)
+                               ? std::max({rows, stagedStorageRows(rows, true), matrixStorageRows(rows)})
                                : (rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, storage);
   // The most rows' plan, whose codes and scales the int8 prefill tile holds
   // where it takes the shape's formats.
   if (rows > kMaximumDecodeTileRows) {
     const LinearWorkload most{matrix, rows, LinearEpilogue::None};
-    bound.include(
-        LinearPlan(most, selectProjection(calibration_, int8Activations_, most, unitFormats(shape))).scratchSize());
+    bound.include(LinearPlan(most, selectProjection(calibration_, int8Activations_, step_,
+                                                    selectedWorkload(most, shape.planOutputs), unitFormats(shape)))
+                      .scratchSize());
   }
   return bound;
 }

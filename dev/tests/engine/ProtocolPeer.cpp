@@ -106,12 +106,15 @@ FrameType write(Writer &out, const RequestFrame &request) {
   out.u32(thinking.tokens);
   out.u32(static_cast<uint32_t>(thinking.end.size()));
   out.u32(thinking.alsoEnds);
+  out.u32(request.headTokens);
   out.words(request.promptTokens);
   for (const ImageSpan &span : request.imageSpans) {
     out.u32(span.offset);
     out.u32(span.tokens);
     out.u32(span.gridHeight);
     out.u32(span.gridWidth);
+    out.u32(span.contentHeight);
+    out.u32(span.contentWidth);
     out.u64(span.digestLo);
     out.u64(span.digestHi);
   }
@@ -185,6 +188,11 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.requestId = in.u64();
     event.lane = in.u32();
     event.matchedPromptTokens = in.u32();
+    event.prefixTokens = in.u32();
+    event.stateSource = static_cast<engine::StateSource>(in.u8());
+    event.lostState = in.u8() != 0;
+    event.reuseEnd = static_cast<engine::ReuseEnd>(in.u8());
+    event.reuseEndTokens = in.u32();
     return event;
   }
   case FrameType::PromptProgress: {
@@ -245,6 +253,8 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.retryable = in.u8() != 0;
     event.retryAfterSeconds = in.u32();
     event.requestId = in.u64();
+    event.capacity.limit = static_cast<engine::CapacityLimit>(in.u8());
+    event.capacity.fitsTokens = in.u32();
     const uint32_t codeBytes = in.u32();
     const uint32_t messageBytes = in.u32();
     event.code = in.text(codeBytes);

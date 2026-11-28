@@ -333,7 +333,7 @@ void encodeStore(id<MTLComputeCommandEncoder> encoder,
   [encoder setBuffer:data.chunkKeys offset:0 atIndex:1];
   [encoder setBuffer:data.chunkValues offset:0 atIndex:2];
   setPageTables(encoder, data.pageTableBuffer, 3);
-  [encoder setBytes:&params length:sizeof(params) atIndex:7];
+  [encoder setBytes:&params length:sizeof(params) atIndex:3 + SPLASH_MAXIMUM_BATCH_WIDTH];
   data.pool->use(encoder, MTLResourceUsageWrite);
   [encoder dispatchThreadgroups:MTLSizeMake(kKvHeads, data.params.chunk_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
@@ -364,9 +364,9 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   [encoder setBuffer:data.statistics offset:0 atIndex:2];
   setPageTables(encoder, data.pageTableBuffer, 3);
   // Without tree rows the split binds another buffer in their place.
-  [encoder setBuffer:data.partials offset:0 atIndex:7];
-  setLayout(encoder, data, 8);
-  [encoder setBytes:&params length:sizeof(params) atIndex:9];
+  [encoder setBuffer:data.partials offset:0 atIndex:3 + SPLASH_MAXIMUM_BATCH_WIDTH];
+  setLayout(encoder, data, 4 + SPLASH_MAXIMUM_BATCH_WIDTH);
+  [encoder setBytes:&params length:sizeof(params) atIndex:5 + SPLASH_MAXIMUM_BATCH_WIDTH];
   data.pool->use(encoder, MTLResourceUsageRead);
   [encoder dispatchThreadgroups:MTLSizeMake(split.x, split.y, split.z)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -815,11 +815,12 @@ void testCommitIndexOverwrite(id<MTLDevice> device,
   }
 }
 
-// One store of four lanes' eight rows, lane after lane: each lane's rows
-// and staging follow the lanes' before it, its page table its own.
+// One store of a full batch's lanes of eight rows each, lane after lane:
+// each lane's rows and staging follow the lanes' before it, its page table
+// its own.
 void testBatchedStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
                       id<MTLComputePipelineState> store) {
-  constexpr uint32_t lanes = 4;
+  constexpr uint32_t lanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   constexpr uint32_t committed = 31;
   constexpr uint32_t rows = 8;
   constexpr uint32_t stride = 32;
@@ -881,9 +882,10 @@ void testBatchedStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:layout offset:0 atIndex:0];
   [encoder setBuffer:chunkKeys offset:0 atIndex:1];
   [encoder setBuffer:chunkValues offset:0 atIndex:2];
-  for (uint32_t lane = 0; lane < lanes; ++lane)
-    [encoder setBuffer:tableBuffers[lane] offset:0 atIndex:3 + lane];
-  [encoder setBytes:&params length:sizeof(params) atIndex:7];
+  // Every table's place is bound, lanes past the batch's with lane 0's.
+  for (uint32_t lane = 0; lane < SPLASH_MAXIMUM_BATCH_WIDTH; ++lane)
+    [encoder setBuffer:tableBuffers[lane < lanes ? lane : 0] offset:0 atIndex:3 + lane];
+  [encoder setBytes:&params length:sizeof(params) atIndex:3 + SPLASH_MAXIMUM_BATCH_WIDTH];
   pool.use(encoder, MTLResourceUsageWrite);
   [encoder dispatchThreadgroups:MTLSizeMake(kKvHeads, rows, lanes)
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];

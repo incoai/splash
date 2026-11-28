@@ -134,6 +134,27 @@ MetalBuffer filled(MetalBackend &backend, uint64_t bytes, uint8_t value) {
   return buffer;
 }
 
+// The lane counts a batch's sections run at: every count up to the default's
+// four, as before, and the most. A lane's work is its own at every count, so
+// the counts between show nothing the most does not.
+constexpr std::array<uint32_t, SPLASH_DEFAULT_LANES + 1> kLaneCounts{1, 2, 3, 4, kLanes};
+
+// The masks of `lanes` lanes a property of each lane is checked on, whatever
+// the other lanes do: every mask up to the default's four lanes; past them no
+// lane, every lane, each lane alone, and alternate lanes, which set lanes on
+// both sides of the fourth.
+std::vector<uint32_t> laneMasks(uint32_t lanes) {
+  const uint32_t all = (1U << lanes) - 1;
+  std::vector<uint32_t> masks;
+  if (lanes <= SPLASH_DEFAULT_LANES) {
+    for (uint32_t mask = 0; mask <= all; ++mask) masks.push_back(mask);
+    return masks;
+  }
+  masks = {0, all, 0xAAU & all};
+  for (uint32_t lane = 0; lane < lanes; ++lane) masks.push_back(1U << lane);
+  return masks;
+}
+
 // Each of `lanes` lanes' verify block: its kRows rows at lane x kRows.
 std::vector<LaneRows> blocks(size_t lanes) {
   std::vector<LaneRows> result;
@@ -1100,11 +1121,19 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
       minP ? std::array<std::vector<SamplingPolicy>, kLanes>{
                  std::vector{floor}, std::vector{floorNucleus, floorGreedy},
                  std::vector{heaviest, floorless, stoplessGreedy},
-                 std::vector{floor, floorNucleus, greedy, heaviest}}
+                 std::vector{floor, floorNucleus, greedy, heaviest},
+                 std::vector{floorless, floor, floorGreedy, floorNucleus, heaviest},
+                 std::vector{greedy, floorless, floor, stoplessGreedy, floorNucleus, heaviest},
+                 std::vector{floor, floorNucleus, floorGreedy, heaviest, floorless, stoplessGreedy, greedy},
+                 std::vector{heaviest, floor, floorNucleus, greedy, floorless, floorGreedy, stoplessGreedy, floor}}
            : std::array<std::vector<SamplingPolicy>, kLanes>{
                  std::vector{disabled}, std::vector{fifty, maskedGreedy},
                  std::vector{beyond, narrow, stoplessGreedy},
-                 std::vector{wide, thousand, greedy, fifty}};
+                 std::vector{wide, thousand, greedy, fifty},
+                 std::vector{narrow, beyond, maskedGreedy, disabled, wide},
+                 std::vector{fifty, wide, stoplessGreedy, thousand, narrow, greedy},
+                 std::vector{disabled, narrow, fifty, beyond, maskedGreedy, wide, thousand},
+                 std::vector{thousand, greedy, wide, disabled, fifty, stoplessGreedy, beyond, narrow}};
   const std::vector<SamplingPolicy> &policies = batches[lanes - 1];
   for (uint32_t index = 0; index < lanes * kMaskRows * batch.maskWords();
        ++index)
@@ -1250,8 +1279,9 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
   }
 }
 
-// Lanes of different row counts, packed one after another (5, 6, 1 and 6
-// rows from rows 0, 5, 13 and 14, rows 11 and 12 of no lane), select and
+// Lanes of different row counts, packed one after another (5, 6, 1, 6, 3,
+// 2, 7 and 4 rows from rows 0, 5, 13, 14, 20, 23, 26 and 33, rows 11, 12 and
+// 25 of no lane), select and
 // accept as each lane does alone in a block from row 0, bit for bit: its
 // penalized logits, tokens and sampled records, and its retained and
 // accepted counts and rows. A lane whose thinking cutoff is at its first row
@@ -1262,13 +1292,17 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
 // selects, penalizes or accepts a row of no lane.
 void packedLanes(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003, lanes = kLanes;
-  const std::array<LaneRows, lanes> packed{{{0, 5}, {5, 6}, {13, 1}, {14, 6}}};
-  const std::array<uint32_t, lanes> tableRows{2, 0, 3, 1}, retainedLimits{5, 8, 1, 4};
+  const std::array<LaneRows, lanes> packed{{{0, 5}, {5, 6}, {13, 1}, {14, 6}, {20, 3}, {23, 2}, {26, 7}, {33, 4}}};
+  const std::array<uint32_t, lanes> tableRows{2, 0, 3, 1, 0, 2, 1, 3}, retainedLimits{5, 8, 1, 4, 3, 1, 6, 4};
   const std::array<uint32_t, 3> end{vocabulary - 6, vocabulary - 7, vocabulary - 3};
   std::array<SamplingPolicy, lanes> policies{
       SamplingPolicy{}, SamplingPolicy{32, 0.8F, 0.95F, true, false, {1.3F, 0.5F, 0.25F}},
       SamplingPolicy{1, 0.0F, 1.0F, false, true},
-      SamplingPolicy{0, 1.0F, 0.9F, false, false, {0.8F, 0.0F, 0.0F}, 0.05F}};
+      SamplingPolicy{0, 1.0F, 0.9F, false, false, {0.8F, 0.0F, 0.0F}, 0.05F},
+      SamplingPolicy{},
+      SamplingPolicy{16, 0.7F, 0.9F, false, false, {1.1F, 0.0F, 0.0F}},
+      SamplingPolicy{1, 0.0F, 1.0F, false, true},
+      SamplingPolicy{0, 1.0F, 0.95F}};
   policies[0].thinkingCutoff = ThinkingCutoff{0, end, vocabulary - 5};
   policies[2].thinkingCutoff = ThinkingCutoff{0, end, vocabulary - 5};
   policies[3].thinkingCutoff = ThinkingCutoff{3, end, vocabulary - 5};
@@ -1559,10 +1593,11 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
   for (uint32_t lane = 0; lane < kLanes; ++lane)
     batch.inputTokens()[lane * kRows + 1] = leading;
   std::fill(uniforms, uniforms + kLanes * kUniforms, 0.5F);
-  const std::array<uint32_t, kLanes> maximumRetained{kRows, kRows, kRows, kRows};
-  for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
-    for (uint32_t excludeMask = 0; excludeMask < (1U << lanes); ++excludeMask) {
-      for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+  std::array<uint32_t, kLanes> maximumRetained;
+  maximumRetained.fill(kRows);
+  for (const uint32_t lanes : kLaneCounts) {
+    for (const uint32_t excludeMask : laneMasks(lanes)) {
+      for (const uint32_t samplingMask : {0U, 0x55U, 0xFFU}) {
         std::vector<SamplingPolicy> policies;
         for (uint32_t lane = 0; lane < lanes; ++lane)
           policies.push_back({32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F,
@@ -1739,7 +1774,8 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
         for (uint32_t row = 1; row < kRows && row <= cutoff->replacedProposals(); ++row)
           batch.inputTokens()[lane * kRows + row] = cutoff->end[row - 1];
   };
-  const std::array<uint32_t, kLanes> maximumRetained{kRows, kRows, kRows, kRows};
+  std::array<uint32_t, kLanes> maximumRetained;
+  maximumRetained.fill(kRows);
   // Acceptance keeps the drafts up to the first one that is not its row's
   // token, and that row's token.
   const auto retainedRows = [](std::span<const uint32_t> drafts, std::span<const uint32_t> rows) {
@@ -1871,12 +1907,14 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   // At row 0, lane 0 has more end tokens left than verify rows, lane 1 three
   // and lane 3 the close alone; each one proposes its end in place of its
   // draft's best tokens. Lane 2's end starts at its row 2, which its draft
-  // keeps.
+  // keeps; lanes 4 to 7 mix the same.
   const std::vector<uint32_t> &end = ends.back();
   const std::span<const uint32_t> whole(end);
   const std::array<ThinkingCutoff, kLanes> started{
       ThinkingCutoff{0, whole, alsoEnds}, ThinkingCutoff{0, whole.last(3), alsoEnds},
-      ThinkingCutoff{2, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds}};
+      ThinkingCutoff{2, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds},
+      ThinkingCutoff{0, whole.last(2), alsoEnds}, ThinkingCutoff{0, whole, alsoEnds},
+      ThinkingCutoff{2, whole, alsoEnds}, ThinkingCutoff{0, whole.last(3), alsoEnds}};
   for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
     std::vector<SamplingPolicy> policies;
     std::array<std::array<uint32_t, kRows>, kLanes> expected{};
@@ -1912,15 +1950,17 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   // hold.
   const std::array<ThinkingCutoff, kLanes> drafting{
       ThinkingCutoff{0, whole, alsoEnds, true}, ThinkingCutoff{0, whole.last(3), alsoEnds},
+      ThinkingCutoff{0, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds, true},
+      ThinkingCutoff{0, whole, alsoEnds, true}, ThinkingCutoff{0, whole.last(3), alsoEnds},
       ThinkingCutoff{0, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds, true}};
-  const std::array<uint32_t, kLanes> replaced{0, 3, SPLASH_TREE_CHAIN_TOKENS, 0};
+  const std::array<uint32_t, kLanes> replaced{0, 3, SPLASH_TREE_CHAIN_TOKENS, 0, 0, 3, SPLASH_TREE_CHAIN_TOKENS, 0};
   for (uint32_t lane = 0; lane < kLanes; ++lane)
     require(drafting[lane].replacedProposals() == replaced[lane], "an end counted the wrong replaced proposals");
 
   // Lane l's row nonFinite[l] has no selectable logit: it keeps its sentinel,
   // which acceptance retains after the end tokens before it.
   constexpr uint32_t kSentinel = 0xFFFFFFFFU;
-  const std::array<uint32_t, kLanes> nonFinite{0, 2, 5, kRows - 1};
+  const std::array<uint32_t, kLanes> nonFinite{0, 2, 5, kRows - 1, 1, 3, 6, kRows - 2};
   for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
     std::vector<SamplingPolicy> policies;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
@@ -2232,6 +2272,21 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
 // reference does and take about as long as an ordinary row's search: even
 // key splits bound every search to a few passes, where pivots at distances
 // of the temperature alone once took thousands and stalled the batch.
+//
+// kExtremeSearchBound is how many ordinary searches an extreme one may take.
+// What it guards against is a search of hundreds or thousands of passes. The
+// extreme searches' time does not follow the ordinary one's: on a quiet
+// 12-core M6, 1.7.4's ordinary search took 0.48 to 1.32 ms and 1.7.5's takes
+// 0.41 to 0.45, while the saturated tail's kept its 3.6 to 4.8 ms on both, so
+// its ratio rose from 3 to 9 to 7.9 to 11.6; on a 16-core M5 Pro it read 8.2
+// and 9.6 beside another GPU job (ordinary 0.47 and 0.56 ms). A bound of 8
+// failed every quiet run of 1.7.5 on the M6, and one in three of 1.7.4's,
+// whenever its ordinary search ran fast. 24 is twice the largest ratio
+// measured, far under a search that does not converge: on a 32-core M5 Max,
+// whose saturated tail reads 3.1 ordinary searches, the same search run eight
+// times over in the timed command reads 28.8 and fails, and four times over
+// 8.3 and passes (a scratch build).
+constexpr double kExtremeSearchBound = 24.0;
 void extremeSearches(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 248320;
   Sampling sampling(vocabulary);
@@ -2298,7 +2353,7 @@ void extremeSearches(MetalBackend &backend) {
                         referenceDistribution(batch.row(row), vocabulary,
                                               c.policy),
                         std::string(c.name) + " row " + std::to_string(row));
-    require(seconds <= 8.0 * ordinary,
+    require(seconds <= kExtremeSearchBound * ordinary,
             std::string(c.name) + ": the search took " +
                 std::to_string(seconds / ordinary) + " times an ordinary one");
   }
@@ -2751,7 +2806,9 @@ void childTests(MetalBackend &backend) {
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const std::array<uint32_t, kLanes> tableRows{};
   const std::vector<SamplingPolicy> policies{SamplingPolicy{20, 1.0F, 0.95F}, SamplingPolicy{20, 0.7F, 0.8F},
-                                             SamplingPolicy{0, 1.0F, 1.0F}, SamplingPolicy{40, 1.3F, 0.9F}};
+                                             SamplingPolicy{0, 1.0F, 1.0F},   SamplingPolicy{40, 1.3F, 0.9F},
+                                             SamplingPolicy{20, 0.9F, 0.9F},  SamplingPolicy{0, 0.8F, 0.95F},
+                                             SamplingPolicy{30, 1.1F, 1.0F},  SamplingPolicy{40, 1.0F, 0.85F}};
   Random random(0x63686c64);
   std::mt19937_64 rng(0x63686c64);
   // A lane of more than eight rows branches at its anchor: its rows from the
@@ -3076,7 +3133,8 @@ void childTestsOnTrees(MetalBackend &backend, const SamplingPolicy &policy, bool
   // them are of no lane.
   std::vector<LaneRows> laneRows = blocks(kLanes);
   for (LaneRows &rows : laneRows) rows.rows = kTreeRows;
-  const std::array<uint32_t, kLanes> limits{kRows, kRows, kRows, kRows};
+  std::array<uint32_t, kLanes> limits;
+  limits.fill(kRows);
   const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, kLanes);
   // Preorder: the anchor, the first child and its two, the second and its two.
   constexpr std::array<uint32_t, kTreeRows> parents{0, 0, 1, 1, 0, 4, 4};
@@ -3372,7 +3430,7 @@ void childTestsOfTheSelectorsDraws(MetalBackend &backend, const SamplingPolicy &
       lanes.push_back({7, 2, 0, 3, DraftCalibration{}, policy.temperature,
                        uint64_t{random.next()} << 32 | random.next()});
     CommandGraph layout;
-    selector.add(layout, trees, codebooks, DraftVocabulary{}, lanes);
+    selector.add(layout, trees, codebooks, DraftVocabulary{}, vocabulary, lanes, SPLASH_DRAFT_SAMPLING_MOST_SHARDS);
     DraftSelector::addVerifyRows(layout, trees, step);
     static_cast<void>(backend.submitCommandAsync(layout.dispatches()).wait());
     // Each row's logits: its tree row's, the anchor's, a child's or a
@@ -3596,7 +3654,7 @@ int main(int argc, char **argv) {
     childTestsOfTheSelectorsDraws(backend, SamplingPolicy{20, 0.7F, 0.95F});
     for (const uint32_t vocabulary : {1003U, 248320U}) {
       uint32_t changedSelections = 0;
-      for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+      for (const uint32_t lanes : kLaneCounts) {
         const std::string batch = " B" + std::to_string(lanes) +
                                   ", vocabulary " + std::to_string(vocabulary);
         stage = "mixed penalties" + batch;
@@ -3617,8 +3675,8 @@ int main(int argc, char **argv) {
       stage = "thinking cutoffs, vocabulary " + std::to_string(vocabulary);
       thinkingCutoffs(backend, vocabulary);
     }
-    for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
-      for (uint32_t mask = 0; mask < (1U << lanes); ++mask) {
+    for (const uint32_t lanes : kLaneCounts) {
+      for (const uint32_t mask : laneMasks(lanes)) {
         stage = "mixed verify B" + std::to_string(lanes) + ", sampling mask " +
                 std::to_string(mask);
         mixedVerify(backend, lanes, mask);

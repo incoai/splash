@@ -24,6 +24,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
@@ -34,6 +35,9 @@ from . import models
 HUB_TIMEOUT = 5
 # Seconds between two measurements of a download's progress.
 PROGRESS_INTERVAL = 0.25
+# Seconds after which a log gets a download's progress line even short of
+# its next tenth (_ConsoleProgress).
+LOG_PROGRESS_SECONDS = 30
 # Seconds a download's caller waits on it at a time, the longest Ctrl+C
 # takes to reach that caller (_interruptible).
 INTERRUPT_INTERVAL = 0.1
@@ -82,11 +86,15 @@ def reason(error) -> str:
 
 
 def failure_kind(error) -> str | None:
-    """What the app words a Hub or network failure by
-    (models.ModelError.kind): no such repository, no connection or access
-    denied; None for any other, which the app shows by its message, such as
-    a revision or file the repository lacks. A gated repository is access
-    denied, though huggingface_hub refuses it as a RepositoryNotFoundError
+    """What the app words a Hub, network or disk failure by
+    (models.ModelError.kind): no such repository, no connection, a
+    connection that dropped during the download ("interrupted"), access
+    denied, or a disk that filled ("disk", without the figures
+    _require_room gives, as a disk can fill after that check, which counts
+    the purgeable space macOS frees only as it is needed); None for any
+    other, which the app shows by its message, such as a revision or file
+    the repository lacks. A gated repository is access denied, though
+    huggingface_hub refuses it as a RepositoryNotFoundError
     (GatedRepoError)."""
     import httpx
     from huggingface_hub.errors import (
@@ -108,6 +116,10 @@ def failure_kind(error) -> str | None:
         return "auth"
     if isinstance(error, (httpx.ConnectError, httpx.TimeoutException)):
         return "offline"
+    if isinstance(error, (httpx.NetworkError, httpx.RemoteProtocolError)):
+        return "interrupted"
+    if isinstance(error, OSError) and error.errno in (errno.ENOSPC, errno.EDQUOT):
+        return "disk"
     return None
 
 
@@ -150,6 +162,18 @@ def cached_repositories() -> list[str]:
 
 def snapshot(repo_id: str, commit: str) -> Path:
     return folder(repo_id) / "snapshots" / commit
+
+
+def cached_snapshots(repo_id: str) -> list[str]:
+    """The commits of repo_id whose snapshots the Hub cache holds, the one
+    whose folder changed last first."""
+    snapshots = [
+        path
+        for path in (folder(repo_id) / "snapshots").glob("*")
+        if models.is_hex_digest(path.name, 40) and path.is_dir()
+    ]
+    snapshots.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    return [path.name for path in snapshots]
 
 
 def snapshot_commit(path: Path, repo_id: str) -> str:
@@ -491,9 +515,10 @@ class Repository:
         (_cached_commits); without either, the ModelError carries that class
         for the app. unreachable and unreachable_kind, from another repository
         this start, stand for the Hub's answer without a request. A different
-        revision is never substituted."""
-        import httpx
-        from huggingface_hub import HfApi, constants
+        revision is never substituted here; offline, a default branch's GGUF
+        variant the recorded snapshot lacks may be taken from another
+        (upstream._cached_holding)."""
+        from huggingface_hub import constants
 
         if Path(name).is_absolute():
             return cls.local_directory(name)
@@ -509,6 +534,12 @@ class Repository:
         elif unreachable:
             why, kind = unreachable, unreachable_kind
         else:
+            # Only a request needs the client and the Hub's API: an offline
+            # or pinned start of an installed model imports neither (httpx
+            # alone took 67 ms of that start's 0.14 s).
+            import httpx
+            from huggingface_hub import HfApi
+
             try:
                 info = HfApi().model_info(
                     name, revision=revision, files_metadata=True, timeout=HUB_TIMEOUT
@@ -591,11 +622,33 @@ class Repository:
             f"{self.name}/{name}", "rb", revision=self.revision, block_size=8 << 20
         )
 
-    def download(self, names):
+    def stored(self, names):
+        """(bytes, blob ID) of each of names the Hub lists: what a download
+        of names comes to, the blobs the Hub cache has and those it lacks."""
+        if self.paths is not None:
+            return []
+        return [self.sizes[n] for n in names if n in self.sizes]
+
+    def missing(self, names):
+        """(bytes, blob ID) of each of names whose blob the Hub cache lacks:
+        what a download of names fetches."""
+        if self.paths is not None:
+            return []
+        blobs = folder(self.name) / "blobs"
+        return [
+            (size, blob)
+            for size, blob in self.stored(names)
+            if not (blob and (blobs / blob).exists())
+        ]
+
+    def download(self, names, *, reserve=0):
         """Each of names -> its local path, downloading what the cache lacks.
-        Before a download, the partial files killed ones left in the
-        repository's blobs folder are removed. Ctrl+C stops the wait for it
-        at once (_interruptible)."""
+        reserve is the bytes of the downloads that follow this one into the
+        Hub cache, which its room check counts too, so that a disk without
+        room for all of them refuses the first (_require_room). Before a
+        download, the partial files killed ones left in the repository's
+        blobs folder are removed. Ctrl+C stops the wait for it at once
+        (_interruptible)."""
         for name in names:
             self._require(name)
         if self.paths is not None:
@@ -603,22 +656,17 @@ class Repository:
         from huggingface_hub import snapshot_download
 
         blobs = folder(self.name) / "blobs"
-        # (bytes, blob ID) of each file whose blob the cache lacks.
-        fetch = [
-            (size, blob)
-            for size, blob in (self.sizes[n] for n in names if n in self.sizes)
-            if not (blob and (blobs / blob).exists())
-        ]
+        fetch = self.missing(names)
         total = sum(size for size, _ in fetch)
         if fetch:
             _remove_abandoned_downloads(blobs)
-            _require_room(self.name, blobs, total)
+            _require_room(blobs, total + reserve)
             print(
                 f"Fetching {len(fetch)} file(s), {total / 1e9:.2f} GB, "
                 f"from {self.name}@{self.revision[:12]}; cached files are reused.",
                 flush=True,
             )
-        with _download_progress(self.name, blobs, fetch) as counted:
+        with _download_progress(self.name, blobs, self.stored(names), fetch) as counted:
             path = Path(
                 _interruptible(
                     snapshot_download,
@@ -651,9 +699,11 @@ def _cached_commits(name, revision, installation):
     without the Hub, most specific first: revision itself when it is a
     commit; the commit installation recorded, then the ones it pinned
     (refs/splash); then the cache's record of the branch or tag (refs/main,
-    _record_default_branch). Other installations' pins never stand in: a pin
-    does not say which revision it was installed for. The record is read as
-    it is, so a damaged installation can be rebuilt."""
+    _record_default_branch). Other installations' pins are not among them: a
+    pin does not say which revision it was installed for (only a GGUF
+    variant the recorded snapshot lacks is looked for in every snapshot,
+    upstream._cached_holding). The record is read as it is, so a damaged
+    installation can be rebuilt."""
     if models.is_hex_digest(revision, 40):
         return [revision.lower()]
     commits = []
@@ -722,17 +772,21 @@ def _publish(path, content):
             pending.unlink(missing_ok=True)
 
 
-def _require_room(repo_id, blobs, needed):
+def _require_room(blobs, needed):
     """Refuse a download of needed bytes into the blobs folder that its volume
     has no room for, before it fills the disk: the Hub cache can be on
-    another volume (HF_HOME, HF_HUB_CACHE) than the home folder."""
+    another volume (HF_HOME, HF_HUB_CACHE) than the home folder. The refusal
+    is of kind "disk", with the bytes needed and available, which the app
+    words; its message, with the cache's path, is for the log."""
     existing = next(p for p in (blobs, *blobs.parents) if p.exists())
     available = _available_bytes(existing)
     if needed > available:
         raise models.ModelError(
-            f"not enough disk space for {repo_id}: the download needs "
+            f"not enough disk space: the installation needs "
             f"{needed / 1e9:.2f} GB and {available / 1e9:.2f} GB is available "
-            f"in {blobs.parent.parent}"
+            f"in {blobs.parent.parent}",
+            kind="disk",
+            details={"needed": needed, "available": available},
         )
 
 
@@ -840,44 +894,92 @@ def _interruptible(call, *args, **kwargs):
 
 
 @contextmanager
-def _download_progress(repo_id, blobs, fetch):
-    """With json_progress, report the download in the block of fetch,
-    (bytes, blob ID) pairs in the blobs folder, as JSON lines on stdout,
-    and yield the tqdm class the block's snapshot_download counts with (None
-    without json_progress): done 0 first, then, measured every
-    PROGRESS_INTERVAL, whenever it grew, the bytes received, and done == total
-    once the block succeeds. Received is what the network has brought or what
-    the folder holds of fetch, whichever is more, and at most the total: under
-    Xet a file is written in order from chunks that arrive out of order and
-    wait in memory, so the folder alone can stay at 0 for minutes, then jump."""
-    if not (json_progress and fetch):
+def _download_progress(repo_id, blobs, files, fetch):
+    """Report the download in the block of files, (bytes, blob ID) pairs in
+    the blobs folder, of which it fetches those in fetch, in bytes: as JSON
+    lines on stdout with json_progress, else on the console
+    (_ConsoleProgress); and yield the tqdm class the block's
+    snapshot_download counts with, whose bars draw nothing: huggingface_hub's
+    own counts files, 0 of 2 for minutes. Done first the bytes of the files
+    the folder has whole, so that a download started again goes on from what
+    the one before finished, then, measured every PROGRESS_INTERVAL, whenever
+    it grew, those and the bytes received, and done == total once the block
+    succeeds. Received is what the network has brought or what the folder
+    holds of fetch, whichever is more, and at most the total: under Xet a
+    file is written in order from chunks that arrive out of order and wait in
+    memory, so the folder alone can stay at 0 for minutes, then jump."""
+    if not fetch:
         yield None
         return
-    total = sum(size for size, _ in fetch)
+    total = sum(size for size, _ in files)
+    had = total - sum(size for size, _ in fetch)
+    report = _report_progress if json_progress else _ConsoleProgress()
     counted = _network_counter()
     stop = threading.Event()
 
     def measure():
-        done = 0
+        done = had
         while not stop.wait(PROGRESS_INTERVAL):
             held = _blob_bytes(blobs)
             written = sum(min(size, held.get(blob, 0)) for size, blob in fetch)
-            now = min(max(written, counted.received), total)
+            now = had + min(max(written, counted.received), total - had)
             # A partial file renamed to its blob between the listing and its
             # size goes uncounted once, so only growth is reported.
             if now > done:
                 done = now
-                _report_progress(repo_id, done, total)
+                report(repo_id, done, total)
 
-    _report_progress(repo_id, 0, total)
+    report(repo_id, had, total)
     thread = threading.Thread(target=measure)
     thread.start()
+    succeeded = False
     try:
         yield counted
+        succeeded = True
     finally:
         stop.set()
         thread.join()
-    _report_progress(repo_id, total, total)
+        if not succeeded and isinstance(report, _ConsoleProgress):
+            report.close()
+    report(repo_id, total, total)
+
+
+class _ConsoleProgress:
+    """A download's bytes on stdout, beside its Fetching line: on a terminal
+    one line rewritten at each report, ended with the download, whether it
+    succeeds or not (close); in a log, as `splash serve` relays the
+    installer's output, a line at each tenth of the total and whenever
+    LOG_PROGRESS_SECONDS pass without one, so that a log of an 8 GB download
+    holds about a dozen lines, and one of 65 GB at 10 MB/s a line every 30 s
+    rather than every eleven minutes."""
+
+    def __init__(self):
+        self.terminal = sys.stdout.isatty()
+        self.tenths = -1
+        self.written = 0.0
+        self.open = False
+
+    def __call__(self, repo_id, done, total):
+        line = (
+            f"Downloading {repo_id}: {done / 1e9:.2f} of {total / 1e9:.2f} GB "
+            f"({100 * done // max(total, 1)}%)"
+        )
+        tenths = 10 * done // max(total, 1)
+        now = time.monotonic()
+        if self.terminal:
+            self.open = done != total
+            sys.stdout.write(f"\r{line}\033[K{'' if self.open else chr(10)}")
+        elif tenths > self.tenths or now - self.written >= LOG_PROGRESS_SECONDS:
+            self.tenths, self.written = tenths, now
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    def close(self):
+        """End the terminal's line a download that failed left open."""
+        if self.open:
+            self.open = False
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 
 # The progress bar snapshot_download counts the bytes from the network on, as
@@ -887,8 +989,7 @@ NETWORK_BAR = "huggingface_hub.snapshot_download.transfer"
 
 def _network_counter():
     """A tqdm class for snapshot_download that counts in `received` the bytes
-    its network bar is told have arrived; json_progress has its bars draw
-    nothing."""
+    its network bar is told have arrived, and draws none of its bars."""
     from huggingface_hub.utils import tqdm
 
     lock = threading.Lock()
@@ -898,6 +999,7 @@ def _network_counter():
 
         def __init__(self, *args, **kwargs):
             self.network = kwargs.get("name") == NETWORK_BAR
+            kwargs["disable"] = True
             super().__init__(*args, **kwargs)
 
         def update(self, n=1):

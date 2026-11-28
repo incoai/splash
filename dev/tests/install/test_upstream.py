@@ -7,6 +7,8 @@ import json
 import re
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +22,9 @@ from dev.tests.installer_fixtures import (
     CONFIGS,
     DENSE,
     DRAFT_COMMIT,
-    GGUF_ONLY,
+    FLINT,
+    GGUF_CONFIGS,
+    INKLING,
     MODEL,
     MOE,
     PROCESSOR,
@@ -37,6 +41,7 @@ from dev.tests.installer_fixtures import (
     missing_revision,
     mlx_target,
     pins,
+    prepared_towers,
     selection,
     tensor_table,
     write_target,
@@ -47,7 +52,7 @@ from install import assembly, families, hub, models, paths, upstream
 # tells it apart.
 UNSUPPORTED = (
     "no supported model has this architecture [(]{}[)]; "
-    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next"
+    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B [(]Ornith-1.5-122B[)], Qwen3.8-Flash-Next"
 )
 
 
@@ -57,6 +62,7 @@ class UpstreamTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.cache = self.root / "hub"
+        prepared_towers(self)
 
     @staticmethod
     def prepare(chosen):
@@ -75,27 +81,101 @@ class UpstreamTest(unittest.TestCase):
                 self.assertEqual(models.validate_repo_id(repo), repo)
         self.assertEqual(len(set(repos)), len(repos))
 
+    def test_the_engine_says_what_weights_auto_changes_of_an_assemblys_target(self):
+        # What the app offers --weights by is the engine's answer, asked of
+        # the target's files linked as the assembly links them; where the
+        # engine does not say, nothing is said.
+        root = self.root / "files"
+        root.mkdir()
+        files = {}
+        for name in ("config.json", "target/model.safetensors", "tokenizer/t.json"):
+            files[name] = root / name.replace("/", "-")
+            files[name].write_bytes(name.encode())
+        seen = {}
+
+        def engine(arguments, purpose):
+            target = Path(arguments[-1])
+            seen.update(
+                arguments=arguments[:-1],
+                target={
+                    str(p.relative_to(target)): p.read_bytes() for p in target.iterdir()
+                },
+            )
+            return '{"family": "Qwen3.8-27B", "quantizable_weights": true}'
+
+        with mock.patch.object(models, "run_engine", engine):
+            self.assertIs(upstream._weights_auto_changes("mlx-affine", files), True)
+        self.assertEqual(
+            seen,
+            {
+                "arguments": [
+                    "model-check",
+                    "mlx-affine",
+                    "none",
+                    str(files["config.json"]),
+                ],
+                "target": {"model.safetensors": b"target/model.safetensors"},
+            },
+        )
+        for said in ('{"family": "Qwen3.8-27B"}', models.ModelError("refused")):
+            with mock.patch.object(models, "run_engine", side_effect=[said]):
+                self.assertIsNone(upstream._weights_auto_changes("mlx-affine", files))
+
+    def test_an_assembly_records_what_its_template_makes_of_reasoning(self):
+        # The server's own report (chat_templates.tokenizer_reasoning), asked
+        # of the assembly's tokenizer files linked as it links them; nothing
+        # where the tokenizer does not load.
+        from server import chat_templates
+
+        root = self.root / "files"
+        root.mkdir()
+        files = {}
+        for name in ("config.json", "tokenizer/tokenizer.json", "target/m.gguf"):
+            files[name] = root / name.replace("/", "-")
+            files[name].write_bytes(name.encode())
+        seen = {}
+
+        def reasoning(directory, chat_format):
+            seen.update(
+                files={p.name: p.read_bytes() for p in Path(directory).iterdir()},
+                chat_format=chat_format,
+            )
+            return {"thinks": True, "efforts": [], "default": None}
+
+        with mock.patch.object(chat_templates, "tokenizer_reasoning", reasoning):
+            self.assertEqual(
+                upstream._reasoning(MOE.name, files),
+                {"thinks": True, "efforts": [], "default": None},
+            )
+        self.assertEqual(
+            seen,
+            {
+                "files": {"tokenizer.json": b"tokenizer/tokenizer.json"},
+                "chat_format": MOE.chat_format,
+            },
+        )
+        # A tokenizer.json that is none.
+        self.assertIsNone(upstream._reasoning(MOE.name, files))
+
     def test_family_is_identified_by_architecture_not_name(self):
         # The engine's check (its model-check command), with and without the
-        # draft, of each family an MLX checkpoint serves.
+        # draft, of each family's MLX checkpoint (Inkling 2's release's).
         for family in families.FAMILIES:
-            if family in GGUF_ONLY:
-                continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
+            vision = "safetensors" if family.vision else "none"
             for arguments in ({}, {"draft": draft / "config.json"}):
                 self.assertIs(
-                    upstream.check_model(
-                        "mlx-affine", "safetensors", config, **arguments
-                    ),
+                    upstream.check_model("mlx-affine", vision, config, **arguments),
                     family,
                 )
 
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config the
-        # installer derives from it and its header name the family, with and
-        # without its draft (Flint's flat config, its release's keys, and a
-        # test draft naming one of its reserved tokens as its mask), and
-        # another family's draft is refused.
+        # Qwen3.8-Flash-Next, Flint and Inkling 2 load from a GGUF too: the
+        # config the installer derives from it and its header name the
+        # family, with and without its draft (Flint's flat config, its
+        # release's keys, and a test draft naming one of its reserved tokens
+        # as its mask; Inkling 2's release draft), and another family's draft
+        # is refused.
         def headers(family):
             directory = self.root / family.name / "target"
             directory.mkdir(parents=True, exist_ok=True)
@@ -104,7 +184,7 @@ class UpstreamTest(unittest.TestCase):
             )
             return {"gguf_headers": directory}
 
-        for family in GGUF_ONLY:
+        for family in GGUF_CONFIGS:
             configs = CONFIGS / family.name.lower()
             gguf_check = headers(family)
             for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
@@ -118,6 +198,26 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
+        # Inkling 2's GGUF in Unsloth's own layout (the root files of
+        # unsloth/Inkling-2-Mini-GGUF) names its family too.
+        unsloth = self.root / "inkling2" / "target"
+        unsloth.mkdir(parents=True)
+        write_target(
+            unsloth / "model.gguf",
+            fixture(family=INKLING, metadata="gguf-metadata-inkling2.json"),
+            tensor_table(INKLING, "gguf-tensors-inkling2.json"),
+        )
+        configs = CONFIGS / INKLING.name.lower()
+        self.assertIs(
+            upstream.check_model(
+                "gguf",
+                "none",
+                configs / "config.json",
+                gguf_headers=unsloth,
+                draft=configs / "draft" / "config.json",
+            ),
+            INKLING,
+        )
         flash = families.named("Qwen3.8-Flash-Next")
         configs = CONFIGS / flash.name.lower()
         gguf_check = headers(flash)
@@ -522,12 +622,12 @@ class UpstreamTest(unittest.TestCase):
         fake = fake_hub(self, self.cache)
         required = (
             r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 bits "
-            r"in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 or FP8 checkpoint "
-            r"of Model Optimizer or compressed-tensors, or a supported GGUF"
+            r"in groups of 32, 64 or 128, mxfp4, mxfp8 or nvfp4\), an NVFP4 or FP8 "
+            r"checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF"
         )
         formats = (
             r"; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, "
-            "64 or 128, or as mxfp4 or nvfp4"
+            "64 or 128, or as mxfp4, mxfp8 or nvfp4"
         )
         for name, quantization, refusal in (
             # A transformers quantization_config alone is another method.
@@ -595,19 +695,6 @@ class UpstreamTest(unittest.TestCase):
                 "quantization language_model.model.layers.0.mlp.down_proj is "
                 "affine 4-bit in groups of 256" + formats,
             ),
-            # MLX writes false for a module it leaves unquantized.
-            (
-                "bf16-head",
-                {
-                    "quantization": {
-                        "bits": 4,
-                        "group_size": 64,
-                        "language_model.lm_head": False,
-                    }
-                },
-                "quantization language_model.lm_head is unquantized; Splash loads "
-                "quantized MLX projections",
-            ),
         ):
             with self.subTest(name=name):
                 fake.publish(f"someone/{name}", "b" * 40, target(quantization))
@@ -655,6 +742,12 @@ class UpstreamTest(unittest.TestCase):
             ("q3-g32", {"bits": 3, "group_size": 32, "mode": "affine"}),
             ("mxfp4", {"bits": 4, "group_size": 32, "mode": "mxfp4"}),
             ("nvfp4", {"bits": 4, "group_size": 16, "mode": "nvfp4"}),
+            # MLX writes false for a module it leaves unquantized, which loads
+            # as Q8_0.
+            (
+                "bf16-head",
+                {"bits": 4, "group_size": 64, "language_model.lm_head": False},
+            ),
             (
                 "mixed",
                 {
@@ -716,9 +809,9 @@ class UpstreamTest(unittest.TestCase):
                 "Qwen/Qwen3.8-27B",
                 transformers_release,
                 r"this model requires an MLX checkpoint \(affine 2, 3, 4, 5, 6 or 8 "
-                r"bits in groups of 32, 64 or 128, mxfp4 or nvfp4\), an NVFP4 or FP8 "
-                r"checkpoint of Model Optimizer or compressed-tensors, or a supported "
-                r"GGUF",
+                r"bits in groups of 32, 64 or 128, mxfp4, mxfp8 or nvfp4\), an NVFP4 or "
+                r"FP8 checkpoint of Model Optimizer or compressed-tensors, or a "
+                r"supported GGUF",
             ),
             (
                 "mlx-community/Qwen3.5-4B-MLX-4bit",
@@ -789,20 +882,15 @@ class UpstreamTest(unittest.TestCase):
             "preprocessor_config.json",
         )
         fake = FakeHub(self, self.cache)
+
+        def without(root, missing):
+            mlx_target(root, DENSE)
+            (root / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+            (root / missing).unlink()
+
         for missing in required:
             with self.subTest(missing=missing):
-                fake.publish(
-                    "user/custom",
-                    "a" * 40,
-                    lambda p: (
-                        p.mkdir(parents=True, exist_ok=True),
-                        [
-                            (p / name).write_text("{}")
-                            for name in ("model.safetensors", *required)
-                            if name != missing
-                        ],
-                    ),
-                )
+                fake.publish("user/custom", "a" * 40, lambda p: without(p, missing))
                 chosen = selection(self.root, "user/custom", language_only=False)
                 with self.assertRaisesRegex(
                     models.ModelError, "must come from the target repository"
@@ -819,9 +907,26 @@ class UpstreamTest(unittest.TestCase):
                     in str(refused.exception),
                     missing == "preprocessor_config.json",
                 )
-                self.assertEqual(fake.downloads, [])
+                # Without a processor, the config alone is read: its family
+                # says whether it needs one (family.vision).
+                self.assertEqual(
+                    fake.downloads,
+                    ["user/custom/config.json"]
+                    if missing == "preprocessor_config.json"
+                    else [],
+                )
                 self.assertFalse(chosen.models_root.exists())
+                fake.downloads.clear()
                 shutil.rmtree(fake.remote)
+
+        # A checkpoint no family serves is refused for that, processor or not.
+        def unserved(root):
+            without(root, "preprocessor_config.json")
+            (root / "config.json").write_text("{}")
+
+        fake.publish("user/custom", "b" * 40, unserved)
+        with self.assertRaisesRegex(models.ModelError, "no supported model"):
+            self.prepare(selection(self.root, "user/custom", language_only=False))
 
     def test_a_draft_that_ships_its_mask_embedding_installs_it(self):
         # A release may ship its mask token's embedding beside its weights,
@@ -863,6 +968,9 @@ class UpstreamTest(unittest.TestCase):
         )
         record = assembly.verify(chosen.link)
         self.assertEqual(record["family"], MOE.name)
+        # Its shard's header is not one: what --weights auto does to its
+        # weights is recorded as unsaid, and the app does not offer the option.
+        self.assertIsNone(record["quantizable_weights"])
         self.assertEqual(
             record["sources"],
             {
@@ -1111,6 +1219,20 @@ class UpstreamTest(unittest.TestCase):
         self.assertNotIn("someone/text/model.safetensors", fake.downloads)
         self.assertIn("someone/text/model.safetensors", fake.range_reads)
 
+    def test_a_text_only_familys_mlx_target_installs_without_language_only(self):
+        # Flint has no vision tower (family.vision): its MLX repository holds
+        # no processor, and installs to serve text as its GGUF does, without
+        # --language-only.
+        fake_hub(self, self.cache, target=FLINT)
+        chosen = selection(self.root, language_only=False)
+        self.prepare(chosen)
+        record = json.loads((chosen.link / "model.json").read_text())
+        self.assertEqual(
+            (record["family"], record["target_format"], record["vision_format"]),
+            ("Flint", "mlx-affine", "none"),
+        )
+        self.assertFalse((chosen.link / "vision").exists())
+
     def test_a_cached_file_is_read_from_the_cache(self):
         fake = FakeHub(self, self.cache)
         fake.publish(MODEL, "a" * 40, lambda p: mlx_target(p, DENSE))
@@ -1326,6 +1448,48 @@ class UpstreamTest(unittest.TestCase):
         self.assertIn("is already installed", output)
         self.assertEqual((fake.requests, fake.downloads), ([], []))
 
+    def test_an_offline_start_of_an_installed_model_imports_no_hub_client(self):
+        # As the launcher runs it for every start: the installer finds the
+        # model installed without httpx or the Hub's API, which only a
+        # request needs.
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        script = (
+            "import json, runpy, sys\n"
+            "try:\n"
+            "    runpy.run_path('install/models.py', run_name='__main__')\n"
+            "except SystemExit as end:\n"
+            "    print(json.dumps({'code': end.code, 'modules': sorted(sys.modules)}))\n"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                "--models",
+                str(self.root / "models"),
+                "--model",
+                MODEL,
+                "--language-only",
+                "prepare",
+            ],
+            cwd=Path(upstream.__file__).resolve().parents[1],
+            env={
+                "HOME": str(self.root),
+                "HF_HUB_OFFLINE": "1",
+                "HF_HUB_CACHE": str(self.cache),
+            },
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertIn("is already installed", result.stdout, result.stderr)
+        ended = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(ended["code"], 0, result.stderr)
+        self.assertNotIn("httpx", ended["modules"])
+        self.assertNotIn("huggingface_hub.hf_api", ended["modules"])
+
     def test_new_commit_rejected_before_download_keeps_the_installed_one(self):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
@@ -1339,7 +1503,7 @@ class UpstreamTest(unittest.TestCase):
             f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot install "
             f"{MODEL}@{'b' * 40}: no supported model has this architecture (text "
             "config head_dim: safetensors 128, Qwen3.8-27B 256); supported: Qwen3.8-27B, "
-            "Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next",
+            "Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next",
             warnings,
         )
         self.assertEqual(chosen.link.resolve(), installed)
@@ -1385,6 +1549,44 @@ class UpstreamTest(unittest.TestCase):
             all(name.startswith(DENSE.draft_repo + "/") for name in fake.downloads)
         )
         self.assertEqual(pins(self.cache), sorted(["a" * 40, "e" * 40]))
+
+    def test_a_draft_revision_pins_the_draft_as_a_revision_pins_the_target(self):
+        # A 40-hex --draft-revision installs that commit beside the draft's
+        # default branch, and holds it while the branch moves and the
+        # target's follows its own: the draft is asked for no more.
+        fake = fake_hub(self, self.cache)
+        fake.publish(
+            DENSE.draft_repo, "e" * 40, lambda p: draft_dir(p, DENSE), branch="preview"
+        )
+        chosen = selection(self.root, draft_revision="e" * 40)
+        self.prepare(chosen)
+        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft_repo, "e" * 40)])
+        fake.publish(DENSE.draft_repo, "f" * 40, lambda p: draft_dir(p, DENSE))
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        fake.requests.clear(), fake.downloads.clear()
+        self.prepare(chosen)
+        self.assertEqual(fake.requests, [(MODEL, None)])
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"],
+            {
+                "target": {"repo": MODEL, "revision": "b" * 40},
+                "draft": {"repo": DENSE.draft_repo, "revision": "e" * 40},
+            },
+        )
+
+    def test_a_draft_revision_names_a_branch_of_a_chosen_draft_repository(self):
+        # A branch is followed as the target's is, in --draft-model's
+        # repository as in the family's.
+        fake = fake_hub(self, self.cache)
+        repository = "someone/other-draft"
+        fake.publish(repository, "c" * 40, lambda p: draft_dir(p, DENSE), branch="v2")
+        chosen = selection(self.root, draft_model=repository, draft_revision="v2")
+        self.prepare(chosen)
+        self.assertEqual(fake.requests, [(MODEL, None), (repository, "v2")])
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["draft"],
+            {"repo": repository, "revision": "c" * 40},
+        )
 
     def test_an_installation_of_another_draft_repository_moves_to_the_familys(self):
         fake = fake_hub(self, self.cache)
@@ -1663,17 +1865,20 @@ class UpstreamTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return upstream.remove(chosen)
 
-    def run_installer(self, *arguments):
+    def run_installer(self, *arguments, language_only=True):
         """models.main's status, JSON events and warnings, for arguments after
-        the models root and MODEL, text only."""
+        the models root and MODEL, text only unless language_only is
+        False."""
         argv = ["--models", str(self.root / "models"), "--model", MODEL]
+        if language_only:
+            argv.append("--language-only")
         with (
             mock.patch.object(hub, "json_progress", False),
             mock.patch("huggingface_hub.utils.disable_progress_bars"),
             contextlib.redirect_stdout(io.StringIO()) as output,
             contextlib.redirect_stderr(io.StringIO()) as warnings,
         ):
-            status = models.main([*argv, "--language-only", *arguments])
+            status = models.main([*argv, *arguments])
         events = [
             json.loads(line)
             for line in output.getvalue().splitlines()
@@ -1882,6 +2087,24 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(self.remove(first), 0)
         self.assertEqual(blob_bytes(self.cache, MODEL), size)
 
+    def test_an_installations_vocabulary_is_its_drafts(self):
+        """The server builds its grammars' table of it before the engine is
+        Ready (server.main)."""
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        self.assertEqual(
+            assembly.vocabulary(chosen.link),
+            family_config(DENSE, "draft/config.json")["vocab_size"],
+        )
+        broken = self.root / "broken"
+        (broken / "draft").mkdir(parents=True)
+        for config in ("{", "{}", '{"vocab_size": "248320"}', '{"vocab_size": 0}'):
+            with self.subTest(config=config):
+                (broken / "draft/config.json").write_text(config)
+                with self.assertRaises(models.ModelError):
+                    assembly.vocabulary(broken)
+
     def test_a_recorded_path_that_climbs_out_of_its_snapshot_is_never_freed(self):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
@@ -1919,6 +2142,51 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(plain)
         self.prepare(text_only)
         self.assertEqual(upstream._selections_of(plain), [text_only.link, plain.link])
+
+    def test_a_download_the_disk_has_no_room_for_is_refused_for_the_whole_model(self):
+        # The draft downloads first, and its check counts the target's files
+        # too, each once: the shard that holds the tower and a text tensor is
+        # linked under both target/ and vision/. Freeing what the refusal
+        # names is enough, and no more, so a second try does not stop again
+        # at the target. The error event says so in numbers, classed for the
+        # app.
+        fake = fake_hub(self, self.cache)
+
+        def shared_shard(root):
+            vision_target(root)
+            index = root / "model.safetensors.index.json"
+            shards = json.loads(index.read_text())["weight_map"]
+            shards["language_model.embed_tokens.weight"] = (
+                "model-00001-of-00002.safetensors"
+            )
+            index.write_text(json.dumps({"weight_map": shards}))
+
+        fake.publish(MODEL, "d" * 40, shared_shard)
+        with mock.patch.object(hub, "_available_bytes", lambda path: 0):
+            status, events, _ = self.run_installer("prepare", language_only=False)
+        self.assertEqual(status, 1)
+        [event] = events
+        needed = event["needed"]
+        self.assertEqual(
+            {k: event[k] for k in ("event", "kind", "available")},
+            {"event": "error", "kind": "disk", "available": 0},
+        )
+        self.assertFalse([d for d in fake.downloads if d.endswith(".safetensors")])
+        with mock.patch.object(hub, "_available_bytes", lambda path: needed - 1):
+            status, events, _ = self.run_installer("prepare", language_only=False)
+        self.assertEqual((status, events[0]["needed"]), (1, needed))
+        fake.downloads.clear()
+        with mock.patch.object(hub, "_available_bytes", lambda path: needed):
+            status, _, _ = self.run_installer("prepare", language_only=False)
+        self.assertEqual(status, 0)
+        # What it downloaded, each file once, is what it needed.
+        commits = {MODEL: "d" * 40, DENSE.draft_repo: DRAFT_COMMIT}
+        fetched = 0
+        for download in fake.downloads:
+            owner, name, file = download.split("/", 2)
+            repo = f"{owner}/{name}"
+            fetched += (fake.remote / repo / commits[repo] / file).stat().st_size
+        self.assertEqual(needed, fetched)
 
     def test_the_remove_command_reports_the_bytes_freed(self):
         fake_hub(self, self.cache)
@@ -2101,6 +2369,7 @@ class UpstreamTest(unittest.TestCase):
         record = json.loads((chosen.link / "model.json").read_text())
         for change in (
             lambda r: r.pop("family"),
+            lambda r: r.update(quantizable_weights="no"),
             lambda r: r.update(metadata="0" * 64),
             lambda r: r.update(target_format="safetensors"),
             lambda r: r.update(version=True),
@@ -2110,6 +2379,10 @@ class UpstreamTest(unittest.TestCase):
             lambda r: r["files"]["config.json"].update(digest="z" * 64),
             lambda r: r["files"].update({"../escape": r["files"]["config.json"]}),
             lambda r: r["files"].update({".": r["files"]["config.json"]}),
+            lambda r: r.update(surplus=""),
+            lambda r: r.update(vision_unavailable=None),
+            # Only a text-only assembly records why it serves no images.
+            lambda r: r.update(vision_format="gguf", vision_unavailable="none"),
         ):
             changed = json.loads(json.dumps(record))
             change(changed)
@@ -2120,6 +2393,11 @@ class UpstreamTest(unittest.TestCase):
             (built / "model.json").write_text(json.dumps(changed))
             with self.assertRaisesRegex(models.ModelError, "invalid resolved model"):
                 assembly.verify(built)
+        (built / "model.json").unlink()
+        (built / "model.json").write_text(
+            json.dumps(record | {"vision_unavailable": "no tower"})
+        )
+        assembly.verify(built)
 
     def test_hub_resolution_pins_one_commit(self):
         fake = FakeHub(self, self.cache)

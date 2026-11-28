@@ -9,8 +9,8 @@ from dataclasses import replace
 from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHQ")
-_REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIIII")
+_IMAGE_SPAN = struct.Struct("<IIIIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQII")
 _ID = struct.Struct("<Q")
 
@@ -88,7 +88,15 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             )
         case wire.StartEvent():
             return wire.FrameType.START, struct.pack(
-                "<QII", event.request_id, event.lane, event.matched_prompt_tokens
+                "<QIIIBBBI",
+                event.request_id,
+                event.lane,
+                event.matched_prompt_tokens,
+                event.prefix_tokens,
+                event.state_source,
+                event.lost_state,
+                event.reuse_end,
+                event.reuse_end_tokens,
             )
         case wire.PromptProgressEvent():
             return wire.FrameType.PROMPT_PROGRESS, struct.pack(
@@ -143,11 +151,13 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             return wire.FrameType.DONE, payload
         case wire.ErrorEvent():
             return wire.FrameType.ERROR, struct.pack(
-                f"<BBIQII{len(event.code)}s{len(event.message)}s",
+                f"<BBIQBIII{len(event.code)}s{len(event.message)}s",
                 event.failure_class,
                 event.retryable,
                 event.retry_after_seconds,
                 event.request_id,
+                event.capacity_limit,
+                event.fits_tokens,
                 len(event.code),
                 len(event.message),
                 event.code,
@@ -173,7 +183,7 @@ def _words(payload: bytes, offset: int, count: int) -> tuple[int, ...]:
     return struct.unpack_from(f"<{count}I", payload, offset)
 
 
-def _decode_request(payload: bytes) -> wire.RequestFrame:
+def _decode_request(payload: bytes, patch: int) -> wire.RequestFrame:
     (
         request_id,
         priority,
@@ -193,16 +203,37 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         thinking_tokens,
         thinking_end_count,
         thinking_also_ends,
+        head_tokens,
     ) = _REQUEST.unpack_from(payload)
     offset = _REQUEST.size
     prompt = _words(payload, offset, prompt_count)
     offset += 4 * prompt_count
-    spans = tuple(
-        wire.ImageSpan(
-            *_IMAGE_SPAN.unpack_from(payload, offset + index * _IMAGE_SPAN.size)
+    spans = []
+    for index in range(span_count):
+        (
+            span_offset,
+            tokens,
+            grid_height,
+            grid_width,
+            content_height,
+            content_width,
+            digest_lo,
+            digest_hi,
+        ) = _IMAGE_SPAN.unpack_from(payload, offset + index * _IMAGE_SPAN.size)
+        spans.append(
+            wire.ImageSpan(
+                span_offset,
+                tokens,
+                grid_height,
+                grid_width,
+                digest_lo,
+                digest_hi,
+                content_height,
+                content_width,
+                patch,
+            )
         )
-        for index in range(span_count)
-    )
+    spans = tuple(spans)
     offset += _IMAGE_SPAN.size * span_count
     pixel_bytes = sum(span.pixel_bytes for span in spans)
     pixels = bytes(payload[offset : offset + pixel_bytes])
@@ -228,15 +259,20 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         None
         if thinking_tokens == 0xFFFFFFFF
         else wire.ThinkingBudget(thinking_tokens, thinking_end, thinking_also_ends),
+        head_tokens,
     )
 
 
-def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
+def decode_client_frame(
+    frame_type: int, payload: bytes, patch: int = 16
+) -> wire.ClientMessage:
     """One client frame's message, read as the engine reads it but without
-    checking the rules the server's encoder already enforced."""
+    checking the rules the server's encoder already enforced. patch is the
+    side of an image's patch, the served tower's, which the engine knows and
+    the frame does not state: Qwen's 16 pixels, Inkling's 20."""
     match frame_type:
         case wire.FrameType.REQUEST:
-            return _decode_request(payload)
+            return _decode_request(payload, patch)
         case wire.FrameType.CANCEL:
             return wire.CancelFrame(*_ID.unpack(payload))
         case wire.FrameType.MASK_RESPONSE:
@@ -263,8 +299,10 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
 class ClientFrameReader:
     """Splits the server's byte stream into client frames."""
 
-    def __init__(self):
+    def __init__(self, patch: int = 16):
         self._buffer = bytearray()
+        # The served tower's patch side (decode_client_frame).
+        self._patch = patch
 
     def feed(self, data) -> list[tuple[wire.ClientMessage, bytes]]:
         """Each complete frame in what has arrived so far, as its message and
@@ -283,6 +321,11 @@ class ClientFrameReader:
             raw = bytes(self._buffer[:end])
             del self._buffer[:end]
             frames.append(
-                (decode_client_frame(frame_type, raw[wire.FRAME_HEADER_BYTES :]), raw)
+                (
+                    decode_client_frame(
+                        frame_type, raw[wire.FRAME_HEADER_BYTES :], self._patch
+                    ),
+                    raw,
+                )
             )
         return frames

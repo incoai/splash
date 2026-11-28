@@ -126,7 +126,7 @@ struct ComposerTests {
         let fake = try FakeRuntime("splash-composer-stage", launcher: "stepped_server")
         // Installed, as a model that runs is, so that its name opens the models' menu.
         try fake.install("example/Model")
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer {
             state.quit()
             try? FileManager.default.removeItem(at: fake.root)
@@ -200,7 +200,7 @@ struct ComposerTests {
     @Test func imagesAttachAwayFromTheMainThreadInTheirOrder() async throws {
         let files = FileManager.default.temporaryDirectory.appending(path: "splash-draft-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: files) }
-        let draft = Draft(files: files)
+        let draft = Draft(files: files, kept: files.appending(path: "Drafts.plist")) { nil }
         let photo = try #require(NSImage(data: Self.photo(width: 4032, height: 3024)))
         let picture = try #require(NSImage(data: Showcase.picture))
         draft.attach([photo])

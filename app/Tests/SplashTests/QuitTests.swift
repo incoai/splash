@@ -10,7 +10,7 @@ struct QuitTests {
     /// A quit asks only where it would cut off requests being answered, a download or a terminal's
     /// program, and says each; a model that only runs is no loss.
     @Test func aQuitCostsWhatItCutsOff() {
-        let download = "Flash is still downloading. If you quit, the download starts over next time."
+        let download = "Flash is still downloading. If you quit, it stops. Download it again later to go on: the files it finished are kept."
         #expect(AppState.QuitCost(model: "27B").message == nil)
         #expect(AppState.QuitCost(model: "27B", requests: 1).message == "27B is answering a request.")
         #expect(AppState.QuitCost(model: "27B", requests: 2).message == "27B is answering 2 requests.")
@@ -43,7 +43,7 @@ struct QuitTests {
         let fake = try FakeRuntime("splash-quit", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
         let model = "a/First-GGUF:Q4"
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.options["--port"] = String(fake.port)

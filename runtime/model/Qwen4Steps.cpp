@@ -17,8 +17,6 @@ namespace {
 
 constexpr uint32_t kLanes = ExecutionLimits::maximumBatchWidth;
 constexpr uint32_t kChunkRows = ExecutionLimits::prefillTokenBudget;
-// A decode step's most rows: every lane's verify block, packed.
-constexpr uint32_t kStepRows = kLanes * ExecutionLimits::targetVerifyRows;
 // The QSA selection scores a prefill chunk's rows in batches, which bounds
 // its score scratch (a row scores every block of the context): of this many
 // rows at the native window (prefillScoreRows); a verify scores every lane's
@@ -36,7 +34,9 @@ constexpr uint32_t blockCount(uint64_t position, uint32_t rows) noexcept {
 // sequence completes at most one block more than its rows hold whole, and a
 // chunk holds at most a sequence per lane. A verify lane's: those a path of
 // a verify block's most rows may complete.
-constexpr uint64_t kChunkBlockBytes = (kChunkRows / BLOCK_INDEXER_BLOCK + kLanes) * sizeof(BlockIndexerBlock);
+constexpr uint64_t chunkBlockBytes(const QwenTargetGeometry &g) noexcept {
+  return (kChunkRows / BLOCK_INDEXER_BLOCK + g.lanes) * sizeof(BlockIndexerBlock);
+}
 constexpr uint32_t kBlockRows = ExecutionLimits::targetVerifyRows;
 constexpr uint64_t kLaneBlockBytes =
     (kBlockRows + BLOCK_INDEXER_BLOCK - 1) / BLOCK_INDEXER_BLOCK * sizeof(BlockIndexerBlock);
@@ -99,13 +99,13 @@ struct Tensor final {
 // (ops::BlockIndexer::addTreePool).
 uint64_t keyRowBytes(bool decode) { return decode ? 0 : bytesFor<uint16_t>(BLOCK_INDEXER_DIMENSION); }
 uint64_t keyFixedBytes(const QwenTargetGeometry &g, bool decode) {
-  return decode ? bytesFor<uint16_t>(uint64_t{g.attentionLayerCount()} * kStepRows * BLOCK_INDEXER_DIMENSION) : 0;
+  return decode ? bytesFor<uint16_t>(uint64_t{g.attentionLayerCount()} * g.stepRows() * BLOCK_INDEXER_DIMENSION) : 0;
 }
 
 // A prefill chunk's or a decode step's tensors; a streamed PLE table's rows
 // are `pleRowBytes` each (zero for a table in memory).
 std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, bool decode) {
-  const uint32_t scoreRows = decode ? kStepRows : prefillScoreRows(g);
+  const uint32_t scoreRows = decode ? g.stepRows() : prefillScoreRows(g);
   std::vector<Tensor> result{
       {&Qwen4Scratch::streams, bytesFor<float>(g.streamWidth()), 0, true},
       {&Qwen4Scratch::normalized, bytesFor<uint16_t>(g.streamWidth()), 0, false},
@@ -129,8 +129,8 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, b
       // for the lists' counts: a step's rows fill whole tiles but the last of
       // each of its sequences (at most one a lane), which may hold fewer.
       {&Qwen4Scratch::qsaLists, bytesFor<uint32_t>(listStride(g) / kTileRows),
-       bytesFor<uint32_t>(uint64_t{kLanes} * listStride(g)), false},
-      {&Qwen4Scratch::qsaListCounts, bytesFor<uint32_t>(1), bytesFor<uint32_t>(kLanes), false},
+       bytesFor<uint32_t>(uint64_t{g.lanes} * listStride(g)), false},
+      {&Qwen4Scratch::qsaListCounts, bytesFor<uint32_t>(1), bytesFor<uint32_t>(g.lanes), false},
   };
   // A decode step's block keys of every attention layer and each row's mask
   // of its lane's rows it attends (ops::BlockIndexer::addTreeSelect).
@@ -162,10 +162,10 @@ Layout layout(const QwenTargetGeometry &g, uint64_t pleRowBytes, uint32_t chunks
   Layout result;
   for (const Tensor &tensor : tensors(g, pleRowBytes, false))
     result.prefillBlocks += alignUp(bytesOf(tensor, kChunkRows)) * (tensor.carried ? chunks : 1);
-  result.prefillBytes = result.prefillBlocks + alignUp(kChunkBlockBytes) * chunks;
-  for (const Tensor &tensor : tensors(g, pleRowBytes, true)) result.decodeBlocks += alignUp(bytesOf(tensor, kStepRows));
-  result.decodePrior = result.decodeBlocks + alignUp(kLanes * kLaneBlockBytes);
-  result.decodeBytes = result.decodePrior + alignUp(bytesFor<uint32_t>(kLanes * priorCount(g)));
+  result.prefillBytes = result.prefillBlocks + alignUp(chunkBlockBytes(g)) * chunks;
+  for (const Tensor &tensor : tensors(g, pleRowBytes, true)) result.decodeBlocks += alignUp(bytesOf(tensor, decodeStorageRows(g.lanes)));
+  result.decodePrior = result.decodeBlocks + alignUp(g.lanes * kLaneBlockBytes);
+  result.decodeBytes = result.decodePrior + alignUp(bytesFor<uint32_t>(g.lanes * priorCount(g)));
   return result;
 }
 
@@ -214,10 +214,11 @@ Qwen4Steps::Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry 
   cursor = 0;
   for (const Tensor &tensor : tensors(geometry_, pleRowBytes_, true)) {
     decodeTensors_.push_back({tensor.field, tensor.rowBytes, tensor.fixedBytes, tensor.carried, cursor});
-    cursor += alignUp(bytesOf(tensor, kStepRows));
+    cursor += alignUp(bytesOf(tensor, decodeStorageRows(geometry_.lanes)));
   }
   // The rows the MoE adds a block's output to.
-  for (const metal::MetalBuffer &zeros : {prefillScratch(0).zeros, verifyScratch(kStepRows).zeros})
+  for (const metal::MetalBuffer &zeros :
+       {prefillScratch(0).zeros, verifyScratch(decodeStorageRows(geometry_.lanes)).zeros})
     std::memset(zeros.contents(), 0, zeros.sizeBytes());
 }
 
@@ -248,14 +249,15 @@ Qwen4Scratch Qwen4Steps::prefillScratch(uint32_t index) const {
 std::vector<Qwen4Blocks> Qwen4Steps::prefillBlocks(uint32_t index, const QwenTargetPrefillChunk &chunk) const {
   if (index >= prefillChunks_) throw std::out_of_range("Qwen3.8-Flash-Next prefill chunk");
   const metal::MetalBuffer records =
-      backend_.view(prefill_, prefillBlocksOffset_ + index * alignUp(kChunkBlockBytes), kChunkBlockBytes);
+      backend_.view(prefill_, prefillBlocksOffset_ + index * alignUp(chunkBlockBytes(geometry_)),
+                    chunkBlockBytes(geometry_));
   std::vector<Qwen4Blocks> blocks;
   uint64_t written = 0;
   for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
     const uint32_t count = blockCount(sequence.chunk.committed_tokens, sequence.rows);
     const uint64_t bytes = count * sizeof(BlockIndexerBlock);
     if (sequence.tokens.size() != sequence.rows || uint64_t{sequence.rowBegin} + sequence.rows > chunk.rows ||
-        written + bytes > kChunkBlockBytes)
+        written + bytes > chunkBlockBytes(geometry_))
       throw std::invalid_argument("invalid Qwen3.8-Flash-Next prefill sequence");
     blocks.push_back(count ? Qwen4Blocks{backend_.view(records, written, bytes), count} : Qwen4Blocks{});
     written += bytes;
@@ -287,7 +289,7 @@ void Qwen4Steps::readAhead(std::span<const QwenTargetPrefillChunk> chunks) {
   std::array<const QwenTargetPrefillSequence *, kLanes> last{};
   for (const QwenTargetPrefillChunk &chunk : chunks)
     for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
-      if (sequence.lane >= kLanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next prefill lane");
+      if (sequence.lane >= geometry_.lanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next prefill lane");
       last[sequence.lane] = &sequence;
     }
   const uint32_t heads = geometry_.pleHeads();
@@ -310,19 +312,19 @@ void Qwen4Steps::readAhead(std::span<const QwenTargetPrefillChunk> chunks) {
 }
 
 Qwen4Scratch Qwen4Steps::verifyScratch(uint32_t rows) const {
-  if (!rows || rows > kStepRows) throw std::out_of_range("Qwen3.8-Flash-Next verify rows");
-  Qwen4Scratch scratch{.scoreRows = kStepRows,
+  if (!rows || rows > decodeStorageRows(geometry_.lanes)) throw std::out_of_range("Qwen3.8-Flash-Next verify rows");
+  Qwen4Scratch scratch{.scoreRows = geometry_.stepRows(),
                        .scoreStride = scoreStride(geometry_),
                        .maskWords = maskWords(geometry_),
                        .listStride = listStride(geometry_),
-                       .keyLayerRows = kStepRows};
+                       .keyLayerRows = geometry_.stepRows()};
   for (const Placed &tensor : decodeTensors_)
     scratch.*tensor.field = backend_.view(decode_, tensor.offset, tensor.rowBytes * rows + tensor.fixedBytes);
   return scratch;
 }
 
 void Qwen4Steps::prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) {
-  if (lane >= kLanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next verify lane");
+  if (lane >= geometry_.lanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next verify lane");
   if (request.tokens.size() < position)
     throw std::logic_error("Qwen3.8-Flash-Next verify history is shorter than its position");
   const uint32_t prior = priorCount(geometry_);
@@ -338,8 +340,9 @@ void Qwen4Steps::prepareVerifyLane(uint32_t lane, uint64_t position, const QwenT
 }
 
 Qwen4LaneBlocks Qwen4Steps::verifyBlocks(std::span<const uint32_t> positions) const {
-  if (positions.empty() || positions.size() > kLanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next lanes");
-  Qwen4LaneBlocks blocks{.records = backend_.view(decode_, decodeBlocksOffset_, kLanes * kLaneBlockBytes),
+  if (positions.empty() || positions.size() > geometry_.lanes)
+    throw std::invalid_argument("invalid Qwen3.8-Flash-Next lanes");
+  Qwen4LaneBlocks blocks{.records = backend_.view(decode_, decodeBlocksOffset_, geometry_.lanes * kLaneBlockBytes),
                          .counts = {},
                          .laneRecords = kLaneBlockBytes / sizeof(BlockIndexerBlock)};
   for (uint32_t lane = 0; lane < positions.size(); ++lane) {
@@ -351,7 +354,7 @@ Qwen4LaneBlocks Qwen4Steps::verifyBlocks(std::span<const uint32_t> positions) co
 }
 
 std::array<uint32_t, ExecutionLimits::maximumBatchWidth> Qwen4Steps::verifyPositions(uint32_t lanes) const {
-  if (!lanes || lanes > kLanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next lanes");
+  if (!lanes || lanes > geometry_.lanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next lanes");
   std::array<uint32_t, kLanes> positions{};
   for (uint32_t lane = 0; lane < lanes; ++lane) positions[lane] = static_cast<uint32_t>(preparedPositions_[lane]);
   return positions;
@@ -365,7 +368,7 @@ metal::MetalBuffer Qwen4Steps::qsaPending(const metal::MetalBuffer &auxiliary, u
 }
 
 metal::MetalBuffer Qwen4Steps::priorTokens() const {
-  return backend_.view(decode_, decodePriorOffset_, bytesFor<uint32_t>(kLanes * priorCount(geometry_)));
+  return backend_.view(decode_, decodePriorOffset_, bytesFor<uint32_t>(geometry_.lanes * priorCount(geometry_)));
 }
 
 void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const {
@@ -396,9 +399,9 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInpu
 }
 
 std::vector<uint32_t> Qwen4Steps::verifyPleRows(const ops::LaneRows &rows) const {
-  if (uint64_t{rows.first} + rows.rows > kStepRows) throw std::out_of_range("Qwen3.8-Flash-Next verify rows");
+  if (uint64_t{rows.first} + rows.rows > geometry_.stepRows()) throw std::out_of_range("Qwen3.8-Flash-Next verify rows");
   const uint32_t heads = geometry_.pleHeads();
-  const auto *indices = contents<const uint32_t>(verifyScratch(kStepRows).pleIndices);
+  const auto *indices = contents<const uint32_t>(verifyScratch(geometry_.stepRows()).pleIndices);
   return {indices + uint64_t{rows.first} * heads, indices + (uint64_t{rows.first} + rows.rows) * heads};
 }
 

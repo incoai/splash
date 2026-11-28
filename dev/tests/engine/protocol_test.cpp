@@ -74,7 +74,8 @@ constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
 constexpr size_t cacheSalt = flags + 4;
 constexpr size_t thinkingBudget = cacheSalt + 16;
-static_assert(thinkingBudget + 12 == kRequestFixedBytes);
+constexpr size_t headTokens = thinkingBudget + 12;
+static_assert(headTokens + 4 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -178,6 +179,7 @@ RequestFrame exampleRequest() {
   request.sampling.seed = 0xfedcba9876543210ULL;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
+  request.headTokens = 2;
   request.cacheSalt = {0x8899aabbccddeeffULL, 0x0011223344556677ULL};
   request.thinkingBudget = ThinkingBudget{4096, {198, 248069}, 248058};
   return request;
@@ -186,9 +188,10 @@ RequestFrame exampleRequest() {
 RequestFrame exampleImageRequest() {
   RequestFrame request = exampleRequest();
   request.promptTokens = {7, 3, 9};
+  // Its own pixels 30 x 28 of the grid's 32 x 32, as test_protocol_python.py's.
   request.imageSpans = {
-      {1, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
-  request.imagePixels.resize(request.imageSpans[0].pixelBytes());
+      {1, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL, 30, 28}};
+  request.imagePixels.resize(request.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < request.imagePixels.size(); ++index) {
     request.imagePixels[index] = static_cast<uint8_t>(index * 7 + 1);
   }
@@ -263,7 +266,8 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
                         {},
                         "a start command ran out of GPU memory"}},
       {"warming", WarmingEvent{3, 9}},
-      {"start", StartEvent{91, 2, 4096}},
+      {"start", StartEvent{91, 2, 4096, 4160, splash::engine::StateSource::Disk, true,
+                           splash::engine::ReuseEnd::KvWithoutState, 64}},
       {"prompt_progress", PromptProgressEvent{91, 2048, 123456}},
       {"tokens", TokensEvent{91, 17, {10, 11, 12}}},
       {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}, {}}},
@@ -284,6 +288,10 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
       {"error_retry_after",
        ErrorEvent{FailureClass::RequestError, 91, true, "kv_write_budget",
                   "the SSD cache's write budget is spent", 21'600}},
+      {"error_capacity",
+       ErrorEvent{FailureClass::RequestError, 91, false, "kv_disk_quota",
+                  "this request's KV needs more of the SSD cache", 0,
+                  {splash::engine::CapacityLimit::DiskQuota, 8191}}},
       {"error_engine", ErrorEvent{FailureClass::EngineUnhealthy, 0, false,
                                   "gpu_fault", "Metal command buffer failed"}},
       {"error_protocol",
@@ -425,7 +433,7 @@ void testScoreRequestAndDoneLogits() {
   RequestFrame withImage = request;
   withImage.imageSpans = {
       {0, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
-  withImage.imagePixels.resize(withImage.imageSpans[0].pixelBytes());
+  withImage.imagePixels.resize(withImage.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels));
   // Score requests may carry images: prefill encodes them as for generation.
   CHECK(test, roundTrip(withImage) == withImage);
 
@@ -630,7 +638,7 @@ void testImagePixelsMoveOutOfThePayload() {
   expected.imageSpans[0].gridWidth = 32;
   expected.imageSpans[0].tokens = 32 * 16;
   expected.promptTokens.assign(expected.imageSpans[0].tokens + 2, 7);
-  expected.imagePixels.resize(expected.imageSpans[0].pixelBytes());
+  expected.imagePixels.resize(expected.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels));
   for (size_t index = 0; index < expected.imagePixels.size(); ++index)
     expected.imagePixels[index] = static_cast<uint8_t>(index * 13 + 5);
   CHECK(test, expected.imagePixels.size() >= 1024 * 1024);
@@ -789,12 +797,15 @@ void testPromptAndImageSpanRejections() {
   RequestFrame wholePrompt = exampleRequest();
   wholePrompt.generationPromptTokens = wholePrompt.promptTokens.size();
   expectRequestIssue(test, wholePrompt, IssueCode::InvalidCount);
+  RequestFrame wholeHead = exampleRequest();
+  wholeHead.headTokens = wholeHead.promptTokens.size();
+  expectRequestIssue(test, wholeHead, IssueCode::InvalidCount);
 
   const RequestFrame image = exampleImageRequest();
   auto withSpan = [&](auto change) {
     RequestFrame result = image;
     change(result.imageSpans[0]);
-    result.imagePixels.resize(result.imageSpans[0].pixelBytes());
+    result.imagePixels.resize(result.imageSpans[0].pixelBytes(splash::ops::kImagePatchPixels));
     return result;
   };
   expectRequestIssue(test,
@@ -829,6 +840,11 @@ void testPromptAndImageSpanRejections() {
   expectRequestIssue(test, wrapped, IssueCode::InvalidCount);
   expectRequestIssue(test, withSpan([](ImageSpan &span) { span.tokens = 2; }),
                      IssueCode::InvalidCount);
+  // Content past the grid's pixels; at them, the whole grid.
+  expectRequestIssue(test, withSpan([](ImageSpan &span) { span.contentHeight = 33; }),
+                     IssueCode::InvalidCount);
+  const RequestFrame whole = withSpan([](ImageSpan &span) { span.contentHeight = span.contentWidth = 32; });
+  CHECK(test, roundTrip(whole) == whole);
   expectRequestIssue(test, withSpan([](ImageSpan &span) { span.offset = 3; }),
                      IssueCode::InvalidCount);
   RequestFrame overlapping = image;
@@ -844,6 +860,20 @@ void testPromptAndImageSpanRejections() {
   ProtocolLimits oneImage;
   oneImage.maxImageSpans = 1;
   expectRequestIssue(test, twoImages, IssueCode::LimitExceeded, oneImage);
+  // A tower of 20-pixel patches (Inkling's) takes its grids' pixels in
+  // them: 16-pixel ones are a short payload, and its own decode whole.
+  ProtocolLimits inkling;
+  inkling.imagePatchPixels = 20;
+  expectRequestIssue(test, image, IssueCode::InvalidPayloadLength, inkling);
+  RequestFrame wide = image;
+  wide.imagePixels.resize(image.imageSpans[0].pixelBytes(20), 3);
+  CHECK(test, wide.imagePixels.size() == 40 * 40 * 3);
+  auto decoded = decodeClient(peer::serialize(wide), inkling);
+  CHECK(test, decoded && std::get<RequestFrame>(std::move(*decoded.value)) == wide);
+  expectRequestIssue(test, wide, IssueCode::InvalidPayloadLength);
+  ProtocolLimits none = inkling;
+  none.imagePatchPixels = 0;
+  CHECK(test, validateLimits(none).has_value());
 }
 
 // The sampling parameters are one block after the image span count:
@@ -1061,6 +1091,9 @@ void testFailureTaxonomy() {
   for (ErrorEvent expected : {
            ErrorEvent{FailureClass::RequestError, 5, true, "busy",
                       "retry this request"},
+           ErrorEvent{FailureClass::RequestError, 5, false, "capacity_exhausted",
+                      "does not fit alone", 0,
+                      {splash::engine::CapacityLimit::Memory, 4080}},
            ErrorEvent{FailureClass::EngineUnhealthy, 0, false, "metal_error",
                       "replace engine"},
            ErrorEvent{FailureClass::ProtocolFatal, 0, false, "framing_error",
@@ -1097,6 +1130,9 @@ void testFailureTaxonomy() {
   expectEventIssue(test, unknownBound, IssueCode::InvalidEnumValue);
   expectEventIssue(test, StartEvent{8, ExecutionLimits::maximumBatchWidth, 0},
                    IssueCode::InvalidCount);
+  StartEvent unknownEnd{8, 0, 0};
+  unknownEnd.reuseEnd = static_cast<splash::engine::ReuseEnd>(splash::engine::kReuseEnds);
+  expectEventIssue(test, unknownEnd, IssueCode::InvalidEnumValue);
   expectEventIssue(test,
                    TokensEvent{8, std::numeric_limits<uint32_t>::max(), {1}},
                    IssueCode::IntegerOverflow);
@@ -1112,6 +1148,21 @@ void testFailureTaxonomy() {
   // Only a retryable error says when to retry.
   expectEventIssue(test,
                    ErrorEvent{FailureClass::RequestError, 5, false, "bad", "", 60},
+                   IssueCode::InvalidErrorClassification);
+  // Only a request's capacity failure says what it lacked, and what fits
+  // only with what it lacked.
+  using splash::engine::CapacityLimit;
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::RequestError, 5, false, "bad", "", 0,
+                              {static_cast<CapacityLimit>(5), 0}},
+                   IssueCode::InvalidEnumValue);
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::EngineUnhealthy, 0, false, "bad", "", 0,
+                              {CapacityLimit::Memory, 0}},
+                   IssueCode::InvalidErrorClassification);
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::RequestError, 5, false, "bad", "", 0,
+                              {CapacityLimit::None, 64}},
                    IssueCode::InvalidErrorClassification);
 }
 

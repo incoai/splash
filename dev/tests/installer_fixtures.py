@@ -22,18 +22,22 @@ from huggingface_hub.hf_api import RepoSibling
 from tokenizers import pre_tokenizers
 
 from dev.tests import fixture_files
-from install import families, hub, models
+from install import families, hub, models, upstream
 
 DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
 FLINT = families.named("Flint")
-# The families whose targets the engine loads from a GGUF only.
-GGUF_ONLY = (FLASH_NEXT, FLINT)
+INKLING = families.named("Inkling-2-Mini")
+# The families whose config.json fixture is the one the installer derives
+# from their GGUF, or the release's where it holds the keys of that one
+# (Inkling 2's); an MLX config.json of one is mlx-config.json.
+GGUF_CONFIGS = (FLASH_NEXT, FLINT, INKLING)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
-# An MLX config.json (of a GGUF_ONLY family, the one the installer derives
-# from its GGUF), a DFlash2 draft config and, of Qwen3.6-35B-A3B and the
-# GGUF_ONLY families, a GGUF header's architecture metadata built like the
+# An MLX config.json (of a GGUF_CONFIGS family, the one the installer derives
+# from its GGUF, beside its MLX mlx-config.json), a DFlash2 draft config and,
+# of Qwen3.6-35B-A3B and the GGUF_CONFIGS families, a GGUF header's
+# architecture metadata built like the
 # family's (gguf-metadata.json) and a real GGUF's tensor table
 # (gguf-tensors.json), in the family's lower-case name. The native
 # configuration test reads the configs too.
@@ -58,11 +62,13 @@ def family_config(family, name="config.json"):
 
 
 def mlx_target(root, family, *, changes=None):
-    """An MLX repository of family's target: its config.json, with changes
-    to its text_config, tokenizer files and weights."""
+    """An MLX repository of family's target: its MLX config.json, with
+    changes to its text model's keys (text_config, or a flat config's own),
+    tokenizer files and weights."""
     root.mkdir(parents=True, exist_ok=True)
-    target = family_config(family)
-    target["text_config"] |= changes or {}
+    mlx = CONFIGS / family.name.lower() / "mlx-config.json"
+    target = family_config(family, mlx.name if mlx.exists() else "config.json")
+    (target["text_config"] if "text_config" in target else target).update(changes or {})
     (root / "config.json").write_text(json.dumps(target))
     for name in ("tokenizer.json", "tokenizer_config.json", "model.safetensors"):
         (root / name).write_text("{}")
@@ -124,16 +130,16 @@ def write_gguf(path, values, tensors=()):
     return fixture_files.write_gguf(path, values, table)
 
 
-def tensor_table(family=MOE):
-    """The tensors of a real GGUF of family, in its order: name, extents
-    (innermost first) and GGML type. Qwen3.6-35B-A3B's are
-    unsloth/Qwen3.6-35B-A3B-GGUF's Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (revision
-    a483e9e6cbd595906af30beda3187c2663a1118c), Qwen3.8-Flash-Next's the three
-    parts of unsloth/Qwen3.8-Flash-Next-GGUF's UD-IQ3_XXS (revision
+def tensor_table(family=MOE, tensors="gguf-tensors.json"):
+    """The tensors of a real GGUF of family (of the fixture `tensors`), in its
+    order: name, extents (innermost first) and GGML type. Qwen3.6-35B-A3B's
+    are unsloth/Qwen3.6-35B-A3B-GGUF's Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+    (revision a483e9e6cbd595906af30beda3187c2663a1118c), Qwen3.8-Flash-Next's
+    the three parts of unsloth/Qwen3.8-Flash-Next-GGUF's UD-IQ3_XXS (revision
     766911a6b7369840a91dbcd95f9f997acaab6cd6), whose headers alone were read."""
     return [
         (name, extents, GGML[kind])
-        for name, (kind, extents) in family_config(family, "gguf-tensors.json").items()
+        for name, (kind, extents) in family_config(family, tensors).items()
     ]
 
 
@@ -144,10 +150,10 @@ def write_target(path, values, tensors):
     return fixture_files.write_gguf(path, values, table)
 
 
-def fixture(*, native=False, family=MOE):
+def fixture(*, native=False, family=MOE, metadata="gguf-metadata.json"):
     """A GGUF's metadata of family's (Qwen3.6-35B-A3B's by default): its
-    architecture's and a tokenizer's, native=True of Qwen's vocabulary
-    size."""
+    architecture's (of the fixture `metadata`) and a tokenizer's, native=True
+    of Qwen's vocabulary size."""
     tokens = sorted(pre_tokenizers.ByteLevel.alphabet())
     tokens += ["ab", "<|endoftext|>", "<|im_end|>", "<think>", "<|im_start|>"]
     types = [NORMAL] * 257 + [CONTROL, CONTROL, USER_DEFINED, CONTROL]
@@ -155,7 +161,7 @@ def fixture(*, native=False, family=MOE):
         padding = 248320 - len(tokens)
         tokens += [f"[unused{i}]" for i in range(padding)]
         types += [UNUSED] * padding
-    return family_config(family, "gguf-metadata.json") | {
+    return family_config(family, metadata) | {
         "tokenizer.ggml.model": "gpt2",
         "tokenizer.ggml.pre": "qwen35",
         "tokenizer.ggml.tokens": tokens,
@@ -187,6 +193,14 @@ def vision_fixture():
     }
 
 
+def prepared_towers(test):
+    """The engine's preparation of each tower the test installs (its
+    vision-check, upstream.check_vision), which the fixtures' towers, a few
+    tensors' headers, would fail: accepted until the test ends. A test of
+    the check patches upstream.check_vision again, or calls it."""
+    test.enterContext(mock.patch.object(upstream, "check_vision"))
+
+
 def selection(root, model=MODEL, **options):
     """model's selection under root/models, text only unless options say."""
     return models.Selection.of(
@@ -195,6 +209,7 @@ def selection(root, model=MODEL, **options):
         revision=options.get("revision"),
         language_only=options.get("language_only", True),
         draft_model=options.get("draft_model"),
+        draft_revision=options.get("draft_revision"),
     )
 
 

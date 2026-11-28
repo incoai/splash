@@ -264,16 +264,18 @@ def sign(app, identity):
 def check_signed(app):
     """Run the signed runtime as the app does, its libraries loading under
     their new signatures, then check that it left the bundle sealed: a
-    bytecode file written into it would break the seal."""
+    bytecode file written into it, beside the runtime's own, would break the
+    seal."""
     runtime = app / "Contents/Resources/splash"
+    bytecode = set(app.rglob("*.pyc"))
     subprocess.run(
         [str(runtime / "python/bin/python3"), "-I", "-B", "-c", package.SMOKE_IMPORTS],
         cwd=runtime,
         check=True,
     )
     subprocess.run([str(runtime / "engine/splash"), "device-check"], check=True)
-    if any(app.rglob("__pycache__")):
-        raise RuntimeError(f"{app} holds bytecode")
+    if set(app.rglob("*.pyc")) != bytecode:
+        raise RuntimeError(f"{app} gained bytecode")
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
 
 

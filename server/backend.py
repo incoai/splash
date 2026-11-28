@@ -14,18 +14,19 @@ from tokenizers.decoders import DecodeStream
 from . import json_codec, supervision
 from . import protocol as wire
 from . import runtime as engine_runtime
-from .chat_format import THINK_END, ChatFormat
+from .chat_format import ChatFormat
 from .constraints import TokenConstraint
 from .diagnostics import print_status
-from .errors import APIError, ConstraintError
+from .errors import APIError, CapacityError, ConstraintError
 from .latency import RequestLatency
 from .metrics import metrics_dict
 from .output import StopSearch
 from .tool_schema import ToolPolicy
 
 # Engine outcomes whose message the engine words from its own limits and
-# counts, never from a request: the client gets it as it is, and the console
-# prints it beside the code.
+# counts, never from a request: the console prints it beside the code, and
+# the client gets it as it is, or for a request that cannot fit even alone
+# as a prompt over the context (CapacityError).
 _ENGINE_RESOURCE_CODES = frozenset(
     {"capacity_exhausted", "kv_disk_quota", "kv_write_budget", "resource_timeout"}
 )
@@ -53,8 +54,8 @@ def thinking_end_tokens(tokenizer, text, chat_format):
         or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens[:-1])
     ):
         raise ThinkingEndError(
-            f"the thinking end {text!r} must end with {THINK_END} and hold no "
-            "other special token"
+            f"the thinking end {text!r} must end with {chat_format.think_close} "
+            "and hold no other special token"
         )
     if len(tokens) > wire.MAX_THINKING_END_TOKENS:
         raise ThinkingEndError(
@@ -62,6 +63,22 @@ def thinking_end_tokens(tokenizer, text, chat_format):
             f"{wire.MAX_THINKING_END_TOKENS}"
         )
     return tokens
+
+
+# A start's state source as usage names it: null for none.
+_STATE_SOURCES = {
+    wire.StateSource.NONE: None,
+    wire.StateSource.MEMORY: "memory",
+    wire.StateSource.DISK: "disk",
+}
+# Why a start's reuse stopped (wire.ReuseEnd), as usage, the log and /status
+# name it.
+REUSE_ENDS = {
+    wire.ReuseEnd.NOTHING_MATCHED: "nothing_matched",
+    wire.ReuseEnd.PREFIX_END: "prefix_end",
+    wire.ReuseEnd.KV_WITHOUT_STATE: "kv_without_state",
+    wire.ReuseEnd.DISK_READ_FAILED: "disk_read_failed",
+}
 
 
 @dataclass(frozen=True)
@@ -72,6 +89,28 @@ class CacheInfo:
     # Tokens whose KV the request read from cached blocks another request
     # computed, past its cached prefix; known once it is done.
     deduplicated_tokens: int = 0
+    # What its start found beside the cached prefix (wire.StartEvent): how
+    # far the cache matched its prompt's KV, where the state it resumed from
+    # was, whether a state past it was lost, and why its reuse stopped
+    # (REUSE_ENDS) with that end's tokens: where the matched KV ends at a
+    # prefix end, the matched KV past the state, the tokens a failed SSD read
+    # would have restored, 0 where nothing matched.
+    prefix_tokens: int = 0
+    state_source: str | None = None
+    lost_state: bool = False
+    reuse_end: str | None = None
+    reuse_end_tokens: int = 0
+
+    def reuse(self):
+        """The usage fields that say what the request reused, beside each
+        API's cached tokens."""
+        return {
+            "prefix_tokens": self.prefix_tokens,
+            "state_source": self.state_source,
+            "lost_state": self.lost_state,
+            "reuse_end": self.reuse_end,
+            "reuse_end_tokens": self.reuse_end_tokens,
+        }
 
 
 @dataclass(frozen=True)
@@ -145,6 +184,8 @@ class Job:
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
+    # The failure the server cancelled the job for (NativeBackend.cancel).
+    ended_by: APIError | None = None
     tool_policy: ToolPolicy | None = None
     response_validator: object | None = None
     response_format: dict | None = None
@@ -174,6 +215,9 @@ class Job:
     # Trailing prompt tokens of the chat template's generation prompt; zero
     # when unknown.
     generation_prompt_tokens: int = 0
+    # Where the prompt's head (a system prompt and tools) ends; zero without
+    # one (frontend._head_tokens).
+    head_tokens: int = 0
     flags: wire.RequestFlag = wire.RequestFlag(0)
     # The request asked for more output than the context leaves, and
     # max_new_tokens was lowered to what it leaves.
@@ -192,12 +236,27 @@ class Job:
 
 
 class CallbackStreamer:
-    def __init__(self, tokenizer, callback, stop_sequences=(), on_stop=None):
+    def __init__(
+        self, tokenizer, callback, stop_sequences=(), on_stop=None, visible_tags=()
+    ):
         self.tokenizer = tokenizer
         self.callback = callback
         self.stops = StopSearch(stop_sequences) if stop_sequences else None
         self.on_stop = on_stop
         self.backend = tokenizer.backend_tokenizer
+        # Special tokens the text holds (ChatFormat.visible_tags), by ID; every
+        # other special token decodes to nothing. The text is each run of
+        # other tokens decoded on its own, then each tag's text (_decode): at
+        # a tag, the run before it is finished as that decode finishes it,
+        # an unfinished character's bytes as its replacement, and the next
+        # run starts a new stream.
+        self.visible = {
+            tokenizer.convert_tokens_to_ids(tag): tag for tag in visible_tags
+        }
+        # The tokens of the run since the last visible tag, and the text the
+        # stream decoded of them.
+        self.run = []
+        self.run_text = ""
         self.decode_stream = DecodeStream(skip_special_tokens=True)
         self.token_ids = []
         self.emitted = []
@@ -236,6 +295,14 @@ class CallbackStreamer:
         for token_id in token_ids:
             token_id = int(token_id)
             self.token_ids.append(token_id)
+            if token_id in self.visible:
+                self._end_run()
+                self._emit(self.visible[token_id])
+                if self.stop_sequence is not None:
+                    break
+                continue
+            if self.visible:
+                self.run.append(token_id)
             if self.decode_stream is None:
                 continue
             try:
@@ -249,44 +316,87 @@ class CallbackStreamer:
                 self.decode_stream = None
                 continue
             if text:
+                if self.visible:
+                    self.run_text += text
                 self._emit(text)
                 if self.stop_sequence is not None:
                     break
 
+    def _end_run(self):
+        """Finish the run before a visible tag as _decode decodes it, and
+        start a new stream for the run after it."""
+        decoded = self._decode_run(self.run)
+        if not decoded.startswith(self.run_text):
+            raise RuntimeError("incremental tokenizer output diverged")
+        self._emit(decoded[len(self.run_text) :])
+        self.run, self.run_text = [], ""
+        self.decode_stream = DecodeStream(skip_special_tokens=True)
+
     def end(self):
         if self.stop_sequence is not None:
             return
-        decoded = self.tokenizer.decode(
-            self.token_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
+        decoded = self._decode(self.token_ids)
         handled = "".join(self.emitted) + self.pending_text
         if not decoded.startswith(handled):
             raise RuntimeError("incremental tokenizer output diverged")
         # Bytes of a multi-byte character the output ends inside decode to
         # U+FFFD; DecodeStream held them back for the rest. Drop the trailing
-        # U+FFFD, as vLLM's detokenizer does; one that text follows stays.
+        # U+FFFD; one that text follows stays.
         self._emit(decoded[len(handled) :].rstrip("\ufffd"))
         if self.stop_sequence is None:
             self._send(self.pending_text)
             self.pending_text = ""
 
+    def _decode(self, token_ids):
+        """The text of token_ids, each visible tag as its text between the
+        runs of other tokens, decoded without the other special tokens."""
+        if not self.visible:
+            return self._decode_run(token_ids)
+        text, run = [], []
+        for token_id in token_ids:
+            if token_id in self.visible:
+                text += [self._decode_run(run), self.visible[token_id]]
+                run = []
+            else:
+                run.append(token_id)
+        return "".join([*text, self._decode_run(run)])
+
+    def _decode_run(self, token_ids):
+        return self.tokenizer.decode(
+            token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+
     def count_reasoning_tokens(self, chat_format, thinking, tool_calls=False):
         """The reasoning's tokens, as ReasoningSplitter reads the text: from
         the start of the output where the generation prompt opened the
         reasoning (thinking), or after the model's own opening of it
-        (chat_format.think_start_id), to its close or, where a call may follow
-        and a call's opening ends the reasoning, a call's opening; none for
-        a request without a chat format."""
+        (chat_format.think_start_ids), to its close or, where a call may
+        follow and a call's opening ends the reasoning, a call's opening;
+        where the format's reasoning returns after text, those inside each
+        of its reasoning blocks; none for a request without a chat format."""
         if chat_format is None:
             return 0
+        opening = chat_format.think_start_ids
+        if chat_format.reasoning_returns:
+            count, index, inside = 0, 0, thinking
+            while index < len(self.token_ids):
+                if inside:
+                    inside = self.token_ids[index] != chat_format.think_end_id
+                    count += inside
+                    index += 1
+                elif (
+                    opening
+                    and tuple(self.token_ids[index : index + len(opening)]) == opening
+                ):
+                    inside = True
+                    index += len(opening)
+                else:
+                    index += 1
+            return count
         if thinking:
             start = 0
-        elif chat_format.think_start_id is not None and self.token_ids[:1] == [
-            chat_format.think_start_id
-        ]:
-            start = 1
+        elif opening and tuple(self.token_ids[: len(opening)]) == opening:
+            start = len(opening)
         else:
             return 0
         calls_end = tool_calls and chat_format.calls_end_reasoning
@@ -320,6 +430,9 @@ class _JobState:
     detached: bool = False
     shutdown_requested: bool = False
     first_token_batch_tokens: int = 0
+    # Whether the engine has started it (its StartEvent): a drain lets such
+    # a request finish and ends one still waiting (NativeBackend.drain).
+    started: bool = False
 
     def detach(self):
         self.detached = True
@@ -360,7 +473,11 @@ class NativeBackend:
         self.thinking_end = thinking_end
         self.active = {}
         self.closing = False
+        # Set by drain(): no request is admitted any more, and those running
+        # may finish; `drained` is told whenever `active` empties.
+        self.draining = False
         self.lock = threading.RLock()
+        self.drained = threading.Condition(self.lock)
         self.status_snapshot = None
         self.status_snapshot_at = None
         # Since when the engine loop has left status probes unanswered.
@@ -665,7 +782,7 @@ class NativeBackend:
         """The error a request not yet admitted gets now; None while the
         engine serves."""
         with self.lock:
-            if self.closing or self.stop_reason is not None:
+            if self.closing or self.draining or self.stop_reason is not None:
                 return self._closed_error_locked()
             self._ensure_recovery_locked()
             if self.runtime.ready:
@@ -681,7 +798,12 @@ class NativeBackend:
         )
 
     def is_ready(self):
-        # The engine's own ready folds in memory pressure and Metal health.
+        # A server that admits nothing, draining for a stop or closing, is
+        # not ready; else the engine's own ready folds in memory pressure and
+        # Metal health.
+        with self.lock:
+            if self.draining or self.closing:
+                return False
         return self.status()["ready"] is True
 
     @staticmethod
@@ -834,6 +956,7 @@ class NativeBackend:
             flags=job.flags,
             cache_salt=job.cache_salt,
             thinking_budget=self._thinking_budget(job),
+            head_tokens=job.head_tokens,
         )
         return engine_runtime.GenerationRequest(
             frame,
@@ -907,7 +1030,11 @@ class NativeBackend:
             job.events.put(("text", text))
 
         streamer = CallbackStreamer(
-            self.tokenizer, emit, job.stop_sequences, stop_matched
+            self.tokenizer,
+            emit,
+            job.stop_sequences,
+            stop_matched,
+            () if job.chat_format is None else job.chat_format.visible_tags,
         )
         state = _JobState(job, streamer)
         request = self._generation_request(job)
@@ -945,7 +1072,7 @@ class NativeBackend:
     def _admit(self, state, request, on_event, on_complete):
         job = state.job
         with self.lock:
-            if self.closing:
+            if self.closing or self.draining:
                 state.detach()
                 job.events.put(("error", self._closed_error_locked()))
                 return
@@ -1002,14 +1129,22 @@ class NativeBackend:
         state.detach()
         if self.active.get(state.job.request_id) is state:
             del self.active[state.job.request_id]
+            if not self.active:
+                self.drained.notify_all()
 
     def _on_event(self, state, event):
         job = state.job
         if isinstance(event, wire.StartEvent):
+            state.started = True
             cache = CacheInfo(
                 "hit" if event.matched_prompt_tokens else "miss",
                 event.matched_prompt_tokens,
                 event.lane,
+                prefix_tokens=event.prefix_tokens,
+                state_source=_STATE_SOURCES[event.state_source],
+                lost_state=event.lost_state,
+                reuse_end=REUSE_ENDS[event.reuse_end],
+                reuse_end_tokens=event.reuse_end_tokens,
             )
             with self.lock:
                 job.cache = cache
@@ -1018,6 +1153,8 @@ class NativeBackend:
                 "request_id": event.request_id,
                 "prompt_tokens": len(job.prompt_tokens),
                 "cached_tokens": cache.matched_tokens,
+                "reuse_end": cache.reuse_end,
+                "reuse_end_tokens": cache.reuse_end_tokens,
             }
             if job.reasoning is not None:
                 record["reasoning"] = {
@@ -1025,7 +1162,14 @@ class NativeBackend:
                     "effort": job.reasoning.effort,
                     "enable_thinking": job.reasoning.enable_thinking,
                     "template_effort": job.reasoning.template,
-                    "thinking": job.thinking,
+                    # Whether the generation prompt opened the reasoning, where
+                    # the prompt decides it; None where the model opens its own
+                    # (ChatFormat.prompt_switches_reasoning: Inkling 2's, Flint's).
+                    "thinking": (
+                        job.thinking
+                        if job.chat_format.prompt_switches_reasoning
+                        else None
+                    ),
                 }
             self._log(record)
             job.events.put(("start", None))
@@ -1050,9 +1194,14 @@ class NativeBackend:
                 job.constraint.commit(event.tokens)
             state.streamer.put_tokens(event.tokens)
 
-    def cancel(self, job):
+    def cancel(self, job, error=None):
+        """Cancel job; with `error`, the failure that ends it, as the server
+        ended it at its deadline, which its record names in place of a
+        cancel: the request's one line says why it ended."""
         call = None
         with self.lock:
+            if error is not None and not job.cancelled.is_set():
+                job.ended_by = error
             job.cancelled.set()
             state = self.active.get(job.request_id)
             if state is not None:
@@ -1142,6 +1291,15 @@ class NativeBackend:
                         "runtime_unavailable",
                         self._recovery_retry_after_locked(),
                     )
+        except engine_runtime.RequestFailed as failure:
+            # A request that does not fit even alone, as the engine says, is
+            # answered as a prompt over the context; the console keeps the
+            # engine's sentence (_record).
+            error = (
+                CapacityError(len(job.prompt_tokens), failure)
+                if failure.capacity_limit
+                else self._api_error(failure)
+            )
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:
@@ -1152,6 +1310,8 @@ class NativeBackend:
                     state.shutdown_requested and self.stop_reason is None
                 )
                 self._detach_locked(state)
+        if result is not None and result.reason == "cancelled" and job.ended_by:
+            result, error = None, job.ended_by
         if shutdown_requested:
             # Once close() has claimed an active HTTP request, its public
             # terminal is deterministic even if the native cancellation and
@@ -1171,13 +1331,11 @@ class NativeBackend:
         if isinstance(error, engine_runtime.RequestFailed):
             code = error.code.decode("ascii", "replace")
             message = error.message_bytes.decode("utf-8", "replace")
+            # The request's deadline, met in the engine, is worded as the
+            # server words one it meets itself, a stream's among them: one
+            # timeout, one message.
             if code == "deadline_exceeded":
-                return APIError(504, message, "request_timeout")
-            # A request that does not fit even alone, in memory or in the SSD
-            # cache, fails the same way on a retry; the engine's message names
-            # what it lacked and the limits that would fit it.
-            if code in ("capacity_exhausted", "kv_disk_quota"):
-                return APIError(400, message, code)
+                return APIError(504, "request timed out", "request_timeout")
             request_codes = {
                 "invalid_constraint",
                 "invalid_count",
@@ -1231,7 +1389,11 @@ class NativeBackend:
             }
         if error:
             record["error_code"] = error.code
-            if error.code in _ENGINE_RESOURCE_CODES:
+            if isinstance(error, CapacityError):
+                record["error_code"] = error.engine_code
+                record["engine_reason"] = error.engine_reason
+                record["remedy"] = error.remedy
+            elif error.code in _ENGINE_RESOURCE_CODES:
                 record["engine_reason"] = error.message
             error.logged = True
         self._log(record)
@@ -1242,6 +1404,26 @@ class NativeBackend:
             self.request_logger(record)
         except Exception:
             pass
+
+    def drain(self, seconds):
+        """The first stop signal's drain: admits no request from now on (each
+        gets the 503 server_shutdown a closing server answers with), ends at
+        once those the engine has not started, with that error, and waits up
+        to `seconds` for those it started to finish. Returns how many are
+        still running; close() then ends them as it ends any."""
+        error = APIError(503, "server is shutting down", "server_shutdown")
+        deadline = time.monotonic() + seconds
+        with self.lock:
+            if self.closing or self.stop_reason is not None:
+                return len(self.active)
+            self.draining = True
+            waiting = [state for state in self.active.values() if not state.started]
+        for state in waiting:
+            self.cancel(state.job, error)
+        with self.lock:
+            while self.active and (remaining := deadline - time.monotonic()) > 0:
+                self.drained.wait(remaining)
+            return len(self.active)
 
     def close(self):
         with self.lock:

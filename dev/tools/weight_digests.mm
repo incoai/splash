@@ -3,7 +3,7 @@
 // SHA-256 of each: the release check records them (verify-models) and the
 // regression benchmarks compare them between builds (dev/benchmarks/weights.py).
 //
-//   weight-digests METALLIB MODEL_DIRECTORY [--expert-memory SIZE] [--ple-memory SIZE]
+//   weight-digests METALLIB MODEL_DIRECTORY [--weights original|auto] [--expert-memory SIZE] [--ple-memory SIZE]
 //
 // The options stream a MoE target's routed experts and a Qwen3.8-Flash-Next
 // target's PLE table from their files, as the runtime oracle's do
@@ -40,7 +40,8 @@ int main(int argc, char **argv) {
   @autoreleasepool {
     const auto usage = [] {
       std::fprintf(stderr,
-                   "usage: weight-digests METALLIB MODEL_DIRECTORY [--expert-memory SIZE] [--ple-memory SIZE]\n");
+                   "usage: weight-digests METALLIB MODEL_DIRECTORY [--weights original|auto] [--expert-memory SIZE] "
+                   "[--ple-memory SIZE]\n");
       return 2;
     };
     // Options come as option-value pairs.
@@ -54,11 +55,12 @@ int main(int argc, char **argv) {
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root = std::filesystem::canonical(argv[2]);
       const model::ModelDescriptor descriptor = model::inspectModelRoot(root);
-      // No start of the engine loads weights past its Metal memory budget,
-      // which --max-memory only lowers, and a load past it can fail in a Metal
+      // A start of the engine without --max-memory loads no weights past its
+      // automatic Metal memory budget, and a load past it can fail in a Metal
       // command for memory: refuse it before any image loads.
-      const uint64_t budget =
-          engine::EngineMemoryPolicy::hardBudgetBytes(backend.capabilities().recommendedMaxWorkingSetBytes, 0);
+      const auto &device = backend.capabilities();
+      const uint64_t budget = engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes, 0,
+                                                                         device.physicalMemoryBytes);
       if (const uint64_t bytes = tools::weightBytes(root, descriptor, options); bytes > budget)
         throw std::runtime_error("the weights need " + std::to_string(bytes / engine::kMiB) +
                                  " MiB, and the Metal memory budget is " + std::to_string(budget / engine::kMiB) +

@@ -177,22 +177,30 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "always")
         throw UsageError("--kv-spill requires always");
       result.kvSpillAlways = true;
-    } else if (option == "--kv-window-trim") {
-      if (value != "on" && value != "off")
-        throw UsageError("--kv-window-trim requires on or off");
-      result.kvWindowTrim = value == "on";
     } else if (option == "--ane") {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--ane-calibration") {
+      if (value != "again")
+        throw UsageError("--ane-calibration requires again");
+      result.recalibrateAne = true;
     } else if (option == "--activations") {
       if (value != "auto" && value != "bf16")
         throw UsageError("--activations requires auto or bf16");
       result.int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+    } else if (option == "--weights") {
+      if (value != "auto" && value != "original")
+        throw UsageError("--weights requires original or auto");
+      result.weights = value == "auto" ? model::gguf::Float16Weights::Q8_0 : model::gguf::Float16Weights::Published;
     } else if (option == "--verify-rows") {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+    } else if (option == "--max-concurrent-requests") {
+      if (!parsePositive(value, result.lanes) || result.lanes > model::ExecutionLimits::maximumBatchWidth)
+        throw UsageError("--max-concurrent-requests requires an integer in [1, " +
+                         std::to_string(model::ExecutionLimits::maximumBatchWidth) + "]");
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {

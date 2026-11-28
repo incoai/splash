@@ -66,8 +66,8 @@ struct TargetSamplingParams {
   uint32_t trees;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 108,
-              "Target sampling parameters are 108 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 44 + 16 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "Target sampling parameters are the same size on both sides");
 
 // The selection of each lane's first token after its prompt from its one row
 // of the logits, row[l]: decode_sample_first_rows writes the lane rows
@@ -77,8 +77,8 @@ struct SampleFirstRowsParams {
   uint32_t row[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SampleFirstRowsParams) == 16,
-              "First-token row parameters are 16 bytes on both sides");
+static_assert(sizeof(SampleFirstRowsParams) == 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "First-token row parameters are the same size on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
@@ -141,8 +141,8 @@ struct SamplingPenaltyParams {
   float frequency[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SamplingPenaltyParams) == 104,
-              "Sampling penalty parameters are 104 bytes on both sides");
+static_assert(sizeof(SamplingPenaltyParams) == 8 + 24 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "Sampling penalty parameters are the same size on both sides");
 
 // One selection's thinking cutoffs (ops::SamplingPolicy::thinkingCutoff) over
 // its lanes' selected rows (TargetSamplingParams), each a row of its block's
@@ -172,26 +172,33 @@ struct ThinkingCutoffParams {
   uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
 };
 
-static_assert(sizeof(ThinkingCutoffParams) == 80 + 16 * SPLASH_TARGET_VERIFY_ROWS,
+static_assert(sizeof(ThinkingCutoffParams) == 16 + (16 + 4 * SPLASH_TARGET_VERIFY_ROWS) * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Thinking cutoff parameters are the same size on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
-// are zero and unread. The draft's logits rows hold `columns` tokens of the
-// vocabulary's (ops::DraftVocabulary): column c is token c below `leading`
-// and token c - leading + trailing from there; the codebooks hold a row of
-// each of the `vocabulary` tokens.
+// are zero and unread. The draft's logits rows, `stride` floats apart (the
+// head's outputs, whole tiles of a padded head's rows), hold `columns`
+// tokens of the vocabulary's (ops::DraftVocabulary) first: column c is token
+// c below `leading` and token c - leading + trailing from there. A row's
+// columns past them are a padded head's rows of no token, which the selector
+// never reads. The codebooks hold a row of each of the `vocabulary` tokens.
+// Each proposal row's top-16 takes `shards` shards of its columns, a power of
+// two from 2 to SPLASH_DRAFT_SAMPLING_MOST_SHARDS; their partials fill the
+// first of the partial values, and the edge tables follow the most shards'.
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   uint32_t vocabulary;
   uint32_t columns;
+  uint32_t stride;
   uint32_t leading;
   uint32_t trailing;
+  uint32_t shards;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 36,
-              "Draft selector parameters are 36 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 28 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "Draft selector parameters are the same size on both sides");
 
 // The most tokens a host chain proposes: a verify block's rows after its
 // anchor.
@@ -214,7 +221,10 @@ static_assert(sizeof(SelectorBatchParams) == 36,
 // the product over the path of its steps' estimates. A step to a draft
 // candidate at proposal position p, of probability q among the position's
 // candidates after its parent's (the softmax at temperature 1 of their unary
-// scores plus the edge from the parent's candidate), is estimated at
+// scores plus the edge from the parent's candidate, each sum softcapped,
+// softcap tanh(sum / softcap), where the draft's head takes a softcap, as
+// DFlash2 trains a draft of such a head; as it is at a softcap of 0), is
+// estimated at
 // sigmoid(slope[l] * logit(q) + intercept[l][p]), the lane's acceptance model
 // (a greedy lane's or a sampled one's, model::VerifyBudget), at most its cap:
 // what its parent's host chain child and the steps its parent drew before it
@@ -229,8 +239,14 @@ static_assert(sizeof(SelectorBatchParams) == 36,
 // next, one row for each token path (a step to a token its parent already
 // has a child of joins that child), until it holds the lane's rows, or
 // depth[l] + 1 rows, as many as the tokens a walk of it may retain, or none
-// no deeper than depth[l] is left. A greedy lane's row (temperature[l] 0)
-// takes its most
+// no deeper than depth[l] is left. A row of one of the target's stop tokens
+// (stop_tokens, as ops::StopTokens pads them) grows no children, as
+// acceptance retains no token past a stop (AcceptBatchParams), and a greedy
+// lane takes no row of one: its parent's argmax selects the stop with or
+// without the row, so the row adds no token, while its estimate still
+// counts against its later siblings' caps. A sampled lane keeps the row, as
+// its parent's rejection sampling tests every child it drew. A greedy lane's
+// row (temperature[l] 0) takes its most
 // likely candidates; a sampled lane's draws them without replacement from
 // q_T, the candidates' probabilities at the lane's temperature T, its
 // Gumbel-top-k: the largest log q_T + G, G a Gumbel of the row's key and the
@@ -245,14 +261,17 @@ struct DraftTreeParams {
   uint32_t chain[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t children[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
+  float softcap;
+  uint32_t stop_tokens[SPLASH_STOP_TOKENS];
   float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
   float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
 };
 
-static_assert(sizeof(DraftTreeParams) == 244,
-              "Draft tree parameters are 244 bytes on both sides");
+static_assert(sizeof(DraftTreeParams) ==
+                  8 + 4 * SPLASH_STOP_TOKENS + (32 + 4 * SPLASH_DRAFT_PROPOSAL_TOKENS) * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "Draft tree parameters are the same size on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): the `rows` rows of its
 // step's plan (ops::StepRows), laid out over its lanes' trees
@@ -297,6 +316,11 @@ struct VerifyRowsParams {
   float floor;
 };
 
+// The threads that lay a cycle's rows out (draft_verify_rows): a thread for
+// each of the most lanes' verify block rows, so that every candidate row and
+// every row of a step has one.
+#define SPLASH_VERIFY_ROWS_THREADS (SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS)
+
 static_assert(sizeof(VerifyRowsParams) == 16, "Verify rows parameters are 16 bytes on both sides");
 
 // Acceptance of each lane's rows (SplashLaneRows) of the command's packed
@@ -316,5 +340,5 @@ struct AcceptBatchParams {
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];
 };
 
-static_assert(sizeof(AcceptBatchParams) == 32,
-              "Batched acceptance parameters are 32 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 16 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "Batched acceptance parameters are the same size on both sides");

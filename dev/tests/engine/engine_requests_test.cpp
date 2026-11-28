@@ -272,7 +272,7 @@ void testSharedPrefillProducerFailureReleasesWaiters() {
                 model.requests.size() == 1,
             "shared prefill waiter was admitted before its prefix was ready");
     if (cancelled)
-      engine.cancel(1);
+      engine.cancel(1, 0.0);
     else
       engine.failRequest(1, LaneOutcome::InvalidMask, "producer failed");
     h.runUntilIdle();
@@ -295,7 +295,7 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
     engine.submit(std::move(waiter));
     static_cast<void>(tickAt(h, 0));
     if (cancelled)
-      engine.cancel(2);
+      engine.cancel(2, 0.0);
     // Its deadline passes while it waits for the prefix.
     h.advanceTo(h.now() + 1);
     h.runUntilIdle();
@@ -333,7 +333,7 @@ void testSharedPrefillDoesNotBlockUnrelatedWork() {
       auto value = request(id, std::vector<uint32_t>(193, images ? 7 : id));
       if (images) {
         value.images = {{0, 16, 8, 8, id, id}};
-        value.imagePixels.assign(value.images.front().pixelBytes(), 1);
+        value.imagePixels.assign(value.images.front().pixelBytes(splash::ops::kImagePatchPixels), 1);
       }
       engine.submit(std::move(value));
     }
@@ -896,7 +896,7 @@ void testPreemptedReplyKeepsItsDeepestState() {
   engine.submit(conversationTurn(2, nextTurn(prompt, 80), 1));
   tickUntil(h, now, [&] { return events.usage.contains(2); }, "the next turn did not complete");
   for (uint64_t id = 11; id <= 13; ++id)
-    engine.cancel(id);
+    engine.cancel(id, 0.0);
   tickUntil(h, now, [&] { return idle(engine); }, "the fillers did not end");
   require(events.starts.back() == 128, "the next turn did not resume at the reply's deepest state");
 }
@@ -923,8 +923,45 @@ void testPreemptedReplyCheckpointIsDropped() {
   require(cached.offloads == 0 && cached.checkpointEntries == 0,
           "reclaim wrote a preempted reply's checkpoint rather than dropping it");
   for (const uint64_t id : {1, 5, 11, 12, 13})
-    engine.cancel(id);
+    engine.cancel(id, 0.0);
   tickUntil(h, now, [&] { return idle(engine); }, "the requests did not end");
+}
+
+// A lane suspended with a reply WriteBehind::kMinimumTokens past its prompt's replay point keeps its newest reply
+// state (Cache::keepReply), whatever its client: a reclaim meanwhile writes it, once, rather than drop it, and the
+// lane resumes from it, not from its prompt's replay point (32), which would replay its whole reply. A shorter
+// reply's state is dropped (testPreemptedReplyCheckpointIsDropped). The suspension comes mid-page, as a resume
+// replays a token at least: a state at the page the lane's KV ends at serves its next turn, not its resume.
+void testALongPreemptedReplyKeepsItsNewestState() {
+  test::EngineHarness h({.pages = 512});
+  Executor &executor = h.model;
+  engine::Engine &engine = h.engine;
+  executor.decodeFinishes = false;
+  executor.offloadTier = std::make_shared<OffloadControl>();
+  executor.offloadTier->ready = true;
+  executor.restoreControl->ready = true;
+  std::vector<uint32_t> prompt(60);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  fillOtherLanes(engine);
+  engine.submit(conversationTurn(1, prompt, 2400));
+  h.runUntil([&] { return capturedAt(executor, 1, 2112) && h.events.outputs[1].size() >= 2112 - 60 + 10; },
+             "decode did not pass its page at 2112", 100'000);
+  EngineRequest arriving = request(5, std::vector<uint32_t>(9, 5));
+  arriving.priority = RequestPriority::Foreground;
+  engine.submit(std::move(arriving));
+  h.runUntil([&] { return executor.suspensions == 1 && !engine.commandInFlight(); },
+             "the arrival did not take the reply's lane", 100'000);
+  reclaimUpToInUse(h.cache);
+  const StateCacheSnapshot cached = h.cache.snapshot().stateCache;
+  require(cached.offloads == 1, "reclaim did not write a long preempted reply's newest state once (" +
+                                    std::to_string(cached.offloads) + " writes)");
+  engine.cancel(5, 0.0);
+  h.runUntil([&] { return executor.restored != 0; }, "the reply did not resume", 100'000);
+  require(executor.restored >= 2080, "the reply resumed at " + std::to_string(executor.restored) +
+                                         ", not at its newest state");
+  for (const uint64_t id : {1, 11, 12, 13})
+    engine.cancel(id, 0.0);
+  h.runUntil([&] { return idle(engine); }, "the requests did not end", 100'000);
 }
 
 // A running reply's checkpoint that reclaim takes is dropped rather than
@@ -946,7 +983,7 @@ void testRunningReplyCheckpointIsDropped() {
   const StateCacheSnapshot cached = h.cache.snapshot().stateCache;
   require(cached.offloads == 0 && cached.checkpointEvictions == 1,
           "reclaim wrote a running reply's checkpoint rather than dropping it");
-  engine.cancel(1);
+  engine.cancel(1, 0.0);
   tickUntil(h, now, [&] { return idle(engine); }, "the reply did not end");
 }
 
@@ -970,7 +1007,7 @@ void testEndedReplyKeepsItsLastCheckpoint() {
       executor.poisonRequest = 1;
       executor.poisonToken = 0xFFFFFFFFU;
     } else {
-      engine.cancel(1);
+      engine.cancel(1, 0.0);
     }
     tickUntil(h, now, [&] { return idle(engine); }, "the reply did not end");
     require(events.failedCount == (fails ? 1U : 0U) && events.completedCount == (fails ? 0U : 1U),
@@ -984,6 +1021,244 @@ void testEndedReplyKeepsItsLastCheckpoint() {
     tickUntil(h, now, [&] { return idle(engine); }, "the next turn did not complete");
     require(events.starts.back() == last, "the next turn did not resume at the ended reply's last checkpoint");
   }
+}
+
+// A conversation whose prompt starts with a head of 3,000 tokens, a system prompt and tools the server marks
+// (headTokens), keeps an ordinary state at the head's end: a second conversation sharing the head, the first to
+// follow, resumes at the head's last whole page. A head shorter than a draft window keeps one too (#874): a small
+// harness's system prompt and tools can lie under one, and it would otherwise never resume past the head. A
+// prompt without a head keeps none: the second conversation starts from 0.
+void testASecondConversationResumesAtASharedHead() {
+  for (const uint32_t headTokens : {3000U, 1024U, 512U, 0U}) {
+    test::EngineHarness h({.pages = 1024});
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
+    double now = 1;
+    const auto conversation = [&](uint64_t id, uint32_t seed) {
+      std::vector<uint32_t> prompt(3000);
+      std::iota(prompt.begin(), prompt.end(), 1);
+      prompt.resize(prompt.size() + 1500, seed);
+      EngineRequest result = conversationTurn(id, prompt, 8);
+      result.headTokens = headTokens;
+      return result;
+    };
+    engine.submit(conversation(1, 20'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the first conversation did not complete");
+    engine.submit(conversation(2, 30'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the second conversation did not complete");
+    const uint32_t head = headTokens / KvCache::pageTokens * KvCache::pageTokens;
+    require(events.starts.back() == head, "head " + std::to_string(headTokens) +
+                                              ": the second conversation resumed from " +
+                                              std::to_string(events.starts.back()) + ", not " + std::to_string(head));
+  }
+}
+
+// #874's table: a head of 1,510 tokens (its state at 1,504) and first messages that put the first conversation's
+// prompt at 1,524 to 1,635 tokens, its replay point at 1,504 to 1,600. Whatever the first message's length, a second
+// conversation of 1,533 tokens sharing only the head resumes at the head; before #876 it did only where the replay
+// point fell on the head's last page (prompts of 1,524 and 1,540).
+void testASecondConversationResumesAtAShortHeadWhateverTheFirstMessage() {
+  constexpr uint32_t kHead = 1510;
+  for (const uint32_t first : {1524U, 1540U, 1551U, 1575U, 1635U}) {
+    test::EngineHarness h({.pages = 1024});
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
+    double now = 1;
+    const auto conversation = [&](uint64_t id, uint32_t tokens, uint32_t seed) {
+      std::vector<uint32_t> prompt(kHead);
+      std::iota(prompt.begin(), prompt.end(), 1);
+      prompt.resize(tokens, seed);
+      EngineRequest result = conversationTurn(id, prompt, 16);
+      result.headTokens = kHead;
+      return result;
+    };
+    engine.submit(conversation(1, first, 20'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the first conversation did not complete");
+    engine.submit(conversation(2, 1533, 30'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the second conversation did not complete");
+    constexpr uint32_t head = kHead / KvCache::pageTokens * KvCache::pageTokens;
+    require(events.starts.back() == head, "a first prompt of " + std::to_string(first) +
+                                              ": the second conversation resumed from " +
+                                              std::to_string(events.starts.back()) + ", not " + std::to_string(head));
+  }
+}
+
+// A conversation's head often ends in text of its own, as an agent's system prompt ends in its environment block (its
+// working directory, its git status). A second conversation whose prompt first differs inside the first's last head
+// page shares no state there: heads of 3,010 tokens, whose state is at 3,008, and first differences at 2,980 and 2,995.
+// The head's state keeps the lane's last prefill checkpoint below it cached, at 2,048, one more cached state beside the
+// head's and the replay point's, and the second conversation resumes there instead of at 0. One whose head's state lies
+// below its first difference (2,990 tokens, the state at 2,976) resumes at the head. With decode captures and without.
+void testAConversationWhoseHeadEndsDifferentlyResumesBelowIt() {
+  constexpr uint32_t kCheckpoint = 2048;
+  for (const bool captures : {false, true})
+    for (const auto &[headTokens, differs] :
+         std::initializer_list<std::pair<uint32_t, uint32_t>>{{3010, 2980}, {3010, 2995}, {2990, 2980}}) {
+      test::EngineHarness h({.pages = 1024, .engine = {.prefillCheckpointTokens = kCheckpoint}});
+      h.model.decodeStateCaptures = captures;
+      h.model.decodeFinishes = false;
+      const auto conversation = [&](uint64_t id, uint32_t session, uint32_t output) {
+        std::vector<uint32_t> prompt(headTokens + 1500);
+        std::iota(prompt.begin(), prompt.end(), 1);
+        // The session's own tokens from its first difference on, the head's end among them.
+        for (uint32_t index = differs; index < prompt.size(); ++index)
+          prompt[index] = session + index;
+        EngineRequest result = conversationTurn(id, prompt, output);
+        result.headTokens = headTokens;
+        return result;
+      };
+      const std::string variant = "head " + std::to_string(headTokens) + ", first difference at " +
+                                  std::to_string(differs) + (captures ? ", decode captures" : ", no decode captures");
+      h.engine.submit(conversation(1, 100'000, 150));
+      h.runUntil([&] { return idle(h.engine); }, "the first conversation did not complete");
+      const StateCacheSnapshot cached = h.cache.snapshot().stateCache;
+      h.engine.submit(conversation(2, 200'000, 8));
+      h.runUntil([&] { return idle(h.engine); }, "the second conversation did not complete");
+      const uint32_t head = headTokens / KvCache::pageTokens * KvCache::pageTokens;
+      const uint32_t resumed = head <= differs ? head : kCheckpoint;
+      require(h.events.starts.back() == resumed, variant + ": the second conversation resumed from " +
+                                                     std::to_string(h.events.starts.back()) + ", not " +
+                                                     std::to_string(resumed));
+      // Without reply states, the first conversation left the checkpoint, the head's state and the replay point.
+      require(captures || (cached.entries == 3 && cached.checkpointEntries == 1),
+              variant + ": the head's state did not keep the checkpoint below it beside the replay point");
+    }
+}
+
+// A new agent session in another directory: the same tools, one long block, and the same system prompt but for its
+// environment block at the end (the working directory, the git status), from 300 tokens before the head's end, below
+// the head's state. It resumes at the last checkpoint the first session's head state kept below it, instead of 0: at
+// most the checkpoints' spacing below the head's state (4,096 tokens), or 6,144 where the first session's prompt ends
+// within a prefill chunk (2,048 tokens) of the checkpoint past that one, which then is not planned. A later session in
+// the first directory resumes at the head's state. Heads and first messages of Claude Code's sizes (27,584 and 2,236
+// tokens) and smaller ones (13,000 and 2,000; 8,500 and 1,500, whose prompt ends too close to a checkpoint at 8,192).
+void testANewSessionInAnotherDirectoryResumesBelowItsHead() {
+  struct Session final {
+    uint32_t head = 0;
+    uint32_t message = 0;
+    uint32_t checkpoint = 0;
+  };
+  for (const Session &sizes : {Session{27'584, 2'236, 24'576}, Session{13'000, 2'000, 12'288},
+                               Session{8'500, 1'500, 4'096}}) {
+    test::EngineHarness h({.pages = 2048});
+    // A session's first request: the tools and the system prompt, whose last 300 tokens are its directory's, and a
+    // first message of its own.
+    const auto session = [&](uint64_t id, uint32_t directory, uint32_t message) {
+      std::vector<uint32_t> prompt(sizes.head + sizes.message);
+      std::iota(prompt.begin(), prompt.end(), 1);
+      for (uint32_t index = sizes.head - 300; index < sizes.head; ++index)
+        prompt[index] = directory + index;
+      for (uint32_t index = sizes.head; index < prompt.size(); ++index)
+        prompt[index] = message + index;
+      EngineRequest result = conversationTurn(id, prompt, 8);
+      result.headTokens = sizes.head;
+      return result;
+    };
+    const std::string variant = "head " + std::to_string(sizes.head) + ": ";
+    h.engine.submit(session(1, 100'000, 200'000));
+    h.runUntil([&] { return idle(h.engine); }, "the first session did not complete");
+    h.engine.submit(session(2, 300'000, 400'000));
+    h.runUntil([&] { return idle(h.engine); }, "the session in another directory did not complete");
+    require(h.events.starts.back() == sizes.checkpoint,
+            variant + "the session in another directory resumed from " + std::to_string(h.events.starts.back()) +
+                ", not the kept checkpoint's " + std::to_string(sizes.checkpoint));
+    h.engine.submit(session(3, 100'000, 500'000));
+    h.runUntil([&] { return idle(h.engine); }, "the later session in the first directory did not complete");
+    const uint32_t head = sizes.head / KvCache::pageTokens * KvCache::pageTokens;
+    require(h.events.starts.back() == head, variant + "the later session in the first directory resumed from " +
+                                                std::to_string(h.events.starts.back()) + ", not its head's " +
+                                                std::to_string(head));
+  }
+}
+
+// A command that reaches a checkpoint and then the head's end captures both, since the head's state keeps the
+// checkpoint, where it passes a checkpoint on its way to a junction. A conversation resumed at a state of 1,024 tokens
+// prefills from there, its command from 3,072 reaching the checkpoint at 4,096 and the head's state at 4,512, and the
+// next conversation, whose head first differs at 4,500, resumes at that checkpoint.
+void testACommandCapturesTheCheckpointBeforeTheHead() {
+  constexpr uint32_t kHead = 4530;
+  test::EngineHarness h({.pages = 1024});
+  const auto conversation = [&](uint64_t id, uint32_t differs, uint32_t session) {
+    std::vector<uint32_t> prompt(kHead + 2500);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    for (uint32_t index = differs; index < prompt.size(); ++index)
+      prompt[index] = session + index;
+    EngineRequest result = conversationTurn(id, prompt, 8);
+    result.headTokens = kHead;
+    return result;
+  };
+  // A request of the prompt's first 1,031 tokens keeps its replay point at 1,024.
+  const EngineRequest first = conversation(1, kHead, 20'000);
+  h.engine.submit(conversationTurn(1, std::vector<uint32_t>(first.prompt.begin(), first.prompt.begin() + 1031), 1));
+  h.runUntil([&] { return idle(h.engine); }, "the opening request did not complete");
+  h.engine.submit(conversation(2, kHead, 20'000));
+  h.runUntil([&] { return idle(h.engine); }, "the first conversation did not complete");
+  require(h.events.starts.back() == 1024, "the first conversation did not resume at 1,024");
+  const uint32_t checkpoint = engine::kPrefillCheckpointTokens;
+  require(checkpoint == 4096 && 3072 + model::ExecutionLimits::prefillTokenBudget > kHead,
+          "the checkpoint and the head's end do not lie in one command");
+  h.engine.submit(conversation(3, 4500, 30'000));
+  h.runUntil([&] { return idle(h.engine); }, "the second conversation did not complete");
+  require(h.events.starts.back() == checkpoint, "the conversation whose head differs resumed from " +
+                                                    std::to_string(h.events.starts.back()) +
+                                                    ", not the checkpoint's " + std::to_string(checkpoint));
+}
+
+// The agent run whose next conversation missed its head (Claude Code on Inkling-2-Mini): a conversation's first turn
+// prefills a head of 3,010 tokens and the rest of its prompt while a short side request decodes beside it, its later
+// turns render each reply back, one reply of 1,095 tokens, and then come a conversation sharing the whole head and one
+// whose head first differs inside its last page. The first resumes at the head's last whole page, the second at the
+// checkpoint the head's state kept below it. With decode captures (reply states) and without, with the KV cache's room
+// for every turn and with fewer pages.
+void testConversationsAfterRepliesResumeAtTheHeadOrBelowIt() {
+  constexpr uint32_t kHead = 3010;
+  constexpr uint32_t kCheckpoint = 2048;
+  for (const bool captures : {false, true})
+    for (const uint32_t pages : {1024U, 420U}) {
+      test::EngineHarness h({.pages = pages, .engine = {.prefillCheckpointTokens = kCheckpoint}});
+      h.model.decodeStateCaptures = captures;
+      h.model.decodeFinishes = false;
+      Events &events = h.events;
+      engine::Engine &engine = h.engine;
+      // A conversation's first turn, its tokens its own from `differs` on.
+      const auto conversation = [&](uint64_t id, uint32_t differs, uint32_t session, uint32_t output) {
+        std::vector<uint32_t> prompt(kHead + 1500);
+        std::iota(prompt.begin(), prompt.end(), 1);
+        for (uint32_t index = differs; index < prompt.size(); ++index)
+          prompt[index] = session + index;
+        EngineRequest result = conversationTurn(id, prompt, output);
+        result.headTokens = kHead;
+        return result;
+      };
+      const std::string variant =
+          std::to_string(pages) + " pages" + (captures ? ", decode captures" : ", no decode captures");
+      engine.submit(conversationTurn(1, std::vector<uint32_t>(100, 7), 230));
+      EngineRequest turn = conversation(2, kHead, 20'000, 150);
+      engine.submit(turn);
+      h.runUntil([&] { return idle(engine); }, "the first turn and the side request did not complete");
+      require(events.outputs[1].size() == 230 && events.outputs[2].size() == 150,
+              variant + ": the side request or the first turn ended early");
+      uint64_t id = 3;
+      for (const uint32_t output : {63U, 1095U, 45U, 135U}) {
+        turn = conversationTurn(id, nextTurn(turn.prompt, static_cast<uint32_t>(events.outputs[id - 1].size())),
+                                output);
+        turn.headTokens = kHead;
+        engine.submit(turn);
+        h.runUntil([&] { return idle(engine); }, "a later turn did not complete");
+        ++id;
+      }
+      engine.submit(conversation(id, kHead, 30'000, 8));
+      h.runUntil([&] { return idle(engine); }, "the conversation sharing the head did not complete");
+      const uint32_t head = kHead / KvCache::pageTokens * KvCache::pageTokens;
+      require(events.starts.back() == head, variant + ": the conversation sharing the head resumed from " +
+                                                std::to_string(events.starts.back()) + ", not its head's " +
+                                                std::to_string(head));
+      engine.submit(conversation(id + 1, 2995, 40'000, 8));
+      h.runUntil([&] { return idle(engine); }, "the conversation whose head differs did not complete");
+      require(events.starts.back() == kCheckpoint, variant + ": the conversation whose head differs resumed from " +
+                                                       std::to_string(events.starts.back()) + ", not the checkpoint's " +
+                                                       std::to_string(kCheckpoint));
+    }
 }
 
 // A finished request's KV holds part of the budget, so a later request's KV
@@ -1050,20 +1325,20 @@ void testCompletedReplyStateIsDroppedAtTheWall() {
           "reclaim wrote a reply's state no request resumed from rather than dropping it");
 }
 
-// A reply's last state is kept, written by a reclaim rather than dropped,
-// once its request's prompt rendered an earlier reply back and its reply
-// saves the next turn a point worth a write (WriteBehind::kMinimumTokens).
-// Turns of 2,100 tokens each, every one rendering the reply before it back
-// unless it says otherwise, with a reclaim of every state after some. Turn
-// 1's reply, which no prompt rendered back yet, is opportunistic: a reclaim
-// drops it, and turn 2 resumes from its prompt's replay point at 64. Turn 2
-// rendered it back, whether it resumed from it at 2,176 or its match only
-// reached its blocks, so it keeps its own, which turn 3 resumes from at
-// 4,320 after a reclaim, restored from the SSD tier; so does turn 3, for
-// turn 4 at 6,464. A turn 2 that renders turn 1's reply otherwise leaves
-// its own opportunistic: after a reclaim turn 3 resumes from its replay
-// point at 2,208. Turns of 70 tokens keep none: after turn 2 resumed at 160,
-// a reclaim sends turn 3 to its replay point at 192.
+// A reply's last state is kept as an ordinary state, written by a reclaim
+// rather than dropped, once its request's prompt rendered an earlier reply
+// back, whatever the reply's length. Turns of 2,100 tokens each, every one
+// rendering the reply before it back unless it says otherwise, with a
+// reclaim of every state after some. Turn 1's reply, which no prompt
+// rendered back yet, is opportunistic: a reclaim drops it, and turn 2
+// resumes from its prompt's replay point at 64. Turn 2 rendered it back,
+// whether it resumed from it at 2,176 or its match only reached its blocks,
+// so it keeps its own, which turn 3 resumes from at 4,320 after a reclaim,
+// restored from the SSD tier; so does turn 3, for turn 4 at 6,464. A turn 2
+// that renders turn 1's reply otherwise leaves its own opportunistic: after
+// a reclaim turn 3 resumes from its replay point at 2,208. Turns of 70
+// tokens keep theirs too: after turn 2 resumed at 160, turn 3 resumes after
+// a reclaim at turn 2's last page, 256.
 void testRepliesAreKeptOnceAConversationRendersThemBack() {
   const auto starts = [](uint32_t output, std::vector<bool> reclaimAfter, bool otherwise = false) {
     test::EngineHarness h({.pages = 512});
@@ -1101,8 +1376,391 @@ void testRepliesAreKeptOnceAConversationRendersThemBack() {
           "a reclaim dropped the reply's state of a turn that resumed through a kept one");
   require(starts(2100, {false, true}, true) == Starts{0, 64, 2208},
           "a reclaim wrote the reply's state of a turn that rendered the reply before it otherwise");
-  require(starts(70, {false, true}) == Starts{0, 160, 192},
-          "a reclaim wrote the state of a reply too short to be worth a write");
+  require(starts(70, {false, true}) == Starts{0, 160, 256},
+          "a reclaim dropped the state of a short reply its conversation renders back");
+}
+
+// A harness at the memory wall: the governor's limit leaves room, KV pages of 16 bytes and states of 64, that the
+// replay points of 20 earlier conversations fill, so that no state's buffers come free but those a claim takes.
+struct AtTheWall final {
+  // Without an SSD tier, a reclaim drops an ordinary state rather than write it.
+  explicit AtTheWall(bool tier = true) {
+    if (tier) {
+      h.model.offloadTier = std::make_shared<OffloadControl>();
+      h.model.offloadTier->ready = true;
+    }
+    h.model.restoreControl->ready = true;
+    h.model.decodeFinishes = false;
+    for (uint64_t id = 100; id < 120; ++id)
+      static_cast<void>(converse(id, std::vector<uint32_t>(72, static_cast<uint32_t>(900 + id)), 1));
+    require(h.governor->snapshot().headroomBytes < 64, "fixture: the room still holds a state");
+  }
+  // Request `id`, `prompt` and a reply of `output` tokens to its end, at its output limit or by a stop token;
+  // returns the prompt and the reply.
+  std::vector<uint32_t> converse(uint64_t id, std::vector<uint32_t> prompt, uint32_t output, bool stops = false) {
+    EngineRequest turn = conversationTurn(id, prompt, stops ? 30'000 : output);
+    turn.deadlineMilliseconds = 1e9;
+    h.engine.submit(std::move(turn));
+    if (stops) {
+      h.runUntil([&] { return h.events.outputs[id].size() + 1 >= output; }, "the reply did not reach its end");
+      h.model.decodeFinishes = true;
+    }
+    h.runUntil([&] { return h.events.usage.contains(id); }, "the turn did not complete");
+    h.model.decodeFinishes = false;
+    prompt.resize(prompt.size() + output, 42);
+    return prompt;
+  }
+
+  test::EngineHarness h{{.pages = 1024, .pageBytes = 16, .extentPages = 4, .memory = test::FakeMemory::Config{},
+                         .limits = {.limitBytes = 1280}}};
+};
+
+// `count` tokens from `first` on.
+std::vector<uint32_t> tokensFrom(uint32_t first, uint32_t count = 60) {
+  std::vector<uint32_t> tokens(count);
+  std::iota(tokens.begin(), tokens.end(), first);
+  return tokens;
+}
+
+// At the memory wall no room frees for a reply's capture in one attempt. A conversation's first reply, which nothing
+// yet shows its client renders back, takes what frees at once for it, but not its lane's recovery point, and ends
+// with its last page's state, opportunistic still: at 352 for a reply that ends at its output limit (360), at 320 for
+// one that ends by a stop token (350) after its last capture reserved for 352. Its next turn, rendering the reply
+// back at once, resumes there.
+void testAFirstReplyCapturesAtTheWall() {
+  struct Reply final {
+    uint32_t output = 300;
+    bool stops = false;
+    uint32_t last = 352;
+  };
+  for (const Reply reply : {Reply{}, Reply{.output = 290, .stops = true, .last = 320}}) {
+    AtTheWall wall;
+    test::EngineHarness &h = wall.h;
+    const std::vector<uint32_t> tokens = wall.converse(1, tokensFrom(1), reply.output, reply.stops);
+    const std::string label = std::to_string(reply.output) + "-token reply" + (reply.stops ? " ended by a stop" : "");
+    const uint64_t state = test::stateAt(h.cache, tokens, reply.last);
+    require(state, label + ": the reply took no state at its last page");
+    require(static_cast<bool>(h.cache.checkpointState(state)), label + ": a first reply's state ended ordinary");
+    static_cast<void>(wall.converse(2, nextTurn(tokensFrom(1), reply.output), 1));
+    require(h.events.starts.back() == reply.last, label + ": the next turn resumed at " +
+                                                      std::to_string(h.events.starts.back()));
+  }
+}
+
+// A reply's capture at the wall counts what its takes free, with an SSD tier and without one, where a reclaim drops
+// an ordinary state rather than write it: no count that covers its claim frees less than it counted.
+void testACapturesCountAtTheWallIsWhatItsTakesFree() {
+  for (const bool tier : {true, false}) {
+    AtTheWall wall(tier);
+    test::EngineHarness &h = wall.h;
+    const engine::MemoryLedger::CountChecks before = h.governor->snapshot().countChecks;
+    static_cast<void>(wall.converse(1, tokensFrom(1), 300));
+    const engine::MemoryLedger::CountChecks after = h.governor->snapshot().countChecks;
+    require(after.overcountedRuns == before.overcountedRuns,
+            std::string(tier ? "with" : "without") + " an SSD tier: of " +
+                std::to_string(after.coveredRuns - before.coveredRuns) + " counts that covered their claim, " +
+                std::to_string(after.overcountedRuns - before.overcountedRuns) + " freed less than they counted");
+  }
+}
+
+// A reply's capture refused at a page claims again at the next: its captures for every page but its last (352) are
+// refused, and the next turn, rendering the reply back, still resumes at 352.
+void testARefusedCaptureClaimsAgainAtTheNextPage() {
+  test::EngineHarness h({.pages = 64, .pageBytes = 16, .memory = test::FakeMemory::Config{},
+                         .limits = {.limitBytes = 1 << 20}});
+  h.model.decodeFinishes = false;
+  const auto held = [&] { return static_cast<uint32_t>(60 + h.events.outputs[1].size()); };
+  const auto page = [&] { return (held() / engine::KvCache::pageTokens + 1) * engine::KvCache::pageTokens; };
+  h.model.reservationRoom = [&] { return page() == 352; };
+  h.engine.submit(conversationTurn(1, tokensFrom(1), 300));
+  h.runUntil([&] { return h.events.usage.contains(1); }, "the reply did not complete");
+  h.model.reservationRoom = nullptr;
+  h.engine.submit(conversationTurn(2, nextTurn(tokensFrom(1), 300), 1));
+  h.runUntil([&] { return h.events.usage.contains(2); }, "the next turn did not complete");
+  require(h.events.starts.back() == 352, "after refused captures the next turn resumed at " +
+                                             std::to_string(h.events.starts.back()) + ", not at the reply's last page");
+}
+
+// Two replies at the memory wall, decoding side by side, take what frees at once for their captures but not each
+// other's recovery point: each next turn, rendering its reply back, resumes at that reply's last page (352).
+void testTwoRepliesAtTheWallKeepEachOthersStates() {
+  AtTheWall wall;
+  test::EngineHarness &h = wall.h;
+  for (const uint32_t first : {1U, 701U}) {
+    EngineRequest turn = conversationTurn(first, tokensFrom(first), 300);
+    turn.deadlineMilliseconds = 1e9;
+    h.engine.submit(std::move(turn));
+  }
+  h.runUntil([&] { return h.events.usage.contains(1) && h.events.usage.contains(701); }, "the replies did not complete");
+  for (const uint32_t first : {1U, 701U}) {
+    static_cast<void>(wall.converse(first + 1, nextTurn(tokensFrom(first), 300), 1));
+    require(h.events.starts.back() == 352, "a reply's next turn resumed at " + std::to_string(h.events.starts.back()));
+  }
+}
+
+// A reply that captured no state still shows that its conversation renders replies back: turn 1's decode captures
+// none, and turn 2, whose prompt renders turn 1's reply back, ends with its own reply's last state (256) ordinary.
+// A turn 2 that renders turn 1's reply otherwise leaves it an opportunistic checkpoint.
+void testAReplyWithNoStateShowsItsConversationRendersRepliesBack() {
+  for (const bool renderedBack : {true, false}) {
+    test::EngineHarness h({.pages = 64});
+    h.model.decodeFinishes = false;
+    h.model.decodeStateCaptures = false;
+    h.engine.submit(conversationTurn(1, tokensFrom(1), 90));
+    h.runUntilIdle();
+    h.model.decodeStateCaptures = true;
+    std::vector<uint32_t> prompt = nextTurn(tokensFrom(1), 90);
+    if (!renderedBack)
+      std::fill_n(prompt.begin() + 60, 90, 43);
+    h.engine.submit(conversationTurn(2, prompt, 90));
+    h.runUntilIdle();
+    prompt.resize(prompt.size() + 90, 42);
+    const uint64_t reply = test::stateAt(h.cache, prompt, 256);
+    require(reply, "turn 2's reply kept no state at its last page");
+    require(static_cast<bool>(h.cache.checkpointState(reply)) != renderedBack,
+            renderedBack ? "a reply rendering back one that captured no state ended as a checkpoint"
+                         : "a reply rendering the one before it otherwise ended as an ordinary state");
+  }
+}
+
+// A block shared by a prompt and its reply shows nothing: a client that renders each reply otherwise past its first
+// two tokens, which share the prompt's last block (30 prompt tokens and 2 of the reply, as a think opener a template
+// renders into history too), is never judged to render replies back. Over six turns each reply's last state stays an
+// opportunistic checkpoint, while a client that renders its 90-token replies back whole ends each from turn 2 on as
+// an ordinary state.
+void testABlockSharedWithThePromptShowsNoReplyRenderedBack() {
+  for (const bool whole : {false, true}) {
+    test::EngineHarness h({.pages = 512});
+    h.model.decodeFinishes = false;
+    std::vector<uint32_t> prompt = tokensFrom(1, 62);
+    for (uint64_t turn = 1; turn <= 6; ++turn) {
+      h.engine.submit(conversationTurn(turn, prompt, 90));
+      h.runUntilIdle();
+      std::vector<uint32_t> tokens = prompt;
+      tokens.resize(prompt.size() + 90, 42);
+      const uint32_t last = static_cast<uint32_t>(tokens.size()) / 32 * 32;
+      const uint64_t reply = test::stateAt(h.cache, tokens, last);
+      require(reply, "turn " + std::to_string(turn) + "'s reply kept no state at its last page");
+      require(static_cast<bool>(h.cache.checkpointState(reply)) == (!whole || turn == 1),
+              std::string(whole ? "rendered back whole: " : "rendered otherwise past a shared block: ") + "turn " +
+                  std::to_string(turn) + "'s reply state ended " +
+                  (h.cache.checkpointState(reply) ? "opportunistic" : "ordinary"));
+      if (!whole)
+        std::fill(tokens.begin() + static_cast<std::ptrdiff_t>(prompt.size()) + 2, tokens.end(), 43);
+      // The next prompt: the reply as the client renders it, then its own tokens up to 30 past a block.
+      tokens.resize(tokens.size() + (62 - tokens.size() % 32) % 32 + (tokens.size() % 32 > 30 ? 32 : 0), 500);
+      prompt = std::move(tokens);
+    }
+  }
+}
+
+// One server, two clients at the memory wall: conversation A renders its replies back, conversation B, served after
+// it, renders them otherwise, and each is judged by its own chain. A's second reply ends as an ordinary state, which
+// its third turn resumes from (at 672) after B and four more conversations took room; B's second reply stays an
+// opportunistic checkpoint.
+void testClientsThatRenderRepliesBackAndOthersAreJudgedApart() {
+  AtTheWall wall;
+  test::EngineHarness &h = wall.h;
+  static_cast<void>(wall.converse(1, tokensFrom(1), 300));
+  const std::vector<uint32_t> a = wall.converse(2, nextTurn(tokensFrom(1), 300), 300);
+  const uint64_t aState = test::stateAt(h.cache, a, 672);
+  require(aState && !h.cache.checkpointState(aState), "A's reply, which renders replies back, did not end ordinary");
+  static_cast<void>(wall.converse(3, tokensFrom(701), 300));
+  std::vector<uint32_t> otherwise = nextTurn(tokensFrom(701), 300);
+  std::fill_n(otherwise.begin() + 60, 300, 43);
+  const std::vector<uint32_t> b = wall.converse(4, otherwise, 300);
+  const uint64_t bState = test::stateAt(h.cache, b, 672);
+  require(bState && h.cache.checkpointState(bState), "B's reply, rendered otherwise, did not stay a checkpoint");
+  for (uint64_t id = 200; id < 204; ++id)
+    static_cast<void>(wall.converse(id, std::vector<uint32_t>(72, static_cast<uint32_t>(id)), 1));
+  static_cast<void>(wall.converse(5, nextTurn(std::vector<uint32_t>(a.begin(), a.begin() + 401), 300), 1));
+  require(h.events.starts.back() == 672,
+          "A's next turn resumed at " + std::to_string(h.events.starts.back()) + ", not after its reply");
+}
+
+// A conversation that renders its replies back, then asks for its last turn
+// again (a regenerate, or a retry after a stop), with no SSD tier: memory holds the replay points of 20 idle
+// conversations, and six more arrive between the turn and its repeat. The repeat's prompt is the turn's own, so it
+// resumes at that prompt's replay point (384), the newest state its conversation has for it.
+void testARepeatedTurnResumesAtItsReplayPointAtTheWall() {
+  test::EngineHarness h{{.pages = 1024, .pageBytes = 16, .extentPages = 4, .memory = test::FakeMemory::Config{},
+                         .limits = {.limitBytes = 1280}}};
+  h.model.restoreControl->ready = true;
+  h.model.decodeFinishes = false;
+  const auto converse = [&](uint64_t id, const std::vector<uint32_t> &prompt, uint32_t output) {
+    EngineRequest turn = conversationTurn(id, prompt, output);
+    turn.deadlineMilliseconds = 1e9;
+    h.engine.submit(std::move(turn));
+    h.runUntil([&] { return h.events.usage.contains(id); }, "a turn did not complete");
+  };
+  for (uint64_t id = 100; id < 120; ++id)
+    converse(id, std::vector<uint32_t>(72, static_cast<uint32_t>(900 + id)), 1);
+  std::vector<uint32_t> first(60);
+  std::iota(first.begin(), first.end(), 1);
+  converse(1, first, 300);
+  const std::vector<uint32_t> second = nextTurn(first, 300);
+  converse(2, second, 300);
+  require(h.events.starts.back() == 352 || h.events.starts.back() == 32,
+          "fixture: turn 2 resumed at " + std::to_string(h.events.starts.back()));
+  for (uint64_t id = 200; id < 206; ++id)
+    converse(id, std::vector<uint32_t>(72, static_cast<uint32_t>(id)), 1);
+  converse(3, second, 1);
+  require(h.events.starts.back() == 384, "the repeated turn resumed at " + std::to_string(h.events.starts.back()) +
+                                             ", not at its prompt's replay point (384)");
+}
+
+// What a reply's last state is, by how far the reply went, in
+// a conversation that renders replies back. Turn 1 is 60 tokens and a 90-token reply; turn 2's prompt renders it
+// back and is 191 tokens long, so the block 160..191 holds 31 of its tokens and the reply's first one, and the
+// reply's first whole block is 192..223. A reply's last state is ordinary only past 192: one that ends inside the
+// shared block's successor without filling it (1 token, ending on the boundary; 20 tokens) leaves its state at 192
+// a checkpoint; one that fills a block whole (33 tokens, ending on the boundary; 90 tokens) ends ordinary.
+void testAReplysLastStateIsOrdinaryOnlyPastTheBlockItSharesWithItsPrompt() {
+  std::string failures;
+  for (const uint32_t output : {1U, 20U, 33U, 90U}) {
+    test::EngineHarness h({.pages = 64});
+    h.model.decodeFinishes = false;
+    h.engine.submit(conversationTurn(1, tokensFrom(1), 90));
+    h.runUntilIdle();
+    std::vector<uint32_t> tokens = nextTurn(tokensFrom(1), 90);
+    h.engine.submit(conversationTurn(2, tokens, output));
+    h.runUntilIdle();
+    tokens.resize(tokens.size() + output, 42);
+    uint32_t last = 0;
+    for (uint32_t boundary = 192; boundary <= tokens.size(); boundary += engine::KvCache::pageTokens)
+      if (test::stateAt(h.cache, tokens, boundary))
+        last = boundary;
+    if (!last) {
+      failures += "a " + std::to_string(output) + "-token reply left no state at or past 192; ";
+      continue;
+    }
+    const bool ordinary = !h.cache.checkpointState(test::stateAt(h.cache, tokens, last));
+    if (ordinary != (last > 192))
+      failures += "a " + std::to_string(output) + "-token reply's last state, at " + std::to_string(last) + ", ended " +
+                  (ordinary ? "ordinary" : "a checkpoint") + "; ";
+  }
+  require(failures.empty(), failures);
+}
+
+// The agent shape at the memory wall with no SSD tier. A
+// conversation renders its replies back; its second turn's reply is a short one (20 tokens, a tool call), whose
+// last state sits at the end of the block it shares with the prompt (416). The same prompt asked again, after six
+// other conversations took room, resumes at its replay point (384).
+void testARepeatedTurnAfterAShortReplyResumesAtItsReplayPoint() {
+  AtTheWall wall(false);
+  test::EngineHarness &h = wall.h;
+  static_cast<void>(wall.converse(1, tokensFrom(1), 300));
+  const std::vector<uint32_t> second = nextTurn(tokensFrom(1), 300);
+  static_cast<void>(wall.converse(2, second, 20));
+  for (uint64_t id = 200; id < 206; ++id)
+    static_cast<void>(wall.converse(id, std::vector<uint32_t>(72, static_cast<uint32_t>(id)), 1));
+  static_cast<void>(wall.converse(3, second, 1));
+  require(h.events.starts.back() == 384, "after a short reply the repeated turn resumed at " +
+                                             std::to_string(h.events.starts.back()) +
+                                             ", not at its prompt's replay point (384)");
+}
+
+// The other direction. The second turn's reply is long (300
+// tokens, its last state at 672, ordinary) and the third prompt renders it otherwise from its first token: it
+// resumes at the second prompt's replay point (384), which the unrendered reply's end kept; and a short reply then
+// a long one rendered back resume in turn at the long one's last page.
+void testALongReplyRenderedOtherwiseLeavesItsReplayPoint() {
+  AtTheWall wall(false);
+  test::EngineHarness &h = wall.h;
+  static_cast<void>(wall.converse(1, tokensFrom(1), 300));
+  const std::vector<uint32_t> second = nextTurn(tokensFrom(1), 300);
+  static_cast<void>(wall.converse(2, second, 300));
+  for (uint64_t id = 200; id < 206; ++id)
+    static_cast<void>(wall.converse(id, std::vector<uint32_t>(72, static_cast<uint32_t>(id)), 1));
+  std::vector<uint32_t> third = nextTurn(second, 300);
+  std::fill_n(third.begin() + static_cast<std::ptrdiff_t>(second.size()), 300, 43);
+  static_cast<void>(wall.converse(3, third, 20));
+  require(h.events.starts.back() == 384, "a prompt that renders a long reply otherwise resumed at " +
+                                             std::to_string(h.events.starts.back()) +
+                                             ", not at the replay point before that reply (384)");
+  // A short reply (20 tokens) rendered back, then a long one (300), then its follow-up.
+  const std::vector<uint32_t> fourth = nextTurn(third, 20);
+  const std::vector<uint32_t> long_ = wall.converse(4, fourth, 300);
+  const uint32_t fourthStart = h.events.starts.back();
+  const uint32_t replay = static_cast<uint32_t>((third.size() - 7) / 32 * 32);
+  require(fourthStart >= replay, "after a short reply the next turn resumed at " + std::to_string(fourthStart) +
+                                     ", before the replay point of the turn before it (" + std::to_string(replay) + ")");
+  static_cast<void>(wall.converse(5, nextTurn(fourth, 300), 1));
+  const uint32_t lastPage = static_cast<uint32_t>(long_.size() / 32 * 32);
+  require(h.events.starts.back() == lastPage, "the turn after a long reply rendered back resumed at " +
+                                                  std::to_string(h.events.starts.back()) + ", not at its last page (" +
+                                                  std::to_string(lastPage) + ")");
+}
+
+// A long reply whose later captures were refused. Turn 2's
+// reply is 90 tokens, two blocks whole, but only its capture for 192, the end of the block it shares with the
+// prompt, finds room. Its last state is then the one at 192, which is no reply's end past the shared block however
+// long the reply was: it stays a checkpoint, and the same prompt asked again still resumes at its replay point.
+void testALongRepliesLastStateOnTheSharedBlockIsNoOrdinaryState() {
+  test::EngineHarness h({.pages = 64});
+  h.model.decodeFinishes = false;
+  h.engine.submit(conversationTurn(1, tokensFrom(1), 90));
+  h.runUntilIdle();
+  std::vector<uint32_t> tokens = nextTurn(tokensFrom(1), 90);
+  const size_t prompt = tokens.size();
+  h.model.reservationRoom = [&] {
+    return (prompt + h.events.outputs[2].size()) / engine::KvCache::pageTokens * engine::KvCache::pageTokens +
+               engine::KvCache::pageTokens == 192;
+  };
+  h.engine.submit(conversationTurn(2, tokens, 90));
+  h.runUntilIdle();
+  h.model.reservationRoom = nullptr;
+  tokens.resize(tokens.size() + 90, 42);
+  require(prompt == 191 && test::stateAt(h.cache, tokens, 192) && !test::stateAt(h.cache, tokens, 224) &&
+              !test::stateAt(h.cache, tokens, 256),
+          "fixture: the reply's only capture is not the one at 192");
+  require(static_cast<bool>(h.cache.checkpointState(test::stateAt(h.cache, tokens, 192))),
+          "a 90-token reply whose last state lies at the end of the block it shares with its prompt (192) ended "
+          "ordinary");
+}
+
+// A 2,000-token reply at the memory wall, decoding seven tokens a cycle, whose KV grows into room that the filler's
+// cached KV frees at once: its last capture (1,984) is its lane's recovery point, which no growth of the lane takes
+// while other cache frees at once, so the reply ends holding it (2,008 tokens) and the next turn, rendering the
+// reply back, resumes there rather than at the prompt's replay point (64).
+void testALongReplyKeepsItsEndStateAtTheWall() {
+  test::EngineHarness h({.pages = 256, .extentPages = 1});
+  h.storage.budgetPages = 80;
+  double now = 1;
+  fillToTheWall(h, now);
+  std::vector<uint32_t> prompt(97);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  h.model.speculativeCounts[2] = {7, 6};
+  h.engine.submit(conversationTurn(2, prompt, 1911));
+  h.runUntil([&] { return idle(h.engine); }, "the reply did not complete");
+  require(h.events.usage.at(2).second == 1911 && h.cache.snapshot().stateCache.evictions > 0,
+          "fixture: the reply did not complete at the wall");
+  h.engine.submit(conversationTurn(3, nextTurn(prompt, 1911), 1));
+  h.runUntil([&] { return idle(h.engine); }, "the next turn did not complete");
+  require(h.events.starts.back() == 1984, "the next turn resumed at " + std::to_string(h.events.starts.back()) +
+                                              ", not at the long reply's last page");
+}
+
+// A lone lane at the memory wall whose only room is its own recovery point keeps decoding: a 1,911-token reply under
+// a limit that holds its KV only once its rolling checkpoint goes completes its whole output, with no failure and no
+// suspension, its growth taking the checkpoint rather than waiting.
+void testALoneLaneWhoseCheckpointIsTheOnlyRoomDecodesOn() {
+  test::EngineHarness h({.pages = 1024, .pageBytes = 16, .extentPages = 4, .memory = test::FakeMemory::Config{},
+                         .limits = {.limitBytes = 1100}});
+  h.model.offloadTier = std::make_shared<OffloadControl>();
+  h.model.offloadTier->ready = true;
+  h.model.decodeFinishes = false;
+  h.model.speculativeCounts[2] = {7, 6};
+  std::vector<uint32_t> prompt(97);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  EngineRequest turn = conversationTurn(2, prompt, 1911);
+  turn.deadlineMilliseconds = 1e9;
+  h.engine.submit(std::move(turn));
+  h.runUntil([&] { return idle(h.engine); }, "the reply did not end");
+  require(h.cache.snapshot().stateCache.checkpointEvictions > 0, "fixture: the lane's checkpoint was not its room");
+  require(h.events.failures.empty() && h.engine.snapshot().resourceSuspensions == 0 &&
+              h.events.usage.count(2) && h.events.usage.at(2).second == 1911,
+          "a lone lane whose only room was its checkpoint did not decode its whole reply");
 }
 
 // A capture at a page that holds a checkpoint already reuses it as it is: a
@@ -1194,7 +1852,7 @@ void testEndedReplyCheckpointIsDroppedAtTheWall() {
   engine.submit(conversationTurn(2, prompt, 1000));
   tickUntil(h, now, [&] { return events.outputs[2].size() >= 200; },
             "the reply did not cross its pages");
-  engine.cancel(2);
+  engine.cancel(2, 0.0);
   tickUntil(h, now, [&] { return idle(engine); }, "the reply did not end");
   const StateCacheSnapshot ended = h.cache.snapshot().stateCache;
   require(ended.checkpointEntries == 1, "the cancelled reply left no checkpoint");
@@ -1292,7 +1950,7 @@ void testImageSpansKeyPrefixIdentity() {
   auto withImage = [&](uint64_t id, uint64_t digest) {
     EngineRequest result = request(id, prompt);
     result.images = {{8, 16, 8, 8, digest, digest ^ 0xabcdULL}};
-    result.imagePixels.assign(result.images[0].pixelBytes(), 1);
+    result.imagePixels.assign(result.images[0].pixelBytes(splash::ops::kImagePatchPixels), 1);
     return result;
   };
 
@@ -1339,7 +1997,7 @@ void testSharedPrefillBoundaryStopsAtTheFirstDifferentImage() {
       EngineRequest result = request(id, std::vector<uint32_t>(289, 248056));
       result.images = images;
       for (const ImageSpan &image : images)
-        result.imagePixels.resize(result.imagePixels.size() + image.pixelBytes(), 1);
+        result.imagePixels.resize(result.imagePixels.size() + image.pixelBytes(splash::ops::kImagePatchPixels), 1);
       return result;
     };
     engine.submit(withImages(1, shape.producer));
@@ -1520,7 +2178,7 @@ void testCancellationAfterJunctionDiscardsLaterState() {
               published.junctionMaterializations == 1 &&
               executor.reservationAttempts == 2,
           "junction publication did not land in the first command");
-  engine.cancel(10);
+  engine.cancel(10, 0.0);
   h.runUntilIdle();
   // The 2112 boundary is dropped with the lane: no reservation, no failure
   // counted, and the junction state stays cached.
@@ -1633,7 +2291,7 @@ void testConstrainedLaneSharesDecodeCommand() {
               engine.snapshot().scheduler.decodeBatchesByWidth[1] != 0,
           "the constrained lane's mask did not complete the command for both lanes");
   for (const uint64_t id : {1, 2})
-    engine.cancel(id);
+    engine.cancel(id, 0.0);
   tickUntil(h, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.failedCount == 0, "a lane failed");
 }
@@ -1713,7 +2371,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
     engine::Engine &engine = h.engine;
     engine.submit(constrainedRequest(201));
     advanceToOverlappedVerify(h, 201);
-    engine.cancel(201);
+    engine.cancel(201, 0.0);
     const std::array<uint32_t, 1> lateMask{1};
     engine.provideMask(201, lateMask, {});
     engine.failRequest(201, LaneOutcome::InvalidMask, "late mask");
@@ -1885,7 +2543,7 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
             "ordinary deadline released resources owned by in-flight Metal");
     require(engine.nextWakeupMilliseconds() == 1100.0 && !tickAt(h, 101),
             "expired in-flight request lost its bounded health wakeup");
-    engine.cancel(310); // A later cancel must not replace the deadline failure.
+    engine.cancel(310, 0.0); // A later cancel must not replace the deadline failure.
     *released = true;
     // A held prefill expires with the state it captured, which goes back to
     // the pool; a held decode follows the prefill that published it.
@@ -1959,6 +2617,52 @@ void testTerminalAnchorWithoutKvIsNotCached() {
 // selects it, before the first decode cycle that commits it; that cycle's
 // event leaves it out, and the usage counts what the client got, also when the
 // request is cancelled before that cycle.
+// A Background request behind attended work ages to Normal: beside a Normal
+// lane that decodes without end it waits, then starts once it has been in the
+// engine kBackgroundAgeMilliseconds (10 s). Strict priority held a run's step
+// for minutes. It still yields memory as Background: a Normal start refused
+// memory suspends it, not the Normal lane, and then runs.
+void testABackgroundRequestAgesToNormal() {
+  test::EngineHarness h({.pages = 512});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  executor.decodeFinishes = false;
+  const auto submit = [&](uint64_t id, RequestPriority priority) {
+    auto value = request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+    value.priority = priority;
+    value.maxNewTokens = 1'000'000;
+    value.deadlineMilliseconds = 1e9;
+    engine.submit(std::move(value));
+  };
+  // Ticks until done(), the clock 100 ms on after each.
+  const auto runFor = [&](double milliseconds, const std::function<bool()> &done) {
+    for (const double end = h.now() + milliseconds; h.now() < end && !done();) {
+      static_cast<void>(h.tick());
+      h.advanceTo(h.now() + 100.0);
+    }
+  };
+  submit(1, RequestPriority::Normal);
+  runFor(1'000.0, [&] { return events.outputs.contains(1); });
+  require(events.outputs.contains(1), "the Normal request did not decode");
+  submit(2, RequestPriority::Background);
+  const double submitted = h.now();
+  runFor(9'000.0, [&] { return events.outputs.contains(2); });
+  require(!events.outputs.contains(2), "the Background request ran beside the Normal lane before it aged");
+  runFor(2'000.0, [&] { return events.outputs.contains(2); });
+  require(events.outputs.contains(2) && h.now() - submitted >= 10'000.0,
+          "the Background request did not start once it had waited 10 s");
+  executor.beginGrowthBlocked = [&] { return executor.lastBeginId == 3 && executor.requests.at(2).resident; };
+  submit(3, RequestPriority::Normal);
+  runFor(1'000.0, [&] { return events.outputs.contains(3); });
+  require(events.outputs.contains(3) && engine.snapshot().prioritySuspensions == 1 &&
+              executor.resumedPrompts.size() == 1 && executor.resumedPrompts.front().front() == 2,
+          "a Normal start refused memory did not suspend the aged Background lane to run");
+  for (const uint64_t id : {1, 2, 3})
+    engine.cancel(id, 0.0);
+  h.runUntilIdle();
+}
+
 void testFirstTokenIsSentAtPrefill() {
   for (const bool cancel : {false, true}) {
     test::EngineHarness h({.pages = 8, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
@@ -1980,7 +2684,7 @@ void testFirstTokenIsSentAtPrefill() {
     require(events.outputs[91] == std::vector<uint32_t>{42},
             "the first token did not reach the client before the first cycle");
     if (cancel)
-      engine.cancel(91);
+      engine.cancel(91, 0.0);
     *executor.holdDecodeUntil = true;
     tickUntil(h, now, [&] { return idle(engine); }, "the request did not end");
     const uint32_t expected = cancel ? 1 : 12;
@@ -2305,7 +3009,7 @@ void testNonFiniteStepAfterCancellationInvalidatesTheState() {
   for (double now = 1; now < 100 && !engine.commandInFlight(); ++now)
     static_cast<void>(tickAt(h, now));
   require(engine.commandInFlight(), "the resumed request did not launch its held prefill");
-  engine.cancel(2);
+  engine.cancel(2, 0.0);
   *model.holdPrefillUntil = true;
   h.runUntilIdle();
   require(engine.snapshot().cancelled == 1 && events.failedCount == 0,
@@ -2486,11 +3190,39 @@ std::span<const test::TestCase> requestsTests() {
       {"testReplyStatesFollowSpeculativeCycles", testReplyStatesFollowSpeculativeCycles},
       {"testPreemptedReplyKeepsItsDeepestState", testPreemptedReplyKeepsItsDeepestState},
       {"testPreemptedReplyCheckpointIsDropped", testPreemptedReplyCheckpointIsDropped},
+      {"testALongPreemptedReplyKeepsItsNewestState", testALongPreemptedReplyKeepsItsNewestState},
       {"testRunningReplyCheckpointIsDropped", testRunningReplyCheckpointIsDropped},
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
+      {"testASecondConversationResumesAtASharedHead", testASecondConversationResumesAtASharedHead},
+      {"testASecondConversationResumesAtAShortHeadWhateverTheFirstMessage",
+       testASecondConversationResumesAtAShortHeadWhateverTheFirstMessage},
+      {"testAConversationWhoseHeadEndsDifferentlyResumesBelowIt",
+       testAConversationWhoseHeadEndsDifferentlyResumesBelowIt},
+      {"testANewSessionInAnotherDirectoryResumesBelowItsHead", testANewSessionInAnotherDirectoryResumesBelowItsHead},
+      {"testACommandCapturesTheCheckpointBeforeTheHead", testACommandCapturesTheCheckpointBeforeTheHead},
+      {"testConversationsAfterRepliesResumeAtTheHeadOrBelowIt", testConversationsAfterRepliesResumeAtTheHeadOrBelowIt},
       {"testReplyCheckpointsAreNotWrittenAtTheWall", testReplyCheckpointsAreNotWrittenAtTheWall},
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},
       {"testRepliesAreKeptOnceAConversationRendersThemBack", testRepliesAreKeptOnceAConversationRendersThemBack},
+      {"testALongReplyKeepsItsEndStateAtTheWall", testALongReplyKeepsItsEndStateAtTheWall},
+      {"testALoneLaneWhoseCheckpointIsTheOnlyRoomDecodesOn", testALoneLaneWhoseCheckpointIsTheOnlyRoomDecodesOn},
+      {"testAFirstReplyCapturesAtTheWall", testAFirstReplyCapturesAtTheWall},
+      {"testARefusedCaptureClaimsAgainAtTheNextPage", testARefusedCaptureClaimsAgainAtTheNextPage},
+      {"testACapturesCountAtTheWallIsWhatItsTakesFree", testACapturesCountAtTheWallIsWhatItsTakesFree},
+      {"testTwoRepliesAtTheWallKeepEachOthersStates", testTwoRepliesAtTheWallKeepEachOthersStates},
+      {"testABlockSharedWithThePromptShowsNoReplyRenderedBack", testABlockSharedWithThePromptShowsNoReplyRenderedBack},
+      {"testAReplyWithNoStateShowsItsConversationRendersRepliesBack",
+       testAReplyWithNoStateShowsItsConversationRendersRepliesBack},
+      {"testClientsThatRenderRepliesBackAndOthersAreJudgedApart",
+       testClientsThatRenderRepliesBackAndOthersAreJudgedApart},
+      {"testARepeatedTurnResumesAtItsReplayPointAtTheWall", testARepeatedTurnResumesAtItsReplayPointAtTheWall},
+      {"testAReplysLastStateIsOrdinaryOnlyPastTheBlockItSharesWithItsPrompt",
+       testAReplysLastStateIsOrdinaryOnlyPastTheBlockItSharesWithItsPrompt},
+      {"testARepeatedTurnAfterAShortReplyResumesAtItsReplayPoint",
+       testARepeatedTurnAfterAShortReplyResumesAtItsReplayPoint},
+      {"testALongReplyRenderedOtherwiseLeavesItsReplayPoint", testALongReplyRenderedOtherwiseLeavesItsReplayPoint},
+      {"testALongRepliesLastStateOnTheSharedBlockIsNoOrdinaryState",
+       testALongRepliesLastStateOnTheSharedBlockIsNoOrdinaryState},
       {"testReplyCaptureReusesACheckpointAsItIs", testReplyCaptureReusesACheckpointAsItIs},
       {"testRetryLeavesAnOpportunisticReplyOpportunistic", testRetryLeavesAnOpportunisticReplyOpportunistic},
       {"testEndedReplyCheckpointIsDroppedAtTheWall", testEndedReplyCheckpointIsDroppedAtTheWall},
@@ -2520,6 +3252,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testTerminalAnchorWithoutKvIsNotCached", testTerminalAnchorWithoutKvIsNotCached},
       {"testPrefillCanCompleteTheRequest", testPrefillCanCompleteTheRequest},
       {"testFirstTokenIsSentAtPrefill", testFirstTokenIsSentAtPrefill},
+      {"testABackgroundRequestAgesToNormal", testABackgroundRequestAgesToNormal},
       {"testFirstTokenSentBeforeASuspensionIsNotSentAgain", testFirstTokenSentBeforeASuspensionIsNotSentAgain},
       {"testResumedLaneClearsThePagesPastItsRestoredChain", testResumedLaneClearsThePagesPastItsRestoredChain},
       {"testReplayFindsItsOwnBlocks", testReplayFindsItsOwnBlocks},

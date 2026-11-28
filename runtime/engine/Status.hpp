@@ -12,6 +12,7 @@
 #include "model/ExpertStoreStats.hpp"
 #include "model/KvReadStats.hpp"
 #include "model/Model.hpp"
+#include "model/SlotFile.hpp"
 #include "model/SparseRowStore.hpp"
 
 #include <array>
@@ -74,6 +75,8 @@ struct StatusSample final {
   std::optional<model::ExpertStoreStats> streamedExperts;
   // None for a target that keeps its KV in memory.
   std::optional<KvSpill> kvSpill;
+  // Damage the persistent cache's files showed (disk.damage).
+  model::SlotFileDamage cacheDamage{};
 };
 
 // Single source for /status and native protocol status events.

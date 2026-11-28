@@ -21,6 +21,7 @@ public:
   [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart,
                                          bool keepLane) const noexcept override;
   [[nodiscard]] uint64_t startStateBytes() const noexcept override;
+  [[nodiscard]] uint64_t imageStartBytes(const ModelRequest &request) const override;
   [[nodiscard]] CommandLimits commandLimits() const noexcept override;
   [[nodiscard]] CommandWork prefillWork(std::span<const PrefillLane> lanes, uint32_t first,
                                         uint32_t passesLeft) const override;
@@ -54,7 +55,7 @@ public:
   [[nodiscard]] bool capturesInDecode() const noexcept override;
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
-  [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;
+  [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
   [[nodiscard]] uint64_t stagingShortfall(uint64_t requestId, uint32_t pages) const override;
@@ -66,9 +67,12 @@ public:
   provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced) override;
   void end(uint64_t requestId) override;
 
+  [[nodiscard]] std::vector<uint32_t> prefillRowClasses() const override;
+  [[nodiscard]] std::string activationsDescription(uint32_t contextTokens) const override;
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;
   [[nodiscard]] WarmupStepResult
   warmupDecodeBatch(uint32_t width) override;
+  [[nodiscard]] WarmupStepResult prepareDecodeBatch(uint32_t width) override;
   [[nodiscard]] WarmupStepResult
   warmupCompositeStateRestore() override;
   [[nodiscard]] ModelMemoryActual
@@ -76,6 +80,8 @@ public:
 
   [[nodiscard]] ModelTelemetry
   telemetry() const noexcept override;
+  void setAneFfn(ops::AneFfn *split) override;
+  void withPrefillFfn(const PrefillFfnUse &use) override;
 
 private:
   // The state lane of a resident request; the storage checks that its
@@ -84,8 +90,8 @@ private:
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   // The step costs of `width` lanes on this machine (StepCosts::measure),
-  // from passes of a cycle of each of their points, and their spread.
-  double measureDecodeSteps(uint32_t width);
+  // from passes of a cycle of each of their points.
+  void measureDecodeSteps(uint32_t width);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,
                                        uint32_t stateLane);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>

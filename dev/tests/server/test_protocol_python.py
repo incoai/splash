@@ -39,6 +39,7 @@ REQUEST_FIELDS = (
     "thinking_tokens",
     "thinking_end_count",
     "thinking_also_ends",
+    "head_tokens",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -70,18 +71,41 @@ def example_request():
         seed=0xFEDCBA9876543210,
         constraint=p.ConstraintMode.TOKEN_MASK,
         generation_prompt_tokens=2,
+        head_tokens=2,
         cache_salt=0x00112233445566778899AABBCCDDEEFF,
         thinking_budget=p.ThinkingBudget(4096, (198, 248069), 248058),
     )
 
 
 def example_image_request():
-    span = p.ImageSpan(1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888)
+    # Its own pixels 30 x 28 of the grid's 32 x 32, as protocol_test.cpp's.
+    span = p.ImageSpan(
+        1,
+        1,
+        2,
+        2,
+        0x1111222233334444,
+        0x5555666677778888,
+        content_height=30,
+        content_width=28,
+    )
     return replace(
         example_request(),
         prompt_tokens=(7, 3, 9),
         image_spans=(span,),
         image_pixels=bytes((i * 7 + 1) & 0xFF for i in range(span.pixel_bytes)),
+    )
+
+
+def example_inkling_image_request():
+    """One token of Inkling's image: 2x2 patches of 20 pixels, its own 33 x
+    37 of them."""
+    span = p.ImageSpan(1, 1, 2, 2, 7, 9, content_height=33, content_width=37, patch=20)
+    return replace(
+        example_request(),
+        prompt_tokens=(7, 3, 9),
+        image_spans=(span,),
+        image_pixels=bytes((i * 5 + 3) & 0xFF for i in range(span.pixel_bytes)),
     )
 
 
@@ -168,7 +192,9 @@ def engine_events():
             b"a start command ran out of GPU memory",
         ),
         "warming": p.WarmingEvent(3, 9),
-        "start": p.StartEvent(91, 2, 4096),
+        "start": p.StartEvent(
+            91, 2, 4096, 4160, p.StateSource.DISK, True, p.ReuseEnd.KV_WITHOUT_STATE, 64
+        ),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
         "mask_request_initial": p.MaskRequestEvent(91, 6, 4, (), ()),
@@ -213,6 +239,16 @@ def engine_events():
             b"kv_write_budget",
             b"the SSD cache's write budget is spent",
             21_600,
+        ),
+        "error_capacity": p.ErrorEvent(
+            p.FailureClass.REQUEST_ERROR,
+            91,
+            False,
+            b"kv_disk_quota",
+            b"this request's KV needs more of the SSD cache",
+            0,
+            p.CapacityLimit.DISK_QUOTA,
+            8191,
         ),
         "error_engine": p.ErrorEvent(
             p.FailureClass.ENGINE_UNHEALTHY,
@@ -543,9 +579,21 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.thinking_budget.tokens,
                 len(request.thinking_budget.end),
                 request.thinking_budget.also_ends,
+                request.head_tokens,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
-            + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
+            # The span's wire fields, in their order; its patch side is not one.
+            + struct.pack(
+                p._IMAGE_SPAN.format,
+                span.offset,
+                span.tokens,
+                span.grid_height,
+                span.grid_width,
+                span.content_height,
+                span.content_width,
+                span.digest_lo,
+                span.digest_hi,
+            )
             + request.image_pixels
             + struct.pack("<2I", *request.thinking_budget.end)
         )
@@ -729,6 +777,31 @@ class ProtocolPythonTests(unittest.TestCase):
                 self.assertEqual(decoded, event)
                 self.assertIs(type(decoded.reason), p.FinishReason)
 
+    def test_an_inkling_image_request_round_trips_with_its_patch_side(self):
+        request = example_inkling_image_request()
+        self.assertEqual(len(request.image_pixels), 4800)
+        ((message, _raw),) = native_peer.ClientFrameReader(patch=20).feed(
+            p.serialize_message(request)
+        )
+        self.assertEqual(message, request)
+
+    def test_an_image_s_content_lies_inside_its_grid(self):
+        # The engine's rule (imageSpansValidationError): the image's own
+        # pixels are within the grid's, 40 a side here.
+        request = example_inkling_image_request()
+        (span,) = request.image_spans
+        for content in ({"content_height": 41}, {"content_width": 41}):
+            with self.subTest(content=content):
+                outside = replace(request, image_spans=(replace(span, **content),))
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda outside=outside: p.serialize_message(outside),
+                )
+                self.assertIn("inside its grid", issue.message)
+        whole = replace(span, content_height=40, content_width=40)
+        p.serialize_message(replace(request, image_spans=(whole,)))
+
     def test_request_header_and_binary_prompt(self):
         request = example_request()
         wire = p.serialize_message(request)
@@ -782,12 +855,13 @@ class ProtocolPythonTests(unittest.TestCase):
             )[0],
             1,
         )
+        # Offset, tokens, grid, the image's own pixels, digest.
         self.assertEqual(
-            struct.unpack_from("<IIIIQQ", wire, span_offset),
-            (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888),
+            struct.unpack_from("<IIIIIIQQ", wire, span_offset),
+            (1, 1, 2, 2, 30, 28, 0x1111222233334444, 0x5555666677778888),
         )
         # The thinking end tokens follow the pixels.
-        self.assertEqual(wire[span_offset + 32 : -8], image.image_pixels)
+        self.assertEqual(wire[span_offset + 40 : -8], image.image_pixels)
         self.assertEqual(decode_client(wire), image)
 
     def test_thinking_budget_follows_the_cache_salt(self):
@@ -849,6 +923,19 @@ class ProtocolPythonTests(unittest.TestCase):
                     p.IssueCode.INVALID_COUNT,
                     lambda tokens=tokens: p.serialize_message(
                         replace(request, generation_prompt_tokens=tokens)
+                    ),
+                )
+                self.assertEqual(issue.request_id, request.request_id)
+
+    def test_head_must_leave_a_prompt_token(self):
+        request = example_request()
+        for tokens in (len(request.prompt_tokens), 0xFFFFFFFF):
+            with self.subTest(tokens=tokens):
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda tokens=tokens: p.serialize_message(
+                        replace(request, head_tokens=tokens)
                     ),
                 )
                 self.assertEqual(issue.request_id, request.request_id)
@@ -1061,7 +1148,7 @@ class ProtocolPythonTests(unittest.TestCase):
         error = native_peer.serialize_event(
             p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"message")
         )
-        bad_error = mutate_u32(error, p.FRAME_HEADER_BYTES + 14, 0xFFFFFFFF)
+        bad_error = mutate_u32(error, p.FRAME_HEADER_BYTES + 19, 0xFFFFFFFF)
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
@@ -1075,6 +1162,28 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assert_fatal_event(
             p.IssueCode.INVALID_ERROR_CLASSIFICATION,
             p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"", 60),
+        )
+        # Only a request's capacity failure says what it lacked, and what fits
+        # only with what it lacked.
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ENUM_VALUE,
+            p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"", 0, 5),
+        )
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ERROR_CLASSIFICATION,
+            p.ErrorEvent(
+                p.FailureClass.ENGINE_UNHEALTHY,
+                0,
+                False,
+                b"bad",
+                b"",
+                0,
+                p.CapacityLimit.MEMORY,
+            ),
+        )
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ERROR_CLASSIFICATION,
+            p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"", 0, 0, 64),
         )
 
     def test_status_json_is_opaque_length_delimited_and_bounded(self):
@@ -1098,6 +1207,16 @@ class ProtocolPythonTests(unittest.TestCase):
                 True,
                 b"busy",
                 b"retry this request",
+            ),
+            p.ErrorEvent(
+                p.FailureClass.REQUEST_ERROR,
+                5,
+                False,
+                b"capacity_exhausted",
+                b"does not fit alone",
+                0,
+                p.CapacityLimit.MEMORY,
+                4080,
             ),
             p.ErrorEvent(
                 p.FailureClass.ENGINE_UNHEALTHY,

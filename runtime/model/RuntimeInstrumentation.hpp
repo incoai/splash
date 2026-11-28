@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace splash::model {
@@ -28,11 +29,33 @@ public:
   // final position of the prefill chunk that ended a prompt.
   [[nodiscard]] static std::span<const float> lastLogits(const Runtime &runtime, uint32_t lane);
   // The target rows the last prefill command captured for the draft in its
-  // chunk `chunk`'s buffer, until the next prefill: bf16 rows of the output
-  // of each target layer the draft reads (its target_layer_ids, hiddenSize
-  // values each, in their order), the captured rows in the order the draft's
-  // context plan captured them (a cold prompt's first command: its rows).
+  // chunk `chunk`'s buffer, until the next prefill: bf16 rows of each target
+  // layer id the draft reads (its target_layer_ids, hiddenSize values each,
+  // in their order; QwenTargetDimensions::draftReadsLayerInputs names which
+  // rows), the captured rows in the order the draft's context plan captured
+  // them (a cold prompt's first command: its rows).
   [[nodiscard]] static std::span<const uint16_t> lastCapturedRows(const Runtime &runtime, uint32_t chunk);
+  // Has every later prefill command's draft read `rows`, the captured rows of
+  // positions 0 .. their count - 1 (capturedHiddenSize bf16 values each), in
+  // place of those its target captures at those positions, so that a
+  // reference's draft and Splash's read the same rows; no rows restores the
+  // target's.
+  static void replaceCapturedRows(Runtime &runtime, std::span<const uint16_t> rows);
+  // The draft's lattice of batch lane `lane` of the last decode step of
+  // `lanes` lanes, until the next decode step, as ops::DraftSelector left
+  // it: each proposal position's candidates, their unary scores (the
+  // draft's logits of them, its head's finish but its softcap applied) and
+  // the edges to them from each candidate of the position before (from the
+  // anchor alone, predecessor 0, for the first position), each
+  // [position][predecessor][candidate]; and the probabilities of the first
+  // position's candidates after the anchor, which its tree's first row holds.
+  struct DraftLattice final {
+    std::vector<uint32_t> candidates;
+    std::vector<float> unary;
+    std::vector<float> edges;
+    std::vector<float> first;
+  };
+  [[nodiscard]] static DraftLattice lastDraftLattice(const Runtime &runtime, uint32_t lane, uint32_t lanes);
   // The rows batch lane `lane` of the last decode step verified, its rows of
   // the step as its selector laid them out (ops::DraftSelector::
   // addVerifyRows), until the next command that selects.
@@ -48,10 +71,38 @@ public:
   // not teach; none gives the choice back. For measuring steps' costs by
   // their rows, and for steps whose lanes take fewer rows than they hold.
   static void forceStepRows(Runtime &runtime, std::optional<uint32_t> rows, float floor = 0.0F);
+  // With `laneRows` R, every later decode cycle is a plain step: no draft
+  // dispatch runs, and each lane verifies a chain of R rows that all hold its
+  // anchor (R = 1: the anchor alone; more: the copied rows of another
+  // engine's verify ladder), a forced step of a lane cap of R. The host lays
+  // the rows out as draft_verify_rows lays out a chain (with no draw, so that
+  // a sampled row samples the target alone), and the acceptance reads the
+  // copies; the target's part runs as in any cycle, but commits no draft
+  // context and writes no state capture, so the draft's context falls
+  // behind: a runtime that ran plain steps is not to draft again.
+  // Unconstrained lanes only. None gives the step back to the cycles' choice,
+  // as forceStepRows(none) does. For measuring the target's verify alone
+  // against another engine's (decode-profile --plain R).
+  static void skipDraft(Runtime &runtime, std::optional<uint32_t> laneRows);
+  // The next decode cycle of constrained request `requestId` gives each row
+  // `row` of its lane's tree past the anchor the token `token` of `tokens`
+  // in place of its own: written into the cycle's verify input once its
+  // draft laid out the step's rows (ops::DraftSelector::addVerifyRows),
+  // before its mask request and the target's forward, which both read it;
+  // the tree's rows and their places stay. For checking that a row computes
+  // what its path holds whatever its tree's other rows hold.
+  static void replaceTreeTokens(Runtime &runtime, uint64_t requestId,
+                                std::vector<std::pair<uint32_t, uint32_t>> tokens);
+  // The next decode cycle of request `requestId` draws its tree's children
+  // from its draft at `temperature` with `noise` (ops::DraftTreeLane), in
+  // place of its own: other draws of a sampled lane, draws in place of a
+  // greedy lane's most likely candidates. Its verify selects by its own
+  // policy and uniforms. For checking what a cycle's own draft decides.
+  static void redrawTree(Runtime &runtime, uint64_t requestId, float temperature, uint64_t noise);
   // Whether a streamed-expert target's later cycles each plan a draft's
-  // block a lane, at their floor, whatever class their floor passes the
-  // lanes' last chances into (CostLine::choose): for measuring what the
-  // larger class's kernels cost a cycle.
+  // block a lane within its store's round, at their floor, whatever class
+  // their floor passes the lanes' last chances into (CostLine::choose): for
+  // measuring what the larger class's kernels cost a cycle.
   static void planBlocks(Runtime &runtime, bool enabled);
   // A decode cycle's choice of its step (StepCosts::choose) and what it
   // weighed: its rows and lane cap, the chances its lanes' curves held
@@ -86,6 +137,9 @@ public:
   // The classes of `lanes` lanes' steps and their measured costs
   // (StepCosts::points); none without --verify-rows auto.
   [[nodiscard]] static std::vector<StepCosts::Point> stepPoints(const Runtime &runtime, uint32_t lanes);
+  // The level check of the tables its start recalled: their largest step of
+  // the first warmup's lanes over that step's median now (none without one).
+  [[nodiscard]] static std::optional<double> levelRatio(const Runtime &runtime);
   // While capturing, each command that selects first tokens or verifies
   // copies the rows lastLogits returns, as the target's forward wrote them
   // before the policy rewrites them in place: for each of its batch lanes,

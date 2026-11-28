@@ -67,6 +67,8 @@ class RequestFailed(EngineRuntimeError):
         *,
         retryable: bool = False,
         retry_after_seconds: int = 0,
+        capacity_limit: wire.CapacityLimit = wire.CapacityLimit.NONE,
+        fits_tokens: int = 0,
     ):
         self.request_id = request_id
         self.code = code
@@ -74,6 +76,11 @@ class RequestFailed(EngineRuntimeError):
         self.retryable = retryable
         # When a retry may succeed, in seconds; 0 for at once.
         self.retry_after_seconds = retry_after_seconds
+        # For a request that cannot fit even alone, what it lacked and the
+        # prompt tokens that fit, 0 where the engine cannot say
+        # (wire.ErrorEvent).
+        self.capacity_limit = capacity_limit
+        self.fits_tokens = fits_tokens
         text = message.decode("utf-8", errors="replace")
         machine_code = code.decode("ascii", errors="replace")
         super().__init__(f"request {request_id} failed [{machine_code}]: {text}")
@@ -85,6 +92,8 @@ class RequestFailed(EngineRuntimeError):
             self.message_bytes,
             retryable=self.retryable,
             retry_after_seconds=self.retry_after_seconds,
+            capacity_limit=self.capacity_limit,
+            fits_tokens=self.fits_tokens,
         )
 
 
@@ -168,10 +177,14 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
-def _wire_deadline(remaining: float) -> tuple[int, int]:
-    """(absolute unix µs, remaining µs) for a deadline `remaining` seconds
-    away; an infinite one saturates at the wire's u64 maximum."""
+def _wire_deadline(deadline: float) -> tuple[int, int]:
+    """(absolute unix µs, remaining µs) for `deadline` on the monotonic clock;
+    an infinite one saturates at the wire's u64 maximum. The wall clock is
+    read first, so the absolute deadline is never later than `deadline`: the
+    engine, which reads its clocks the other way round, then counts a cancel
+    at `deadline` as a timeout."""
     wall = time.time_ns() // 1000
+    remaining = _remaining(deadline)
     limit = _MAX_U64 - wall
     micros = (
         limit if remaining >= limit / 1_000_000 else max(1, int(remaining * 1_000_000))
@@ -541,6 +554,11 @@ class MultiplexedRuntime:
         self._stderr_relay: threading.Thread | None = None
         self._generation = 0
         self._startup_attempt: _StartupAttempt | None = None
+        # The attempt start() began, until a wait takes it. It is the first
+        # wait's, ended or not: an engine that failed before the server waited
+        # reports that failure and is not started again, and a wait after it,
+        # such as a relaunch after a crash, starts a new engine.
+        self._started: _StartupAttempt | None = None
         self._ready_message: wire.ReadyEvent | None = None
         # When the current generation's ReadyEvent arrived.
         self._ready_at: float | None = None
@@ -588,12 +606,17 @@ class MultiplexedRuntime:
 
     @staticmethod
     def _spawn(command: Sequence[str]) -> ProcessLike:
+        # The engine shares the server's process group, so that a stop of the
+        # group (Ctrl+C, the app, a supervisor) or its kill takes it too; it
+        # then ends on the server's own SIGTERM alone, which follows the
+        # server's drain (--shutdown-timeout), or once the server is gone.
         return subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=dict(os.environ, SPLASH_ENGINE_STOPPED_BY_PARENT="1"),
         )
 
     @property
@@ -650,6 +673,13 @@ class MultiplexedRuntime:
         path = self._crash_trace.last_dump
         return str(path) if path is not None else None
 
+    def start(self) -> None:
+        """Start an engine unless one serves or starts, without waiting for
+        its Ready: the server loads its tokenizer while the engine loads its
+        weights, and wait_ready() then waits for it and raises why its
+        startup failed, if it did."""
+        self._ensure_process(wait=False)
+
     def wait_ready(self, timeout: float | None = None) -> bool:
         """Start an engine unless one serves, and wait for its Ready.
 
@@ -682,7 +712,7 @@ class MultiplexedRuntime:
         call: RuntimeCall | None = None
         try:
             # Admission must precede serialization, which copies image payloads.
-            absolute, remaining = _wire_deadline(_remaining(deadline))
+            absolute, remaining = _wire_deadline(deadline)
             frame = replace(
                 request.frame,
                 request_id=request_id,
@@ -839,7 +869,7 @@ class MultiplexedRuntime:
             return EngineUnhealthy(issue.describe())
         return ProtocolFatal(issue.describe())
 
-    def _ensure_process(self, timeout: float | None = None) -> None:
+    def _ensure_process(self, timeout: float | None = None, wait: bool = True) -> None:
         if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
             raise ValueError("ready timeout must be positive")
         caller_deadline = None if timeout is None else time.monotonic() + timeout
@@ -849,6 +879,9 @@ class MultiplexedRuntime:
             with self._state_lock:
                 if self._closed:
                     raise RuntimeClosed("runtime is closed")
+                started = self._started
+                if wait:
+                    self._started = None
                 process = self._process
                 if (
                     process is not None
@@ -858,7 +891,9 @@ class MultiplexedRuntime:
                 ):
                     return
                 attempt = self._startup_attempt
-                if attempt is not None and not attempt.event.is_set():
+                if attempt is not None and (
+                    attempt is started or not attempt.event.is_set()
+                ):
                     pass
                 elif process is not None and self._terminal_error is None:
                     stale_generation = self._generation
@@ -868,6 +903,8 @@ class MultiplexedRuntime:
                     old_process = process
                     old_reader = self._reader_thread
                     owner = True
+                    if not wait:
+                        self._started = attempt
 
             if stale_generation is not None:
                 # Deliver terminal callbacks without any startup ownership
@@ -888,6 +925,8 @@ class MultiplexedRuntime:
                     name="splash-native-startup",
                     daemon=True,
                 ).start()
+            if not wait:
+                return
             deadline = min(attempt.deadline, caller_deadline or attempt.deadline)
             if not attempt.event.wait(max(0.0, deadline - time.monotonic())):
                 if time.monotonic() < attempt.deadline:
@@ -1371,6 +1410,8 @@ class MultiplexedRuntime:
                     event.message,
                     retryable=event.retryable,
                     retry_after_seconds=event.retry_after_seconds,
+                    capacity_limit=event.capacity_limit,
+                    fits_tokens=event.fits_tokens,
                 ),
             )
             return

@@ -45,7 +45,11 @@ MAX_TICK_MS = 5000
 # processes it started, its engine, running past SIGINT's grace
 # (run.Server.stop).
 CLEAN_STOP = {"signals": ["SIGINT"], "exit": 0, "left_running": []}
-# G9: the engine's resource wait timeout; a claim waiting that long starves.
+# G9: the engine's resource wait limit; a request that waits that long for
+# memory while nothing ahead of it makes progress starves. A longer wait
+# behind work in progress is by design: a request that has waited for memory
+# is served in arrival order behind the work sent before it (the engine's
+# ClaimRank), and the limit restarts while a lane ahead of it works.
 CLAIM_WAIT_MS = 30_000
 # A regrown store unit taken back within this many seconds of its regrow
 # counts as taken back, and a second take back within it of the first is an
@@ -67,6 +71,21 @@ FIRST_TOKEN_MARGIN = 2
 THERMAL_HOT = ("serious", "critical")
 # The scenarios whose runs end in clients.write_summary's summary.
 CONVERSATION_SCENARIOS = ("agent", "edit")
+# The turns of those whose conversations grow: each request sends its
+# conversation's previous one and more (clients.run_agent, run_edit).
+GROWING_TURNS = ("first", "loop", "build")
+# Conversation: a growing turn's request finds at least this share of its
+# conversation's previous prompt cached. Of 583 such requests in five runs
+# on two Macs the least found 0.994; a request that lost it finds 0.
+CACHED_SHARE = 0.9
+# Conversation: a growing turn's first tokens come within this many times
+# its new tokens' prefill at the run's median time per new token of such a
+# turn. The five runs' slowest turns took 1.73 times; the turns whose
+# conversations had lost their cache, cached 0 and 161 to 199 s, 6.3 to 7.4.
+GROWING_TTFT_MARGIN = 3
+# A turn whose first tokens all came within this many seconds is not judged
+# by its time: its new tokens' prefill is too short to measure against.
+GROWING_TTFT_FLOOR_S = 10
 # A process the run did not start, among the top five by CPU at this share or
 # more, competes with the server and voids a timed comparison (not_quiet):
 # twice the busiest steady system process on the Studio (WindowServer,
@@ -316,10 +335,16 @@ def g8_failures(run: Run) -> list[str]:
     return failures
 
 
-def g9_failures(run: Run) -> list[str]:
+def g9(run: Run) -> tuple[list[str], list[str]]:
     """G9, memory bookkeeping: the accounts sum to the charged bytes in
-    every sample, no claim waits CLAIM_WAIT_MS, nothing is owed at the end."""
-    failures = []
+    every sample, no request waits CLAIM_WAIT_MS for memory while nothing
+    ahead of it makes progress (/status admission.stalled_wait_ms: how far
+    into its resource wait limit the request furthest into it is), nothing is
+    owed at the end. The longest wait for memory of any cause
+    (memory_governor.claims.oldest_ms), behind progress or not, is noted. A
+    server that reports no stalled_wait_ms is held to that wait instead.
+    Returns the failures and the notes."""
+    failures, notes = [], []
     for sample in run.samples:
         governor = sample["status"].get("memory_governor") or {}
         accounts = governor.get("accounts")
@@ -337,12 +362,29 @@ def g9_failures(run: Run) -> list[str]:
         ),
         default=0,
     )
-    if oldest >= CLAIM_WAIT_MS:
-        failures.append(f"G9: a claim waited {oldest:.0f} ms")
+    stalls = [
+        stalled
+        for s in run.samples
+        if (stalled := value(s["status"], "admission.stalled_wait_ms")) is not None
+    ]
+    if stalls:
+        notes.append(f"G9: the longest wait for memory {oldest:.0f} ms")
+        if max(stalls) >= CLAIM_WAIT_MS:
+            failures.append(
+                f"G9: a request waited {max(stalls):.0f} ms for memory while "
+                "nothing ahead of it made progress"
+            )
+    else:
+        notes.append(
+            "G9: the server reports no admission.stalled_wait_ms; every wait "
+            "for memory is held to the limit"
+        )
+        if oldest >= CLAIM_WAIT_MS:
+            failures.append(f"G9: a request waited {oldest:.0f} ms for memory")
     owed = value(run.last, "memory_governor.owed.bytes", 0)
     if owed:
         failures.append(f"G9: {owed} bytes owed at the end")
-    return failures
+    return failures, notes
 
 
 def quantile(ordered: list[float], q: float) -> float:
@@ -471,6 +513,64 @@ def first_token_waits(run: Run) -> list[tuple[dict, float]]:
     return waits
 
 
+def growing_turns(run: Run) -> dict[int, dict]:
+    """Each growing turn after a conversation's first, by its index: its
+    requests, each with its conversation's previous prompt (`previous`), the
+    tokens the turn's requests added to their conversations (`new`) and its
+    last first token's milliseconds (`ttft_ms`). A request whose answer
+    carried no usage counts nothing it could be judged by, so neither it nor
+    its conversation's next request is judged."""
+    previous: dict[int, int] = {}
+    turns: dict[int, dict] = {}
+    for record in run.events:
+        if record.get("kind") != "request" or record["turn_kind"] not in GROWING_TURNS:
+            continue
+        before = previous.pop(record["conv"], None)
+        if record.get("prompt") is None or record.get("cached") is None:
+            continue
+        previous[record["conv"]] = record["prompt"]
+        if before is None:
+            continue
+        turn = turns.setdefault(
+            record["turn"], {"requests": [], "new": 0, "ttft_ms": 0}
+        )
+        turn["requests"].append({**record, "previous": before})
+        turn["new"] += record["prompt"] - before
+        turn["ttft_ms"] = max(turn["ttft_ms"], record["ttft_ms"])
+    return turns
+
+
+def conversation_failures(run: Run) -> list[str]:
+    """The conversation gate of an agent or edit run: each growing turn's
+    requests found their conversations' previous prompts cached
+    (CACHED_SHARE), and its first tokens came in time for its new tokens
+    (GROWING_TTFT_MARGIN)."""
+    failures = []
+    turns = growing_turns(run)
+    for index, turn in sorted(turns.items()):
+        for record in turn["requests"]:
+            if record["cached"] < CACHED_SHARE * record["previous"]:
+                failures.append(
+                    f"conversation: turn {index}, conversation {record['conv']} "
+                    f"found {record['cached']} of its previous {record['previous']} "
+                    f"prompt tokens cached, under {CACHED_SHARE:.0%}"
+                )
+    paces = sorted(t["ttft_ms"] / t["new"] for t in turns.values() if t["new"] > 0)
+    if not paces:
+        return failures
+    pace = quantile(paces, 0.5)
+    for index, turn in sorted(turns.items()):
+        allowed = GROWING_TTFT_MARGIN * pace * turn["new"]
+        if turn["ttft_ms"] > max(allowed, GROWING_TTFT_FLOOR_S * 1000):
+            failures.append(
+                f"conversation: turn {index}'s first tokens took "
+                f"{turn['ttft_ms'] / 1000:.1f} s, past {GROWING_TTFT_MARGIN} x "
+                f"{allowed / GROWING_TTFT_MARGIN / 1000:.1f} s, its {turn['new']} "
+                "new tokens at the run's median pace"
+            )
+    return failures
+
+
 def mebibytes(count: float) -> str:
     return f"{count / (1 << 20):,.1f} MiB"
 
@@ -480,8 +580,7 @@ def write_notes(run: Run) -> list[str]:
     (clients.write_summary): what the SSD cache wrote during the turns, per
     request and per 1,000 prompt tokens, by cause, and after the last turn;
     what the requests reused and the cache read back; each kind of turn's
-    time to first token; and, for a target that writes Slim pages, that the
-    KV by cause counts them whole (clients.written_by_cause)."""
+    time to first token."""
     summary = next((e for e in run.events if e.get("kind") == "summary"), None)
     if summary is None:
         return []
@@ -516,13 +615,6 @@ def write_notes(run: Run) -> list[str]:
         f"({mebibytes(counters['disk.read_bytes'])} read), "
         f"{counters['cache.lost_state_misses']:g} lookups past a lost state",
     ]
-    if summary.get("slim_page_bytes"):
-        notes.append(
-            "KV by cause counts every page at "
-            f"{mebibytes(summary['kv_page_bytes'])}: this target's Slim pages "
-            f"store {mebibytes(summary['slim_page_bytes'])}, so its KV is "
-            "overstated and its states understated"
-        )
     notes += [
         f"first token, {kind}: median {times['median']:g} ms, max "
         f"{times['max']:g} ms over {times['n']} requests"
@@ -541,7 +633,8 @@ def check_run(
     them why its machine was not quiet. Every run is judged on G8; a churn
     run also on its load window, every client served, G4, G9, the store
     line and its first tokens' waits (FIRST_TOKEN_MARGIN). An agent or edit
-    run notes what it measured (write_notes)."""
+    run also on its conversations (conversation_failures), and notes what it
+    measured (write_notes)."""
     result = {
         "invalid": invalid(run, build, streamed),
         "failures": g8_failures(run),
@@ -549,6 +642,7 @@ def check_run(
     }
     scenario = run.meta.get("scenario", "churn")
     if scenario in CONVERSATION_SCENARIOS:
+        result["failures"] += conversation_failures(run)
         result["notes"] += write_notes(run)
     if scenario != "churn":
         return result
@@ -560,8 +654,9 @@ def check_run(
     if missing:
         failures.append(f"workers that completed no request: {missing}")
     gap_failures, gap_notes = g4(run)
-    failures += gap_failures + g9_failures(run)
-    notes += gap_notes
+    memory_failures, memory_notes = g9(run)
+    failures += gap_failures + memory_failures
+    notes += gap_notes + memory_notes
     causes = gap_causes(run)
     if causes:
         notes.append(f"gaps past {GAP_TARGET_S:g} s by cause: {causes}")

@@ -142,17 +142,23 @@ struct ServeSettingsTests {
                                           "--max-cache-disk": "0", "--sparse-kv-memory": "2G"])
         #expect(text.serveArguments(model: "a/b") == ["serve", "--model", "a/b", "--port", "8000", "--offline",
                                                       "--language-only", "--max-cache-disk", "0"])
+        // A start recalibrates the Neural Engine where asked while it is on, never while it is off.
+        var ane = ServeSettings(values: ["--recalibrate-ane": "true"])
+        #expect(ane.serveArguments(model: "a/b").last == "--recalibrate-ane")
+        ane["--disable-ane"] = "true"
+        #expect(ane.serveArguments(model: "a/b") == ServeSettings(values: ["--disable-ane": "true"]).serveArguments(model: "a/b"))
     }
 
     /// An option the others leave no effect says what it lacks.
     @Test func aDimmedOptionSaysWhatItNeeds() {
-        let off = ServeSettings(values: ["--max-cache-disk": "0", "--language-only": "true"])
+        let off = ServeSettings(values: ["--max-cache-disk": "0", "--language-only": "true", "--disable-ane": "true"])
         let ssd = "Needs the SSD cache (SSD Cache Size not Off)."
         #expect(LaunchOption.all.filter { !$0.applies(off) }.map { [$0.flag, $0.lacks(off)] } == [
             ["--sparse-kv-memory", ssd], ["--max-cache-disk-writes", ssd], ["--persistent-cache", ssd],
             ["--cache-dir", "Needs Keep after stopping on. \(ssd)"],
             ["--announce-served-name", "Needs a served model name."],
             ["--max-image-pixels", "Needs the model’s vision (Text only off)."],
+            ["--recalibrate-ane", "Needs Neural Engine for long prompts on."],
         ])
         // Only what it lacks.
         let cacheDir = LaunchOption.all.first { $0.flag == "--cache-dir" }
@@ -164,10 +170,10 @@ struct ServeSettingsTests {
     /// Flint's options, as the runtime reports its family: no vision, recurrent state, PLE table,
     /// sparse KV, Neural Engine or thinking switch.
     static let flint = ModelFamily(unusable: ["--language-only", "--state-format", "--cached-states", "--ple-memory", "--sparse-kv-memory",
-                                              "--disable-ane", "--max-image-pixels", "--default-reasoning-effort",
+                                              "--disable-ane", "--recalibrate-ane", "--max-image-pixels", "--default-reasoning-effort",
                                               "--thinking-token-budget", "--thinking-end-text"],
                                    contextTokens: 262_144, maxContextTokens: 262_144)
-    static let moe = ModelFamily(unusable: ["--ple-memory", "--sparse-kv-memory", "--disable-ane"],
+    static let moe = ModelFamily(unusable: ["--ple-memory", "--sparse-kv-memory", "--disable-ane", "--recalibrate-ane"],
                                  contextTokens: 262_144, maxContextTokens: 1_010_000)
 
     @Test func aModelStartsWithoutTheOptionsItsFamilyCannotUse() {
@@ -188,8 +194,21 @@ struct ServeSettingsTests {
         #expect(settings.differs(from: other, model: "a/b", family: .unknown))
         // The card leaves them out, and the bands of parts left empty.
         #expect(LaunchOptions.options(.memory, for: Self.flint).map(\.flag)
-            == ["--kv-format", "--expert-memory"])
-        #expect(LaunchOptions.options(.memory, for: .unknown).count == 6)
+            == ["--weights", "--kv-format", "--expert-memory"])
+        // Weights is kept only for a model some of whose weights Auto would load otherwise: left
+        // out for one that has none and for one whose record doesn't say, which starts without it.
+        for quantizable in [false, nil] as [Bool?] {
+            #expect(LaunchOptions.options(.memory, for: Self.flint.weights(quantizable: quantizable)).map(\.flag)
+                == ["--kv-format", "--expert-memory"])
+            #expect(ServeSettings(values: ["--weights": "auto"], apiKey: "k")
+                .usable(by: Self.flint.weights(quantizable: quantizable)).values.isEmpty)
+        }
+        #expect(Self.flint.weights(quantizable: true) == Self.flint)
+        #expect(LaunchOptions.options(.memory, for: .unknown).count == 7)
+        // Recalibrating the Neural Engine goes with the Neural Engine.
+        #expect(LaunchOptions.options(.requests, for: Self.moe).map(\.flag).filter { $0.hasSuffix("-ane") } == [])
+        #expect(LaunchOptions.options(.requests, for: .unknown).map(\.flag).filter { $0.hasSuffix("-ane") }
+            == ["--disable-ane", "--recalibrate-ane"])
     }
 
     /// A context length longer than the model picked serves stays kept for a model that serves it,
@@ -230,6 +249,87 @@ struct ServeSettingsTests {
         #expect(!ContextLength.message(Self.flint).contains("YaRN"))
         #expect(ContextLength.message(Self.moe).contains("at most 1,010,000. Past the model’s own window, 256K, it stretches it with YaRN"))
         #expect(ContextLength.message(.unknown).contains("YaRN"))
+    }
+
+    /// The Activations menu names the family's own default as its default item and offers the
+    /// other value; a start passes neither that default nor a value kept that equals it.
+    @Test func theActivationsMenuNamesTheFamilysDefault() throws {
+        let activations = try #require(LaunchOption.all.first { $0.flag == "--activations" })
+        var inkling = Self.moe
+        inkling.activations = "bf16"
+        var qwen = Self.moe
+        qwen.activations = "auto"
+        #expect(activations.standard(for: inkling) == "16-bit" && activations.choices(for: inkling).map(\.value) == ["auto"])
+        #expect(activations.standard(for: qwen) == "Auto" && activations.choices(for: qwen).map(\.value) == ["bf16"])
+        #expect(activations.standard(for: .unknown) == "Auto" && activations.choices(for: .unknown).map(\.value) == ["bf16"])
+        let kept = ServeSettings(values: ["--activations": "bf16"], apiKey: nil)
+        #expect(!kept.usable(by: inkling).serveArguments(model: "a/b").contains("--activations"))
+        #expect(kept.usable(by: qwen).serveArguments(model: "a/b").contains("bf16"))
+        let family = try JSONDecoder().decode(ModelFamily.self, from: Data(#"{"unusable": [], "context_tokens": 1, "max_context_tokens": 1, "activations": "bf16"}"#.utf8))
+        #expect(family.activations == "bf16" && family.standard("--weights") == nil)
+    }
+
+    /// Thinking offers what the model picked's own chat template renders, as its record says: its
+    /// default named and left out of the choices, No Thinking, and only the efforts it tells
+    /// apart; one whose efforts all render alike has thinking on and off. An effort the model
+    /// doesn't have is not passed. A model whose record doesn't say has every effort.
+    @Test func thinkingOffersTheEffortsTheModelHas() throws {
+        let thinking = try #require(LaunchOption.all.first { $0.flag == "--default-reasoning-effort" })
+        let levels = Self.moe.thinking(ModelReasoning(thinks: true, efforts: ["low", "medium", "xhigh"], standard: "xhigh"))
+        #expect(thinking.standard(for: levels) == "Extra High")
+        // In the Chat's order, most to least and No Thinking last, the default in its own place.
+        #expect(thinking.choices(for: levels).map(\.title) == ["Medium", "Low", "No Thinking"] && levels.standardIndex("--default-reasoning-effort") == 0)
+        let inkling = Self.moe.thinking(ModelReasoning(thinks: true, efforts: ["minimal", "low", "medium", "high", "xhigh"], standard: "high"))
+        #expect(thinking.choices(for: inkling).map(\.title) == ["Extra High", "Medium", "Low", "Minimal", "No Thinking"])
+        #expect(inkling.standardIndex("--default-reasoning-effort") == 1 && Self.moe.standardIndex("--default-reasoning-effort") == 0)
+        let kept = ServeSettings(values: ["--default-reasoning-effort": "max"], apiKey: nil)
+        #expect(!kept.usable(by: levels).serveArguments(model: "a/b").contains("--default-reasoning-effort"))
+        #expect(ServeSettings(values: ["--default-reasoning-effort": "xhigh"], apiKey: nil).usable(by: levels).values.isEmpty)
+        #expect(ServeSettings(values: ["--default-reasoning-effort": "low"], apiKey: nil).usable(by: levels).values.count == 1)
+        let on = Self.moe.thinking(ModelReasoning(thinks: true, efforts: [], standard: nil))
+        #expect(thinking.standard(for: on) == "Thinking" && thinking.choices(for: on).map(\.title) == ["No Thinking"])
+        #expect(kept.usable(by: on).values.isEmpty)
+        let off = Self.moe.thinking(ModelReasoning(thinks: false, efforts: [], standard: nil))
+        #expect(thinking.standard(for: off) == "No Thinking")
+        #expect(thinking.choices(for: off).map(\.value) == ["medium"] && thinking.choices(for: off).map(\.title) == ["Thinking"])
+        #expect(off.standardIndex("--default-reasoning-effort") == 1 && on.standardIndex("--default-reasoning-effort") == 0)
+        #expect(thinking.standard(for: Self.moe) == "Model’s Default" && thinking.choices(for: Self.moe).count == 7)
+        #expect(kept.usable(by: Self.moe).values.count == 1)
+        let record = try JSONDecoder().decode(ModelReasoning.self, from: Data(#"{"thinks": true, "efforts": ["low"], "default": "low"}"#.utf8))
+        #expect(record == ModelReasoning(thinks: true, efforts: ["low"], standard: "low"))
+    }
+
+    /// The sampling fields keep their settings as the option keeps them, so that what 1.7.3's one
+    /// field kept reads into them and a start passes each; an empty field passes nothing. Each
+    /// takes the server's forms and ranges, and shows what the model picked's requests get.
+    @Test func theSamplingFieldsKeepTheOptionsPairs() throws {
+        let old = "temperature=0.6, top_k=20"
+        #expect(Sampling.values(old) == ["temperature": "0.6", "top_k": "20"])
+        var values = Sampling.values(old)
+        values["min_p"] = "0.05"
+        values["temperature"] = nil
+        #expect(Sampling.stored(values) == "top_k=20, min_p=0.05")
+        #expect(Sampling.stored([:]) == nil && Sampling.values(nil).isEmpty)
+        let kept = ServeSettings(values: ["--sampling-default": try #require(Sampling.stored(values))], apiKey: nil)
+        let arguments = kept.serveArguments(model: "a/b")
+        #expect(arguments.contains("top_k=20") && arguments.contains("min_p=0.05"))
+        #expect(arguments.filter { $0 == "--sampling-default" }.count == 2)
+        let all = Dictionary(uniqueKeysWithValues: (Sampling.main + Sampling.more).map { ($0.name, $0) })
+        let temperature = try #require(all["temperature"]), topP = try #require(all["top_p"]), topK = try #require(all["top_k"])
+        let repetition = try #require(all["repetition_penalty"]), minP = try #require(all["min_p"])
+        #expect(Sampling.parse(temperature, " 0.7 ") == "0.7" && Sampling.parse(temperature, "2.5") == nil)
+        #expect(Sampling.parse(topP, "0") == nil && Sampling.parse(topP, "1") == "1")
+        #expect(Sampling.parse(topK, "20") == "20" && Sampling.parse(topK, "0.5") == nil)
+        #expect(Sampling.parse(repetition, "0") == nil && Sampling.parse(minP, "x") == nil)
+        var qwen = Self.moe, inkling = Self.moe
+        qwen.sampling = ["temperature": 1.0, "top_p": 0.95, "top_k": 20]
+        inkling.sampling = ["temperature": 1.0, "top_p": 1.0, "top_k": 0]
+        #expect(Sampling.main.map { Sampling.placeholder($0, qwen) } == ["1", "0.95", "20"])
+        #expect(Sampling.main.map { Sampling.placeholder($0, inkling) } == ["1", "1", "Off"])
+        #expect(Sampling.placeholder(topK, .unknown) == "Model’s Default")
+        #expect(Sampling.more.map { Sampling.placeholder($0, qwen) } == ["0", "0", "1", "0"])
+        let family = try JSONDecoder().decode(ModelFamily.self, from: Data(#"{"unusable": [], "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}}"#.utf8))
+        #expect(family.sampling?["top_k"] == 20)
     }
 
     /// The context menu offers the lengths the model picked serves, 1M tokens where YaRN stretches
@@ -291,6 +391,15 @@ struct ServeSettingsTests {
             == "Splash can’t serve this model: no supported model has this architecture (Llama)")
         #expect(problem(failure("internal"))
             == "It stopped: the engine's words. The log has the details.")
+        // A value the launcher refused, by the title of the launch option that sets it.
+        #expect(problem(failure("configuration", message: "argument --sampling-default: temperature must be a number in [0, 2]"))
+            == "Sampling defaults: temperature must be a number in [0, 2]")
+        #expect(problem(failure("configuration", message: "argument --sampling-default: top_k must be 0 or -1 (disabled) or a positive integer"))
+            == "Sampling defaults: top_k must be 0 or -1 (disabled) or a positive integer")
+        #expect(problem(failure("configuration", message: "argument --max-context: must be 'auto' or a token count up to 1010000"))
+            == "Context length: must be 'auto' or a token count up to 1010000")
+        // One of no launch option stays in the launcher's words.
+        #expect(problem(failure("configuration", message: "argument --no-such-option: x")) == "argument --no-such-option: x")
         // The rest in the engine's words, as its refusal of a MAX_CONTEXT past the model's.
         for kind in ["configuration", "memory_budget", "device"] {
             #expect(problem(failure(kind)) == "the engine's words")
@@ -376,6 +485,12 @@ struct ServeSettingsTests {
         #expect(try custom("--idle-release").parse("45M") == "45m")
         #expect(try custom("--port").parse("0") == nil)
         #expect(try custom("--served-model-name").parse("gpt-4o,  o3 ") == "gpt-4o, o3")
+        // The sampling defaults the server takes (parse_sampling_default): a setting it names, top_k
+        // a whole number; a value out of range is the server's to refuse.
+        let sampling = try custom("--sampling-default")
+        #expect(sampling.parse("temperature=0.7  top_k=20,min_p=0") == "temperature=0.7, top_k=20, min_p=0")
+        #expect(sampling.parse("top_k=-1") == "top_k=-1" && sampling.parse("top_p=5") == "top_p=5")
+        #expect(["temp=0.7", "top_k=0.5", "top_k=", "=0.7", "temperature=0.7=1", "temperature", ""].allSatisfy { sampling.parse($0) == nil })
         // A value typed in is one the option takes, as kept and read back: every example, and the
         // menu's choices.
         for option in LaunchOption.all {
@@ -404,7 +519,7 @@ struct ServeSettingsTests {
 
     /// Whether this session can write the login Keychain, which is locked over SSH.
     static let keychainWritable: Bool = {
-        let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")
+        let keychain = Keychain.forTests()
         guard (try? keychain.write("probe")) != nil else { return false }
         try? keychain.write(nil)
         return true
@@ -412,7 +527,7 @@ struct ServeSettingsTests {
 
     @Test(.enabled(if: keychainWritable, "the login Keychain is locked, as over SSH"))
     func keepsTheKeyInTheKeychain() throws {
-        let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")
+        let keychain = Keychain.forTests()
         defer { try? keychain.write(nil) }
         #expect(try keychain.read() == nil)
         try keychain.write("first")
@@ -428,7 +543,7 @@ struct ServeSettingsTests {
 struct AppStateTests {
     @Test(.enabled(if: ServeSettingsTests.keychainWritable, "the login Keychain is locked, as over SSH"))
     func keepsTheKeyTheOptionsHave() throws {
-        let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")
+        let keychain = Keychain.forTests()
         defer { try? keychain.write(nil) }
         let root = FileManager.default.temporaryDirectory.appending(path: "splash-state-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -450,16 +565,34 @@ struct AppStateTests {
         #expect(try keychain.read() == nil)
     }
 
+    /// No app a test builds writes in the user's Library: its logs, chats and drafts are in its
+    /// own folder.
+    @Test func noTestsAppReachesTheUsersPlaces() throws {
+        let (state, folder) = AppState.forTests()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        defer { state.quit() }
+        let fake = try FakeRuntime("splash-places", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let other = fake.state()
+        defer { other.quit() }
+        let library = URL.libraryDirectory.path(percentEncoded: false)
+        for app in [state, other] {
+            for place in [app.server.log, app.installer.log, app.chats.drafts] {
+                #expect(!place.path(percentEncoded: false).hasPrefix(library), "\(place.path) is in the user's Library")
+            }
+        }
+    }
+
     /// What model files on this Mac start with besides is kept as it is set, joins the settings
     /// their start uses, and goes with them off the list.
     @Test func keepsWhatModelFilesStartWith() throws {
         let fake = try FakeRuntime("splash-model-files", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         state.modelFiles["/m/q.gguf", default: AppState.ModelFiles()].projector = "/m/mmproj.gguf"
         state.modelFiles["/m/q.gguf", default: AppState.ModelFiles()].draft = "/m/draft"
-        let again = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let again = fake.state()
         defer { again.quit() }
         #expect(again.modelFiles["/m/q.gguf"] == AppState.ModelFiles(projector: "/m/mmproj.gguf", draft: "/m/draft"))
         #expect(state.settings(for: "/m/q.gguf").projector == "/m/mmproj.gguf" && state.settings(for: "a/b").projector == nil)
@@ -475,7 +608,7 @@ struct AppStateTests {
     @Test func aCheckForUpdatesSaysWhatItFound() async throws {
         let fake = try FakeRuntime("splash-check", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         let installer = fake.root.appending(path: "install/models.py")
@@ -514,7 +647,7 @@ struct AppStateTests {
         defer { try? FileManager.default.removeItem(at: fake.root) }
         try fake.install("a/b")
         try fake.install("c/d")
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         await state.listed()
@@ -558,7 +691,7 @@ struct AppStateTests {
     @Test func theStatusIsAskedLessOftenWhileNothingShowsIt() throws {
         let fake = try FakeRuntime("splash-watched", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         #expect(!state.server.unwatched)
         state.windowShows = false
@@ -635,7 +768,7 @@ struct AppStateTests {
         let first = "a/First-GGUF:Q4", second = "a/Second-GGUF:Q4"
         try fake.install(first)
         try fake.install(second)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         func step(_ name: String) { FileManager.default.createFile(atPath: fake.root.appending(path: name).path, contents: nil) }
         #expect(!state.canStart(first))
@@ -700,6 +833,14 @@ struct ServerTests {
         // While the server starts a failed engine again.
         #expect(Server.report(Data(#"{"transport": {"ready": false, "recovering": true, "stopped": false}}"#.utf8))?.recovering == true)
         #expect(Server.report(Data("not json".utf8)) == nil)
+        // An SSD cache asked for that the disk left off says why; the golden's is on.
+        #expect(report.cacheOff == nil)
+        let off = Server.report(Data(#"{"disk": {"capacity_bytes": 0, "off_reason": "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free"}}"#.utf8))
+        #expect(off?.cacheOff == "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free")
+        // A concurrency limit past four says what it costs in context; the golden's four costs none.
+        #expect(report.lanesCost == nil)
+        let lanes = Server.report(Data(#"{"capabilities": {"max_context_tokens": 180224}, "memory_plan": {"maximum_context_tokens": 196608, "budget": {"maximum_batch_width": 8, "default_lanes_context_tokens": 262144}}}"#.utf8))
+        #expect(lanes?.lanesCost == Server.LanesCost(lanes: 8, context: 180224, defaultContext: 262144))
     }
 
     /// What a running request does, as the engine's phase gives it, and when it came; one without
@@ -1127,6 +1268,15 @@ struct ChildRecordTests {
         #expect(defaults.object(forKey: Preference.installerPID) == nil)
     }
 
+    @Test func installerCommandsCarryTextOnly() {
+        let runtime = Runtime(root: URL(filePath: "/"))
+        #expect(Array(runtime.installCommand("a/b").suffix(4)) == ["--model", "a/b", "prepare", "--json-progress"])
+        #expect(Array(runtime.installCommand("a/b", textOnly: true).suffix(5))
+                == ["--model", "a/b", "--language-only", "prepare", "--json-progress"])
+        #expect(Array(runtime.removeCommand("a/b", textOnly: true).suffix(4))
+                == ["--model", "a/b", "--language-only", "remove"])
+    }
+
     /// A leftover server stops by itself once its app has ended, as SIGTERM stops it, and a
     /// Ctrl+C would then stop its engine at once: the next launch sends SIGTERM, which it ignores
     /// by then, and waits for it.
@@ -1262,6 +1412,63 @@ struct ModelFamilyTests {
         #expect(runtime.preparedFamilies() == ["/models/27B.gguf": "Qwen3.8-27B"])
     }
 
+    /// A model installed with Text only alone, as the app downloads one with it on, is listed by the
+    /// selection link `install/models.py` gives it (`selection_link`, whose name for owner/repo:Q4
+    /// this pins), and its removal names that option; installed without it too, it is listed once,
+    /// and the model alone removes both. A selection of other options than the app's is not listed.
+    @Test func aModelInstalledWithTextOnlyAloneIsListed() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-text-only-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        func record(_ link: String, model: String) throws {
+            let folder = runtime.models.appending(path: link)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try #"{"model": "\#(model)", "family": "Gemma", "files": {}}"#
+                .write(to: folder.appending(path: "model.json"), atomically: true, encoding: .utf8)
+        }
+        #expect(Runtime.textOnlySelection("owner/repo:Q4")
+                == "322f1b99e584a792642a70c0962fdc9f25a7d7d03d3cf5c1a72db5b5dab50d81")
+        try record(".selections/\(Runtime.textOnlySelection("a/b:Q4"))", model: "a/b:Q4")
+        try record(".selections/0123", model: "c/d:Q4")
+        let listed = { runtime.installedModels().map { [$0.id, $0.textOnly ? "text only" : "named"] } }
+        #expect(listed() == [["a/b:Q4", "text only"]])
+        try record("a/b:Q4", model: "a/b:Q4")
+        #expect(listed() == [["a/b:Q4", "named"]])
+        #expect(Array(runtime.removeCommand("a/b:Q4").suffix(3)) == ["--model", "a/b:Q4", "remove"])
+    }
+
+    /// An installation made text only before Splash served its family's images awaits its vision
+    /// tower, which an update takes in: its record names no tower and no reason, its family serves
+    /// images, and Text only is off. One whose repository has no tower Splash serves
+    /// (`vision_unavailable`), one that has its tower and one of a family without vision do not.
+    @Test func anInstallationMadeBeforeItsFamilyServedImagesAwaitsItsTower() async throws {
+        let fake = try FakeRuntime("splash-families", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let runtime = Runtime(root: fake.root)
+        try #"print('{"Inkling-2-Mini": {"unusable": []}, "Flint": {"unusable": ["--language-only"]}}')"#
+            .write(to: runtime.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
+        func record(_ model: String, family: String, _ vision: String) throws {
+            let folder = runtime.models.appending(path: model)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try #"{"model": "\#(model)", "family": "\#(family)", "files": {}, \#(vision)}"#
+                .write(to: folder.appending(path: "model.json"), atomically: true, encoding: .utf8)
+        }
+        try record("a/Inkling-GGUF:Q4", family: "Inkling-2-Mini", #""vision_format": "none""#)
+        try record("b/Inkling-GGUF:Q4", family: "Inkling-2-Mini",
+                   #""vision_format": "none", "vision_unavailable": "its repository holds no projector""#)
+        try record("c/Inkling-GGUF:Q4", family: "Inkling-2-Mini", #""vision_format": "gguf""#)
+        try record("d/Flint-GGUF:Q4", family: "Flint", #""vision_format": "none""#)
+        #expect(runtime.installedModels().filter(\.towerless).map(\.id) == ["a/Inkling-GGUF:Q4", "d/Flint-GGUF:Q4"])
+        let state = fake.state()
+        defer { state.quit() }
+        await state.launch()
+        #expect(state.installed.count == 4)
+        #expect(state.awaitingVision.map(\.id) == ["a/Inkling-GGUF:Q4"])
+        await Snapshot.save("server-awaiting-vision", MainView().environment(state))
+        state.options["--language-only"] = "true"
+        #expect(state.awaitingVision.isEmpty)
+    }
+
     @Test func theRuntimeReportsWhatEachFamilyMakesOfTheOptions() async throws {
         let fake = try FakeRuntime("splash-families", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
@@ -1286,7 +1493,7 @@ struct ModelFamilyTests {
         let runtime = Runtime(root: fake.root)
         try #"print('{"Flint": {"unusable": ["--state-format"], "context_tokens": 262144, "max_context_tokens": 262144}}')"#
             .write(to: runtime.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         #expect(!state.families.isEmpty)
@@ -1295,7 +1502,7 @@ struct ModelFamilyTests {
         state.addLocal(file)
         await state.listed()
         #expect(state.installed.last == InstalledModel(id: file.path, bytes: 1000, gguf: true) && state.selection == file.path)
-        #expect(state.family(of: file.path) == .unknown)
+        #expect(state.family(of: file.path) == ModelFamily.unknown.weights(quantizable: nil))
         state.options["--port"] = String(fake.port)
         state.start(file.path)
         // The start prepares the files under a selection link of its options, as `splash serve` does,
@@ -1324,9 +1531,9 @@ struct ModelFamilyTests {
         let flint = "a/Flint-GGUF:Q4", other = "a/Other-GGUF:Q4"
         try fake.install(flint, family: "Flint")
         try fake.install(other, family: "Other")
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
-        #expect(state.family(of: flint) == .unknown)
+        #expect(state.family(of: flint) == ModelFamily.unknown.weights(quantizable: nil))
         await state.launch()
         #expect(state.isInstalled(flint) && state.isInstalled(other))
         // The options the card shows the model picked.
@@ -1343,7 +1550,7 @@ struct ModelFamilyTests {
         #expect(state.selection == other)
         await state.listed()
         #expect(state.selection == file.path)
-        #expect(state.family(of: file.path) == .unknown && shown(file.path).contains("--state-format"))
+        #expect(state.family(of: file.path) == ModelFamily.unknown.weights(quantizable: nil) && shown(file.path).contains("--state-format"))
         state.removeLocal(file.path)
         state.options["--port"] = String(fake.port)
         state.options["--state-format"] = "bf16"
@@ -1382,7 +1589,7 @@ struct ModelFamilyTests {
         try fake.install(speech, family: "Speech")
         let file = fake.root.appending(path: "Added-Q4_0.gguf")
         try Data(count: 10).write(to: file)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         state.addLocal(file)
         await state.listed()
@@ -1392,7 +1599,7 @@ struct ModelFamilyTests {
         #expect(state.selection == flint)
         // The next launch, whose report fails.
         try "import sys; sys.exit(1)".write(to: script, atomically: true, encoding: .utf8)
-        let next = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let next = fake.state()
         defer { next.quit() }
         await next.launch()
         #expect(next.installed.map(\.id) == [flint, speech, file.path])
@@ -1414,7 +1621,7 @@ struct AgentTests {
     @MainActor @Test func opensInADrawerTerminalInTheAgentsFolder() throws {
         let fake = try FakeRuntime("splash-agent", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         let folder = fake.root.appending(path: "project")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -1438,6 +1645,23 @@ struct OutputTests {
         #expect(try words("auth")
             == "Hugging Face refused access to a/b. Sign in with an account that can read it (hf auth login) and, "
                 + "if the model asks, accept its terms at huggingface.co/a/b, then try again.")
+        // A disk without room is worded by its numbers, not by the message, which names the
+        // repository downloading (the draft, first) and the cache's path for the log: what it
+        // needs and how much more than is free, which read apart even where what is free rounds
+        // to what it needs.
+        for (needed, available, said) in [(3_870_000_000, 310_000_000, "It needs 3.9 GB of disk space, 3.6 GB more than is free."),
+                                           (4_040_000_000, 3_960_000_000, "It needs 4.0 GB of disk space, 80 MB more than is free."),
+                                           (25_400_000_000, 24_600_000_000, "It needs 25 GB of disk space, 800 MB more than is free.")] {
+            let disk = try #require(Installer.Failure(line: #"{"event": "error", "kind": "disk", "needed": \#(needed), "#
+                + #""available": \#(available), "message": "not enough disk space for incoai/b-DFlash2: the installation "#
+                + #"needs more than is available in /Users/x/.cache/huggingface/hub"}"#))
+            #expect(Installer.problem(disk, model: "a/b:Q4") == said + " Free some space, then try again.")
+        }
+        // A disk that filled during the download, and a connection that dropped during it, are
+        // worded by their kind, not the installer's message ("[Errno 28] No space left on device").
+        #expect(try words("disk") == "The disk is full. Free some space, then try again.")
+        #expect(try words("interrupted")
+            == "The connection to Hugging Face dropped during the download. Check the internet connection, then try again.")
         let unclassed = try #require(Installer.Failure(
             line: #"{"event": "error", "kind": null, "message": "cannot install a/b: no supported model"}"#))
         #expect(Installer.problem(unclassed, model: "a/b") == "cannot install a/b: no supported model")
@@ -1641,7 +1865,7 @@ struct ChatTests {
         let file = folder.appending(path: "\(id).json")
         #expect(try String(contentsOf: file, encoding: .utf8).contains(png.base64EncodedString()))
         #expect(FileManager.default.fileExists(atPath: stray.path))
-        store.adoptFiles()
+        store.adoptFiles(keeping: [])
         store.flush()
         let message = try #require(store.conversations.first?.messages.first)
         let attachments = try #require(message.attachments)
@@ -1655,7 +1879,7 @@ struct ChatTests {
         let unreadable = folder.appending(path: "\(UUID()).json")
         try Data("{".utf8).write(to: unreadable)
         let other = ChatStore(folder: folder)
-        other.adoptFiles()
+        other.adoptFiles(keeping: [])
         other.flush()
         #expect(FileManager.default.fileExists(atPath: stray.path))
         try FileManager.default.removeItem(at: unreadable)
@@ -1680,7 +1904,7 @@ struct ChatTests {
             + #""text": "Look", "reasoning": "", "images": ["\#(Showcase.picture.base64EncodedString())"]}]}"#
         let file = fake.chats.appending(path: "\(id).json")
         try Data(old.utf8).write(to: file)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         #expect(state.blocker != nil)

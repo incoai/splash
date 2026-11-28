@@ -39,9 +39,9 @@ std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root
   return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
 }
 
-QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                    const VisionLoader *loader) {
-  return loader ? loadQwenVisionWeights(backend, images, *loader) : QwenVisionWeights{};
+VisionTowerWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                     const VisionLoader *loader) {
+  return loader ? loadVisionTowerWeights(backend, images, *loader) : VisionTowerWeights{};
 }
 
 namespace {
@@ -63,6 +63,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &lay
 
 TargetWeights readTarget(metal::MetalBackend &backend, const FlintLayout &layout, const QwenTargetFiles &files) {
   return loadFlintWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const Inkling2LoopLayout &layout,
+                         const QwenTargetFiles &files) {
+  return loadInkling2LoopWeights(backend, layout, files);
 }
 
 } // namespace
@@ -92,19 +97,20 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
   return std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
+        // A streamed table's store: its memory and readers here, the rows a
+        // step stages and prefetches from the family.
+        SparseRowStoreOptions table = streamedTableRows(layout);
+        table.cacheBytes = options.streamedTableBytes;
+        table.readers = options.readers;
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
+          SafetensorsTargetLoader loader(backend, images, directory, safetensorsTargetPlan(layout), table, experts,
+                                         options.weights);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          // A streamed table's store: its memory and readers here, the rows
-          // a step stages and prefetches from the family.
-          SparseRowStoreOptions table = streamedTableRows(layout);
-          table.cacheBytes = options.streamedTableBytes;
-          table.readers = options.readers;
-          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
-                                  experts);
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), ggufTargetPlan(layout), table,
+                                  experts, options.weights);
           return readTarget(backend, layout, std::ref(loader));
         }
         }
@@ -117,13 +123,14 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
 
 QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend, const std::filesystem::path &root,
                                          const ModelDescriptor &descriptor, uint64_t streamedTableBytes,
-                                         std::shared_ptr<SsdReaders> readers) {
+                                         std::shared_ptr<SsdReaders> readers, gguf::Float16Weights weights) {
   if (!descriptor.valid()) throw std::invalid_argument("model descriptor is invalid");
   // Released before the first image, the images load reserved.
   WeightImages images(backend, descriptor.sourceIdentity);
   images.release();
-  const TargetWeights target = loadTarget(backend, images, root, descriptor,
-                                          {.streamedTableBytes = streamedTableBytes, .readers = std::move(readers)});
+  const TargetWeights target =
+      loadTarget(backend, images, root, descriptor,
+                 {.streamedTableBytes = streamedTableBytes, .readers = std::move(readers), .weights = weights});
   return std::visit(
       [&](const auto &weights) { return qwenTargetGeometry(weights, descriptor.draft.targetLayerIds()); }, target);
 }
